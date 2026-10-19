@@ -147,10 +147,13 @@ kur \(\Theta=\{P,W,R,O,b,\tau,\tau^c,G\}\).
 | Iestatījums | Vērtība | Kāpēc |
 |-------------|---------|--------|
 | \(\eta\) (`DEFAULT_LR`) | **0.1** | 1 solis maina svarus ~**0.01** mērogā (vecais 0.0005 gandrīz neko nemainīja) |
-| Labels \(y_t\) | 8 pabeigtu M1 **virziens** pret spread | PDF nenosaka \(y_t\); tas ir proxy, **ne** P&L |
+| Background labels \(y_t\) | **nākamā M1** svece (HORIZON=1) pret spread | Tas pats tempiņš kā lēmumiem — nav 8 min novēlojuma |
+| Primārā korekcija | **Aizvērta treida P&L** (zaudējumā → regret uz pretējo) | `_learn_closed_trade`: loss = 3× learn; win = 1× |
+| Evolūcija | Pēc treida `force=True` (īpaši pēc mīnusa) | Ne gaida 20 label “jubileju”, kamēr režīms jau pagājis |
 | Grad clip | `max_norm=2` | stabilitāte |
 
-Kodā: `NeuralCore.learn` (lr=0.1), `AdaptiveBrain.tick` (delayed labels).
+Kodā: `NeuralCore.learn` (lr=0.1), `AdaptiveBrain.tick` (1-bar labels),
+`SingleTradeEngine._learn_closed_trade` (P&L pašnovērtējums).
 
 ---
 
@@ -194,7 +197,7 @@ Kodā: `math_rules.stop_take`, `engine.protect_position`.
 ## 8. Kas NAV peļņas garantija
 
 - Softmax % ≠ “varbūtība nopelnīt”
-- 8 min virziens ≠ brokeru neto P&L
+- Background 1-bar virziens ir **papildu** signāls; **galvenā** mācība pēc treida ir P&L regret/reinforce
 - Backtest / offline testi ≠ Capital.com LIVE pierādījums
 - Pašmācīšanās nozīmē **pielāgošanos**, ne automātisku peļņu
 

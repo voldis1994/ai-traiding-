@@ -46,5 +46,6 @@ python -m pytest -q
 ## Svarīgi
 
 - LIVE lēmums = **neironu argmax** (BUY/SELL/HOLD), ne vecie 60%/MIN_EDGE vārti
-- Labels = 8 min cenas **virziens**, ne garantēta peļņa
+- Background labels = **nākamā M1** svece; pēc aizvērta treida — **P&L pašnovērtējums** (mīnuss → regret)
+- Evolūcija pēc treida (`force`), lai nesekotu novecojušam režīmam
 - Riskē tikai naudu, ko vari zaudēt

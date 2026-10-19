@@ -288,7 +288,7 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
             assert brain.core.last_loss is not None
-            assert any('Broker-confirmed trade outcome' in e['message'] for e in s.recent())
+            assert any('P&L self-evaluation' in e['message'] for e in s.recent())
     async_run(scenario())
 
 

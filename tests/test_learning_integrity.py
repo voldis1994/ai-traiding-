@@ -16,16 +16,17 @@ def new_brain(folder):
     return store,AdaptiveBrain(store,data_dir=folder)
 
 
-def test_gradual_trend_over_spread_yields_directional_labels():
+def test_next_bar_moves_over_spread_yield_directional_labels():
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
-        # Each one-poll move is smaller than bid/ask spread, but the eight-step
-        # horizon return is greater than the spread in price units.
-        for i in range(80):
-            brain.tick(100+i*.10, .75, .01, 'GOLD')
+        # HORIZON=1: each completed bar is labeled against the next bar.
+        # Moves must clear the spread in a single step (no 8-minute lag).
+        assert brain.HORIZON==1
+        for i in range(40):
+            brain.tick(100+i*1.0, .75, .01, 'GOLD')
         labels=[r[0] for r in store.db.execute('SELECT label FROM signals WHERE label IS NOT NULL')]
-        assert len(labels)==80-brain.HORIZON
-        assert labels==['0']*len(labels), 'Gradual uptrend must not be mislabeled HOLD'
+        assert len(labels)==40-brain.HORIZON
+        assert labels==['0']*len(labels), 'Clear up-bars must label BUY, not HOLD'
         assert brain.core.last_loss is not None
 
 
@@ -40,35 +41,36 @@ def test_label_costs_are_consistent_across_price_scales():
 def test_cross_epic_price_never_labels_previous_instrument():
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
-        for i in range(9):brain.tick(4150+i*.2,.75,.1,'GOLD')
-        assert brain.labeled==1
+        for i in range(3):brain.tick(4150+i*.2,.05,.1,'GOLD')
+        assert brain.labeled==2  # HORIZON=1 → labels after each next bar
         steps_gold=brain.core.steps
         brain.tick(100.,.02,.01,'US500')
         assert brain.epic=='US500' and brain.labeled==0
         assert brain.core.steps==1
-        assert store.db.execute('SELECT COUNT(*) FROM signals WHERE epic=? AND label IS NOT NULL',('GOLD',)).fetchone()[0]==1
-        brain.tick(4151.8,.75,.1,'GOLD')
+        assert store.db.execute('SELECT COUNT(*) FROM signals WHERE epic=? AND label IS NOT NULL',('GOLD',)).fetchone()[0]==2
+        brain.tick(4151.8,.05,.1,'GOLD')
         assert brain.epic=='GOLD' and brain.core.steps==steps_gold+1
-        assert brain.labeled==2
+        assert brain.labeled==3
         assert store.db.execute('SELECT COUNT(*) FROM signals WHERE epic=? AND label IS NOT NULL',('US500',)).fetchone()[0]==0
-        # The GOLD context has never seen 100-dollar US500 quotes as a price step.
-        assert abs(brain.last_change-2)<1e-6
+        # GOLD resumed from its own last mid (~4150.4), not the US500 mid of 100.
+        assert brain.last_mid==pytest.approx(4151.8)
+        assert abs(brain.last_change - (4151.8-4150.4)/.1) < 1e-6
 
 
 def test_restart_restores_labels_and_pending_horizon_per_epic():
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
-        for i in range(18):brain.tick(100+i*.11,.5,.01,'GOLD')
-        assert brain.labeled==10 and len(brain.pending)==8
+        for i in range(18):brain.tick(100+i*1.0,.5,.01,'GOLD')
+        assert brain.labeled==17 and len(brain.pending)==1
         prev_step=brain.core.steps
         other=AdaptiveBrain(store,data_dir=directory)
         assert other.epic=='GOLD'
-        assert other.labeled==10
-        assert len(other.pending)==8
+        assert other.labeled==17
+        assert len(other.pending)==1
         assert len(other.history)==18
         assert other.core.steps==prev_step
-        other.tick(100+18*.11,.5,.01,'GOLD')
-        assert other.labeled==11 and other.core.steps==prev_step+1
+        other.tick(100+18*1.0,.5,.01,'GOLD')
+        assert other.labeled==18 and other.core.steps==prev_step+1
         assert other.core.last_loss is not None
 
 
@@ -79,14 +81,14 @@ def test_switch_and_restart_keep_separate_weights_and_pending():
         gold_P=brain.core.P.copy()
         gold_steps=brain.core.steps
         for i in range(12):brain.tick(10000+i*2,1.,.1,'INDEX')
-        assert brain.labeled==4
+        assert brain.labeled==11  # HORIZON=1 → 12 INDEX ticks yield 11 labels
         assert brain.core.steps==12
         gold_brain=AdaptiveBrain(store,data_dir=directory)
         assert gold_brain.epic=='GOLD'
         assert gold_brain.core.steps==gold_steps
         np.testing.assert_allclose(gold_brain.core.P,gold_P)
         gold_brain.tick(10024,1.,.1,'INDEX')
-        assert gold_brain.labeled==5
+        assert gold_brain.labeled==12
         gold_brain.tick(105.2,.05,.01,'GOLD')
         np.testing.assert_allclose(gold_brain.core.P,gold_P,rtol=0,atol=0.01)
         assert gold_brain.core.steps==gold_steps+1
@@ -130,7 +132,7 @@ def test_growth_does_not_starve_learning_in_long_session():
             return result
         brain.core.learn=tracked
         for i in range(80):brain.tick(100+i*.05,.03,.01,'GOLD')
-        assert len(calls)==72
+        assert len(calls)==80-brain.HORIZON
         assert brain.core.births<=80//brain.FAST_GROWTH_INTERVAL
 
 
@@ -140,15 +142,40 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
         brain.tick(100,.05,.01,'GOLD')
         engine=SingleTradeEngine(store,brain)
         engine.market={'epic':'GOLD','tick':10,'spread':100.}
+        engine.policy=AutoEvolution(store,Path(directory)/'policy.py')
         store.set('entry_brain:deal1',{'epic':'GOLD','direction':'SELL','entry':100,
             'tick_size':.01,'entry_spread':.05,
             'transition':brain._json_transition(brain.core.last_transition)})
         engine._learn_closed_trade('deal1',{'level':99.8})
-        last=[e for e in store.recent() if 'Broker-confirmed trade outcome used' in e['message']][0]
+        last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['realized_directional_ticks']==pytest.approx(20.)
+        assert detail['mode']=='reinforce_win'
         assert detail['target']==1
+        assert detail['learn_repeats']==1
         assert store.get('entry_brain:deal1') is None
+
+
+def test_losing_trade_regrets_opposite_action_with_stronger_update():
+    with tempfile.TemporaryDirectory() as directory:
+        store,brain=new_brain(directory)
+        brain.tick(100,.05,.01,'GOLD')
+        before=brain.core.P.copy()
+        engine=SingleTradeEngine(store,brain)
+        engine.market={'epic':'GOLD','tick':.01,'spread':.05}
+        engine.policy=AutoEvolution(store,Path(directory)/'policy.py')
+        store.set('entry_brain:loss1',{'epic':'GOLD','direction':'BUY','entry':100,
+            'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
+        # BUY that exited lower → loss → regret toward SELL (label 1), 3 repeats.
+        engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
+        last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
+        detail=json.loads(last['details'])
+        assert detail['mode']=='regret_loss'
+        assert detail['target']==1
+        assert detail['learn_repeats']==3
+        assert detail['broker_pnl']==-12.5
+        assert not np.array_equal(before,brain.core.P)
+        assert store.get('entry_brain:loss1') is None
 
 
 def test_mismatched_broker_trade_outcome_never_trains():

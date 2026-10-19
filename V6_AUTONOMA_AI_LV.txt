@@ -1,0 +1,75 @@
+NEURAL TRADING AI — v6 AUTONOMA LEMUMU SISTEMA
+================================================
+
+SI VERSIJA IR PILNS PROJEKTA ZIP, NEVIS ATSKIRTS PATCH.
+
+GALVENAIS NOTEIKUMS
+-------------------
+* Pirmais darijums tiek atverts MANUALI Capital.com.
+* Robots nolasa apstiprinato brokeru darijumu (dealId, EPIC, size, direction).
+* Kamer si manuala pozicija ir atverta, robots parvalda brokeru poziicijas aizsardzibu.
+* Pec brokeri apstiprinatas pozicijas aizversanas AI pats izvelas BUY, SELL vai HOLD.
+* Ja BUY vai SELL ir lielakais no neuraliem rezultatiem, nav veca 60% / 8.1 pp / hronologisko
+  pieradijumu minimuma bloketaja. Ja HOLD ir lielakais, tas paliek AI lemums.
+* Ja atver jaunu manualu darijumu (ar jaunu dealId), robots parnem ta instrumentu
+  un faktisko izmeru ari bez programmas restarta. Atkariba no izmainitam pozicijam,
+  liela poziciju konflikta gadijuma robota izpilde paliek aptureta.
+* Robota automatiskie orderi netiek sajaukti ar jauniem manualiem orderiem.
+
+SVECES / TIMEFRAME
+------------------
+* AI tiek palaists tikai, kad pienak jauna BROKERA APMEKLETA, PILNIBA PABEIGTA M1 svece.
+* M5, M15, H1 funkcijas un starptirgu + zinu dati tiek lietoti ka ievades pazimes.
+* Atvertais tiks paliek tikai aktuālajai cenai, grafika kustibai un brokeru SL/TP uzraudzibai.
+* Vienu un to pasu M1 sveci robots neparrekina par jaunu tirdzniecibas lemumu.
+* Vairak neka viena automatiska ieeja tai pasai pabeigtajai svecei nav atlauta.
+* Pec iepriekseja darijuma aizversanas nakama JAUNA pabeigta M1 svece ir pirma iespeja lemumam.
+
+KAS VIRS NEIRONU LEMUMA NAV VAIRS BLOKETAJS
+------------------------------------------
+* Nav neviena absoluuta 60% AI vertējuma slieksna.
+* Nav 8.1 pp / MIN_EDGE atseviska LIVE orderu veto.
+* Nav 96 lidziga signala pieradijumu uzkrasanas prasibas pirms katra LIVE ordera.
+* Nav dubultas intermarket korelacijas veto — datos izvertē pati 18-pazimju neuralā sistema.
+* Koda evolucija turpina savu pasu izpeti/replay, bet tās vecie MIN_EDGE noteikumi
+  NAV slēpti LIVE orderu aizliegumi.
+
+KAS SAGLABATS (izpildes nevis prognozes ierobezojumi)
+-----------------------------------------------------
+* Ekonomisko zinu aizsardziba (Forex Factory) pirms/pec augstas ietekmes zinas.
+* Ja kalendars nav pieejams un nav derigas svaigas kesatminas, jaunas ieejas netiek atvertas.
+* Slodzes laika tiek izmantota deriga, vel ne-novecojusi kesatmina.
+* Market status TRADEABLE, atverts orders/pozicija, korekti darijuma nosacijumi.
+* Brokera apstiprinati SL/TP, orderu apstiprinajumi un aizsardziba pret dubletiem orderiem.
+* Ja nav svaigu M1/M5/M15/H1 vai nepieciešamo 18 dimensiju datu, netiek izmantoti izdomati signali.
+
+SVARIGI PAR RISKU
+----------------
+* Sī versija izmantota tikai OFFLINE simulacijas un vienibu testos; nav veikts Capital.com LIVE tests.
+* AI izvada ne-kalibretus signalus; lielakais rezultats NAV garantija pelnai.
+* Modelis joprojam macas no 8 pabeigtu M1 minusu cenas virziena pec spreda,
+  nevis no pilna faktiska P&L ieskaitot visu slidi, komisijas un overnight finansesanu.
+* Parbaudi brokeri faktiski redzamos stopLoss / takeProfit un manualas pozicijas izmeru.
+* DEMO konts pirms LIVE ir loti ieteicams.
+
+UZSTADISANA — WINDOWS
+---------------------
+1. Pilniba aizver veco robotu (arī komandrindas logu).
+2. Nokopē veco data mapi ka rezerves kopiju (ieskaitot visus neironu svarus
+   brain*.npz, SQLite robot.sqlite3 un active_policy.py).
+3. Izpako V6 ZIP jaunā Windows mape.
+4. Iekope veco data mapes saturu jaunās mapes data mapē.
+5. Palaiž run_windows.bat no JAUNAS mapes.
+6. DEMO: manuali atver poziciju, parliecinies par adoptejošo EPIC/size/SL/TP,
+   tad aizver un apstiprini, ka tikai pec JAUNAS pabeigtas M1 sveces ir AI lemums.
+7. Ja kalendara plūsma nav pieejama, panelis norada NEWS GUARD iemeslu.
+
+NEIEKLAUTS ZIP
+-------------
+ZIP NAV iepakota tava privāta data/robot.sqlite3, brain.npz, brain_*.npz,
+active_policy.py, login akreditacijas dati vai paroles. Tas ir apzinati.
+
+TEHNISKA PĀRBAUDE
+-----------------
+V6 laboratorijas pārbaude: 137 pytest testi, Python compileall un node --check app/web/ui.js.
+Visi brokeru orderi testos ir imitēti, nevis izpildīti reālajā Capital.com kontā.

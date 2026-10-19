@@ -1,0 +1,24 @@
+NEURAL TRADING AI - Capital.com LIVE pieslegsanas diagnostika
+
+Sis labojums ATSEVISKI paradis, kura posma rodas kluda:
+  1. Capital.com LIVE autentifikacija (POST /session)
+  2. Capital.com konta nolasana (GET /accounts)
+  3. Capital.com poziciju nolasana (GET /positions)
+
+Klukas tiek raditas ar HTTP statusu, bet bez paroles, API atslēgas vai tokeniem.
+Tas neapiet Capital.com drosibas nosacijumus un negarante LIVE pieslegsanos.
+
+UZSTADISANA:
+  - Aizver veco robotu un izveido rezerves kopiju.
+  - Izpako so projektu jaunaja mape.
+  - Ja velies saglabat ieprieksejo macisanos, NEIZDZES data mapi.
+  - Palaid run_windows.bat un meginiet ielogoties vienu reizi.
+  - Atsuti tikai sarkana paziņojuma TEKSTU (ne paroli, ne API atslēgu).
+
+Ja paradas HTTP 401 autentifikacija: parbaudi Capital.com LIVE login datus,
+API atslegas derigumu un konta piekluvi.
+Ja paradas HTTP 429: nesuti daudzus atkartotus meginajumus; uzgaidi.
+Ja paradas konta/poziciju nolasanas kluda, autentifikacija var but izdevusies,
+bet atbilstosais datu pieprasijums - ne.
+
+Ja ir aktiva pozicija, parbaudi tas SL/TP tiesi Capital.com aplikacija.

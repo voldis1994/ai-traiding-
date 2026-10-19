@@ -1,0 +1,80 @@
+NEURAL TRADING AI — MĀCĪŠANĀS MĒROGA UN DATU IZOLĀCIJAS LABOJUMS
+
+Šī ir pilna Windows projekta avota koda versija, nevis DEMO.
+Capital.com LIVE integrācija ir saglabāta, taču reāls orderis šajā vidē NAV pārbaudīts.
+
+DROŠA UZSTĀDĪŠANA
+1. Apturi esošo robotu un aizver palaidēja logu.
+2. Izveido drošu iepriekšējās projekta mapes un īpaši data/ kopiju.
+3. Izpako šo ZIP jaunā mapē.
+4. Ja vēlies saglabāt savu apmācības vēsturi, pārkopē VISU veco data/
+   saturu uz jaunās mapes data/ (īpaši robot.sqlite3, brain.npz,
+   brain_*.npz un active_policy.py). Nekopē, kamēr robots darbojas.
+5. Palaid run_windows.bat kā iepriekš. Pievienojies ar Capital.com LIVE.
+6. Pārbaudi žurnālu un pozīciju/SL/TP statusu pirms automātiskas tirdzniecības.
+
+LABOJUMI
+- Instruments (EPIC) izolēts no citiem instrumentiem; atsevišķa neironu vēsture.
+- Marķējums no 8 novērojumu kustības, salīdzinājums cenas vienībās pret spredu.
+- Neironu augšana neizmet aizkavētās apmācības pārejas; stabilas neironu ID.
+- Saglabāti neironu ID, nepabeigtās etiķetes, statistika un cenu konteksts.
+- Spreda politika vērtēta bāzes punktos, nevis dažādu instrumentu tick vienībās.
+- Aizvērta darījuma apmācība izmanto saglabāto entry EPIC un entry tick.
+- Vecie viena soļa marķējumi saglabāti vēsturē, bet izslēgti no jauna mērķa.
+
+Automatizētie testi pārbauda mācīšanās loģiku un simulētu orderu ciklu.
+Netiek garantēta peļņa vai ordera pieņemšana īstā brokera sesijā.
+
+2026-10-13 PAPILDINĀJUMS — BUY/SELL/HOLD SIGNĀLU IZPILDES SASKAŅOŠANA
+
+- Atjauninātā automātiskā stratēģija vairs neprasa, lai BUY vai SELL neironu vērtējums sasniedz absolūtos 60%. Tā salīdzina izvēlēto virzienu ar stiprāko alternatīvu un izmanto adaptīvu virziena pārsvara robežu (sākotnēji 6 procentpunkti).
+- Pirms reāla jauna ordera robotam vajag vismaz 64 apstiprinātas, aizkavētas cenu kustības etiķetes un 8 aptuveni neatkarīgus līdzīga virziena piemērus, kuru pareizība ir vismaz 60% pēc cenas virziena aizstājējmēra. Tas nav peļņas apliecinājums un var pamatoti aizturēt LIVE orderi.
+- Sistēma saglabā Capital.com LIVE pieslēgumu, vienas pozīcijas ierobežojumu, SL/TP, orderu žurnālu un brokera apstiprināšanu. Nav nepieciešama DEMO konfigurācija, bet LIVE savienojums netika pārbaudīts izstrādes laikā.
+- Iepriekšējais automātiski ģenerētais active_policy.py tiek saglabāts kā active_policy.before_edge_v2.py un mainīts uz MIN_EDGE politiku. Nezināmu manuāli rediģētu politiku nemaina.
+- Pirms uzstādīšanas APTURI robotu, izveido pilnu dublējumu un nekad vienlaikus nepalaid veco un jauno procesu. Pārvieto savus iepriekšējos data failus uz jaunās versijas datu mapi, saglabājot robot.sqlite3, brain*.npz un active_policy.py.
+- Panelī pārbaudi "Directional lead", "Strategy proposal", "Policy decision (validated)" un "Historical direction checks". Tikai pēc faktiskā brokerī apstiprinātā OPEN ordera var secināt, ka atvērts jauns darījums.
+
+==============================
+JA PARĀDĀS "database disk image is malformed"
+==============================
+Šis ir bojāts SQLite robot.sqlite3 (iespējams, nokopēts bez -wal/-shm failiem
+vai pirms robota pilnīgas aizvēršanas). Tas NAV BUY/SELL/HOLD signāla slieksnis.
+
+1. APTURI robotu pilnīgi (arī otru logu, ja darbojas).
+2. Atver Capital.com un pārbaudi jebkuras atvērtas LIVE pozīcijas un SL/TP.
+3. NEDZĒS robot.sqlite3, robot.sqlite3-wal vai robot.sqlite3-shm.
+4. Palaid repair_database_windows.bat no šīs projekta mapes.
+5. Ieraksti BACKUP: rīks saglabās atsevišķu kopiju ar visiem SQLite
+   pavadošajiem failiem un mēģinās atjaunot bojāto datubāzi citā failā.
+6. Rīks NENOMAINĪS oriģinālu, ja kaut vienu datu tabulu nevar pilnībā
+   nolasīt. Pārbaudi rīka ziņojumu.
+7. Ja visas tabulas nolasītas, tikai ar atsevišķu APPLY apstiprinājumu
+   rīks aizvietos bojāto datubāzi, saglabājot pilnu oriģinālu rezervē.
+
+Ja rīks ziņo par nolasīšanas kļūdu, atjauno iepriekšēju pilnu data/
+rezerves kopiju vai lūdz manuāli atjaunot bojāto DB. NEVEIDO tukšu DB
+un nesāc LIVE tirdzniecību bez orderu žurnāla saskaņošanas ar brokeri.
+
+
+==============================
+JAUNS: PILNA TIRGUS KONTEKSTA MĀCĪŠANĀS (v3)
+==============================
+- Robots vairs neveido neironu signālus tikai no pēdējās cenas kustības.
+- Neironu ievade: 1, 5, 15 un 60 minūšu cenu atdeves, EMA tendence,
+  svārstīgums, 60 minūšu cenu diapazons, pēdējās PABEIGTĀS sveces ķermenis, spreds.
+- Aktīvo vēl NEPABEIGTO sveci izmanto grafikam, nevis apstiprinātai AI apmācībai.
+- Vajadzīgas 61 nepārtrauktas vēsturiskas MINUTE sveces no Capital.com.
+  Ja to trūkst vai dati ir veci, panelī būs WAIT, jauni orderi netiks sūtīti.
+- Modelis apmācās vienu reizi katrai jaunai pabeigtai minūtes svecei.
+  Apmācības mērķis ir 8 pabeigtu minūšu virziena kustība pēc izmaksu sliekšņa.
+- Vecā 3 ievades lielumu neironu faila svari NAV savietojami ar jauno 10
+  ievades lielumu modeli. Kad saņemti pietiekami dati, vecais brain*.npz
+  tiek nokopēts kā *.before_mtf_v3.npz; sākas jauns neironu modelis.
+  Vecā datubāze un orderu vēsture netiek dzēsta.
+- Grafika kotāciju sveces un brokera vēsturiskās sveces tiek nodalītas.
+- Capital.com LIVE darbība paliek, bez DEMO pārslēgšanas.
+
+NEKAD neiekopē bojātu robot.sqlite3 no vecas instalācijas.
+Jaunajā ZIP nav iekļauti konkrēta konta data faili vai paroles.
+Vispirms aizver iepriekšējo procesu, saglabā datu kopiju un
+izpako jauno ZIP atsevišķā mapē.

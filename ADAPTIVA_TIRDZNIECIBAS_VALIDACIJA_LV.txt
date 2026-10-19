@@ -1,0 +1,47 @@
+NEURAL TRADING AI — ADAPTĪVĀ IEJAS PĀRBAUDE (v5)
+================================================
+
+Kas mainīts:
+- Izņemta fiksētā 60% aizkavēto BUY/SELL etiķešu precizitātes prasība no reālo
+  ieeju izvērtēšanas (app/autonomy.py: directional_evidence).
+- Tā vietā robots katram izvēlētajam instrumentam atsevišķi izvērtē iepriekš
+  izteikto signālu faktiskās astoņu pabeigtu minūšu cenu kustības pēc aptuvenām
+  ieejas/izejas bid/ask spreda izmaksām.
+- Pārbaudē tiek ņemti tikai 8 minūtes nepārklājošies vēsturiski piemēri; visas
+  minūtes un nobriedušās cenu virziena etiķetes ir jāpārbauda hronoloģiski.
+- Lai atļautu jaunu BUY/SELL, pārsvaram jābūt pozitīvam arī vēlākā, no treniņa
+  nodalītā forward periodā; tiek lietota vienkāršota nenoteiktības rezerve un
+  izturīgāka noviržu ierobežošana, lai viens milzīgs pīķis nevarētu dominēt.
+- 40% signālu precizitāte var būt pietiekama, ja veiksmīgās kustības pārsniedz
+  neveiksmīgās; 80% precizitāte nepietiek, ja kļūdas ir daudz dārgākas.
+- Neironu modeļa 18 ievades pazīmes, Forex Factory ziņu drošība un Capital.com
+  starptirgu novērojumi turpina darboties tāpat kā v4.
+- MIN_EDGE ir atsevišķa neironu rādītāju starpības pārbaude. Tās samazināšana
+  nenozīmē, ka ir pierādīta pozitīva cena vai peļņa, tāpēc tā joprojām kalibrējas
+  tikai pēc attiecīgo instrumentu vēsturiskiem datiem.
+- Brokerī noteiktais pozīcijas lielums, pirmā MANUĀLĀ darījuma prasība,
+  pozīciju saskaņošana, SL/TP un ziņu drošības bloķētāji netika atcelti.
+
+Kā lasīt PRO TRADE BRIEF:
+- "8-min price edge after spread (proxy)": vidējā virzienam pareizā astoņu
+  minūšu cenu kustība *pēc aptuvena spreda* bāzes punktos (bp).
+- "Train / forward lower price-edge estimate": konservatīva cena-pēc-spreda
+  novērtējuma apakšējā robeža agrākajā un vēlākajā vēstures periodā. Abām jābūt
+  pozitīvām. Ja ir par maz piemēru, paneļa skaidrojums norādīs iemeslu.
+- "Historical direction checks": nepārklājušos, pietiekami vecu signālu skaits.
+- Ja galīgais lēmums ir HOLD, robots neiesniedz orderi pat tad, ja neironi rāda
+  BUY vai SELL.
+
+SVARĪGI RISKI:
+- 8 minūšu cenu-mērķis ir prognozes kvalitātes PROXY; tā nav faktiska darījumu
+  peļņa. Tas neietver slīdējumu, komisijas, finansēšanu, nodokļus vai darījumu
+  īsto SL/TP izejas laiku. Pozitīvs vēsturiskais novērtējums nav peļņas garantija.
+- Šis modulis nepārbauda SL/TP izpildi Capital.com LIVE kontā.
+- Pirmo palaišanu pārbaudi Capital.com DEMO vai citā bezriska vidē.
+- Pirms jaunas versijas uzstādīšanas PILNĪBĀ aizver robotu un saglabā visu
+  pašreizējā projekta data mapi, ieskaitot robot.sqlite3 un brain*.npz.
+- Izpako ZIP atsevišķā mapē, un tad pārcel savu iepriekš saglabāto data saturu.
+- Neatver LIVE automātisko tirdzniecību, kamēr nav brokerī pārbaudīta pirmā
+  manuālā pozīcija, izmaiņu pielietojums un īstie SL/TP.
+
+Tests: python -m pytest -q (bez brokeru LIVE pieslēguma).

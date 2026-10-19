@@ -1,0 +1,36 @@
+UNIVERSĀLS EKONOMISKO ZIŅU DROŠĪBAS MODULIS
+
+Jauns modulis: app/external_risk.py. Tas nav piesaistīts GOLD.
+
+SVARĪGI: Projektā NAV automātiska ekonomisko ziņu kalendāra piegādātāja.
+Bez data/economic_calendar.json ziņu aizsardzība ir NEAKTĪVA,
+un dashboard API laukā economic_news_risk.status redzams UNCONFIGURED.
+Neuzskatīt šo versiju par automātiski aizsargātu pret ekonomiskām ziņām!
+
+Lai aktivizētu aizsardzību, uzticamai ārējai sistēmai regulāri
+jāatjauno data/economic_calendar.json. Piemēra saturs:
+{
+  "enabled": true,
+  "updated_at": "2026-10-14T17:00:00Z",
+  "max_age_hours": 24,
+  "before_minutes": 30,
+  "after_minutes": 30,
+  "instrument_currencies": {
+    "CS.D.EURUSD.CFD.IP": ["EUR", "USD"]
+  },
+  "events": [
+    {"at": "2026-10-14T18:00:00Z", "impact": "HIGH",
+     "currencies": ["USD"], "name": "US inflation release"}
+  ]
+}
+
+Visi datumi ISO-8601 ar laika joslu; instrumenta EPIC jāsakrīt precīzi.
+Var norādīt arī epics: ["konkrets EPIC"] vai ["*"].
+Ja enabled=true, bet fails novecojis vai nederīgs, jauni orderi ir bloķēti.
+Esošās pozīcijas turpina pārvaldīt iepriekšējā loģika.
+Ziņu bloķēšana pārbaudīta arī tieši pirms ordera nosūtīšanas.
+
+Citu tirgu savstarpējās ietekmes automātiska datu iegūšana vēl NAV ieviesta.
+Neironu tīkla apmācība pēc instrumenta ir saglabāta. Nav pierādījumu,
+ka jauni signāli jau izmanto DXY, obligācijas vai citus tirgus.
+LIVE izmantošanai vispirms jāveic DEMO un brokeru SL/TP pārbaude.

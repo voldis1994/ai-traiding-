@@ -1,0 +1,38 @@
+LIVE IEEJAS SLIEKSNA KALIBRACIJA (v4)
+====================================
+
+Problema: aktiva evolucijas politika, piemeram, pieprasija vismaz 6.2
+procentpunktu BUY/SELL parsv aru. Neironu tikla rezultats var but
+korekts, bet nenonakt lidz izpildes politikai. Ar veco politiku tika
+mekleti tikai agrak jau apstiprinati signali, kas neveidoja pieradijumus
+saudz i gakai robe zai.
+
+Labojums: robots tagad parbauda ari zemakus (1--5 procentpunktu)
+virziena parsv ara variantus uz jau pabeigtu 8 minusu prognozu etiketam.
+Robeza tiek pazeminata tikai tad, ja:
+  - ir vismaz 96 atrisinati apmacibas piemer i no attieciga instrumenta;
+  - vismaz 8 savstarpeji neatkarigi atbilstosi virziena piemeri apmaciba;
+  - vismaz 4 velakajos datos, kas nav bijusi izmantoti atlasei;
+  - abos segmentos vismaz 60 % pareizi apmacibas virziena merk ejumi;
+  - starp apmacibas un parbaudes periodiem ir 8 svecu izolacijas zona.
+
+Rezultats NAV garanteta 60 % pelna vai prognozes varbutiba. Etiketes
+nozim e cenu virzienu, kas parsniegusi izmerito spredu 8-minusu horizonta.
+Tirdznieciba var neaktivizeties, ja dati neatbalsta zemaku slieksni.
+0.4 procentpunktu virziena parsv ars joprojam ir parak neizteikts,
+ari ja vesturiska parbaude atlautu viszemako 1.0 pp robezu.
+
+HOLD joprojam ir atlauts, un saglabatas visas Capital.com riska kontroles,
+orderu apstiprinasana, SL/TP parbaude, neatrisinato orderu noblok esana
+un pirma manu ala darijuma prasiba.
+
+Market Analysis rada gan aktivas politikas pamatrobezu,
+gan faktisko robezu, trenina un velako datu paraugu skaitu,
+k a ari precizu blo k esanas iemeslu.
+
+Instalesana: apturi ieprieksejo robota versiju, saglaba visu data mapi
+rezerves kopija. Izpako jauno ZIP atseviska mape un parkope esošo
+veselo data mapi (ari aktiv as politikas failu). Nekadu RESET neveic.
+P arbaudi, lai nav nenoskaidrotu LIVE orderu un brokera SL/TP ir aktivi.
+
+Tests: tikai OFFLINE simulacija, bez Capital.com LIVE darijuma.

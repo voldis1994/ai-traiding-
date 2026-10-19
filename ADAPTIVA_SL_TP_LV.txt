@@ -1,0 +1,52 @@
+NEURAL TRADING AI — ADAPTĪVA SL/TP PĀRVALDĪBA CAPITAL.COM LIVE
+
+KAS IR JAUNS
+- Robota PAŠA apstiprinātiem jaunajiem LIVE darījumiem sistēma uzrauga SL/TP
+  arī pēc pozīcijas atvēršanas.
+- Jaunā app/protection_ai.py neatkārto vienu ATR koeficientu. Tā salīdzina
+  dažādus peļņas aizsardzības un TP pagarināšanas kandidātus uz iepriekšējām
+  pabeigtām 1 minūtes svecēm. Kandidāts tiek novērtēts uz vēlākām, atlasei
+  neizmantotām vēsturiskām svecēm (chronological holdout).
+- Ja nav pietiekamu datu vai kandidāts neuzlabo pārbaudes rezultātu, vecie
+  Capital.com SL/TP paliek spēkā.
+- Ja cena virzās pozīcijai par labu, SL var tikt pārvietots tikai stingrāk
+  peļņas virzienā (NEKAD netiek paplašināts sākotnējais risks).
+- Ja virziens saglabājas 5 un 15 minūšu pabeigtajās svecēs un vēsturiskā
+  kandidātu pārbaude to atbalsta, TP var tikt pagarināts, nevis saīsināts.
+- Capital.com izmaiņas tiek pierakstītas pirms PUT pieprasījuma, pārbaudītas
+  caur GET /confirms un salīdzinātas ar faktiski brokerī reģistrētajiem
+  SL/TP līmeņiem. Nezināma izpildes rezultāta gadījumā turpmāka automātiska
+  tirdzniecība tiek apturēta līdz saskaņošanai.
+- UI sadaļās Current Position un Market Analysis ir Adaptive SL/TP statuss.
+
+KAS NAV MAINĪTS
+- Nav pārslēgšanas uz DEMO. Capital.com LIVE integrācija saglabāta.
+- Darījumu atvēršanas BUY/SELL/HOLD loģika un evolūcija nav mainīta.
+- Netiek pārrakstītas manuāli atvērtas pozīcijas, kā arī veci darījumi,
+  kurus robots ir atvēris PIRMS jaunā koda uzstādīšanas.
+- Saglabāts viens darījums vienlaicīgi, brokerī verificēts SL/TP, un
+  operatora PAUSE/EMERGENCY vadība.
+
+SVARĪGI PAR MODEĻA IEROBEŽOJUMIEM
+- Šis ir uz datiem adaptīvs SL/TP kandidātu izvēles mehānisms, nevis jauns
+  uzraudzīts neironu tīkls optimālu SL/TP garantēšanai.
+- Testu vēsturiskie rezultāti nav dzīvu darījumu peļņas garantija; vēsturiskā
+  1 minūtes sveču secība neatklāj cenu gaitu sveces iekšpusē, tāpēc tests
+  piesardzīgi pieņem, ka Stop Loss var nostrādāt pirms Take Profit.
+- Brokeris var noraidīt līmeņu izmaiņas vai izpildīt stopu ar slīdi/gapu.
+- Reāls PUT /positions ar īstu Capital.com kontu šeit NETIKA veikts.
+
+UZSTĀDĪŠANA
+1. Pārbaudi Capital.com esošo pozīciju un SL/TP. Aizver robotu pilnībā.
+2. Izveido rezerves kopiju — visas esošās projekta un data mapes.
+3. Izpako ZIP ATSEVIŠĶĀ mapē. Ja vēlies saglabāt neironus un orderu vēsturi,
+   pārkopē veco data mapi TIKAI PĒC robota apturēšanas.
+4. Nekopē atpakaļ bojātu SQLite robot.sqlite3.
+5. Palaid run_windows.bat, pievienojies Capital.com LIVE kā iepriekš.
+6. Tikai nākamajiem paša robota apstiprinātajiem OPEN darījumiem tiks
+   aktivizēta jaunā SL/TP pārvaldība. Pārbaudi panelī Adaptive SL/TP statusu
+   un Capital.com lietotnē faktiskos stop/profit līmeņus.
+7. Ja nav pieejami 15 neatkarīgi vēsturiskie 8 minūšu logi vai nav uzvarošas
+   forward pārbaudes, attālumi netiks pārvietoti. Tas NAV kļūdas pazīme.
+
+RĪKS: python -m pytest -q  (bez reāliem API orderiem)

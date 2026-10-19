@@ -1,0 +1,89 @@
+NEURAL TRADING AI — NEIRONU STARPTIRGU + ZINU APMACIBA (v4)
+=======================================================
+
+KAS IR IZDARITS
+---------------
+1) IEKSA NEIRONU TIKLA: v4 ievadei ir 18 pazimes:
+   - 10 izveletaa instrumenta pabeigto M1 OHLC pazimes (ieprieksejais modelis),
+   - 6 no Capital.com pieejamo citu tirgu saskanotam pabeigtam svecem:
+     korelaciju zimes svertas 1/5/15 min izmainas, 5 min virziena konsenss,
+     korelaciju ticamiba un references datu pietiekamiba,
+   - 2 Forex Factory zinu grafika pazimes: augstas ietekmes zinam tuvums
+     turpmakajas 6 stundas un pecnotikuma posms 2 stundu laika.
+
+2) PAZIMES TIEK APMACITAS: jaunajam PyTorch ievades svaru kolonam ir
+   reali gradienti. Tiek izmantoti tie pasi 8 secigu pabeigtu minusu
+   aizkavetie cenu virziena marķejumi, ka esosa neironu apmaciba.
+   Viena jauna minusu svece ir viens apmacibas solis; pirmais jaunais
+   markejums parasti rodas pec astoniem secigiem apmacibas soļiem.
+   Tas NEAPMACA tiesi peļnu/zaudejumus un neapliecina prognozu ienesigumu.
+
+3) SAGLABATI VECIE SVARI: pec pirmajiem tiesam sinhronizetajiem
+   referencu un deriga zinu kalendara datiem, v3 10 ievades P/G svari
+   tiek PAPLASINATI lidz 18, tos nenodzeshot. Jaunie svari sakas ar 0,
+   bet apmacibas laikā tiek pakapeniski atjaunoti. Pirms parveidosanas
+   katra instrumenta .npz failam tiek izveidota
+   'brain*.before_fusion_v4.npz' kopija (ja bija vecs fails).
+   V3 gaidito 8 solju nepiepilditos paraugus neatkartoti neparnes uz v4,
+   jo tie satur novecojusas ievades dimensijas. V3 labelu un SQL vesture,
+   ieprieksejie neironu svari un solju skaits tiek saglabati.
+
+4) ATSEVISKI INSTRUMENTI: katram Capital.com EPIC ir sava neironu datne
+   un ievades schema. Mainot GOLD uz EUR/USD, NASDAQ utt., nav jamaina
+   kods, ja brokers spej atrast izveletajam instrumentam atbilstosas
+   references un zinu kalendars spej noteikt attiecigas valutas.
+   Nezinamam instrumentam nekas netiek izdomats — jaunu orderu ieejas
+   tiek blocketas ar skaidru iemeslu.
+
+5) ATVĒRTAS POZICIJAS: references cenas un kalendars tiek ieladeti fona,
+   lai netraucetu trukstosa SL/TP brokeri parbaudi/uzliksanu. Paša
+   neironu apmaciba turpinas, kad ir pilnas derigas datu kombinacijas.
+   Ja jauna svece nav saņemta vai nav datu no referencem, v4 neizdoma
+   nulletus tirgus; tadel AI uz so minuti var dot HOLD.
+
+6) KORELACIJA NEPIERADA CAUSALITATI: nekads cross-market signāls pats
+   neatver orderi. Iepriekseja Forex Factory HIGH impact ieejas blokēšana,
+   citu tirgu drošibas veto, manualais pirmais darijums, SL/TP un
+   riska/signalus validacija paliek speka.
+
+KUR REDZET PANELI
+-----------------
+NEURAL NETWORK: NEURAL INPUTS = 18, EXTERNAL NEURAL LEARNING = READY vai
+WAITING DATA, un aizkaveto jauno apmacibu skaits.
+MARKET ANALYSIS: Neural intermarket + news training = 18 INPUTS · LEARNING
+(vai 18 INPUTS · FEED WAIT), apskatamas ari FF/news un peer sadaļas.
+
+SVARIGI: kad modelis vel gaida pirmajiem saistitajiem tirgiem un derigam
+zinu kalendaram, tas var turpinat veco 10-pazimju apmacibu. Pec pirma
+veiksmiga v4 parveidosanas tas nekad neizmantos saīsinatu datu kopu
+lai pieņemtu BUY/SELL un neimites trukstosas references.
+
+UZSTADISANA
+-----------
+A. Pilniba aizver programmu un visas tas procesa kopijas.
+B. Uztaisi visu veca projekta un datu mapes rezerves kopiju, kad datubaze
+   ir aizverta: robot.sqlite3, -wal/-shm, brain.npz, brain_*.npz,
+   active_policy.py, un apmacibas/konfiguracijas failus.
+C. Izpako atjaunoto ZIP ATSEVISKA mapē.
+D. Parnes savus VECOS data failus uz jaunā projekta data (vai, ja lieto
+   Windows EXE, atstaj %LOCALAPPDATA%/NeuralTradingAI esošo datu mapi).
+   NEPARAKSTI savus vecos brain.npz/robot.sqlite3 ar jaunu tukso stāvokli.
+E. Palaid run_windows.bat, piesledz Capital.com DEMO kontu un vispirms
+   pārbaudi signālu datu statusus, manuala darijuma SL/TP un instrumenta
+   pārslēgšanos.
+
+PARBAUDE
+---------
+128 lokali automātiskie testi bez broker autorizacijas vai realas naudas:
+- tiesa ieprieksejo neironu matricu saglabasana un paplasinasana;
+- jauno ievades kolonnu atjaunosana ar PyTorch gradientiem;
+- v4 restartesana un EPIC izolacija;
+- nevienadi/nepabeigti tirgus datu logi un trukstoss zinu avots;
+- reala engine.poll() datu cels ar simulētu Capital.com brokeri;
+- poziciju atseviskas atsauces cenu atjaunosana fona;
+- vecie orderu, SL/TP, policy un Windows testu komplekti.
+
+NAV PARBAUDITS REALA Capital.com LIVE KONTA. Lokalie testi negarante
+pelnu, brokeru atsaucibu vai SL/TP izpildes cenu. Pirms ieslegsanas
+ar realu naudu vispirms jagarantē DEMO testi un faktiska brokerī
+redzama stop-loss/take-profit esamiba.

@@ -1,0 +1,17 @@
+GitHub publicesana (ja ChatGPT savienojums nedod rakstisanas tiesibas)
+
+Repo: https://github.com/voldis1994/ai-traiding-
+
+1. Instalē Git for Windows: https://git-scm.com/download/win
+2. Izpako so arhivu atseviska mape.
+3. Palaid PUBLICET_GITHUB_WINDOWS.bat.
+4. Ja nepieciesams, apstiprini GitHub pierakstisanos Git Credential Manager loga.
+5. Parbaudi repozitorija main atzaru.
+
+Skripts klone esoso repo, kope attiritus koda failus, veido commit un git push.
+Nekope lokalo data mapi ar personigiem Capital.com sesijas datiem.
+NESKATI un NEPUBLICĒ savas API atslēgas, .env, brain*.npz, robot.sqlite3.
+Reala LIVE izpilde un SL/TP ir japarliecinas DEMO vide.
+
+Testesana si sagatavosanas vide: 135 veiksmigi, 2 neveiksmigi
+(test_neural_external_fusion saistiba ar arējo datu inicializacijas scenarijiem).

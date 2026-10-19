@@ -1,0 +1,97 @@
+NEURAL TRADING AI - FOREX FACTORY + INTERMARKET
+==============================================
+
+KAS IEVIETS
+-----------
+1) EKONOMISKO ZINU KALENDARS
+- Noklusetais oficialas Forex Factory lapas iknedelas JSON eksports:
+  https://nfs.faireconomy.media/ff_calendar_thisweek.json
+  Lapa: https://www.forexfactory.com/calendar
+- Nav jadod cita API atslega. Vajadzigs interneta pieslegums.
+- Tiek ielasits reizi 5 minutes, kad nav atvertas pozicijas un robotam
+  jau ir parnemts instruments. Pirmai manualajai pozicijai sarga uzdevums
+  nav aizliegt tirgu; sargs BLOKE tikai JAUNUS automatiski atvertus orderus.
+- Tikai 'High' impact zinas sarga ietvaros: 30 minutes pirms un pec
+  notikuma. Precizi 'High' laiki tiek parveidoti UTC no avota timezone.
+- Robots avtomatiski nosaka atbilstosas valutas pec instrumenta EPIC,
+  nosaukuma un Capital.com instrumenta valutas metadatiem. Nezinamam
+  instrumentam NAV izdomatas atbilstibas: jaunas ieejas tiek aizturetas.
+- Ja FF dati nav pieejami, ir novecojusi, no nepareizas nedelas,
+  bojati vai dati izdzesti, jaunu orderu atversana tiek bloketa.
+- Veco opcionalo JSON providera URL var joprojam iestatit vides mainigaja
+  NEURAL_ECONOMIC_CALENDAR_URL; nesaderigs/bojats saturs bloke ieejas.
+- Forex Factory publice aptuvenus laikus; pats datu avots var mainities,
+  but pieejams ar ierobezojumiem vai nekorekti atspogulot izmainas.
+  Sis nav garantets institucionals ziņu terminalis.
+
+2) INTERMARKET ANALYSIS - AUTOMATISKA CITU TIRGU PARBAUDE
+- Izmanto tikai Capital.com GET /markets?searchTerm un GET /prices/{epic}
+  ar jau pieslegto kontu, NEATSUTOT broker API atslēgu FF vietnei.
+- Nosaka FOREX, METALS, COMMODITIES, INDICES, CRYPTO, EQUITIES vai OTHER.
+  Mekle atbilstosas references (piem. Silver, US Dollar Index, US 500,
+  Brent Crude, Gold, Bitcoin). Izvelas tikai precizus brokeru atgrieztus
+  nosaukumu/EPIC sakritibas, nekad neizdomā peer EPIC.
+- Atlasa pabeigtas 1 minutes sveces, parbauda 61 nepārtrauktu minūti un
+  saskanotus UTC laika logus. Neizmanto veidojamas sveces vai datus no nakotnes.
+- Aprēķina korelaciju uz 40 agrakam izmainam, stabilitati uz nakamajam
+  15 un diagnostikas virzienu uz pēdējām 5 pabeigtām minutem.
+- Ja DIVAS vai vairak stabilas references ir pretruna ar jau
+  VALIDETU BUY/SELL signalu, jauna ieeja tiek atcelta. Ja nav saskanotu
+  brokeru reference datu, jauna ieeja tiek atcelta. Tikai pec dokumentetas
+  neitrales parbaudes lēmums var turpinaties caur esošo AI validaciju.
+- Starptirgu signali paši NEATVER darijumus, nepalielina risku un
+  nepieņem, ka korelacija nozime prognozes precizitati.
+- Atvertas pozicijas gadijuma references cenas tiek ieladetas FONA, nevis
+  gaiditas pirms brokera SL/TP. Trukstoss SL/TP vispirms tiek aizsargats.
+
+3) INSTRUMENTA MAINAS POGA
+- Dashboard: SWITCH INSTRUMENT (MANUAL FIRST).
+- Vispirms JAIZVER VISAS atvertas Capital.com pozicijas. Robots uz brokera
+  pusi parbauda, ka poziciju nav un nezinamu pasutijumu nav.
+- Pec apstiprinasanas pats nonem veco instrumenta mandatu, saglabajot
+  ieprieksejo neironu apmacibu un SQLite darijumu vesturi.
+- CAPITAL.COM MOBILAJA aplikacija ATVER PIRMO darijumu jaunaja tirgu.
+  Bots to adoptes; tikai pec brokeri apstiprinatas aizversanas robots
+  vares autonomi izvērtet nākamos darijumus.
+
+UZSTADISANA / DATU SAGLABASANA
+-----------------------------
+1. AIZVER ROBOTU pilniba, nevis tikai parslēdz pārluku.
+2. Izveido vecas programmas un visu DATA mapes rezerves kopiju,
+   ieskaitot robot.sqlite3, brain.npz, active_policy.py un -wal/-shm,
+   ja tadi ir. NEKOPĒ SQLITE datubazi kamēr robots darbojas!
+3. Atarhive ZIP jaunā direktorijā. Saja pakā NAV iepakota tava
+   datubaze, brāņa svari vai active_policy.py, lai neparrakstitu vecos.
+4. Ja saglabā ieprieksejo source projektu, nokopē tieši savus DATA
+   failus no IZSLĒGTA vecā robota uz jauna projekta data mapi.
+   Frozen Windows build glabā datus %LOCALAPPDATA%\NeuralTradingAI.
+5. Palaid run_windows.bat un piesledz LIVE vai DEMO Capital.com kontu.
+6. Skaties MARKET ANALYSIS -> PROFESSIONAL TRADE BRIEF:
+   'Forex Factory news guard', 'Intermarket analysis' un peer statusus.
+7. Ja nav FF interneta pieejas / Capital.com peer instrumentu datu,
+   signalam jaliek HOLD ar saprotamu statusu, nevis jāizliekas 'CLEAR'.
+
+IESPEJAMIE STATUSI
+------------------
+CALENDAR_WAITING: gaida ieladi
+CALENDAR_FEED_ERROR: ielade neizdevās; BLOKETS
+NEWS_WINDOW: augstas ietekmes notikuma logs; BLOKETS
+CALENDAR_UNAVAILABLE: nav deriga kalendara; BLOKETS
+UNMAPPED_INSTRUMENT: instrumenta valutas nav noteiktas; BLOKETS
+CLEAR: augstas ietekmes relevantu FF notikumu nav noraditaja loga
+INTERMARKET UNAVAILABLE: peer datu trukst; BLOKETS
+INTERMARKET READY: pastav saskanoti pabeigtu svecu dati
+CONTRADICTION: 2+ stabilas atsauces ir pret BUY/SELL; BLOKETS
+
+IEROBEZOJUMI
+------------
+- Capital.com REALA konta pieejas dati šaja ZIP nav. Nav veikti tikla
+  LIVE orderi, nebaudziti SL/TP ar personisko Capital.com kontu.
+- Testos tiek lietota simulēta FF JSON atbilde un simulēti broker dati.
+- Neko neprognostē perfekti. Vismaz 61 svecu vēsture ir nepieciešama;
+  īstermiņa korelācijas ir risks/diagnostika, nevis pierādījums peļņai.
+- JAUNAJA v4 VERSIJA starptirgu un zinu pazimes tagad papildus ieplust
+  pasa neironu tikla gradientu apmaciba ar 8-minute aizkavetiem labeliem.
+  Skati NEIRONU_INTERMARKET_APMACIBA_LV.txt. Tas nav tiesi apmacits uz
+  pelnu, un 60% slieksnis netiek maksligi pazeminats.
+- Obligati pārbaudi DEMO un brokeri faktiski uzliktos SL/TP pirms LIVE.

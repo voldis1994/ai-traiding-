@@ -1,0 +1,1330 @@
+"""Automatic broker/AI/order/learning cycle and persistent event journal.
+
+Non-idempotent operations are journaled BEFORE transmission. Ambiguous outcomes
+are reconciled, never blindly repeated. No order until an initial mobile trade has
+been detected in this authenticated session and broker confirmed its closure.
+"""
+import asyncio
+import json
+import math
+import sqlite3
+import time
+from collections import deque
+from datetime import datetime,timezone
+from decimal import Decimal
+from pathlib import Path
+import numpy as np
+from .core import NeuralCore
+from .autonomy import AutoEvolution
+from .math_rules import stop_take
+from .protection_ai import select_policy, propose_update
+from .storage import DATA
+from .market_context import market_features, candle_bucket, FEATURE_SCHEMA, FEATURE_DIM
+from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features
+
+DB=DATA/'robot.sqlite3'
+
+def now():return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+def clock():
+    """Parse engine `now()` into an aware UTC datetime (monkeypatch-friendly in tests)."""
+    value=now()
+    dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+    if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _safe_broker_error(exc):
+    """Record only Capital.com errorCode, never session tokens or request headers."""
+    response=getattr(exc,'response',None)
+    if response is None:return str(exc)[:180] if not hasattr(exc,'request') else type(exc).__name__
+    try:
+        body=response.json()
+        if isinstance(body,dict):
+            return str(body.get('errorCode') or body.get('error') or body.get('message') or 'HTTP error')[:180]
+    except (ValueError,TypeError):pass
+    return 'HTTP error (no structured broker code)'
+
+def _num(value,default=None):
+    try:
+        result=float(value)
+        return result if math.isfinite(result) else default
+    except (ValueError,TypeError):return default
+
+class Store:
+    def __init__(self,path=DB):
+        self.path=Path(path)
+        self.db=sqlite3.connect(str(path),check_same_thread=False)
+        try:
+            # Refuse trading against malformed state/order journals. Recovery is
+            # always explicit; NEVER discard or recreate the old DB silently.
+            check=self.db.execute('PRAGMA integrity_check').fetchall()
+            if check!=[('ok',)]:
+                raise sqlite3.DatabaseError('integrity_check failed: '+str(check[:3]))
+            self.db.execute('PRAGMA journal_mode=WAL')
+        except sqlite3.DatabaseError as exc:
+            self.db.close()
+            raise RuntimeError(
+                'SQLite robot.sqlite3 is damaged. STOP live trading, retain '
+                'robot.sqlite3 plus its -wal/-shm files, and run '
+                'repair_database_windows.bat with the robot CLOSED. '
+                'No training or order data has been deleted.'
+            ) from exc
+        self.db.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY,time TEXT,kind TEXT,message TEXT,details TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY,value TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY,time TEXT,epic TEXT,action TEXT,scores TEXT,price REAL,model_step INTEGER,label TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS trades (deal_id TEXT PRIMARY KEY,epic TEXT,size TEXT,direction TEXT,opened TEXT,closed TEXT,entry REAL,exit REAL,pnl REAL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY,time TEXT,kind TEXT,deal_id TEXT,reference TEXT,payload TEXT,status TEXT)')
+        self.db.execute("CREATE TABLE IF NOT EXISTS candles (epic TEXT,at TEXT,open REAL,high REAL,low REAL,close REAL,source TEXT DEFAULT 'QUOTE',PRIMARY KEY(epic,at))")
+        candle_columns={r[1] for r in self.db.execute('PRAGMA table_info(candles)')}
+        if 'source' not in candle_columns:
+            self.db.execute("ALTER TABLE candles ADD COLUMN source TEXT DEFAULT 'QUOTE'")
+        # Migration from the earlier project's signals table.
+        columns={r[1] for r in self.db.execute('PRAGMA table_info(signals)')}
+        if 'label' not in columns:self.db.execute('ALTER TABLE signals ADD COLUMN label TEXT')
+        # Legacy labels were produced using one-poll price moves. Keep them for
+        # audit, but never mix them with the new multi-step supervised targets.
+        for name,kind in (('spread','REAL'),('tick_size','REAL'),('label_version','INTEGER')):
+            if name not in columns:self.db.execute(f'ALTER TABLE signals ADD COLUMN {name} {kind}')
+        self.db.commit()
+    def event(self,kind,message,details=None):
+        self.db.execute('INSERT INTO events(time,kind,message,details) VALUES(?,?,?,?)',
+            (now(),kind,message,json.dumps(details or {},default=str)));self.db.commit()
+    def recent(self,n=100):
+        cols=('time','kind','message','details')
+        return [dict(zip(cols,r)) for r in self.db.execute('SELECT time,kind,message,details FROM events ORDER BY id DESC LIMIT ?', (n,))]
+    def set(self,k,v):
+        self.db.execute('INSERT OR REPLACE INTO state VALUES(?,?)',(k,json.dumps(v,default=str)));self.db.commit()
+    def get(self,k,default=None):
+        r=self.db.execute('SELECT value FROM state WHERE key=?',(k,)).fetchone();return json.loads(r[0]) if r else default
+    def signals(self,n=100):
+        cols=('time','epic','action','scores','price','model_step','label')
+        return [dict(zip(cols,r)) for r in self.db.execute('SELECT time,epic,action,scores,price,model_step,label FROM signals ORDER BY id DESC LIMIT ?', (n,))]
+    def order(self,kind,deal_id,payload):
+        cur=self.db.execute('INSERT INTO orders(time,kind,deal_id,reference,payload,status) VALUES(?,?,?,?,?,?)',
+            (now(),kind,deal_id,None,json.dumps(payload,default=str),'PENDING'))
+        self.db.commit();return cur.lastrowid
+    def order_update(self,order_id,status,reference=None):
+        self.db.execute('UPDATE orders SET status=?,reference=COALESCE(?,reference) WHERE id=?',
+            (status,reference,order_id));self.db.commit()
+    def unresolved(self):
+        cols=('id','time','kind','deal_id','reference','payload','status')
+        return [dict(zip(cols,r)) for r in self.db.execute("SELECT id,time,kind,deal_id,reference,payload,status FROM orders WHERE status IN ('PENDING','UNCERTAIN') ORDER BY id")]
+    def upsert_trade(self,p):
+        self.db.execute('INSERT OR IGNORE INTO trades(deal_id,epic,size,direction,opened,entry) VALUES(?,?,?,?,?,?)',
+            (p['dealId'],p['epic'],str(p['size']),p['direction'],now(),_num(p.get('level'))))
+        self.db.commit()
+    def close_trade(self,deal_id,exit_price=None,pnl=None):
+        self.db.execute('UPDATE trades SET closed=COALESCE(closed,?),exit=COALESCE(?,exit),pnl=COALESCE(?,pnl) WHERE deal_id=?',
+            (now(),_num(exit_price),_num(pnl),deal_id));self.db.commit()
+    def trades(self,n=150):
+        cols=('deal_id','epic','size','direction','opened','closed','entry','exit','pnl')
+        return [dict(zip(cols,r)) for r in self.db.execute('SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl FROM trades ORDER BY opened DESC LIMIT ?', (n,))]
+    def candle(self,epic,bar,source='QUOTE'):
+        if source not in ('QUOTE','HISTORICAL'):raise ValueError('Invalid candle provenance')
+        self.db.execute('INSERT OR REPLACE INTO candles(epic,at,open,high,low,close,source) VALUES(?,?,?,?,?,?,?)',
+            (epic,str(bar['at']),bar['open'],bar['high'],bar['low'],bar['close'],source))
+        self.db.commit()
+    def candles(self,epic,n=120,historical_only=False):
+        cols=('at','open','high','low','close')
+        where="epic=? AND source='HISTORICAL'" if historical_only else 'epic=?'
+        rows=list(self.db.execute(f'SELECT at,open,high,low,close FROM candles WHERE {where} ORDER BY at DESC LIMIT ?', (epic,n)))
+        return [dict(zip(cols,r)) for r in reversed(rows)]
+
+class AdaptiveBrain:
+    """Instrument-isolated online learner with cost-aware, delayed labels.
+
+    Price deltas and spreads are compared in the SAME price units over an
+    explicit multi-observation forecast horizon, never across two EPICs.
+    Uncalibrated softmax scores are not probabilities of profitable trades.
+    """
+    LABEL_VERSION=3
+    HORIZON=8
+    GROWTH_INTERVAL=25
+    FAST_GROWTH_INTERVAL=10  # sustained high reconstruction error only
+
+    def __init__(self,store,n=16,data_dir=None):
+        self.store=store
+        self.path=(Path(data_dir) if data_dir else DATA)/'brain.npz'
+        self.initial_neurons=n
+        self.core=NeuralCore(n=n)
+        self.epic=None
+        self._legacy_epic=self.store.get('legacy_brain_epic')
+        self.history=deque(maxlen=1000)
+        self.pending=deque()
+        self.correct=0;self.labeled=0;self.last_change=0.;self.last_mid=None
+        self.prior_record=None;self.last_regime='LEARNING'
+        self.feature_schema=None
+        self.fusion_labels=0
+        # Backward-compatible old brain.npz: bind once to the first observed EPIC.
+        # Once bound, never load the saved brain for another instrument.
+        self.load()
+        if self._legacy_epic:
+            self.epic=self._legacy_epic
+            self._restore_context(self.epic)
+            self._restore_pending(self.epic)
+
+    def _path_for(self,epic):
+        if epic==self._legacy_epic:return self.path
+        import hashlib
+        return self.path.parent/('brain_'+hashlib.sha256(epic.encode('utf8')).hexdigest()[:16]+'.npz')
+
+    def _restore_context(self,epic):
+        self.history=deque(maxlen=1000);self.pending=deque()
+        self.correct=0;self.labeled=0;self.last_mid=None;self.last_change=0.
+        self.prior_record=None;self.last_regime='LEARNING'
+        # Old (one-tick) labels remain in the audit table, but must NOT silently
+        # become evidence for the new eight-observation training objective.
+        rows=list(self.store.db.execute('''
+            SELECT id,action,scores,price,label,spread,tick_size,time
+            FROM signals WHERE epic=? AND label_version=? ORDER BY id DESC LIMIT 1000
+        ''',(epic,self.LABEL_VERSION)))
+        for signal_id,action,scores,price,label,spread,tick_size,bar_time in reversed(rows):
+            try:
+                cls=int(label) if label is not None else None
+                parsed=json.loads(scores)
+                if not isinstance(parsed,dict):continue
+                self.history.append({'signal_id':signal_id,'price':price,'scores':parsed,
+                    'action':action,'label':cls,'time':bar_time,
+                    'spread_bps':float(spread)*10000/float(price)
+                    if spread is not None and price and price>0 else 0.})
+            except (ValueError,TypeError,ZeroDivisionError):continue
+        good=self.store.db.execute('''SELECT action,label FROM signals
+            WHERE epic=? AND label_version=? AND label IS NOT NULL''',(epic,self.LABEL_VERSION))
+        for action,label in good:
+            self.labeled+=1
+            self.correct+=int(action==('BUY','SELL','HOLD')[int(label)])
+
+    def _json_transition(self,transition):
+        if transition is None:return None
+        return {'z':np.asarray(transition['z']).tolist(),
+                'h':np.asarray(transition['h']).tolist(),
+                'c':np.asarray(transition['c']).tolist(),
+                'dt':float(transition['dt']),
+                'neuron_ids':np.asarray(transition.get('neuron_ids',np.arange(len(transition['h'])))).tolist()}
+
+    def _activate(self,epic):
+        if self.epic==epic:return
+        if self.epic is not None:self.save()
+        if self._legacy_epic is None:
+            self._legacy_epic=epic
+            self.store.set('legacy_brain_epic',epic)
+            # In-memory core already contains the legacy weights, if present.
+        else:
+            self.core=NeuralCore(n=self.initial_neurons)
+            self.feature_schema=None  # Schema belongs to the selected EPIC, not the prior one.
+            self.fusion_labels=0
+            self.load(self._path_for(epic),expected_epic=epic)
+        self.epic=epic
+        self._restore_context(epic)
+        self._restore_pending(epic)
+        self.store.event('learning','Instrument learning context activated',{'epic':epic})
+
+    def load(self,path=None,expected_epic=None):
+        path=Path(path) if path else self.path
+        if not path.exists():return
+        try:
+            with np.load(path,allow_pickle=False) as d:
+                if expected_epic and 'epic' in d and str(d['epic'])!=expected_epic:
+                    raise ValueError('Brain file instrument mismatch')
+                names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G')
+                for name in names:setattr(self.core,name,d[name].copy())
+                self.core.n=len(self.core.h)
+                self.core.d=self.core.P.shape[1]
+                self.core.last_z=np.zeros(self.core.d)
+                self.core.steps=int(d['steps']);self.core.vbar=float(d['vbar'])
+                for name in ('births','deaths'):
+                    if name in d:setattr(self.core,name,int(d[name]))
+                self.feature_schema=str(d['feature_schema']) if 'feature_schema' in d else None
+                self.fusion_labels=int(d['fusion_labels']) if 'fusion_labels' in d else 0
+                if ((self.feature_schema==FUSION_SCHEMA and self.core.d!=FUSION_DIM)
+                    or (self.feature_schema==FEATURE_SCHEMA and self.core.d!=FEATURE_DIM)):
+                    raise ValueError('Stored neural feature schema and input weights disagree')
+                if 'neuron_ids' in d:
+                    self.core.neuron_ids=d['neuron_ids'].astype(np.int64).copy()
+                    self.core.next_neuron_id=int(d['next_neuron_id'])
+                else:
+                    self.core.neuron_ids=np.arange(self.core.n,dtype=np.int64)
+                    self.core.next_neuron_id=self.core.n
+        except Exception as exc:
+            self.store.event('error','Neural state load failed',{'type':type(exc).__name__,'file':path.name})
+            # Never continue with a partly loaded/mismatched network.
+            self.core=NeuralCore(n=self.initial_neurons)
+            self.feature_schema=None
+            self.fusion_labels=0
+
+    def _restore_pending(self,epic):
+        path=self._path_for(epic)
+        if not path.exists():return
+        try:
+            with np.load(path,allow_pickle=False) as d:
+                if 'pending_json' not in d:return
+                saved_schema=str(d['feature_schema']) if 'feature_schema' in d else 'legacy_quote_v2'
+                if saved_schema!=(self.feature_schema or 'legacy_quote_v2'):return
+                if 'epic' in d and str(d['epic'])!=epic:return
+                records=json.loads(str(d['pending_json']))
+                for p in records[-self.HORIZON:]:
+                    if p['epic']==epic and p['signal_id'] is not None:
+                        self.pending.append(p)
+                if self.pending:
+                    latest=self.pending[-1]
+                    self.last_mid=float(latest['mid']);self.last_change=float(latest['change'])
+        except Exception as exc:
+            self.pending.clear()
+            self.store.event('warning','Pending labels could not be restored',{'type':type(exc).__name__})
+
+    def save(self):
+        self.path.parent.mkdir(exist_ok=True,parents=True)
+        path=self._path_for(self.epic) if self.epic else self.path
+        tmp=path.with_suffix('.tmp.npz');c=self.core
+        payload={k:getattr(c,k) for k in ('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G','neuron_ids')}
+        payload.update(steps=c.steps,vbar=c.vbar,births=c.births,deaths=c.deaths,
+                       next_neuron_id=c.next_neuron_id,epic=self.epic or '',
+                       feature_schema=self.feature_schema or 'legacy_quote_v2',
+                       fusion_labels=self.fusion_labels,
+                       pending_json=json.dumps(list(self.pending),separators=(',',':')))
+        np.savez_compressed(tmp,**payload)
+        tmp.replace(path)
+
+    def _switch_to_market_features(self):
+        """Versioned migration: never apply old 3-input weights to new OHLC units.
+
+        Keep legacy weights on disk as an audit/rollback backup; old signals remain
+        in SQLite under their original label_version, never replayed as v3.
+        """
+        if self.feature_schema==FEATURE_SCHEMA and self.core.d==FEATURE_DIM:return
+        path=self._path_for(self.epic)
+        if path.exists():
+            backup=path.with_name(path.stem+'.before_mtf_v3.npz')
+            if not backup.exists():
+                import shutil
+                shutil.copy2(path,backup)
+        self.core=NeuralCore(n=self.initial_neurons,d=FEATURE_DIM)
+        self.feature_schema=FEATURE_SCHEMA
+        self.history=deque(maxlen=1000);self.pending=deque()
+        self.correct=0;self.labeled=0
+        self.last_change=0.;self.last_mid=None;self.prior_record=None
+        self.last_regime='LEARNING'
+        self.store.set('mtf_last_bar:'+self.epic,None)
+        self.store.event('learning','New OHLC feature schema activated; old neural weights backed up',
+            {'epic':self.epic,'feature_schema':FEATURE_SCHEMA,'input_count':FEATURE_DIM})
+        self.save()
+
+    def _extend_to_external_features(self):
+        """Expand input dimensions WITHOUT reinitializing learned neuron weights.
+
+        Existing v3 pending transitions have 10 inputs; do not train them against
+        the 18-input network. Historical labels and network weights are preserved.
+        """
+        if self.feature_schema==FUSION_SCHEMA and self.core.d==FUSION_DIM:return
+        if self.feature_schema!=FEATURE_SCHEMA or self.core.d!=FEATURE_DIM:
+            raise ValueError('External feature expansion requires complete v3 OHLC state')
+        path=self._path_for(self.epic)
+        if path.exists():
+            backup=path.with_name(path.stem+'.before_fusion_v4.npz')
+            if not backup.exists():
+                import shutil
+                shutil.copy2(path,backup)
+        c=self.core
+        extra=FUSION_DIM-c.d
+        c.P=np.pad(c.P,((0,0),(0,extra)))
+        c.G=np.pad(c.G,((0,extra),(0,0)))
+        c.mu=np.append(c.mu,np.zeros(extra))
+        c.nu=np.append(c.nu,np.ones(extra))
+        c.last_z=np.append(c.last_z,np.zeros(extra))
+        c.last_transition=None
+        c.d=FUSION_DIM
+        # A v3 transition's z is not compatible with the expanded input.
+        self.pending.clear()
+        c.h[:]=0.;c.c[:]=0.
+        self.last_mid=None;self.last_change=0.
+        self.feature_schema=FUSION_SCHEMA
+        self.fusion_labels=0
+        self.store.event('learning','Cross-market and news features joined neural inputs; old weights preserved',
+            {'epic':self.epic,'feature_schema':FUSION_SCHEMA,'inputs':FUSION_DIM,
+             'preserved_steps':c.steps,'old_pending_labels_dropped':True})
+        self.save()
+
+    @staticmethod
+    def _label(from_mid,to_mid,from_spread,to_spread):
+        # Full bid/ask spread in PRICE units, not a relative percentage or ticks.
+        # Thresholding the entire horizon return instead of one poll avoids
+        # spuriously labeling every small trending step as HOLD.
+        delta=to_mid-from_mid
+        cost=max(from_spread,to_spread)
+        return 0 if delta>cost else (1 if delta < -cost else 2)
+
+    def tick(self,mid,spread,tick_size,epic,dt=1.,features=None,bar_time=None,external_features=None):
+        if (not isinstance(epic,str) or not epic or
+            not all(map(math.isfinite,(mid,spread,tick_size))) or
+            mid<=0 or tick_size<=0 or spread<0):return None
+        self._activate(epic)
+        if features is not None:
+            if (bar_time is None or not isinstance(features,(list,tuple,np.ndarray))
+                or not np.isfinite(features).all()):return None
+            if external_features is not None:
+                if len(features)!=FUSION_DIM or external_features is not True:return None
+                # New or old v3 weights are first moved to a known, versioned schema.
+                if self.feature_schema!=FUSION_SCHEMA:
+                    self._switch_to_market_features()
+                    self._extend_to_external_features()
+            else:
+                if len(features)!=FEATURE_DIM:return None
+                # Never run a v4 neural network on fabricated zero external data.
+                if self.feature_schema==FUSION_SCHEMA:return None
+                self._switch_to_market_features()
+            prev_bar=self.store.get('mtf_last_bar:'+epic)
+            if prev_bar and bar_time<=prev_bar:return None
+            if prev_bar:
+                from .market_context import candle_time
+                gap=(candle_time(bar_time)-candle_time(prev_bar)).total_seconds()/60.
+                if gap!=1.:
+                    # Missing minute(s) invalidate an 8-MINUTE horizon target.
+                    self.pending.clear();self.core.h[:]=0;self.core.c[:]=0
+                    self.last_mid=None;self.last_change=0.
+                    self.store.event('learning','Skipped discontinuous OHLC minutes',
+                        {'epic':epic,'gap_minutes':gap})
+        prev=self.last_mid if self.last_mid is not None else mid
+        change=(mid-prev)/tick_size
+        previous_change=self.last_change
+        x=list(features) if features is not None else [change,spread/tick_size,change-previous_change]
+
+        # Label an older observation, never the latest one and never another EPIC.
+        # Do this before step/growth, so gradients always have a safe state mapping.
+        if len(self.pending)>=self.HORIZON:
+            past=self.pending.popleft()
+            if past['epic']==epic:
+                label=self._label(float(past['mid']),mid,float(past['spread']),spread)
+                transition=past.get('transition')
+                if transition is not None:
+                    self.core.update_utility(past['h'],past['c'],label,
+                        neuron_ids=past.get('neuron_ids'))
+                    loss=self.core.learn(transition,label)
+                    if loss is not None and self.feature_schema==FUSION_SCHEMA:
+                        self.fusion_labels+=1
+                    if loss is not None and (self.labeled+1)%100==0:
+                        self.store.event('learning','Horizon-label learning checkpoint',
+                            {'loss':loss,'horizon':self.HORIZON,'epic':epic})
+                self.labeled+=1
+                self.correct+=int(past['action']==('BUY','SELL','HOLD')[label])
+                self.store.db.execute('UPDATE signals SET label=?,label_version=? WHERE id=? AND epic=?',
+                    (str(label),self.LABEL_VERSION,past['signal_id'],epic))
+                self.store.db.commit()
+                for item in self.history:
+                    if item['signal_id']==past['signal_id']:
+                        item['label']=label
+                        break
+
+        result=self.core.step(x,max(.1,min(float(dt),60)))
+        # Structural growth is separate from learning; avoid allocating a neuron
+        # nearly every quote and overwhelming gradients/CPU/memory.
+        growth_interval=(self.FAST_GROWTH_INTERVAL if self.core.vbar>2.0
+                         else self.GROWTH_INTERVAL)
+        if self.core.steps%growth_interval==0:
+            z=np.asarray(result['z'])
+            if self.core.grow_if_needed(z,threshold=1.,nmax=None):
+                self.store.event('neural','Neuron automatically added',{'neurons':self.core.n})
+        if self.core.steps%200==0:
+            deleted=self.core.prune()
+            if deleted:self.store.event('neural','Low utility neurons removed',
+                {'count':deleted,'neurons':self.core.n})
+        cur=self.store.db.execute('''INSERT INTO signals
+            (time,epic,action,scores,price,model_step,label,spread,tick_size,label_version)
+            VALUES(?,?,?,?,?,?,NULL,?,?,?)''',
+            (bar_time if features is not None else now(),epic,result['action'],json.dumps(result['scores']),mid,self.core.steps,
+             spread,tick_size,self.LABEL_VERSION))
+        self.store.db.commit()
+        tr=self._json_transition(self.core.last_transition)
+        self.pending.append({'epic':epic,'mid':mid,'spread':spread,'tick_size':tick_size,
+            'change':change,'bar_time':bar_time,'transition':tr,'h':self.core.h.tolist(),
+            'c':self.core.c.tolist(),'neuron_ids':self.core.neuron_ids.tolist(),
+            'action':result['action'],'signal_id':cur.lastrowid})
+        self.prior_record=self.pending[-1]
+        self.history.append({'signal_id':cur.lastrowid,'price':mid,'scores':result['scores'],
+            'action':result['action'],'label':None,'time':bar_time if features is not None else now(),
+            'spread_bps':10000*spread/mid})
+        self.last_regime=('HIGH VOLATILITY' if abs(change)>10 else
+            'RANGING' if abs(change)<spread/tick_size else 'TRENDING')
+        self.last_mid=mid;self.last_change=change
+        if features is not None:self.store.set('mtf_last_bar:'+epic,bar_time)
+        # Persist the complete short pending horizon each poll, to avoid losing
+        # training state when the Windows process is restarted or switched.
+        self.save()
+        result['market_regime']=self.last_regime
+        result['confidence']=max(result['scores'].values())
+        result['accuracy_proxy']=self.correct/self.labeled if self.labeled else None
+        return result
+
+
+from .external_risk import assess_news
+from .calendar_feed import refresh_calendar
+from .instrument_profile import instrument_profile
+from .intermarket import IntermarketMonitor
+import os
+
+class SingleTradeEngine:
+    def __init__(self,store,brain):
+        self.store=store;self.brain=brain;self.broker=None
+        self.armed=False;self.execution_enabled=False;self.mandate=None
+        self.positions=[];self.account={};self.market={};self.last_signal=None;self.last_error=None
+        self.position_age=0;self.last_position_id=None;self.last_closed_step=-1
+        self.last_entry_signal_step=-1;self.last_order_ref=None
+        self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
+        self.pending_order=False;self.pending_close=False;self.lock=asyncio.Lock()
+        self.last_time=None;self.last_account_tick=0;self.last_candle_tick=-20
+        self.policy=AutoEvolution(store);self.tick_count=0;self.latest_close_id=None
+        self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
+        self.latest_fusion_ready=False
+        self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
+        self.last_entry_audit_key=None
+        self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
+        self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
+        self.protection_brief={'status':'Awaiting first robot-opened position'}
+        self.last_protection_bar=None
+        self.last_calendar_refresh=0.0
+        self._calendar_task=None
+        self.calendar_feed_error=None
+        self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
+        self.intermarket=IntermarketMonitor()
+        self._peer_refresh_task=None
+        self._peer_requested_bar=None
+        self.news_calendar_path=self.store.path.parent/'economic_calendar.json' if hasattr(self.store,'path') else __import__('pathlib').Path('data/economic_calendar.json')
+    def _news_risk(self, when=None):
+        # Use the engine clock so candle learning, news features and entry guards
+        # share one timeline (and tests can freeze time via monkeypatching now()).
+        result=assess_news(self.mandate['epic'] if self.mandate else '',
+                           self.news_calendar_path,
+                           now=when or clock(),
+                           instrument_currencies=self.instrument_profile['currencies'])
+        if result.get('enabled') and result.get('status') in ('CLEAR','NEWS_WINDOW'):
+            # A transient network failure does not invalidate a still-current
+            # verified cached calendar; the freshness checks are in assess_news.
+            if self.calendar_feed_error:
+                return dict(result,reason=result['reason']+' (using fresh cached calendar)')
+            return result
+        if self.calendar_feed_error:
+            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_FEED_ERROR',
+                    'reason':self.calendar_feed_error}
+        if not self.last_calendar_refresh and not self.news_calendar_path.exists():
+            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_WAITING',
+                    'reason':'Waiting for Forex Factory calendar download'}
+        if not result.get('enabled'):
+            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_UNAVAILABLE',
+                    'reason':'News protection inactive or calendar file missing; new entries blocked'}
+        return result
+
+    async def _refresh_calendar_if_due(self):
+        moment=time.monotonic()
+        if self.last_calendar_refresh and moment-self.last_calendar_refresh<300:return
+        self.last_calendar_refresh=moment
+        result=await refresh_calendar(self.news_calendar_path)
+        self.calendar_feed_error=None if result['updated'] else result['reason']
+        if not result['updated']:
+            self.store.event('warning','Forex Factory calendar unavailable; new entries blocked',
+                             {'reason':result['reason']})
+
+    def _schedule_calendar_in_background(self):
+        """Keep news learning current during an open trade without delaying SL/TP."""
+        if self._calendar_task is not None and not self._calendar_task.done():return
+        if self.last_calendar_refresh and time.monotonic()-self.last_calendar_refresh<300:return
+        self._calendar_task=asyncio.create_task(self._refresh_calendar_if_due())
+
+    def cancel_calendar_refresh(self):
+        if self._calendar_task is not None and not self._calendar_task.done():
+            self._calendar_task.cancel()
+        self._calendar_task=None
+
+    def _external_entry_check(self,action):
+        """Economic-event safety only. Peer movements are already neural inputs.
+
+        Vetoing a neural BUY/SELL a *second* time using correlation heuristics
+        recreates the user's old permanent-HOLD trap. Unavailable peer data
+        is handled by the neural feature readiness check before this point.
+        """
+        news=self._news_risk()
+        if not news['entry_allowed']:
+            return {'entry_allowed':False,'status':news['status'],'reason':'News guard: '+news['reason']}
+        return {'entry_allowed':True,'status':'AI_INTERMARKET_FUSION',
+                'reason':'Intermarket evidence is evaluated by the neural model, not a duplicate veto'}
+
+    def cancel_peer_refresh(self):
+        task=self._peer_refresh_task
+        if task is not None and not task.done():task.cancel()
+        self._peer_refresh_task=None
+        self._peer_requested_bar=None
+
+    def _refresh_peers_without_delaying_protection(self, instrument, candles):
+        """Read reference markets in background while a position is open.
+
+        Never let slow secondary-price GETs postpone broker position protection.
+        At most one refresh per completed candle; inference checks exact bar time.
+        """
+        bar=self.market_context.get('bar_time')
+        if not bar or self._peer_requested_bar==bar:return
+        if self._peer_refresh_task and not self._peer_refresh_task.done():return
+        self._peer_requested_bar=bar
+        monitor=self.intermarket
+        broker=self.broker
+        epic=self.mandate['epic']
+        async def task_body():
+            try:
+                await monitor.refresh(broker,epic,instrument,candles)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                monitor.state={'status':'UNAVAILABLE','entry_allowed':False,
+                    'reason':'Reference refresh error: '+type(exc).__name__,'peers':[]}
+                self.store.event('warning','Background reference prices unavailable',
+                    {'epic':epic,'type':type(exc).__name__})
+        self._peer_refresh_task=asyncio.create_task(task_body())
+
+    def attach(self,broker):
+        self.broker=broker;self.armed=True;self.execution_enabled=True
+        self.mandate=None;self.positions=[];self.last_position_id=None;self.last_closed_step=-1
+        self.last_entry_signal_step=-1;self.position_age=0;self.last_time=None
+        self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
+        self._seen_initial=False;self.protected=set();self.latest_close_id=None
+        self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
+        self.last_error=None;self.account={};self.last_entry_audit_key=None
+        self.latest_fusion_ready=False
+        self.last_calendar_refresh=0.;self.calendar_feed_error=None
+        self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
+        self.cancel_peer_refresh()
+        self.cancel_calendar_refresh()
+        self.intermarket=IntermarketMonitor()
+        self.protection_brief={'status':'Waiting for robot-opened position'}
+        self.last_protection_bar=None
+        self._unresolved_at_login=bool(self.store.unresolved())
+        # A confirmed initial manual trade remains the owner's authorization
+        # after a routine app/browser reconnect. Only resume if the *same* deal
+        # has a durable locally confirmed close; never infer closure solely
+        # because the broker currently reports zero positions.
+        saved=self.store.get('mandate')
+        if (isinstance(saved,dict) and saved.get('epic') and
+            saved.get('initial_deal_id') and saved.get('size')):
+            closed=self.store.db.execute(
+                'SELECT closed,epic,size FROM trades WHERE deal_id=?',
+                (saved['initial_deal_id'],)).fetchone()
+            if (closed and closed[0] is not None and closed[1]==saved['epic']
+                and Decimal(str(saved['size']))>0):
+                self.mandate=saved
+                self._seen_initial=True
+                self.last_closed_step=self.brain.core.steps
+                self.store.event('reconcile',
+                    'Confirmed closed initial manual trade restored after reconnect',
+                    {'epic':saved['epic'],'deal_id':saved['initial_deal_id']})
+        if self._unresolved_at_login:
+            self.execution_enabled=False;self.store.event('warning','Previous order outcome unresolved; waiting for reconciliation')
+    async def prepare_new_instrument(self):
+        """Explicit operator-authorized switch, no open/unresolved broker positions.
+
+        The next first mobile trade becomes the NEW instrument mandate. Neural
+        files and historical trades from prior instruments are preserved.
+        """
+        async with self.lock:
+            if not self.broker:raise RuntimeError('Not connected to broker')
+            if self.store.unresolved():raise ValueError('Unresolved broker operation')
+            await self.sync()  # Fresh read, not a cached open-position count.
+            if self.positions:raise ValueError('Close all broker positions before switching')
+            if self.store.unresolved():raise ValueError('Unresolved broker operation')
+            previous=self.mandate['epic'] if self.mandate else None
+            self.mandate=None;self.store.set('mandate',None)
+            self.last_signal=None;self.last_closed_step=-1
+            self.last_entry_signal_step=-1;self.last_entry_audit_key=None
+            self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
+            self.last_position_id=None;self._seen_initial=False
+            self.position_age=0;self.market={}
+            self.market_context={'ready':False,'reason':'Waiting for a NEW manual trade in the selected market'}
+            self.latest_fusion_ready=False
+            self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
+            self.cancel_peer_refresh()
+            self.cancel_calendar_refresh()
+            self.intermarket=IntermarketMonitor()
+            self._paused_for_mismatch=False;self.operator_paused=False
+            self.armed=True;self.execution_enabled=True
+            self.store.event('control','Market mandate cleared by operator; awaiting new first mobile trade',
+                             {'previous_epic':previous})
+            return {'ok':True,'previous_epic':previous,'next_step':'Open first trade manually on Capital.com'}
+
+    def _map_positions(self,data):
+        out=[]
+        for raw in data:
+            p=raw.get('position',{});m=raw.get('market',{})
+            out.append({'dealId':p.get('dealId'),'epic':m.get('epic') or p.get('epic'),
+                'size':p.get('size'),'direction':p.get('direction'),'level':p.get('level'),
+                'stopLevel':p.get('stopLevel'),'profitLevel':p.get('profitLevel') if p.get('profitLevel') is not None else p.get('limitLevel'),
+                'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
+        return out
+    @staticmethod
+    def _protection_matches(live,payload):
+        """Reconcile requested levels, not merely pre-existing non-null stops."""
+        if not live or live.get('stopLevel') is None or live.get('profitLevel') is None:
+            return False
+        tick=_num(payload.get('tick'),.01) or .01
+        tolerance=max(1e-6,.51*tick)
+        for requested,actual in ((payload.get('stop'),live.get('stopLevel')),
+                                 (payload.get('profit'),live.get('profitLevel'))):
+            if requested is None:continue
+            a=_num(actual);b=_num(requested)
+            if a is None or b is None or abs(a-b)>tolerance:return False
+        return True
+
+    async def reconcile_outstanding(self):
+        """At session start, settle durable operations via broker data where possible.
+        No guesswork for requests without a receipt reference.
+        """
+        if not self.broker:return False
+        outstanding=self.store.unresolved()
+        if not outstanding:return True
+        positions=self._map_positions(await self.broker.positions())
+        for item in outstanding:
+            reference=item['reference']
+            # A protection update is idempotently verifiable from a fresh broker
+            # position read. Do not replay the PUT when its outcome is uncertain.
+            if item['kind']=='PROTECT':
+                live=next((p for p in positions if p['dealId']==item['deal_id']),None)
+                if live is None:
+                    self.store.order_update(item['id'],'SUPERSEDED',reference)
+                    self.store.event('reconcile','Old protection request belongs to a position no longer open',{'deal_id':item['deal_id']})
+                    continue
+                try:request=json.loads(item['payload'])
+                except (ValueError,TypeError):request={}
+                if self._protection_matches(live,request):
+                    self.store.order_update(item['id'],'CONFIRMED',reference)
+                    self.store.event('reconcile','Protection verified from live broker position',{'deal_id':item['deal_id']})
+                    continue
+            if not reference:continue
+            try:confirmed=await self.broker.confirm(reference)
+            except Exception:continue
+            status=confirmed.get('dealStatus')
+            if status=='REJECTED':
+                self.store.order_update(item['id'],'REJECTED',reference)
+                self.store.event('reconcile','Previous request confirmed rejected',{'reference':reference})
+                continue
+            if status!='ACCEPTED':continue
+            kind=item['kind']
+            try:payload=json.loads(item['payload'])
+            except (ValueError,TypeError):payload={}
+            matched=(kind=='OPEN' and len(positions)==1 and
+                positions[0]['epic']==payload.get('epic') and
+                positions[0]['direction']==payload.get('direction') and
+                Decimal(str(positions[0]['size']))==Decimal(str(payload.get('size')))) or \
+                (kind=='CLOSE' and not any(p['dealId']==item['deal_id'] for p in positions)) or \
+                (kind=='PROTECT' and any(p['dealId']==item['deal_id'] and
+                                    self._protection_matches(p,payload) for p in positions))
+            if matched:
+                self.store.order_update(item['id'],'CONFIRMED',reference)
+                self.store.event('reconcile','Recovered confirmed broker request',{'kind':kind,'reference':reference})
+        self._unresolved_at_login=bool(self.store.unresolved())
+        if not self._unresolved_at_login and not self.operator_paused and not self._paused_for_multi:
+            self.armed=True;self.execution_enabled=True
+        return not self._unresolved_at_login
+
+    async def sync(self):
+        if not self.broker:raise RuntimeError('Not connected')
+        latest=self._map_positions(await self.broker.positions())
+        prev_id=self.last_position_id
+        self.positions=latest
+        if len(latest)>1:
+            if not self._paused_for_multi:self.store.event('warning','Multiple open positions; autonomous execution suspended')
+            self.armed=False;self.execution_enabled=False;self._paused_for_multi=True
+        elif self._paused_for_multi and len(latest)<=1 and not self.operator_paused and not self.store.unresolved():
+            self._paused_for_multi=False;self.armed=True;self.execution_enabled=True
+            self.store.event('reconcile','Multiple-position conflict resolved; automatic execution resumed')
+        current=latest[0]['dealId'] if len(latest)==1 else None
+        if prev_id and prev_id!=current:
+            self.last_closed_step=self.brain.core.steps
+            self.latest_close_id=prev_id
+            self.store.close_trade(prev_id)
+            self.store.event('trade','Previous broker deal no longer open',{'dealId':prev_id})
+        if current:
+            self.position_age=(self.position_age+1 if current==prev_id else 0)
+            self.store.upsert_trade(latest[0])
+        else:self.position_age=0
+        self.last_position_id=current
+        # Any NEW external/mobile position becomes the operator's latest mandate.
+        # An order created by this process is not a new manual mandate.
+        if len(latest)==1:
+            p=latest[0]
+            deal_id=p.get('dealId')
+            try: size=Decimal(str(p['size']))
+            except (ValueError,TypeError,ArithmeticError): size=Decimal(0)
+            valid=bool(deal_id and p.get('epic') and p.get('direction') in ('BUY','SELL')
+                       and size.is_finite() and size>0)
+            # A confirmed bot deal (including after restart) must not override
+            # the last operator sizing reference or require a new manual close.
+            own_order=bool(deal_id and self.store.get('robot_open:'+str(deal_id)))
+            open_in_flight=bool(self.pending_order or any(
+                op['kind']=='OPEN' for op in self.store.unresolved()))
+            is_new_manual=(valid and not own_order and not open_in_flight and
+                (not self.mandate or deal_id!=self.mandate.get('last_manual_deal_id',
+                                                     self.mandate.get('initial_deal_id'))) and
+                deal_id!=self.store.get('latest_robot_deal_id'))
+            # While a bot-managed deal is open, its presence is not an invitation
+            # to re-adopt a new instrument or alter the operator's selected size.
+            if is_new_manual:
+                old=self.mandate
+                self.mandate={'epic':p['epic'],'size':str(p['size']),
+                              'initial_deal_id':deal_id,'last_manual_deal_id':deal_id}
+                self._seen_initial=True;self.last_closed_step=-1
+                self.last_entry_signal_step=-1
+                self.last_signal=None;self.last_decision_bar=None
+                self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
+                self.last_entry_audit_key=None
+                if not old or old['epic']!=p['epic']:
+                    # Switch model state BEFORE the manual deal can close; old
+                    # instrument step counters must never gate a new market.
+                    if hasattr(self.brain,'_activate'):
+                        self.brain._activate(p['epic'])
+                    self.last_candle_tick=-20
+                    self.cancel_peer_refresh();self.cancel_calendar_refresh()
+                    self.intermarket=IntermarketMonitor()
+                    self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
+                    self.market_context={'ready':False,'reason':'Waiting for completed candles on newly adopted market'}
+                    self.latest_fusion_ready=False
+                    self.last_calendar_refresh=0.;self.calendar_feed_error=None
+                    self.market={}
+                self.store.set('mandate',self.mandate)
+                self.store.event('adoption','New manual position adopted; instrument and size updated',
+                    {'deal_id':deal_id,'epic':p['epic'],'size':str(p['size']),
+                     'previous_epic':old['epic'] if old else None})
+        # The mandate's size is a cached sizing reference, not evidence of the
+        # currently open position. On every broker sync (including restart),
+        # refresh it from the actual single open position of the authorized
+        # instrument. Never infer a position from the local trade history.
+        # A different instrument or ambiguous/multiple positions must still
+        # trigger the existing safety stop.
+        if self.mandate and len(latest)==1:
+            p=latest[0]
+            try: live_size=Decimal(str(p['size']))
+            except (ValueError, TypeError, ArithmeticError): live_size=Decimal(0)
+            if (p['epic']==self.mandate['epic'] and
+                p.get('dealId')==self.mandate.get('last_manual_deal_id',self.mandate.get('initial_deal_id')) and
+                p.get('direction') in ('BUY','SELL') and live_size.is_finite() and
+                live_size>0 and not self.store.unresolved()):
+                if Decimal(str(self.mandate['size']))!=live_size:
+                    previous=self.mandate['size']
+                    self.mandate={**self.mandate,'size':str(p['size'])}
+                    self.store.set('mandate',self.mandate)
+                    self.store.event('reconcile','Adopted sizing refreshed from live broker position',
+                        {'deal_id':p['dealId'],'previous_size':previous,'live_size':str(p['size'])})
+        mismatch=False
+        if self.mandate and len(latest)==1:
+            p=latest[0]
+            try:
+                live_size=Decimal(str(p['size']))
+                mismatch=(p['epic']!=self.mandate['epic'] or
+                          not live_size.is_finite() or live_size<=0 or
+                          (p.get('dealId')==self.mandate.get('last_manual_deal_id',
+                              self.mandate.get('initial_deal_id')) and
+                           live_size!=Decimal(str(self.mandate['size']))))
+            except (ValueError,TypeError,ArithmeticError):mismatch=True
+        if mismatch:
+            if not self._paused_for_mismatch:
+                self.store.event('warning','Position instrument/size differs from adopted trade; execution suspended')
+            self._paused_for_mismatch=True
+            self.execution_enabled=False;self.armed=False
+        elif self._paused_for_mismatch:
+            # Only clear this specific pause when the broker reports a safe
+            # position state. Other pauses and unresolved orders remain blocking.
+            self._paused_for_mismatch=False
+            if (len(latest)<=1 and not self.operator_paused and
+                not self._paused_for_multi and not self._paused_for_read and
+                not self.store.unresolved() and not self._unresolved_at_login):
+                self.armed=True;self.execution_enabled=True
+                self.store.event('reconcile','Position mismatch resolved; execution resumed')
+        return self.positions
+    @staticmethod
+    def _min_distance(market,price):
+        rules=market.get('dealingRules',{})
+        rule=rules.get('minStopOrProfitDistance') or rules.get('minNormalStopOrLimitDistance') or {}
+        value=_num(rule.get('value'),0) or 0
+        unit=rule.get('unit')
+        if unit=='PERCENTAGE':return price*value/100
+        if unit=='POINTS':return value
+        return None
+    @staticmethod
+    def _tick(market):
+        inst=market.get('instrument',{});snap=market.get('snapshot',{})
+        tick=_num(inst.get('onePipMeans'))
+        if tick and tick>0:return tick
+        decimals=snap.get('decimalPlacesFactor')
+        if isinstance(decimals,int) and 0<=decimals<=10:return 10.**(-decimals)
+        return None
+    async def _account_and_candles(self):
+        if self.tick_count-self.last_account_tick>=10:
+            self.last_account_tick=self.tick_count
+            try:self.account=await self.broker.accounts()
+            except Exception as exc:self.store.event('warning','Account refresh unsuccessful',{'type':type(exc).__name__})
+        if self.tick_count-self.last_candle_tick>=20 and self.mandate:
+            self.last_candle_tick=self.tick_count
+            if not hasattr(self.broker,'prices'):return
+            try:
+                source=await self.broker.prices(self.mandate['epic'],resolution='MINUTE',maximum=180)
+                for p in source.get('prices',[]):
+                    def midprice(name):
+                        item=p.get(name) or {};b=_num(item.get('bid'));a=_num(item.get('ask'))
+                        return (a+b)/2 if a is not None and b is not None else None
+                    at=candle_bucket(p.get('snapshotTimeUTC') or p.get('snapshotTime'))
+                    current_bucket=candle_bucket(now())
+                    if at is None or at>=current_bucket:continue
+                    bar={'at':at,
+                         'open':midprice('openPrice'),'high':midprice('highPrice'),
+                         'low':midprice('lowPrice'),'close':midprice('closePrice')}
+                    if bar['at'] and all(v is not None for k,v in bar.items() if k!='at'):
+                        self.store.candle(self.mandate['epic'],bar,source='HISTORICAL')
+            except Exception as exc:self.store.event('warning','Candle refresh unsuccessful',{'type':type(exc).__name__})
+    async def poll(self):
+        async with self.lock:
+            await self.sync()
+            if not self.mandate:return
+            # Do not delay managing SL/TP on an OPEN trade for a remote news feed.
+            # External feeds gate future NEW entries only.
+            if not self.positions:await self._refresh_calendar_if_due()
+            broker_market=await self.broker.market(self.mandate['epic'])
+            snap=broker_market.get('snapshot',{});inst=broker_market.get('instrument',{})
+            bid=_num(snap.get('bid'));ask=_num(snap.get('offer'));tick=self._tick(broker_market)
+            streamed=getattr(self,'quote_stream',None)
+            streamed=streamed.current(self.mandate['epic']) if streamed else None
+            if streamed:bid=streamed['bid'];ask=streamed['ask']
+            if bid is None or ask is None or tick is None or ask<bid or bid<=0:return
+            mid=(bid+ask)/2;moment=time.monotonic();dt=moment-self.last_time if self.last_time else 1
+            self.last_time=moment;self.tick_count+=1
+            self.instrument_profile=instrument_profile(self.mandate['epic'],inst)
+            self.market={'epic':self.mandate['epic'],'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
+                         'time':now(),'status':snap.get('marketStatus'),'min_distance':self._min_distance(broker_market,mid),
+                         'instrument_name':inst.get('name') or inst.get('epic') or self.mandate['epic'],
+                         'source':'WEBSOCKET' if streamed else 'REST'}
+            # Broker protection is handled before slow secondary data calls.
+            if len(self.positions)==1 and (self.positions[0].get('stopLevel') is None or
+                                           self.positions[0].get('profitLevel') is None):
+                await self.protect_position(self.positions[0])
+                if (len(self.positions)==1 and
+                    (self.positions[0].get('stopLevel') is None or
+                     self.positions[0].get('profitLevel') is None)):
+                    return
+
+            if self.positions:
+                # News download is background-only while an open position needs
+                # protection/SLTP management. Initial missing stops were already
+                # addressed above, before any secondary feed is scheduled.
+                self._schedule_calendar_in_background()
+            # Unfinished quote candle is for the chart only, not learning/trading.
+            bucket=now()[:16]+':00+00:00'
+            existing=self.store.db.execute('SELECT open,high,low FROM candles WHERE epic=? AND at=?',(self.mandate['epic'],bucket)).fetchone()
+            bar={'at':bucket,'open':existing[0] if existing else mid,
+                 'high':max(mid,existing[1]) if existing else mid,
+                 'low':min(mid,existing[2]) if existing else mid,'close':mid}
+            self.store.candle(self.mandate['epic'],bar)
+            await self._account_and_candles()
+            # Only BROKER-REPORTED complete MINUTE OHLC bars may feed the AI.
+            # The forming quote candle is explicitly excluded by market_features.
+            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            self.market_context=market_features(candles,spread=ask-bid,epic=self.mandate['epic'])
+            # Reference broker reads are background-only while managing an open
+            # position; a slow feed must NOT stall live SL/TP supervision.
+            if self.market_context['ready']:
+                if self.positions:
+                    self._refresh_peers_without_delaying_protection(inst,candles)
+                else:
+                    await self.intermarket.refresh(self.broker,self.mandate['epic'],inst,candles)
+            new_closed_bar=False
+            if self.market_context['ready']:
+                self.brain.last_regime=self.market_context['trend']
+                fused=fusion_features(self.market_context,self.intermarket.state,
+                    self.mandate['epic'],self.news_calendar_path,self.instrument_profile['currencies'],
+                    now=clock())
+                self.latest_fusion_ready=fused is not None
+                # Before the first verified external sample, retain legacy OHLC
+                # learning. Once upgraded, NEVER infer on incomplete external data.
+                if fused is not None:
+                    next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
+                        self.mandate['epic'],dt=60,features=fused,
+                        bar_time=self.market_context['bar_time'],external_features=True)
+                elif self.brain.feature_schema!=FUSION_SCHEMA:
+                    next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
+                        self.mandate['epic'],dt=60,features=self.market_context['features'],
+                        bar_time=self.market_context['bar_time'])
+                else:
+                    next_signal=None
+                    self.last_signal=None  # Old external features must not be reused.
+                if next_signal is not None:
+                    self.last_signal=next_signal
+                    self.last_decision_bar=self.market_context['bar_time']
+                    new_closed_bar=True
+                self.brain.last_regime=self.market_context['trend']
+            else:
+                self.latest_fusion_ready=False
+                self.last_signal=None  # Never trade stale/incomplete OHLC context.
+            # Associate an entry-time neural state with this deal for delayed
+            # trade-outcome feedback after the broker confirms a closing level.
+            if len(self.positions)==1 and self.brain.core.last_transition:
+                p=self.positions[0];key='entry_brain:'+str(p['dealId'])
+                if self.store.get(key) is None:
+                    tr=self.brain.core.last_transition
+                    if len(tr['h'])==self.brain.core.n:
+                        self.store.set(key,{'epic':p['epic'],'direction':p['direction'],
+                            'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
+                            'transition':self.brain._json_transition(tr)})
+            if new_closed_bar and self.brain.labeled:
+                self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
+            if not self.armed or not self.execution_enabled:return
+            if len(self.positions)==1:
+                p=self.positions[0]
+                if p.get('stopLevel') is None or p.get('profitLevel') is None:
+                    await self.protect_position(p);return
+                # Existing bracket supervision continues on each poll. Directional
+                # exits can happen only once on a NEW confirmed M1 bar.
+                if (new_closed_bar and self.last_signal and
+                    self.last_exit_processed_bar!=self.last_decision_bar):
+                    self.last_exit_processed_bar=self.last_decision_bar
+                    decision=self.policy.neural_decision(self.last_signal['scores'],p['direction'])
+                    if decision=='CLOSE':
+                        await self.exit_position(p['dealId']);return
+                await self.adapt_protection(p)
+            elif (len(self.positions)==0 and self.last_signal and
+                  self.last_closed_step>=0 and new_closed_bar and
+                  self.last_entry_processed_bar!=self.last_decision_bar):
+                self.last_entry_processed_bar=self.last_decision_bar
+                evaluation=self._entry_evaluation()
+                action=evaluation['action']
+                self.last_policy_decision=action
+                self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
+                self.store.event('entry',
+                    'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
+                    {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                     'proposal':evaluation.get('proposal'), 'decision':action,
+                     'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                # One entry opportunity per completed M1 bar. The first new
+                # confirmed bar after a broker-verified close can already act.
+                if (action in ('BUY','SELL') and
+                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                    snap.get('marketStatus')=='TRADEABLE'):
+                    await self.submit(action,broker_market)
+    def _spread_bps(self):
+        mid=self.market.get('mid') or 0
+        return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
+
+    def _adaptive_threshold(self):
+        accuracy=self.brain.correct/self.brain.labeled if self.brain.labeled else None
+        return self.policy.adaptive_threshold(accuracy,self.brain.labeled,self._spread_bps())
+
+    def _entry_evaluation(self):
+        if not self.market_context.get('ready',False):
+            return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
+                    'reason':'Market context unavailable: '+self.market_context.get('reason','unknown'),
+                    'evidence':None}
+        if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
+            return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
+                    'reason':'Waiting for same-instrument neural signal','evidence':None}
+        result=self.policy.evaluate_neural_entry(self.last_signal['scores'])
+        if result['action'] in ('BUY','SELL'):
+            safety=self._external_entry_check(result['action'])
+            if not safety['entry_allowed']:
+                return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
+        return result
+
+    def _signal_reason(self,action,market_status=None,evaluation=None):
+        if not self.last_signal:return 'No neural signal'
+        evaluation=evaluation or self._entry_evaluation()
+        if action=='HOLD':return 'Policy HOLD: '+evaluation['reason']
+        if market_status!='TRADEABLE':return 'Broker market not tradeable'
+        if self.brain.core.steps<=max(self.last_closed_step,self.last_entry_signal_step):
+            return 'Waiting for first completed new candle after previous trade'
+        return 'Validated directional proposal; broker order pending or being submitted'
+
+    async def _confirm_reconcile(self,receipt,order_id,kind,deal_id=None):
+        ref=receipt.get('dealReference')
+        if not ref:raise RuntimeError('No broker deal reference: order result uncertain')
+        self.store.order_update(order_id,'PENDING',ref)
+        status=None;confirmation={}
+        for delay in (0,.4,1.0,2.0):
+            if delay:await asyncio.sleep(delay)
+            confirmation=await self.broker.confirm(ref)
+            status=confirmation.get('dealStatus')
+            if status in ('ACCEPTED','REJECTED'):break
+        if status=='REJECTED':
+            self.store.order_update(order_id,'REJECTED',ref)
+            self.store.event('order','Broker rejected order',{'kind':kind,'reference':ref,'reason':confirmation.get('reason')})
+            return False
+        if status!='ACCEPTED':raise RuntimeError('Broker confirmation not final')
+        await self.sync()
+        if kind=='OPEN':
+            req=json.loads(self.store.db.execute('SELECT payload FROM orders WHERE id=?',(order_id,)).fetchone()[0])
+            matched=(len(self.positions)==1 and self.positions[0]['epic']==self.mandate['epic'] and
+                     self.positions[0]['direction']==req['direction'] and
+                     Decimal(str(self.positions[0]['size']))==Decimal(str(req['size'])))
+        elif kind=='CLOSE':matched=not any(p['dealId']==deal_id for p in self.positions)
+        else:
+            req=json.loads(self.store.db.execute('SELECT payload FROM orders WHERE id=?',(order_id,)).fetchone()[0])
+            matched=(len(self.positions)==1 and self.positions[0]['dealId']==deal_id and
+                     self._protection_matches(self.positions[0],req))
+        if not matched:
+            for delay in (.5,1.,2.):
+                await asyncio.sleep(delay);await self.sync()
+                if kind=='OPEN' and len(self.positions)==1 and self.positions[0]['epic']==self.mandate['epic']:matched=True
+                if kind=='CLOSE' and not any(p['dealId']==deal_id for p in self.positions):matched=True
+                if kind=='PROTECT' and len(self.positions)==1 and self.positions[0]['dealId']==deal_id and self._protection_matches(self.positions[0],req):matched=True
+                if matched:break
+        if not matched:raise RuntimeError('Accepted request not reconciled with broker positions')
+        self.store.order_update(order_id,'CONFIRMED',ref)
+        if kind=='OPEN' and self.positions:
+            p=self.positions[0]
+            # Persist origin so a later reconnect does not mistake a robot
+            # deal for a NEW manual mandate.
+            self.store.set('robot_open:'+str(p['dealId']),True)
+            self.store.set('latest_robot_deal_id',p['dealId'])
+            entry=_num(p.get('level'));stop=_num(p.get('stopLevel'));tp=_num(p.get('profitLevel'))
+            sign=1 if p['direction']=='BUY' else -1
+            if all(v is not None for v in (entry,stop,tp)) and sign*(entry-stop)>0 and sign*(tp-entry)>0:
+                self.store.set('adaptive_protection:'+str(p['dealId']),{
+                    'owner':'AUTO','deal_id':p['dealId'],'epic':p['epic'],
+                    'original_risk':abs(entry-stop),'original_profit':abs(tp-entry),
+                    'opened':now()})
+                self.store.event('protection','Robot-opened position enrolled in adaptive SL/TP',
+                                 {'deal_id':p['dealId'],'initial_risk':abs(entry-stop),'initial_profit':abs(tp-entry)})
+            else:
+                self.store.event('warning','Adaptive protection unavailable: opening bracket missing or invalid',
+                                 {'deal_id':p['dealId']})
+        if kind=='CLOSE':
+            self.store.close_trade(deal_id,confirmation.get('level'))
+            self._learn_closed_trade(deal_id,confirmation)
+        self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
+        return True
+    def _learn_closed_trade(self,deal_id,confirmation):
+        """Train only on a broker-confirmed same-instrument exit price.
+
+        Entry/exit are DEAL prices and already contain bid/ask execution costs;
+        subtracting the spread again would double-count it. Commissions are not
+        represented here, so this is NOT a net-profit or calibrated P&L target.
+        """
+        key='entry_brain:'+str(deal_id)
+        saved=self.store.get(key)
+        exit_level=_num(confirmation.get('level'))
+        if not saved or exit_level is None:return
+        epic=saved.get('epic')
+        entry=_num(saved.get('entry'))
+        tick=_num(saved.get('tick_size'))
+        direction=saved.get('direction')
+        if (not epic or epic!=self.brain.epic or
+            epic!=self.market.get('epic') or
+            entry is None or not tick or tick<=0 or
+            direction not in ('BUY','SELL') or not saved.get('transition')):
+            self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
+                {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic})
+            self.store.set(key,None)
+            return
+        sign=1 if direction=='BUY' else -1
+        realized_ticks=sign*(exit_level-entry)/tick
+        # Ignore sub-tick noise; this classifies executed directional moves,
+        # NOT true profitability after financing/commissions.
+        label=(0 if direction=='BUY' else 1) if realized_ticks>0.5 else (
+            (1 if direction=='BUY' else 0) if realized_ticks < -0.5 else 2)
+        # Same visible step as online delayed-label learning (was 0.0001 — ineffective).
+        loss=self.brain.core.learn(saved['transition'],label)
+        self.brain.save()
+        self.store.event('learning','Broker-confirmed trade outcome used for model update',
+            {'deal_id':deal_id,'epic':epic,'realized_directional_ticks':realized_ticks,
+             'target':label,'loss':loss,'tick_size':tick})
+        self.store.set(key,None)
+
+    async def adapt_protection(self,p):
+        """Optional, evidenced SL/TP changes for ROBOT-OPENED positions only.
+
+        No extra risk, duplicate broker requests or unaudited shadow decisions.
+        A broker rejects an update -> keep old levels and retry on a NEW bar only;
+        uncertain PUT outcome -> suspend execution until explicit reconciliation.
+        """
+        meta=self.store.get('adaptive_protection:'+str(p['dealId']))
+        if not meta or meta.get('owner')!='AUTO':
+            self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
+            return
+        bar=self.market_context.get('bar_time')
+        if not bar or self.last_protection_bar==(p['dealId'],bar):return
+        self.last_protection_bar=(p['dealId'],bar)
+        runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{})
+        if runtime.get('bar_time')==bar or self.store.unresolved() or self.pending_order or self.pending_close:return
+        if not self.market_context.get('ready') or self.market.get('status')!='TRADEABLE':return
+        candles=self.store.candles(p['epic'],n=190,historical_only=True)
+        policy=select_policy(candles,p['direction'],float(meta['original_risk']),
+                             float(meta['original_profit']),float(self.market.get('spread') or 0))
+        if not policy.get('ready'):
+            self.protection_brief={'status':policy.get('reason'),'candidate_samples':policy.get('samples'),
+                                   'deal_id':p['dealId']}
+            return
+        # 5m and 15m confirmed moves must agree with the position before TP can
+        # be extended. HOLD/mixed bars never cause an optimistic extension.
+        returns=self.market_context.get('returns_bps',{})
+        sign=1 if p['direction']=='BUY' else -1
+        aligned=(sign*float(returns.get('5',0))>0 and sign*float(returns.get('15',0))>0)
+        evidence=dict(meta,trend_aligned=aligned)
+        proposal=propose_update(p,self.market,evidence,policy,bar)
+        self.protection_brief={'status':'Proposal validated' if proposal else 'No improvement required',
+                               'deal_id':p['dealId'],'evidence':policy,'trend_aligned':aligned,
+                               'proposal':proposal}
+        if not proposal:return
+        # A 3-bar minimum interval prevents PUT storms and over-trading. The
+        # proposed stop never widens the downside, regardless of future policy.
+        previous=runtime.get('bar_time')
+        from .market_context import candle_time
+        if previous and candle_time(bar) and candle_time(previous):
+            wait=900 if runtime.get('status')=='REJECTED' else 180
+            if (candle_time(bar)-candle_time(previous)).total_seconds()<wait:return
+        stop=proposal['stop_level'];tp=proposal['profit_level']
+        oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
+            'tick':self.market['tick'],'reason':'ADAPTIVE','evidence':policy})
+        try:
+            receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=tp)
+            if await self._confirm_reconcile(receipt,oid,'PROTECT',p['dealId']):
+                self.store.set('adaptive_runtime:'+str(p['dealId']),{
+                    'bar_time':bar,'stop':stop,'profit':tp,'policy':policy,'status':'CONFIRMED'})
+                self.protection_brief['status']='Broker-confirmed adaptive update'
+                self.store.event('protection','Adaptive SL/TP levels verified by broker',{
+                    'deal_id':p['dealId'],'new_stop':stop,'new_profit':tp,
+                    'historical_samples':policy['samples'],'policy':policy})
+            else:
+                # Rejected requests do not affect the existing broker SL/TP.
+                self.protection_brief['status']='Broker rejected candidate; old levels retained'
+                self.store.set('adaptive_runtime:'+str(p['dealId']),{'bar_time':bar,'status':'REJECTED'})
+                self.store.event('warning','Adaptive protection candidate rejected; original levels retained',
+                                 {'deal_id':p['dealId'],'stop':stop,'profit':tp})
+        except Exception as exc:
+            self.store.order_update(oid,'UNCERTAIN')
+            self.armed=False;self.execution_enabled=False
+            self.protection_brief['status']='Uncertain broker PUT; automatic execution suspended'
+            self.store.event('error','Adaptive protection outcome uncertain; suspended for reconciliation',{
+                'deal_id':p['dealId'],'type':type(exc).__name__,
+                'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
+                'broker_error':_safe_broker_error(exc)})
+
+    async def protect_position(self,p):
+        if self.pending_order or self.pending_close:return
+        if p.get('stopLevel') is not None and p.get('profitLevel') is not None:
+            self.protected.add(p['dealId']);return
+        if self.store.unresolved():return
+        min_dist=self.market.get('min_distance');tick=self.market.get('tick');mid=self.market.get('mid')
+        if min_dist is None or not tick or not mid:
+            self.store.event('warning','Protection not possible: unsupported broker distance/price rule')
+            self.execution_enabled=False;return
+        result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist)
+        stop=result['stop_level'] if p.get('stopLevel') is None else None
+        profit=result['profit_level'] if p.get('profitLevel') is None else None
+        order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
+        try:
+            receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=profit)
+            if await self._confirm_reconcile(receipt,order_id,'PROTECT',p['dealId']):
+                self.protected.add(p['dealId'])
+            else:
+                self.armed=False;self.execution_enabled=False
+                self.store.event('error','Protection rejected or could not be reconciled',{'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),'requested_stop':str(stop),'requested_profit':str(profit)})
+        except Exception as exc:
+            self.store.order_update(order_id,'UNCERTAIN')
+            self.armed=False;self.execution_enabled=False
+            self.store.event('error','Position protection uncertain; trading suspended',{'type':type(exc).__name__, 'broker_status':getattr(getattr(exc,'response',None),'status_code',None), 'broker_error':_safe_broker_error(exc), 'deal_id':p.get('dealId'), 'stop_level':str(stop), 'take_profit_level':str(profit)})
+    async def exit_position(self,deal_id):
+        if self.pending_order or self.pending_close or not self.execution_enabled:return
+        self.pending_close=True
+        oid=self.store.order('CLOSE',deal_id,{'deal_id':deal_id})
+        try:
+            receipt=await self.broker.close_position(deal_id)
+            if not await self._confirm_reconcile(receipt,oid,'CLOSE',deal_id):
+                self.armed=False;self.execution_enabled=False
+        except Exception as exc:
+            self.store.order_update(oid,'UNCERTAIN')
+            self.armed=False;self.execution_enabled=False
+            self.store.event('error','Exit outcome uncertain, execution suspended',{'type':type(exc).__name__})
+        finally:self.pending_close=False
+    async def submit(self,action,broker_market=None):
+        if self.pending_order or self.pending_close or self.positions or not self.armed or not self.execution_enabled or not self.mandate:return
+        if action not in ('BUY','SELL') or self.last_closed_step<0:return
+        # Never submit when the learned market context is stale/incomplete.
+        if not self.market_context.get('ready'):return
+        if not self._external_entry_check(action)['entry_allowed']:return
+        self.pending_order=True
+        try:
+            await self.sync()
+            if self.positions or not self._external_entry_check(action)['entry_allowed']:return
+            market=broker_market or await self.broker.market(self.mandate['epic'])
+            snap=market.get('snapshot',{});tick=self._tick(market)
+            mid=self.market.get('mid');spread=self.market.get('spread')
+            if snap.get('marketStatus') not in (None,'TRADEABLE') or not tick or mid is None or spread is None:return
+            minimum=self._min_distance(market,mid)
+            if minimum is None:
+                self.store.event('warning','Unrecognized instrument SL/TP distance; skipped order')
+                return
+            size=Decimal(self.mandate['size'])
+            if size<=0:return
+            entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
+            brackets=stop_take(entry,action,tick,spread,minimum)
+            # Durable order record BEFORE a real order is sent; never blindly retry.
+            oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
+                'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance'])})
+            self.last_entry_signal_step=self.brain.core.steps
+            try:
+                receipt=await self.broker.open_position(self.mandate['epic'],action,size,
+                    stop_distance=brackets['stop_distance'],profit_distance=brackets['profit_distance'])
+                self.last_order_ref=receipt.get('dealReference')
+                await self._confirm_reconcile(receipt,oid,'OPEN')
+            except Exception as exc:
+                self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
+                self.execution_enabled=False;self.armed=False
+                self.store.event('error','Entry outcome uncertain; no automatic retry',{'type':type(exc).__name__})
+        finally:self.pending_order=False
+    def snapshot(self):
+        account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
+        active=next((a for a in account if a.get('preferred') or a.get('accountId')==self.account.get('currentAccountId')),account[0] if account else {})
+        evaluation=self._entry_evaluation() if not self.positions else None
+        news=self._news_risk()
+        intermarket=self.intermarket.state
+        decision=(self.policy.neural_decision(self.last_signal['scores'],self.positions[0]['direction'])
+            if self.last_signal else 'HOLD') if self.positions else evaluation['action']
+        return {'connected':bool(self.broker),'armed':self.armed,'execution_enabled':self.execution_enabled,
+                'mandate':self.mandate,'positions':self.positions,'market':self.market,'signal':self.last_signal,
+                'neural':dict(self.brain.core.snapshot(),feature_schema=self.brain.feature_schema,
+                    input_dimension=self.brain.core.d,
+                    external_features_learned=(self.brain.feature_schema==FUSION_SCHEMA),
+                    external_feed_ready=self.latest_fusion_ready,
+                    external_trained_labels=self.brain.fusion_labels),
+                'accuracy_proxy':self.brain.correct/max(1,self.brain.labeled),
+                'labeled_samples':self.brain.labeled,'market_regime':self.brain.last_regime,
+                'market_context':self.market_context,'adaptive_protection':self.protection_brief,
+                'economic_news_risk':news,'intermarket_analysis':intermarket,
+                'instrument_profile':self.instrument_profile,
+                'account':{'accountId':active.get('accountId'),'currency':active.get('currency'),
+                           'balance':active.get('balance',{})},'error':self.last_error,
+                'pending_order':self.pending_order,'pending_close':self.pending_close,
+                'unresolved_orders':self.store.unresolved(),'code_generation':self.policy.generation,
+                'position_age':self.position_age,'last_order_reference':self.last_order_ref,
+                'tick_count':self.tick_count,
+                'policy_decision':decision,
+                'policy_proposal':evaluation['proposal'] if evaluation else decision,
+                'directional_advantage':self.policy.score_edge(self.last_signal['scores']) if self.last_signal else 0.,
+                'directional_validation':evaluation.get('evidence') if evaluation else None,
+                'adaptive_threshold':None,
+                'policy_base_threshold':None,
+                'entry_margin_calibration':evaluation.get('calibration') if evaluation else None,
+                'threshold_unit':'neural_argmax_no_fixed_margin',
+                'neural_decision_bar':self.last_decision_bar,
+                'neural_entry_rule':'BUY/SELL/HOLD class winner on completed M1 candle',
+                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved()),
+                'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
+                'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
+                'entry_policy_reason':evaluation.get('reason') if evaluation else None,
+                'entry_independent_samples':(evaluation.get('evidence') or {}).get('samples') if evaluation else None,
+                'entry_can_submit_now':bool(evaluation and evaluation.get('action') in ('BUY','SELL') and
+                    self.market.get('status')=='TRADEABLE' and self.market_context.get('ready') and
+                    self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and
+                    self.execution_enabled and not self.store.unresolved() and
+                    self._external_entry_check(evaluation['action'])['entry_allowed'] and
+                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                    self.last_decision_bar is not None and
+                    self.last_entry_processed_bar!=self.last_decision_bar),
+                'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
+                    'Unresolved broker operation' if self.store.unresolved() else
+                    'Existing open position' if self.positions else
+                    'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
+                    'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
+                    'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
+                    self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
+                    'Waiting for aligned external neural inputs' if self.brain.feature_schema==FUSION_SCHEMA else
+                    'Waiting for signal')}
+

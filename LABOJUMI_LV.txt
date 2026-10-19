@@ -1,0 +1,6 @@
+LABOJUMI (2026-10-14)
+- Paaugstinātas rekonstrukcijas kļūdas (EMA > 2.0) laikā jaunu neironu pievienošanas pārbaude notiek ik pēc 10, nevis 25 apmācības soļiem. Neironu skaita griesti nav uzlikti; kļūdas slieksnis un apgriešanas aizsardzība paliek spēkā.
+- Ja brokerī iepriekš konstatēta pozīcijas instrumenta/izmēra neatbilstība, apturēšanas iemesls tagad tiek izsekots atsevišķi. Kad brokeris atkal uzrāda drošu pozīciju stāvokli, izpildi drīkst atjaunot tikai tad, ja nav operatora apturēšanas, citu konfliktu vai neatrisinātu orderu.
+- Vairāku pozīciju konflikta atrisinājumu atpazīst arī tad, kad visas pozīcijas ir aizvērtas.
+- Netika atslēgtas brokeru aizsardzības, HOLD filtrs vai neatrisinātu orderu bloķēšana.
+- Straujas tirgus izmaiņas pašas par sevi negarantē BUY/SELL signālu. Pārbaudes ir lokālas; LIVE brokerī orderi netika sūtīti.

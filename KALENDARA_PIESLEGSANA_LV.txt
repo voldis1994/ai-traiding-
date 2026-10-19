@@ -1,0 +1,27 @@
+EKONOMISKO ZINU AUTOMATISKA PIESLEGSANA
+
+Robots tagad atbalsta konfigurējamu HTTPS JSON kalendara plūsmu. Tas nav
+konkrēta pakalpojuma abonements: bez īstas datu plūsmas URL automātiskā
+ielāde nenotiek. Nepieciešams pakalpojums, kas izsniedz JSON ar laukiem:
+  enabled: true
+  updated_at: UTC ISO-8601 laiks
+  events: [{at, impact, name, epics, currencies}]
+  instrument_currencies: {"IZVELETAIS_EPIC": ["USD", "EUR"]}
+
+Windows run_windows.bat pirms palaišanas var iestatīt vides mainīgo:
+  set NEURAL_ECONOMIC_CALENDAR_URL=https://JUSU-KALENDARA-PAKALPOJUMS/events.json
+
+Robots atjauno kalendāru ne biežāk kā reizi 5 minūtēs. Ja konfigurētais
+avots nav sasniedzams vai atbilde nav derīga, jauni orderi tiek bloķēti.
+Tas nemaina esošo pozīciju pārvaldību.
+
+SVARIGI: Ja URL nav konfigurēts, iepriekšējais economic_calendar.json
+režīms paliek spēkā. Ja nav arī šī faila, ziņu aizsardzība ir NEAKTĪVA.
+
+NAV IEVIETS: automātiska DXY/obligāciju/sudraba u.c. instrumentu
+savstarpējo datu iegūšana, neironu modeļa starptirgu apmācība un pilnībā
+pārstrādāta adaptīvā ieejas validācija. Nepieciešami uzticami datu avoti,
+un šīs funkcijas nav jāsajauc ar gatavu LIVE aizsardzību.
+
+Pirms LIVE lietošanas: DEMO pārbaude, datu plūsmas pārbaude, ziņu
+notikumu atbilstība katram EPIC un brokerī apstiprināti SL/TP.

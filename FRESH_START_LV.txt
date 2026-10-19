@@ -1,0 +1,30 @@
+NEURAL TRADING AI -- SĀKT MĀCĪŠANOS NO NULLĒM (CAPITAL.COM LIVE)
+
+1. Pārtrauc robota darbu; aizver visas tā CMD/Python programmas.
+2. Capital.com lietotnē pārbaudi, vai ir atvērtas pozīcijas un aktīvi SL/TP.
+3. Izpako visu ZIP atsevišķā mapē vai pārkopē šos failus projekta mapē.
+4. Ja projekts jau darbojas vecajā C:\NEURAL_TRADING_AI mapē, izmanto
+   reset_learning_windows.bat TIEŠI ŠAJĀ MAPĒ, nevis citā kopijā.
+5. Kad jautā, ieraksti RESET ar lielajiem burtiem.
+6. Vecā data mape tiks pārvietota uz NEURAL_AI_DATA_BACKUP_... blakus data mapei.
+   NEIZDZĒS to, kamēr neesi pārliecināts par jauno darbību.
+7. Palaid run_windows.bat; pieslēdzies Capital.com LIVE.
+
+Tiek atiestatīts: robot.sqlite3, WAL/SHM, visi brain*.npz, active_policy.py,
+neironu un evolūcijas vēsture, iepriekšējās pozīcijas pārņemšanas pilnvarojums.
+
+Netiek mainīts: Capital.com konts, brokerī atvērtās pozīcijas, stop-loss,
+take-profit, API atslēgas. Robots neglabā pierakstīšanās datus šajā mapē.
+
+SVARĪGI: pēc nulles starta robota pirmās mobilās pozīcijas pārņemšanas
+posmam jānorit atkārtoti. Ja brokerī jau ir atvērta viena pozīcija,
+robots pēc pierakstīšanās to var pārņemt. Ja nav pozīciju,
+pirms automātiskās tirdzniecības jāatver jauna sākotnējā manuālā pozīcija.
+Nesāc dubultu pozīciju tikai, lai atiestatītu apmācību.
+
+Nedrīkst pārkopēt veco bojāto data/robot.sqlite3 atpakaļ jaunajā data mapē.
+Ja gribi atgūt iepriekšējos datus, vispirms apstādini robotu un konsultējies.
+
+Ja serveris jau darbojas http://127.0.0.1:8765, reset rīks atsakās strādāt.
+Ja reset mapes dublējums neizdodas, programma saglabā vecos datus un apstājas.
+LIVE orderu izpilde nav pārbaudīta pret īstu brokeri šajā ZIP izveides vidē.

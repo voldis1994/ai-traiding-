@@ -1119,7 +1119,8 @@ class SingleTradeEngine:
         # NOT true profitability after financing/commissions.
         label=(0 if direction=='BUY' else 1) if realized_ticks>0.5 else (
             (1 if direction=='BUY' else 0) if realized_ticks < -0.5 else 2)
-        loss=self.brain.core.learn(saved['transition'],label,lr=.0001)
+        # Same visible step as online delayed-label learning (was 0.0001 — ineffective).
+        loss=self.brain.core.learn(saved['transition'],label)
         self.brain.save()
         self.store.event('learning','Broker-confirmed trade outcome used for model update',
             {'deal_id':deal_id,'epic':epic,'realized_directional_ticks':realized_ticks,

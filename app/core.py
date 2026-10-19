@@ -79,10 +79,17 @@ class NeuralCore:
             if pos is not None:aligned_h[dest]=h[pos];aligned_c[dest]=c[pos]
         return aligned_h,aligned_c
 
-    def learn(self,transition,label,lr=.0005,reconstruction_weight=.01):
+    # Default step was 0.0005 (~1e-5 weight deltas) — too weak to correct a visible
+    # mistake in one update. 0.1 yields ~0.01-scale changes on P/R/O (and larger on b)
+    # while gradient clipping (max_norm=2) still bounds instability.
+    DEFAULT_LR = 0.1
+
+    def learn(self,transition,label,lr=None,reconstruction_weight=.01):
         """One-step BPTT supervised delayed price-direction class and reconstruction objective.
         Model outputs are trained on market direction proxy, not financial returns.
         """
+        if lr is None:lr=self.DEFAULT_LR
+        if not (isinstance(lr,(int,float)) and lr>0):raise ValueError('Learning rate must be positive')
         if transition is None or label not in (0,1,2):return None
         t=lambda value,grad=False:torch.tensor(value,dtype=torch.float64,requires_grad=grad)
         tensors={name:t(getattr(self,name),True) for name in ('P','W','R','O','b','G','tau','tau_c')}

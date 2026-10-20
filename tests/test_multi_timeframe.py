@@ -88,10 +88,10 @@ def test_mtf_retrain_once_per_bar_and_gap_resets_unresolved_labels():
             timestamp=(BASE+timedelta(minutes=i)).isoformat()
             assert brain.tick(100+i*.1,.03,.01,'GOLD',features=[.2]*FEATURE_DIM,bar_time=timestamp)
             assert brain.tick(100+i*.1,.03,.01,'GOLD',features=[.2]*FEATURE_DIM,bar_time=timestamp) is None
-        assert brain.core.steps==12 and brain.labeled==4
+        assert brain.core.steps==12 and brain.labeled==11  # HORIZON=1
         assert brain.tick(104,.03,.01,'GOLD',features=[.2]*FEATURE_DIM,
                           bar_time=(BASE+timedelta(minutes=30)).isoformat())
-        assert brain.labeled==4  # do not label 30-minute gap as 8 minutes
+        assert brain.labeled==11  # gap clears pending; do not invent a label across the hole
         assert len(brain.pending)==1
 
 
@@ -140,7 +140,7 @@ def test_market_context_for_real_broker_candles_and_minute_learning(monkeypatch)
                 e.last_candle_tick=-20  # request new minute history in deterministic test
                 await e.poll()
             assert brain.core.steps==10
-            assert brain.labeled==2
+            assert brain.labeled==9  # HORIZON=1: ten M1 steps → nine next-bar labels
             assert e.snapshot()['market_context']['trend']=='UP'
     asyncio.run(scenario())
 

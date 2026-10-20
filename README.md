@@ -1,25 +1,39 @@
 # Mans pašmācīšanās treidinga robots
 
-Personīgā **Neural Trading AI v6** sistēma ar rekurentu neironu tīklu, Capital.com LIVE savienojumu un automātisku stratēģijas evolūciju.
+**Šis repo ir reāla pašmācīšanās mašīna** — neironu kodols + Capital.com LIVE +
+automātiska mācīšanās un (shadow) stratēģijas evolūcija.
 
-## Kas tas ir
+## Algoritmi un vienādojumi
 
-- Pašmācās no pabeigtām M1 svecēm (+ M5/M15/H1, intermarket, ziņu kalendārs)
-- Lemj BUY / SELL / HOLD
-- Neironi var augt un tikt izgriezti (birth / prune)
-- Pirmais darījums: **manuāli** Capital.com → robots pārņem EPIC un lotu
-- Pēc manuālās pozīcijas aizvēršanas AI var atvērt nākamos orderus pats
+Sāc šeit (latviski, viena patiesība par sistēmu):
 
-## Palaišana (Windows)
+→ **[`PASMACISANAS_MASINA_LV.md`](PASMACISANAS_MASINA_LV.md)**
 
-1. Python **3.11–3.13** (64-bit)
-2. Izpako / klonē šo repo
-3. Palaid `run_windows.bat`
-4. Atver `http://127.0.0.1:8765`
-5. Ievadi savus Capital.com API datus (paliek tikai RAM šajā sesijā)
-6. Telefonā atver vienu pozīciju → robots to adoptē un sāk mācīties / aizsargāt
+Tur ir:
+- cauruļvads \(F_{\text{learn}}\circ\ldots\circ F_{\text{neuron}}\)
+- \(h/c\) dinamika, Softmax, birth/prune
+- mācīšanās ar \(\eta=0.1\)
+- SL/TP formulas
+- kas ir LIVE lēmums vs kas ir tikai shadow
 
-Linux: `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && pip install torch --index-url https://download.pytorch.org/whl/cpu && python launcher.py`
+Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
+Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
+
+## Kā palaist
+
+1. Windows: `run_windows.bat` → `http://127.0.0.1:8765`
+2. Capital.com API (sesijā RAM)
+3. Telefonā **viena** manuāla pozīcija → robots adoptē EPIC/lotu
+4. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+
+Linux:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+python launcher.py
+```
 
 ## Testi
 
@@ -27,12 +41,11 @@ Linux: `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirem
 python -m pytest -q
 ```
 
-Pašlaik: **137 passed**.
+137 passed.
 
 ## Svarīgi
 
-- Šis ir **tavs** lokālais robots — kredenciāli netiek commitoti.
-- Neironu svari un SQLite saglabājas `data/` (vai Windows: `%LOCALAPPDATA%\NeuralTradingAI`).
-- Signāli ir modeļa score, nevis peļņas garantija. Riskē tikai ar naudu, ko vari zaudēt.
-
-Detalizētā tehniskā dokumentācija: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`, `UZSTADISANA_LV.txt`.
+- LIVE lēmums = **neironu argmax** (BUY/SELL/HOLD), ne vecie 60%/MIN_EDGE vārti
+- Background labels = **nākamā M1** svece; pēc aizvērta treida — **P&L pašnovērtējums** (mīnuss → regret)
+- Evolūcija pēc treida (`force`), lai nesekotu novecojušam režīmam
+- Riskē tikai naudu, ko vari zaudēt

@@ -574,15 +574,26 @@ class AutoEvolution:
             if isinstance(a,ast.Assign) and len(a.targets)==1 and isinstance(a.targets[0],ast.Name) and isinstance(a.value,ast.Constant):
                 constants[a.targets[0].id]=a.value.value
         return constants
-    def evolve(self,accuracy,sample_count,history=None):
-        if sample_count<20:
-            self.last_reason=f'Waiting for labels: {sample_count}/20'
+    def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
+        """Search/promote policy candidates.
+
+        Normal path: every 20 new labels (background).
+        force=True: run immediately after a closed trade so evolution keeps up
+        with live trading tempo; loss_trade lowers the sample floor.
+        """
+        min_samples=8 if (force and loss_trade) else (12 if force else 20)
+        if sample_count<min_samples:
+            self.last_reason=f'Waiting for labels: {sample_count}/{min_samples}'
             return None
-        if sample_count%20!=0:return None
-        # One attempt per NEW labeled milestone, not another attempt every poll.
-        if sample_count<=self.store.get('evo_last_labeled_v3',-1):return None
-        if time.monotonic()-self.last_change<8:return None
-        self.store.set('evo_last_labeled_v3',sample_count)
+        if not force:
+            if sample_count%20!=0:return None
+            # One attempt per NEW labeled milestone, not another attempt every poll.
+            if sample_count<=self.store.get('evo_last_labeled_v3',-1):return None
+            if time.monotonic()-self.last_change<8:return None
+        else:
+            # Trade-timed: short debounce only — do not wait for a stale milestone.
+            if time.monotonic()-self.last_change<(1.0 if loss_trade else 2.0):return None
+        self.store.set('evo_last_labeled_v3',max(sample_count,int(self.store.get('evo_last_labeled_v3',-1) or -1)))
         self.attempts+=1
         self.store.set('evolution_attempts',self.attempts)
         self.last_reason='Evaluating candidate strategies'

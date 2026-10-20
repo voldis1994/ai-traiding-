@@ -131,14 +131,15 @@ class Store:
         return [dict(zip(cols,r)) for r in reversed(rows)]
 
 class AdaptiveBrain:
-    """Instrument-isolated online learner with cost-aware, delayed labels.
+    """Instrument-isolated online learner synced to the M1 trading tempo.
 
-    Price deltas and spreads are compared in the SAME price units over an
-    explicit multi-observation forecast horizon, never across two EPICs.
+    Background labels use the NEXT completed minute (HORIZON=1) so learning
+    does not trail eight bars behind live decisions. Real closed-trade P&L is
+    the primary corrective signal (see SingleTradeEngine._learn_closed_trade).
     Uncalibrated softmax scores are not probabilities of profitable trades.
     """
-    LABEL_VERSION=3
-    HORIZON=8
+    LABEL_VERSION=4  # v4: 1-bar market labels + trade P&L regret learning
+    HORIZON=1        # same cadence as M1 decisions — not an 8-minute lag
     GROWTH_INTERVAL=25
     FAST_GROWTH_INTERVAL=10  # sustained high reconstruction error only
 
@@ -378,7 +379,7 @@ class AdaptiveBrain:
                 from .market_context import candle_time
                 gap=(candle_time(bar_time)-candle_time(prev_bar)).total_seconds()/60.
                 if gap!=1.:
-                    # Missing minute(s) invalidate an 8-MINUTE horizon target.
+                    # Missing minute(s) invalidate the pending next-bar target.
                     self.pending.clear();self.core.h[:]=0;self.core.c[:]=0
                     self.last_mid=None;self.last_change=0.
                     self.store.event('learning','Skipped discontinuous OHLC minutes',
@@ -409,10 +410,12 @@ class AdaptiveBrain:
                 self.store.db.execute('UPDATE signals SET label=?,label_version=? WHERE id=? AND epic=?',
                     (str(label),self.LABEL_VERSION,past['signal_id'],epic))
                 self.store.db.commit()
-                for item in self.history:
-                    if item['signal_id']==past['signal_id']:
-                        item['label']=label
-                        break
+                sid=past.get('signal_id')
+                if sid is not None:
+                    for item in self.history:
+                        if item.get('signal_id')==sid:
+                            item['label']=label
+                            break
 
         result=self.core.step(x,max(.1,min(float(dt),60)))
         # Structural growth is separate from learning; avoid allocating a neuron
@@ -734,7 +737,11 @@ class SingleTradeEngine:
         if prev_id and prev_id!=current:
             self.last_closed_step=self.brain.core.steps
             self.latest_close_id=prev_id
-            self.store.close_trade(prev_id)
+            # Approximate exit from last mid when the deal vanishes without a
+            # CLOSE confirm payload — still enough for signed P&L regret learning.
+            exit_guess=_num(self.market.get('mid'))
+            self.store.close_trade(prev_id,exit_guess)
+            self._learn_closed_trade(prev_id,{'level':exit_guess,'source':'position_disappeared'})
             self.store.event('trade','Previous broker deal no longer open',{'dealId':prev_id})
         if current:
             self.position_age=(self.position_age+1 if current==prev_id else 0)
@@ -1091,23 +1098,26 @@ class SingleTradeEngine:
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _learn_closed_trade(self,deal_id,confirmation):
-        """Train only on a broker-confirmed same-instrument exit price.
+        """Immediate self-evaluation from a closed trade's signed P&L.
 
-        Entry/exit are DEAL prices and already contain bid/ask execution costs;
-        subtracting the spread again would double-count it. Commissions are not
-        represented here, so this is NOT a net-profit or calibrated P&L target.
+        When the trade is a LOSS, the entry-time neural state is trained toward
+        the opposite action (regret) so the machine corrects the decision that
+        just hurt — at trade-close speed, not after an 8-minute market proxy.
+        Wins reinforce the taken direction. Evolution is forced right after.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
+        if not saved:return
         exit_level=_num(confirmation.get('level'))
-        if not saved or exit_level is None:return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
         tick=_num(saved.get('tick_size'))
         direction=saved.get('direction')
+        broker_pnl=_num(confirmation.get('profit'))
+        if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
         if (not epic or epic!=self.brain.epic or
             epic!=self.market.get('epic') or
-            entry is None or not tick or tick<=0 or
+            entry is None or exit_level is None or not tick or tick<=0 or
             direction not in ('BUY','SELL') or not saved.get('transition')):
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic})
@@ -1115,16 +1125,54 @@ class SingleTradeEngine:
             return
         sign=1 if direction=='BUY' else -1
         realized_ticks=sign*(exit_level-entry)/tick
-        # Ignore sub-tick noise; this classifies executed directional moves,
-        # NOT true profitability after financing/commissions.
-        label=(0 if direction=='BUY' else 1) if realized_ticks>0.5 else (
-            (1 if direction=='BUY' else 0) if realized_ticks < -0.5 else 2)
-        # Same visible step as online delayed-label learning (was 0.0001 — ineffective).
-        loss=self.brain.core.learn(saved['transition'],label)
+        # Prefer explicit broker P&L when present; else signed tick move.
+        if broker_pnl is not None and math.isfinite(broker_pnl):
+            pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
+            pnl_value=broker_pnl
+        else:
+            pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
+            pnl_value=realized_ticks*tick  # price units, size-agnostic proxy
+        if pnl_sign>0:
+            # Profit: reinforce the action that was taken at entry.
+            label=0 if direction=='BUY' else 1
+            repeats=1
+            mode='reinforce_win'
+        elif pnl_sign<0:
+            # Loss: teach the opposite of the mistaken entry (self-critique).
+            label=1 if direction=='BUY' else 0
+            repeats=3  # stronger regret so one bad trade is not a no-op update
+            mode='regret_loss'
+        else:
+            label=2
+            repeats=1
+            mode='flat_hold'
+        transition=saved['transition']
+        losses=[]
+        for _ in range(repeats):
+            step_loss=self.brain.core.learn(transition,label)
+            if step_loss is not None:losses.append(step_loss)
+        if transition.get('h') is not None and transition.get('c') is not None:
+            self.brain.core.update_utility(transition['h'],transition['c'],label,
+                neuron_ids=transition.get('neuron_ids'))
+        self.brain.labeled+=1
+        self.brain.correct+=int(pnl_sign>0)
+        self.store.close_trade(deal_id,exit_level,pnl_value if broker_pnl is not None else None)
         self.brain.save()
-        self.store.event('learning','Broker-confirmed trade outcome used for model update',
-            {'deal_id':deal_id,'epic':epic,'realized_directional_ticks':realized_ticks,
-             'target':label,'loss':loss,'tick_size':tick})
+        self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
+            {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
+             'pnl_proxy':pnl_value,'broker_pnl':broker_pnl,
+             'realized_directional_ticks':realized_ticks,'target':label,
+             'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
+             'tick_size':tick})
+        # Evolve at trade tempo — especially after a loss — so policy search
+        # is not still digesting labels from a regime that has already passed.
+        try:
+            self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
+                               self.brain.labeled,list(self.brain.history),
+                               force=True,loss_trade=(pnl_sign<0))
+        except Exception as exc:
+            self.store.event('warning','Trade-timed evolution skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set(key,None)
 
     async def adapt_protection(self,p):

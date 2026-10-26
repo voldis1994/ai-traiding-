@@ -70,3 +70,58 @@ def test_direction_aliases_and_nested_payload_still_adopt():
             assert eng.mandate['size']=='.2'
             assert eng.positions[0]['direction']=='SELL'
     asyncio.run(scenario())
+
+
+def test_stale_unresolved_open_no_longer_blocks_fresh_gold_adoption():
+    """Regression: Execution PAUSED + WAITING FOR MOBILE TRADE while UPL open.
+
+    A leftover PENDING/UNCERTAIN OPEN in SQLite (often without confirm reference)
+    used to set open_in_flight and block adopting the live manual Gold deal.
+    """
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store=Store(Path(d)/'robot.sqlite3')
+            brain=AdaptiveBrain(store,data_dir=d)
+            oid=store.order('OPEN',None,{'epic':'GOLD','direction':'SELL','size':'0.04'})
+            store.order_update(oid,'UNCERTAIN')  # no reference → reconcile cannot clear it
+            assert store.unresolved()
+            broker=BrokerSimulation()
+            broker.open=[{'position':{'dealId':'manual-gold','size':0.04,'direction':'SELL',
+                'level':4017.14,'upl':-0.05},
+                'market':{'epic':'GOLD','instrumentName':'Gold Spot','symbol':'Gold Spot'}}]
+            eng=SingleTradeEngine(store,brain)
+            eng.policy=AutoEvolution(store,Path(d)/'policy.py')
+            eng.attach(broker)
+            assert eng.execution_enabled is False  # unresolved-at-login pause
+            assert eng.mandate is None
+            await eng.sync()
+            assert eng.mandate is not None
+            assert eng.mandate['epic']=='GOLD'
+            assert eng.mandate['size']=='0.04'
+            assert eng.mandate['initial_deal_id']=='manual-gold'
+            assert store.unresolved()==[]
+            assert eng.execution_enabled is True
+            assert store.db.execute('SELECT status FROM orders WHERE id=?',(oid,)).fetchone()[0]=='SUPERSEDED'
+    asyncio.run(scenario())
+
+
+def test_display_symbol_is_not_treated_as_epic():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store=Store(Path(d)/'robot.sqlite3')
+            brain=AdaptiveBrain(store,data_dir=d)
+            class GoldBroker(BrokerSimulation):
+                async def search_markets(self,term):
+                    assert 'Gold' in term
+                    return {'markets':[{'epic':'CS.D.USCGC.TODAY.IP','instrumentName':'Gold Spot'}]}
+            broker=GoldBroker()
+            # Capital.com often puts the human label in symbol; epic may be absent.
+            broker.open=[{'position':{'dealId':'g1','size':'0.04','direction':'SELL',
+                'level':4017.14,'upl':-0.04},
+                'market':{'symbol':'Gold Spot','instrumentName':'Gold Spot'}}]
+            eng=SingleTradeEngine(store,brain)
+            eng.attach(broker)
+            await eng.sync()
+            assert eng.positions[0]['epic']=='CS.D.USCGC.TODAY.IP'
+            assert eng.mandate['epic']=='CS.D.USCGC.TODAY.IP'
+    asyncio.run(scenario())

@@ -7,6 +7,7 @@ been detected in this authenticated session and broker confirmed its closure.
 import asyncio
 import json
 import math
+import re
 import sqlite3
 import time
 from collections import deque
@@ -655,14 +656,39 @@ class SingleTradeEngine:
         return None
 
     @staticmethod
+    def _looks_like_epic(value):
+        """Capital.com epic codes are compact tokens; 'Gold Spot' is a label, not an epic."""
+        if not isinstance(value,str):return False
+        text=value.strip()
+        if not text or ' ' in text or len(text)>64:return False
+        return bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._\-]*',text))
+
+    @staticmethod
     def _extract_epic(position,market):
-        """Capital.com usually puts epic under market; some payloads only have symbol."""
+        """Capital.com usually puts epic under market; symbol is often a display name."""
         for source in (market,position):
             if not isinstance(source,dict):continue
-            for key in ('epic','symbol','instrumentEpic'):
+            for key in ('epic','instrumentEpic'):
+                value=source.get(key)
+                if SingleTradeEngine._looks_like_epic(value):
+                    return value.strip()
+            symbol=source.get('symbol')
+            if SingleTradeEngine._looks_like_epic(symbol):
+                return symbol.strip()
+        return None
+
+    @staticmethod
+    def _extract_instrument_name(position,market):
+        for source in (market,position):
+            if not isinstance(source,dict):continue
+            for key in ('instrumentName','name'):
                 value=source.get(key)
                 if isinstance(value,str) and value.strip():
                     return value.strip()
+            symbol=source.get('symbol')
+            # Human labels such as "Gold Spot" help market search when epic is missing.
+            if isinstance(symbol,str) and symbol.strip() and not SingleTradeEngine._looks_like_epic(symbol):
+                return symbol.strip()
         return None
 
     def _map_positions(self,data):
@@ -675,12 +701,34 @@ class SingleTradeEngine:
             epic=self._extract_epic(p,m)
             out.append({'dealId':p.get('dealId') or p.get('dealID'),
                 'epic':epic,
-                'instrument_name':m.get('instrumentName') or p.get('instrumentName'),
+                'instrument_name':self._extract_instrument_name(p,m),
                 'size':p.get('size'),'direction':direction,'level':p.get('level'),
                 'stopLevel':p.get('stopLevel'),
                 'profitLevel':p.get('profitLevel') if p.get('profitLevel') is not None else p.get('limitLevel'),
                 'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
         return out
+
+    def _supersede_stale_open_orders(self,live_deal_id):
+        """Drop journal OPEN rows once the broker already shows a live deal.
+
+        Stale PENDING/UNCERTAIN OPEN (often without a usable confirm reference)
+        otherwise keep execution_enabled=False and used to block mandate adoption,
+        leaving the UI on WAITING FOR MOBILE TRADE while UPL already showed the trade.
+        """
+        cleared=0
+        for op in list(self.store.unresolved()):
+            if op.get('kind')!='OPEN':continue
+            self.store.order_update(op['id'],'SUPERSEDED',op.get('reference'))
+            cleared+=1
+            self.store.event('reconcile','Stale OPEN superseded by live broker position',
+                {'order_id':op['id'],'live_deal_id':live_deal_id,
+                 'previous_status':op.get('status')})
+        if cleared:
+            self._unresolved_at_login=bool(self.store.unresolved())
+            if (not self._unresolved_at_login and not self.operator_paused and
+                not self._paused_for_multi and not self._paused_for_read):
+                self.armed=True;self.execution_enabled=True
+        return cleared
     @staticmethod
     def _protection_matches(live,payload):
         """Reconcile requested levels, not merely pre-existing non-null stops."""
@@ -821,10 +869,14 @@ class SingleTradeEngine:
                 op['kind']=='OPEN' for op in self.store.unresolved()))
             already_this_deal=(self.mandate is not None and
                 deal_id==self.mandate.get('last_manual_deal_id',self.mandate.get('initial_deal_id')))
-            # Fresh session: adopt whatever single live deal the broker reports.
-            # Mid-session: adopt only a NEW non-robot manual deal.
-            should_adopt=(valid and not open_in_flight and not already_this_deal and
-                          (self.mandate is None or (not own_order and
+            fresh_session=self.mandate is None
+            # Fresh session: adopt the single live broker deal even if a stale
+            # OPEN journal row remains (that used to keep WAITING FOR MOBILE TRADE
+            # while UPL already showed the manual Gold/etc. position).
+            # Mid-session: adopt only a NEW non-robot manual deal, and never while
+            # this process still has an OPEN in flight.
+            should_adopt=(valid and not already_this_deal and
+                          (fresh_session or (not open_in_flight and not own_order and
                            deal_id!=self.store.get('latest_robot_deal_id'))))
             if should_adopt:
                 old=self.mandate
@@ -849,11 +901,14 @@ class SingleTradeEngine:
                     self.last_calendar_refresh=0.;self.calendar_feed_error=None
                     self.market={}
                 self.store.set('mandate',self.mandate)
+                if fresh_session and open_in_flight:
+                    self._supersede_stale_open_orders(deal_id)
                 self.store.event('adoption','Live broker position adopted for this session',
                     {'deal_id':deal_id,'epic':p['epic'],'size':str(p['size']),
                      'direction':p.get('direction'),
                      'previous_epic':old['epic'] if old else None,
-                     'fresh_session':old is None})
+                     'fresh_session':fresh_session,
+                     'cleared_stale_open':bool(fresh_session and open_in_flight)})
             elif self.mandate is None and latest:
                 # Surface why WAITING FOR MOBILE TRADE persists despite an open deal.
                 self.store.event('warning','Open broker position not adopted yet',

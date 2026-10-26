@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+duckdns_config.bat
 *.sqlite
 *.sqlite3
 *.db

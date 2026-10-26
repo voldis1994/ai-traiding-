@@ -1,0 +1,6 @@
+@echo off
+REM Nokopē šo failu kā:  duckdns_config.bat
+REM (duckdns_config.bat NAV git — tur ir tavs secret token)
+
+set "DUCKDNS_DOMAIN=neuraltraidingai"
+set "DUCKDNS_TOKEN=IEVADI_SAVU_TOKEN_NO_DUCKDNS"

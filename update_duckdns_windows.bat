@@ -1,18 +1,28 @@
 @echo off
 setlocal EnableExtensions
-REM === Aizpildi DOMAIN un TOKEN no https://www.duckdns.org ===
-set DOMAIN=neuraltradingai
-set TOKEN=IEVADI_SAVU_DUCKDNS_TOKENU
+pushd "%~dp0" >nul 2>&1
 
-if "%TOKEN%"=="IEVADI_SAVU_DUCKDNS_TOKENU" (
-  echo [ERROR] Atver update_duckdns_windows.bat Notepad un ieraksti DOMAIN + TOKEN.
-  pause
+if exist "duckdns_config.bat" (
+  call "duckdns_config.bat"
+) else (
+  echo [ERROR] Nav faila duckdns_config.bat
+  echo [INFO]  Nokopē duckdns_config.bat.example -^> duckdns_config.bat
+  echo [INFO]  un ieraksti DUCKDNS_TOKEN no https://www.duckdns.org
   exit /b 1
 )
 
-echo Updating DuckDNS: %DOMAIN%.duckdns.org ...
-curl -s "https://www.duckdns.org/update?domains=%DOMAIN%&token=%TOKEN%&ip="
-echo.
-echo Gatavs. Klientam: http://%DOMAIN%.duckdns.org:8765/app
-echo ^(PC jabut ieslegtam + run_windows.bat^)
-exit /b 0
+if "%DUCKDNS_DOMAIN%"=="" (
+  echo [ERROR] DUCKDNS_DOMAIN tukss duckdns_config.bat
+  exit /b 1
+)
+if "%DUCKDNS_TOKEN%"=="" (
+  echo [ERROR] DUCKDNS_TOKEN tukss duckdns_config.bat
+  exit /b 1
+)
+if /I "%DUCKDNS_TOKEN%"=="IEVADI_SAVU_TOKEN_NO_DUCKDNS" (
+  echo [ERROR] Ieraksti īsto DuckDNS token failā duckdns_config.bat
+  exit /b 1
+)
+
+curl -s "https://www.duckdns.org/update?domains=%DUCKDNS_DOMAIN%&token=%DUCKDNS_TOKEN%&ip="
+exit /b %ERRORLEVEL%

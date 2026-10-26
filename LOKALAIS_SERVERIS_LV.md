@@ -11,64 +11,33 @@ Mērķis: robots un dati **tavā PC**, klientiem viena un tā pati saite.
 
 ---
 
-## A) DuckDNS (ieteicams, ja gribi 0 €)
+## A) DuckDNS — **viens bat palaiz visu**
 
-### 1. DuckDNS
-1. https://www.duckdns.org → Sign in (Google/GitHub)
-2. Izveido subdomēnu, piem. `neuraltradingai`  
-   → adrese: `neuraltradingai.duckdns.org`
-3. Nokopē **token**
+### Faili (jau repo)
+| Fails | Kas |
+|-------|-----|
+| `start_all_windows.bat` | **Galvenais** — DuckDNS + robots + pārlūks |
+| `duckdns_config.bat.example` | Šablons → nokopē kā `duckdns_config.bat` |
+| `duckdns_config.bat` | Tavs token (lokāli, netiek commitots) |
+| `update_duckdns_windows.bat` | IP atjaunošana |
+| `setup_firewall_windows.bat` | Firewall 8765 (vienreiz kā Admin) |
 
-### 2. Windows — atjauno IP (CMD kā Administrators nav obligāti)
-Izveido failu `C:\NeuralTradingAI_NEW\update_duckdns.bat`:
+### Soli
+1. https://www.duckdns.org → domēns (tev: `neuraltraidingai`) + nokopē **token**
+2. `git pull origin main`
+3. Dubultklikšķis **`start_all_windows.bat`**  
+   — pirmajā reizē atvērs Notepad: ieraksti token → saglabā → palaid vēlreiz
+4. Vienreiz: labais klikšķis **`setup_firewall_windows.bat`** → Run as administrator
+5. Routerī **vienreiz** Port Forward `8765` → PC IPv4 → `8765` TCP
 
-```bat
-@echo off
-set DOMAIN=neuraltradingai
-set TOKEN=TAVA_DUCKDNS_TOKENA
-curl "https://www.duckdns.org/update?domains=%DOMAIN%&token=%TOKEN%&ip="
-echo.
-pause
+### Saites (nemainās)
 ```
-
-Palaid **reizi** un pēc tam ieliec Task Scheduler ik pēc 5–15 min (vai katru reizi ieslēdzot PC).
-
-### 3. Router — port forward
-Router admin (bieži `192.168.1.1` / `192.168.0.1`):
-- **External port:** `8765` (vai `80` → iekšēji 8765)
-- **Internal IP:** tava PC LAN IP (piem. `192.168.1.50`) — labāk **DHCP reservation**, lai IP nemainās
-- **Internal port:** `8765`
-- Protocol: TCP
-
-### 4. Windows Firewall
-CMD **kā Administrator**:
-```bat
-netsh advfirewall firewall add rule name="Neural Trading AI" dir=in action=allow protocol=TCP localport=8765
+http://neuraltraidingai.duckdns.org:8765/app
+http://neuraltraidingai.duckdns.org:8765/admin
 ```
+Lokāli tev: `http://127.0.0.1:8765/admin`
 
-### 5. Palaid robotu
-```bat
-cd /d C:\NeuralTradingAI_NEW
-run_windows.bat
-```
-
-### 6. Klientam (nemainās)
-```
-http://neuraltradingai.duckdns.org:8765/app
-```
-Admin:
-```
-http://neuraltradingai.duckdns.org:8765/admin
-```
-
-**Svarīgi:** PC jāpaliek ieslēgtam + `run_windows.bat` jāstrādā.  
-HTTP (ne HTTPS) — pietiek sākumam; vēlāk var Caddy/HTTPS.
-
-Env (pēc izvēles) pirms starta:
-```bat
-set NTA_PUBLIC_URL=http://neuraltradingai.duckdns.org:8765
-set NTA_PRODUCTION=1
-```
+**Svarīgi:** PC ieslēgts + `start_all_windows.bat` / robots logs atvērti.
 
 ---
 

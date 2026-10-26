@@ -6,7 +6,7 @@
 |------|-----|
 | `/admin` | Reģistrācija (pareizi) |
 | `/app` | Klienta web — **šo sūti** |
-| `/console` | Operators (Capital.com) — NAV klienta panelis |
+| `/console` | Novirza uz `/admin` |
 
 ---
 

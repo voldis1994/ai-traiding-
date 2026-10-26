@@ -11,7 +11,7 @@ Mērķis: **viens stabils URL**, ceļi nekad nemainās:
 | `/` | Portāla sākums |
 | `/app` | Klienta mobilā web |
 | `/admin` | Tavs admin |
-| `/console` | Operatora Capital.com dashboard |
+| `/console` | Novirza uz `/admin` |
 
 ## Varianti
 

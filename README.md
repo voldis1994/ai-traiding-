@@ -26,7 +26,7 @@ Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
 | `/` | Portāla sākums |
 | `/app` | **Klients** — LV/EN/RU, vadīti soļi, tad robots (BUY/HOLD/SELL + evolūcija, Pause/Resume) |
 | `/admin` | **Admin** — izveido klienta login/paroli, pieslēdz brokeru API |
-| `/console` | Operatora konsoles (Capital.com LIVE, pilnais dashboard) |
+| `/console` | Novirza uz `/admin` (vecā API forma noņemta no UX) |
 
 Noklusējuma admin (mainiet ar env): `NTA_ADMIN_USER=admin` · `NTA_ADMIN_PASSWORD=admin123`  
 Brokeru atslēgas šifrētas `data/secret.key` (vai `NTA_SECRET_KEY`).
@@ -37,7 +37,7 @@ Deploy detalizētāk: [`DEPLOY_LV.md`](DEPLOY_LV.md). Ceļi `/`, `/app`, `/admin
 ## Kā palaist
 
 1. Windows: `run_windows.bat` → `http://127.0.0.1:8765`
-2. Admin: `/admin` → izveido klientu + brokeri **vai** operator: `/console`
+2. Admin: `/admin` → izveido klientu + pieslēdz brokeru API
 3. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
 4. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
 

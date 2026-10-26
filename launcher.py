@@ -17,9 +17,15 @@ import traceback
 import urllib.request
 import webbrowser
 
-HOST = '127.0.0.1'
-PORT = 8765
-URL = f'http://{HOST}:{PORT}/'
+def _runtime_bind():
+    from app.config import bind_host, bind_port
+    host = bind_host()
+    port = bind_port(8765)
+    # Browser opener always uses localhost even when server binds 0.0.0.0
+    browse = '127.0.0.1' if host in ('0.0.0.0', '::') else host
+    return host, port, f'http://{browse}:{port}/'
+
+HOST, PORT, URL = '127.0.0.1', 8765, 'http://127.0.0.1:8765/'
 
 
 def log_directory():
@@ -95,6 +101,7 @@ def self_test():
     assert (static / 'ui.js').is_file()
     assert (static / 'admin' / 'index.html').is_file()
     assert (static / 'client' / 'index.html').is_file()
+    assert (static / 'portal.html').is_file()
     assert app.title == 'Neural Trading AI'
     result = NeuralCore(n=8).step([0.0, 1.0, 0.0])
     assert abs(sum(result['scores'].values()) - 1) < 1e-8
@@ -128,12 +135,19 @@ def check_port_available():
 
 
 def start_server():
+    global HOST, PORT, URL
+    HOST, PORT, URL = _runtime_bind()
     check_port_available()
     import uvicorn
     from app.main import app
-    logging.info('Neural Trading AI starting on %s', URL)
+    logging.info('Neural Trading AI starting on %s (bind %s:%s)', URL, HOST, PORT)
     print(f'Neural Trading AI starting. Browser address: {URL}', flush=True)
-    threading.Thread(target=browser_when_ready, daemon=True, name='browser-opener').start()
+    print('Portals: /  /app  /admin  /console', flush=True)
+    if HOST in ('0.0.0.0', '::') or os.getenv('PORT'):
+        # Cloud / LAN: do not force-open a local browser.
+        pass
+    else:
+        threading.Thread(target=browser_when_ready, daemon=True, name='browser-opener').start()
     uvicorn.run(app, host=HOST, port=PORT, access_log=False, log_level='info')
     return 0
 

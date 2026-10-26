@@ -1,0 +1,18 @@
+services:
+  neural-trading:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      NTA_PRODUCTION: "1"
+      NTA_SECURE_COOKIES: "0"
+      NTA_ADMIN_USER: admin
+      NTA_ADMIN_PASSWORD: ${NTA_ADMIN_PASSWORD:-ChangeMe_LocalOnly_9x!}
+      NTA_PUBLIC_URL: ${NTA_PUBLIC_URL:-http://127.0.0.1:8765}
+      NEURAL_AI_DATA_DIR: /data
+    volumes:
+      - nta-data:/data
+    restart: unless-stopped
+
+volumes:
+  nta-data:

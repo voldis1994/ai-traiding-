@@ -65,9 +65,14 @@ def test_admin_and_client_portals(monkeypatch,tmp_path):
     monkeypatch.setattr('app.runtime_hub.create_broker',lambda *a,**k:LoginBroker())
 
     with TestClient(main.app) as client:
+        assert client.get('/').status_code==200
+        assert client.get('/console').status_code==200
         assert client.get('/admin').status_code==200
         assert client.get('/app').status_code==200
-        assert client.get('/api/health').json()['portals']['client']=='/app'
+        health=client.get('/api/health').json()
+        assert health['portals']['client']=='/app'
+        assert health['portals']['operator']=='/console'
+        assert health['portals']['home']=='/'
 
         assert client.post('/api/admin/login',json={'username':'admin','password':'x'}).status_code==401
         assert client.post('/api/admin/login',json={'username':'admin','password':'admin123'}).status_code==200

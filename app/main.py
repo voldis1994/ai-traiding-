@@ -18,6 +18,7 @@ from .engine import Store,AdaptiveBrain,SingleTradeEngine
 from .storage import DATA
 from .platform import PlatformStore
 from .runtime_hub import RuntimeHub
+from .config import cookie_secure, public_base_url
 
 store=Store();brain=AdaptiveBrain(store);engine=SingleTradeEngine(store,brain)
 SESSION=secrets.token_urlsafe(48)
@@ -35,11 +36,15 @@ WEB=Path(__file__).parent/'web'
 
 
 def _bootstrap_admin():
+    from .config import env_flag
     user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
     password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
+    if env_flag('NTA_PRODUCTION') and password in ('admin123','change-me-now','password','admin'):
+        logging.error('Refusing weak NTA_ADMIN_PASSWORD in production — set a strong secret')
+        raise RuntimeError('Set a strong NTA_ADMIN_PASSWORD before production start')
     if platform.admin_count()==0:
         platform.ensure_admin(user,password)
-        logging.warning('Bootstrapped admin user %r — change NTA_ADMIN_PASSWORD in production',user)
+        logging.warning('Bootstrapped admin user %r — change NTA_ADMIN_PASSWORD if still default',user)
     else:
         # Ensure configured admin exists (idempotent username).
         platform.ensure_admin(user,password)
@@ -186,9 +191,16 @@ def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
         return HTTPException(503, f'Neizdevās sasniegt Capital.com ({label}). Pārbaudi interneta savienojumu.')
     return HTTPException(502, f'Capital.com {label} neizdevās ({type(exc).__name__}). Skati konsoli.')
 
-# ---------- pages ----------
+def _set_session_cookie(response:JSONResponse,name:str,value:str):
+    response.set_cookie(name,value,httponly=True,samesite='strict',
+                        secure=cookie_secure(),path='/')
+
+# ---------- pages (stable public paths) ----------
 @app.get('/')
-async def index():return FileResponse(WEB/'index.html')
+async def portal_home():return FileResponse(WEB/'portal.html')
+
+@app.get('/console')
+async def operator_console():return FileResponse(WEB/'index.html')
 
 @app.get('/admin')
 async def admin_page():return FileResponse(WEB/'admin'/'index.html')
@@ -228,7 +240,7 @@ async def connect(data:Credentials):
                  'mandate_requires_new_manual_trade':engine.mandate is None})
     response=JSONResponse({'ok':True,'live':True,'automatic':True,
                            'data_dir':str(DATA),'mandate':engine.mandate})
-    response.set_cookie(COOKIE,SESSION,httponly=True,samesite='strict',secure=False,path='/')
+    _set_session_cookie(response,COOKIE,SESSION)
     return response
 
 @app.get('/api/status')
@@ -311,7 +323,9 @@ async def logout(_:bool=Depends(require_auth)):
 @app.get('/api/health')
 async def health():
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
-            'portals':{'operator':'/','admin':'/admin','client':'/app'},
+            'portals':{'home':'/','operator':'/console','admin':'/admin','client':'/app'},
+            'public_url':public_base_url(),
+            'secure_cookies':cookie_secure(),
             'clients':len(platform.list_clients()),
             'running_robots':len(hub.all_runtimes())}
 
@@ -322,7 +336,7 @@ async def admin_login(data:UserPass):
     if not admin:raise HTTPException(401,'Invalid admin credentials')
     token=platform.create_session('admin',admin['id'])
     response=JSONResponse({'ok':True,'username':admin['username']})
-    response.set_cookie(ADMIN_COOKIE,token,httponly=True,samesite='strict',secure=False,path='/')
+    _set_session_cookie(response,ADMIN_COOKIE,token)
     return response
 
 @app.post('/api/admin/logout')
@@ -416,7 +430,7 @@ async def client_login(data:UserPass):
     response=JSONResponse({'ok':True,'client':{
         'id':client['id'],'username':client['username'],
         'display_name':client['display_name'],'language':client['language']}})
-    response.set_cookie(CLIENT_COOKIE,token,httponly=True,samesite='strict',secure=False,path='/')
+    _set_session_cookie(response,CLIENT_COOKIE,token)
     return response
 
 @app.post('/api/client/logout')

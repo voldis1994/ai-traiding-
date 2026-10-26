@@ -1,0 +1,27 @@
+# Render Blueprint — stable paths: /  /app  /admin  /console
+# Dashboard → New → Blueprint → select this repo.
+services:
+  - type: web
+    name: neural-trading-ai
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: NTA_PRODUCTION
+        value: "1"
+      - key: NTA_SECURE_COOKIES
+        value: "1"
+      - key: NTA_ADMIN_USER
+        value: admin
+      - key: NTA_ADMIN_PASSWORD
+        generateValue: true
+      - key: NTA_SECRET_KEY
+        generateValue: true
+      - key: NTA_PUBLIC_URL
+        sync: false
+      - key: NEURAL_AI_DATA_DIR
+        value: /data
+    disk:
+      name: nta-data
+      mountPath: /data
+      sizeGB: 1

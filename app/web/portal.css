@@ -1,0 +1,19 @@
+:root{color-scheme:dark;font-family:"Segoe UI",system-ui,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:#e8eef8;background:#0a0d16;
+  background-image:radial-gradient(ellipse 80% 55% at 50% -15%,#1c2740,transparent)}
+.shell{max-width:860px;margin:0 auto;padding:48px 20px 40px}
+.brand{text-align:center;margin-bottom:36px}
+.mark{font-size:48px;color:#3ecf8e;margin-bottom:10px}
+.brand h1{margin:0;font-size:28px;letter-spacing:.06em}
+.brand p{margin:10px 0 0;color:#8b97b0}
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.card{display:block;text-decoration:none;color:inherit;background:#121826;border:1px solid #2a3348;
+  border-radius:14px;padding:18px;min-height:150px;transition:border-color .15s,transform .15s}
+.card:hover{border-color:#3ecf8e;transform:translateY(-2px)}
+.eyebrow{display:block;color:#8b97b0;font-size:11px;font-weight:800;letter-spacing:.08em;margin-bottom:10px}
+.card strong{display:block;font-size:22px;margin-bottom:10px;color:#3ecf8e}
+.card em{display:block;font-style:normal;color:#b7c0d4;line-height:1.45;font-size:13px}
+footer{margin-top:28px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  color:#68758f;font-size:12px}
+@media(max-width:780px){.cards{grid-template-columns:1fr}.shell{padding-top:28px}}

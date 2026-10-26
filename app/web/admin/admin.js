@@ -58,7 +58,8 @@ $('createForm').onsubmit=async ev=>{
   const data=Object.fromEntries(new FormData(ev.target).entries());
   try{
     const res=await api('/api/admin/clients','POST',data);
-    $('createMsg').textContent=`Izveidots #${res.client.id} · login ${res.client.username}`;
+    $('createMsg').textContent=
+      `Nosūti klientam → /app · login: ${res.client.username} · parole: ${data.password}`;
     ev.target.reset();await loadClients();
   }catch(e){$('createMsg').textContent=e.message}
 };

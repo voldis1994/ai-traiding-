@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neural Trading AI</title>
+  <link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <div class="mark">⬡</div>
+      <h1>Neural Trading AI</h1>
+      <p>Stabils portāls · Admin · Klients · Operators</p>
+    </header>
+    <nav class="cards">
+      <a class="card" href="/app">
+        <span class="eyebrow">Klients</span>
+        <strong>/app</strong>
+        <em>Mobilā web: valoda, 1. manuālais treids, robots</em>
+      </a>
+      <a class="card" href="/admin">
+        <span class="eyebrow">Admin</span>
+        <strong>/admin</strong>
+        <em>Izveido login/paroles un pieslēdz brokeru API</em>
+      </a>
+      <a class="card" href="/console">
+        <span class="eyebrow">Operators</span>
+        <strong>/console</strong>
+        <em>Pilnais Capital.com dashboard (tavs konts)</em>
+      </a>
+    </nav>
+    <footer>
+      <span>URL ceļi nemainās pēc deploy</span>
+      <span id="health">…</span>
+    </footer>
+  </main>
+  <script>
+    fetch('/api/health').then(r=>r.json()).then(h=>{
+      document.getElementById('health').textContent=
+        (h.running_robots||0)+' roboti · '+(h.clients||0)+' klienti';
+    }).catch(()=>{});
+  </script>
+</body>
+</html>

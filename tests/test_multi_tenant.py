@@ -90,6 +90,17 @@ def test_admin_and_client_portals(monkeypatch,tmp_path):
             'api_key':'k','identifier':'i','password':'p'})
         assert attach.status_code==200, attach.text
 
+        overview=client.get('/api/admin/overview')
+        assert overview.status_code==200, overview.text
+        body=overview.json()
+        assert body['summary']['clients']>=1
+        assert body['summary']['running_robots']>=1
+        card=next(c for c in body['clients'] if c['id']==cid)
+        assert 'evolution' in card and 'results' in card and 'scores' in card
+        assert 'neurons' in card['evolution']
+        assert client.post(f'/api/admin/clients/{cid}/pause').status_code==200
+        assert client.post(f'/api/admin/clients/{cid}/resume').status_code==200
+
         # Same browser jar can hold admin + client cookies (different names).
         login=client.post('/api/client/login',json={'username':'anna','password':'anna-pass'})
         assert login.status_code==200

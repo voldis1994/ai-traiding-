@@ -1,7 +1,8 @@
-:root{color-scheme:dark;font-family:"Segoe UI",system-ui,sans-serif;--bg:#0a0d16;--panel:#121826;--line:#2a3348;--text:#e8eef8;--muted:#8b97b0;--ok:#3ecf8e}
+:root{color-scheme:dark;font-family:"Segoe UI",system-ui,sans-serif;--bg:#0a0d16;--panel:#121826;--line:#2a3348;--text:#e8eef8;--muted:#8b97b0;--ok:#3ecf8e;--bad:#e85d7b;--warn:#e0b35a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);min-height:100vh;
   background-image:radial-gradient(ellipse 70% 40% at 10% 0%,#182033,transparent)}
 .hidden{display:none!important}.wrap{max-width:1100px;margin:0 auto;padding:22px}
+.wrap.wide{max-width:1280px}
 .box{max-width:420px;margin:10vh auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
 .box h1{margin:0 0 8px}.muted{color:var(--muted)}.small{font-size:12px;line-height:1.5}
 label{display:block;margin:0 0 12px;font-size:12px;font-weight:700;color:var(--muted)}
@@ -9,14 +10,31 @@ input,select{width:100%;margin-top:6px;padding:11px;border-radius:9px;border:1px
 .btn{border:1px solid var(--line);background:#1a2233;color:var(--text);border-radius:9px;padding:11px 14px;font-weight:700;cursor:pointer}
 .btn.primary{background:#1f6b4a;border-color:#2f9a6a}.btn.ghost{background:transparent}
 .btn.tiny{padding:7px 10px;font-size:12px}
-.error{color:#e85d7b;min-height:16px;font-size:12px}
+.error{color:var(--bad);min-height:16px;font-size:12px}
 .bar{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:18px;flex-wrap:wrap}
-.bar strong{display:block;font-size:18px}.bar-actions{display:flex;gap:8px;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.bar strong{display:block;font-size:18px}.bar-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:14px}
-.panel h2{margin:0 0 12px;font-size:16px}.row{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
-th{color:var(--muted);font-size:11px;letter-spacing:.04em}
+.panel h2{margin:0 0 12px;font-size:16px}.row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 a{color:var(--ok)}
-@media(max-width:860px){.grid{grid-template-columns:1fr}}
+.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.stat b{display:block;font-size:22px;margin-top:4px}.stat span{color:var(--muted);font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.card{border:1px solid var(--line);border-radius:12px;padding:14px;background:#0d1320}
+.card.head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start;margin-bottom:10px}
+.card h3{margin:0;font-size:15px}.pill{font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;border:1px solid var(--line)}
+.pill.on{color:var(--ok);border-color:#2f9a6a}.pill.off{color:var(--muted)}.pill.pause{color:var(--warn);border-color:#8a6a2a}
+.scores{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:10px 0}
+.score{background:#0b101a;border:1px solid var(--line);border-radius:8px;padding:8px;text-align:center}
+.score em{display:block;font-style:normal;font-size:11px;color:var(--muted)}.score b{font-size:16px}
+.score.buy b{color:var(--ok)}.score.sell b{color:var(--bad)}
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;font-size:12px;margin:8px 0}
+.meta span{color:var(--muted)}.meta strong{color:var(--text);font-weight:600}
+.actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.trades{margin-top:8px;font-size:11px;color:var(--muted);max-height:90px;overflow:auto}
+.trades div{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px solid #1a2233}
+.pnl-pos{color:var(--ok)}.pnl-neg{color:var(--bad)}
+.setup summary{cursor:pointer;list-style:none}.setup summary::-webkit-details-marker{display:none}
+@media(max-width:860px){.grid,.summary{grid-template-columns:1fr 1fr}.cards{grid-template-columns:1fr}}
+@media(max-width:520px){.summary{grid-template-columns:1fr}}

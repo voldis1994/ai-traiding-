@@ -364,12 +364,13 @@ async def admin_brokers(_:dict=Depends(require_admin)):
 
 @app.get('/api/admin/clients')
 async def admin_clients(_:dict=Depends(require_admin)):
-    rows=[]
-    for c in platform.list_clients():
-        rt=hub.get(c['id'])
-        rows.append({**c,'robot_running':bool(rt and rt.started and rt.engine.broker),
-                     'phase':(rt.client_view()['phase'] if rt and rt.started else None)})
-    return {'clients':rows}
+    """Legacy list + rich control-panel fields (neural, activity, P&L)."""
+    overview=hub.admin_overview()
+    return {'clients':overview['clients'],'summary':overview['summary']}
+
+@app.get('/api/admin/overview')
+async def admin_overview(_:dict=Depends(require_admin)):
+    return {'ok':True,**hub.admin_overview()}
 
 @app.post('/api/admin/clients')
 async def admin_create_client(data:ClientCreate,_:dict=Depends(require_admin)):
@@ -429,6 +430,25 @@ async def admin_start_client(client_id:int,_:dict=Depends(require_admin)):
 async def admin_stop_client(client_id:int,_:dict=Depends(require_admin)):
     await hub.stop_client(client_id)
     return {'ok':True}
+
+@app.post('/api/admin/clients/{client_id}/pause')
+async def admin_pause_client(client_id:int,_:dict=Depends(require_admin)):
+    rt=hub.get(client_id)
+    if not rt or not rt.started:raise HTTPException(409,'Robots nav palaists')
+    rt.engine.armed=False;rt.engine.execution_enabled=False;rt.engine.operator_paused=True
+    rt.store.event('control','Paused by admin')
+    return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+
+@app.post('/api/admin/clients/{client_id}/resume')
+async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
+    rt=hub.get(client_id)
+    if not rt or not rt.started:raise HTTPException(409,'Robots nav palaists')
+    if rt.store.unresolved():
+        raise HTTPException(409,'Nevar atsākt — neatrisināta brokera operācija')
+    rt.engine.armed=True;rt.engine.execution_enabled=True
+    rt.engine.operator_paused=False;rt.engine._paused_for_read=False
+    rt.store.event('control','Resumed by admin')
+    return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
 
 # ---------- client portal API ----------
 @app.post('/api/client/login')

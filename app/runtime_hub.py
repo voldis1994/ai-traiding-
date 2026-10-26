@@ -80,6 +80,121 @@ class RuntimeHub:
     def all_runtimes(self) -> list[AccountRuntime]:
         return list(self._runtimes.values())
 
+    def _trade_stats(self,store: Store) -> dict:
+        trades=store.trades(200)
+        closed=[t for t in trades if t.get('closed')]
+        open_rows=[t for t in trades if not t.get('closed')]
+        pnls=[]
+        for t in closed:
+            if t.get('pnl') is None:continue
+            try:pnls.append(float(t['pnl']))
+            except (TypeError,ValueError):pass
+        wins=sum(1 for p in pnls if p>0)
+        losses=sum(1 for p in pnls if p<0)
+        return {
+            'closed_trades':len(closed),
+            'open_trades_recorded':len(open_rows),
+            'realized_pnl':round(sum(pnls),4) if pnls else 0.0,
+            'wins':wins,
+            'losses':losses,
+            'win_rate':round(wins/max(1,wins+losses),3),
+            'recent_trades':closed[:12],
+        }
+
+    def admin_client_card(self,client: dict) -> dict:
+        """Full operator card for one client — neural, activity, results."""
+        cid=int(client['id'])
+        rt=self.get(cid)
+        card={
+            **client,
+            'robot_running':False,
+            'phase':None,
+            'connected':False,
+            'operator_paused':False,
+            'execution_enabled':False,
+            'armed':False,
+            'scores':{'BUY':0.,'HOLD':0.,'SELL':0.},
+            'action':None,
+            'evolution':{
+                'generation':0,'labeled_samples':0,'neurons':None,'steps':0,
+                'accuracy_proxy':0.,'births':0,'pruned':0,'loss':None,
+                'smoothed_error':None,'utility_mean':None,
+            },
+            'activity':{
+                'tick_count':0,'market':None,'mandate':None,'position':None,
+                'entry_block_reason':None,'error':None,
+            },
+            'results':{
+                'closed_trades':0,'open_trades_recorded':0,'realized_pnl':0.0,
+                'wins':0,'losses':0,'win_rate':0.0,'recent_trades':[],
+            },
+        }
+        store=None
+        if rt and rt.started:
+            view=rt.client_view()
+            snap=rt.engine.snapshot()
+            neural=snap.get('neural') or {}
+            evo=view.get('evolution') or {}
+            store=rt.store
+            card.update({
+                'robot_running':True,
+                'phase':view.get('phase'),
+                'connected':bool(view.get('connected')),
+                'operator_paused':bool(view.get('operator_paused')),
+                'execution_enabled':bool(view.get('execution_enabled')),
+                'armed':bool(view.get('armed')),
+                'scores':view.get('scores') or card['scores'],
+                'action':view.get('action'),
+                'evolution':{
+                    'generation':int(evo.get('generation') or 0),
+                    'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),
+                    'neurons':neural.get('neurons'),
+                    'steps':int(neural.get('steps') or 0),
+                    'accuracy_proxy':round(float(snap.get('accuracy_proxy') or 0),4),
+                    'births':int(neural.get('births') or 0),
+                    'pruned':int(neural.get('pruned') or 0),
+                    'loss':neural.get('loss'),
+                    'smoothed_error':neural.get('smoothed_error'),
+                    'utility_mean':neural.get('utility_mean'),
+                    'strategy':evo.get('strategy'),
+                },
+                'activity':{
+                    'tick_count':int(view.get('tick_count') or snap.get('tick_count') or 0),
+                    'market':(view.get('mandate') or {}).get('epic') or (snap.get('market') or {}).get('epic'),
+                    'market_status':(snap.get('market') or {}).get('status'),
+                    'mandate':view.get('mandate'),
+                    'position':view.get('position'),
+                    'entry_block_reason':snap.get('entry_block_reason'),
+                    'error':view.get('error') or snap.get('error'),
+                    'balance':((snap.get('account') or {}).get('balance') or {}),
+                },
+            })
+        else:
+            data_dir=self.platform.account_data_dir(cid)
+            db=data_dir/'robot.sqlite3'
+            if db.is_file():
+                try:store=Store(db)
+                except Exception:store=None
+        if store is not None:
+            try:card['results']=self._trade_stats(store)
+            except Exception:pass
+        return card
+
+    def admin_overview(self) -> dict:
+        clients=[self.admin_client_card(c) for c in self.platform.list_clients()]
+        running=sum(1 for c in clients if c.get('robot_running'))
+        total_pnl=sum(float((c.get('results') or {}).get('realized_pnl') or 0) for c in clients)
+        total_closed=sum(int((c.get('results') or {}).get('closed_trades') or 0) for c in clients)
+        return {
+            'summary':{
+                'clients':len(clients),
+                'running_robots':running,
+                'realized_pnl_all':round(total_pnl,4),
+                'closed_trades_all':total_closed,
+            },
+            'clients':clients,
+        }
+
     async def start_account(self,broker_row: dict, *, connected_broker=None) -> AccountRuntime:
         """Start robot. Pass connected_broker to avoid a second Capital.com login."""
         client_id=int(broker_row['client_id'])

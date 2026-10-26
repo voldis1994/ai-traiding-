@@ -31,7 +31,8 @@ Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
 Noklusējuma admin (mainiet ar env): `NTA_ADMIN_USER=admin` · `NTA_ADMIN_PASSWORD=admin123`  
 Brokeru atslēgas šifrētas `data/secret.key` (vai `NTA_SECRET_KEY`).
 
-**Publisks hostings:** skati [`DEPLOY_LV.md`](DEPLOY_LV.md) (Render / Docker / Railway). Ceļi `/`, `/app`, `/admin`, `/console` nemainās.
+**Klienta publiskā saite (bez sava domēna):** [`KLIENTA_SAITE_LV.md`](KLIENTA_SAITE_LV.md) — ngrok ātri, Render pastāvīgi.  
+Deploy detalizētāk: [`DEPLOY_LV.md`](DEPLOY_LV.md). Ceļi `/`, `/app`, `/admin`, `/console` nemainās.
 
 ## Kā palaist
 

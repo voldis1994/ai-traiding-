@@ -1,5 +1,9 @@
 # Publisks hostings (klienti ārpus tava Wi‑Fi)
 
+**Savs domēns NAV obligāts.** Render/ngrok paši iedod `https://….` adresi.
+
+Īsā klientu saite: skati **`KLIENTA_SAITE_LV.md`**.
+
 Mērķis: **viens stabils URL**, ceļi nekad nemainās:
 
 | Ceļš | Kas |

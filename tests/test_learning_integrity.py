@@ -146,13 +146,15 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
         store.set('entry_brain:deal1',{'epic':'GOLD','direction':'SELL','entry':100,
             'tick_size':.01,'entry_spread':.05,
             'transition':brain._json_transition(brain.core.last_transition)})
+        store.upsert_trade({'dealId':'deal1','epic':'GOLD','size':'0.5','direction':'SELL','level':100})
         engine._learn_closed_trade('deal1',{'level':99.8})
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['realized_directional_ticks']==pytest.approx(20.)
         assert detail['mode']=='reinforce_win'
         assert detail['target']==1
-        assert detail['learn_repeats']==1
+        assert detail['learn_repeats']==2
+        assert store.trades(1)[0]['pnl']==pytest.approx(0.1)  # SELL 0.5 * 0.2
         assert store.get('entry_brain:deal1') is None
 
 
@@ -164,16 +166,19 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         engine=SingleTradeEngine(store,brain)
         engine.market={'epic':'GOLD','tick':.01,'spread':.05}
         engine.policy=AutoEvolution(store,Path(directory)/'policy.py')
+        store.upsert_trade({'dealId':'loss1','epic':'GOLD','size':'1','direction':'BUY','level':100})
         store.set('entry_brain:loss1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
-        # BUY that exited lower → loss → regret toward SELL (label 1), 3 repeats.
+        # BUY that exited lower → loss → regret toward SELL (label 1), stronger repeats.
         engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['mode']=='regret_loss'
         assert detail['target']==1
-        assert detail['learn_repeats']==3
+        assert detail['learn_repeats']==5
         assert detail['broker_pnl']==-12.5
+        assert detail['pnl']==-12.5
+        assert store.trades(1)[0]['pnl']==pytest.approx(-12.5)
         assert not np.array_equal(before,brain.core.P)
         assert store.get('entry_brain:loss1') is None
 

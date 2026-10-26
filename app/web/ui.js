@@ -94,7 +94,9 @@ function render(data){
   setHtml('evoDetails',`<div class="kv"><span>Generation</span><b>${state.code_generation||0}</b></div><div class="kv"><span>Shadow-evolved code variant (not LIVE gate)</span><b>${escapeHtml(data.code?.strategy||'—')}</b></div><div class="kv"><span>Evolution attempts</span><b>${data.code?.attempts??0}</b></div><div class="kv"><span>Next evaluation</span><b>${Math.ceil(Math.max(20,state.labeled_samples+1)/20)*20} labeled samples</b></div><div class="kv"><span>Last evolution result</span><b>${escapeHtml(data.code?.last_reason||'—')}</b></div><div class="kv"><span>SHA-256</span><b>${escapeHtml(data.code?.sha256?.slice(0,24)||'—')}…</b></div>`);
   setText('codeSource',data.code?.source||'—');setHtml('codeEvents',entries((data.events||[]).filter(e=>e.kind==='code'),40));
   setHtml('signalHistory',table([['Time','time'],['Epic','epic'],['Action','action'],['Price','price'],['Step','model_step'],['Next-label','label']],data.signals||[]));
-  setHtml('fullTrades',table([['Deal','deal_id'],['Epic','epic'],['Side','direction'],['Size','size'],['Entry','entry'],['Exit','exit'],['P&L','pnl'],['Opened','opened'],['Closed','closed']],data.trades||[]));
+  setHtml('fullTrades',table([['Deal','deal_id'],['Epic','epic'],['Side','direction'],['Size','size'],['Entry','entry'],['Exit','exit'],
+    ['P&L',row=>row.pnl==null||row.pnl===''?'—':Number(row.pnl).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:4})],
+    ['Opened','opened'],['Closed','closed']],data.trades||[]));
   setHtml('fullEvents',entries(data.events,80));setText('footerState',state.error?state.error:'CAPITAL.COM LIVE · NEURAL ENGINE');
   if(visible==='dashboard')drawCandles('candleChart',data.candles);
   if(visible==='analysis'){renderIntelligence(data);drawCandles('analysisChart',data.candles);drawSignalMarkers(data.candles,data.signals||[])}

@@ -115,11 +115,40 @@ class Store:
             (p['dealId'],p['epic'],str(p['size']),p['direction'],now(),_num(p.get('level'))))
         self.db.commit()
     def close_trade(self,deal_id,exit_price=None,pnl=None):
-        self.db.execute('UPDATE trades SET closed=COALESCE(closed,?),exit=COALESCE(?,exit),pnl=COALESCE(?,pnl) WHERE deal_id=?',
-            (now(),_num(exit_price),_num(pnl),deal_id));self.db.commit()
+        """Persist exit and realized P&L. Explicit pnl overwrites a prior NULL."""
+        exit_n=_num(exit_price);pnl_n=_num(pnl)
+        self.db.execute(
+            'UPDATE trades SET closed=COALESCE(closed,?), '
+            'exit=COALESCE(?,exit), '
+            'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END '
+            'WHERE deal_id=?',
+            (now(),exit_n,pnl_n,pnl_n,deal_id))
+        self.db.commit()
+        # If exit exists but P&L was never supplied, derive a signed price×size proxy
+        # so History is never blank while the machine already learned from the trade.
+        if pnl_n is None:
+            row=self.db.execute(
+                'SELECT entry,exit,direction,size,pnl FROM trades WHERE deal_id=?',
+                (deal_id,)).fetchone()
+            if row and row[4] is None and row[0] is not None and row[1] is not None and row[2] in ('BUY','SELL'):
+                try:
+                    sign=1.0 if row[2]=='BUY' else -1.0
+                    size=float(row[3] or 1)
+                    derived=sign*(float(row[1])-float(row[0]))*size
+                    if math.isfinite(derived):
+                        self.db.execute('UPDATE trades SET pnl=? WHERE deal_id=?',(derived,deal_id))
+                        self.db.commit()
+                except (TypeError,ValueError):pass
     def trades(self,n=150):
         cols=('deal_id','epic','size','direction','opened','closed','entry','exit','pnl')
-        return [dict(zip(cols,r)) for r in self.db.execute('SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl FROM trades ORDER BY opened DESC LIMIT ?', (n,))]
+        rows=[dict(zip(cols,r)) for r in self.db.execute(
+            'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl FROM trades '
+            'ORDER BY opened DESC LIMIT ?',(n,))]
+        for row in rows:
+            if row.get('pnl') is not None:
+                try:row['pnl']=round(float(row['pnl']),4)
+                except (TypeError,ValueError):pass
+        return rows
     def candle(self,epic,bar,source='QUOTE'):
         if source not in ('QUOTE','HISTORICAL'):raise ValueError('Invalid candle provenance')
         self.db.execute('INSERT OR REPLACE INTO candles(epic,at,open,high,low,close,source) VALUES(?,?,?,?,?,?,?)',
@@ -141,8 +170,8 @@ class AdaptiveBrain:
     """
     LABEL_VERSION=4  # v4: 1-bar market labels + trade P&L regret learning
     HORIZON=1        # same cadence as M1 decisions — not an 8-minute lag
-    GROWTH_INTERVAL=25
-    FAST_GROWTH_INTERVAL=10  # sustained high reconstruction error only
+    GROWTH_INTERVAL=8   # faster structural growth so the net adapts with trades
+    FAST_GROWTH_INTERVAL=4  # sustained high reconstruction error
 
     def __init__(self,store,n=16,data_dir=None):
         self.store=store
@@ -425,10 +454,10 @@ class AdaptiveBrain:
                          else self.GROWTH_INTERVAL)
         if self.core.steps%growth_interval==0:
             z=np.asarray(result['z'])
-            if self.core.grow_if_needed(z,threshold=1.,nmax=None):
+            if self.core.grow_if_needed(z,threshold=.65,nmax=None):
                 self.store.event('neural','Neuron automatically added',{'neurons':self.core.n})
-        if self.core.steps%200==0:
-            deleted=self.core.prune()
+        if self.core.steps%80==0:
+            deleted=self.core.prune(min_age=80,threshold=-.01)
             if deleted:self.store.event('neural','Low utility neurons removed',
                 {'count':deleted,'neurons':self.core.n})
         cur=self.store.db.execute('''INSERT INTO signals
@@ -1216,10 +1245,21 @@ class SingleTradeEngine:
                 self.store.event('warning','Adaptive protection unavailable: opening bracket missing or invalid',
                                  {'deal_id':p['dealId']})
         if kind=='CLOSE':
-            self.store.close_trade(deal_id,confirmation.get('level'))
+            # Learn first so realized P&L is written into History in the same step.
             self._learn_closed_trade(deal_id,confirmation)
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
+    def _realized_trade_pnl(self,deal_id,entry,exit_level,direction,broker_pnl=None):
+        """Prefer broker cash P&L; else signed (exit-entry)*size for History + learning."""
+        if broker_pnl is not None and math.isfinite(broker_pnl):
+            return float(broker_pnl),'broker'
+        row=self.store.db.execute('SELECT size FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
+        try:size=float(row[0]) if row and row[0] is not None else 1.0
+        except (TypeError,ValueError):size=1.0
+        if not math.isfinite(size) or size<=0:size=1.0
+        sign=1.0 if direction=='BUY' else -1.0
+        return sign*(float(exit_level)-float(entry))*size,'price_size'
+
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed P&L.
 
@@ -1227,43 +1267,54 @@ class SingleTradeEngine:
         the opposite action (regret) so the machine corrects the decision that
         just hurt — at trade-close speed, not after an 8-minute market proxy.
         Wins reinforce the taken direction. Evolution is forced right after.
+        Realized P&L is always written to the trades History table.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
-        if not saved:return
         exit_level=_num(confirmation.get('level'))
+        broker_pnl=_num(confirmation.get('profit'))
+        if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
+        # Even without a saved neural entry state, still record P&L in History.
+        if not saved:
+            row=self.store.db.execute(
+                'SELECT entry,direction FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
+            if row and exit_level is not None and row[0] is not None and row[1] in ('BUY','SELL'):
+                pnl_value,_=self._realized_trade_pnl(deal_id,row[0],exit_level,row[1],broker_pnl)
+                self.store.close_trade(deal_id,exit_level,pnl_value)
+            elif exit_level is not None:
+                self.store.close_trade(deal_id,exit_level,broker_pnl)
+            return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
         tick=_num(saved.get('tick_size'))
         direction=saved.get('direction')
-        broker_pnl=_num(confirmation.get('profit'))
-        if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
         if (not epic or epic!=self.brain.epic or
             epic!=self.market.get('epic') or
             entry is None or exit_level is None or not tick or tick<=0 or
             direction not in ('BUY','SELL') or not saved.get('transition')):
+            if entry is not None and exit_level is not None and direction in ('BUY','SELL'):
+                pnl_value,_=self._realized_trade_pnl(deal_id,entry,exit_level,direction,broker_pnl)
+                self.store.close_trade(deal_id,exit_level,pnl_value)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic})
             self.store.set(key,None)
             return
         sign=1 if direction=='BUY' else -1
         realized_ticks=sign*(exit_level-entry)/tick
-        # Prefer explicit broker P&L when present; else signed tick move.
+        pnl_value,pnl_source=self._realized_trade_pnl(deal_id,entry,exit_level,direction,broker_pnl)
         if broker_pnl is not None and math.isfinite(broker_pnl):
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
-            pnl_value=broker_pnl
         else:
             pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
-            pnl_value=realized_ticks*tick  # price units, size-agnostic proxy
         if pnl_sign>0:
             # Profit: reinforce the action that was taken at entry.
             label=0 if direction=='BUY' else 1
-            repeats=1
+            repeats=2
             mode='reinforce_win'
         elif pnl_sign<0:
             # Loss: teach the opposite of the mistaken entry (self-critique).
             label=1 if direction=='BUY' else 0
-            repeats=3  # stronger regret so one bad trade is not a no-op update
+            repeats=5  # stronger regret so one bad trade moves the network
             mode='regret_loss'
         else:
             label=2
@@ -1279,11 +1330,17 @@ class SingleTradeEngine:
                 neuron_ids=transition.get('neuron_ids'))
         self.brain.labeled+=1
         self.brain.correct+=int(pnl_sign>0)
-        self.store.close_trade(deal_id,exit_level,pnl_value if broker_pnl is not None else None)
+        # Always persist realized P&L so History shows what the machine learned from.
+        self.store.close_trade(deal_id,exit_level,pnl_value)
+        # Extra growth nudge after each closed trade — faster adaptation.
+        if self.brain.core.last_z is not None:
+            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
+                self.store.event('neural','Neuron added after closed-trade learning',
+                                 {'neurons':self.brain.core.n,'deal_id':deal_id})
         self.brain.save()
         self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
             {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
-             'pnl_proxy':pnl_value,'broker_pnl':broker_pnl,
+             'pnl':pnl_value,'pnl_source':pnl_source,'broker_pnl':broker_pnl,
              'realized_directional_ticks':realized_ticks,'target':label,
              'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
              'tick_size':tick})

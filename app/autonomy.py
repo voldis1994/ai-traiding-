@@ -307,11 +307,25 @@ class AutoEvolution:
         return 'CLOSE' if action in ('BUY','SELL') and action!=current_direction else 'HOLD'
 
     def evaluate_neural_entry(self,scores):
-        """Single neural vote: never stack historic fixed-percentage gates."""
-        action=self.neural_decision(scores)
-        return {'action':action,'proposal':action,'threshold':None,
-                'reason':('Neural '+action+' leads on completed M1 bar'
-                          if action!='HOLD' else 'Neural network selected HOLD on completed M1 bar'),
+        """Entry uses BUY/SELL only — HOLD is never an entry mode.
+
+        When flat, the robot may open BUY or SELL. HOLD can only *block* an
+        entry when it strictly dominates the stronger direction; it is never
+        submitted as an order and never counts as an entry action.
+        """
+        if not AutoEvolution._safe_scores(scores):
+            return {'action':'HOLD','proposal':'HOLD','threshold':None,
+                    'reason':'Invalid neural scores; no entry','evidence':None,'calibration':None}
+        buy=float(scores['BUY']);sell=float(scores['SELL']);hold=float(scores['HOLD'])
+        direction='BUY' if buy>=sell else 'SELL'
+        strength=buy if direction=='BUY' else sell
+        if hold>strength:
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':(f'HOLD is not an entry mode; skip while HOLD {hold:.1%} '
+                              f'dominates {direction} {strength:.1%}'),
+                    'evidence':None,'calibration':None}
+        return {'action':direction,'proposal':direction,'threshold':None,
+                'reason':f'Entry {direction} on completed M1 (BUY/SELL only; HOLD never enters)',
                 'evidence':None,'calibration':None}
 
     @staticmethod
@@ -577,22 +591,22 @@ class AutoEvolution:
     def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
         """Search/promote policy candidates.
 
-        Normal path: every 20 new labels (background).
+        Normal path: every 10 new labels (background).
         force=True: run immediately after a closed trade so evolution keeps up
         with live trading tempo; loss_trade lowers the sample floor.
         """
-        min_samples=8 if (force and loss_trade) else (12 if force else 20)
+        min_samples=4 if (force and loss_trade) else (6 if force else 10)
         if sample_count<min_samples:
             self.last_reason=f'Waiting for labels: {sample_count}/{min_samples}'
             return None
         if not force:
-            if sample_count%20!=0:return None
+            if sample_count%10!=0:return None
             # One attempt per NEW labeled milestone, not another attempt every poll.
             if sample_count<=self.store.get('evo_last_labeled_v3',-1):return None
-            if time.monotonic()-self.last_change<8:return None
+            if time.monotonic()-self.last_change<4:return None
         else:
             # Trade-timed: short debounce only — do not wait for a stale milestone.
-            if time.monotonic()-self.last_change<(1.0 if loss_trade else 2.0):return None
+            if time.monotonic()-self.last_change<(0.5 if loss_trade else 1.0):return None
         self.store.set('evo_last_labeled_v3',max(sample_count,int(self.store.get('evo_last_labeled_v3',-1) or -1)))
         self.attempts+=1
         self.store.set('evolution_attempts',self.attempts)
@@ -632,6 +646,11 @@ class AutoEvolution:
         old_train,_=self._replay(incumbent,train,
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
         winner=None;best=baseline
+        # Faster promotion: fewer labels + smaller holdout edge so the machine
+        # improves on a trade/learning tempo instead of waiting for 80+ samples.
+        need_n=24 if force else 30
+        need_val=6 if force else 8
+        lift=.002 if (force and loss_trade) else .003
         for kind,val,source in variants:
             try:
                 fn=self._compile(source)
@@ -639,12 +658,13 @@ class AutoEvolution:
                 new_margin=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=val)
                 train_score,_=self._replay(fn,train,margin_override=new_margin)
                 validation_score,validation_n=self._replay(fn,validation,margin_override=new_margin)
-                if (n>=80 and validation_n>=20 and train_score>=old_train and
-                    validation_score>old_validation+.004 and reward>best+.004):
+                if (n>=need_n and validation_n>=need_val and train_score>=old_train and
+                    validation_score>old_validation+lift and reward>best+lift):
                     best=reward;winner=(kind,val,source)
             except Exception:continue
         if not winner:
-            self.last_reason=('Waiting for balanced BUY/SELL replay (minimum 80 labels)' if n<80 else 'No relative-edge candidate passed training and forward holdout replay')
+            self.last_reason=(f'Waiting for BUY/SELL replay (minimum {need_n} labels)' if n<need_n
+                              else 'No relative-edge candidate passed training and forward holdout replay')
             self.store.set('evolution_last_reason',self.last_reason)
             self.store.event('code','Evolution candidate not promoted',{'reason':self.last_reason,'samples':n})
             return None

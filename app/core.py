@@ -80,9 +80,9 @@ class NeuralCore:
         return aligned_h,aligned_c
 
     # Default step was 0.0005 (~1e-5 weight deltas) — too weak to correct a visible
-    # mistake in one update. 0.1 yields ~0.01-scale changes on P/R/O (and larger on b)
-    # while gradient clipping (max_norm=2) still bounds instability.
-    DEFAULT_LR = 0.1
+    # mistake in one update. 0.15 yields clear weight moves on each closed-trade
+    # regret while gradient clipping (max_norm=2) still bounds instability.
+    DEFAULT_LR = 0.15
 
     def learn(self,transition,label,lr=None,reconstruction_weight=.01):
         """One-step BPTT supervised delayed price-direction class and reconstruction objective.

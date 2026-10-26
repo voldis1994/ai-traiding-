@@ -106,7 +106,9 @@ def test_entry_diagnostics_emit_one_event_per_completed_model_step(monkeypatch):
             state=e.snapshot()
             assert state['entry_signal_validated'] is False
             assert state['entry_can_submit_now'] is False
-            assert 'News guard:' in state['entry_policy_reason'] or 'Neural' in state['entry_policy_reason']
+            reason=state['entry_policy_reason'] or ''
+            assert ('News guard:' in reason or 'Neural' in reason or
+                    'HOLD is not an entry mode' in reason or 'not an entry mode' in reason)
     asyncio.run(scenario())
 
 

@@ -30,7 +30,14 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         assert result['threshold'] is None
         assert result['evidence'] is None
         assert p.neural_decision({'BUY':.34,'SELL':.33,'HOLD':.33})=='BUY'
+        # Raw network may prefer HOLD, but HOLD is never an entry mode.
         assert p.neural_decision({'BUY':.25,'SELL':.35,'HOLD':.40})=='HOLD'
+        blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40})
+        assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
+        assert 'not an entry mode' in blocked['reason']
+        # Tie BUY vs HOLD → directional entry wins (HOLD never enters).
+        entered=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33})
+        assert entered['action']=='BUY'
         assert p.neural_decision(score,current_direction='BUY')=='CLOSE'
         assert p.neural_decision(score,current_direction='SELL')=='HOLD'
         assert p.neural_decision({'BUY':float('nan'),'SELL':.6,'HOLD':.4})=='HOLD'

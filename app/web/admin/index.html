@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neural Trading · Admin</title>
+  <link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+  <div id="login" class="wrap">
+    <form id="loginForm" class="box">
+      <h1>Admin</h1>
+      <p class="muted">Izveido klientu login + paroli un pieslēdz brokeru API.</p>
+      <label>Lietotājvārds<input name="username" required autocomplete="username"></label>
+      <label>Parole<input name="password" type="password" required autocomplete="current-password"></label>
+      <button class="btn" type="submit">Ienākt</button>
+      <p id="loginError" class="error"></p>
+      <p class="muted small">Operatora konsoles Capital.com: <a href="/">/</a> · Klienta app: <a href="/app">/app</a></p>
+    </form>
+  </div>
+
+  <div id="dash" class="wrap hidden">
+    <header class="bar">
+      <div>
+        <strong>Admin panelis</strong>
+        <span class="muted">Klienti · brokeri · roboti</span>
+      </div>
+      <div class="bar-actions">
+        <a class="btn ghost" href="/app" target="_blank">Klienta /app</a>
+        <a class="btn ghost" href="/" target="_blank">Operator /</a>
+        <button type="button" id="logoutBtn" class="btn">Iziet</button>
+      </div>
+    </header>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Jauns klients</h2>
+        <form id="createForm">
+          <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
+          <label>Parole<input name="password" required minlength="4" maxlength="256" placeholder="••••••••"></label>
+          <label>Vārds / nosaukums<input name="display_name" maxlength="120" placeholder="Jānis"></label>
+          <label>Valoda
+            <select name="language">
+              <option value="lv">Latviešu</option>
+              <option value="en">English</option>
+              <option value="ru">Русский</option>
+            </select>
+          </label>
+          <button class="btn primary" type="submit">Izveidot klientu</button>
+          <p id="createMsg" class="muted"></p>
+        </form>
+      </article>
+
+      <article class="panel">
+        <h2>Pieslēgt brokeri klientam</h2>
+        <form id="brokerForm">
+          <label>Klients
+            <select name="client_id" id="brokerClient" required></select>
+          </label>
+          <label>Brokeris
+            <select name="broker_type" id="brokerType" required></select>
+          </label>
+          <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
+          <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
+          <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
+          <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
+          <button class="btn primary" type="submit">Saglabāt un palaist robotu</button>
+          <p id="brokerMsg" class="muted"></p>
+        </form>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <h2>Klienti</h2>
+        <button type="button" id="refreshBtn" class="btn ghost">Atsvaidzināt</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Login</th><th>Vārds</th><th>Valoda</th><th>Brokeris</th><th>Robots</th><th>Fāze</th><th></th></tr>
+          </thead>
+          <tbody id="clientRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script src="/admin/static/admin.js"></script>
+</body>
+</html>

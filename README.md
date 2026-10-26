@@ -19,12 +19,25 @@ Tur ir:
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
 Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
 
+## Portāli
+
+| URL | Kas |
+|-----|-----|
+| `/` | Operatora konsoles (Capital.com LIVE, pilnais dashboard) |
+| `/admin` | **Admin** — izveido klienta login/paroli, pieslēdz brokeru API |
+| `/app` | **Klients** — LV/EN/RU, vadīti soļi, tad robots (BUY/HOLD/SELL + evolūcija, Pause/Resume) |
+
+Noklusējuma admin (mainiet ar env): `NTA_ADMIN_USER=admin` · `NTA_ADMIN_PASSWORD=admin123`  
+Brokeru atslēgas šifrētas `data/secret.key` (vai `NTA_SECRET_KEY`).
+
 ## Kā palaist
 
 1. Windows: `run_windows.bat` → `http://127.0.0.1:8765`
-2. Capital.com API (sesijā RAM)
-3. Telefonā **viena** manuāla pozīcija → robots adoptē EPIC/lotu
+2. Admin: `/admin` → izveido klientu + brokeri **vai** operator: Capital.com API uz `/`
+3. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
 4. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+
+Publiskam hostam (klienti ārpus tava Wi‑Fi) deployē šo pašu app ar stabilu URL; ceļi `/admin` un `/app` nemainās.
 
 Linux:
 
@@ -41,7 +54,7 @@ python launcher.py
 python -m pytest -q
 ```
 
-137 passed.
+147 passed.
 
 ## Svarīgi
 

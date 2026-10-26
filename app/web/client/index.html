@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Neural Trading · Client</title>
+  <link rel="stylesheet" href="/app/static/app.css">
+</head>
+<body>
+  <div id="login" class="screen">
+    <header class="hero">
+      <div class="mark">⬡</div>
+      <h1 data-i18n="brand">Neural Trading</h1>
+      <p data-i18n="tagline">Tavs robots</p>
+    </header>
+    <form id="loginForm" class="card" autocomplete="username">
+      <h2 data-i18n="loginTitle">Klienta ieeja</h2>
+      <label><span data-i18n="username">Lietotājvārds</span>
+        <input name="username" required maxlength="64" autocomplete="username">
+      </label>
+      <label><span data-i18n="password">Parole</span>
+        <input name="password" type="password" required maxlength="256" autocomplete="current-password">
+      </label>
+      <label><span data-i18n="language">Valoda</span>
+        <select id="loginLang" name="language">
+          <option value="lv">Latviešu</option>
+          <option value="en">English</option>
+          <option value="ru">Русский</option>
+        </select>
+      </label>
+      <button class="btn primary" type="submit" data-i18n="enter">Ienākt</button>
+      <p id="loginError" class="error"></p>
+    </form>
+  </div>
+
+  <div id="shell" class="screen hidden">
+    <header class="top">
+      <div>
+        <strong id="clientName">—</strong>
+        <small id="runState">—</small>
+      </div>
+      <div class="top-actions">
+        <select id="langSelect" aria-label="Language">
+          <option value="lv">LV</option>
+          <option value="en">EN</option>
+          <option value="ru">RU</option>
+        </select>
+        <button type="button" id="logoutBtn" class="btn ghost" data-i18n="logout">Iziet</button>
+      </div>
+    </header>
+
+    <section id="guide" class="panel hidden">
+      <h2 data-i18n="guideTitle">Kas jādara tagad</h2>
+      <p class="lead" data-i18n="guideLead"></p>
+      <ol class="steps">
+        <li data-i18n="step1"></li>
+        <li data-i18n="step2"></li>
+        <li data-i18n="step3"></li>
+        <li data-i18n="step4"></li>
+      </ol>
+      <div id="guideStatus" class="status-pill">…</div>
+    </section>
+
+    <section id="robot" class="panel hidden">
+      <div class="robot-head">
+        <h2 data-i18n="robotTitle">Robots strādā</h2>
+        <span id="livePill" class="status-pill">—</span>
+      </div>
+      <div class="scores">
+        <div class="score"><span>BUY</span><strong id="scoreBuy">0%</strong><i id="barBuy"></i></div>
+        <div class="score"><span>HOLD</span><strong id="scoreHold">0%</strong><i id="barHold"></i></div>
+        <div class="score"><span>SELL</span><strong id="scoreSell">0%</strong><i id="barSell"></i></div>
+      </div>
+      <div class="evo">
+        <span data-i18n="evolution">Evolūcijas koeficients</span>
+        <strong id="evoCoef">0</strong>
+        <small><span data-i18n="generation">Paaudze</span> <b id="evoGen">0</b> · <span data-i18n="samples">Mācību paraugi</span> <b id="evoSamples">0</b></small>
+      </div>
+      <div class="meta">
+        <div><span data-i18n="market">Tirgus</span><b id="marketEpic">—</b></div>
+        <div><span data-i18n="size">Lots</span><b id="marketSize">—</b></div>
+        <div><span data-i18n="position">Pozīcija</span><b id="positionLine">—</b></div>
+      </div>
+      <div class="controls">
+        <button type="button" id="pauseBtn" class="btn dim" data-i18n="pause">Pauzēt</button>
+        <button type="button" id="resumeBtn" class="btn primary" data-i18n="resume">Atsākt</button>
+      </div>
+      <p id="robotError" class="error"></p>
+    </section>
+  </div>
+
+  <script src="/app/static/i18n.js"></script>
+  <script src="/app/static/app.js"></script>
+</body>
+</html>

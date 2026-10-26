@@ -66,4 +66,12 @@ class CapitalBroker:
             payload['profitLevel']=float(profit_level if profit_level is not None else limit_level)
         if not payload:raise ValueError('No changes supplied')
         return await self._request('PUT','/api/v1/positions/'+quote(str(deal_id),safe=''),json=payload)
-    async def close(self):await self.client.aclose()
+    async def close(self, *, end_session: bool=True):
+        # Free Capital.com session slot so a second connect (or another client) is not blocked.
+        if end_session and self.cst and self.security:
+            try:
+                await self.client.delete('/api/v1/session',headers=self.headers())
+            except Exception:
+                pass
+        self.cst=None;self.security=None
+        await self.client.aclose()

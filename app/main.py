@@ -170,16 +170,24 @@ class PasswordBody(BaseModel):
 
 def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     """Explain the failed step, without ever exposing credentials, headers or response body."""
-    stages={'session':'autentifikācija', 'accounts':'konta nolasīšana', 'positions':'pozīciju nolasīšana'}
+    stages={
+        'session':'autentifikācija',
+        'accounts':'konta nolasīšana',
+        'positions':'pozīciju nolasīšana',
+        'robot_start':'robota starts',
+    }
     label=stages.get(stage,stage)
     status=getattr(getattr(exc, 'response', None), 'status_code', None)
     logging.warning('Capital.com connect failed: stage=%s exception=%s http=%s',
                     stage, type(exc).__name__, status if status is not None else '-')
     if status is not None:
         if status==429:
-            return HTTPException(429, f'Capital.com pieprasījumu limits (HTTP 429; {label}). Uzgaidi un mēģini vēlāk.')
-        if stage=='session' and status in (401,403):
-            return HTTPException(401, f'Capital.com nepieņēma LIVE autentifikāciju (HTTP {status}). Pārbaudi LIVE API atslēgu, identifikatoru un paroli.')
+            return HTTPException(429, f'Capital.com pieprasījumu limits (HTTP 429; {label}). Uzgaidi 1 min un mēģini vēlāk.')
+        if stage in ('session','robot_start') and status in (401,403):
+            return HTTPException(401,
+                f'Capital.com nepieņēma LIVE autentifikāciju (HTTP {status}; {label}). '
+                f'Pārbaudi LIVE (ne DEMO) API key, identifikatoru (epasts) un API paroli. '
+                f'Divi klienti nedrīkst lietot vienu un to pašu API atslēgu vienlaikus.')
         if status in (401,403):
             return HTTPException(502, f'Capital.com sesija izveidota, bet {label} noraidīta (HTTP {status}).')
         if status>=500:
@@ -188,8 +196,8 @@ def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     if isinstance(exc, httpx.TimeoutException):
         return HTTPException(503, f'Capital.com neatbildēja laikus ({label}).')
     if isinstance(exc, httpx.RequestError):
-        return HTTPException(503, f'Neizdevās sasniegt Capital.com ({label}). Pārbaudi interneta savienojumu.')
-    return HTTPException(502, f'Capital.com {label} neizdevās ({type(exc).__name__}). Skati konsoli.')
+        return HTTPException(503, f'Neizdevās sasniegt Capital.com ({label}).')
+    return HTTPException(502, f'Capital.com {label} neizdevās ({type(exc).__name__}).')
 
 def _set_session_cookie(response:JSONResponse,name:str,value:str):
     response.set_cookie(name,value,httponly=True,samesite='strict',
@@ -379,10 +387,12 @@ async def admin_reset_password(client_id:int,data:PasswordBody,_:dict=Depends(re
 @app.post('/api/admin/clients/{client_id}/broker')
 async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(require_admin)):
     if not platform.get_client(client_id):raise HTTPException(404,'Client not found')
-    # Validate credentials against the live broker before saving.
+    # One LIVE session: validate, save, then hand the same connection to the robot
+    # (a second login often fails with HTTPStatusError / session conflict).
+    api_key=data.api_key.strip(); identifier=data.identifier.strip(); password=data.password.strip()
     stage='session'
     try:
-        candidate=create_broker(data.broker_type,data.api_key,data.identifier,data.password,live=True)
+        candidate=create_broker(data.broker_type,api_key,identifier,password,live=True)
     except ValueError as exc:
         raise HTTPException(400,str(exc)) from None
     try:
@@ -392,13 +402,14 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
     except Exception as exc:
         await candidate.close()
         raise _capital_connect_error(stage,exc) from None
-    await candidate.close()
     account=platform.attach_broker(client_id,data.broker_type,data.display_name,
-                                   data.api_key,data.identifier,data.password)
+                                   api_key,identifier,password)
     try:
-        await hub.start_account(account)
+        await hub.start_account(account,connected_broker=candidate)
     except Exception as exc:
-        raise HTTPException(502,f'Broker saved but robot failed to start ({type(exc).__name__})') from None
+        try:await candidate.close()
+        except Exception:pass
+        raise _capital_connect_error('robot_start',exc) from None
     return {'ok':True,'broker':{'id':account['id'],'broker_type':account['broker_type'],
                                 'display_name':account['display_name']},
             'client':platform.get_client(client_id)}
@@ -408,8 +419,8 @@ async def admin_start_client(client_id:int,_:dict=Depends(require_admin)):
     try:
         rt=await hub.ensure_client_running(client_id)
     except Exception as exc:
-        raise HTTPException(502,f'Could not start robot ({type(exc).__name__})') from None
-    if not rt:raise HTTPException(409,'Client has no broker account')
+        raise _capital_connect_error('robot_start',exc) from None
+    if not rt:raise HTTPException(409,'Klientam nav pieslēgta brokera konta')
     return {'ok':True,'view':rt.client_view()}
 
 @app.post('/api/admin/clients/{client_id}/stop')

@@ -80,7 +80,8 @@ class RuntimeHub:
     def all_runtimes(self) -> list[AccountRuntime]:
         return list(self._runtimes.values())
 
-    async def start_account(self,broker_row: dict) -> AccountRuntime:
+    async def start_account(self,broker_row: dict, *, connected_broker=None) -> AccountRuntime:
+        """Start robot. Pass connected_broker to avoid a second Capital.com login."""
         client_id=int(broker_row['client_id'])
         async with self._lock:
             existing=self._runtimes.get(client_id)
@@ -94,15 +95,25 @@ class RuntimeHub:
             stream=CapitalQuoteStream()
             engine.quote_stream=stream
             creds=self.platform.broker_credentials(broker_row)
-            broker=create_broker(creds['broker_type'],creds['api_key'],creds['identifier'],
-                                 creds['password'],live=True)
-            try:
-                await broker.connect()
-                accounts=await broker.accounts()
-                await broker.positions()
-            except Exception:
-                await broker.close()
-                raise
+            broker=connected_broker
+            owns_connect=broker is None
+            if owns_connect:
+                broker=create_broker(creds['broker_type'],creds['api_key'],creds['identifier'],
+                                     creds['password'],live=True)
+                try:
+                    await broker.connect()
+                    accounts=await broker.accounts()
+                    await broker.positions()
+                except Exception:
+                    await broker.close()
+                    raise
+            else:
+                try:
+                    accounts=await broker.accounts()
+                    await broker.positions()
+                except Exception:
+                    await broker.close()
+                    raise
             engine.attach(broker)
             engine.account=accounts
             try:

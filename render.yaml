@@ -1,6 +1,6 @@
-# Render Blueprint — stabils URL BEZ sava domēna:
-#   https://neural-trading-ai.onrender.com
-# Dashboard → New → Blueprint → šis repo. Adrese nemainās pēc restart.
+# Render Blueprint — stabils URL BEZ sava domēna.
+# Dashboard → New → Blueprint → šis repo.
+# Vai: Web Service + Runtime Docker + branch main.
 services:
   - type: web
     name: neural-trading-ai
@@ -22,5 +22,7 @@ services:
         value: https://neural-trading-ai.onrender.com
       - key: NEURAL_AI_DATA_DIR
         value: /data
-    # Persistents disks: Render free bieži to neļauj.
-    # Kad vajag saglabāt klientus pēc redeploy — upgrade uz Starter un pievieno disk /data.
+      - key: TORCH_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"

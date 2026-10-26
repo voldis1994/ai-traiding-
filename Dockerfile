@@ -5,13 +5,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     NTA_PRODUCTION=1 \
     NTA_BIND_HOST=0.0.0.0 \
-    NEURAL_AI_DATA_DIR=/data
+    NEURAL_AI_DATA_DIR=/data \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    TORCH_NUM_THREADS=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# Includes CPU torch via --extra-index-url in requirements.txt (fixes Render ModuleNotFoundError: torch).
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app

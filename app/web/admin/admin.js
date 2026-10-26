@@ -25,13 +25,29 @@ async function loadBrokers(){
   });
 }
 
+function money(v,ccy){
+  if(v==null||v===''||!Number.isFinite(Number(v)))return '—';
+  return num(v,2)+(ccy?' '+ccy:'');
+}
 function renderSummary(s){
   s=s||{};
+  let pnlLabel;
+  const by=s.pnl_by_currency||{};
+  const keys=Object.keys(by);
+  if(keys.length>1){
+    pnlLabel=keys.map(k=>`${num(by[k],2)} ${k}`).join(' · ');
+  }else if(s.realized_pnl_all!=null && s.pnl_currency){
+    pnlLabel=money(s.realized_pnl_all,s.pnl_currency);
+  }else if(keys.length===1){
+    pnlLabel=money(by[keys[0]],keys[0]);
+  }else{
+    pnlLabel='—';
+  }
   $('summary').innerHTML=`
     <div class="stat"><span>Klienti</span><b>${s.clients||0}</b></div>
     <div class="stat"><span>Roboti ON</span><b>${s.running_robots||0}</b></div>
     <div class="stat"><span>Slēgtie treidi</span><b>${s.closed_trades_all||0}</b></div>
-    <div class="stat"><span>Realizētais P&amp;L</span><b class="${pnlClass(s.realized_pnl_all)}">${num(s.realized_pnl_all,2)}</b></div>`;
+    <div class="stat"><span>Realizētais P&amp;L (konta valūta)</span><b class="${pnlClass(s.realized_pnl_all)}">${pnlLabel}</b></div>`;
 }
 
 function renderCard(c){
@@ -41,9 +57,12 @@ function renderCard(c){
   const pill=running?(paused?'pause':'on'):'off';
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';
   const broker=c.broker?`${c.broker.display_name}`:'nav brokera';
+  const ccy=r.pnl_currency||c.account_currency||a.currency||'';
   const trades=(r.recent_trades||[]).slice(0,6).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
-    return `<div><span>${t.direction||'?'} ${t.epic||''}</span><span class="${cls}">${p==null?'—':num(p,2)}</span></div>`;
+    const tCcy=t.pnl_currency||ccy;
+    const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
+    return `<div><span>${t.direction||'?'} ${t.epic||''}${src}</span><span class="${cls}">${p==null?'—':money(p,tCcy)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
   const el=document.createElement('article');
   el.className='card';
@@ -51,7 +70,7 @@ function renderCard(c){
     <div class="head">
       <div>
         <h3>#${c.id} ${c.display_name||c.username}</h3>
-        <div class="muted small">@${c.username} · ${c.language||''} · ${broker}</div>
+        <div class="muted small">@${c.username} · ${c.language||''} · ${broker}${ccy?' · '+ccy:''}</div>
       </div>
       <span class="pill ${pill}">${pillText}</span>
     </div>
@@ -71,7 +90,7 @@ function renderCard(c){
       <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
       <div><span>Tirgus</span><br><strong>${a.market||'—'}</strong></div>
       <div><span>Ticki</span><br><strong>${a.tick_count??0}</strong></div>
-      <div><span>P&amp;L</span><br><strong class="${pnlClass(r.realized_pnl)}">${num(r.realized_pnl,2)}</strong></div>
+      <div><span>P&amp;L (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
       <div><span>W / L</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.win_rate)})</strong></div>
     </div>
     <div class="muted small">${a.entry_block_reason||a.error||''}</div>

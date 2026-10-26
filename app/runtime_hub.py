@@ -80,21 +80,40 @@ class RuntimeHub:
     def all_runtimes(self) -> list[AccountRuntime]:
         return list(self._runtimes.values())
 
-    def _trade_stats(self,store: Store) -> dict:
+    def _trade_stats(self,store: Store, account_currency: str|None=None) -> dict:
         trades=store.trades(200)
         closed=[t for t in trades if t.get('closed')]
         open_rows=[t for t in trades if not t.get('closed')]
-        pnls=[]
+        # Only sum broker cash rows. price_size / ticks_only are not account money.
+        by_ccy: dict[str,list[float]]={}
+        signed=[]
         for t in closed:
             if t.get('pnl') is None:continue
-            try:pnls.append(float(t['pnl']))
-            except (TypeError,ValueError):pass
-        wins=sum(1 for p in pnls if p>0)
-        losses=sum(1 for p in pnls if p<0)
+            src=(t.get('pnl_source') or '').strip().lower()
+            # Skip non-cash proxies (GOLD price×size looked like USD vs GBP UPL).
+            if src in ('ticks_only','price_size','pending_close_sync','position_disappeared'):
+                continue
+            try:val=float(t['pnl'])
+            except (TypeError,ValueError):continue
+            ccy=(t.get('pnl_currency') or account_currency or '?').upper()
+            by_ccy.setdefault(ccy,[]).append(val)
+            signed.append(val)
+        wins=sum(1 for p in signed if p>0)
+        losses=sum(1 for p in signed if p<0)
+        # Prefer a single currency total; if mixed, keep map and avoid one fake sum.
+        primary=None
+        if len(by_ccy)==1:
+            ccy,vals=next(iter(by_ccy.items()))
+            primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
+        elif account_currency and account_currency in by_ccy:
+            primary={'currency':account_currency,
+                     'realized_pnl':round(sum(by_ccy[account_currency]),4)}
         return {
             'closed_trades':len(closed),
             'open_trades_recorded':len(open_rows),
-            'realized_pnl':round(sum(pnls),4) if pnls else 0.0,
+            'realized_pnl':primary['realized_pnl'] if primary else 0.0,
+            'pnl_currency':primary['currency'] if primary else (account_currency or None),
+            'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
             'win_rate':round(wins/max(1,wins+losses),3),
@@ -126,16 +145,21 @@ class RuntimeHub:
             },
             'results':{
                 'closed_trades':0,'open_trades_recorded':0,'realized_pnl':0.0,
+                'pnl_currency':None,'pnl_by_currency':{},
                 'wins':0,'losses':0,'win_rate':0.0,'recent_trades':[],
             },
+            'account_currency':None,
         }
         store=None
+        account_currency=None
         if rt and rt.started:
             view=rt.client_view()
             snap=rt.engine.snapshot()
             neural=snap.get('neural') or {}
             evo=view.get('evolution') or {}
             store=rt.store
+            account_currency=((snap.get('account') or {}).get('currency') or '').strip().upper() or None
+            pos=view.get('position') or {}
             card.update({
                 'robot_running':True,
                 'phase':view.get('phase'),
@@ -145,6 +169,7 @@ class RuntimeHub:
                 'armed':bool(view.get('armed')),
                 'scores':view.get('scores') or card['scores'],
                 'action':view.get('action'),
+                'account_currency':account_currency or (pos.get('currency') or None),
                 'evolution':{
                     'generation':int(evo.get('generation') or 0),
                     'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),
@@ -167,6 +192,7 @@ class RuntimeHub:
                     'entry_block_reason':snap.get('entry_block_reason'),
                     'error':view.get('error') or snap.get('error'),
                     'balance':((snap.get('account') or {}).get('balance') or {}),
+                    'currency':account_currency,
                 },
             })
         else:
@@ -176,20 +202,34 @@ class RuntimeHub:
                 try:store=Store(db)
                 except Exception:store=None
         if store is not None:
-            try:card['results']=self._trade_stats(store)
+            try:card['results']=self._trade_stats(store,card.get('account_currency'))
             except Exception:pass
         return card
 
     def admin_overview(self) -> dict:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]
         running=sum(1 for c in clients if c.get('robot_running'))
-        total_pnl=sum(float((c.get('results') or {}).get('realized_pnl') or 0) for c in clients)
         total_closed=sum(int((c.get('results') or {}).get('closed_trades') or 0) for c in clients)
+        # Never add GBP + USD into one number.
+        by_ccy: dict[str,float]={}
+        for c in clients:
+            res=c.get('results') or {}
+            for ccy,val in (res.get('pnl_by_currency') or {}).items():
+                by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(val or 0),4)
+            if not res.get('pnl_by_currency') and res.get('pnl_currency') and res.get('realized_pnl') is not None:
+                ccy=res['pnl_currency']
+                by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(res.get('realized_pnl') or 0),4)
+        primary=None
+        if len(by_ccy)==1:
+            ccy,val=next(iter(by_ccy.items()))
+            primary={'currency':ccy,'realized_pnl':val}
         return {
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
-                'realized_pnl_all':round(total_pnl,4),
+                'realized_pnl_all':primary['realized_pnl'] if primary else None,
+                'pnl_currency':primary['currency'] if primary else None,
+                'pnl_by_currency':by_ccy,
                 'closed_trades_all':total_closed,
             },
             'clients':clients,

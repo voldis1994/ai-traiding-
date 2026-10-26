@@ -79,6 +79,11 @@ class Store:
         candle_columns={r[1] for r in self.db.execute('PRAGMA table_info(candles)')}
         if 'source' not in candle_columns:
             self.db.execute("ALTER TABLE candles ADD COLUMN source TEXT DEFAULT 'QUOTE'")
+        trade_columns={r[1] for r in self.db.execute('PRAGMA table_info(trades)')}
+        # Cash P&L must carry account currency + source so GOLD USD quotes are
+        # never mixed with GBP account profit as if they were the same unit.
+        for name,kind in (('pnl_currency','TEXT'),('pnl_source','TEXT')):
+            if name not in trade_columns:self.db.execute(f'ALTER TABLE trades ADD COLUMN {name} {kind}')
         # Migration from the earlier project's signals table.
         columns={r[1] for r in self.db.execute('PRAGMA table_info(signals)')}
         if 'label' not in columns:self.db.execute('ALTER TABLE signals ADD COLUMN label TEXT')
@@ -114,35 +119,42 @@ class Store:
         self.db.execute('INSERT OR IGNORE INTO trades(deal_id,epic,size,direction,opened,entry) VALUES(?,?,?,?,?,?)',
             (p['dealId'],p['epic'],str(p['size']),p['direction'],now(),_num(p.get('level'))))
         self.db.commit()
-    def close_trade(self,deal_id,exit_price=None,pnl=None):
-        """Persist exit and realized P&L. Explicit pnl overwrites a prior NULL."""
+    def close_trade(self,deal_id,exit_price=None,pnl=None,*,currency=None,source=None,overwrite=False):
+        """Persist exit and realized cash P&L.
+
+        Never invent (exit-entry)*size as account money — GOLD is USD-quoted while
+        Capital.com profit/UPL is in account currency (often GBP). Only store cash
+        when the broker (or an explicit caller) supplies it, with currency+source.
+        overwrite=True lets a later CLOSE confirm replace a mid guess.
+        """
         exit_n=_num(exit_price);pnl_n=_num(pnl)
-        self.db.execute(
-            'UPDATE trades SET closed=COALESCE(closed,?), '
-            'exit=COALESCE(?,exit), '
-            'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END '
-            'WHERE deal_id=?',
-            (now(),exit_n,pnl_n,pnl_n,deal_id))
+        currency=(currency or '').strip().upper() or None
+        source=(source or '').strip() or None
+        if overwrite:
+            self.db.execute(
+                'UPDATE trades SET closed=COALESCE(closed,?), '
+                'exit=CASE WHEN ? IS NOT NULL THEN ? ELSE exit END, '
+                'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END, '
+                'pnl_currency=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_currency END, '
+                'pnl_source=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_source END '
+                'WHERE deal_id=?',
+                (now(),exit_n,exit_n,pnl_n,pnl_n,currency,currency,source,source,deal_id))
+        else:
+            self.db.execute(
+                'UPDATE trades SET closed=COALESCE(closed,?), '
+                'exit=COALESCE(?,exit), '
+                'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END, '
+                'pnl_currency=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_currency END, '
+                'pnl_source=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_source END '
+                'WHERE deal_id=?',
+                (now(),exit_n,pnl_n,pnl_n,currency,currency,source,source,deal_id))
         self.db.commit()
-        # If exit exists but P&L was never supplied, derive a signed price×size proxy
-        # so History is never blank while the machine already learned from the trade.
-        if pnl_n is None:
-            row=self.db.execute(
-                'SELECT entry,exit,direction,size,pnl FROM trades WHERE deal_id=?',
-                (deal_id,)).fetchone()
-            if row and row[4] is None and row[0] is not None and row[1] is not None and row[2] in ('BUY','SELL'):
-                try:
-                    sign=1.0 if row[2]=='BUY' else -1.0
-                    size=float(row[3] or 1)
-                    derived=sign*(float(row[1])-float(row[0]))*size
-                    if math.isfinite(derived):
-                        self.db.execute('UPDATE trades SET pnl=? WHERE deal_id=?',(derived,deal_id))
-                        self.db.commit()
-                except (TypeError,ValueError):pass
     def trades(self,n=150):
-        cols=('deal_id','epic','size','direction','opened','closed','entry','exit','pnl')
+        cols=('deal_id','epic','size','direction','opened','closed','entry','exit','pnl',
+              'pnl_currency','pnl_source')
         rows=[dict(zip(cols,r)) for r in self.db.execute(
-            'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl FROM trades '
+            'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
+            'pnl_currency,pnl_source FROM trades '
             'ORDER BY opened DESC LIMIT ?',(n,))]
         for row in rows:
             if row.get('pnl') is not None:
@@ -870,12 +882,18 @@ class SingleTradeEngine:
         if prev_id and prev_id!=current:
             self.last_closed_step=self.brain.core.steps
             self.latest_close_id=prev_id
-            # Approximate exit from last mid when the deal vanishes without a
-            # CLOSE confirm payload — still enough for signed P&L regret learning.
             exit_guess=_num(self.market.get('mid'))
-            self.store.close_trade(prev_id,exit_guess)
-            self._learn_closed_trade(prev_id,{'level':exit_guess,'source':'position_disappeared'})
-            self.store.event('trade','Previous broker deal no longer open',{'dealId':prev_id})
+            # If our CLOSE confirm is in flight, do NOT learn yet — sync() runs
+            # before confirm profit/level and would train on mid + clear entry_brain.
+            if self.pending_close:
+                self.store.close_trade(prev_id,exit_guess,source='pending_close_sync')
+                self.store.event('trade','Deal closed pending broker confirm P&L',
+                                 {'dealId':prev_id,'exit_guess':exit_guess})
+            else:
+                # External/manual close: learn from ticks; cash P&L only if broker later supplies it.
+                self.store.close_trade(prev_id,exit_guess,source='position_disappeared')
+                self._learn_closed_trade(prev_id,{'level':exit_guess,'source':'position_disappeared'})
+                self.store.event('trade','Previous broker deal no longer open',{'dealId':prev_id})
         if current:
             self.position_age=(self.position_age+1 if current==prev_id else 0)
             self.store.upsert_trade(latest[0])
@@ -1249,40 +1267,53 @@ class SingleTradeEngine:
             self._learn_closed_trade(deal_id,confirmation)
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
+    def _account_currency(self):
+        account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
+        active=next((a for a in account if a.get('preferred') or
+                     a.get('accountId')==self.account.get('currentAccountId')),
+                    account[0] if account else {})
+        cur=(active.get('currency') or '').strip().upper()
+        return cur or None
+
     def _realized_trade_pnl(self,deal_id,entry,exit_level,direction,broker_pnl=None):
-        """Prefer broker cash P&L; else signed (exit-entry)*size for History + learning."""
+        """Prefer broker cash P&L in account currency. Never invent price×size cash.
+
+        GOLD mid is USD-quoted; Capital.com confirm.profit / position.upl are in
+        the account currency (often GBP). (exit-entry)*size looks like dollars
+        and must not be stored as money.
+        """
         if broker_pnl is not None and math.isfinite(broker_pnl):
-            return float(broker_pnl),'broker'
-        row=self.store.db.execute('SELECT size FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
-        try:size=float(row[0]) if row and row[0] is not None else 1.0
-        except (TypeError,ValueError):size=1.0
-        if not math.isfinite(size) or size<=0:size=1.0
-        sign=1.0 if direction=='BUY' else -1.0
-        return sign*(float(exit_level)-float(entry))*size,'price_size'
+            return float(broker_pnl),'broker',self._account_currency()
+        return None,'ticks_only',None
 
     def _learn_closed_trade(self,deal_id,confirmation):
-        """Immediate self-evaluation from a closed trade's signed P&L.
+        """Immediate self-evaluation from a closed trade's signed outcome.
 
         When the trade is a LOSS, the entry-time neural state is trained toward
-        the opposite action (regret) so the machine corrects the decision that
-        just hurt — at trade-close speed, not after an 8-minute market proxy.
-        Wins reinforce the taken direction. Evolution is forced right after.
-        Realized P&L is always written to the trades History table.
+        the opposite action (regret). Wins reinforce. Cash P&L is stored only
+        from broker profit (+ account currency). Without broker profit, learning
+        still uses directional ticks — History cash stays blank rather than fake $.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
         exit_level=_num(confirmation.get('level'))
         broker_pnl=_num(confirmation.get('profit'))
         if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
-        # Even without a saved neural entry state, still record P&L in History.
+        overwrite=confirmation.get('source')!='position_disappeared'
+        # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
             row=self.store.db.execute(
                 'SELECT entry,direction FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
             if row and exit_level is not None and row[0] is not None and row[1] in ('BUY','SELL'):
-                pnl_value,_=self._realized_trade_pnl(deal_id,row[0],exit_level,row[1],broker_pnl)
-                self.store.close_trade(deal_id,exit_level,pnl_value)
+                pnl_value,pnl_source,currency=self._realized_trade_pnl(
+                    deal_id,row[0],exit_level,row[1],broker_pnl)
+                self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
+                                       source=pnl_source,overwrite=overwrite)
             elif exit_level is not None:
-                self.store.close_trade(deal_id,exit_level,broker_pnl)
+                currency=self._account_currency() if broker_pnl is not None else None
+                self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
+                                       source='broker' if broker_pnl is not None else None,
+                                       overwrite=overwrite)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -1293,28 +1324,29 @@ class SingleTradeEngine:
             entry is None or exit_level is None or not tick or tick<=0 or
             direction not in ('BUY','SELL') or not saved.get('transition')):
             if entry is not None and exit_level is not None and direction in ('BUY','SELL'):
-                pnl_value,_=self._realized_trade_pnl(deal_id,entry,exit_level,direction,broker_pnl)
-                self.store.close_trade(deal_id,exit_level,pnl_value)
+                pnl_value,pnl_source,currency=self._realized_trade_pnl(
+                    deal_id,entry,exit_level,direction,broker_pnl)
+                self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
+                                       source=pnl_source,overwrite=overwrite)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic})
             self.store.set(key,None)
             return
         sign=1 if direction=='BUY' else -1
         realized_ticks=sign*(exit_level-entry)/tick
-        pnl_value,pnl_source=self._realized_trade_pnl(deal_id,entry,exit_level,direction,broker_pnl)
+        pnl_value,pnl_source,currency=self._realized_trade_pnl(
+            deal_id,entry,exit_level,direction,broker_pnl)
         if broker_pnl is not None and math.isfinite(broker_pnl):
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
         else:
             pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
         if pnl_sign>0:
-            # Profit: reinforce the action that was taken at entry.
             label=0 if direction=='BUY' else 1
             repeats=2
             mode='reinforce_win'
         elif pnl_sign<0:
-            # Loss: teach the opposite of the mistaken entry (self-critique).
             label=1 if direction=='BUY' else 0
-            repeats=5  # stronger regret so one bad trade moves the network
+            repeats=5
             mode='regret_loss'
         else:
             label=2
@@ -1330,9 +1362,8 @@ class SingleTradeEngine:
                 neuron_ids=transition.get('neuron_ids'))
         self.brain.labeled+=1
         self.brain.correct+=int(pnl_sign>0)
-        # Always persist realized P&L so History shows what the machine learned from.
-        self.store.close_trade(deal_id,exit_level,pnl_value)
-        # Extra growth nudge after each closed trade — faster adaptation.
+        self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
+                               source=pnl_source,overwrite=overwrite)
         if self.brain.core.last_z is not None:
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
@@ -1340,12 +1371,11 @@ class SingleTradeEngine:
         self.brain.save()
         self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
             {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
-             'pnl':pnl_value,'pnl_source':pnl_source,'broker_pnl':broker_pnl,
+             'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
+             'broker_pnl':broker_pnl,
              'realized_directional_ticks':realized_ticks,'target':label,
              'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
              'tick_size':tick})
-        # Evolve at trade tempo — especially after a loss — so policy search
-        # is not still digesting labels from a regime that has already passed.
         try:
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),

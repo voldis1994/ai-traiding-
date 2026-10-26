@@ -154,7 +154,9 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
         assert detail['mode']=='reinforce_win'
         assert detail['target']==1
         assert detail['learn_repeats']==2
-        assert store.trades(1)[0]['pnl']==pytest.approx(0.1)  # SELL 0.5 * 0.2
+        # Without broker profit, cash P&L stays blank (no fake GOLD USD price×size).
+        assert store.trades(1)[0]['pnl'] is None
+        assert detail['pnl_source']=='ticks_only'
         assert store.get('entry_brain:deal1') is None
 
 

@@ -11,35 +11,29 @@
     <header class="brand">
       <div class="mark">⬡</div>
       <h1>Neural Trading AI</h1>
-      <p>Stabils portāls · Admin · Klients · Operators</p>
+      <p>Portāls · Admin · Klients</p>
     </header>
 
     <div id="localWarn" class="warn hidden">
       <strong>Lokālā adrese</strong>
-      <span><code>127.0.0.1</code> klientiem neder. Lai sūtītu <code>/app</code> citiem:
-      palaid <code>run_public_tunnel_windows.bat</code> (ngrok) vai deploy uz Render —
-      skati <code>KLIENTA_SAITE_LV.md</code>.</span>
+      <span><code>127.0.0.1</code> klientiem neder. Klientam sūti publisko
+      <code>https://…onrender.com/app</code> (skati <code>KLIENTA_SAITE_LV.md</code>).</span>
     </div>
 
     <nav class="cards">
-      <a class="card" href="/app">
-        <span class="eyebrow">Klients</span>
-        <strong>/app</strong>
-        <em>Mobilā web: valoda, 1. manuālais treids, robots. Šo ceļu sūti klientam uz publisko URL.</em>
-      </a>
       <a class="card" href="/admin">
         <span class="eyebrow">Admin</span>
         <strong>/admin</strong>
-        <em>Izveido login/paroles un pieslēdz brokeru API (reģistrācija)</em>
+        <em>Tikai admin login + parole. Šeit izveido klientus un pieslēdz brokeru API (klients API neredz).</em>
       </a>
-      <a class="card" href="/console">
-        <span class="eyebrow">Operators</span>
-        <strong>/console</strong>
-        <em>Capital.com LIVE dashboard — tavs operatora konts (nav klienta panelis)</em>
+      <a class="card" href="/app">
+        <span class="eyebrow">Klients</span>
+        <strong>/app</strong>
+        <em>Mobilā web klientam: valoda, 1. manuālais treids, robots. Bez API atslēgām.</em>
       </a>
     </nav>
     <footer>
-      <span>URL ceļi nemainās pēc deploy · bez sava domēna: ngrok vai Render</span>
+      <span>API atslēgas tikai /admin · klientam tikai /app</span>
       <span id="health">…</span>
     </footer>
   </main>
@@ -47,7 +41,7 @@
     const local=location.hostname==='127.0.0.1'||location.hostname==='localhost';
     if(local)document.getElementById('localWarn').classList.remove('hidden');
     fetch('/api/health').then(r=>r.json()).then(h=>{
-      const base=h.public_url|| (local?'(lokāli — nav publiskas saites)':location.origin);
+      const base=h.public_url|| (local?'(lokāli)':location.origin);
       document.getElementById('health').textContent=
         (h.running_robots||0)+' roboti · '+(h.clients||0)+' klienti · '+base;
     }).catch(()=>{});

@@ -208,7 +208,9 @@ def _set_session_cookie(response:JSONResponse,name:str,value:str):
 async def portal_home():return FileResponse(WEB/'portal.html')
 
 @app.get('/console')
-async def operator_console():return FileResponse(WEB/'index.html')
+async def operator_console():
+    # Legacy Capital.com API login removed from the public UX — admin owns broker APIs.
+    return RedirectResponse('/admin', status_code=302)
 
 @app.get('/admin')
 async def admin_page():return FileResponse(WEB/'admin'/'index.html')
@@ -331,7 +333,7 @@ async def logout(_:bool=Depends(require_auth)):
 @app.get('/api/health')
 async def health():
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
-            'portals':{'home':'/','operator':'/console','admin':'/admin','client':'/app'},
+            'portals':{'home':'/','operator':'/admin','admin':'/admin','client':'/app'},
             'public_url':public_base_url(),
             'secure_cookies':cookie_secure(),
             'clients':len(platform.list_clients()),

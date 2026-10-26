@@ -64,10 +64,13 @@ function render(data){
   const state=data.state;const signal=state.signal||{};const scores=signal.scores||{BUY:0,SELL:0,HOLD:0};const position=state.positions?.[0];const quote=state.market||{};const neural=state.neural||{};const mandate=state.mandate;
   const bal=state.account?.balance||{},curr=state.account?.currency||'';
   setText('balance',money(bal.balance,curr));setText('equity',money(bal.available,curr));setText('pnl',money(position?.upl,curr));
+  setText('pnlSub',position?'Open position':'No open position');
   setText('confidence',signal.confidence!=null?(signal.confidence*100).toFixed(1)+'%':'—');setText('signalBrief',signal.action?signal.action+' · uncalibrated score':'Waiting for prices');
   setText('connection',state.error?'◌ MARKET CONNECTION ISSUE':'● CAPITAL.COM CONNECTED');
   setText('accountId',state.account?.accountId||'—');setText('execute',state.execution_enabled?'AUTOMATIC LIVE':'PAUSED');setText('robotState',state.armed?'RUNNING':'PAUSED');setText('ticks',state.tick_count);
-  setText('epic',mandate?.epic||'WAITING FOR MOBILE TRADE');setText('size',mandate?'ADOPTED SIZE: '+mandate.size:'Instrument and lot size will be adopted automatically');setText('marketStatus',quote.status||'—');
+  setText('epic',mandate?.epic||(position?'ADOPTING OPEN POSITION…':'WAITING FOR MOBILE TRADE'));
+  setText('size',mandate?'ADOPTED SIZE: '+mandate.size:(position?'Broker position seen — waiting for epic/size adoption':'Instrument and lot size will be adopted automatically'));
+  setText('marketStatus',quote.status||'—');
   setText('mid',small(quote.mid));setText('bidask',`BID ${small(quote.bid)}  /  ASK ${small(quote.ask)}`);setText('chartEpic',quote.epic||'—');
   const action=signal.action||'HOLD';setText('decision',action);$('decision').className='signal-value '+action.toLowerCase();
   setHtml('scores',Object.entries(scores).map(([key,value])=>`<div class="scorebar"><header><span>${key}</span><span>${(value*100).toFixed(1)}%</span></header><div class="track"><span style="width:${Math.max(0,Math.min(100,value*100))}%"></span></div></div>`).join(''));

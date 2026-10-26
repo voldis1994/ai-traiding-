@@ -645,13 +645,40 @@ class SingleTradeEngine:
                              {'previous_epic':previous})
             return {'ok':True,'previous_epic':previous,'next_step':'Open first trade manually on Capital.com'}
 
+    @staticmethod
+    def _normalize_direction(value):
+        if value is None:return None
+        text=str(value).strip().upper()
+        if text in ('BUY','SELL'):return text
+        if text in ('LONG','B'):return 'BUY'
+        if text in ('SHORT','S'):return 'SELL'
+        return None
+
+    @staticmethod
+    def _extract_epic(position,market):
+        """Capital.com usually puts epic under market; some payloads only have symbol."""
+        for source in (market,position):
+            if not isinstance(source,dict):continue
+            for key in ('epic','symbol','instrumentEpic'):
+                value=source.get(key)
+                if isinstance(value,str) and value.strip():
+                    return value.strip()
+        return None
+
     def _map_positions(self,data):
         out=[]
-        for raw in data:
-            p=raw.get('position',{});m=raw.get('market',{})
-            out.append({'dealId':p.get('dealId'),'epic':m.get('epic') or p.get('epic'),
-                'size':p.get('size'),'direction':p.get('direction'),'level':p.get('level'),
-                'stopLevel':p.get('stopLevel'),'profitLevel':p.get('profitLevel') if p.get('profitLevel') is not None else p.get('limitLevel'),
+        for raw in data or []:
+            if not isinstance(raw,dict):continue
+            p=raw.get('position') if isinstance(raw.get('position'),dict) else raw
+            m=raw.get('market') if isinstance(raw.get('market'),dict) else {}
+            direction=self._normalize_direction(p.get('direction'))
+            epic=self._extract_epic(p,m)
+            out.append({'dealId':p.get('dealId') or p.get('dealID'),
+                'epic':epic,
+                'instrument_name':m.get('instrumentName') or p.get('instrumentName'),
+                'size':p.get('size'),'direction':direction,'level':p.get('level'),
+                'stopLevel':p.get('stopLevel'),
+                'profitLevel':p.get('profitLevel') if p.get('profitLevel') is not None else p.get('limitLevel'),
                 'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
         return out
     @staticmethod
@@ -719,9 +746,41 @@ class SingleTradeEngine:
             self.armed=True;self.execution_enabled=True
         return not self._unresolved_at_login
 
+    async def _fill_missing_epic(self,mapped):
+        """If positions lack epic but have a name, resolve via Capital.com search."""
+        if len(mapped)!=1:return mapped
+        row=mapped[0]
+        if row.get('epic') or not row.get('instrument_name'):return mapped
+        if not hasattr(self.broker,'search_markets'):return mapped
+        try:
+            payload=await self.broker.search_markets(str(row['instrument_name']))
+            markets=payload.get('markets') if isinstance(payload,dict) else None
+            if not isinstance(markets,list):return mapped
+            name=str(row['instrument_name']).strip().lower()
+            for market in markets:
+                if not isinstance(market,dict):continue
+                epic=market.get('epic')
+                label=str(market.get('instrumentName') or '').strip().lower()
+                if epic and (label==name or name in label or label in name):
+                    row={**row,'epic':str(epic).strip()}
+                    return [row]
+            # Fall back to the first searchable epic rather than staying stuck.
+            for market in markets:
+                epic=market.get('epic') if isinstance(market,dict) else None
+                if epic:
+                    row={**row,'epic':str(epic).strip()}
+                    self.store.event('reconcile','Resolved missing epic via market search',
+                        {'instrument_name':row.get('instrument_name'),'epic':row['epic']})
+                    return [row]
+        except Exception as exc:
+            self.store.event('warning','Could not resolve epic for open position',
+                             {'type':type(exc).__name__,'instrument_name':row.get('instrument_name')})
+        return mapped
+
     async def sync(self):
         if not self.broker:raise RuntimeError('Not connected')
         latest=self._map_positions(await self.broker.positions())
+        latest=await self._fill_missing_epic(latest)
         prev_id=self.last_position_id
         self.positions=latest
         if len(latest)>1:
@@ -745,8 +804,11 @@ class SingleTradeEngine:
             self.store.upsert_trade(latest[0])
         else:self.position_age=0
         self.last_position_id=current
-        # Any NEW external/mobile position becomes the operator's latest mandate.
-        # An order created by this process is not a new manual mandate.
+        # Live open position → this session's instrument/size mandate.
+        # After login, mandate is intentionally empty; the first valid broker
+        # position must be adopted even if an old robot_open marker remains in
+        # SQLite from a previous process (that marker used to leave the UI stuck
+        # on WAITING FOR MOBILE TRADE while UPL already showed an open deal).
         if len(latest)==1:
             p=latest[0]
             deal_id=p.get('dealId')
@@ -754,18 +816,17 @@ class SingleTradeEngine:
             except (ValueError,TypeError,ArithmeticError): size=Decimal(0)
             valid=bool(deal_id and p.get('epic') and p.get('direction') in ('BUY','SELL')
                        and size.is_finite() and size>0)
-            # A confirmed bot deal (including after restart) must not override
-            # the last operator sizing reference or require a new manual close.
             own_order=bool(deal_id and self.store.get('robot_open:'+str(deal_id)))
             open_in_flight=bool(self.pending_order or any(
                 op['kind']=='OPEN' for op in self.store.unresolved()))
-            is_new_manual=(valid and not own_order and not open_in_flight and
-                (not self.mandate or deal_id!=self.mandate.get('last_manual_deal_id',
-                                                     self.mandate.get('initial_deal_id'))) and
-                deal_id!=self.store.get('latest_robot_deal_id'))
-            # While a bot-managed deal is open, its presence is not an invitation
-            # to re-adopt a new instrument or alter the operator's selected size.
-            if is_new_manual:
+            already_this_deal=(self.mandate is not None and
+                deal_id==self.mandate.get('last_manual_deal_id',self.mandate.get('initial_deal_id')))
+            # Fresh session: adopt whatever single live deal the broker reports.
+            # Mid-session: adopt only a NEW non-robot manual deal.
+            should_adopt=(valid and not open_in_flight and not already_this_deal and
+                          (self.mandate is None or (not own_order and
+                           deal_id!=self.store.get('latest_robot_deal_id'))))
+            if should_adopt:
                 old=self.mandate
                 self.mandate={'epic':p['epic'],'size':str(p['size']),
                               'initial_deal_id':deal_id,'last_manual_deal_id':deal_id}
@@ -788,9 +849,19 @@ class SingleTradeEngine:
                     self.last_calendar_refresh=0.;self.calendar_feed_error=None
                     self.market={}
                 self.store.set('mandate',self.mandate)
-                self.store.event('adoption','New manual position adopted; instrument and size updated',
+                self.store.event('adoption','Live broker position adopted for this session',
                     {'deal_id':deal_id,'epic':p['epic'],'size':str(p['size']),
-                     'previous_epic':old['epic'] if old else None})
+                     'direction':p.get('direction'),
+                     'previous_epic':old['epic'] if old else None,
+                     'fresh_session':old is None})
+            elif self.mandate is None and latest:
+                # Surface why WAITING FOR MOBILE TRADE persists despite an open deal.
+                self.store.event('warning','Open broker position not adopted yet',
+                    {'deal_id':deal_id,'epic':p.get('epic'),
+                     'instrument_name':p.get('instrument_name'),
+                     'direction':p.get('direction'),'size':p.get('size'),
+                     'valid':valid,'own_order_marker':own_order,
+                     'open_in_flight':open_in_flight})
         # The mandate's size is a cached sizing reference, not evidence of the
         # currently open position. On every broker sync (including restart),
         # refresh it from the actual single open position of the authorized

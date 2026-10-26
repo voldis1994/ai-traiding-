@@ -72,11 +72,12 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
             restarted=SingleTradeEngine(store,brain)
             restarted.attach(broker)
             await restarted.sync()
-            # Restart clears cached adoptive size. An open ROBOT deal is not a
-            # new manual authorization — operator must open a fresh manual trade
-            # before the next autonomous entry may use a size.
-            assert restarted.mandate is None
-            assert store.get('mandate') is None
+            # Restart clears SQLite mandate, then re-adopts the LIVE open deal
+            # for THIS session (size/epic from broker — not the old cache).
+            assert restarted.mandate is not None
+            assert str(restarted.mandate['size']) in ('.5','0.5')
+            assert restarted.mandate['initial_deal_id']=='b2'
+            assert restarted.last_closed_step==-1
             assert restarted.positions and restarted.positions[0]['dealId']=='b2'
     asyncio.run(scenario())
 

@@ -157,6 +157,8 @@ class RuntimeHub:
             snap=rt.engine.snapshot()
             neural=snap.get('neural') or {}
             evo=view.get('evolution') or {}
+            try:policy_info=rt.engine.policy.info() if rt.engine.policy else {}
+            except Exception:policy_info={}
             store=rt.store
             account_currency=((snap.get('account') or {}).get('currency') or '').strip().upper() or None
             pos=view.get('position') or {}
@@ -171,7 +173,7 @@ class RuntimeHub:
                 'action':view.get('action'),
                 'account_currency':account_currency or (pos.get('currency') or None),
                 'evolution':{
-                    'generation':int(evo.get('generation') or 0),
+                    'generation':int(evo.get('generation') or policy_info.get('generation') or 0),
                     'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),
                     'neurons':neural.get('neurons'),
                     'steps':int(neural.get('steps') or 0),
@@ -181,7 +183,9 @@ class RuntimeHub:
                     'loss':neural.get('loss'),
                     'smoothed_error':neural.get('smoothed_error'),
                     'utility_mean':neural.get('utility_mean'),
-                    'strategy':evo.get('strategy'),
+                    'strategy':evo.get('strategy') or policy_info.get('strategy'),
+                    'attempts':int(policy_info.get('attempts') or evo.get('attempts') or 0),
+                    'last_reason':policy_info.get('last_reason') or evo.get('last_reason'),
                 },
                 'activity':{
                     'tick_count':int(view.get('tick_count') or snap.get('tick_count') or 0),

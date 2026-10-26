@@ -515,6 +515,7 @@ class SingleTradeEngine:
         self.last_entry_signal_step=-1;self.last_order_ref=None
         self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
         self.pending_order=False;self.pending_close=False;self.lock=asyncio.Lock()
+        self._pending_entry_brain=None  # neural state at the decision that opened the trade
         self.last_time=None;self.last_account_tick=0;self.last_candle_tick=-20
         self.policy=AutoEvolution(store);self.tick_count=0;self.latest_close_id=None
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
@@ -1132,16 +1133,22 @@ class SingleTradeEngine:
             else:
                 self.latest_fusion_ready=False
                 self.last_signal=None  # Never trade stale/incomplete OHLC context.
-            # Associate an entry-time neural state with this deal for delayed
-            # trade-outcome feedback after the broker confirms a closing level.
-            if len(self.positions)==1 and self.brain.core.last_transition:
+            # Bind the decision-time neural state (captured in submit) to the deal.
+            # Fallback: only if we never captured at entry (e.g. manual adopt).
+            if len(self.positions)==1:
                 p=self.positions[0];key='entry_brain:'+str(p['dealId'])
-                if self.store.get(key) is None:
+                if self.store.get(key) is None and self._pending_entry_brain:
+                    pending=self._pending_entry_brain
+                    if pending.get('direction')==p.get('direction') and pending.get('epic')==p.get('epic'):
+                        self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry')})
+                        self._pending_entry_brain=None
+                elif self.store.get(key) is None and self.brain.core.last_transition:
                     tr=self.brain.core.last_transition
                     if len(tr['h'])==self.brain.core.n:
                         self.store.set(key,{'epic':p['epic'],'direction':p['direction'],
                             'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
-                            'transition':self.brain._json_transition(tr)})
+                            'transition':self.brain._json_transition(tr),
+                            'captured':'poll_fallback'})
             if new_closed_bar and self.brain.labeled:
                 self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
             if not self.armed or not self.execution_enabled:return
@@ -1513,6 +1520,15 @@ class SingleTradeEngine:
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
             brackets=stop_take(entry,action,tick,spread,minimum)
+            # Snapshot the neural state that voted for THIS entry — not a later bar.
+            if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
+                self._pending_entry_brain={
+                    'epic':self.mandate['epic'],'direction':action,'entry':entry,
+                    'tick_size':tick,'entry_spread':spread,
+                    'transition':self.brain._json_transition(self.brain.core.last_transition),
+                    'scores':(self.last_signal or {}).get('scores'),
+                    'bar_time':self.last_decision_bar,'captured':'submit',
+                }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
                 'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance'])})
@@ -1522,9 +1538,18 @@ class SingleTradeEngine:
                     stop_distance=brackets['stop_distance'],profit_distance=brackets['profit_distance'])
                 self.last_order_ref=receipt.get('dealReference')
                 await self._confirm_reconcile(receipt,oid,'OPEN')
+                if self.positions and self._pending_entry_brain:
+                    deal_id=self.positions[0].get('dealId')
+                    key='entry_brain:'+str(deal_id)
+                    if deal_id and self.store.get(key) is None:
+                        pending=self._pending_entry_brain
+                        self.store.set(key,{**pending,
+                            'entry':self.positions[0].get('level') if self.positions[0].get('level') is not None else pending.get('entry')})
+                    self._pending_entry_brain=None
             except Exception as exc:
                 self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
                 self.execution_enabled=False;self.armed=False
+                self._pending_entry_brain=None
                 self.store.event('error','Entry outcome uncertain; no automatic retry',{'type':type(exc).__name__})
         finally:self.pending_order=False
     def snapshot(self):

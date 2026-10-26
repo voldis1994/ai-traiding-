@@ -40,11 +40,13 @@ https://neural-trading-ai.onrender.com
 
 Ja vārds `neural-trading-ai` jau aizņemts — Render ļaus citu servisa nosaukumu; tad URL būs `https://<tavs-nosaukums>.onrender.com` un to ieliec arī env `NTA_PUBLIC_URL`.
 
-### Brīdinājumi (free)
+### Brīdinājumi (dati!)
 
-- Free serviss **aizmieg** pēc ~15 min bez aktivitātes → pirmā ielāde var aizņemt 30–60 s (pēc tam ātri).
-- Free bieži **bez pastāvīga diska** → pēc liela redeploy klientu dati var pazust; tad upgrade uz **Starter** + disk `/data` (skati `DEPLOY_LV.md`).
-- Live tirdzniecībai 24/7 labāk Starter (neiet gulēt).
+- **Klienti + history** dzīvo `/data` (`platform.sqlite3`, `accounts/…`).
+- Bez **Render Disk** uz `/data` Manual Deploy / restart **var dzēst** visus klientus un treidu history.
+- Dari: Render → serviss → **Disks** → Mount path `/data`, size 1 GB (parasti vajag **Starter**, ne free).
+- `NTA_SECRET_KEY` **nemaini** pēc tam, kad klienti jau izveidoti (citādi brokeru API atšifrēšana lūzt).
+- Free arī **aizmieg** ~15 min → pirmā ielāde 30–60 s.
 
 ---
 

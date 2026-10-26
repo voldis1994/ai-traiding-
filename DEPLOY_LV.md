@@ -15,16 +15,20 @@ Mērķis: **viens stabils URL**, ceļi nekad nemainās:
 
 ## Varianti
 
-### A) Render (ieteicams, vienkārši)
+### A) Render (ieteicams — bezmaksas stabils URL)
+
+Render iedod **nemainīgu** adresi bez pirkta domēna, piem.:
+`https://neural-trading-ai.onrender.com`
 
 1. Push `main` uz GitHub
-2. [Render](https://render.com) → **New → Blueprint** → izvēlies repo (`render.yaml`)
-3. Iestatī env:
-   - `NTA_ADMIN_PASSWORD` = tava stiprā parole
-   - `NTA_PUBLIC_URL` = `https://<tavs-serviss>.onrender.com`
-4. Pēc deploy klientiem iedod: `https://<tavs-serviss>.onrender.com/app`
+2. [Render](https://render.com) → **New → Blueprint** → repo + `render.yaml`
+3. Env: `NTA_ADMIN_PASSWORD` = tava stiprā parole  
+   (`NTA_PUBLIC_URL` jau ir blueprintā)
+4. Klientiem: `https://neural-trading-ai.onrender.com/app`
 
-**Savs domēns (URL nemainās):** Render → Custom Domain → `trading.tavsdomens.lv`  
+Īsie soļi: **`KLIENTA_SAITE_LV.md`**.
+
+**Savs domēns (nav obligāts):** Render → Custom Domain → `trading.tavsdomens.lv`  
 Tad `NTA_PUBLIC_URL=https://trading.tavsdomens.lv`
 
 ### B) Docker (VPS / jebkur)

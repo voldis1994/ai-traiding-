@@ -1,49 +1,64 @@
 # Klienta web adrese (BEZ sava domēna)
 
-`127.0.0.1` / `localhost` **nedrīkst** sūtīt klientiem — tas strādā tikai tavā datorā.
+`127.0.0.1` klientiem neder.
 
-Tevis jau ir pareizie ceļi:
-- `/admin` — reģistrācija (pareizi)
-- `/app` — klienta web
-- `/console` — **Operators** (Capital.com login) — tas NAV “vecais admin”, tā ir tava operatora konsoles
-
----
-
-## A) ĀTRI tagad (tunelis, bez domēna)
-
-Kamēr tavs `run_windows.bat` logs ir atvērts:
-
-1. Otrajā CMD:
-```bat
-winget install ngrok.ngrok
-```
-2. Izveido bezmaksas kontu: https://dashboard.ngrok.com/signup  
-3. Nokopē Authtoken un CMD:
-```bat
-ngrok config add-authtoken TAVA_TOKENA_VERTIBA
-cd /d C:\NeuralTradingAI_NEW
-run_public_tunnel_windows.bat
-```
-4. Ngrok logā būs rinda tipa:
-`Forwarding  https://xxxx.ngrok-free.app -> http://127.0.0.1:8765`
-5. **Klientam sūti:**
-`https://xxxx.ngrok-free.app/app`  
-+ login/paroli no `/admin`
-
-**Svarīgi:** klients redz lapu tikai kamēr tavs dators un robots strādā.
+| Ceļš | Kas |
+|------|-----|
+| `/admin` | Reģistrācija (pareizi) |
+| `/app` | Klienta web — **šo sūti** |
+| `/console` | Operators (Capital.com) — NAV klienta panelis |
 
 ---
 
-## B) PASTĀVĪGI (Render, arī BEZ sava domēna)
+## Nemainīga bezmaksas adrese (ieteicams)
 
-Render **pats iedod** adresi `https://….onrender.com` — domēnu pirkt nevajag.
+**Render** pats iedod:
+```
+https://neural-trading-ai.onrender.com
+```
+- Domēnu **pirkt nevajag**
+- Adrese **nemainās**, ja restartē sistēmu / redeploy
+- Klientam vienmēr: `https://neural-trading-ai.onrender.com/app`
 
-1. https://render.com → Sign up with GitHub  
-2. **New → Blueprint** → repo `voldis1994/ai-traiding-`  
-3. Env:
-   - `NTA_ADMIN_PASSWORD` = tava stiprā parole  
-   - `NTA_PUBLIC_URL` = (pēc deploy ieliec to `https://….onrender.com`)  
-4. Deploy → kopē servisa URL  
-5. Klientam: `https://….onrender.com/app`
+### Soli pa solim
 
-Detalizētāk: `DEPLOY_LV.md`
+1. Atver https://render.com → **Sign up with GitHub** (tas pats konts, kur `voldis1994/ai-traiding-`)
+2. Dashboard → **New +** → **Blueprint**
+3. Izvēlies repo **`voldis1994/ai-traiding-`**, branch **`main`**
+4. Apstiprini servisu `neural-trading-ai` (free)
+5. Env **`NTA_ADMIN_PASSWORD`** → ieraksti **savu** stipro admin paroli (neģenerē nejaušu, ja gribi zināt)
+6. **Apply** / Create → gaidi ~5–10 min (Build)
+7. Kad Status = **Live**, atver:
+   - Admin: `https://neural-trading-ai.onrender.com/admin`
+   - Klients: `https://neural-trading-ai.onrender.com/app`
+8. `/admin` → izveido klientu + pieslēdz brokeru API  
+9. Klientam sūti **tikai**:
+   ```
+   https://neural-trading-ai.onrender.com/app
+   ```
+   + login + parole
+
+Ja vārds `neural-trading-ai` jau aizņemts — Render ļaus citu servisa nosaukumu; tad URL būs `https://<tavs-nosaukums>.onrender.com` un to ieliec arī env `NTA_PUBLIC_URL`.
+
+### Brīdinājumi (free)
+
+- Free serviss **aizmieg** pēc ~15 min bez aktivitātes → pirmā ielāde var aizņemt 30–60 s (pēc tam ātri).
+- Free bieži **bez pastāvīga diska** → pēc liela redeploy klientu dati var pazust; tad upgrade uz **Starter** + disk `/data` (skati `DEPLOY_LV.md`).
+- Live tirdzniecībai 24/7 labāk Starter (neiet gulēt).
+
+---
+
+## Ātri lokāli (adrese MAINĀS katru reizi)
+
+Ngrok: `run_public_tunnel_windows.bat` — der testam, **nav** stabils domēns.
+
+---
+
+## Kas NAV “bezmaksas domēns, kas nekad nemainās”
+
+| Variants | Stabils? |
+|----------|----------|
+| `127.0.0.1` | Nē — tikai tavs PC |
+| Ngrok free | Nē — jauns URL pēc restart |
+| **Render `*.onrender.com`** | **Jā** — kamēr serviss dzīvs |
+| Savs domēns (pirkts) | Jā — nav obligāts |

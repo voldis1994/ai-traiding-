@@ -1,10 +1,11 @@
-# Render Blueprint — stable paths: /  /app  /admin  /console
-# Dashboard → New → Blueprint → select this repo.
+# Render Blueprint — stabils URL BEZ sava domēna:
+#   https://neural-trading-ai.onrender.com
+# Dashboard → New → Blueprint → šis repo. Adrese nemainās pēc restart.
 services:
   - type: web
     name: neural-trading-ai
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /api/health
     envVars:
       - key: NTA_PRODUCTION
@@ -14,14 +15,12 @@ services:
       - key: NTA_ADMIN_USER
         value: admin
       - key: NTA_ADMIN_PASSWORD
-        generateValue: true
+        sync: false
       - key: NTA_SECRET_KEY
         generateValue: true
       - key: NTA_PUBLIC_URL
-        sync: false
+        value: https://neural-trading-ai.onrender.com
       - key: NEURAL_AI_DATA_DIR
         value: /data
-    disk:
-      name: nta-data
-      mountPath: /data
-      sizeGB: 1
+    # Persistents disks: Render free bieži to neļauj.
+    # Kad vajag saglabāt klientus pēc redeploy — upgrade uz Starter un pievieno disk /data.

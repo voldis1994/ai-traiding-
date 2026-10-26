@@ -72,8 +72,12 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
             restarted=SingleTradeEngine(store,brain)
             restarted.attach(broker)
             await restarted.sync()
-            assert restarted.mandate['last_manual_deal_id']=='m2'
-            assert restarted.mandate['size']=='.5'
+            # Restart clears cached adoptive size. An open ROBOT deal is not a
+            # new manual authorization — operator must open a fresh manual trade
+            # before the next autonomous entry may use a size.
+            assert restarted.mandate is None
+            assert store.get('mandate') is None
+            assert restarted.positions and restarted.positions[0]['dealId']=='b2'
     asyncio.run(scenario())
 
 

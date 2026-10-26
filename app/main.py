@@ -13,6 +13,7 @@ from pydantic import BaseModel,Field
 from .broker import CapitalBroker
 from .stream import CapitalQuoteStream
 from .engine import Store,AdaptiveBrain,SingleTradeEngine
+from .storage import DATA
 
 store=Store();brain=AdaptiveBrain(store);engine=SingleTradeEngine(store,brain)
 SESSION=secrets.token_urlsafe(48)
@@ -142,8 +143,11 @@ async def connect(data:Credentials):
     except Exception as exc:
         await candidate.close();engine.broker=None
         raise HTTPException(502,'Broker position reconciliation failed') from exc
-    store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized')
-    response=JSONResponse({'ok':True,'live':True,'automatic':True})
+    store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized',
+                {'data_dir':str(DATA),'sqlite':str(store.path),
+                 'mandate_requires_new_manual_trade':engine.mandate is None})
+    response=JSONResponse({'ok':True,'live':True,'automatic':True,
+                           'data_dir':str(DATA),'mandate':engine.mandate})
     response.set_cookie(COOKIE,SESSION,httponly=True,samesite='strict',secure=False,path='/')
     return response
 
@@ -222,6 +226,8 @@ async def logout(_:bool=Depends(require_auth)):
     engine.armed=False;engine.execution_enabled=False
     if engine.broker:await engine.broker.close()
     engine.broker=None;engine.mandate=None
+    # Drop durable sizing authorization so the next login cannot reuse old lots.
+    store.set('mandate',None)
     response=JSONResponse({'ok':True});response.delete_cookie(COOKIE);return response
 
 @app.get('/api/health')

@@ -597,24 +597,21 @@ class SingleTradeEngine:
         self.protection_brief={'status':'Waiting for robot-opened position'}
         self.last_protection_bar=None
         self._unresolved_at_login=bool(self.store.unresolved())
-        # A confirmed initial manual trade remains the owner's authorization
-        # after a routine app/browser reconnect. Only resume if the *same* deal
-        # has a durable locally confirmed close; never infer closure solely
-        # because the broker currently reports zero positions.
+        # Session start MUST NOT reuse a cached adoptive size from SQLite.
+        # Size/EPIC authorization is valid only after a live broker position is
+        # adopted in THIS login. Stale mandate rows caused restarts to keep
+        # trading the old lots without a fresh manual confirmation.
         saved=self.store.get('mandate')
-        if (isinstance(saved,dict) and saved.get('epic') and
-            saved.get('initial_deal_id') and saved.get('size')):
-            closed=self.store.db.execute(
-                'SELECT closed,epic,size FROM trades WHERE deal_id=?',
-                (saved['initial_deal_id'],)).fetchone()
-            if (closed and closed[0] is not None and closed[1]==saved['epic']
-                and Decimal(str(saved['size']))>0):
-                self.mandate=saved
-                self._seen_initial=True
-                self.last_closed_step=self.brain.core.steps
-                self.store.event('reconcile',
-                    'Confirmed closed initial manual trade restored after reconnect',
-                    {'epic':saved['epic'],'deal_id':saved['initial_deal_id']})
+        if isinstance(saved,dict) and (saved.get('epic') or saved.get('size')):
+            self.store.set('mandate',None)
+            self.store.event('reconcile',
+                'Previous adoptive size cleared on login; open a new manual trade to authorize',
+                {'previous_epic':saved.get('epic'),'previous_size':saved.get('size'),
+                 'previous_deal_id':saved.get('initial_deal_id') or saved.get('last_manual_deal_id'),
+                 'data_dir':str(self.store.path.parent)})
+        self.mandate=None
+        self._seen_initial=False
+        self.last_closed_step=-1
         if self._unresolved_at_login:
             self.execution_enabled=False;self.store.event('warning','Previous order outcome unresolved; waiting for reconciliation')
     async def prepare_new_instrument(self):
@@ -1326,7 +1323,8 @@ class SingleTradeEngine:
         decision=(self.policy.neural_decision(self.last_signal['scores'],self.positions[0]['direction'])
             if self.last_signal else 'HOLD') if self.positions else evaluation['action']
         return {'connected':bool(self.broker),'armed':self.armed,'execution_enabled':self.execution_enabled,
-                'mandate':self.mandate,'positions':self.positions,'market':self.market,'signal':self.last_signal,
+                'mandate':self.mandate,'data_dir':str(self.store.path.parent),
+                'positions':self.positions,'market':self.market,'signal':self.last_signal,
                 'neural':dict(self.brain.core.snapshot(),feature_schema=self.brain.feature_schema,
                     input_dimension=self.brain.core.d,
                     external_features_learned=(self.brain.feature_schema==FUSION_SCHEMA),
@@ -1369,8 +1367,9 @@ class SingleTradeEngine:
                 'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
                     'Unresolved broker operation' if self.store.unresolved() else
                     'Existing open position' if self.positions else
-                    'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
+                    'No adoptive size this session — open a new manual trade' if not self.mandate else
                     'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
+                    'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
                     'Waiting for aligned external neural inputs' if self.brain.feature_schema==FUSION_SCHEMA else

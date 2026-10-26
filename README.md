@@ -48,4 +48,6 @@ python -m pytest -q
 - LIVE lēmums = **neironu argmax** (BUY/SELL/HOLD), ne vecie 60%/MIN_EDGE vārti
 - Background labels = **nākamā M1** svece; pēc aizvērta treida — **P&L pašnovērtējums** (mīnuss → regret)
 - Evolūcija pēc treida (`force`), lai nesekotu novecojušam režīmam
+- **Pēc restarta / login:** vecais adoptive size **netiek** atjaunots no SQLite — jāatver **jauna manuāla** pozīcija
+- Datubāze: source run → `data/`; Windows EXE → `%LOCALAPPDATA%\NeuralTradingAI` (login event rāda `data_dir`)
 - Riskē tikai naudu, ko vari zaudēt

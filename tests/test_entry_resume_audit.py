@@ -29,7 +29,8 @@ def test_directional_sampling_does_not_alias_every_eighth_minute():
         assert evidence['precision']==1
 
 
-def test_manual_close_restores_mandate_only_when_durably_confirmed():
+def test_restart_clears_cached_adoptive_size_even_after_confirmed_close():
+    """Restart must not keep trading the old lots from SQLite mandate."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'robot.sqlite3')
@@ -39,33 +40,45 @@ def test_manual_close_restores_mandate_only_when_durably_confirmed():
             broker=BrokerSimulation()
             e.attach(broker)
             await e.sync()  # adopt initial manual trade
-            assert e.mandate and e.last_closed_step==-1
-            # Restarting while the manual trade is still open cannot grant
-            # autonomous-entry authorization.
-            fresh=SingleTradeEngine(store,brain)
-            fresh.attach(broker)
-            assert fresh.mandate is None and fresh.last_closed_step==-1
+            assert e.mandate and e.mandate['size']==str(broker.open[0]['position']['size'])
+            assert e.last_closed_step==-1
             broker.open=[]
             await e.sync()  # broker-confirmed manual close, persisted to SQLite
             assert store.trades()[0]['closed'] is not None
+            assert store.get('mandate') is not None
+            # Fresh login: cached adoptive size MUST be wiped.
+            fresh=SingleTradeEngine(store,brain)
             fresh.attach(broker)
-            assert fresh.mandate['initial_deal_id']=='m1'
-            assert fresh.last_closed_step==brain.core.steps
+            assert fresh.mandate is None and fresh.last_closed_step==-1
+            assert store.get('mandate') is None
+            assert any('Previous adoptive size cleared on login' in ev['message']
+                       for ev in store.recent())
+            assert fresh.snapshot()['entry_block_reason']=='No adoptive size this session — open a new manual trade'
+            # A NEW live manual position is required to authorize size again.
+            broker.open=[{'position':{'dealId':'m2','epic':'SIM','size':'.10',
+                'direction':'BUY','level':100.},
+                'market':{'epic':'SIM','bid':99.9,'ask':100.1,'instrumentName':'Sim'}}]
             await fresh.sync()
-            assert fresh.mandate['epic']=='SIM'
-            assert fresh.snapshot()['entry_block_reason']!='Waiting for first manually opened trade to close'
+            assert fresh.mandate['initial_deal_id']=='m2'
+            assert fresh.mandate['size']=='.10'
+            assert fresh.last_closed_step==-1
     asyncio.run(scenario())
 
 
-def test_no_old_mandate_restored_when_closed_row_missing():
+def test_stale_sqlite_mandate_never_restored_on_attach():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'robot.sqlite3')
-        store.set('mandate',{'epic':'GOLD','size':'.25','initial_deal_id':'not-confirmed'})
+        store.set('mandate',{'epic':'GOLD','size':'.25','initial_deal_id':'old-closed'})
+        store.db.execute(
+            "INSERT INTO trades(deal_id,epic,size,direction,opened,closed,entry) VALUES(?,?,?,?,?,?,?)",
+            ('old-closed','GOLD','.25','BUY','t0','t1',100.))
+        store.db.commit()
         brain=AdaptiveBrain(store,data_dir=d)
         e=SingleTradeEngine(store,brain)
         e.attach(BrokerSimulation())
         assert e.mandate is None
         assert e.last_closed_step==-1
+        assert store.get('mandate') is None
 
 
 def test_entry_diagnostics_emit_one_event_per_completed_model_step(monkeypatch):
@@ -97,7 +110,7 @@ def test_entry_diagnostics_emit_one_event_per_completed_model_step(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_live_size_refreshes_on_restart_without_reusing_historical_size():
+def test_live_open_position_re_adopts_size_after_restart_not_from_history():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'robot.sqlite3')
@@ -111,6 +124,8 @@ def test_live_size_refreshes_on_restart_without_reusing_historical_size():
             broker.open[0]['position']['size']=0.5
             restarted=SingleTradeEngine(store,brain)
             restarted.attach(broker)
+            # Cached SQLite size is cleared; live open deal is re-adopted.
+            assert restarted.mandate is None
             await restarted.sync()
             assert restarted.mandate['size']=='0.5'
             assert store.get('mandate')['size']=='0.5'

@@ -58,6 +58,7 @@ class AccountRuntime:
                 'generation':int(code.get('generation') or snap.get('code_generation') or 0),
                 'strategy':code.get('strategy'),
                 'attempts':int(code.get('attempts') or 0),
+                'last_reason':code.get('last_reason'),
                 'labeled_samples':int(snap.get('labeled_samples') or 0),
                 'neurons':neural.get('neurons'),
                 'steps':neural.get('steps'),

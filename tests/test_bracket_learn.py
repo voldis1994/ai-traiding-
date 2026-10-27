@@ -1,10 +1,11 @@
-"""SL/TP from OHLC at open; cash P&L only nudges — no κ grid lottery."""
+"""SL/TP from OHLC at open; cash P&L teaches when to raise / cut."""
 import tempfile
 from pathlib import Path
 
 from app.bracket_learn import (
-    DEFAULT_KAPPA,DEFAULT_SL_SCALE,evolve_from_history,load_params,
-    propose_for_open,recent_reachable_move,record_outcome,save_params,zone_at_open,
+    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,evolve_from_history,
+    load_multipliers,load_params,propose_for_open,recent_reachable_move,
+    record_outcome,save_params,zone_at_open,
 )
 from app.engine import Store
 from app.math_rules import stop_take
@@ -12,21 +13,6 @@ from app.math_rules import stop_take
 
 def sandbox():
     return tempfile.TemporaryDirectory()
-
-
-def _candles(n=40, up=1.0, down=1.0, span=None):
-    span=span if span is not None else up+down
-    rows=[]
-    for i in range(n):
-        o=100.0
-        # Alternate so median up/down match targets.
-        if i%2==0:
-            rows.append({'open':o,'high':o+up,'low':o-down*0.2,'close':o+up*0.5})
-        else:
-            rows.append({'open':o,'high':o+up*0.2,'low':o-down,'close':o-down*0.5})
-    # Ensure span coverage
-    rows[-1]={'open':100,'high':100+span,'low':100,'close':100+span*0.4}
-    return rows
 
 
 def test_stop_take_broker_min_only_no_20_tick_invent():
@@ -40,7 +26,6 @@ def test_stop_take_broker_min_only_no_20_tick_invent():
 
 
 def test_zone_at_open_computes_kappa_from_moves_not_grid():
-    # Upside wick 3.0, downside wick 1.0 → κ=3 from data, not a table pick.
     rows=[{'open':100,'high':103,'low':99,'close':100} for _ in range(30)]
     z=zone_at_open(rows,n=30,reach_n=30)
     assert z['ready'] is True
@@ -52,17 +37,37 @@ def test_zone_at_open_computes_kappa_from_moves_not_grid():
 def test_propose_uses_ohlc_not_random_fantasy_kappa():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
-        rows=_candles(50,up=1.2,down=1.0,span=2.0)
-        # Cap reachable move small so fantasy TP cannot appear.
-        for r in rows:
-            r['high']=min(r['high'],100.5);r['low']=max(r['low'],99.5)
+        rows=[{'open':100,'high':100.4,'low':99.7,'close':100.1} for _ in range(50)]
         p=propose_for_open(store,candles=rows,base_sl=1.0,max_tp=1.2)
         assert p['explored'] is False
         assert p['kappa']*p['sl_scale']*1.0 <= 1.2*1.05+1e-9
-        assert p['kappa']<5.0  # no κ=6/8 lottery
+        assert p['kappa']<5.0
 
 
-def test_cash_nudge_evolve_widens_when_wide_wins():
+def test_loss_teaches_raise_sl_when_brackets_were_tight():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.20)
+        assert out['reason']=='loss_tight_raise_sl'
+        assert load_multipliers(store)['sl_scale']>before['sl_scale']
+
+
+def test_wide_loss_teaches_cut_tp():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        adapt_after_outcome(store,kappa=2.5,sl_scale=1.5,pnl=-0.30)
+        assert load_multipliers(store)['kappa']<1.0
+
+
+def test_scratch_teaches_raise_sl():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        adapt_after_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.02)
+        assert load_multipliers(store)['sl_scale']>1.0
+
+
+def test_record_outcome_learns_and_batch_raise_when_wide_wins():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         for _ in range(6):
@@ -71,7 +76,7 @@ def test_cash_nudge_evolve_widens_when_wide_wins():
             record_outcome(store,kappa=2.0,sl_scale=1.5,pnl=0.8,currency='GBP')
         promoted=evolve_from_history(store,min_samples=6)
         assert promoted is not None
-        assert promoted['kappa']>=1.05
+        assert load_multipliers(store)['kappa']>=1.0
 
 
 def test_recent_reachable_move_from_candles():

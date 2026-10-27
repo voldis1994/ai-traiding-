@@ -1,9 +1,11 @@
-"""SL/TP from broker OHLC at open — not a hardcoded κ lottery.
+"""SL/TP from OHLC at open + real cash learning when to raise / cut.
 
-At the open moment the robot already has the same M1 candles the neural net
-uses. Stop and take distances are *computed* from recent adverse / favorable
-moves. Cash P&L only applies a mild continuous nudge to those zone distances
-after enough outcomes — it does not pick κ=6 from a static grid and hope.
+Open moment: distances come from recent M1 adverse/favorable moves (same candles
+the neural net sees). After each broker £ result the robot *learns*:
+  - losses / scratches → raise SL room (or cut unreachable TP)
+  - wins → keep / gently reinforce the shape that paid
+
+No hardcoded κ lottery. Learning is the adaptation layer, not a 5% cosmetic nudge.
 """
 from __future__ import annotations
 import math
@@ -12,10 +14,10 @@ from statistics import mean, median
 
 DEFAULT_KAPPA=1.0
 DEFAULT_SL_SCALE=1.0
-# Continuous nudge bounds after cash evidence (not a discrete explore menu).
-NUDGE_KAPPA_MIN,NUDGE_KAPPA_MAX=0.7,1.4
-NUDGE_SL_MIN,NUDGE_SL_MAX=0.85,1.6
-MIN_NUDGE_SAMPLES=8
+# Learned multipliers on top of the live OHLC zone (raised/cut from cash).
+MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
+MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
+MIN_BATCH_SAMPLES=6
 
 
 def _finite(v):
@@ -26,13 +28,27 @@ def _finite(v):
         return None
 
 
+def _clip(v,lo,hi):
+    return float(max(lo,min(hi,float(v))))
+
+
 def load_params(store) -> dict:
-    """Persisted *nudges* relative to the live OHLC zone (default = neutral 1/1)."""
+    """Effective κ / sl_scale last used (for tagging closed trades)."""
     kappa=_finite(store.get('bracket_kappa',DEFAULT_KAPPA)) or DEFAULT_KAPPA
     sl_scale=_finite(store.get('bracket_sl_scale',DEFAULT_SL_SCALE)) or DEFAULT_SL_SCALE
     if kappa<=0:kappa=DEFAULT_KAPPA
     if sl_scale<1:sl_scale=1.0
     return {'kappa':kappa,'sl_scale':sl_scale}
+
+
+def load_multipliers(store) -> dict:
+    """What the robot has learned: raise (>1) or cut (<1) relative to the zone."""
+    k=_finite(store.get('bracket_mult_kappa',1.0)) or 1.0
+    s=_finite(store.get('bracket_mult_sl',1.0)) or 1.0
+    return {
+        'kappa':_clip(k,MULT_KAPPA_MIN,MULT_KAPPA_MAX),
+        'sl_scale':_clip(max(1.0,s),MULT_SL_MIN,MULT_SL_MAX),
+    }
 
 
 def save_params(store,kappa: float,sl_scale: float,reason: str=''):
@@ -41,8 +57,15 @@ def save_params(store,kappa: float,sl_scale: float,reason: str=''):
     store.set('bracket_learn_reason',reason or 'updated')
 
 
+def save_multipliers(store,kappa_mult: float,sl_mult: float,reason: str=''):
+    store.set('bracket_mult_kappa',_clip(kappa_mult,MULT_KAPPA_MIN,MULT_KAPPA_MAX))
+    store.set('bracket_mult_sl',_clip(max(1.0,sl_mult),MULT_SL_MIN,MULT_SL_MAX))
+    if reason:
+        store.set('bracket_learn_reason',reason)
+
+
 def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None):
-    """Append one cash outcome tagged with the brackets that opened the trade."""
+    """Append cash outcome and immediately learn raise/cut from that result."""
     pnl_n=_finite(pnl)
     if pnl_n is None:return
     k=_finite(kappa);s=_finite(sl_scale)
@@ -54,6 +77,38 @@ def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None):
         'currency':currency,'deal_id':deal_id,
     })
     store.set('bracket_outcome_history',hist[-200:])
+    adapt_after_outcome(store,kappa=float(k),sl_scale=float(s),pnl=float(pnl_n))
+
+
+def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float) -> dict:
+    """Learn from one closed trade: when to raise SL/TP room, when to cut TP.
+
+    Signals (broker cash in account currency):
+      scratch |pnl|≤0.05 → SL too tight → raise sl_mult
+      loss < -0.05 with tight shape → raise sl_mult (need more room)
+      loss with already-wide shape → cut kappa_mult (TP was fantasy; SL hit first)
+      win > 0.05 → reinforce current multipliers slightly
+    """
+    mult=load_multipliers(store)
+    k_m,s_m=mult['kappa'],mult['sl_scale']
+    shape=float(kappa)*float(sl_scale)
+    reason='hold'
+    if abs(pnl)<=0.05:
+        s_m=min(MULT_SL_MAX,s_m*1.10)
+        reason='scratch_raise_sl'
+    elif pnl<-0.05:
+        if shape<1.6:
+            s_m=min(MULT_SL_MAX,s_m*1.12)
+            reason='loss_tight_raise_sl'
+        else:
+            k_m=max(MULT_KAPPA_MIN,k_m*0.90)
+            reason='loss_wide_cut_tp'
+    elif pnl>0.05:
+        k_m=min(MULT_KAPPA_MAX,k_m*1.05)
+        s_m=min(MULT_SL_MAX,s_m*1.03)
+        reason='win_reinforce'
+    save_multipliers(store,k_m,s_m,reason=f'learned_{reason} pnl={pnl:.4f}')
+    return {'kappa_mult':k_m,'sl_mult':s_m,'reason':reason,'pnl':pnl}
 
 
 def _bar_moves(candles, n: int=40):
@@ -71,8 +126,7 @@ def _bar_moves(candles, n: int=40):
 
 
 def kappa_from_ohlc(candles, n: int=40) -> float|None:
-    """Zone κ = median favorable / median adverse on recent M1 (continuous)."""
-    ups,downs,_= _bar_moves(candles,n)
+    ups,downs,_=_bar_moves(candles,n)
     if len(ups)<5 or len(downs)<5:return None
     du=median(downs)
     if du<=0:return None
@@ -82,7 +136,6 @@ def kappa_from_ohlc(candles, n: int=40) -> float|None:
 
 
 def recent_reachable_move(candles, n: int=60) -> float|None:
-    """Largest recent M1 high−low — hard ceiling for TP at this open."""
     _,_,spans=_bar_moves(candles,n)
     if len(spans)<5:return None
     spans=sorted(spans)
@@ -91,12 +144,7 @@ def recent_reachable_move(candles, n: int=60) -> float|None:
 
 
 def zone_at_open(candles, *, n: int=40, reach_n: int=60) -> dict:
-    """Optimal-ish SL/TP shape from all recent OHLC at the open moment.
-
-    SL distance proxy = median bar range (noise floor the market just printed).
-    κ = median upside / median downside (asymmetric zone, not a table pick).
-    max_tp = recent reachable move (do not target a move absent from the window).
-    """
+    """SL/TP shape from recent OHLC at the open — the information already on hand."""
     ups,downs,spans=_bar_moves(candles,n)
     reach=recent_reachable_move(candles,reach_n)
     if len(spans)<5:
@@ -111,7 +159,6 @@ def zone_at_open(candles, *, n: int=40, reach_n: int=60) -> dict:
         kappa=med_up/med_down
     if not math.isfinite(kappa) or kappa<=0:
         kappa=DEFAULT_KAPPA
-    # Soft floor: at least ~1:1 against the median bar; never invent κ from a table.
     kappa=max(float(kappa),0.5)
     return {
         'kappa':float(kappa),
@@ -122,41 +169,10 @@ def zone_at_open(candles, *, n: int=40, reach_n: int=60) -> dict:
     }
 
 
-def _cash_nudge(store) -> dict:
-    """Mild continuous scale from cash P&L — never a discrete fantasy grid."""
-    hist=store.get('bracket_outcome_history',[]) or []
-    if not isinstance(hist,list) or len(hist)<MIN_NUDGE_SAMPLES:
-        return {'kappa':1.0,'sl_scale':1.0,'samples':len(hist) if isinstance(hist,list) else 0}
-    # Wider κ/sl correlated with better mean cash → nudge up; else down.
-    wide=[];tight=[]
-    for row in hist:
-        pnl=_finite(row.get('pnl'));k=_finite(row.get('kappa'));s=_finite(row.get('sl_scale'))
-        if pnl is None or k is None or s is None:continue
-        shape=k*s
-        (wide if shape>=1.5 else tight).append(pnl)
-    k_nudge=1.0;s_nudge=1.0
-    if len(wide)>=3 and len(tight)>=3:
-        mw,mt=mean(wide),mean(tight)
-        if mw>mt+1e-9:
-            k_nudge=min(NUDGE_KAPPA_MAX,1.0+(mw-mt)/(abs(mt)+0.05)*0.15)
-            s_nudge=min(NUDGE_SL_MAX,1.0+(mw-mt)/(abs(mt)+0.05)*0.1)
-        elif mt>mw+1e-9:
-            k_nudge=max(NUDGE_KAPPA_MIN,1.0-(mt-mw)/(abs(mw)+0.05)*0.15)
-            s_nudge=max(NUDGE_SL_MIN,1.0-(mt-mw)/(abs(mw)+0.05)*0.1)
-    # Blend with stored champion lightly so promote still matters.
-    stored=load_params(store)
-    k_nudge=0.7*k_nudge+0.3*max(NUDGE_KAPPA_MIN,min(NUDGE_KAPPA_MAX,stored['kappa']))
-    s_nudge=0.7*s_nudge+0.3*max(NUDGE_SL_MIN,min(NUDGE_SL_MAX,stored['sl_scale']))
-    return {'kappa':float(k_nudge),'sl_scale':float(s_nudge),'samples':len(hist)}
-
-
 def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
                      candles=None) -> dict:
-    """Compute κ / sl_scale from the open-time zone; cash only nudges.
-
-    `explore_every` / `rng` kept for call-site compatibility — unused (no lottery).
-    """
+    """Zone distances × learned raise/cut multipliers; TP still capped by reach."""
     zone=zone_at_open(candles or [],n=40,reach_n=60) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
         'range_distance':float(base_sl or 0),'max_tp':max_tp,'ready':bool(ohlc_kappa),
@@ -165,32 +181,30 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         max_tp=zone.get('max_tp')
     kappa=float(zone.get('kappa') or DEFAULT_KAPPA)
     if ohlc_kappa and ohlc_kappa>0:
-        # Average continuous OHLC κ with the richer zone_at_open κ when both exist.
         kappa=0.5*kappa+0.5*float(ohlc_kappa)
-    nudge=_cash_nudge(store)
-    kappa*=nudge['kappa']
-    sl_scale=max(1.0,float(nudge['sl_scale']))
-    # Final TP must fit the reachable ceiling when we know base SL.
+    learned=load_multipliers(store)
+    kappa*=learned['kappa']
+    sl_scale=max(1.0,float(learned['sl_scale']))
     base=float(base_sl or zone.get('range_distance') or 0)
     if base>0 and max_tp and max_tp>0:
-        # κ * base * sl_scale ≤ max_tp
         room=max_tp/(base*sl_scale)
         if kappa>room:
             kappa=max(0.5,room)
-    # Persist the computed shape so closed-trade learning tags the real open.
     save_params(store,kappa,sl_scale,
-                reason=f'ohlc_zone_open nudge_samples={nudge["samples"]}')
+                reason=(f"ohlc×learn k_mult={learned['kappa']:.3f} "
+                        f"sl_mult={learned['sl_scale']:.3f}"))
     return {
         'kappa':float(kappa),'sl_scale':float(sl_scale),'explored':False,
         'max_tp':max_tp,'base_sl':base_sl or zone.get('range_distance'),
         'ohlc_kappa':ohlc_kappa,'zone_ready':bool(zone.get('ready')),
         'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
-        'nudge_samples':nudge['samples'],
+        'kappa_mult':learned['kappa'],'sl_mult':learned['sl_scale'],
+        'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }
 
 
-def evolve_from_history(store, *, min_samples: int=6) -> dict|None:
-    """Update continuous nudges from cash P&L buckets (wide vs tight), not a grid crown."""
+def evolve_from_history(store, *, min_samples: int=MIN_BATCH_SAMPLES) -> dict|None:
+    """Batch confirm: if wide brackets earn more £ than tight, raise; else cut TP/SL."""
     hist=store.get('bracket_outcome_history',[]) or []
     if not isinstance(hist,list) or len(hist)<min_samples:
         return None
@@ -202,16 +216,21 @@ def evolve_from_history(store, *, min_samples: int=6) -> dict|None:
     if len(wide)<2 or len(tight)<2:
         return None
     mw,mt=mean(wide),mean(tight)
-    cur=load_params(store)
+    mult=load_multipliers(store)
+    k_m,s_m=mult['kappa'],mult['sl_scale']
     if mw>mt+1e-9:
-        k=min(NUDGE_KAPPA_MAX,max(cur['kappa'],1.05))
-        s=min(NUDGE_SL_MAX,max(cur['sl_scale'],1.05))
+        k_m=min(MULT_KAPPA_MAX,k_m*1.08)
+        s_m=min(MULT_SL_MAX,s_m*1.08)
+        reason=f'batch_raise wide_mean={mw:.4f} tight_mean={mt:.4f}'
     elif mt>mw+1e-9:
-        k=max(NUDGE_KAPPA_MIN,min(cur['kappa'],0.95))
-        s=max(1.0,min(cur['sl_scale'],0.95))
+        k_m=max(MULT_KAPPA_MIN,k_m*0.92)
+        # Keep SL floor ≥1; cut TP ambition when tight wins.
+        reason=f'batch_cut_tp wide_mean={mw:.4f} tight_mean={mt:.4f}'
     else:
         return None
-    if abs(k-cur['kappa'])<1e-6 and abs(s-cur['sl_scale'])<1e-6:
+    before=dict(mult)
+    save_multipliers(store,k_m,s_m,reason=reason)
+    if abs(k_m-before['kappa'])<1e-6 and abs(s_m-before['sl_scale'])<1e-6:
         return None
-    save_params(store,k,s,reason=f'cash_nudge wide_mean={mw:.4f} tight_mean={mt:.4f}')
-    return {'kappa':k,'sl_scale':s,'mean_pnl':mw,'samples':len(wide)+len(tight)}
+    save_params(store,k_m,s_m,reason=reason)
+    return {'kappa':k_m,'sl_scale':s_m,'mean_pnl':mw,'samples':len(wide)+len(tight)}

@@ -1697,13 +1697,14 @@ class SingleTradeEngine:
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
-            self.store.event('bracket','OHLC-computed SL/TP at open',{
+            self.store.event('bracket','OHLC zone × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
+                'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
-                'nudge_samples':bp.get('nudge_samples')})
+                'learn_samples':bp.get('nudge_samples')})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 self._pending_entry_brain={

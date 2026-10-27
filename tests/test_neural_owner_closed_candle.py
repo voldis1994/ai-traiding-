@@ -159,11 +159,11 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_position_exit_decision_not_recomputed_per_quote(monkeypatch):
+def test_position_exit_never_market_deletes_neural_intent(monkeypatch):
+    """Zone+streak may score CLOSE intent, but live exit is SL/TP/trail only."""
     from app import engine as module
     clock=[datetime(2026,10,14,17,10,tzinfo=timezone.utc)]
     def context(rows,*,spread=0.,epic=None):
-        # DOWN zone so SELL exit of a BUY can clear the multi-TF gate.
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.,'features':[.02]*FEATURE_DIM,
                 'trend':'DOWN','returns_bps':{'1':-1,'5':-4,'15':-5,'60':-6},
@@ -179,23 +179,16 @@ def test_position_exit_decision_not_recomputed_per_quote(monkeypatch):
             exits=[]
             async def fake_exit(deal_id):exits.append(deal_id)
             e.exit_position=fake_exit
-            await e.poll()  # establish schema + streak 0
+            await e.poll()
             exits.clear()
-            brain.core.b=np.array([-4.,8.,-4.]) # SELL opposes manual BUY
-            clock[0]+=timedelta(minutes=1)
-            await e.poll()
-            assert exits==[]  # first opposite bar only — zone streak=1, no CLOSE yet
-            clock[0]+=timedelta(minutes=1)
-            await e.poll()
-            assert exits==['m1']  # second confirming bar + DOWN zone → CLOSE
-            steps=brain.core.steps
-            for _ in range(4):await e.poll()
-            assert exits==['m1'] and brain.core.steps==steps
-            clock[0]+=timedelta(minutes=1)
-            await e.poll()
-            # streak reset after close; need two more opposite bars
-            assert exits==['m1']
-            clock[0]+=timedelta(minutes=1)
-            await e.poll()
-            assert exits==['m1','m1'] and brain.core.steps==steps+2
+            brain.core.b=np.array([-4.,8.,-4.])  # SELL opposes manual BUY
+            for _ in range(5):
+                clock[0]+=timedelta(minutes=1)
+                await e.poll()
+            assert exits==[]  # never market-delete; broker SL/TP must close
+            snap=e.snapshot()
+            assert snap.get('neural_market_exit') is False
+            events=store.recent(50)
+            assert any(ev.get('kind')=='exit' and 'SL/TP' in str(ev.get('message',''))
+                       for ev in events)
     asyncio.run(scenario())

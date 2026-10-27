@@ -296,19 +296,22 @@ class AutoEvolution:
     def neural_decision(scores,current_direction=None):
         """Raw neural vote on one completed candle (scores only).
 
-        Flat → BUY/SELL/HOLD. In a position this alone must NOT close — use
-        evaluate_neural_exit (zone + multi-bar confirmation).
+        Flat → BUY/SELL/HOLD. In a position this alone must NOT close — live
+        exits are broker SL/TP/trail; evaluate_neural_exit only scores intent.
         """
         if not AutoEvolution._safe_scores(scores):return 'HOLD'
         action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores[a]))
         if current_direction is None:return action
-        # Legacy callers: still report intent, but engine exits via evaluate_neural_exit.
+        # Legacy callers: still report intent; engine does not market-delete.
         return 'CLOSE' if action in ('BUY','SELL') and action!=current_direction else 'HOLD'
 
     @staticmethod
     def evaluate_neural_exit(scores,current_direction,*,returns_bps=None,opposite_streak=0,
                              need_streak=2):
-        """CLOSE only with full zone — not one red M1 flip.
+        """Score a CLOSE *intent* from full OHLC zone + multi-bar confirmation.
+
+        Live engine does NOT market-delete on this signal (SL/TP/trail only).
+        Kept so intent can be logged and re-enabled later without rewriting gates.
 
         Requires:
           1) neural vote opposite the open side on this completed bar

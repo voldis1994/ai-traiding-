@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 from app.protection_ai import select_policy,propose_broker_trail,propose_update
+from app.math_rules import stop_take,ohlc_range_distance
 from app.engine import Store,SingleTradeEngine
 from tests.test_integration import BrokerSimulation
 
@@ -21,7 +22,6 @@ def scenario_bars(n=181):
 
 
 def test_walk_forward_candidate_beats_baseline_on_completed_history():
-    # Offline research helper still works; live path does not use it.
     learned=select_policy(scenario_bars(),'BUY',.8,1.6,.1)
     assert learned['ready'] and learned['samples']>=15
     assert learned['holdout_score_r']>learned['baseline_holdout_r']
@@ -43,24 +43,30 @@ def _position(direction='BUY',stop=99.2,profit=101.6):
             'stopLevel':stop,'profitLevel':profit,'size':'.25'}
 
 
-def _meta():
-    return {'owner':'AUTO','deal_id':'auto1','original_risk':.8,
+def _meta(risk=.8):
+    return {'owner':'AUTO','deal_id':'auto1','original_risk':risk,
             'original_profit':1.6,'opened':'2026-10-14T08:00:00+00:00'}
 
 
-def test_stop_moves_only_toward_profit_on_long_and_short():
-    buy=propose_broker_trail(_position(),_market(101.35,101.45),_meta())
-    assert buy and buy['stop_level']==101.05  # bid − min_distance
+def test_trail_uses_opening_risk_not_live_min_glue():
+    """tip±min glued SL to market → £0 Gold scratches; gap = original_risk."""
+    buy=propose_broker_trail(_position(),_market(101.35,101.45),_meta(.8))
+    assert buy and buy['stop_level']==100.55  # tip − opening risk
+    assert buy['trail_gap']==.8
     assert buy['profit_level'] is None
     sellpos=_position('SELL',stop=100.8,profit=98.4)
-    sellmarket=_market(98.55,98.65)
-    sell=propose_broker_trail(sellpos,sellmarket,_meta())
-    assert sell and sell['stop_level']==98.95  # ask + min_distance
-    assert sell['profit_level'] is None
+    sell=propose_broker_trail(sellpos,_market(98.55,98.65),_meta(.8))
+    assert sell and sell['stop_level']==99.45  # tip + opening risk
+    assert sell['trail_gap']==.8
+
+
+def test_trail_waits_until_favorable_covers_opening_gap():
+    # Only +0.4 favorable with gap 0.8 → no ratchet (would glue near entry).
+    assert propose_broker_trail(_position(),_market(100.4,100.5),_meta(.8)) is None
 
 
 def test_stop_never_widens_if_existing_better_and_no_manual_trade():
-    assert propose_broker_trail(_position(stop=101.1),_market(101.35,101.45),_meta()) is None
+    assert propose_broker_trail(_position(stop=101.1),_market(101.35,101.45),_meta(.8)) is None
     assert propose_broker_trail(_position(),_market(101.35,101.45),dict(_meta(),owner='MANUAL')) is None
     assert propose_broker_trail(_position(),_market(101.35,101.45),dict(_meta(),deal_id='other')) is None
     assert propose_broker_trail(_position(),dict(_market(101.35,101.45),status='CLOSED'),_meta()) is None
@@ -69,9 +75,9 @@ def test_stop_never_widens_if_existing_better_and_no_manual_trade():
 def test_broker_trail_does_not_invent_tp_extension():
     current=_market(bid=101.1,ask=101.2)
     p=_position(stop=99.2,profit=101.6)
-    result=propose_broker_trail(p,current,_meta())
+    result=propose_broker_trail(p,current,_meta(.8))
     assert result and result['profit_level'] is None
-    assert result['stop_level']==101.1-0.3
+    assert result['stop_level']==101.1-0.8
 
 
 class Brain:
@@ -106,8 +112,7 @@ def engine_fixture(tmp):
     eng.market=_market(101.35,101.45)
     eng.market_context={'ready':True,'bar_time':'2026-10-14T09:00:00+00:00',
                         'returns_bps':{'5':4.,'15':5.}}
-    store.set('adaptive_protection:auto1',dict(_meta(),epic='GOLD'))
-    # Live trail uses broker ticks; do not inject pre-trade OHLC extremes.
+    store.set('adaptive_protection:auto1',dict(_meta(.8),epic='GOLD'))
     return eng,broker,store
 
 
@@ -121,7 +126,7 @@ def test_live_update_protects_with_confirmation_and_throttle():
             assert b.open[0]['position']['stopLevel']>99.2
             assert not s.unresolved()
             assert s.get('adaptive_runtime:auto1')['status']=='CONFIRMED'
-            await e.adapt_protection(e.positions[0])  # throttled
+            await e.adapt_protection(e.positions[0])
             assert len(b.requests)==1
     asyncio.run(scenario())
 
@@ -173,7 +178,7 @@ def test_protection_reconciliation_uses_actual_requested_levels(tmp_path):
 
 def test_crossed_tp_or_poor_broker_rules_do_not_trigger_put():
     p=_position()
-    assert propose_broker_trail(p,_market(102.,102.1),_meta()) is None  # past TP
+    assert propose_broker_trail(p,_market(102.,102.1),_meta()) is None
     assert propose_broker_trail(p,dict(_market(101.35,101.45),min_distance=None),_meta()) is None
 
 
@@ -184,8 +189,7 @@ def test_broker_rejection_backoff_then_retries():
             await e.sync();await e.adapt_protection(e.positions[0])
             assert len(b.requests)==1
             await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1  # still in 15s reject backoff
-            # Simulate backoff expiry
+            assert len(b.requests)==1
             rt=s.get('adaptive_runtime:auto1')
             rt['mono']=time.monotonic()-20
             s.set('adaptive_runtime:auto1',rt)
@@ -237,18 +241,38 @@ def test_tick_prefers_decimal_places_over_one_pip_means():
     assert SingleTradeEngine._min_distance(market,4004.15)==2.0
 
 
-def test_sell_4015_trail_uses_ask_plus_broker_min_only():
-    """User case: SELL 4015, SL 4014, price→4004 → stop = 4004 + min (not 4006.075)."""
+def test_sell_4015_trails_by_opening_risk_not_min_glue():
+    """SELL 4015, extreme 4004, opening risk 5 → stop 4009 (not tip+min=4006 glued)."""
     market={'epic':'IDX','bid':4003.7,'ask':4004.0,'spread':0.3,'tick':0.1,
             'min_distance':2.0,'status':'TRADEABLE'}
     position={'dealId':'d1','epic':'IDX','direction':'SELL','level':4015.0,
-              'stopLevel':4014.0,'profitLevel':3990.0,'size':'.5'}
-    meta={'owner':'AUTO','deal_id':'d1','original_risk':1.0,'original_profit':25.0}
+              'stopLevel':4020.0,'profitLevel':3990.0,'size':'.5'}
+    meta={'owner':'AUTO','deal_id':'d1','original_risk':5.0,'original_profit':25.0}
     prop=propose_broker_trail(position,market,meta,extreme=4004.0)
-    assert prop and prop['stop_level']==4006.0
+    assert prop and prop['stop_level']==4009.0
+    assert prop['trail_gap']==5.0
     assert prop['stop_level']!=4006.075
-    assert prop['extreme']==4004.0
-    assert prop['min_distance']==2.0
-    # Compat wrapper also ignores invented policy grid
-    wrapped=propose_update(position,market,meta,{'ready':True,'retention':0.65},'b')
-    assert wrapped and wrapped['stop_level']==4006.0
+
+
+def test_ohlc_range_widens_open_bracket_past_min_only():
+    bars=[{'high':100.8,'low':100.1},{'high':100.9,'low':100.2},{'high':100.7,'low':100.0}]
+    rng=ohlc_range_distance(bars,n=3)
+    assert float(rng)==0.7
+    # Without range: min+buffer only; with range: uses broker M1 median range.
+    tight=stop_take(100,'BUY',0.01,0.05,0.3,kappa=2,sl_scale=1,range_distance=0)
+    wide=stop_take(100,'BUY',0.01,0.05,0.3,kappa=2,sl_scale=1,range_distance=float(rng))
+    assert wide['stop_distance']>tight['stop_distance']
+    assert wide['stop_ticks']>=70
+
+
+def test_scratch_close_sets_entry_cooldown():
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        e=SingleTradeEngine(s,Brain())
+        e._note_scratch_close(0.0,'d1')
+        assert s.get('entry_scratch_cooldown')==5
+        e._note_scratch_close(-0.02,'d2')
+        assert s.get('entry_scratch_cooldown')==5
+        e._note_scratch_close(-1.5,'d3')  # real loss — do not refresh cooldown from this helper alone
+        # still 5 from prior scratch
+        assert s.get('entry_scratch_cooldown')==5

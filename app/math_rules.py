@@ -9,23 +9,44 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 D = lambda value: Decimal(str(value))
 
 
-def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_scale=1):
-    """Broker-min floor × learned sl_scale; TP = kappa × SL.
+def ohlc_range_distance(candles, n=20):
+    """Median M1 high−low from broker OHLC — live noise floor, not a magic constant."""
+    ranges=[]
+    for row in list(candles or [])[-max(1,int(n)):]:
+        try:
+            h=D(row.get('high'));l=D(row.get('low'))
+        except Exception:
+            continue
+        if h>0 and l>0 and h>=l:
+            ranges.append(h-l)
+    if not ranges:
+        return None
+    ranges.sort()
+    mid=len(ranges)//2
+    if len(ranges)%2:
+        return ranges[mid]
+    return (ranges[mid-1]+ranges[mid])/2
 
-    Only dealing-rule floor is hard: max(min_distance, 0) + spread/tick buffer.
-    sl_scale (>=1) and kappa (>0) come from bracket learning (cash P&L history).
+
+def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_scale=1,
+              range_distance=0):
+    """Broker-min + optional broker OHLC range, × learned sl_scale; TP = kappa × SL.
+
+    Hard floor: dealing min + spread/tick buffer. Soft floor from recent broker
+    M1 ranges (stops noise scratches when min alone is inside the spread).
     """
-    entry, tick, spread, minimum, kappa, sl_scale = map(
-        D, (entry, tick_size, spread, min_distance, kappa, sl_scale))
-    if tick <= 0 or spread < 0 or minimum < 0 or kappa <= 0 or sl_scale < 1:
+    entry, tick, spread, minimum, kappa, sl_scale, range_distance = map(
+        D, (entry, tick_size, spread, min_distance, kappa, sl_scale, range_distance or 0))
+    if tick <= 0 or spread < 0 or minimum < 0 or kappa <= 0 or sl_scale < 1 or range_distance < 0:
         raise ValueError('Invalid stop/take inputs')
     if direction not in ('BUY', 'SELL'):
         raise ValueError('Invalid stop/take inputs')
     buffer = max(2*tick, 2*spread)
-    # No invented 20*tick / 4*spread policy floor — only broker min + buffer.
     base = minimum + buffer
     if base <= 0:
         base = buffer if buffer > 0 else tick
+    if range_distance > base:
+        base = range_distance
     distance = base * sl_scale
     sl_ticks = int((distance/tick).to_integral_value(rounding=ROUND_CEILING))
     if sl_ticks < 1:sl_ticks=1
@@ -37,6 +58,7 @@ def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_s
     return {'stop_distance':rho,'profit_distance':profit_distance,
             'stop_level':entry-sign*rho,'profit_level':entry+sign*profit_distance,
             'stop_ticks':sl_ticks,'profit_ticks':tp_ticks,'buffer':buffer,
+            'range_distance':float(range_distance),
             'kappa':float(kappa),'sl_scale':float(sl_scale)}
 
 

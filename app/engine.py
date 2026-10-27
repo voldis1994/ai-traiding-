@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from .core import NeuralCore
 from .autonomy import AutoEvolution
-from .math_rules import stop_take
+from .math_rules import stop_take, ohlc_range_distance
 from . import bracket_learn
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
@@ -1176,21 +1176,28 @@ class SingleTradeEngine:
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
                 self.last_entry_processed_bar=self.last_decision_bar
-                evaluation=self._entry_evaluation()
-                action=evaluation['action']
-                self.last_policy_decision=action
-                self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
-                self.store.event('entry',
-                    'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
-                    {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
-                     'proposal':evaluation.get('proposal'), 'decision':action,
-                     'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
-                # One entry opportunity per completed M1 bar. The first new
-                # confirmed bar after a broker-verified close can already act.
-                if (action in ('BUY','SELL') and
-                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
-                    snap.get('marketStatus')=='TRADEABLE'):
-                    await self.submit(action,broker_market)
+                # Scratch cooldown: after £0 / -£0.02 spam, skip several M1 bars.
+                cool=int(self.store.get('entry_scratch_cooldown') or 0)
+                if cool>0:
+                    self.store.set('entry_scratch_cooldown',cool-1)
+                    self.store.event('entry','Scratch cooldown — skip re-entry this M1 bar',
+                                    {'remaining':cool-1,'bar_time':self.last_decision_bar})
+                else:
+                    evaluation=self._entry_evaluation()
+                    action=evaluation['action']
+                    self.last_policy_decision=action
+                    self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
+                    self.store.event('entry',
+                        'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
+                        {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                         'proposal':evaluation.get('proposal'), 'decision':action,
+                         'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                    # One entry opportunity per completed M1 bar. The first new
+                    # confirmed bar after a broker-verified close can already act.
+                    if (action in ('BUY','SELL') and
+                        self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                        snap.get('marketStatus')=='TRADEABLE'):
+                        await self.submit(action,broker_market)
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -1300,6 +1307,16 @@ class SingleTradeEngine:
             return float(broker_pnl),'broker',self._account_currency()
         return None,'ticks_only',None
 
+    def _note_scratch_close(self,pnl_value,deal_id=None):
+        """£0 / penny closes → cool re-entry so we do not spam Capital history."""
+        if pnl_value is None:return
+        try:val=abs(float(pnl_value))
+        except (TypeError,ValueError):return
+        if val>0.05:return
+        self.store.set('entry_scratch_cooldown',5)
+        self.store.event('entry','Scratch close — cooling re-entry for 5 M1 bars',
+                         {'pnl':pnl_value,'deal_id':deal_id})
+
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
 
@@ -1323,11 +1340,13 @@ class SingleTradeEngine:
                     deal_id,row[0],exit_level,row[1],broker_pnl)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
+                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
             elif exit_level is not None:
                 currency=self._account_currency() if broker_pnl is not None else None
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
+                if broker_pnl is not None:self._note_scratch_close(broker_pnl,deal_id)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -1388,6 +1407,7 @@ class SingleTradeEngine:
             promoted=bracket_learn.evolve_from_history(self.store)
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
+            self._note_scratch_close(pnl_value,deal_id)
         if self.brain.core.last_z is not None:
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
@@ -1411,10 +1431,10 @@ class SingleTradeEngine:
         self.store.set(key,None)
 
     async def adapt_protection(self,p):
-        """Trail SL from broker ticks/OHLC + min distance — ROBOT positions only.
+        """Trail SL behind broker extreme by opening-bracket risk — ROBOT only.
 
-        No invented retention grid. PUT only when the broker-native stop improves
-        by ≥1 tick; short throttle avoids storms; reject → longer backoff.
+        Gap = original_risk (≥ minStop). Not tip±min (that glued SL to market and
+        scratched Gold for £0). Throttle PUTs; reject → longer backoff.
         """
         key='adaptive_protection:'+str(p['dealId'])
         meta=self.store.get(key)
@@ -1482,8 +1502,11 @@ class SingleTradeEngine:
             self.store.event('warning','Protection not possible: unsupported broker distance/price rule')
             self.execution_enabled=False;return
         bp=bracket_learn.load_params(self.store)
+        rng=ohlc_range_distance(self.store.candles(p.get('epic') or self.mandate.get('epic'),n=30,
+                                                   historical_only=True),n=20)
         result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
-                         kappa=bp['kappa'],sl_scale=bp['sl_scale'])
+                         kappa=bp['kappa'],sl_scale=bp['sl_scale'],
+                         range_distance=float(rng) if rng is not None else 0)
         stop=result['stop_level'] if p.get('stopLevel') is None else None
         profit=result['profit_level'] if p.get('profitLevel') is None else None
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
@@ -1533,8 +1556,10 @@ class SingleTradeEngine:
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
             bp=bracket_learn.propose_for_open(self.store)
+            rng=ohlc_range_distance(self.store.candles(self.mandate['epic'],n=30,historical_only=True),n=20)
             brackets=stop_take(entry,action,tick,spread,minimum,
-                               kappa=bp['kappa'],sl_scale=bp['sl_scale'])
+                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
+                               range_distance=float(rng) if rng is not None else 0)
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 self._pending_entry_brain={

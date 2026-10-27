@@ -165,10 +165,61 @@ class NeuralCore:
         self.n=len(keep);self.deaths+=count
         return count
 
+    def expand_inputs(self, new_d, *, init_scale=0.01, insert_at=None):
+        """Grow input dimension; preserve learned weights on existing columns.
+
+        Layout contract (must match market_fusion): [BASE_OHLC | DYNAMIC | EXTERNAL].
+        - append (insert_at=None): grow EXTERNAL or OHLC-only tail
+        - insert_at=ohlc_dim: insert DYNAMIC columns *before* EXTERNAL so fusion
+          vectors stay aligned with P/G columns (never append dyn after peers/news)
+
+        New slots get small noise so features can train; W,R,O,h,c unchanged.
+        """
+        new_d=int(new_d)
+        if new_d<self.d:raise ValueError('expand_inputs cannot shrink dimension')
+        if new_d==self.d:return False
+        extra=new_d-self.d
+        at=self.d if insert_at is None else int(insert_at)
+        if at<0 or at>self.d:raise ValueError('insert_at out of range')
+        new_p=self.rng.normal(0,init_scale,(self.n,extra)) if init_scale else np.zeros((self.n,extra))
+        new_g=self.rng.normal(0,init_scale,(extra,self.n)) if init_scale else np.zeros((extra,self.n))
+        self.P=np.concatenate([self.P[:,:at],new_p,self.P[:,at:]],axis=1)
+        self.G=np.concatenate([self.G[:at,:],new_g,self.G[at:,:]],axis=0)
+        self.mu=np.concatenate([self.mu[:at],np.zeros(extra),self.mu[at:]])
+        self.nu=np.concatenate([self.nu[:at],np.ones(extra),self.nu[at:]])
+        self.last_z=np.concatenate([self.last_z[:at],np.zeros(extra),self.last_z[at:]])
+        self.last_transition=None
+        self.d=new_d
+        return True
+
+    def copy_weights_from(self, other):
+        """Copy compatible weights from another core (shadow warm-start). Dim must match."""
+        if not isinstance(other,NeuralCore) or other.d!=self.d:return False
+        n=min(self.n,other.n)
+        self.P[:n,:]=other.P[:n,:]
+        self.W[:n,:n]=other.W[:n,:n]
+        self.R[:,:n]=other.R[:,:n];self.O[:,:n]=other.O[:,:n]
+        self.G[:,:n]=other.G[:,:n]
+        self.b[:]=other.b
+        self.mu[:]=other.mu;self.nu[:]=other.nu
+        self.tau[:n]=other.tau[:n];self.tau_c[:n]=other.tau_c[:n]
+        return True
+
+    def clone_architecture(self, *, n=None, seed=None, copy_weights=False):
+        """Shadow candidate with optional different neuron count.
+
+        Used for alternative-architecture search — NOT a live swap by itself.
+        """
+        n=int(n) if n is not None else self.n
+        seed=int(seed) if seed is not None else 7
+        clone=NeuralCore(n=max(8,n),d=self.d,seed=seed)
+        if copy_weights:clone.copy_weights_from(self)
+        return clone
+
     def snapshot(self):
         return {'neurons':self.n,'steps':self.steps,'smoothed_error':self.vbar,
                 'mean_activation':float(np.mean(np.abs(self.h))),
                 'births':self.births,'pruned':self.deaths,'loss':self.last_loss,
                 'gradient_norm':self.last_grad,'utility_mean':float(np.mean(self.utility)),
                 'activations':self.h[:72].round(4).tolist(),'memory':self.c[:72].round(4).tolist(),
-                'edges':int(np.count_nonzero(self.W))}
+                'edges':int(np.count_nonzero(self.W)),'input_dim':self.d}

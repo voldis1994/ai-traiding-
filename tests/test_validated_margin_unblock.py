@@ -66,7 +66,7 @@ def test_near_tie_and_no_evidence_do_not_force_live_trade():
 
 
 def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeypatch):
-    install_synthetic_context(monkeypatch)
+    install_synthetic_context(monkeypatch, direction='SELL')
     async def run():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'data.sqlite3')

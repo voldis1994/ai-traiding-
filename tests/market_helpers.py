@@ -3,15 +3,19 @@ from datetime import datetime,timedelta,timezone
 from app.market_context import FEATURE_DIM,FEATURE_SCHEMA
 
 
-def install_synthetic_context(monkeypatch):
+def install_synthetic_context(monkeypatch, *, direction='BUY'):
+    """OHLC zone aligned to direction so entry tests exercise neural+zone, not score alone."""
     from app import engine
     counter=[0]
-    def fake_context(rows,*,spread=0.,epic=None):
+    up=direction=='BUY'
+    returns={'1':1,'5':5,'15':15,'60':60} if up else {'1':-1,'5':-5,'15':-15,'60':-60}
+    trend='UP' if up else 'DOWN'
+    def fake_context(rows,*,spread=0.,epic=None,**_kw):
         counter[0]+=1
         stamp=(datetime(2026,10,13,15,0,tzinfo=timezone.utc)+timedelta(minutes=counter[0])).isoformat()
         return {'ready':True,'reason':'synthetic test context','epic':epic,
                 'bar_time':stamp,'close':100.+counter[0]*.01,'features':[.1]*FEATURE_DIM,
-                'trend':'UP','returns_bps':{'1':1,'5':5,'15':15,'60':60},
+                'trend':trend,'regime':'ALIGNED','returns_bps':returns,
                 'feature_schema':FEATURE_SCHEMA}
     monkeypatch.setattr(engine,'market_features',fake_context)
 

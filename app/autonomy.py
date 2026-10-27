@@ -307,23 +307,19 @@ class AutoEvolution:
 
     @staticmethod
     def evaluate_neural_exit(scores,current_direction,*,returns_bps=None,opposite_streak=0,
-                             need_streak=2):
+                             need_streak=None,store=None):
         """Score a CLOSE *intent* from full OHLC zone + multi-bar confirmation.
 
         Live engine does NOT market-delete on this signal (SL/TP/trail only).
-        Kept so intent can be logged and re-enabled later without rewriting gates.
-
-        Requires:
-          1) neural vote opposite the open side on this completed bar
-          2) 5m AND 15m returns agree with that exit direction (same OHLC zone
-             entry already sees via market_features)
-          3) opposite_streak ≥ need_streak (default 2 completed M1 bars)
+        need_streak comes from self_params (robot-owned), not a frozen default.
         """
+        if need_streak is None:
+            from .self_params import get as sp_get
+            need_streak=int(sp_get(store,'exit_need_streak',2))
         if current_direction not in ('BUY','SELL'):return 'HOLD'
         if not AutoEvolution._safe_scores(scores):return 'HOLD'
         action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores[a]))
         if action not in ('BUY','SELL') or action==current_direction:return 'HOLD'
-        # Zone from broker OHLC returns (bps): closing a BUY needs DOWN zone, etc.
         if not isinstance(returns_bps,dict):return 'HOLD'
         try:
             r5=float(returns_bps.get('5',0) or 0)
@@ -335,11 +331,15 @@ class AutoEvolution:
         if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
         return 'CLOSE'
 
-    def evaluate_neural_entry(self,scores):
-        """Entry uses BUY/SELL only — HOLD is never an entry mode.
+    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None):
+        """Enter only when neural vote and OHLC zone agree — no cooldown magic.
 
-        Risk frame is adopted lot + market. No extra score-margin 'safety' gate:
-        the network vote stands unless HOLD strictly dominates the direction.
+        HOLD is a real decision when:
+          - HOLD score dominates, or
+          - 5m/15m zone fights the vote (mid-chop / against short zone), or
+          - 15m+60m trend fights the vote, or
+          - short vs long regime is SHIFT (market changing).
+        Signs from broker returns — not hardcoded score margins or bar timers.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -349,13 +349,48 @@ class AutoEvolution:
         strength=buy if direction=='BUY' else sell
         if hold>strength:
             return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':(f'HOLD is not an entry mode; skip while HOLD {hold:.1%} '
-                              f'dominates {direction} {strength:.1%}'),
+                    'reason':(f'HOLD dominates {direction} ({hold:.1%} > {strength:.1%})'),
                     'evidence':None,'calibration':None}
+        if not isinstance(returns_bps,dict):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':'OHLC zone unavailable; no entry without market context',
+                    'evidence':None,'calibration':None}
+        try:
+            r5=float(returns_bps.get('5',0) or 0)
+            r15=float(returns_bps.get('15',0) or 0)
+            r60=float(returns_bps.get('60',0) or 0)
+        except (TypeError,ValueError):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':'OHLC returns unreadable; no entry','evidence':None,'calibration':None}
+        # Regime shift: 5m and 60m disagree → sit out (feel the change, don't force).
+        if regime=='SHIFT' or (r5>0 and r60<0) or (r5<0 and r60>0):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':f'Regime SHIFT (5m vs 60m); skip {direction}',
+                    'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
+                    'calibration':None}
+        if direction=='BUY':
+            if not (r5>0 and r15>0):
+                return {'action':'HOLD','proposal':'BUY','threshold':None,
+                        'reason':'BUY vote but 5m/15m zone not UP — avoid mid-zone / chop entry',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+            if trend=='DOWN' or (r15<0 and r60<0):
+                return {'action':'HOLD','proposal':'BUY','threshold':None,
+                        'reason':'BUY against DOWN trend (15m/60m)',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+        else:
+            if not (r5<0 and r15<0):
+                return {'action':'HOLD','proposal':'SELL','threshold':None,
+                        'reason':'SELL vote but 5m/15m zone not DOWN — avoid mid-zone / chop entry',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+            if trend=='UP' or (r15>0 and r60>0):
+                return {'action':'HOLD','proposal':'SELL','threshold':None,
+                        'reason':'SELL against UP trend (15m/60m)',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
         return {'action':direction,'proposal':direction,'threshold':None,
-                'reason':(f'Entry {direction} on completed M1 '
-                          f'(neural vote; risk=adopted lot/market; HOLD never enters)'),
-                'evidence':None,'calibration':None}
+                'reason':(f'Entry {direction}: neural vote + OHLC zone aligned '
+                          f'(trend={trend or "n/a"})'),
+                'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
+                'calibration':None}
 
     @staticmethod
     def _minute_time(value):
@@ -724,3 +759,100 @@ class AutoEvolution:
         return {'generation':self.generation,'strategy':self.kind,'source':source,
                 'sha256':hashlib.sha256(source.encode()).hexdigest(),
                 'attempts':self.attempts,'last_reason':self.last_reason}
+
+    def shadow_self_dev_tick(self, engine):
+        """Side-by-side shadow NeuralCore vs live using *cash-comparable* paper £.
+
+        Shadow runs its own paper journal. Price moves are scaled to account
+        currency via LIVE broker_£/price ratios — never raw price units vs £.
+        """
+        from .model_validation import compare_models
+        from .self_params import (load as load_params, evolve_from_feedback,
+                                  maybe_commit_long_horizon)
+        engine._ensure_shadow_brain()
+        cfg=load_params(self.store)
+        min_trades=int(cfg['shadow_min_broker_trades'])
+        win=int(cfg['shadow_rollback_window'])
+        delta=float(cfg['shadow_rollback_delta'])
+        oos_frac=float(cfg['val_oos_frac'])
+        live_hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
+                   if r.get('actual_pnl') is not None]
+        paper=getattr(engine,'shadow_paper',None)
+        if paper is not None:
+            paper.update_cash_scale(live_hist)
+        # Cash-only paper rows (unit=account_currency) — skip price-unit leftovers.
+        shadow_cash=(paper.paper_cash_pnls() if paper else [])
+        if len(live_hist)<min_trades or len(shadow_cash)<max(4,min_trades//2):
+            self.last_reason=('Shadow self-dev waiting for broker £ + cash-scaled '
+                              'paper trades')
+            return None
+        live_cut=int(len(live_hist)*(1.0-oos_frac))
+        sh_cut=int(len(shadow_cash)*(1.0-oos_frac))
+        live_pnls=[float(r['actual_pnl']) for r in live_hist[live_cut:]]
+        shadow_pnls=list(shadow_cash[sh_cut:])
+        decision=compare_models(live_pnls,shadow_pnls,store=self.store)
+        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
+                             commit=False)
+        maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
+        if len(live_hist)>=win*2:
+            recent=sum(r['actual_pnl'] for r in live_hist[-win:])
+            prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])
+            if recent<prior-delta:
+                restore=getattr(engine,'restore_neural_weights',None)
+                prev=engine.model_validator.mark_rollback(
+                    'recent broker £ worse than prior window',
+                    restore_fn=restore)
+                restored=bool(prev and prev.get('weights_restored'))
+                self.last_reason=('Shadow rollback '+
+                    ('restored weights+registry v' if restored else 'flagged v')+
+                    str((prev or {}).get('model_version')))
+                return {'rollback':True,'previous':prev,'decision':decision,
+                        'weights_restored':restored,
+                        'registry_restored':bool(prev and prev.get('registry_restored'))}
+        self.store.set('shadow_self_dev_last',{
+            'decision':decision,
+            'shadow_neurons':getattr(engine.shadow_brain,'n',None),
+            'shadow_dim':getattr(engine.shadow_brain,'d',None),
+            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_cash),
+            'method':'independent_shadow_paper_cash',
+            'paper_summary':paper.summary() if paper else None,
+            'params':{'min_trades':min_trades,'window':win,'delta':delta}})
+        self.last_reason=('Shadow paper cash beats live OOS broker £' if decision.get('promote')
+                          else 'Shadow paper cash not better than live OOS broker £')
+        return decision
+
+    def promote_shadow_policy(self, candidate_source, *, force=False):
+        """Promote a validated policy source with .previous.py rollback file."""
+        if not force and not self._test_candidate(candidate_source):
+            self.last_reason='Shadow policy failed isolated tests'
+            return False
+        old=self.path.read_text(encoding='utf8')
+        previous=self.path.with_suffix('.previous.py')
+        nextfile=self.path.with_suffix('.next.py')
+        previous.write_text(old,encoding='utf8')
+        nextfile.write_text(candidate_source,encoding='utf8')
+        os.replace(nextfile,self.path)
+        try:
+            self._compile(self.path.read_text(encoding='utf8'))
+        except Exception:
+            os.replace(previous,self.path)
+            self.last_reason='Shadow promote compile failed; restored previous'
+            return False
+        self.generation+=1
+        self.store.set('code_generation',self.generation)
+        self.last_reason='Shadow policy promoted with rollback file'
+        self.store.event('code','Shadow-validated policy activated',
+            {'generation':self.generation})
+        return True
+
+    def rollback_policy(self):
+        """Restore active_policy.py from .previous.py if present."""
+        previous=self.path.with_suffix('.previous.py')
+        if not previous.exists():
+            self.last_reason='No previous policy to restore'
+            return False
+        os.replace(previous,self.path)
+        self._compile(self.path.read_text(encoding='utf8'))
+        self.last_reason='Policy rolled back to previous version'
+        self.store.event('code','Policy rolled back to previous version',{})
+        return True

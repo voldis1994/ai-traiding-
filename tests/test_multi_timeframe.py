@@ -27,9 +27,11 @@ def test_uses_complete_minutes_not_future_or_active_candle():
     history=bars(91,start=BASE-timedelta(minutes=90))  # latest = BASE
     at=BASE+timedelta(minutes=1)
     first=market_features(history,now_utc=at,spread=.03,epic='GOLD')
-    assert first['ready'] and first['trend']=='UP'
+    assert first['ready'] and first['trend']=='UP' and first['regime']=='ALIGNED'
     assert first['returns_bps']['15']>0 and first['returns_bps']['60']>0
     assert len(first['features'])==FEATURE_DIM
+    assert first['feature_schema']==FEATURE_SCHEMA
+    assert 'upper_shadow' in first and 'wick_imbalance_5m' in first
     sabotaged=history+[{'at':at.isoformat(),'open':3000,'high':9000,'low':1,'close':3000}]
     second=market_features(sabotaged,now_utc=at,spread=.03,epic='GOLD')
     assert second['features']==first['features']

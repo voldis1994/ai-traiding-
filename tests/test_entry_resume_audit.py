@@ -108,7 +108,8 @@ def test_entry_diagnostics_emit_one_event_per_completed_model_step(monkeypatch):
             assert state['entry_can_submit_now'] is False
             reason=state['entry_policy_reason'] or ''
             assert ('News guard:' in reason or 'Neural' in reason or
-                    'HOLD is not an entry mode' in reason or 'not an entry mode' in reason)
+                    'HOLD dominates' in reason or 'OHLC zone' in reason or
+                    'not an entry mode' in reason)
     asyncio.run(scenario())
 
 

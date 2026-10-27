@@ -25,21 +25,35 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         # 38%: previously forbidden by 60% and by 8.1pp margin
         score={'BUY':.32, 'SELL':.38, 'HOLD':.30}
         assert p.neural_decision(score)=='SELL'
-        result=p.evaluate_neural_entry(score)
+        # Bare scores alone never enter — need OHLC zone (no hardcode margin gate).
+        bare=p.evaluate_neural_entry(score)
+        assert bare['action']=='HOLD' and bare['proposal']=='SELL'
+        assert 'OHLC zone unavailable' in bare['reason']
+        down={'5':-2,'15':-3,'60':-4}
+        result=p.evaluate_neural_entry(score,returns_bps=down,trend='DOWN',regime='ALIGNED')
         assert result['action']=='SELL'
         assert result['threshold'] is None
-        assert result['evidence'] is None
+        assert result['evidence'] is not None
         assert p.neural_decision({'BUY':.34,'SELL':.33,'HOLD':.33})=='BUY'
-        # Raw network may prefer HOLD, but HOLD is never an entry mode.
         assert p.neural_decision({'BUY':.25,'SELL':.35,'HOLD':.40})=='HOLD'
-        blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40})
+        blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40},
+            returns_bps={'5':-1,'15':-2,'60':-3},trend='DOWN')
         assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
-        assert 'not an entry mode' in blocked['reason']
-        # Risk frame = lot + market only: no score-margin gate. Near-ties enter.
-        tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33})
+        # Without OHLC zone — no entry (must read market, not scores alone).
+        assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='HOLD'
+        up={'5':2,'15':3,'60':4}
+        # Near-tie enters only when zone aligns UP.
+        tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33},
+            returns_bps=up,trend='UP',regime='ALIGNED')
         assert tied['action']=='BUY' and tied['proposal']=='BUY'
-        entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27})
+        entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27},
+            returns_bps=up,trend='UP',regime='ALIGNED')
         assert entered['action']=='BUY'
+        # Against trend / mid-zone chop — HOLD (no hardcode cooldown).
+        assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
+            returns_bps={'5':-2,'15':-3,'60':-4},trend='DOWN')['action']=='HOLD'
+        assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
+            returns_bps={'5':2,'15':3,'60':-4},regime='SHIFT')['action']=='HOLD'
         # Raw vote still reports CLOSE intent; live exit needs zone + streak.
         assert p.neural_decision(score,current_direction='BUY')=='CLOSE'
         assert p.neural_decision(score,current_direction='SELL')=='HOLD'
@@ -125,10 +139,10 @@ def test_new_manual_market_adopted_without_switch_button():
 def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     from app import engine as module
     clock=[datetime(2026,10,14,16,30,tzinfo=timezone.utc)]
-    def context(rows,*,spread=0.,epic=None):
+    def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.0,
-                'features':[.01]*FEATURE_DIM,'trend':'UP',
+                'features':[.01]*FEATURE_DIM,'trend':'UP','regime':'ALIGNED',
                 'returns_bps':{'1':1,'5':2,'15':3,'60':4},'feature_schema':FEATURE_SCHEMA}
     monkeypatch.setattr(module,'market_features',context)
     async def scenario():
@@ -163,10 +177,11 @@ def test_position_exit_never_market_deletes_neural_intent(monkeypatch):
     """Zone+streak may score CLOSE intent, but live exit is SL/TP/trail only."""
     from app import engine as module
     clock=[datetime(2026,10,14,17,10,tzinfo=timezone.utc)]
-    def context(rows,*,spread=0.,epic=None):
+    def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.,'features':[.02]*FEATURE_DIM,
-                'trend':'DOWN','returns_bps':{'1':-1,'5':-4,'15':-5,'60':-6},
+                'trend':'DOWN','regime':'ALIGNED',
+                'returns_bps':{'1':-1,'5':-4,'15':-5,'60':-6},
                 'feature_schema':FEATURE_SCHEMA}
     monkeypatch.setattr(module,'market_features',context)
     async def scenario():

@@ -22,7 +22,12 @@ from . import bracket_learn
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
-from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features
+from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES
+from .feature_registry import FeatureRegistry
+from .feature_discovery import FeatureDiscovery
+from .feature_validation import FeatureValidator
+from .profit_learning import ProfitLearning
+from .model_validation import ModelValidator
 
 DB=DATA/'robot.sqlite3'
 
@@ -80,6 +85,9 @@ class Store:
         candle_columns={r[1] for r in self.db.execute('PRAGMA table_info(candles)')}
         if 'source' not in candle_columns:
             self.db.execute("ALTER TABLE candles ADD COLUMN source TEXT DEFAULT 'QUOTE'")
+        # Per-bar spread for Walk-Forward validation (never reuse one live spread for history).
+        if 'spread' not in candle_columns:
+            self.db.execute('ALTER TABLE candles ADD COLUMN spread REAL')
         trade_columns={r[1] for r in self.db.execute('PRAGMA table_info(trades)')}
         # Cash P&L must carry account currency + source so GOLD USD quotes are
         # never mixed with GBP account profit as if they were the same unit.
@@ -164,13 +172,17 @@ class Store:
         return rows
     def candle(self,epic,bar,source='QUOTE'):
         if source not in ('QUOTE','HISTORICAL'):raise ValueError('Invalid candle provenance')
-        self.db.execute('INSERT OR REPLACE INTO candles(epic,at,open,high,low,close,source) VALUES(?,?,?,?,?,?,?)',
-            (epic,str(bar['at']),bar['open'],bar['high'],bar['low'],bar['close'],source))
+        spread=_num(bar.get('spread'))
+        self.db.execute(
+            'INSERT OR REPLACE INTO candles(epic,at,open,high,low,close,source,spread) VALUES(?,?,?,?,?,?,?,?)',
+            (epic,str(bar['at']),bar['open'],bar['high'],bar['low'],bar['close'],source,spread))
         self.db.commit()
     def candles(self,epic,n=120,historical_only=False):
-        cols=('at','open','high','low','close')
+        cols=('at','open','high','low','close','spread')
         where="epic=? AND source='HISTORICAL'" if historical_only else 'epic=?'
-        rows=list(self.db.execute(f'SELECT at,open,high,low,close FROM candles WHERE {where} ORDER BY at DESC LIMIT ?', (epic,n)))
+        rows=list(self.db.execute(
+            f'SELECT at,open,high,low,close,spread FROM candles WHERE {where} ORDER BY at DESC LIMIT ?',
+            (epic,n)))
         return [dict(zip(cols,r)) for r in reversed(rows)]
 
 class AdaptiveBrain:
@@ -199,6 +211,12 @@ class AdaptiveBrain:
         self.prior_record=None;self.last_regime='LEARNING'
         self.feature_schema=None
         self.fusion_labels=0
+        # Runtime dims track base OHLC (+ approved dynamic) and fusion external block.
+        self.ohlc_dim=FEATURE_DIM
+        self.fusion_dim=FUSION_DIM
+        self.ohlc_schema=FEATURE_SCHEMA
+        self.fusion_schema=FUSION_SCHEMA
+        self.model_version=0
         # Backward-compatible old brain.npz: bind once to the first observed EPIC.
         # Once bound, never load the saved brain for another instrument.
         self.load()
@@ -280,8 +298,15 @@ class AdaptiveBrain:
                     if name in d:setattr(self.core,name,int(d[name]))
                 self.feature_schema=str(d['feature_schema']) if 'feature_schema' in d else None
                 self.fusion_labels=int(d['fusion_labels']) if 'fusion_labels' in d else 0
-                if ((self.feature_schema==FUSION_SCHEMA and self.core.d!=FUSION_DIM)
-                    or (self.feature_schema==FEATURE_SCHEMA and self.core.d!=FEATURE_DIM)):
+                self.ohlc_dim=int(d['ohlc_dim']) if 'ohlc_dim' in d else FEATURE_DIM
+                self.fusion_dim=int(d['fusion_dim']) if 'fusion_dim' in d else FUSION_DIM
+                self.ohlc_schema=str(d['ohlc_schema']) if 'ohlc_schema' in d else FEATURE_SCHEMA
+                self.fusion_schema=str(d['fusion_schema']) if 'fusion_schema' in d else FUSION_SCHEMA
+                self.model_version=int(d['model_version']) if 'model_version' in d else 0
+                if ((self.feature_schema==self.fusion_schema and self.core.d!=self.fusion_dim)
+                    or (self.feature_schema==self.ohlc_schema and self.core.d!=self.ohlc_dim)
+                    or (self.feature_schema==FUSION_SCHEMA and self.core.d!=FUSION_DIM and 'fusion_dim' not in d)
+                    or (self.feature_schema==FEATURE_SCHEMA and self.core.d!=FEATURE_DIM and 'ohlc_dim' not in d)):
                     raise ValueError('Stored neural feature schema and input weights disagree')
                 if 'neuron_ids' in d:
                     self.core.neuron_ids=d['neuron_ids'].astype(np.int64).copy()
@@ -295,6 +320,9 @@ class AdaptiveBrain:
             self.core=NeuralCore(n=self.initial_neurons)
             self.feature_schema=None
             self.fusion_labels=0
+            self.ohlc_dim=FEATURE_DIM;self.fusion_dim=FUSION_DIM
+            self.ohlc_schema=FEATURE_SCHEMA;self.fusion_schema=FUSION_SCHEMA
+            self.model_version=0
 
     def _restore_pending(self,epic):
         path=self._path_for(epic)
@@ -325,9 +353,81 @@ class AdaptiveBrain:
                        next_neuron_id=c.next_neuron_id,epic=self.epic or '',
                        feature_schema=self.feature_schema or 'legacy_quote_v2',
                        fusion_labels=self.fusion_labels,
+                       ohlc_dim=self.ohlc_dim,fusion_dim=self.fusion_dim,
+                       ohlc_schema=self.ohlc_schema,fusion_schema=self.fusion_schema,
+                       model_version=self.model_version,
                        pending_json=json.dumps(list(self.pending),separators=(',',':')))
         np.savez_compressed(tmp,**payload)
         tmp.replace(path)
+
+    def backup_weights(self, tag='rollback'):
+        """Copy current neural weights to a versioned .npz — real rollback fodder."""
+        self.save()
+        src=self._path_for(self.epic) if self.epic else self.path
+        if not src.exists():return None
+        safe=''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(tag))[:48]
+        dest=src.with_name(f"{src.stem}.bak_{safe}_v{int(self.model_version)}.npz")
+        import shutil
+        shutil.copy2(src,dest)
+        return str(dest)
+
+    def restore_weights(self, weights_path):
+        """Reload neural weights from a backup file into the live core."""
+        path=Path(weights_path)
+        if not path.exists():
+            self.store.event('error','Weight restore missing file',{'path':str(path)})
+            return False
+        before_ver=self.model_version
+        self.load(path,expected_epic=self.epic)
+        # Persist restored weights as the active brain file.
+        self.save()
+        self.store.event('learning','Neural weights restored from backup',
+            {'path':path.name,'from_version':before_ver,
+             'model_version':self.model_version,'inputs':self.core.d,
+             'neurons':self.core.n})
+        return True
+
+    def apply_registry(self, registry):
+        """Sync dims/schemas from FeatureRegistry; expand weights if approved set grew.
+
+        Vector layout is always [BASE_OHLC | DYNAMIC | EXTERNAL]. When already on
+        fusion and new DYNAMIC features are approved, columns are *inserted*
+        before the EXTERNAL block — never appended after peers/news.
+        """
+        if registry is None:return False
+        old_ohlc=self.ohlc_dim
+        ohlc_d=registry.ohlc_dim();fus_d=registry.fusion_dim()
+        ohlc_s=registry.ohlc_schema();fus_s=registry.fusion_schema()
+        grew=ohlc_d>self.ohlc_dim or fus_d>self.fusion_dim
+        self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
+        self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
+        if self.feature_schema in (None,'legacy_quote_v2'):return False
+        fs=self.feature_schema or ''
+        on_fusion=(fs==self.fusion_schema or fs==FUSION_SCHEMA or 'intermarket_news' in fs)
+        if (fs==self.ohlc_schema or fs==FEATURE_SCHEMA or
+                (FEATURE_SCHEMA in fs and 'intermarket_news' not in fs)):
+            target=self.ohlc_dim;schema=self.ohlc_schema;insert_at=None
+        elif on_fusion:
+            target=self.fusion_dim;schema=self.fusion_schema
+            # New dynamic slots land at old OHLC boundary (before EXTERNAL).
+            insert_at=old_ohlc if ohlc_d>old_ohlc else None
+        else:
+            return False
+        if self.core.d==target and self.feature_schema==schema:return False
+        if self.core.d>target:
+            raise ValueError('Registry shrink is not supported without explicit rollback')
+        if self.core.d<target:
+            self.core.expand_inputs(target,insert_at=insert_at)
+            self.pending.clear()
+            self.core.last_transition=None
+            self.model_version+=1
+            self.store.event('learning','Neural inputs expanded for approved features',
+                {'epic':self.epic,'inputs':target,'schema':schema,
+                 'insert_at':insert_at,'layout':'base|dynamic|external',
+                 'model_version':self.model_version})
+        self.feature_schema=schema
+        self.save()
+        return grew
 
     def _switch_to_market_features(self):
         """Versioned migration: never apply old 3-input weights to new OHLC units.
@@ -335,33 +435,33 @@ class AdaptiveBrain:
         Keep legacy weights on disk as an audit/rollback backup; old signals remain
         in SQLite under their original label_version, never replayed as v3.
         """
-        if self.feature_schema==FEATURE_SCHEMA and self.core.d==FEATURE_DIM:return
+        if self.feature_schema==self.ohlc_schema and self.core.d==self.ohlc_dim:return
         path=self._path_for(self.epic)
         if path.exists():
             backup=path.with_name(path.stem+'.before_mtf_v3.npz')
             if not backup.exists():
                 import shutil
                 shutil.copy2(path,backup)
-        self.core=NeuralCore(n=self.initial_neurons,d=FEATURE_DIM)
-        self.feature_schema=FEATURE_SCHEMA
+        self.core=NeuralCore(n=self.initial_neurons,d=self.ohlc_dim)
+        self.feature_schema=self.ohlc_schema
         self.history=deque(maxlen=1000);self.pending=deque()
         self.correct=0;self.labeled=0
         self.last_change=0.;self.last_mid=None;self.prior_record=None
         self.last_regime='LEARNING'
         self.store.set('mtf_last_bar:'+self.epic,None)
         self.store.event('learning','New OHLC feature schema activated; old neural weights backed up',
-            {'epic':self.epic,'feature_schema':FEATURE_SCHEMA,'input_count':FEATURE_DIM})
+            {'epic':self.epic,'feature_schema':self.ohlc_schema,'input_count':self.ohlc_dim})
         self.save()
 
     def _extend_to_external_features(self):
         """Expand input dimensions WITHOUT reinitializing learned neuron weights.
 
-        Existing v3 pending transitions have 10 inputs; do not train them against
-        the 18-input network. Historical labels and network weights are preserved.
+        Existing OHLC pending transitions are dropped — z length changes.
+        Historical labels and network weights on shared columns are preserved.
         """
-        if self.feature_schema==FUSION_SCHEMA and self.core.d==FUSION_DIM:return
-        if self.feature_schema!=FEATURE_SCHEMA or self.core.d!=FEATURE_DIM:
-            raise ValueError('External feature expansion requires complete v3 OHLC state')
+        if self.feature_schema==self.fusion_schema and self.core.d==self.fusion_dim:return
+        if self.feature_schema not in (self.ohlc_schema,FEATURE_SCHEMA) or self.core.d!=self.ohlc_dim:
+            raise ValueError('External feature expansion requires complete OHLC state')
         path=self._path_for(self.epic)
         if path.exists():
             backup=path.with_name(path.stem+'.before_fusion_v4.npz')
@@ -369,23 +469,18 @@ class AdaptiveBrain:
                 import shutil
                 shutil.copy2(path,backup)
         c=self.core
-        extra=FUSION_DIM-c.d
-        c.P=np.pad(c.P,((0,0),(0,extra)))
-        c.G=np.pad(c.G,((0,extra),(0,0)))
-        c.mu=np.append(c.mu,np.zeros(extra))
-        c.nu=np.append(c.nu,np.ones(extra))
-        c.last_z=np.append(c.last_z,np.zeros(extra))
-        c.last_transition=None
-        c.d=FUSION_DIM
-        # A v3 transition's z is not compatible with the expanded input.
+        c.expand_inputs(self.fusion_dim,init_scale=0.)
+        # A shorter transition's z is not compatible with the expanded input.
         self.pending.clear()
         c.h[:]=0.;c.c[:]=0.
         self.last_mid=None;self.last_change=0.
-        self.feature_schema=FUSION_SCHEMA
+        self.feature_schema=self.fusion_schema
         self.fusion_labels=0
+        self.model_version+=1
         self.store.event('learning','Cross-market and news features joined neural inputs; old weights preserved',
-            {'epic':self.epic,'feature_schema':FUSION_SCHEMA,'inputs':FUSION_DIM,
-             'preserved_steps':c.steps,'old_pending_labels_dropped':True})
+            {'epic':self.epic,'feature_schema':self.fusion_schema,'inputs':self.fusion_dim,
+             'preserved_steps':c.steps,'old_pending_labels_dropped':True,
+             'model_version':self.model_version})
         self.save()
 
     @staticmethod
@@ -406,15 +501,15 @@ class AdaptiveBrain:
             if (bar_time is None or not isinstance(features,(list,tuple,np.ndarray))
                 or not np.isfinite(features).all()):return None
             if external_features is not None:
-                if len(features)!=FUSION_DIM or external_features is not True:return None
-                # New or old v3 weights are first moved to a known, versioned schema.
-                if self.feature_schema!=FUSION_SCHEMA:
+                if len(features)!=self.fusion_dim or external_features is not True:return None
+                # New or old OHLC weights are first moved to a known, versioned schema.
+                if self.feature_schema!=self.fusion_schema:
                     self._switch_to_market_features()
                     self._extend_to_external_features()
             else:
-                if len(features)!=FEATURE_DIM:return None
-                # Never run a v4 neural network on fabricated zero external data.
-                if self.feature_schema==FUSION_SCHEMA:return None
+                if len(features)!=self.ohlc_dim:return None
+                # Never run a fusion network on fabricated zero external data.
+                if self.feature_schema==self.fusion_schema:return None
                 self._switch_to_market_features()
             prev_bar=self.store.get('mtf_last_bar:'+epic)
             if prev_bar and bar_time<=prev_bar:return None
@@ -443,7 +538,7 @@ class AdaptiveBrain:
                     self.core.update_utility(past['h'],past['c'],label,
                         neuron_ids=past.get('neuron_ids'))
                     loss=self.core.learn(transition,label)
-                    if loss is not None and self.feature_schema==FUSION_SCHEMA:
+                    if loss is not None and self.feature_schema==self.fusion_schema:
                         self.fusion_labels+=1
                     if loss is not None and (self.labeled+1)%100==0:
                         self.store.event('learning','Horizon-label learning checkpoint',
@@ -466,11 +561,16 @@ class AdaptiveBrain:
         growth_interval=(self.FAST_GROWTH_INTERVAL if self.core.vbar>2.0
                          else self.GROWTH_INTERVAL)
         if self.core.steps%growth_interval==0:
+            from .self_params import get as sp_get
             z=np.asarray(result['z'])
-            if self.core.grow_if_needed(z,threshold=.65,nmax=None):
+            grow_th=float(sp_get(self.store,'grow_error_threshold',.55))
+            if self.core.grow_if_needed(z,threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron automatically added',{'neurons':self.core.n})
         if self.core.steps%80==0:
-            deleted=self.core.prune(min_age=80,threshold=-.01)
+            from .self_params import get as sp_get
+            deleted=self.core.prune(
+                min_age=int(sp_get(self.store,'prune_min_age',80)),
+                threshold=float(sp_get(self.store,'prune_utility_threshold',-.01)))
             if deleted:self.store.event('neural','Low utility neurons removed',
                 {'count':deleted,'neurons':self.core.n})
         cur=self.store.db.execute('''INSERT INTO signals
@@ -535,6 +635,19 @@ class SingleTradeEngine:
         self._peer_refresh_task=None
         self._peer_requested_bar=None
         self.news_calendar_path=self.store.path.parent/'economic_calendar.json' if hasattr(self.store,'path') else __import__('pathlib').Path('data/economic_calendar.json')
+        # Autonomous self-development (OHLC discovery → validation → dim expand).
+        self.feature_registry=FeatureRegistry(store)
+        self.feature_discovery=FeatureDiscovery(store)
+        self.feature_validator=FeatureValidator(
+            store,self.feature_registry,discovery=self.feature_discovery)
+        self.profit_learning=ProfitLearning(store)
+        self.model_validator=ModelValidator(store)
+        from .shadow_paper import ShadowPaperJournal
+        self.shadow_paper=ShadowPaperJournal(store)
+        if hasattr(self.brain,'apply_registry'):
+            self.brain.apply_registry(self.feature_registry)
+        self._last_self_dev_bar=None
+        self.shadow_brain=None  # optional alternate architecture (never executes LIVE)
     def _news_risk(self, when=None):
         # Use the engine clock so candle learning, news features and entry guards
         # share one timeline (and tests can freeze time via monkeypatching now()).
@@ -1063,10 +1176,14 @@ class SingleTradeEngine:
                     at=candle_bucket(p.get('snapshotTimeUTC') or p.get('snapshotTime'))
                     current_bucket=candle_bucket(now())
                     if at is None or at>=current_bucket:continue
+                    close_item=p.get('closePrice') or {}
+                    cb=_num(close_item.get('bid'));ca=_num(close_item.get('ask'))
+                    bar_spread=(ca-cb) if ca is not None and cb is not None and ca>=cb else None
                     bar={'at':at,
                          'open':midprice('openPrice'),'high':midprice('highPrice'),
-                         'low':midprice('lowPrice'),'close':midprice('closePrice')}
-                    if bar['at'] and all(v is not None for k,v in bar.items() if k!='at'):
+                         'low':midprice('lowPrice'),'close':midprice('closePrice'),
+                         'spread':bar_spread}
+                    if bar['at'] and all(v is not None for k,v in bar.items() if k not in ('at','spread')):
                         self.store.candle(self.mandate['epic'],bar,source='HISTORICAL')
             except Exception as exc:self.store.event('warning','Candle refresh unsuccessful',{'type':type(exc).__name__})
     async def poll(self):
@@ -1108,13 +1225,20 @@ class SingleTradeEngine:
             existing=self.store.db.execute('SELECT open,high,low FROM candles WHERE epic=? AND at=?',(self.mandate['epic'],bucket)).fetchone()
             bar={'at':bucket,'open':existing[0] if existing else mid,
                  'high':max(mid,existing[1]) if existing else mid,
-                 'low':min(mid,existing[2]) if existing else mid,'close':mid}
+                 'low':min(mid,existing[2]) if existing else mid,'close':mid,
+                 'spread':ask-bid}
             self.store.candle(self.mandate['epic'],bar)
             await self._account_and_candles()
             # Only BROKER-REPORTED complete MINUTE OHLC bars may feed the AI.
             # The forming quote candle is explicitly excluded by market_features.
             candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
-            self.market_context=market_features(candles,spread=ask-bid,epic=self.mandate['epic'])
+            self.feature_registry.load()
+            if hasattr(self.brain,'apply_registry'):
+                self.brain.apply_registry(self.feature_registry)
+            self.market_context=market_features(
+                candles,spread=ask-bid,epic=self.mandate['epic'],
+                approved=self.feature_registry.approved,
+                schema=self.feature_registry.ohlc_schema())
             # Reference broker reads are background-only while managing an open
             # position; a slow feed must NOT stall live SL/TP supervision.
             if self.market_context['ready']:
@@ -1127,7 +1251,8 @@ class SingleTradeEngine:
                 self.brain.last_regime=self.market_context['trend']
                 fused=fusion_features(self.market_context,self.intermarket.state,
                     self.mandate['epic'],self.news_calendar_path,self.instrument_profile['currencies'],
-                    now=clock())
+                    now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
+                    fusion_schema=self.brain.fusion_schema)
                 self.latest_fusion_ready=fused is not None
                 # Before the first verified external sample, retain legacy OHLC
                 # learning. Once upgraded, NEVER infer on incomplete external data.
@@ -1135,7 +1260,7 @@ class SingleTradeEngine:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
                         bar_time=self.market_context['bar_time'],external_features=True)
-                elif self.brain.feature_schema!=FUSION_SCHEMA:
+                elif self.brain.feature_schema!=self.brain.fusion_schema:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=self.market_context['features'],
                         bar_time=self.market_context['bar_time'])
@@ -1143,9 +1268,16 @@ class SingleTradeEngine:
                     next_signal=None
                     self.last_signal=None  # Old external features must not be reused.
                 if next_signal is not None:
+                    next_signal=dict(next_signal,
+                        model_version=self.brain.model_version,
+                        feature_schema=self.brain.feature_schema,
+                        market_bar=self.market_context.get('bar_time'),
+                        trend=self.market_context.get('trend'),
+                        regime=self.market_context.get('regime'))
                     self.last_signal=next_signal
                     self.last_decision_bar=self.market_context['bar_time']
                     new_closed_bar=True
+                    self._run_self_development_cycle(candles,spread=ask-bid)
                 self.brain.last_regime=self.market_context['trend']
             else:
                 self.latest_fusion_ready=False
@@ -1194,7 +1326,7 @@ class SingleTradeEngine:
                     intent=self.policy.evaluate_neural_exit(
                         scores,p['direction'],
                         returns_bps=self.market_context.get('returns_bps'),
-                        opposite_streak=streak,need_streak=2)
+                        opposite_streak=streak,store=self.store)
                     if intent=='CLOSE':
                         self.store.event('exit','Neural CLOSE intent ignored — SL/TP/trail only',
                             {'deal_id':p['dealId'],'direction':p['direction'],'vote':vote,
@@ -1243,7 +1375,12 @@ class SingleTradeEngine:
         if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Waiting for same-instrument neural signal','evidence':None}
-        result=self.policy.evaluate_neural_entry(self.last_signal['scores'])
+        ctx=self.market_context or {}
+        result=self.policy.evaluate_neural_entry(
+            self.last_signal['scores'],
+            returns_bps=ctx.get('returns_bps'),
+            trend=ctx.get('trend'),
+            regime=ctx.get('regime'))
         if result['action'] in ('BUY','SELL'):
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
@@ -1496,23 +1633,71 @@ class SingleTradeEngine:
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
         else:
             pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
-        if pnl_sign>0:
-            label=0 if direction=='BUY' else 1
-            repeats=2
-            mode='reinforce_win'
-        elif pnl_sign<0:
-            label=1 if direction=='BUY' else 0
-            repeats=5
-            mode='regret_loss'
+        # Profit-centred labels — no entry cooldown. Flip-after-loss → HOLD
+        # (never auto-train opposite churn). Other losses use counterfactual HOLD
+        # preference via profit_learning before optional opposite regret.
+        prev_out=self.store.get('last_trade_outcome') or {}
+        flip_after_loss=bool(
+            pnl_sign<0 and isinstance(prev_out,dict) and
+            int(prev_out.get('pnl_sign') or 0)<0 and
+            prev_out.get('direction') in ('BUY','SELL') and
+            prev_out.get('direction')!=direction)
+        spread_cost=_num(saved.get('entry_spread')) or 0.
+        shadow_action=None
+        if self.shadow_brain is not None and saved.get('shadow_scores'):
+            sc=saved['shadow_scores']
+            try:
+                shadow_action=max(('BUY','SELL','HOLD'),key=lambda a:float(sc.get(a,0)))
+            except (TypeError,ValueError):
+                shadow_action=None
+        # Profit ledger: ONLY broker-confirmed £ — never ±1 tick fakes.
+        if pnl_source=='broker' and pnl_value is not None:
+            decision=self.profit_learning.record_closed(
+                deal_id=deal_id,epic=epic,direction=direction,entry=entry,
+                exit_level=exit_level,broker_pnl=pnl_value,
+                currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
+                model_version=getattr(self.brain,'model_version',0),
+                feature_schema=getattr(self.brain,'feature_schema',None),
+                shadow_action=shadow_action,require_broker_pnl=True)
+            label=int(decision['label']);mode=decision['mode']
         else:
-            label=2
+            # Tick-direction neural update only — profit_learning not polluted.
+            if flip_after_loss:
+                label,mode=2,'chop_hold_after_flip_loss'
+            elif pnl_sign>0:
+                label=0 if direction=='BUY' else 1;mode='reinforce_win_ticks'
+            elif pnl_sign<0:
+                label,mode=2,'loss_hold_ticks'
+            else:
+                label,mode=2,'flat_hold'
+            self.profit_learning.record_closed(
+                deal_id=deal_id,epic=epic,direction=direction,entry=entry,
+                exit_level=exit_level,broker_pnl=None,
+                currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
+                model_version=getattr(self.brain,'model_version',0),
+                feature_schema=getattr(self.brain,'feature_schema',None),
+                shadow_action=shadow_action,require_broker_pnl=True)
+        from .self_params import load as load_self_params, evolve_from_feedback
+        sp=load_self_params(self.store)
+        if mode in ('reinforce_win','reinforce_win_ticks'):
+            repeats=int(sp['learn_win_repeats'])
+        elif mode in ('flat_hold',):
             repeats=1
-            mode='flat_hold'
+        else:
+            repeats=int(sp['learn_loss_repeats'])
+        learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
         for _ in range(repeats):
-            step_loss=self.brain.core.learn(transition,label)
+            step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
             if step_loss is not None:losses.append(step_loss)
+        # Independent shadow core trains on the same delayed label (side-by-side).
+        self._shadow_learn(transition,label,lr=learn_lr)
+        if pnl_source=='broker' and pnl_value is not None:
+            # Queue evidence only — commit when long-horizon £ proves improvement.
+            evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
+            from .self_params import maybe_commit_long_horizon
+            maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
         if transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
@@ -1520,6 +1705,9 @@ class SingleTradeEngine:
         self.brain.correct+=int(pnl_sign>0)
         self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                source=pnl_source,overwrite=overwrite)
+        self.store.set('last_trade_outcome',{
+            'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
+            'pnl':pnl_value,'mode':mode})
         # Joint system: cash P&L also teaches SL/TP shape (lot+market stay the risk frame).
         if pnl_value is not None and pnl_source=='broker':
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
@@ -1532,7 +1720,8 @@ class SingleTradeEngine:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
             self._note_scratch_close(pnl_value,deal_id)
         if self.brain.core.last_z is not None:
-            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
+            grow_th=float(sp['grow_error_threshold'])
+            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
         self.brain.save()
@@ -1716,6 +1905,7 @@ class SingleTradeEngine:
                     'tick_size':tick,'entry_spread':spread,
                     'transition':self.brain._json_transition(self.brain.core.last_transition),
                     'scores':(self.last_signal or {}).get('scores'),
+                    'shadow_scores':self._shadow_scores_now(),
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
                     'bracket_explored':bool(bp.get('explored')),
@@ -1755,11 +1945,16 @@ class SingleTradeEngine:
         return {'connected':bool(self.broker),'armed':self.armed,'execution_enabled':self.execution_enabled,
                 'mandate':self.mandate,'data_dir':str(self.store.path.parent),
                 'positions':self.positions,'market':self.market,'signal':self.last_signal,
-                'neural':dict(self.brain.core.snapshot(),feature_schema=self.brain.feature_schema,
+                'neural':dict(self.brain.core.snapshot(),feature_schema=getattr(self.brain,'feature_schema',None),
                     input_dimension=self.brain.core.d,
-                    external_features_learned=(self.brain.feature_schema==FUSION_SCHEMA),
+                    external_features_learned=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                        and getattr(self.brain,'fusion_schema',None) is not None),
                     external_feed_ready=self.latest_fusion_ready,
-                    external_trained_labels=self.brain.fusion_labels),
+                    external_trained_labels=getattr(self.brain,'fusion_labels',0),
+                    model_version=getattr(self.brain,'model_version',0),
+                    ohlc_dim=getattr(self.brain,'ohlc_dim',None),
+                    fusion_dim=getattr(self.brain,'fusion_dim',None),
+                    feature_registry=self.feature_registry.snapshot()),
                 'accuracy_proxy':self.brain.correct/max(1,self.brain.labeled),
                 'labeled_samples':self.brain.labeled,'market_regime':self.brain.last_regime,
                 'market_context':self.market_context,'adaptive_protection':self.protection_brief,
@@ -1804,9 +1999,188 @@ class SingleTradeEngine:
                     'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    'Waiting for aligned external neural inputs' if self.brain.feature_schema==FUSION_SCHEMA else
+                    'Waiting for aligned external neural inputs' if (
+                        getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                        and getattr(self.brain,'fusion_schema',None) is not None) else
                     'Waiting for signal'),
+                'self_development':{
+                    'registry':self.feature_registry.snapshot(),
+                    'profit':self.profit_learning.summary(),
+                    'model_stack':len(self.model_validator.stack),
+                    'shadow_active':self.shadow_brain is not None,
+                    'shadow_paper':self.shadow_paper.summary(),
+                    'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
                 'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or [])}
+
+    def _bars_and_spreads_from_candles(self,candles):
+        """Chronological OHLC + per-bar spreads (None when unknown — never invent)."""
+        bars=[];spreads=[];times=[]
+        for raw in sorted(candles or [],key=lambda r:r.get('at') or ''):
+            try:
+                bars.append(tuple(float(raw[k]) for k in ('open','high','low','close')))
+            except (TypeError,ValueError,KeyError):
+                continue
+            times.append(raw.get('at'))
+            sp=_num(raw.get('spread'))
+            spreads.append(float(sp) if sp is not None and sp>=0 else None)
+        return bars,spreads,times
+
+    def _ensure_shadow_brain(self):
+        """Independent shadow NeuralCore — same input dim, own weights (never LIVE)."""
+        d=self.brain.core.d
+        if self.shadow_brain is None or self.shadow_brain.d!=d:
+            alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
+            self.shadow_brain=self.brain.core.clone_architecture(
+                n=alt_n,seed=11+alt_n,copy_weights=False)
+            self.store.event('shadow','Independent shadow neural core ready',
+                {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n})
+        return self.shadow_brain
+
+    def _shadow_learn(self,transition,label,lr=None):
+        shadow=self._ensure_shadow_brain()
+        if transition is None or label not in (0,1,2):return
+        z=transition.get('z')
+        if z is None or len(np.asarray(z))!=shadow.d:return
+        shadow.learn(transition,label,lr=lr)
+
+    def _shadow_scores_now(self):
+        """One forward pass on live last_z for shadow journal (no LIVE order)."""
+        shadow=self._ensure_shadow_brain()
+        z=self.brain.core.last_z
+        if z is None or len(z)!=shadow.d:return None
+        try:
+            # Use shadow's own h/c — step advances shadow state on closed bars only
+            # via learn; here we score without mutating by using _forward snapshot.
+            hn,cn,logits=shadow._forward(
+                np.asarray(z,dtype=float),shadow.h,shadow.c,1.0)
+            prob=shadow._softmax(logits)
+            return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
+        except Exception:
+            return None
+
+    def _run_self_development_cycle(self,candles,*,spread=0.):
+        """Discover → validate → expand (decision-time data only). Never blocks orders."""
+        from .historical_features import build_feature_matrix
+        bar=self.market_context.get('bar_time')
+        if not bar or bar==self._last_self_dev_bar:return
+        self._last_self_dev_bar=bar
+        bars,spreads,times=self._bars_and_spreads_from_candles(candles)
+        if len(bars)<120:return
+        window=bars[-61:]
+        # Discovery uses the latest known per-bar spread when present.
+        last_sp=next((s for s in reversed(spreads) if s is not None),None)
+        if last_sp is None:last_sp=float(spread) if spread is not None else 0.
+        proposals=self.feature_discovery.on_closed_bar(
+            bar,window,spread=last_sp,registry=self.feature_registry)
+        self._ensure_shadow_brain()
+        # Independent shadow paper step on every closed ready bar (not LIVE remap).
+        self._shadow_paper_step(mid=self.market_context.get('close'),
+                                spread=last_sp,bar_time=bar)
+        if not proposals:
+            self.policy.shadow_self_dev_tick(self)
+            return
+        # Real historical feature matrix — never tile one live snapshot.
+        existing,names,indices=build_feature_matrix(
+            bars,spreads,approved=self.feature_registry.approved)
+        # Validation refuses a single live spread pasted on all history.
+        approved_any=False
+        for prop in proposals[:6]:
+            result=self.feature_validator.validate_and_maybe_approve(
+                prop['id'],bars,spreads=spreads,times=times,
+                existing_matrix=existing,existing_names=names,
+                existing_indices=indices)
+            if result.get('approved'):
+                approved_any=True
+        if approved_any:
+            # Snapshot *current* weights onto the stack before expanding.
+            pre_path=None
+            if hasattr(self.brain,'backup_weights'):
+                pre_path=self.brain.backup_weights(
+                    tag=f'v{int(self.brain.model_version)}')
+            pre_specs=[dict(x) for x in self.feature_registry.approved]
+            self.model_validator.push_version({
+                'model_version':self.brain.model_version,
+                'feature_schema':self.brain.feature_schema,
+                'ohlc_dim':self.brain.ohlc_dim,
+                'fusion_dim':self.brain.fusion_dim,
+                'approved':self.feature_registry.approved_ids(),
+                'approved_specs':pre_specs,
+                'weights_path':pre_path})
+            old_ohlc=self.brain.ohlc_dim
+            self.brain.apply_registry(self.feature_registry)
+            # Keep shadow dim aligned (insert dynamic before external if on fusion).
+            if self.shadow_brain is not None and self.shadow_brain.d!=self.brain.core.d:
+                insert=old_ohlc if self.brain.feature_schema==self.brain.fusion_schema else None
+                try:
+                    self.shadow_brain.expand_inputs(self.brain.core.d,insert_at=insert)
+                except Exception:
+                    self.shadow_brain=None
+                    self._ensure_shadow_brain()
+            post_path=None
+            if hasattr(self.brain,'backup_weights'):
+                post_path=self.brain.backup_weights(
+                    tag=f'v{int(self.brain.model_version)}')
+            post_specs=[dict(x) for x in self.feature_registry.approved]
+            self.model_validator.push_version({
+                'model_version':self.brain.model_version,
+                'feature_schema':self.brain.feature_schema,
+                'ohlc_dim':self.brain.ohlc_dim,
+                'fusion_dim':self.brain.fusion_dim,
+                'approved':self.feature_registry.approved_ids(),
+                'approved_specs':post_specs,
+                'weights_path':post_path})
+        self.policy.shadow_self_dev_tick(self)
+
+    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None):
+        """Advance independent shadow paper journal from current shadow vote."""
+        scores=self._shadow_scores_now()
+        if not scores or mid is None:return None
+        try:
+            action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))
+        except (TypeError,ValueError):
+            return None
+        # Scale price→£ from LIVE broker history so paper is cash-comparable.
+        live=getattr(self.profit_learning,'history',[]) or []
+        self.shadow_paper.update_cash_scale(live)
+        return self.shadow_paper.on_bar(
+            action,mid=mid,spread=spread,bar_time=bar_time,
+            cash_scale=self.shadow_paper.cash_scale)
+
+    def restore_neural_weights(self, version_meta_or_path):
+        """Rollback hook: restore feature registry + neural weights together.
+
+        Accepts a full version_meta dict (preferred) or a bare weights path
+        string for older call sites/tests.
+        """
+        if isinstance(version_meta_or_path,dict):
+            meta=version_meta_or_path
+            path=meta.get('weights_path')
+            specs=meta.get('approved_specs')
+        else:
+            meta=None;path=version_meta_or_path;specs=None
+        # Registry first so layout matches the weight file about to load.
+        if specs is not None:
+            self.feature_registry.replace_approved(specs)
+        ok=False
+        if path and hasattr(self.brain,'restore_weights'):
+            ok=bool(self.brain.restore_weights(path))
+        if ok or specs is not None:
+            # Re-sync brain schema labels from restored registry without expanding.
+            reg=self.feature_registry
+            self.brain.ohlc_dim=reg.ohlc_dim()
+            self.brain.fusion_dim=reg.fusion_dim()
+            self.brain.ohlc_schema=reg.ohlc_schema()
+            self.brain.fusion_schema=reg.fusion_schema()
+            # If weights restored, feature_schema on brain comes from the file;
+            # if only registry restored, keep brain.feature_schema as loaded.
+            self.shadow_brain=None
+            self._ensure_shadow_brain()
+            self.store.event('learning','Model snapshot restored',
+                {'weights':bool(ok),'registry':specs is not None,
+                 'ohlc_dim':self.brain.ohlc_dim,
+                 'approved':self.feature_registry.approved_ids(),
+                 'model_version':(meta or {}).get('model_version') if isinstance(meta,dict) else None})
+        return bool(ok or specs is not None)
 

@@ -1243,7 +1243,12 @@ class SingleTradeEngine:
         if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Waiting for same-instrument neural signal','evidence':None}
-        result=self.policy.evaluate_neural_entry(self.last_signal['scores'])
+        ctx=self.market_context or {}
+        result=self.policy.evaluate_neural_entry(
+            self.last_signal['scores'],
+            returns_bps=ctx.get('returns_bps'),
+            trend=ctx.get('trend'),
+            regime=ctx.get('regime'))
         if result['action'] in ('BUY','SELL'):
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
@@ -1496,10 +1501,22 @@ class SingleTradeEngine:
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
         else:
             pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
+        # Learn from £ outcome — no entry cooldown filter. Chop is taught as HOLD:
+        # loss that flipped after a prior loss → HOLD (don't train the opposite flip).
+        prev_out=self.store.get('last_trade_outcome') or {}
+        flip_after_loss=bool(
+            pnl_sign<0 and isinstance(prev_out,dict) and
+            int(prev_out.get('pnl_sign') or 0)<0 and
+            prev_out.get('direction') in ('BUY','SELL') and
+            prev_out.get('direction')!=direction)
         if pnl_sign>0:
             label=0 if direction=='BUY' else 1
             repeats=2
             mode='reinforce_win'
+        elif flip_after_loss:
+            label=2  # HOLD — market reading: abstinence after SL→opposite→SL
+            repeats=5
+            mode='chop_hold_after_flip_loss'
         elif pnl_sign<0:
             label=1 if direction=='BUY' else 0
             repeats=5
@@ -1520,6 +1537,9 @@ class SingleTradeEngine:
         self.brain.correct+=int(pnl_sign>0)
         self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                source=pnl_source,overwrite=overwrite)
+        self.store.set('last_trade_outcome',{
+            'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
+            'pnl':pnl_value,'mode':mode})
         # Joint system: cash P&L also teaches SL/TP shape (lot+market stay the risk frame).
         if pnl_value is not None and pnl_source=='broker':
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')

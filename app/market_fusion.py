@@ -12,7 +12,7 @@ from pathlib import Path
 from .external_risk import _utc, assess_news
 from .market_context import FEATURE_NAMES, candle_time
 
-FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_v4'
+FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_shadow_v5'
 EXTERNAL_NAMES = (
     'peer_corr_weighted_return_1m',
     'peer_corr_weighted_return_5m',

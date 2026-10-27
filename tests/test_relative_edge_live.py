@@ -79,8 +79,8 @@ def test_custom_handwritten_policy_not_silently_overwritten():
 
 
 def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_labels(monkeypatch):
-    install_synthetic_context(monkeypatch)
     async def scenario(direction):
+        install_synthetic_context(monkeypatch, direction=direction)
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
             e=SingleTradeEngine(s,brain);e.policy=AutoEvolution(s,Path(d)/'policy.py')

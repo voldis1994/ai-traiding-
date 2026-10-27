@@ -30,20 +30,29 @@ def test_propose_explores_then_evolve_promotes_better_cash():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         assert load_params(store)=={'kappa':DEFAULT_KAPPA,'sl_scale':DEFAULT_SL_SCALE}
-        # Force exploration of a worse and a better cell via tagged outcomes.
-        for _ in range(4):
+        assert DEFAULT_KAPPA==1.0  # cold start is 1:1, not frozen 1:2
+        for _ in range(6):
             record_outcome(store,kappa=2.0,sl_scale=1.0,pnl=-0.5,currency='GBP')
-        for _ in range(4):
+        for _ in range(6):
             record_outcome(store,kappa=3.0,sl_scale=1.5,pnl=1.2,currency='GBP')
-        promoted=evolve_from_history(store,min_samples=8)
+        promoted=evolve_from_history(store,min_samples=6)
         assert promoted is not None
         assert promoted['kappa']==3.0 and promoted['sl_scale']==1.5
         assert load_params(store)['kappa']==3.0
-        # With enough history and non-explore cadence, propose returns champion.
         class FixedRng:
             def choice(self,seq):return seq[0]
         p=propose_for_open(store,explore_every=99,rng=FixedRng())
         assert p['kappa']==3.0 and p['sl_scale']==1.5 and p['explored'] is False
+
+
+def test_stale_kappa_two_without_history_resets_toward_one_to_one():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        store.set('bracket_kappa',2.0)  # leftover frozen 1:2
+        store.set('bracket_sl_scale',1.0)
+        p=propose_for_open(store,explore_every=99,ohlc_kappa=1.25)
+        # Either OHLC hint saved as champion seed, or explore — never silent κ=2 lock.
+        assert p['kappa']!=2.0 or p['explored'] is True
 
 
 def test_save_and_load_reject_invalid():

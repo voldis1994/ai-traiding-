@@ -892,13 +892,24 @@ class SingleTradeEngine:
                 self.store.event('trade','Deal closed pending broker confirm P&L',
                                  {'dealId':prev_id,'exit_guess':exit_guess})
             else:
-                # External/manual close: learn from ticks; cash P&L only if broker later supplies it.
-                self.store.close_trade(prev_id,exit_guess,source='position_disappeared')
-                self._learn_closed_trade(prev_id,{'level':exit_guess,'source':'position_disappeared'})
-                self.store.event('trade','Previous broker deal no longer open',{'dealId':prev_id})
+                # SL/TP/manual vanish: resolve Capital cash P&L — never settle for ticks_only
+                # when history/UPL still has account-currency profit.
+                if exit_guess is None:
+                    # market may be {} after adopt; last UPL row has no level — keep None.
+                    snap=self.store.get('last_upl:'+str(prev_id)) or {}
+                    exit_guess=_num(snap.get('exit_hint'))
+                conf={'level':exit_guess,'source':'position_disappeared'}
+                pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
+                if pnl is not None:
+                    conf['profit']=pnl
+                    if ccy:conf['pnl_currency']=ccy
+                self._learn_closed_trade(prev_id,conf)
+                self.store.event('trade','Previous broker deal no longer open',
+                                 {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
         if current:
             self.position_age=(self.position_age+1 if current==prev_id else 0)
             self.store.upsert_trade(latest[0])
+            self._snapshot_open_upl(latest[0])
         else:self.position_age=0
         self.last_position_id=current
         # Live open position → this session's instrument/size mandate.
@@ -1284,8 +1295,16 @@ class SingleTradeEngine:
                 self.store.event('warning','Adaptive protection unavailable: opening bracket missing or invalid',
                                  {'deal_id':p['dealId']})
         if kind=='CLOSE':
-            # Learn first so realized P&L is written into History in the same step.
+            # Confirm often omits profit on CLOSE; fill from history/UPL before learn.
+            pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
+            if pnl is not None and _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
+                confirmation={**confirmation,'profit':pnl}
+            if _ccy and not confirmation.get('pnl_currency'):
+                confirmation={**confirmation,'pnl_currency':_ccy}
             self._learn_closed_trade(deal_id,confirmation)
+            if src=='ticks_only':
+                self.store.event('warning','Close learned without broker cash P&L (ticks_only)',
+                                 {'deal_id':deal_id,'reference':ref})
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _account_currency(self):
@@ -1296,7 +1315,7 @@ class SingleTradeEngine:
         cur=(active.get('currency') or '').strip().upper()
         return cur or None
 
-    def _realized_trade_pnl(self,deal_id,entry,exit_level,direction,broker_pnl=None):
+    def _realized_trade_pnl(self,deal_id,entry,exit_level,direction,broker_pnl=None,currency=None):
         """Prefer broker cash P&L in account currency. Never invent price×size cash.
 
         GOLD mid is USD-quoted; Capital.com confirm.profit / position.upl are in
@@ -1304,7 +1323,8 @@ class SingleTradeEngine:
         and must not be stored as money.
         """
         if broker_pnl is not None and math.isfinite(broker_pnl):
-            return float(broker_pnl),'broker',self._account_currency()
+            ccy=(currency or self._account_currency() or '').strip().upper() or None
+            return float(broker_pnl),'broker',ccy
         return None,'ticks_only',None
 
     def _note_scratch_close(self,pnl_value,deal_id=None):
@@ -1316,6 +1336,74 @@ class SingleTradeEngine:
         self.store.set('entry_scratch_cooldown',5)
         self.store.event('entry','Scratch close — cooling re-entry for 5 M1 bars',
                          {'pnl':pnl_value,'deal_id':deal_id})
+
+    def _snapshot_open_upl(self,position):
+        """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
+        deal_id=position.get('dealId')
+        upl=_num(position.get('upl'))
+        if not deal_id or upl is None or not math.isfinite(upl):return
+        ccy=(position.get('currency') or self._account_currency() or '').strip().upper() or None
+        self.store.set('last_upl:'+str(deal_id),{
+            'upl':float(upl),'currency':ccy,'at':now(),
+            'exit_hint':_num(position.get('level')) or _num((self.market or {}).get('mid'))})
+
+    async def _pnl_from_broker_history(self,deal_id):
+        """Pull closed-trade cash from Capital history/activity (not mid×size)."""
+        if not self.broker or not deal_id:return None
+        deal=str(deal_id)
+        # Activity often names the dealId on SL/TP/USER closes.
+        if hasattr(self.broker,'activity'):
+            try:
+                payload=await self.broker.activity(last_period=1800,detailed=True)
+                for row in payload.get('activities') or []:
+                    if str(row.get('dealId') or '')!=deal:continue
+                    details=row.get('details') if isinstance(row.get('details'),dict) else {}
+                    for key in ('profit','pnl','guaranteedStopProfit','realizedPnl'):
+                        val=_num(details.get(key) if details else None)
+                        if val is None:val=_num(row.get(key))
+                        if val is not None and math.isfinite(val):
+                            return float(val),(row.get('currency') or self._account_currency())
+            except Exception as exc:
+                self.store.event('warning','Activity history P&L lookup failed',
+                                 {'type':type(exc).__name__,'deal_id':deal})
+        if hasattr(self.broker,'transactions'):
+            try:
+                payload=await self.broker.transactions(last_period=1800,tx_type='TRADE')
+                for row in payload.get('transactions') or []:
+                    ref=str(row.get('reference') or row.get('transactionId') or '')
+                    if deal not in ref and ref!=deal:continue
+                    val=_num(row.get('pnl'))
+                    if val is None:val=_num(row.get('cash'))
+                    if val is not None and math.isfinite(val):
+                        return float(val),(row.get('currency') or self._account_currency())
+            except Exception as exc:
+                self.store.event('warning','Transaction history P&L lookup failed',
+                                 {'type':type(exc).__name__,'deal_id':deal})
+        return None
+
+    async def _resolve_broker_pnl(self,deal_id,confirmation=None):
+        """Never settle for ticks_only when Capital still has cash P&L somewhere.
+
+        Order: confirm.profit → history/activity → last live UPL snapshot.
+        """
+        confirmation=confirmation or {}
+        ccy=self._account_currency()
+        for key in ('profit','pnl'):
+            val=_num(confirmation.get(key))
+            if val is not None and math.isfinite(val):
+                return float(val),'broker',ccy
+        # Broker journals can lag a second after SL/TP fire.
+        for delay in (0,.6,1.5):
+            if delay:await asyncio.sleep(delay)
+            found=await self._pnl_from_broker_history(deal_id)
+            if found:
+                pnl,hist_ccy=found
+                return pnl,'broker',hist_ccy or ccy
+        snap=self.store.get('last_upl:'+str(deal_id)) or {}
+        upl=_num(snap.get('upl'))
+        if upl is not None and math.isfinite(upl):
+            return float(upl),'broker',snap.get('currency') or ccy
+        return None,'ticks_only',None
 
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
@@ -1330,19 +1418,21 @@ class SingleTradeEngine:
         exit_level=_num(confirmation.get('level'))
         broker_pnl=_num(confirmation.get('profit'))
         if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
-        overwrite=confirmation.get('source')!='position_disappeared'
+        hint_ccy=(confirmation.get('pnl_currency') or confirmation.get('currency') or '').strip().upper() or None
+        # Allow overwrite when we finally have broker cash after a vanish guess.
+        overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
             row=self.store.db.execute(
                 'SELECT entry,direction FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
             if row and exit_level is not None and row[0] is not None and row[1] in ('BUY','SELL'):
                 pnl_value,pnl_source,currency=self._realized_trade_pnl(
-                    deal_id,row[0],exit_level,row[1],broker_pnl)
+                    deal_id,row[0],exit_level,row[1],broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
                 if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
-            elif exit_level is not None:
-                currency=self._account_currency() if broker_pnl is not None else None
+            elif exit_level is not None or broker_pnl is not None:
+                currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
@@ -1352,23 +1442,32 @@ class SingleTradeEngine:
         entry=_num(saved.get('entry'))
         tick=_num(saved.get('tick_size'))
         direction=saved.get('direction')
-        if (not epic or epic!=self.brain.epic or
-            epic!=self.market.get('epic') or
-            entry is None or exit_level is None or not tick or tick<=0 or
-            direction not in ('BUY','SELL') or not saved.get('transition')):
-            if entry is not None and exit_level is not None and direction in ('BUY','SELL'):
+        # market{} is cleared on adopt; fall back to mandate/brain so SL/TP vanishes
+        # still record broker cash instead of ticks_only.
+        live_epic=(self.market.get('epic') or (self.mandate or {}).get('epic') or
+                   getattr(self.brain,'epic',None))
+        if exit_level is None:
+            exit_level=_num((self.market or {}).get('mid')) or _num(saved.get('entry'))
+        mismatched=(not epic or epic!=self.brain.epic or
+            (live_epic and epic!=live_epic) or
+            entry is None or not tick or tick<=0 or
+            direction not in ('BUY','SELL') or not saved.get('transition'))
+        if mismatched:
+            if direction in ('BUY','SELL') and (broker_pnl is not None or exit_level is not None):
                 pnl_value,pnl_source,currency=self._realized_trade_pnl(
-                    deal_id,entry,exit_level,direction,broker_pnl)
+                    deal_id,entry,exit_level or entry,direction,broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
+                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
-                {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic})
+                {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
+                 'live_epic':live_epic,'broker_pnl':broker_pnl})
             self.store.set(key,None)
             return
         sign=1 if direction=='BUY' else -1
-        realized_ticks=sign*(exit_level-entry)/tick
+        realized_ticks=sign*(exit_level-entry)/tick if exit_level is not None else 0.
         pnl_value,pnl_source,currency=self._realized_trade_pnl(
-            deal_id,entry,exit_level,direction,broker_pnl)
+            deal_id,entry,exit_level,direction,broker_pnl,currency=hint_ccy)
         if broker_pnl is not None and math.isfinite(broker_pnl):
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
         else:

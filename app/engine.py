@@ -1328,14 +1328,19 @@ class SingleTradeEngine:
         return None,'ticks_only',None
 
     def _note_scratch_close(self,pnl_value,deal_id=None):
-        """£0 / penny closes → cool re-entry so we do not spam Capital history."""
+        """Repeated £0 / penny closes → cool re-entry (Capital history spam)."""
         if pnl_value is None:return
         try:val=abs(float(pnl_value))
         except (TypeError,ValueError):return
-        if val>0.05:return
-        self.store.set('entry_scratch_cooldown',5)
-        self.store.event('entry','Scratch close — cooling re-entry for 5 M1 bars',
-                         {'pnl':pnl_value,'deal_id':deal_id})
+        if val>0.05:
+            self.store.set('scratch_streak',0)
+            return
+        streak=int(self.store.get('scratch_streak') or 0)+1
+        self.store.set('scratch_streak',streak)
+        if streak<2:return
+        self.store.set('entry_scratch_cooldown',3)
+        self.store.event('entry','Repeated scratch closes — cooling re-entry for 3 M1 bars',
+                         {'pnl':pnl_value,'deal_id':deal_id,'streak':streak})
 
     def _snapshot_open_upl(self,position):
         """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
@@ -1392,13 +1397,14 @@ class SingleTradeEngine:
             val=_num(confirmation.get(key))
             if val is not None and math.isfinite(val):
                 return float(val),'broker',ccy
-        # Broker journals can lag a second after SL/TP fire.
-        for delay in (0,.6,1.5):
-            if delay:await asyncio.sleep(delay)
+        # One quick retry — Capital journals can lag slightly after SL/TP fire.
+        found=await self._pnl_from_broker_history(deal_id)
+        if not found and (hasattr(self.broker,'activity') or hasattr(self.broker,'transactions')):
+            await asyncio.sleep(.8)
             found=await self._pnl_from_broker_history(deal_id)
-            if found:
-                pnl,hist_ccy=found
-                return pnl,'broker',hist_ccy or ccy
+        if found:
+            pnl,hist_ccy=found
+            return pnl,'broker',hist_ccy or ccy
         snap=self.store.get('last_upl:'+str(deal_id)) or {}
         upl=_num(snap.get('upl'))
         if upl is not None and math.isfinite(upl):

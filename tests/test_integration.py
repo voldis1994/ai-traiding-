@@ -29,8 +29,10 @@ def test_pdf_long_short_sl_tp_and_rounding():
     assert sell['stop_level']==Decimal('100.24')
     assert sell['profit_level']==Decimal('99.52')
     # min_distance=0 → only buffer (2*tick), not a fake 20-tick invent.
-    bare=stop_take('100','BUY','.03','.01',0)
+    bare=stop_take('100','BUY','.03','.01',0)  # default κ=1 (1:1), not 1:2
     assert bare['stop_ticks']==2
+    assert bare['profit_ticks']==2
+    assert bare['kappa']==1.0
     assert bare['sl_scale']==1.0
     wider=stop_take('100','BUY','.03','.01',0,kappa=2,sl_scale=2)
     assert wider['stop_ticks']==4

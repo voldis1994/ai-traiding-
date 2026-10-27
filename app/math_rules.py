@@ -28,12 +28,12 @@ def ohlc_range_distance(candles, n=20):
     return (ranges[mid-1]+ranges[mid])/2
 
 
-def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_scale=1,
+def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_scale=1,
               range_distance=0):
     """Broker-min + optional broker OHLC range, × learned sl_scale; TP = kappa × SL.
 
-    Hard floor: dealing min + spread/tick buffer. Soft floor from recent broker
-    M1 ranges (stops noise scratches when min alone is inside the spread).
+    Default κ=1 (1:1), not a frozen 1:2. Learned/explored κ comes from cash P&L.
+    Hard floor: dealing min + spread/tick buffer. Soft floor from broker M1 ranges.
     """
     entry, tick, spread, minimum, kappa, sl_scale, range_distance = map(
         D, (entry, tick_size, spread, min_distance, kappa, sl_scale, range_distance or 0))

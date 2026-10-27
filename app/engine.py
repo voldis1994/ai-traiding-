@@ -1091,12 +1091,11 @@ class SingleTradeEngine:
                          'instrument_name':inst.get('name') or inst.get('epic') or self.mandate['epic'],
                          'source':'WEBSOCKET' if streamed else 'REST'}
             # Broker protection is handled before slow secondary data calls.
+            # Missing TP alone must not abort the poll — trail still needs to run.
             if len(self.positions)==1 and (self.positions[0].get('stopLevel') is None or
                                            self.positions[0].get('profitLevel') is None):
                 await self.protect_position(self.positions[0])
-                if (len(self.positions)==1 and
-                    (self.positions[0].get('stopLevel') is None or
-                     self.positions[0].get('profitLevel') is None)):
+                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
                     return
 
             if self.positions:
@@ -1172,8 +1171,12 @@ class SingleTradeEngine:
             if not self.armed or not self.execution_enabled:return
             if len(self.positions)==1:
                 p=self.positions[0]
-                if p.get('stopLevel') is None or p.get('profitLevel') is None:
+                # Missing SL → install bracket. Missing TP alone must NOT block
+                # trail (Capital often shows Take Profit Off after SL-only PUTs).
+                if p.get('stopLevel') is None:
                     await self.protect_position(p);return
+                if p.get('profitLevel') is None:
+                    await self.protect_position(p)
                 # Live exit = broker SL / TP / trail only. Neural market-delete
                 # was matching M1 noise; the network still learns from cash P&L
                 # when those broker exits confirm. Intent is logged, never sent.

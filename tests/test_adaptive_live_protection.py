@@ -80,6 +80,17 @@ def test_broker_trail_does_not_invent_tp_extension():
     assert result['stop_level']==101.1-0.8
 
 
+def test_trail_still_ratchets_when_take_profit_is_off():
+    """Capital UI Take Profit Off must not freeze robot trailing SL."""
+    p=_position(stop=100.2,profit=None)
+    buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8))
+    assert buy and buy['stop_level']==100.55
+    assert buy['profit_level'] is None
+    sell=_position('SELL',stop=99.8,profit=None)
+    out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8))
+    assert out and out['stop_level']==99.45
+
+
 class Brain:
     class Core:
         steps=20

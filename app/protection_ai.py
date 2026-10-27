@@ -70,11 +70,15 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
 
 
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
-    """Place SL at broker extreme ± min_distance on the broker tick grid.
+    """Trail SL behind broker extreme by the *opening* stop distance.
 
-    BUY: stop = peak_bid_or_high − min_distance (floor).
-    SELL: stop = trough_ask_or_low + min_distance (ceil).
-    Never widens; never invents retention fractions.
+    Using only live min_distance glued the stop to the market (tip±min) and
+    produced £0 / -£0.02 Gold scratches every minute. Trail gap is the broker
+    opening bracket risk already accepted on the deal (`original_risk`), never
+    tighter than minStopOrProfitDistance.
+
+    BUY:  stop = peak − gap (floor).  SELL: stop = trough + gap (ceil).
+    Activates only after favorable excursion ≥ gap (so first ratchet ≈ BE+).
     """
     if market.get('status')!='TRADEABLE':return None
     direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
@@ -84,6 +88,7 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
     tp=_finite(position.get('profitLevel'))
     tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
     minimum=_finite(market.get('min_distance'))
+    gap=_finite(initial.get('original_risk'))
     if any(v is None for v in (entry,stop,tp,tick,bid,ask,minimum)):
         return None
     if min(entry,stop,tp,tick,bid,ask)<=0 or minimum<0 or ask<bid:return None
@@ -91,32 +96,41 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
     if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):
         return None
     if sign*(tp-stop)<=0:return None
+    # Gap = opening SL distance (broker-confirmed). Floor at dealing min.
+    if gap is None or gap<=0:gap=minimum
+    gap=max(gap,minimum)
     exit_quote=bid if sign==1 else ask
     if sign*(tp-exit_quote)<=0:return None  # already at/through TP
     tip=_finite(extreme)
     if tip is None:
         tip=bid if sign==1 else ask
-    # Favorable tip only — do not trail into a loss vs entry using older OHLC.
+    favorable=sign*(exit_quote-entry)
+    tip_fav=sign*(tip-entry)
+    # Need the extreme itself to have traveled ≥ gap before ratcheting.
+    if tip_fav<gap:return None
     if sign==1:
         tip=max(tip,bid)
         if tip<=entry:return None
-        desired=tip-minimum
+        desired=tip-gap
+        # Never place tighter than broker min from live bid.
+        desired=min(desired,bid-minimum)
         new_stop=_quantize(desired,tick,up=False)
         new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
         if new_stop<=stop or new_stop>=tip or sign*(tp-new_stop)<=0:return None
-        if new_stop<stop+tick-1e-12:return None  # need ≥1 tick improvement
+        if new_stop<stop+tick-1e-12:return None
     else:
         tip=min(tip,ask)
         if tip>=entry:return None
-        desired=tip+minimum
+        desired=tip+gap
+        desired=max(desired,ask+minimum)
         new_stop=_quantize(desired,tick,up=True)
         new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
         if new_stop>=stop or new_stop<=tip or sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None
     return {'stop_level':new_stop,'profit_level':None,
-            'reason':'broker tick/OHLC extreme ± minStop distance',
-            'extreme':tip,'min_distance':minimum,'tick':tick,
-            'observed_profit_distance':round(sign*(exit_quote-entry),5),
+            'reason':'broker extreme ± opening stop distance (≥ minStop)',
+            'extreme':tip,'trail_gap':gap,'min_distance':minimum,'tick':tick,
+            'observed_profit_distance':round(favorable,5),
             'bar_time':mark_time}
 
 

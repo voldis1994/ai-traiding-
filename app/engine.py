@@ -18,6 +18,7 @@ import numpy as np
 from .core import NeuralCore
 from .autonomy import AutoEvolution
 from .math_rules import stop_take
+from . import bracket_learn
 from .protection_ai import select_policy, propose_update
 from .storage import DATA
 from .market_context import market_features, candle_bucket, FEATURE_SCHEMA, FEATURE_DIM
@@ -1371,6 +1372,16 @@ class SingleTradeEngine:
         self.brain.correct+=int(pnl_sign>0)
         self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                source=pnl_source,overwrite=overwrite)
+        # Joint system: cash P&L also teaches SL/TP shape (lot+market stay the risk frame).
+        if pnl_value is not None and pnl_source=='broker':
+            bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
+            if bk is None or bs is None:
+                cur=bracket_learn.load_params(self.store);bk,bs=cur['kappa'],cur['sl_scale']
+            bracket_learn.record_outcome(self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
+                                         currency=currency,deal_id=deal_id)
+            promoted=bracket_learn.evolve_from_history(self.store)
+            if promoted:
+                self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
         if self.brain.core.last_z is not None:
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
@@ -1382,7 +1393,8 @@ class SingleTradeEngine:
              'broker_pnl':broker_pnl,
              'realized_directional_ticks':realized_ticks,'target':label,
              'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
-             'tick_size':tick})
+             'tick_size':tick,
+             'bracket':bracket_learn.load_params(self.store)})
         try:
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),
@@ -1470,7 +1482,9 @@ class SingleTradeEngine:
         if min_dist is None or not tick or not mid:
             self.store.event('warning','Protection not possible: unsupported broker distance/price rule')
             self.execution_enabled=False;return
-        result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist)
+        bp=bracket_learn.load_params(self.store)
+        result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
+                         kappa=bp['kappa'],sl_scale=bp['sl_scale'])
         stop=result['stop_level'] if p.get('stopLevel') is None else None
         profit=result['profit_level'] if p.get('profitLevel') is None else None
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
@@ -1519,7 +1533,9 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            brackets=stop_take(entry,action,tick,spread,minimum)
+            bp=bracket_learn.propose_for_open(self.store)
+            brackets=stop_take(entry,action,tick,spread,minimum,
+                               kappa=bp['kappa'],sl_scale=bp['sl_scale'])
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 self._pending_entry_brain={
@@ -1528,10 +1544,13 @@ class SingleTradeEngine:
                     'transition':self.brain._json_transition(self.brain.core.last_transition),
                     'scores':(self.last_signal or {}).get('scores'),
                     'bar_time':self.last_decision_bar,'captured':'submit',
+                    'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
+                    'bracket_explored':bool(bp.get('explored')),
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
-                'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance'])})
+                'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance']),
+                'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
             self.last_entry_signal_step=self.brain.core.steps
             try:
                 receipt=await self.broker.open_position(self.mandate['epic'],action,size,
@@ -1611,5 +1630,8 @@ class SingleTradeEngine:
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
                     'Waiting for aligned external neural inputs' if self.brain.feature_schema==FUSION_SCHEMA else
-                    'Waiting for signal')}
+                    'Waiting for signal'),
+                'bracket':bracket_learn.load_params(self.store),
+                'bracket_learn_reason':self.store.get('bracket_learn_reason'),
+                'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or [])}
 

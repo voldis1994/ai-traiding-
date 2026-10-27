@@ -306,16 +306,11 @@ class AutoEvolution:
         if current_direction is None:return action
         return 'CLOSE' if action in ('BUY','SELL') and action!=current_direction else 'HOLD'
 
-    # Live entry needs a visible edge so near-ties (34/33/33) are not traded as
-    # "random" flips. This is score margin, not the evolved MIN_EDGE exit code.
-    ENTRY_SCORE_EDGE=0.04
-
     def evaluate_neural_entry(self,scores):
         """Entry uses BUY/SELL only — HOLD is never an entry mode.
 
-        When flat, the robot may open BUY or SELL only if the winner beats both
-        HOLD and the opposite side by ENTRY_SCORE_EDGE. HOLD never becomes an
-        order; near-ties wait for a clearer neural vote.
+        Risk frame is adopted lot + market. No extra score-margin 'safety' gate:
+        the network vote stands unless HOLD strictly dominates the direction.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -323,21 +318,14 @@ class AutoEvolution:
         buy=float(scores['BUY']);sell=float(scores['SELL']);hold=float(scores['HOLD'])
         direction='BUY' if buy>=sell else 'SELL'
         strength=buy if direction=='BUY' else sell
-        opposite=sell if direction=='BUY' else buy
         if hold>strength:
             return {'action':'HOLD','proposal':direction,'threshold':None,
                     'reason':(f'HOLD is not an entry mode; skip while HOLD {hold:.1%} '
                               f'dominates {direction} {strength:.1%}'),
                     'evidence':None,'calibration':None}
-        margin=strength-max(hold,opposite)
-        if margin<self.ENTRY_SCORE_EDGE:
-            return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':(f'Scores too close for entry ({direction} lead {margin:.1%} '
-                              f'< {self.ENTRY_SCORE_EDGE:.0%}); wait for clearer neural edge'),
-                    'evidence':None,'calibration':None}
         return {'action':direction,'proposal':direction,'threshold':None,
                 'reason':(f'Entry {direction} on completed M1 '
-                          f'(lead {margin:.1%} over alternatives; HOLD never enters)'),
+                          f'(neural vote; risk=adopted lot/market; HOLD never enters)'),
                 'evidence':None,'calibration':None}
 
     @staticmethod
@@ -658,8 +646,8 @@ class AutoEvolution:
         old_train,_=self._replay(incumbent,train,
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
         winner=None;best=baseline
-        # Promote on a trade/learning tempo. Generation gates EXIT policy code,
-        # not LIVE entry (entry uses neural scores + ENTRY_SCORE_EDGE).
+        # Promote on a trade/learning tempo. Generation gates EXIT policy code;
+        # LIVE entry is neural vote (lot+market = risk frame).
         need_n=12 if force else 18
         need_val=4 if force else 6
         lift=.001 if (force and loss_trade) else .002

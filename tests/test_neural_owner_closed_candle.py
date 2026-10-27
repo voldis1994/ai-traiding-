@@ -35,10 +35,9 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40})
         assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
         assert 'not an entry mode' in blocked['reason']
-        # Near-ties must wait — otherwise entries feel random (34/33/33).
+        # Risk frame = lot + market only: no score-margin gate. Near-ties enter.
         tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33})
-        assert tied['action']=='HOLD' and 'too close' in tied['reason']
-        # Clear lead over HOLD and opposite → enter.
+        assert tied['action']=='BUY' and tied['proposal']=='BUY'
         entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27})
         assert entered['action']=='BUY'
         assert p.neural_decision(score,current_direction='BUY')=='CLOSE'

@@ -1660,8 +1660,10 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            bp=bracket_learn.propose_for_open(self.store)
-            rng=ohlc_range_distance(self.store.candles(self.mandate['epic'],n=30,historical_only=True),n=20)
+            candles=self.store.candles(self.mandate['epic'],n=30,historical_only=True)
+            rng=ohlc_range_distance(candles,n=20)
+            ohlc_k=bracket_learn.kappa_from_ohlc(candles,n=20)
+            bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=ohlc_k)
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)

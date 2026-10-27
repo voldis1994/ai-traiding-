@@ -50,6 +50,21 @@ class CapitalBroker:
         return await self._request('GET','/api/v1/prices/'+quote(epic,safe=''),params={'resolution':resolution,'max':maximum})
     async def confirm(self,deal_reference):
         return await self._request('GET','/api/v1/confirms/'+quote(deal_reference,safe=''))
+    async def transactions(self,*,last_period=600,from_time=None,to_time=None,tx_type='TRADE'):
+        """Account cash movements. Default last 10 minutes — includes closed-trade P&L."""
+        params={}
+        if from_time:params['from']=from_time
+        if to_time:params['to']=to_time
+        if last_period is not None and not from_time:params['lastPeriod']=int(last_period)
+        if tx_type:params['type']=tx_type
+        return await self._request('GET','/api/v1/history/transactions',params=params or None)
+    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True):
+        """Deal activity (SL/TP/USER closes) — often carries dealId + profit details."""
+        params={'detailed':'true' if detailed else 'false'}
+        if from_time:params['from']=from_time
+        if to_time:params['to']=to_time
+        if last_period is not None and not from_time:params['lastPeriod']=int(last_period)
+        return await self._request('GET','/api/v1/history/activity',params=params)
     async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None,limit_distance=None):
         if direction not in ('BUY','SELL') or Decimal(str(size))<=0:raise ValueError('Invalid trade')
         payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False}

@@ -1626,14 +1626,14 @@ class SingleTradeEngine:
             self.execution_enabled=False;return
         candles=self.store.candles(p.get('epic') or self.mandate.get('epic'),n=90,
                                    historical_only=True)
-        rng=ohlc_range_distance(candles,n=20)
+        zone=bracket_learn.zone_at_open(candles,n=40,reach_n=60)
+        rng=zone['range_distance'] or ohlc_range_distance(candles,n=20)
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
-        max_tp=bracket_learn.recent_reachable_move(candles,n=60)
-        ohlc_k=bracket_learn.kappa_from_ohlc(candles,n=20)
-        bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=ohlc_k,
-                                         base_sl=base_sl,max_tp=max_tp)
+        bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
+                                         base_sl=base_sl,max_tp=zone.get('max_tp'),
+                                         candles=candles)
         result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
                          kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                          range_distance=float(rng) if rng is not None else 0)
@@ -1685,23 +1685,25 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # Same OHLC zone the neural path already uses — SL/TP must fit it.
+            # SL/TP computed from the same M1 OHLC the neural net already sees.
             candles=self.store.candles(self.mandate['epic'],n=90,historical_only=True)
-            rng=ohlc_range_distance(candles,n=20)
-            ohlc_k=bracket_learn.kappa_from_ohlc(candles,n=20)
+            zone=bracket_learn.zone_at_open(candles,n=40,reach_n=60)
+            rng=zone['range_distance'] or ohlc_range_distance(candles,n=20)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
-            max_tp=bracket_learn.recent_reachable_move(candles,n=60)
-            bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=ohlc_k,
-                                             base_sl=base_sl,max_tp=max_tp)
+            bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
+                                             base_sl=base_sl,max_tp=zone.get('max_tp'),
+                                             candles=candles)
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
-            self.store.event('bracket','Zone-grounded SL/TP for open',{
-                'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],'explored':bp.get('explored'),
-                'ohlc_kappa':ohlc_k,'base_sl':base_sl,'max_tp':max_tp,
+            self.store.event('bracket','OHLC-computed SL/TP at open',{
+                'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
+                'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
+                'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'stop_distance':float(brackets['stop_distance']),
-                'profit_distance':float(brackets['profit_distance'])})
+                'profit_distance':float(brackets['profit_distance']),
+                'nudge_samples':bp.get('nudge_samples')})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 self._pending_entry_brain={

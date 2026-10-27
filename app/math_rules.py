@@ -9,23 +9,65 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 D = lambda value: Decimal(str(value))
 
 
-def ohlc_range_distance(candles, n=20):
-    """Median M1 high−low from broker OHLC — live noise floor, not a magic constant."""
-    ranges=[]
-    for row in list(candles or [])[-max(1,int(n)):]:
+def _bar_spans(candles):
+    spans=[]
+    for row in candles or ():
         try:
             h=D(row.get('high'));l=D(row.get('low'))
         except Exception:
             continue
         if h>0 and l>0 and h>=l:
-            ranges.append(h-l)
-    if not ranges:
-        return None
-    ranges.sort()
-    mid=len(ranges)//2
-    if len(ranges)%2:
-        return ranges[mid]
-    return (ranges[mid-1]+ranges[mid])/2
+            spans.append(h-l)
+    return spans
+
+
+def _median_decimal(values):
+    if not values:return None
+    values=sorted(values)
+    mid=len(values)//2
+    if len(values)%2:
+        return values[mid]
+    return (values[mid-1]+values[mid])/2
+
+
+def adaptive_lookback(candles, *, min_bars=8):
+    """How many recent M1 bars to use — decided from the series, not a fixed 20/60.
+
+    Grows the window until the median high−low stabilizes (change <10%) or the
+    available history ends. `min_bars` is only a statistics floor so a median
+    exists, not a trading-policy constant.
+    """
+    rows=list(candles or [])
+    if not rows:return 0
+    if len(rows)<=min_bars:return len(rows)
+    prev=None
+    chosen=min_bars
+    # Step through growing windows; stop when the zone stops shifting.
+    for n in range(min_bars,len(rows)+1):
+        med=_median_decimal(_bar_spans(rows[-n:]))
+        if med is None:continue
+        if prev is not None and prev>0:
+            change=abs(med-prev)/prev
+            if change<D('0.10'):
+                chosen=n
+                break
+        prev=med
+        chosen=n
+    return int(chosen)
+
+
+def ohlc_range_distance(candles, n=None):
+    """Median M1 high−low from broker OHLC — live noise floor.
+
+    If `n` is omitted, lookback is chosen by adaptive_lookback() from the data.
+    """
+    rows=list(candles or [])
+    if not rows:return None
+    if n is None:
+        n=adaptive_lookback(rows)
+    if n<=0:n=len(rows)
+    ranges=_bar_spans(rows[-max(1,int(n)):])
+    return _median_decimal(ranges)
 
 
 def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_scale=1,

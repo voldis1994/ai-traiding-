@@ -111,9 +111,13 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float) -> 
     return {'kappa_mult':k_m,'sl_mult':s_m,'reason':reason,'pnl':pnl}
 
 
-def _bar_moves(candles, n: int=40):
+def _bar_moves(candles, n: int|None=None):
+    from .math_rules import adaptive_lookback
+    rows=list(candles or [])
+    if n is None:
+        n=adaptive_lookback(rows) or len(rows)
     ups=[];downs=[];spans=[]
-    for row in list(candles or [])[-max(1,int(n)):]:
+    for row in rows[-max(1,int(n)):]:
         try:
             o=float(row['open']);h=float(row['high']);l=float(row['low']);c=float(row['close'])
         except (KeyError,TypeError,ValueError):
@@ -122,11 +126,11 @@ def _bar_moves(candles, n: int=40):
         ups.append(max(0.,h-min(o,c)))
         downs.append(max(0.,max(o,c)-l))
         spans.append(h-l)
-    return ups,downs,spans
+    return ups,downs,spans,int(n)
 
 
-def kappa_from_ohlc(candles, n: int=40) -> float|None:
-    ups,downs,_=_bar_moves(candles,n)
+def kappa_from_ohlc(candles, n: int|None=None) -> float|None:
+    ups,downs,_,_=_bar_moves(candles,n)
     if len(ups)<5 or len(downs)<5:return None
     du=median(downs)
     if du<=0:return None
@@ -135,21 +139,22 @@ def kappa_from_ohlc(candles, n: int=40) -> float|None:
     return float(raw)
 
 
-def recent_reachable_move(candles, n: int=60) -> float|None:
-    _,_,spans=_bar_moves(candles,n)
+def recent_reachable_move(candles, n: int|None=None) -> float|None:
+    _,_,spans,used=_bar_moves(candles,n)
     if len(spans)<5:return None
     spans=sorted(spans)
     robust=spans[max(0,int(len(spans)*0.9)-1)]
     return float(max(robust,spans[-1]*0.85))
 
 
-def zone_at_open(candles, *, n: int=40, reach_n: int=60) -> dict:
-    """SL/TP shape from recent OHLC at the open — the information already on hand."""
-    ups,downs,spans=_bar_moves(candles,n)
-    reach=recent_reachable_move(candles,reach_n)
+def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
+    """SL/TP shape from recent OHLC at the open — lookback sized from the data."""
+    ups,downs,spans,used=_bar_moves(candles,n)
+    # Reach uses the same adaptive window (or a wider explicit one if given).
+    reach=recent_reachable_move(candles,reach_n if reach_n is not None else used)
     if len(spans)<5:
         return {'kappa':DEFAULT_KAPPA,'range_distance':0.0,'max_tp':reach,
-                'median_up':None,'median_down':None,'ready':False}
+                'median_up':None,'median_down':None,'ready':False,'lookback':used}
     med_span=float(median(spans))
     med_up=float(median(ups)) if ups else med_span
     med_down=float(median(downs)) if downs else med_span
@@ -165,7 +170,7 @@ def zone_at_open(candles, *, n: int=40, reach_n: int=60) -> dict:
         'range_distance':med_span,
         'max_tp':float(reach) if reach is not None else None,
         'median_up':med_up,'median_down':med_down,
-        'ready':True,
+        'ready':True,'lookback':used,
     }
 
 
@@ -173,9 +178,10 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
                      candles=None) -> dict:
     """Zone distances × learned raise/cut multipliers; TP still capped by reach."""
-    zone=zone_at_open(candles or [],n=40,reach_n=60) if candles is not None else {
+    zone=zone_at_open(candles or []) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
         'range_distance':float(base_sl or 0),'max_tp':max_tp,'ready':bool(ohlc_kappa),
+        'lookback':None,
     }
     if max_tp is None:
         max_tp=zone.get('max_tp')
@@ -199,6 +205,7 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         'ohlc_kappa':ohlc_kappa,'zone_ready':bool(zone.get('ready')),
         'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
         'kappa_mult':learned['kappa'],'sl_mult':learned['sl_scale'],
+        'lookback':zone.get('lookback'),
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }
 

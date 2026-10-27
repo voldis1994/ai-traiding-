@@ -1568,8 +1568,8 @@ class SingleTradeEngine:
         if self.market.get('status')!='TRADEABLE':return
         if self.market.get('tick') is None or self.market.get('min_distance') is None:return
         opened=candle_time(meta.get('opened')) if meta.get('opened') else None
-        candles=self.store.candles(p['epic'],n=60,historical_only=True)
-        zone_range=ohlc_range_distance(candles,n=20)
+        candles=self.store.candles(p['epic'],n=120,historical_only=True)
+        zone_range=ohlc_range_distance(candles)  # lookback from data
         extreme=trail_extreme_from_broker(
             p['direction'],self.market.get('bid'),self.market.get('ask'),
             candles=candles,opened_at=opened,prior_extreme=meta.get('trail_extreme'))
@@ -1627,10 +1627,10 @@ class SingleTradeEngine:
         if min_dist is None or not tick or not mid:
             self.store.event('warning','Protection not possible: unsupported broker distance/price rule')
             self.execution_enabled=False;return
-        candles=self.store.candles(p.get('epic') or self.mandate.get('epic'),n=90,
+        candles=self.store.candles(p.get('epic') or self.mandate.get('epic'),n=120,
                                    historical_only=True)
-        zone=bracket_learn.zone_at_open(candles,n=40,reach_n=60)
-        rng=zone['range_distance'] or ohlc_range_distance(candles,n=20)
+        zone=bracket_learn.zone_at_open(candles)
+        rng=zone['range_distance'] or ohlc_range_distance(candles)
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
@@ -1689,9 +1689,9 @@ class SingleTradeEngine:
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
             # SL/TP computed from the same M1 OHLC the neural net already sees.
-            candles=self.store.candles(self.mandate['epic'],n=90,historical_only=True)
-            zone=bracket_learn.zone_at_open(candles,n=40,reach_n=60)
-            rng=zone['range_distance'] or ohlc_range_distance(candles,n=20)
+            candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
+            zone=bracket_learn.zone_at_open(candles)
+            rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
@@ -1704,6 +1704,7 @@ class SingleTradeEngine:
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
+                'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),

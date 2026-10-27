@@ -25,8 +25,28 @@ def _finite(v):
 
 
 def _quantize(v,tick,up):
+    """Snap to the broker price grid; return a clean float (no binary dust)."""
     q=Decimal(str(tick));val=Decimal(str(v))
-    return float((val/q).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR)*q)
+    if q<=0:raise ValueError('tick must be positive')
+    snapped=(val/q).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR)*q
+    # str→float keeps values like 4006.1 exact enough for JSON stopLevel
+    return float(snapped)
+
+def _broker_guard(minimum,tick,spread):
+    """Same dealing cushion as open brackets: min + max(2·tick, 2·spread)."""
+    return float(Decimal(str(minimum))+max(2*Decimal(str(tick)),2*Decimal(str(spread))))
+
+def _away_from_market(level,direction,bid,ask,minimum,tick):
+    """After quantize, step further if still inside broker min distance."""
+    q=Decimal(str(tick));lvl=Decimal(str(level))
+    mn=Decimal(str(minimum));b=Decimal(str(bid));a=Decimal(str(ask))
+    if direction=='BUY':
+        while b-lvl+Decimal('1e-12')<mn:
+            lvl-=q
+        return float(lvl)
+    while lvl-a+Decimal('1e-12')<mn:
+        lvl+=q
+    return float(lvl)
 
 
 def _candles(rows):
@@ -150,17 +170,21 @@ def propose_update(position,market,initial,policy,bar_time):
     if favorable<=0:return None
     activation=policy['activation_r']*risk
     if favorable<activation:return None
-    # Broker may reject protection inside min distance from relevant close price.
-    guard=minimum+max(2*tick,spread*.2)
+    # Same floor as open path — Capital rejects stops inside minStopOrProfitDistance.
+    # Old 0.2·spread cushion + wrong tick produced rejected levels like 4006.075.
+    guard=_broker_guard(minimum,tick,spread)
+    step=max(2*tick,spread*.1)
     desired=entry+sign*(policy['retention']*favorable)
     if sign==1:
         desired=min(desired,bid-guard)
         new_stop=_quantize(desired,tick,up=False)
-        stop_changed=new_stop>=stop+max(2*tick,spread*.1)
+        new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
+        stop_changed=new_stop>=stop+step
     else:
         desired=max(desired,ask+guard)
         new_stop=_quantize(desired,tick,up=True)
-        stop_changed=new_stop<=stop-max(2*tick,spread*.1)
+        new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
+        stop_changed=new_stop<=stop-step
     # TP may be EXTENDED, never pulled into the current spread. Trend evidence
     # comes from the already completed OHLC context via the caller's gate.
     new_tp=None
@@ -171,12 +195,15 @@ def propose_update(position,market,initial,policy,bar_time):
             if sign==1:
                 target=max(target,ask+guard)
                 new_tp=_quantize(target,tick,up=True)
+                new_tp=_away_from_market(new_tp,'SELL',bid,ask,minimum,tick)  # TP above ask
                 if new_tp<=tp+2*tick:new_tp=None
             else:
                 target=min(target,bid-guard)
                 new_tp=_quantize(target,tick,up=False)
+                new_tp=_away_from_market(new_tp,'BUY',bid,ask,minimum,tick)  # TP below bid
                 if new_tp>=tp-2*tick:new_tp=None
     if not stop_changed and new_tp is None:return None
     return {'stop_level':new_stop if stop_changed else None,'profit_level':new_tp,
             'reason':'historical walk-forward policy + current favorable excursion',
-            'observed_profit_distance':round(favorable,5),'bar_time':bar_time}
+            'observed_profit_distance':round(favorable,5),'bar_time':bar_time,
+            'guard':guard,'tick':tick}

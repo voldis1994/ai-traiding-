@@ -226,3 +226,38 @@ def test_confirmed_sell_open_registers_persistent_adaptive_rights():
             assert len([x for x in b.requests if x[0]=='OPEN'])==1
             assert not s.unresolved()
     asyncio.run(scenario())
+
+
+def test_tick_prefers_decimal_places_over_one_pip_means():
+    """Capital accepts stopLevel on decimalPlacesFactor grid, not onePipMeans."""
+    from app.engine import SingleTradeEngine
+    market={
+        'snapshot':{'decimalPlacesFactor':1,'bid':4004,'offer':4004.3},
+        'instrument':{'onePipMeans':0.025},  # wrong grid → used to yield 4006.075
+        'dealingRules':{'minStopOrProfitDistance':{'unit':'POINTS','value':2}},
+    }
+    assert SingleTradeEngine._tick(market)==0.1
+    assert SingleTradeEngine._min_distance(market,4004.15)==2.0
+
+
+def test_sell_second_trail_raise_not_4006_075_rejected_grid():
+    """User case: SELL 4015, SL already 4014, price→4004 — must send broker-valid level.
+
+    Old path: ask+min+0.2·spread then quantize with tick 0.025 → 4006.075 (rejected).
+    """
+    market={'epic':'IDX','bid':4003.7,'ask':4004.0,'spread':0.3,'tick':0.1,
+            'min_distance':2.0,'status':'TRADEABLE'}
+    position={'dealId':'d1','epic':'IDX','direction':'SELL','level':4015.0,
+              'stopLevel':4014.0,'profitLevel':3990.0,'size':'.5'}
+    meta={'owner':'AUTO','deal_id':'d1','original_risk':1.0,'original_profit':25.0,
+          'trend_aligned':False}
+    policy={'ready':True,'retention':0.65,'activation_r':0.8,'tp_multiplier':1.5}
+    prop=propose_update(position,market,meta,policy,'2026-10-27T11:00:00+00:00')
+    assert prop and prop['stop_level'] is not None
+    assert prop['stop_level']!=4006.075
+    # On 0.1 grid and >= broker min from ask
+    assert abs(round(prop['stop_level']/0.1)*0.1-prop['stop_level'])<1e-9
+    assert prop['stop_level']-market['ask']>=market['min_distance']-1e-12
+    assert prop['stop_level']<4014.0  # ratchets toward profit
+    # Same cushion language as open brackets (min + 2·spread when spread dominates)
+    assert prop['guard']==2.0+2*0.3

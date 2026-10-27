@@ -1023,11 +1023,17 @@ class SingleTradeEngine:
         return None
     @staticmethod
     def _tick(market):
+        """Price increment for stopLevel/profitLevel (Capital order grid).
+
+        Prefer snapshot.decimalPlacesFactor — that is the price grid the broker
+        accepts on PUT. onePipMeans is a pip/value hint and can disagree (e.g.
+        0.025), which produced rejected trail levels like 4006.075.
+        """
         inst=market.get('instrument',{});snap=market.get('snapshot',{})
-        tick=_num(inst.get('onePipMeans'))
-        if tick and tick>0:return tick
         decimals=snap.get('decimalPlacesFactor')
         if isinstance(decimals,int) and 0<=decimals<=10:return 10.**(-decimals)
+        tick=_num(inst.get('onePipMeans'))
+        if tick and tick>0:return tick
         return None
     async def _account_and_candles(self):
         if self.tick_count-self.last_account_tick>=10:

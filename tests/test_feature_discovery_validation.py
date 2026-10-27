@@ -220,23 +220,24 @@ def test_shadow_is_independent_core_not_halved_losses():
         shadow=e._ensure_shadow_brain()
         assert shadow is not None and shadow is not brain.core
         assert shadow.d==brain.core.d
-        # LIVE broker £ (independent of shadow paper).
+        # LIVE broker £ with entry/exit so cash scale can be estimated.
         for i in range(30):
             e.profit_learning.history.append({
-                'actual_pnl':0.1 if i%3 else -0.05,
-                'direction':'BUY'})
+                'actual_pnl':0.5 if i%3 else -0.2,
+                'direction':'BUY','entry':100.,'exit':100.5 if i%3 else 99.8})
         e.profit_learning._save()
-        # Independent paper journal — not a remap of live £.
+        # Cash-scaled paper rows (unit=account_currency) — not raw price units.
         for i in range(24):
             e.shadow_paper.history.append({
-                'paper_pnl':0.08 if i%4 else -0.03,
-                'direction':'SELL','source':'shadow_paper'})
+                'paper_pnl':0.4 if i%4 else -0.15,
+                'price_pnl':0.4 if i%4 else -0.15,
+                'unit':'account_currency','direction':'SELL','source':'shadow_paper'})
         e.shadow_paper._persist()
         from app.autonomy import AutoEvolution
         e.policy=AutoEvolution(store,Path(d)/'policy.py')
         out=e.policy.shadow_self_dev_tick(e)
         assert out is not None
-        assert store.get('shadow_self_dev_last')['method']=='independent_shadow_paper_pnl'
+        assert store.get('shadow_self_dev_last')['method']=='independent_shadow_paper_cash'
 
 
 def test_discovery_rotates_past_rejected_candidates():
@@ -284,23 +285,65 @@ def test_weight_backup_and_restore_reloads_neural_core():
         ok=brain.restore_weights(path)
         assert ok and np.allclose(brain.core.P,altered)
         mv=ModelValidator(store)
-        mv.push_version({'model_version':3,'weights_path':path})
+        mv.push_version({'model_version':3,'weights_path':path,'approved_specs':[]})
         brain.core.P[:]-=2.0
-        mv.push_version({'model_version':4,'weights_path':brain.backup_weights(tag='v4')})
+        mv.push_version({'model_version':4,'weights_path':brain.backup_weights(tag='v4'),
+                         'approved_specs':[]})
         e=SingleTradeEngine(store,brain)
         prev=mv.mark_rollback('unit',restore_fn=e.restore_neural_weights)
         assert prev and prev.get('weights_restored') is True
         assert np.allclose(brain.core.P,altered)
 
 
+def test_rollback_restores_feature_registry_with_weights():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        brain=AdaptiveBrain(store,data_dir=d)
+        brain.tick(100,.05,.01,'GOLD',features=[.1]*FEATURE_DIM,bar_time=BASE.isoformat())
+        e=SingleTradeEngine(store,brain)
+        # v3: no dynamic features
+        path_v3=brain.backup_weights(tag='v3')
+        e.model_validator.push_version({
+            'model_version':3,'weights_path':path_v3,'approved_specs':[],
+            'ohlc_dim':FEATURE_DIM})
+        # Approve a feature and expand (v4)
+        e.feature_registry.approve({
+            'id':'session_phase_utc','name':'session_phase_utc','formula':'sin','source':'t'})
+        brain.apply_registry(e.feature_registry)
+        assert brain.ohlc_dim==FEATURE_DIM+1
+        path_v4=brain.backup_weights(tag='v4')
+        e.model_validator.push_version({
+            'model_version':4,'weights_path':path_v4,
+            'approved_specs':[dict(x) for x in e.feature_registry.approved],
+            'ohlc_dim':brain.ohlc_dim})
+        prev=e.model_validator.mark_rollback(
+            'registry+weights',restore_fn=e.restore_neural_weights)
+        assert prev and prev.get('weights_restored') and prev.get('registry_restored')
+        assert e.feature_registry.approved_ids()==[]
+        assert brain.ohlc_dim==FEATURE_DIM
+        assert brain.core.d==FEATURE_DIM
+
+
 def test_shadow_paper_journal_independent_of_live():
-    from app.shadow_paper import ShadowPaperJournal
+    from app.shadow_paper import ShadowPaperJournal, cash_per_price_unit
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
         j=ShadowPaperJournal(store)
+        # Without cash scale → price_pnl only, paper_pnl (cash) is None.
         assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1') is None
-        assert j.position is not None
         closed=j.on_bar('HOLD',mid=101.,spread=0.2,bar_time='t2')
         assert closed is not None and closed['source']=='shadow_paper'
-        assert closed['paper_pnl']!=0  # paid spread both sides vs mid move
-        assert j.summary()['trades']==1
+        assert closed['price_pnl']!=0
+        assert closed['paper_pnl'] is None
+        assert closed['unit']=='price'
+        assert j.paper_cash_pnls()==[]
+        # With scale from LIVE broker rows → cash comparable to £.
+        live=[{'actual_pnl':2.0,'entry':100.,'exit':101.,'direction':'BUY'}]*6
+        scale=cash_per_price_unit(live,min_samples=5)
+        assert scale==pytest.approx(2.0)
+        j2=ShadowPaperJournal(store)
+        j2.on_bar('BUY',mid=100.,spread=0.,bar_time='a',cash_scale=scale)
+        c2=j2.on_bar('HOLD',mid=101.,spread=0.,bar_time='b',cash_scale=scale)
+        assert c2['unit']=='account_currency'
+        assert c2['paper_pnl']==pytest.approx(2.0)
+        assert j2.paper_cash_pnls()

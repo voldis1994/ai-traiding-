@@ -122,32 +122,35 @@ class ModelValidator:
         return self.stack[-2]
 
     def mark_rollback(self, reason, *, restore_fn=None):
-        """Flag rollback and, when possible, restore neural weights from backup.
+        """Flag rollback and restore neural weights + feature registry snapshot.
 
-        restore_fn(weights_path) → bool should reload AdaptiveBrain from the
-        snapshot file recorded on the previous stack entry.
+        restore_fn(version_meta) → bool should reload AdaptiveBrain weights and
+        FeatureRegistry approved specs from the previous stack entry.
         """
         prev=self.previous_version()
         restored=False
         weights_path=None
+        registry_restored=False
         if prev:
             weights_path=prev.get('weights_path')
-            if weights_path and restore_fn is not None:
+            if restore_fn is not None and (weights_path or prev.get('approved_specs') is not None):
                 try:
-                    restored=bool(restore_fn(weights_path))
+                    restored=bool(restore_fn(prev))
+                    registry_restored=bool(prev.get('approved_specs') is not None and restored)
                 except Exception as exc:
-                    self.store.event('model_validation','Weight restore failed',
+                    self.store.event('model_validation','Model snapshot restore failed',
                         {'reason':reason,'path':weights_path,'type':type(exc).__name__})
                     restored=False
             elif weights_path and Path(str(weights_path)).exists() and restore_fn is None:
-                # Path exists but no restore hook — metadata only (caller must pass restore_fn).
                 restored=False
         self.store.event('model_validation',
-            'Rollback '+('restored neural weights' if restored else 'requested'),
+            'Rollback '+('restored weights+registry' if restored else 'requested'),
             {'reason':reason,'previous':prev,'weights_path':weights_path,
-             'weights_restored':restored})
+             'weights_restored':restored,'registry_restored':registry_restored})
         if prev and self.stack:
             self.stack.append({**prev,'restored_at':datetime.now(timezone.utc).isoformat(),
-                               'rollback_reason':reason,'weights_restored':restored})
+                               'rollback_reason':reason,'weights_restored':restored,
+                               'registry_restored':registry_restored})
             self.store.set(MODEL_STACK_KEY,self.stack[-20:])
-        return {**(prev or {}), 'weights_restored':restored} if prev else None
+        return {**(prev or {}), 'weights_restored':restored,
+                'registry_restored':registry_restored} if prev else None

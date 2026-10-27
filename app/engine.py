@@ -2099,12 +2099,14 @@ class SingleTradeEngine:
             if hasattr(self.brain,'backup_weights'):
                 pre_path=self.brain.backup_weights(
                     tag=f'v{int(self.brain.model_version)}')
+            pre_specs=[dict(x) for x in self.feature_registry.approved]
             self.model_validator.push_version({
                 'model_version':self.brain.model_version,
                 'feature_schema':self.brain.feature_schema,
                 'ohlc_dim':self.brain.ohlc_dim,
                 'fusion_dim':self.brain.fusion_dim,
                 'approved':self.feature_registry.approved_ids(),
+                'approved_specs':pre_specs,
                 'weights_path':pre_path})
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
@@ -2120,12 +2122,14 @@ class SingleTradeEngine:
             if hasattr(self.brain,'backup_weights'):
                 post_path=self.brain.backup_weights(
                     tag=f'v{int(self.brain.model_version)}')
+            post_specs=[dict(x) for x in self.feature_registry.approved]
             self.model_validator.push_version({
                 'model_version':self.brain.model_version,
                 'feature_schema':self.brain.feature_schema,
                 'ohlc_dim':self.brain.ohlc_dim,
                 'fusion_dim':self.brain.fusion_dim,
                 'approved':self.feature_registry.approved_ids(),
+                'approved_specs':post_specs,
                 'weights_path':post_path})
         self.policy.shadow_self_dev_tick(self)
 
@@ -2137,15 +2141,46 @@ class SingleTradeEngine:
             action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))
         except (TypeError,ValueError):
             return None
-        return self.shadow_paper.on_bar(action,mid=mid,spread=spread,bar_time=bar_time)
+        # Scale price→£ from LIVE broker history so paper is cash-comparable.
+        live=getattr(self.profit_learning,'history',[]) or []
+        self.shadow_paper.update_cash_scale(live)
+        return self.shadow_paper.on_bar(
+            action,mid=mid,spread=spread,bar_time=bar_time,
+            cash_scale=self.shadow_paper.cash_scale)
 
-    def restore_neural_weights(self, weights_path):
-        """ModelValidator rollback hook — reload AdaptiveBrain from backup .npz."""
-        ok=bool(hasattr(self.brain,'restore_weights') and
-                self.brain.restore_weights(weights_path))
-        if ok:
-            # Shadow must match restored live dim.
+    def restore_neural_weights(self, version_meta_or_path):
+        """Rollback hook: restore feature registry + neural weights together.
+
+        Accepts a full version_meta dict (preferred) or a bare weights path
+        string for older call sites/tests.
+        """
+        if isinstance(version_meta_or_path,dict):
+            meta=version_meta_or_path
+            path=meta.get('weights_path')
+            specs=meta.get('approved_specs')
+        else:
+            meta=None;path=version_meta_or_path;specs=None
+        # Registry first so layout matches the weight file about to load.
+        if specs is not None:
+            self.feature_registry.replace_approved(specs)
+        ok=False
+        if path and hasattr(self.brain,'restore_weights'):
+            ok=bool(self.brain.restore_weights(path))
+        if ok or specs is not None:
+            # Re-sync brain schema labels from restored registry without expanding.
+            reg=self.feature_registry
+            self.brain.ohlc_dim=reg.ohlc_dim()
+            self.brain.fusion_dim=reg.fusion_dim()
+            self.brain.ohlc_schema=reg.ohlc_schema()
+            self.brain.fusion_schema=reg.fusion_schema()
+            # If weights restored, feature_schema on brain comes from the file;
+            # if only registry restored, keep brain.feature_schema as loaded.
             self.shadow_brain=None
             self._ensure_shadow_brain()
-        return ok
+            self.store.event('learning','Model snapshot restored',
+                {'weights':bool(ok),'registry':specs is not None,
+                 'ohlc_dim':self.brain.ohlc_dim,
+                 'approved':self.feature_registry.approved_ids(),
+                 'model_version':(meta or {}).get('model_version') if isinstance(meta,dict) else None})
+        return bool(ok or specs is not None)
 

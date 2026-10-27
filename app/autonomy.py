@@ -761,10 +761,10 @@ class AutoEvolution:
                 'attempts':self.attempts,'last_reason':self.last_reason}
 
     def shadow_self_dev_tick(self, engine):
-        """Side-by-side shadow NeuralCore vs live using *independent paper £*.
+        """Side-by-side shadow NeuralCore vs live using *cash-comparable* paper £.
 
-        Shadow runs its own paper journal (open/close at mid±spread) — never a
-        remap of LIVE broker outcomes onto the shadow vote.
+        Shadow runs its own paper journal. Price moves are scaled to account
+        currency via LIVE broker_£/price ratios — never raw price units vs £.
         """
         from .model_validation import compare_models
         from .self_params import (load as load_params, evolve_from_feedback,
@@ -778,16 +778,18 @@ class AutoEvolution:
         live_hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
                    if r.get('actual_pnl') is not None]
         paper=getattr(engine,'shadow_paper',None)
-        shadow_hist=list(getattr(paper,'history',[]) or []) if paper else []
-        if len(live_hist)<min_trades or len(shadow_hist)<max(4,min_trades//2):
-            self.last_reason=('Shadow self-dev waiting for broker £ + independent '
+        if paper is not None:
+            paper.update_cash_scale(live_hist)
+        # Cash-only paper rows (unit=account_currency) — skip price-unit leftovers.
+        shadow_cash=(paper.paper_cash_pnls() if paper else [])
+        if len(live_hist)<min_trades or len(shadow_cash)<max(4,min_trades//2):
+            self.last_reason=('Shadow self-dev waiting for broker £ + cash-scaled '
                               'paper trades')
             return None
         live_cut=int(len(live_hist)*(1.0-oos_frac))
-        sh_cut=int(len(shadow_hist)*(1.0-oos_frac))
+        sh_cut=int(len(shadow_cash)*(1.0-oos_frac))
         live_pnls=[float(r['actual_pnl']) for r in live_hist[live_cut:]]
-        shadow_pnls=[float(r['paper_pnl']) for r in shadow_hist[sh_cut:]
-                     if r.get('paper_pnl') is not None]
+        shadow_pnls=list(shadow_cash[sh_cut:])
         decision=compare_models(live_pnls,shadow_pnls,store=self.store)
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
@@ -802,20 +804,21 @@ class AutoEvolution:
                     restore_fn=restore)
                 restored=bool(prev and prev.get('weights_restored'))
                 self.last_reason=('Shadow rollback '+
-                    ('restored weights v' if restored else 'flagged v')+
+                    ('restored weights+registry v' if restored else 'flagged v')+
                     str((prev or {}).get('model_version')))
                 return {'rollback':True,'previous':prev,'decision':decision,
-                        'weights_restored':restored}
+                        'weights_restored':restored,
+                        'registry_restored':bool(prev and prev.get('registry_restored'))}
         self.store.set('shadow_self_dev_last',{
             'decision':decision,
             'shadow_neurons':getattr(engine.shadow_brain,'n',None),
             'shadow_dim':getattr(engine.shadow_brain,'d',None),
-            'live_samples':len(live_hist),'paper_samples':len(shadow_hist),
-            'method':'independent_shadow_paper_pnl',
+            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_cash),
+            'method':'independent_shadow_paper_cash',
             'paper_summary':paper.summary() if paper else None,
             'params':{'min_trades':min_trades,'window':win,'delta':delta}})
-        self.last_reason=('Shadow paper £ beats live OOS broker £' if decision.get('promote')
-                          else 'Shadow paper £ not better than live OOS broker £')
+        self.last_reason=('Shadow paper cash beats live OOS broker £' if decision.get('promote')
+                          else 'Shadow paper cash not better than live OOS broker £')
         return decision
 
     def promote_shadow_policy(self, candidate_source, *, force=False):

@@ -113,6 +113,29 @@ class FeatureRegistry:
         self.save()
         return True
 
+    def replace_approved(self, specs):
+        """Replace the dynamic feature list (rollback to a prior snapshot).
+
+        Used with neural weight restore so input layout matches the backup.
+        """
+        out=[]
+        for x in list(specs or []):
+            if not isinstance(x,dict):continue
+            fid=str(x.get('id') or '');name=str(x.get('name') or '')
+            if not fid or not name:continue
+            if name in BASE_OHLC_NAMES or name in EXTERNAL_NAMES:continue
+            if any(e['id']==fid or e['name']==name for e in out):continue
+            out.append({
+                'id':fid,'name':name,
+                'formula':str(x.get('formula') or ''),
+                'source':str(x.get('source') or 'rollback'),
+                'approved_at':x.get('approved_at'),
+                'metrics':x.get('metrics') or {}})
+            if len(out)>=self._cap():break
+        self.approved=out
+        self.save()
+        return list(self.approved)
+
     def snapshot(self):
         return {
             'base_ohlc':list(BASE_OHLC_NAMES),

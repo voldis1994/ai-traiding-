@@ -14,7 +14,8 @@ from .market_context import FEATURE_NAMES as BASE_OHLC_NAMES, FEATURE_SCHEMA as 
 from .market_fusion import EXTERNAL_NAMES
 
 STORE_KEY = 'feature_registry_v1'
-MAX_APPROVED = 12  # hard cap so dim growth stays trainable offline
+# Soft capacity — enough room for combinatorial discoveries; not a magic "12 formulas".
+MAX_APPROVED = 32
 
 
 def _digest(names):

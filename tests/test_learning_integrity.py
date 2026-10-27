@@ -151,7 +151,7 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['realized_directional_ticks']==pytest.approx(20.)
-        assert detail['mode']=='reinforce_win'
+        assert detail['mode']=='reinforce_win_ticks'  # tick path — not fake £ in profit ledger
         assert detail['target']==1
         assert detail['learn_repeats']==2
         # Without broker profit, cash P&L stays blank (no fake GOLD USD price×size).

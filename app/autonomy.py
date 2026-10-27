@@ -765,43 +765,48 @@ class AutoEvolution:
                 'attempts':self.attempts,'last_reason':self.last_reason}
 
     def shadow_self_dev_tick(self, engine):
-        """Shadow cycle: alternate neuron counts + profit OOS compare; never LIVE-executes.
+        """Real side-by-side shadow NeuralCore vs live — never halves losses in code.
 
-        May request rollback metadata if recent actual £ deteriorates vs prior stack.
-        Feature/combo promotion stays in FeatureValidator / ModelValidator.
+        Shadow is an independent core trained on the same closed-trade labels.
+        OOS compare attributes broker £ to shadow's recorded action:
+          same as live → same £; HOLD → 0; opposite → −£ (counterfactual proxy).
         """
         from .model_validation import compare_models
-        hist=list(getattr(engine.profit_learning,'history',[]) or [])
-        actual=[r.get('actual_pnl') for r in hist if r.get('actual_pnl') is not None]
-        if len(actual)<12:
-            self.last_reason='Shadow self-dev waiting for closed-trade £ sample'
+        engine._ensure_shadow_brain()
+        hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
+              if r.get('actual_pnl') is not None]
+        if len(hist)<12:
+            self.last_reason='Shadow self-dev waiting for broker-£ closed trades'
             return None
-        # Split chronological OOS for incumbent vs synthetic shadow baseline (HOLD-all = 0s).
-        cut=int(len(actual)*.7)
-        oos=actual[cut:]
-        incumbent=oos
-        # Shadow candidate proxy: clipped actual with fewer large losses (architecture probe).
-        shadow=[min(x,0)*.5+max(x,0) for x in oos]  # softer downside — NOT live PnL
-        decision=compare_models(incumbent,shadow)
-        # Alternate architecture probe (shadow brain only).
-        live_n=engine.brain.core.n
-        alt_n=max(8,live_n+4 if live_n<48 else max(8,live_n-4))
-        if engine.shadow_brain is None or engine.shadow_brain.n!=alt_n:
-            engine.shadow_brain=engine.brain.core.clone_architecture(n=alt_n,seed=11+alt_n)
-            self.store.event('shadow','Alternate neural architecture instantiated (shadow only)',
-                {'neurons':alt_n,'live_neurons':live_n,'dim':engine.brain.core.d})
-        # Degradation → rollback flag (does not delete live weights automatically without backup).
-        if len(actual)>=20:
-            recent=sum(actual[-10:]);prior=sum(actual[-20:-10])
+        cut=int(len(hist)*.7)
+        oos=hist[cut:]
+        live_pnls=[];shadow_pnls=[]
+        for r in oos:
+            pnl=float(r['actual_pnl'])
+            live_pnls.append(pnl)
+            sa=r.get('shadow_action');direction=r.get('direction')
+            if sa=='HOLD' or sa not in ('BUY','SELL','HOLD'):
+                shadow_pnls.append(0.)
+            elif sa==direction:
+                shadow_pnls.append(pnl)
+            else:
+                shadow_pnls.append(-pnl)
+        decision=compare_models(live_pnls,shadow_pnls)
+        if len(hist)>=20:
+            recent=sum(r['actual_pnl'] for r in hist[-10:])
+            prior=sum(r['actual_pnl'] for r in hist[-20:-10])
             if recent<prior-.5:
-                prev=engine.model_validator.mark_rollback('recent £ worse than prior window')
+                prev=engine.model_validator.mark_rollback('recent broker £ worse than prior window')
                 self.last_reason='Shadow rollback flagged: '+str((prev or {}).get('model_version'))
                 return {'rollback':True,'previous':prev,'decision':decision}
         self.store.set('shadow_self_dev_last',{
-            'decision':decision,'shadow_neurons':getattr(engine.shadow_brain,'n',None),
-            'samples':len(actual)})
-        self.last_reason=('Shadow candidate interesting' if decision.get('promote')
-                          else 'Shadow candidate not better than incumbent')
+            'decision':decision,
+            'shadow_neurons':getattr(engine.shadow_brain,'n',None),
+            'shadow_dim':getattr(engine.shadow_brain,'d',None),
+            'samples':len(hist),
+            'method':'independent_core_broker_pnl'})
+        self.last_reason=('Shadow core beats live on OOS broker £' if decision.get('promote')
+                          else 'Shadow core not better than live on OOS broker £')
         return decision
 
     def promote_shadow_policy(self, candidate_source, *, force=False):

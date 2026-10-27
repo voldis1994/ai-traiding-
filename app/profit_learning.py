@@ -80,8 +80,16 @@ class ProfitLearning:
 
     def record_closed(self, *, deal_id, epic, direction, entry, exit_level,
                       broker_pnl, currency=None, spread=0., slip_bps=0.,
-                      flip_after_loss=False, model_version=None, feature_schema=None):
-        decision=label_from_profit(direction,broker_pnl,flip_after_loss=flip_after_loss,
+                      flip_after_loss=False, model_version=None, feature_schema=None,
+                      shadow_action=None, require_broker_pnl=True):
+        """Record a closed trade. Fake ±1 cash is refused when require_broker_pnl."""
+        actual=_finite(broker_pnl)
+        if require_broker_pnl and actual is None:
+            # Do not invent cash for the profit ledger — caller may still train ticks.
+            return {'label':None,'mode':'skipped_no_broker_pnl','actual_pnl':None,
+                    'simulated':best_action_from_counterfactual(
+                        entry,exit_level,spread=spread,slip_bps=slip_bps)}
+        decision=label_from_profit(direction,actual,flip_after_loss=flip_after_loss,
                                    entry=entry,exit_level=exit_level,spread=spread,
                                    slip_bps=slip_bps)
         sim=best_action_from_counterfactual(entry,exit_level,spread=spread,slip_bps=slip_bps)
@@ -89,18 +97,25 @@ class ProfitLearning:
             'at':datetime.now(timezone.utc).isoformat(),
             'deal_id':deal_id,'epic':epic,'direction':direction,
             'entry':_finite(entry),'exit':_finite(exit_level),
-            'actual_pnl':_finite(broker_pnl),'currency':currency,
+            'actual_pnl':actual,'currency':currency,
             'simulated':sim,'label':decision['label'],'mode':decision['mode'],
             'model_version':model_version,'feature_schema':feature_schema,
+            'shadow_action':shadow_action,
             'spread':_finite(spread),'slip_bps':_finite(slip_bps)}
         self.history.append(row)
         self._save()
         return decision
 
+    def broker_pnls(self):
+        """Only real broker £ rows — never ±1 tick placeholders."""
+        return [r['actual_pnl'] for r in self.history
+                if r.get('actual_pnl') is not None and r.get('mode')!='skipped_no_broker_pnl']
+
     def summary(self):
-        actual=[r['actual_pnl'] for r in self.history if r.get('actual_pnl') is not None]
+        actual=self.broker_pnls()
         return {
             'trades':len(self.history),
+            'broker_trades':len(actual),
             'actual_net':float(sum(actual)) if actual else 0.,
             'wins':sum(1 for x in actual if x>0),
             'losses':sum(1 for x in actual if x<0),

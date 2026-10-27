@@ -5,8 +5,10 @@ Honest limits (Capital.com REST):
   - Volatility = OHLC range / return dispersion; cost proxy = bid/ask spread.
   - News / intermarket enter via market_fusion peers + calendar, not invented here.
 
-Discovers candidate formulas, scores them lightly on past completed bars, and
-persists proposals for feature_validation to Walk-Forward approve/reject.
+Beyond a seed library, candidates are *generated* combinatorially from OHLC
+primitives (horizons × operators × pairwise diffs). That is not free-form
+symbolic AI inventing arbitrary maths — it is an open search over a defined
+OHLC algebra, validated independently before LIVE use.
 """
 from __future__ import annotations
 
@@ -19,9 +21,9 @@ import numpy as np
 from .market_context import candle_time, FEATURE_NAMES as BASE_NAMES
 
 STORE_KEY = 'feature_discovery_state_v1'
-# Continuous search cadence: one proposal batch per N completed M1 bars.
 BARS_BETWEEN_SEARCH = 30
-MAX_PROPOSALS_KEPT = 40
+MAX_PROPOSALS_KEPT = 80
+GEN_HORIZONS = (3, 5, 8, 13, 21, 34)
 
 
 def _shadows(bar, ref_c):
@@ -39,25 +41,23 @@ def _atr(bars, n):
 
 
 def _session_bucket(bar_time):
-    """UTC hour → coarse session encoding in [-1,1] (not a hardcode trade gate)."""
     dt=candle_time(bar_time) if not isinstance(bar_time,datetime) else bar_time
     if dt is None:return 0.
     h=dt.astimezone(timezone.utc).hour
-    # London ~7–16, NY overlap ~13–17, Asia ~0–7 — soft sine of hour.
     return float(math.sin(2*math.pi*h/24.))
 
 
 # Candidate library: id → (name, formula docstring, compute(bars, spread, bar_time)->float|None)
 CANDIDATE_LIBRARY: dict[str, tuple[str, str, Callable]] = {}
+_GENERATED = False
 
 
 def _reg(fid, name, formula, fn):
     CANDIDATE_LIBRARY[fid]=(name,formula,fn)
 
 
-def _build_library():
-    if CANDIDATE_LIBRARY:return
-
+def _seed_library():
+    """Hand-authored seeds (readable defaults). Combinatorial gens added separately."""
     def swing_high(bars, spread, bar_time):
         c=bars[-1][3];hi=max(b[1] for b in bars[-20:])
         return float((hi-c)/c*1000.) if c>0 else None
@@ -101,14 +101,12 @@ def _build_library():
 
     def shadow_mean_up(bars, spread, bar_time):
         c=bars[-1][3]
-        vals=[_shadows(b,c)[0] for b in bars[-8:]]
-        return float(np.mean(vals))
+        return float(np.mean([_shadows(b,c)[0] for b in bars[-8:]]))
     _reg('upper_shadow_mean_8','upper_shadow_mean_8','mean upper wick fraction last 8 M1',shadow_mean_up)
 
     def shadow_mean_lo(bars, spread, bar_time):
         c=bars[-1][3]
-        vals=[_shadows(b,c)[1] for b in bars[-8:]]
-        return float(np.mean(vals))
+        return float(np.mean([_shadows(b,c)[1] for b in bars[-8:]]))
     _reg('lower_shadow_mean_8','lower_shadow_mean_8','mean lower wick fraction last 8 M1',shadow_mean_lo)
 
     def close_loc_5(bars, spread, bar_time):
@@ -139,7 +137,94 @@ def _build_library():
     _reg('gap_open_1m','gap_open_1m','(open-prev_close)/prev_close*1000',gap_open)
 
 
-_build_library()
+def _make_ret(h):
+    def fn(bars, spread, bar_time, _h=h):
+        if len(bars)<=_h:return None
+        c=bars[-1][3];p=bars[-1-_h][3]
+        if p<=0:return None
+        return float(np.clip((c/p-1.)*1000.,-20,20))
+    return fn
+
+
+def _make_range_pos(h):
+    def fn(bars, spread, bar_time, _h=h):
+        w=bars[-_h:];hi=max(b[1] for b in w);lo=min(b[2] for b in w);c=bars[-1][3]
+        if hi<=lo:return 0.
+        return float(np.clip(2*(c-lo)/(hi-lo)-1.,-20,20))
+    return fn
+
+
+def _make_atr_ratio(short_h, long_h):
+    def fn(bars, spread, bar_time, _s=short_h, _l=long_h):
+        a=_atr(bars,_s);b=_atr(bars,_l)
+        if a is None or b is None or b<=0:return None
+        return float(np.clip(a/b,-20,20))
+    return fn
+
+
+def _make_wick_imb(h):
+    def fn(bars, spread, bar_time, _h=h):
+        c=bars[-1][3]
+        vals=[_shadows(b,c)[0]-_shadows(b,c)[1] for b in bars[-_h:]]
+        return float(np.clip(np.mean(vals),-20,20))
+    return fn
+
+
+def _make_body_mean(h):
+    def fn(bars, spread, bar_time, _h=h):
+        vals=[]
+        for b in bars[-_h:]:
+            span=max(b[1]-b[2],1e-12)
+            vals.append((b[3]-b[0])/span)
+        return float(np.clip(np.mean(vals),-20,20))
+    return fn
+
+
+def _make_spread_vs_atr(h):
+    def fn(bars, spread, bar_time, _h=h):
+        a=_atr(bars,_h)
+        if a is None or a<=0:return None
+        return float(np.clip(float(spread)/a,-20,20))
+    return fn
+
+
+def _make_ret_diff(h1, h2):
+    def fn(bars, spread, bar_time, _a=h1, _b=h2):
+        if len(bars)<=max(_a,_b):return None
+        c=bars[-1][3]
+        r1=(c/bars[-1-_a][3]-1.)*1000.
+        r2=(c/bars[-1-_b][3]-1.)*1000.
+        return float(np.clip(r1-r2,-20,20))
+    return fn
+
+
+def _generate_combinatorial():
+    """Open-ended OHLC algebra — new ids each horizon/op, not a fixed list of 12."""
+    global _GENERATED
+    if _GENERATED:return
+    for h in GEN_HORIZONS:
+        _reg(f'gen_ret_{h}',f'gen_ret_{h}',f'(close/close[-{h}]-1)*1000',_make_ret(h))
+        _reg(f'gen_range_pos_{h}',f'gen_range_pos_{h}',
+             f'close location in last-{h} high-low',_make_range_pos(h))
+        _reg(f'gen_wick_imb_{h}',f'gen_wick_imb_{h}',
+             f'mean (upper-lower) wick over {h}',_make_wick_imb(h))
+        _reg(f'gen_body_mean_{h}',f'gen_body_mean_{h}',
+             f'mean body/range over {h}',_make_body_mean(h))
+        _reg(f'gen_spread_atr_{h}',f'gen_spread_atr_{h}',
+             f'spread/ATR({h})',_make_spread_vs_atr(h))
+    for s,l in ((3,13),(5,21),(8,34),(5,34)):
+        _reg(f'gen_atr_ratio_{s}_{l}',f'gen_atr_ratio_{s}_{l}',
+             f'ATR({s})/ATR({l})',_make_atr_ratio(s,l))
+    for a,b in ((3,8),(5,13),(8,21),(13,34),(5,34)):
+        _reg(f'gen_ret_diff_{a}_{b}',f'gen_ret_diff_{a}_{b}',
+             f'ret({a})-ret({b})',_make_ret_diff(a,b))
+    _GENERATED=True
+
+
+def _build_library():
+    if not CANDIDATE_LIBRARY:
+        _seed_library()
+    _generate_combinatorial()
 
 
 def compute_candidate(feature_id, bars, *, spread=0., bar_time=None):
@@ -192,10 +277,10 @@ class FeatureDiscovery:
             'bars_seen':self.bars_seen,
             'proposals':self.proposals[-MAX_PROPOSALS_KEPT:],
             'last_search_bar':self.last_search_bar,
-            'note':'OHLC/spread only — no volume/DOM from Capital'})
+            'library_size':len(CANDIDATE_LIBRARY),
+            'note':'OHLC/spread combinatorial algebra — no volume/DOM from Capital'})
 
     def on_closed_bar(self, bar_time, bars, *, spread=0., registry=None):
-        """Call once per completed M1. Returns new proposals or []."""
         if not bar_time or not bars or len(bars)<61:return []
         if bar_time==self.last_search_bar:return []
         self.bars_seen+=1
@@ -204,8 +289,8 @@ class FeatureDiscovery:
             self._save();return []
         return self.search(bars,spread=spread,registry=registry,bar_time=bar_time)
 
-    def search(self, bars, *, spread=0., registry=None, bar_time=None):
-        """Generate candidate feature snapshots from the library (no leakage: bars must be past)."""
+    def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=24):
+        """Propose up to `limit` finite candidates from seed + generated algebra."""
         exclude=set(BASE_NAMES)
         if registry is not None:
             exclude |= set(registry.approved_names())|set(registry.approved_ids())
@@ -214,15 +299,16 @@ class FeatureDiscovery:
             val=compute_candidate(spec['id'],bars,spread=spread,bar_time=bar_time)
             if val is None:continue
             proposal={**spec,'value':val,'bar_time':bar_time,
-                      'status':'proposed','source':'ohlc_library'}
+                      'status':'proposed','source':'ohlc_algebra'}
             found.append(proposal)
             self.proposals.append(proposal)
+            if len(found)>=limit:break
         self.proposals=self.proposals[-MAX_PROPOSALS_KEPT:]
         self._save()
         if found:
-            self.store.event('discovery','Feature candidates proposed from OHLC library',
-                {'count':len(found),'bar_time':bar_time,
-                 'ids':[p['id'] for p in found]})
+            self.store.event('discovery','Feature candidates proposed from OHLC algebra',
+                {'count':len(found),'library':len(CANDIDATE_LIBRARY),'bar_time':bar_time,
+                 'ids':[p['id'] for p in found[:12]]})
         return found
 
     def pending_proposals(self):

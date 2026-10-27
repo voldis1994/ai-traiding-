@@ -104,6 +104,10 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
                     expected_ohlc_dim=None, fusion_schema=None):
     """Return complete fusion vector or None; never silently fill missing data.
 
+    Layout (must match NeuralCore columns): [BASE_OHLC | DYNAMIC | EXTERNAL].
+    `base['features']` is already BASE+DYNAMIC from market_context; peers+news
+    are appended as EXTERNAL — never interleaved into the middle.
+
     `expected_ohlc_dim`: when registry has dynamic features, base['features'] must
     match that length. Default = FEATURE_DIM (static base only).
     """
@@ -117,8 +121,10 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     need = FEATURE_DIM if expected_ohlc_dim is None else int(expected_ohlc_dim)
     if len(ohlc)!=need:
         return None
-    values = ohlc + peers + news
-    # Dedup / dependency: reject non-finite; peer block already bounded.
+    # EXTERNAL only at the tail — same order expand_inputs uses when appending.
+    values = ohlc + list(peers) + list(news)
+    if len(values)!=need+len(EXTERNAL_NAMES):
+        return None
     if not all(math.isfinite(x) for x in values):
         return None
     return values

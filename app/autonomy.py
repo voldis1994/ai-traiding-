@@ -761,56 +761,61 @@ class AutoEvolution:
                 'attempts':self.attempts,'last_reason':self.last_reason}
 
     def shadow_self_dev_tick(self, engine):
-        """Real side-by-side shadow NeuralCore vs live — never halves losses in code.
+        """Side-by-side shadow NeuralCore vs live using *independent paper £*.
 
-        Shadow is an independent core trained on the same closed-trade labels.
-        OOS compare attributes broker £ to shadow's recorded action:
-          same as live → same £; HOLD → 0; opposite → −£ (counterfactual proxy).
+        Shadow runs its own paper journal (open/close at mid±spread) — never a
+        remap of LIVE broker outcomes onto the shadow vote.
         """
         from .model_validation import compare_models
-        from .self_params import load as load_params, evolve_from_feedback
+        from .self_params import (load as load_params, evolve_from_feedback,
+                                  maybe_commit_long_horizon)
         engine._ensure_shadow_brain()
         cfg=load_params(self.store)
         min_trades=int(cfg['shadow_min_broker_trades'])
         win=int(cfg['shadow_rollback_window'])
         delta=float(cfg['shadow_rollback_delta'])
         oos_frac=float(cfg['val_oos_frac'])
-        hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
-              if r.get('actual_pnl') is not None]
-        if len(hist)<min_trades:
-            self.last_reason='Shadow self-dev waiting for broker-£ closed trades'
+        live_hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
+                   if r.get('actual_pnl') is not None]
+        paper=getattr(engine,'shadow_paper',None)
+        shadow_hist=list(getattr(paper,'history',[]) or []) if paper else []
+        if len(live_hist)<min_trades or len(shadow_hist)<max(4,min_trades//2):
+            self.last_reason=('Shadow self-dev waiting for broker £ + independent '
+                              'paper trades')
             return None
-        cut=int(len(hist)*(1.0-oos_frac))
-        oos=hist[cut:]
-        live_pnls=[];shadow_pnls=[]
-        for r in oos:
-            pnl=float(r['actual_pnl'])
-            live_pnls.append(pnl)
-            sa=r.get('shadow_action');direction=r.get('direction')
-            if sa=='HOLD' or sa not in ('BUY','SELL','HOLD'):
-                shadow_pnls.append(0.)
-            elif sa==direction:
-                shadow_pnls.append(pnl)
-            else:
-                shadow_pnls.append(-pnl)
+        live_cut=int(len(live_hist)*(1.0-oos_frac))
+        sh_cut=int(len(shadow_hist)*(1.0-oos_frac))
+        live_pnls=[float(r['actual_pnl']) for r in live_hist[live_cut:]]
+        shadow_pnls=[float(r['paper_pnl']) for r in shadow_hist[sh_cut:]
+                     if r.get('paper_pnl') is not None]
         decision=compare_models(live_pnls,shadow_pnls,store=self.store)
-        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')))
-        if len(hist)>=win*2:
-            recent=sum(r['actual_pnl'] for r in hist[-win:])
-            prior=sum(r['actual_pnl'] for r in hist[-2*win:-win])
+        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
+                             commit=False)
+        maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
+        if len(live_hist)>=win*2:
+            recent=sum(r['actual_pnl'] for r in live_hist[-win:])
+            prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])
             if recent<prior-delta:
-                prev=engine.model_validator.mark_rollback('recent broker £ worse than prior window')
-                self.last_reason='Shadow rollback flagged: '+str((prev or {}).get('model_version'))
-                return {'rollback':True,'previous':prev,'decision':decision}
+                restore=getattr(engine,'restore_neural_weights',None)
+                prev=engine.model_validator.mark_rollback(
+                    'recent broker £ worse than prior window',
+                    restore_fn=restore)
+                restored=bool(prev and prev.get('weights_restored'))
+                self.last_reason=('Shadow rollback '+
+                    ('restored weights v' if restored else 'flagged v')+
+                    str((prev or {}).get('model_version')))
+                return {'rollback':True,'previous':prev,'decision':decision,
+                        'weights_restored':restored}
         self.store.set('shadow_self_dev_last',{
             'decision':decision,
             'shadow_neurons':getattr(engine.shadow_brain,'n',None),
             'shadow_dim':getattr(engine.shadow_brain,'d',None),
-            'samples':len(hist),
-            'method':'independent_core_broker_pnl',
+            'live_samples':len(live_hist),'paper_samples':len(shadow_hist),
+            'method':'independent_shadow_paper_pnl',
+            'paper_summary':paper.summary() if paper else None,
             'params':{'min_trades':min_trades,'window':win,'delta':delta}})
-        self.last_reason=('Shadow core beats live on OOS broker £' if decision.get('promote')
-                          else 'Shadow core not better than live on OOS broker £')
+        self.last_reason=('Shadow paper £ beats live OOS broker £' if decision.get('promote')
+                          else 'Shadow paper £ not better than live OOS broker £')
         return decision
 
     def promote_shadow_policy(self, candidate_source, *, force=False):

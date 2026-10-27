@@ -2,12 +2,15 @@
 
 Promotes only when candidate shows better net PnL with controlled drawdown on
 chronological holdout. Rejects under-powered or overfit shadows.
-Rollback helper restores previous neural snapshot metadata.
+
+Rollback restores previous *neural weight files* when a backup path is present —
+not merely version metadata.
 """
 from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -104,11 +107,12 @@ class ModelValidator:
         self.store.event('model_validation',
             'Candidate '+('PROMOTE' if decision['promote'] else 'REJECT'),
             {'reason':decision['reason'],'meta':meta or {}})
-        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')))
+        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
+                             commit=False)
         return decision
 
     def push_version(self, version_meta):
-        """Record live model version for rollback."""
+        """Record live model version for rollback (include weights_path when set)."""
         self.stack.append({**version_meta,
             'pushed_at':datetime.now(timezone.utc).isoformat()})
         self.store.set(MODEL_STACK_KEY,self.stack[-20:])
@@ -117,12 +121,33 @@ class ModelValidator:
         if len(self.stack)<2:return None
         return self.stack[-2]
 
-    def mark_rollback(self, reason):
+    def mark_rollback(self, reason, *, restore_fn=None):
+        """Flag rollback and, when possible, restore neural weights from backup.
+
+        restore_fn(weights_path) → bool should reload AdaptiveBrain from the
+        snapshot file recorded on the previous stack entry.
+        """
         prev=self.previous_version()
-        self.store.event('model_validation','Rollback requested',
-            {'reason':reason,'previous':prev})
+        restored=False
+        weights_path=None
+        if prev:
+            weights_path=prev.get('weights_path')
+            if weights_path and restore_fn is not None:
+                try:
+                    restored=bool(restore_fn(weights_path))
+                except Exception as exc:
+                    self.store.event('model_validation','Weight restore failed',
+                        {'reason':reason,'path':weights_path,'type':type(exc).__name__})
+                    restored=False
+            elif weights_path and Path(str(weights_path)).exists() and restore_fn is None:
+                # Path exists but no restore hook — metadata only (caller must pass restore_fn).
+                restored=False
+        self.store.event('model_validation',
+            'Rollback '+('restored neural weights' if restored else 'requested'),
+            {'reason':reason,'previous':prev,'weights_path':weights_path,
+             'weights_restored':restored})
         if prev and self.stack:
             self.stack.append({**prev,'restored_at':datetime.now(timezone.utc).isoformat(),
-                               'rollback_reason':reason})
+                               'rollback_reason':reason,'weights_restored':restored})
             self.store.set(MODEL_STACK_KEY,self.stack[-20:])
-        return prev
+        return {**(prev or {}), 'weights_restored':restored} if prev else None

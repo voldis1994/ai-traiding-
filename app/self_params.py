@@ -3,6 +3,9 @@
 Seed DEFAULTS are only the *first* values. Everything here is persisted in Store
 and nudged from outcomes (approve rate, OOS net, shadow compare, broker £).
 
+Nudges from single events are *queued* (commit=False). Params only save when
+long-horizon broker £ proves improvement — not after one trade.
+
 Honest immutable (NOT in this bag — physics / API / layout):
   - Capital has no volume/DOM
   - Feature vector layout [BASE|DYNAMIC|EXTERNAL]
@@ -12,8 +15,10 @@ Honest immutable (NOT in this bag — physics / API / layout):
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 STORE_KEY = 'self_params_v1'
+PENDING_KEY = 'self_params_pending_v1'
 
 # Seeds only — overwritten by Store once the robot has lived.
 DEFAULTS = {
@@ -50,6 +55,8 @@ DEFAULTS = {
     'grow_error_threshold': 0.55,
     'prune_utility_threshold': -0.01,
     'prune_min_age': 80,
+    # Long-horizon gate before committing param nudges
+    'self_params_horizon_trades': 20,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -81,6 +88,7 @@ BOUNDS = {
     'grow_error_threshold': (0.2, 2.0),
     'prune_utility_threshold': (-0.2, 0.0),
     'prune_min_age': (20, 500),
+    'self_params_horizon_trades': (8, 80),
 }
 
 IMMUTABLE_NOTE = (
@@ -116,7 +124,8 @@ def _clip(key, value):
                'max_approved_features','val_min_bars','val_min_folds',
                'val_horizon_bars','model_min_oos','shadow_min_broker_trades',
                'shadow_rollback_window','learn_win_repeats','learn_loss_repeats',
-               'profit_history_rows','exit_need_streak','prune_min_age'):
+               'profit_history_rows','exit_need_streak','prune_min_age',
+               'self_params_horizon_trades'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds
@@ -149,22 +158,43 @@ def get(store, key, default=None):
 
 
 def snapshot(store) -> dict:
+    pending=store.get(PENDING_KEY) if store is not None else None
     return {'params':load(store),'bounds':{k:list(v) for k,v in BOUNDS.items()},
-            'immutable':IMMUTABLE_NOTE}
+            'immutable':IMMUTABLE_NOTE,
+            'pending_events':len((pending or {}).get('events') or []) if isinstance(pending,dict) else 0}
 
 
-def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
-                         shadow_promote=None, broker_pnl=None, reason=''):
-    """Nudge knobs from outcomes — the robot changes itself when needed."""
-    p=load(store)
+def _pending(store):
+    raw=store.get(PENDING_KEY) if store is not None else None
+    if not isinstance(raw,dict):
+        return {'events':[],'draft':None,'baseline_net':None,'marked_at_trades':0}
+    return {
+        'events':list(raw.get('events') or []),
+        'draft':raw.get('draft'),
+        'baseline_net':raw.get('baseline_net'),
+        'marked_at_trades':int(raw.get('marked_at_trades') or 0),
+    }
+
+
+def _save_pending(store, pending):
+    if store is None:return
+    store.set(PENDING_KEY,{
+        'events':list(pending.get('events') or [])[-80:],
+        'draft':pending.get('draft'),
+        'baseline_net':pending.get('baseline_net'),
+        'marked_at_trades':int(pending.get('marked_at_trades') or 0),
+    })
+
+
+def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
+                 shadow_promote=None, broker_pnl=None):
+    """Mutate a param dict from one evidence event. Returns note strings."""
     notes=[]
     if feature_approved:
-        # Approvals working → allow slightly faster search / more slots.
         p['bars_between_search']=max(BOUNDS['bars_between_search'][0],
             int(p['bars_between_search']*0.9))
         p['max_approved_features']=min(BOUNDS['max_approved_features'][1],
             int(p['max_approved_features'])+1)
-        # Prefer horizons that appear in approved ids.
         fid=str(feature_approved)
         for h in list(p['gen_horizons']):
             if f'_{h}' in fid or fid.endswith(f'_{h}'):
@@ -208,11 +238,86 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
             elif pnl>0:
                 p['learn_lr']=max(BOUNDS['learn_lr'][0],float(p['learn_lr'])*0.98)
                 notes.append('win → calm LR')
+    return notes
+
+
+def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
+                         shadow_promote=None, broker_pnl=None, reason='',
+                         commit=True):
+    """Nudge knobs from outcomes.
+
+    commit=False → queue evidence + draft only (no Store param write).
+    commit=True  → immediate save (tests / explicit force). Production paths
+    use commit=False + maybe_commit_long_horizon after broker £ accumulates.
+    """
+    pending=_pending(store)
+    base=dict(pending['draft']) if isinstance(pending.get('draft'),dict) else load(store)
+    # Ensure all keys present when starting from a partial draft.
+    p={k:_clip(k,base.get(k,DEFAULTS[k])) for k in DEFAULTS}
+    notes=_apply_nudge(p,feature_approved=feature_approved,feature_rejected=feature_rejected,
+                       shadow_promote=shadow_promote,broker_pnl=broker_pnl)
     msg=reason or ('; '.join(notes) if notes else 'no change')
-    save(store,p,reason=msg)
+    clean={k:_clip(k,p[k]) for k in DEFAULTS}
+    if not commit:
+        if notes:
+            pending['events'].append({
+                'at':datetime.now(timezone.utc).isoformat(),
+                'reason':msg,
+                'feature_approved':feature_approved,
+                'feature_rejected':(feature_rejected.get('reason')
+                    if isinstance(feature_rejected,dict) else feature_rejected),
+                'shadow_promote':shadow_promote,
+                'broker_pnl':broker_pnl,
+            })
+            pending['draft']=clean
+            _save_pending(store,pending)
+        return clean
+    save(store,clean,reason=msg)
     if store is not None and notes:
         store.event('self_params','Self-params adapted from feedback',
-            {'reason':msg,'params':{k:p[k] for k in (
+            {'reason':msg,'params':{k:clean[k] for k in (
                 'bars_between_search','val_horizon_bars','learn_lr',
-                'max_approved_features','exit_need_streak') if k in p}})
-    return p
+                'max_approved_features','exit_need_streak') if k in clean},
+             'commit':True})
+    return clean
+
+
+def maybe_commit_long_horizon(store, broker_pnls):
+    """Apply queued draft only when long-horizon broker £ proves improvement.
+
+    Requires ≥ self_params_horizon_trades samples in the recent window with
+    positive net, and (when a prior window exists) recent net > prior net.
+    Single-trade noise never commits.
+    """
+    if store is None:return {'committed':False,'reason':'no store'}
+    pending=_pending(store)
+    if not pending.get('draft') and not pending.get('events'):
+        return {'committed':False,'reason':'no pending draft'}
+    cfg=load(store)
+    need=int(cfg['self_params_horizon_trades'])
+    pnls=[float(x) for x in (broker_pnls or [])
+          if x is not None and math.isfinite(float(x))]
+    if len(pnls)<need:
+        return {'committed':False,'reason':f'need ≥{need} broker £ samples',
+                'n':len(pnls),'pending':len(pending['events'])}
+    recent=pnls[-need:]
+    recent_net=float(sum(recent))
+    prior=pnls[-2*need:-need] if len(pnls)>=2*need else None
+    prior_net=float(sum(prior)) if prior is not None else None
+    if recent_net<=0:
+        return {'committed':False,'reason':'long-horizon net ≤ 0',
+                'recent_net':recent_net,'pending':len(pending['events'])}
+    if prior_net is not None and recent_net<=prior_net:
+        return {'committed':False,'reason':'long-horizon not better than prior window',
+                'recent_net':recent_net,'prior_net':prior_net,
+                'pending':len(pending['events'])}
+    draft=pending.get('draft') or load(store)
+    save(store,draft,reason='long-horizon broker £ proof')
+    n_events=len(pending['events'])
+    _save_pending(store,{'events':[],'draft':None,'baseline_net':recent_net,
+                         'marked_at_trades':len(pnls)})
+    store.event('self_params','Self-params committed after long-horizon £ proof',
+        {'events_applied':n_events,'recent_net':recent_net,'prior_net':prior_net,
+         'horizon':need})
+    return {'committed':True,'recent_net':recent_net,'prior_net':prior_net,
+            'events_applied':n_events}

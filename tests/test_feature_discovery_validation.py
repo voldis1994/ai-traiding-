@@ -220,14 +220,87 @@ def test_shadow_is_independent_core_not_halved_losses():
         shadow=e._ensure_shadow_brain()
         assert shadow is not None and shadow is not brain.core
         assert shadow.d==brain.core.d
-        # Fill broker £ history with shadow actions for compare path.
+        # LIVE broker £ (independent of shadow paper).
         for i in range(30):
             e.profit_learning.history.append({
                 'actual_pnl':0.1 if i%3 else -0.05,
-                'direction':'BUY','shadow_action':'HOLD' if i%2 else 'BUY'})
+                'direction':'BUY'})
         e.profit_learning._save()
+        # Independent paper journal — not a remap of live £.
+        for i in range(24):
+            e.shadow_paper.history.append({
+                'paper_pnl':0.08 if i%4 else -0.03,
+                'direction':'SELL','source':'shadow_paper'})
+        e.shadow_paper._persist()
         from app.autonomy import AutoEvolution
         e.policy=AutoEvolution(store,Path(d)/'policy.py')
         out=e.policy.shadow_self_dev_tick(e)
         assert out is not None
-        assert store.get('shadow_self_dev_last')['method']=='independent_core_broker_pnl'
+        assert store.get('shadow_self_dev_last')['method']=='independent_shadow_paper_pnl'
+
+
+def test_discovery_rotates_past_rejected_candidates():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        disc=FeatureDiscovery(store)
+        bars=make_bars(80)
+        first=disc.search(bars[-61:],spread=0.03,bar_time=BASE.isoformat(),limit=3)
+        assert first
+        for p in first:
+            disc.mark_rejected(p['id'],'unit-test')
+        second=disc.search(bars[-61:],spread=0.03,
+                           bar_time=(BASE+timedelta(minutes=1)).isoformat(),limit=3)
+        assert second
+        first_ids={p['id'] for p in first}
+        second_ids={p['id'] for p in second}
+        # Cooldown must push the next search onto other formulas.
+        assert first_ids.isdisjoint(second_ids)
+
+
+def test_historical_matrix_not_tiled_snapshot():
+    from app.historical_features import build_feature_matrix
+    bars=make_bars(200)
+    spreads=varying_spreads(len(bars))
+    matrix,names,indices=build_feature_matrix(bars,spreads,step=3,max_rows=40)
+    assert matrix is not None and len(indices)==matrix.shape[0]>=20
+    # Distinct rows — a tiled snapshot would have near-zero row variance.
+    row_std=float(np.std(matrix,axis=0).mean())
+    assert row_std>1e-6
+    assert len(set(indices))==len(indices)
+
+
+def test_weight_backup_and_restore_reloads_neural_core():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        brain=AdaptiveBrain(store,data_dir=d)
+        brain.tick(100,.05,.01,'GOLD',features=[.1]*FEATURE_DIM,bar_time=BASE.isoformat())
+        brain.core.P[:]+=0.5
+        brain.model_version=3
+        path=brain.backup_weights(tag='unit')
+        assert path and Path(path).exists()
+        altered=brain.core.P.copy()
+        brain.core.P[:]-=1.0
+        assert not np.allclose(brain.core.P,altered)
+        ok=brain.restore_weights(path)
+        assert ok and np.allclose(brain.core.P,altered)
+        mv=ModelValidator(store)
+        mv.push_version({'model_version':3,'weights_path':path})
+        brain.core.P[:]-=2.0
+        mv.push_version({'model_version':4,'weights_path':brain.backup_weights(tag='v4')})
+        e=SingleTradeEngine(store,brain)
+        prev=mv.mark_rollback('unit',restore_fn=e.restore_neural_weights)
+        assert prev and prev.get('weights_restored') is True
+        assert np.allclose(brain.core.P,altered)
+
+
+def test_shadow_paper_journal_independent_of_live():
+    from app.shadow_paper import ShadowPaperJournal
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        j=ShadowPaperJournal(store)
+        assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1') is None
+        assert j.position is not None
+        closed=j.on_bar('HOLD',mid=101.,spread=0.2,bar_time='t2')
+        assert closed is not None and closed['source']=='shadow_paper'
+        assert closed['paper_pnl']!=0  # paid spread both sides vs mid move
+        assert j.summary()['trades']==1

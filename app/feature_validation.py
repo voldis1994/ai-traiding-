@@ -130,7 +130,8 @@ def _normalize_spreads(spreads, n, *, store=None):
 
 
 def validate_feature(feature_id, bars, *, spreads=None, times=None,
-                     existing_matrix=None, existing_names=None, store=None):
+                     existing_matrix=None, existing_names=None,
+                     existing_indices=None, store=None):
     """Full independent check. bars = list of (o,h,l,c) chronological."""
     cfg=_cfg(store)
     _build_library(horizons=cfg.get('gen_horizons'))
@@ -147,14 +148,27 @@ def validate_feature(feature_id, bars, *, spreads=None, times=None,
     feat=_series_for_feature(feature_id,bars,spreads_n,times)
     if feat is None:return {'approved':False,'reason':'series failed'}
     max_corr=float(cfg['val_max_corr'])
-    if existing_matrix is not None and len(existing_matrix)==len(feat):
+    if existing_matrix is not None:
+        mat=np.asarray(existing_matrix,dtype=float)
         names=list(existing_names or [])
-        for j in range(existing_matrix.shape[1]):
-            c=_corr(feat,existing_matrix[:,j])
-            if c is not None and abs(c)>=max_corr:
-                nm=names[j] if j<len(names) else str(j)
-                return {'approved':False,'reason':f'duplicate/collinear with {nm} (|ρ|={abs(c):.2f})',
-                        'corr':c,'peer':nm}
+        if mat.ndim==2 and mat.shape[0]>=20:
+            # Prefer values on the same historical windows as the matrix
+            # (never compare against a tiled single-bar snapshot).
+            if existing_indices and len(existing_indices)==mat.shape[0]:
+                from .historical_features import candidate_at_indices
+                cand=candidate_at_indices(feature_id,bars,spreads_n,times,existing_indices)
+            elif len(mat)==len(feat):
+                cand=feat
+            else:
+                cand=None
+            if cand is not None and len(cand)==mat.shape[0]:
+                for j in range(mat.shape[1]):
+                    c=_corr(cand,mat[:,j])
+                    if c is not None and abs(c)>=max_corr:
+                        nm=names[j] if j<len(names) else str(j)
+                        return {'approved':False,
+                                'reason':f'duplicate/collinear with {nm} (|ρ|={abs(c):.2f})',
+                                'corr':c,'peer':nm}
     wf=walk_forward_net_pnl(feat,closes,spreads_n,store=store)
     if wf is None:
         return {'approved':False,'reason':'insufficient walk-forward net-PnL folds'}
@@ -179,9 +193,10 @@ def validate_feature(feature_id, bars, *, spreads=None, times=None,
 
 
 class FeatureValidator:
-    def __init__(self, store, registry):
+    def __init__(self, store, registry, discovery=None):
         self.store=store
         self.registry=registry
+        self._discovery=discovery
         self.log=list(self.store.get(STORE_KEY) or [])
 
     def _persist(self, entry):
@@ -189,18 +204,24 @@ class FeatureValidator:
         self.store.set(STORE_KEY,self.log[-80:])
 
     def validate_and_maybe_approve(self, feature_id, bars, *, spreads=None, times=None,
-                                   existing_matrix=None, existing_names=None):
+                                   existing_matrix=None, existing_names=None,
+                                   existing_indices=None):
         from .self_params import evolve_from_feedback
         result=validate_feature(feature_id,bars,spreads=spreads,times=times,
                                 existing_matrix=existing_matrix,existing_names=existing_names,
-                                store=self.store)
+                                existing_indices=existing_indices,store=self.store)
         entry={'feature_id':feature_id,'result':result,
                'at':datetime.now(timezone.utc).isoformat()}
         self._persist(entry)
+        # Discovery rotation: always inform the proposer (skip cool-down / clear).
+        discovery=getattr(self,'_discovery',None)
         if not result.get('approved'):
             self.store.event('validation','Feature rejected',
                 {'id':feature_id,'reason':result.get('reason')})
-            evolve_from_feedback(self.store,feature_rejected=result)
+            if discovery is not None:
+                discovery.mark_rejected(feature_id,result.get('reason'))
+            # Param nudges only via long-horizon gate in self_params (queued evidence).
+            evolve_from_feedback(self.store,feature_rejected=result,commit=False)
             return result
         ok,why=self.registry.approve({
             'id':result['id'],'name':result['name'],'formula':result['formula'],
@@ -210,9 +231,13 @@ class FeatureValidator:
         if ok:
             self.store.event('validation','Feature approved into registry',
                 {'id':feature_id,'name':result['name'],'ohlc_dim':self.registry.ohlc_dim()})
-            evolve_from_feedback(self.store,feature_approved=feature_id)
+            if discovery is not None:
+                discovery.mark_approved(feature_id)
+            evolve_from_feedback(self.store,feature_approved=feature_id,commit=False)
         else:
             result['approved']=False
             result['reason']='validation passed but registry refused: '+why
-            evolve_from_feedback(self.store,feature_rejected=result)
+            if discovery is not None:
+                discovery.mark_rejected(feature_id,why)
+            evolve_from_feedback(self.store,feature_rejected=result,commit=False)
         return result

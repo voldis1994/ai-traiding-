@@ -262,8 +262,13 @@ def list_library(*, exclude_names=None):
             if name not in ban]
 
 
+REJECTED_KEY = 'feature_discovery_rejected_v1'
+# After reject, skip that id for this many search rounds (rotated, not stuck).
+REJECT_COOLDOWN_ROUNDS = 8
+
+
 class FeatureDiscovery:
-    """Continuous proposer — stores candidates for validation, does not LIVE-gate."""
+    """Continuous proposer — rotates library; skips recently rejected ids."""
 
     def __init__(self, store):
         self.store=store
@@ -274,6 +279,10 @@ class FeatureDiscovery:
         self.bars_seen=int(raw.get('bars_seen') or 0)
         self.proposals=list(raw.get('proposals') or [])
         self.last_search_bar=raw.get('last_search_bar')
+        self.cursor=int(raw.get('cursor') or 0)
+        self.search_rounds=int(raw.get('search_rounds') or 0)
+        rej=self.store.get(REJECTED_KEY) or {}
+        self.rejected=dict(rej) if isinstance(rej,dict) else {}
 
     def _save(self):
         keep=int(self._params().get('max_proposals_kept',_SEED_MAX_PROPOSALS_KEPT))
@@ -281,12 +290,31 @@ class FeatureDiscovery:
             'bars_seen':self.bars_seen,
             'proposals':self.proposals[-keep:],
             'last_search_bar':self.last_search_bar,
+            'cursor':self.cursor,
+            'search_rounds':self.search_rounds,
             'library_size':len(CANDIDATE_LIBRARY),
             'note':'OHLC/spread combinatorial algebra — no volume/DOM from Capital'})
+        self.store.set(REJECTED_KEY,self.rejected)
 
     def _params(self):
         from .self_params import load as load_params
         return load_params(self.store)
+
+    def mark_rejected(self, feature_id, reason=''):
+        """Cooldown out a rejected candidate so the next search tries others first."""
+        self.rejected[str(feature_id)]={
+            'round':self.search_rounds,'reason':str(reason)[:160]}
+        self._save()
+
+    def mark_approved(self, feature_id):
+        self.rejected.pop(str(feature_id),None)
+        self._save()
+
+    def _is_cooling(self, feature_id):
+        meta=self.rejected.get(str(feature_id))
+        if not meta:return False
+        age=self.search_rounds-int(meta.get('round') or 0)
+        return age<REJECT_COOLDOWN_ROUNDS
 
     def on_closed_bar(self, bar_time, bars, *, spread=0., registry=None):
         if not bar_time or not bars or len(bars)<61:return []
@@ -300,7 +328,7 @@ class FeatureDiscovery:
         return self.search(bars,spread=spread,registry=registry,bar_time=bar_time)
 
     def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=None):
-        """Propose candidates; cadence/limit/horizons from self_params."""
+        """Rotate through library; skip cooling-off rejects so other formulas get tried."""
         p=self._params()
         _build_library(horizons=p.get('gen_horizons'))
         limit=int(p['search_limit'] if limit is None else limit)
@@ -308,8 +336,17 @@ class FeatureDiscovery:
         exclude=set(BASE_NAMES)
         if registry is not None:
             exclude |= set(registry.approved_names())|set(registry.approved_ids())
-        found=[]
-        for spec in list_library(exclude_names=exclude):
+        library=list_library(exclude_names=exclude)
+        if not library:return []
+        self.search_rounds+=1
+        n=len(library)
+        start=self.cursor % n
+        ordered=library[start:]+library[:start]
+        found=[];scanned=0
+        for spec in ordered:
+            scanned+=1
+            if self._is_cooling(spec['id']):
+                continue
             val=compute_candidate(spec['id'],bars,spread=spread,bar_time=bar_time)
             if val is None:continue
             proposal={**spec,'value':val,'bar_time':bar_time,
@@ -317,13 +354,26 @@ class FeatureDiscovery:
             found.append(proposal)
             self.proposals.append(proposal)
             if len(found)>=limit:break
+        # Advance cursor past what we scanned so next round starts elsewhere.
+        self.cursor=(start+max(1,scanned))%n
+        # If everything was cooling, clear oldest rejects and retry once.
+        if not found and self.rejected:
+            oldest=sorted(self.rejected.items(),key=lambda kv:int(kv[1].get('round') or 0))
+            for fid,_ in oldest[:max(1,len(oldest)//3)]:
+                self.rejected.pop(fid,None)
+            for spec in ordered:
+                val=compute_candidate(spec['id'],bars,spread=spread,bar_time=bar_time)
+                if val is None:continue
+                found.append({**spec,'value':val,'bar_time':bar_time,
+                              'status':'proposed','source':'ohlc_algebra_retry'})
+                if len(found)>=limit:break
         self.proposals=self.proposals[-keep:]
         self._save()
         if found:
-            self.store.event('discovery','Feature candidates proposed from OHLC algebra',
+            self.store.event('discovery','Feature candidates proposed (rotated library)',
                 {'count':len(found),'library':len(CANDIDATE_LIBRARY),'bar_time':bar_time,
-                 'ids':[x['id'] for x in found[:12]],
-                 'bars_between_search':int(p['bars_between_search']),
+                 'ids':[x['id'] for x in found],'cursor':self.cursor,
+                 'cooling':len([1 for k in self.rejected if self._is_cooling(k)]),
                  'search_limit':limit})
         return found
 

@@ -360,6 +360,33 @@ class AdaptiveBrain:
         np.savez_compressed(tmp,**payload)
         tmp.replace(path)
 
+    def backup_weights(self, tag='rollback'):
+        """Copy current neural weights to a versioned .npz — real rollback fodder."""
+        self.save()
+        src=self._path_for(self.epic) if self.epic else self.path
+        if not src.exists():return None
+        safe=''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(tag))[:48]
+        dest=src.with_name(f"{src.stem}.bak_{safe}_v{int(self.model_version)}.npz")
+        import shutil
+        shutil.copy2(src,dest)
+        return str(dest)
+
+    def restore_weights(self, weights_path):
+        """Reload neural weights from a backup file into the live core."""
+        path=Path(weights_path)
+        if not path.exists():
+            self.store.event('error','Weight restore missing file',{'path':str(path)})
+            return False
+        before_ver=self.model_version
+        self.load(path,expected_epic=self.epic)
+        # Persist restored weights as the active brain file.
+        self.save()
+        self.store.event('learning','Neural weights restored from backup',
+            {'path':path.name,'from_version':before_ver,
+             'model_version':self.model_version,'inputs':self.core.d,
+             'neurons':self.core.n})
+        return True
+
     def apply_registry(self, registry):
         """Sync dims/schemas from FeatureRegistry; expand weights if approved set grew.
 
@@ -611,9 +638,12 @@ class SingleTradeEngine:
         # Autonomous self-development (OHLC discovery → validation → dim expand).
         self.feature_registry=FeatureRegistry(store)
         self.feature_discovery=FeatureDiscovery(store)
-        self.feature_validator=FeatureValidator(store,self.feature_registry)
+        self.feature_validator=FeatureValidator(
+            store,self.feature_registry,discovery=self.feature_discovery)
         self.profit_learning=ProfitLearning(store)
         self.model_validator=ModelValidator(store)
+        from .shadow_paper import ShadowPaperJournal
+        self.shadow_paper=ShadowPaperJournal(store)
         if hasattr(self.brain,'apply_registry'):
             self.brain.apply_registry(self.feature_registry)
         self._last_self_dev_bar=None
@@ -1664,7 +1694,10 @@ class SingleTradeEngine:
         # Independent shadow core trains on the same delayed label (side-by-side).
         self._shadow_learn(transition,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
-            evolve_from_feedback(self.store,broker_pnl=pnl_value)
+            # Queue evidence only — commit when long-horizon £ proves improvement.
+            evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
+            from .self_params import maybe_commit_long_horizon
+            maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
         if transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
@@ -1975,6 +2008,7 @@ class SingleTradeEngine:
                     'profit':self.profit_learning.summary(),
                     'model_stack':len(self.model_validator.stack),
                     'shadow_active':self.shadow_brain is not None,
+                    'shadow_paper':self.shadow_paper.summary(),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
@@ -2028,7 +2062,7 @@ class SingleTradeEngine:
 
     def _run_self_development_cycle(self,candles,*,spread=0.):
         """Discover → validate → expand (decision-time data only). Never blocks orders."""
-        from .market_context import FEATURE_NAMES as _BASE_NAMES
+        from .historical_features import build_feature_matrix
         bar=self.market_context.get('bar_time')
         if not bar or bar==self._last_self_dev_bar:return
         self._last_self_dev_bar=bar
@@ -2041,24 +2075,37 @@ class SingleTradeEngine:
         proposals=self.feature_discovery.on_closed_bar(
             bar,window,spread=last_sp,registry=self.feature_registry)
         self._ensure_shadow_brain()
+        # Independent shadow paper step on every closed ready bar (not LIVE remap).
+        self._shadow_paper_step(mid=self.market_context.get('close'),
+                                spread=last_sp,bar_time=bar)
         if not proposals:
             self.policy.shadow_self_dev_tick(self)
             return
-        existing=None
-        names=list(_BASE_NAMES)
-        feats=self.market_context.get('features')
-        if feats and len(feats)>=len(names):
-            base=np.asarray(feats[:len(names)],dtype=float)
-            existing=np.tile(base,(max(40,len(bars)-60),1))
+        # Real historical feature matrix — never tile one live snapshot.
+        existing,names,indices=build_feature_matrix(
+            bars,spreads,approved=self.feature_registry.approved)
         # Validation refuses a single live spread pasted on all history.
         approved_any=False
         for prop in proposals[:6]:
             result=self.feature_validator.validate_and_maybe_approve(
                 prop['id'],bars,spreads=spreads,times=times,
-                existing_matrix=existing,existing_names=names)
+                existing_matrix=existing,existing_names=names,
+                existing_indices=indices)
             if result.get('approved'):
                 approved_any=True
         if approved_any:
+            # Snapshot *current* weights onto the stack before expanding.
+            pre_path=None
+            if hasattr(self.brain,'backup_weights'):
+                pre_path=self.brain.backup_weights(
+                    tag=f'v{int(self.brain.model_version)}')
+            self.model_validator.push_version({
+                'model_version':self.brain.model_version,
+                'feature_schema':self.brain.feature_schema,
+                'ohlc_dim':self.brain.ohlc_dim,
+                'fusion_dim':self.brain.fusion_dim,
+                'approved':self.feature_registry.approved_ids(),
+                'weights_path':pre_path})
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
             # Keep shadow dim aligned (insert dynamic before external if on fusion).
@@ -2069,11 +2116,36 @@ class SingleTradeEngine:
                 except Exception:
                     self.shadow_brain=None
                     self._ensure_shadow_brain()
+            post_path=None
+            if hasattr(self.brain,'backup_weights'):
+                post_path=self.brain.backup_weights(
+                    tag=f'v{int(self.brain.model_version)}')
             self.model_validator.push_version({
                 'model_version':self.brain.model_version,
                 'feature_schema':self.brain.feature_schema,
                 'ohlc_dim':self.brain.ohlc_dim,
                 'fusion_dim':self.brain.fusion_dim,
-                'approved':self.feature_registry.approved_ids()})
+                'approved':self.feature_registry.approved_ids(),
+                'weights_path':post_path})
         self.policy.shadow_self_dev_tick(self)
+
+    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None):
+        """Advance independent shadow paper journal from current shadow vote."""
+        scores=self._shadow_scores_now()
+        if not scores or mid is None:return None
+        try:
+            action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))
+        except (TypeError,ValueError):
+            return None
+        return self.shadow_paper.on_bar(action,mid=mid,spread=spread,bar_time=bar_time)
+
+    def restore_neural_weights(self, weights_path):
+        """ModelValidator rollback hook — reload AdaptiveBrain from backup .npz."""
+        ok=bool(hasattr(self.brain,'restore_weights') and
+                self.brain.restore_weights(weights_path))
+        if ok:
+            # Shadow must match restored live dim.
+            self.shadow_brain=None
+            self._ensure_shadow_brain()
+        return ok
 

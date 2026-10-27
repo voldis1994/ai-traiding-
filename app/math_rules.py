@@ -9,23 +9,84 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 D = lambda value: Decimal(str(value))
 
 
-def ohlc_range_distance(candles, n=20):
-    """Median M1 high−low from broker OHLC — live noise floor, not a magic constant."""
-    ranges=[]
-    for row in list(candles or [])[-max(1,int(n)):]:
+def _bar_spans(candles):
+    spans=[]
+    for row in candles or ():
         try:
             h=D(row.get('high'));l=D(row.get('low'))
         except Exception:
             continue
         if h>0 and l>0 and h>=l:
-            ranges.append(h-l)
-    if not ranges:
-        return None
-    ranges.sort()
-    mid=len(ranges)//2
-    if len(ranges)%2:
-        return ranges[mid]
-    return (ranges[mid-1]+ranges[mid])/2
+            spans.append(h-l)
+    return spans
+
+
+def _median_decimal(values):
+    if not values:return None
+    values=sorted(values)
+    mid=len(values)//2
+    if len(values)%2:
+        return values[mid]
+    return (values[mid-1]+values[mid])/2
+
+
+def _knee_index(values):
+    """Index of the elbow on a curve — pure geometry, no % threshold.
+
+    Maximises distance from each point to the chord between the first and last
+    samples (standard knee/elbow pick on the median-vs-lookback curve).
+    """
+    n=len(values)
+    if n<=1:return 0
+    if n==2:return 1
+    y0=float(values[0]);y1=float(values[-1])
+    best_i=0;best_d=-1.0
+    # Line from (0,y0) to (n-1,y1); distance of (i,yi) to that segment.
+    dx=float(n-1);dy=y1-y0
+    norm=(dx*dx+dy*dy)**0.5
+    if norm<=0:
+        return n-1
+    for i,yi in enumerate(values):
+        # | (yi-y0)*dx - i*dy | / norm   (2D cross-product distance)
+        d=abs((float(yi)-y0)*dx-float(i)*dy)/norm
+        if d>=best_d:
+            best_d=d;best_i=i
+    return best_i
+
+
+def adaptive_lookback(candles):
+    """How many recent M1 bars to use — analysed from the OHLC series itself.
+
+    Builds median(high−low) for every feasible window length, then picks the
+    elbow on that curve. No fixed 20/60 count and no hardcoded 10% stop rule.
+    Needs ≥3 bars only because a median is undefined below that.
+    """
+    rows=list(candles or [])
+    if not rows:return 0
+    if len(rows)<3:return len(rows)
+    series=[]  # (n, median_span)
+    for n in range(3,len(rows)+1):
+        med=_median_decimal(_bar_spans(rows[-n:]))
+        if med is None:continue
+        series.append((n,med))
+    if not series:return len(rows)
+    if len(series)==1:return int(series[0][0])
+    knee=_knee_index([m for _,m in series])
+    return int(series[knee][0])
+
+
+def ohlc_range_distance(candles, n=None):
+    """Median M1 high−low from broker OHLC — live noise floor.
+
+    If `n` is omitted, lookback is chosen by adaptive_lookback() from the data.
+    """
+    rows=list(candles or [])
+    if not rows:return None
+    if n is None:
+        n=adaptive_lookback(rows)
+    if n<=0:n=len(rows)
+    ranges=_bar_spans(rows[-max(1,int(n)):])
+    return _median_decimal(ranges)
 
 
 def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_scale=1,

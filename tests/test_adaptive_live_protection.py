@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 import time
 
+import pytest
+
 from app.protection_ai import select_policy,propose_broker_trail,propose_update
 from app.math_rules import stop_take,ohlc_range_distance
 from app.engine import Store,SingleTradeEngine
@@ -82,13 +84,34 @@ def test_broker_trail_does_not_invent_tp_extension():
 
 def test_trail_still_ratchets_when_take_profit_is_off():
     """Capital UI Take Profit Off must not freeze robot trailing SL."""
-    p=_position(stop=100.2,profit=None)
+    # Stop still below entry → opening gap path (not yet BE-locked).
+    p=_position(stop=99.5,profit=None)
     buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8))
     assert buy and buy['stop_level']==100.55
     assert buy['profit_level'] is None
-    sell=_position('SELL',stop=99.8,profit=None)
+    sell=_position('SELL',stop=100.5,profit=None)
     out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8))
     assert out and out['stop_level']==99.45
+
+
+def test_trail_continues_past_break_even_using_ohlc_zone_gap():
+    """After BE, follow distance comes from OHLC median range — not 0.35*R."""
+    p=_position(stop=100.05,profit=103.0)
+    buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35,
+                             zone_range=0.4)
+    assert buy is not None
+    assert buy['be_locked'] is True
+    # gap = max(min=0.3, min(open=0.8, zone=0.4)) → 0.4
+    assert buy['trail_gap']==pytest.approx(0.4)
+    assert buy['stop_level']>100.05
+    assert buy['stop_level']==pytest.approx(101.35-0.4,abs=0.02)
+    # Without OHLC yet → only broker min (still past BE, no magic %).
+    bare=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
+    assert bare and bare['trail_gap']==pytest.approx(0.3)
+    sell=_position('SELL',stop=99.95,profit=97.0)
+    out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8),extreme=98.55,
+                             zone_range=0.4)
+    assert out and out['be_locked'] is True and out['stop_level']<99.95
 
 
 class Brain:

@@ -335,11 +335,15 @@ class AutoEvolution:
         if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
         return 'CLOSE'
 
-    def evaluate_neural_entry(self,scores):
-        """Entry uses BUY/SELL only — HOLD is never an entry mode.
+    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None):
+        """Enter only when neural vote and OHLC zone agree — no cooldown magic.
 
-        Risk frame is adopted lot + market. No extra score-margin 'safety' gate:
-        the network vote stands unless HOLD strictly dominates the direction.
+        HOLD is a real decision when:
+          - HOLD score dominates, or
+          - 5m/15m zone fights the vote (mid-chop / against short zone), or
+          - 15m+60m trend fights the vote, or
+          - short vs long regime is SHIFT (market changing).
+        Signs from broker returns — not hardcoded score margins or bar timers.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -349,13 +353,48 @@ class AutoEvolution:
         strength=buy if direction=='BUY' else sell
         if hold>strength:
             return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':(f'HOLD is not an entry mode; skip while HOLD {hold:.1%} '
-                              f'dominates {direction} {strength:.1%}'),
+                    'reason':(f'HOLD dominates {direction} ({hold:.1%} > {strength:.1%})'),
                     'evidence':None,'calibration':None}
+        if not isinstance(returns_bps,dict):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':'OHLC zone unavailable; no entry without market context',
+                    'evidence':None,'calibration':None}
+        try:
+            r5=float(returns_bps.get('5',0) or 0)
+            r15=float(returns_bps.get('15',0) or 0)
+            r60=float(returns_bps.get('60',0) or 0)
+        except (TypeError,ValueError):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':'OHLC returns unreadable; no entry','evidence':None,'calibration':None}
+        # Regime shift: 5m and 60m disagree → sit out (feel the change, don't force).
+        if regime=='SHIFT' or (r5>0 and r60<0) or (r5<0 and r60>0):
+            return {'action':'HOLD','proposal':direction,'threshold':None,
+                    'reason':f'Regime SHIFT (5m vs 60m); skip {direction}',
+                    'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
+                    'calibration':None}
+        if direction=='BUY':
+            if not (r5>0 and r15>0):
+                return {'action':'HOLD','proposal':'BUY','threshold':None,
+                        'reason':'BUY vote but 5m/15m zone not UP — avoid mid-zone / chop entry',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+            if trend=='DOWN' or (r15<0 and r60<0):
+                return {'action':'HOLD','proposal':'BUY','threshold':None,
+                        'reason':'BUY against DOWN trend (15m/60m)',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+        else:
+            if not (r5<0 and r15<0):
+                return {'action':'HOLD','proposal':'SELL','threshold':None,
+                        'reason':'SELL vote but 5m/15m zone not DOWN — avoid mid-zone / chop entry',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+            if trend=='UP' or (r15>0 and r60>0):
+                return {'action':'HOLD','proposal':'SELL','threshold':None,
+                        'reason':'SELL against UP trend (15m/60m)',
+                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
         return {'action':direction,'proposal':direction,'threshold':None,
-                'reason':(f'Entry {direction} on completed M1 '
-                          f'(neural vote; risk=adopted lot/market; HOLD never enters)'),
-                'evidence':None,'calibration':None}
+                'reason':(f'Entry {direction}: neural vote + OHLC zone aligned '
+                          f'(trend={trend or "n/a"})'),
+                'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
+                'calibration':None}
 
     @staticmethod
     def _minute_time(value):

@@ -40,13 +40,13 @@ def test_stop_take_broker_min_only_no_20_tick_invent():
 
 
 def test_zone_at_open_computes_kappa_from_moves_not_grid():
-    # Pure upside-heavy bars → κ from medians, not a hardcoded table pick.
-    rows=[{'open':100,'high':103,'low':99.5,'close':102} for _ in range(30)]
+    # Upside wick 3.0, downside wick 1.0 → κ=3 from data, not a table pick.
+    rows=[{'open':100,'high':103,'low':99,'close':100} for _ in range(30)]
     z=zone_at_open(rows,n=30,reach_n=30)
     assert z['ready'] is True
-    assert z['kappa']>2.0
+    assert z['median_up']==3.0 and z['median_down']==1.0
+    assert z['kappa']==3.0
     assert z['max_tp'] is not None
-    assert abs(z['kappa']-(z['median_up']/z['median_down']))<1e-9
 
 
 def test_propose_uses_ohlc_not_random_fantasy_kappa():

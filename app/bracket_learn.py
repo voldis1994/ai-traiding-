@@ -1,8 +1,9 @@
-"""Learnable SL/TP shape from realized cash P&L.
+"""Learnable SL/TP shape from realized cash P&L — grounded in broker OHLC zones.
 
 Risk frame is the adopted lot + market only. Broker min stop is the hard floor.
-κ (TP/SL) and sl_scale are learned from account-currency outcomes — cold start
-is 1:1, NOT a frozen 1:2 invent.
+κ (TP/SL) and sl_scale learn from account-currency outcomes, but explore must
+stay inside *recently observed* M1 moves. Random κ=6/8 that last printed weeks
+ago is not learning — it is hoping.
 """
 from __future__ import annotations
 import math
@@ -14,9 +15,13 @@ from statistics import mean, median
 DEFAULT_KAPPA=1.0
 DEFAULT_SL_SCALE=1.0
 
+# Full research grid (evolve may still promote from history).
 KAPPA_GRID=(0.75,1.0,1.25,1.5,2.0,2.5,3.0,4.0,5.0,6.0,8.0)
 SL_SCALE_GRID=(1.0,1.25,1.5,2.0,2.5,3.0,4.0,5.0,6.0,8.0)
-EXPLORE_UNTIL=12  # force explore until enough cash outcomes exist
+# Live explore stays near the OHLC zone — never jump to fantasy TP on day one.
+EXPLORE_KAPPA=(0.75,1.0,1.25,1.5,2.0,2.5,3.0)
+EXPLORE_SL_SCALE=(1.0,1.25,1.5,2.0,2.5,3.0)
+EXPLORE_UNTIL=12  # force mild explore until enough cash outcomes exist
 
 
 def _finite(v):
@@ -91,38 +96,99 @@ def kappa_from_ohlc(candles, n: int=20) -> float|None:
     return float(min(KAPPA_GRID,key=lambda x:abs(x-raw)))
 
 
-def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None) -> dict:
-    """Next open params: explore hard until cash history exists; then exploit.
+def recent_reachable_move(candles, n: int=60) -> float|None:
+    """Largest single-bar high−low in the recent M1 window (broker zone, not fantasy).
 
-    If SQLite still has a stale κ=2 champion with no outcomes, prefer OHLC κ hint.
+    TP farther than this has not printed even once in the lookback — do not open
+    hoping for a move last seen weeks ago.
+    """
+    spans=[]
+    for row in list(candles or [])[-max(1,int(n)):]:
+        try:
+            h=float(row['high']);l=float(row['low'])
+        except (KeyError,TypeError,ValueError):
+            continue
+        if h>0 and l>0 and h>=l:
+            spans.append(h-l)
+    if len(spans)<5:return None
+    # Soft cap = max recent bar; also keep a robust 90th-ish via sorted pick.
+    spans.sort()
+    robust=spans[max(0,int(len(spans)*0.9)-1)]
+    return float(max(robust,spans[-1]*0.85))
+
+
+def _feasible(kappa,sl_scale,*,base_sl: float,max_tp: float|None) -> bool:
+    """Reject (κ, scale) whose TP would exceed the recent reachable zone."""
+    if max_tp is None or max_tp<=0 or base_sl<=0:return True
+    sl=base_sl*float(sl_scale)
+    tp=float(kappa)*sl
+    return tp<=max_tp*1.05+1e-9  # tiny float cushion
+
+
+def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
+                     base_sl: float|None=None, max_tp: float|None=None) -> dict:
+    """Next open params — zone-first, mild explore inside reachable TP.
+
+    Uses the same recent OHLC zone the neural path already sees. Does NOT pick
+    κ=6/8 just because the static grid lists them.
     """
     cur=load_params(store)
     hist=store.get('bracket_outcome_history',[]) or []
     if not isinstance(hist,list):hist=[]
     n=len(hist)
-    # Stale frozen 1:2 with no evidence — drop to OHLC hint or 1:1.
-    if n==0 and abs(cur['kappa']-2.0)<1e-9 and store.get('bracket_learn_reason') in (None,'',):
-        if ohlc_kappa and ohlc_kappa>0:
-            cur={'kappa':float(ohlc_kappa),'sl_scale':cur['sl_scale']}
-            save_params(store,cur['kappa'],cur['sl_scale'],reason='ohlc_kappa_hint')
-        elif abs(cur['kappa']-DEFAULT_KAPPA)>1e-9:
-            cur={'kappa':DEFAULT_KAPPA,'sl_scale':cur['sl_scale']}
-            save_params(store,cur['kappa'],cur['sl_scale'],reason='cold_start_1_to_1')
-    # Force exploration until enough broker cash samples exist.
+    # Seed champion from OHLC zone whenever we have no cash evidence yet.
+    if n==0 and ohlc_kappa and ohlc_kappa>0:
+        seeded=float(min(EXPLORE_KAPPA,key=lambda x:abs(x-float(ohlc_kappa))))
+        if abs(cur['kappa']-seeded)>1e-9 or store.get('bracket_learn_reason') in (None,''):
+            cur={'kappa':seeded,'sl_scale':min(cur['sl_scale'],3.0)}
+            save_params(store,cur['kappa'],cur['sl_scale'],reason='ohlc_zone_seed')
+    elif n==0 and abs(cur['kappa']-2.0)<1e-9 and store.get('bracket_learn_reason') in (None,''):
+        cur={'kappa':DEFAULT_KAPPA,'sl_scale':DEFAULT_SL_SCALE}
+        save_params(store,cur['kappa'],cur['sl_scale'],reason='cold_start_1_to_1')
+
+    # Clamp stored champion into the reachable zone (stops unreal TP after Update).
+    if base_sl and base_sl>0 and max_tp and max_tp>0:
+        if not _feasible(cur['kappa'],cur['sl_scale'],base_sl=base_sl,max_tp=max_tp):
+            # Shrink κ then sl_scale until TP fits the recent zone.
+            k=float(cur['kappa']);s=float(cur['sl_scale'])
+            for kk in sorted(EXPLORE_KAPPA,reverse=True):
+                if _feasible(kk,s,base_sl=base_sl,max_tp=max_tp):
+                    k=kk;break
+            else:
+                k=min(EXPLORE_KAPPA)
+            for ss in sorted(EXPLORE_SL_SCALE,reverse=True):
+                if _feasible(k,ss,base_sl=base_sl,max_tp=max_tp):
+                    s=ss;break
+            else:
+                s=1.0
+            cur={'kappa':k,'sl_scale':s}
+            save_params(store,k,s,reason='clamped_to_recent_ohlc_zone')
+
     force=n<EXPLORE_UNTIL
     if not force and (n % max(1,explore_every))!=0:
-        return {**cur,'explored':False}
+        return {**cur,'explored':False,'max_tp':max_tp,'base_sl':base_sl}
+
     counts=_counts(hist)
-    cells=[(k,s) for k in KAPPA_GRID for s in SL_SCALE_GRID]
-    cells.sort(key=lambda ks:(counts.get(ks,0),ks[0],ks[1]))
-    least=counts.get(cells[0],0) if cells else 0
-    candidates=[ks for ks in cells if counts.get(ks,0)==least]
-    # Bias first explores away from pure κ=2 so we do not re-lock 1:2.
-    if force and n<4:
-        non_two=[ks for ks in candidates if abs(ks[0]-2.0)>1e-9]
-        if non_two:candidates=non_two
-    pick=(rng or random).choice(candidates) if candidates else (cur['kappa'],cur['sl_scale'])
-    return {'kappa':float(pick[0]),'sl_scale':float(pick[1]),'explored':True}
+    cells=[(k,s) for k in EXPLORE_KAPPA for s in EXPLORE_SL_SCALE]
+    if base_sl and max_tp:
+        feasible=[ks for ks in cells if _feasible(ks[0],ks[1],base_sl=base_sl,max_tp=max_tp)]
+        if feasible:cells=feasible
+    # Prefer cells near the OHLC κ hint (adapt to the zone already given).
+    if ohlc_kappa and ohlc_kappa>0:
+        cells.sort(key=lambda ks:(counts.get(ks,0),abs(ks[0]-float(ohlc_kappa)),ks[0],ks[1]))
+    else:
+        cells.sort(key=lambda ks:(counts.get(ks,0),abs(ks[0]-float(cur['kappa'])),ks[0],ks[1]))
+    if not cells:
+        return {**cur,'explored':False,'max_tp':max_tp,'base_sl':base_sl}
+    least=counts.get(cells[0],0)
+    # Among least-tried, keep only those close to the zone κ (top band).
+    band=[ks for ks in cells if counts.get(ks,0)==least]
+    if ohlc_kappa and ohlc_kappa>0 and len(band)>1:
+        near=[ks for ks in band if abs(ks[0]-float(ohlc_kappa))<=1.0+1e-9]
+        if near:band=near
+    pick=(rng or random).choice(band)
+    return {'kappa':float(pick[0]),'sl_scale':float(pick[1]),'explored':True,
+            'max_tp':max_tp,'base_sl':base_sl,'ohlc_kappa':ohlc_kappa}
 
 
 def evolve_from_history(store, *, min_samples: int=6) -> dict|None:
@@ -140,6 +206,8 @@ def evolve_from_history(store, *, min_samples: int=6) -> dict|None:
     scored=[]
     for (k,s),pnls in buckets.items():
         if len(pnls)<2:continue
+        # Do not re-promote fantasy κ that live explore no longer uses unless
+        # they truly dominate — still allow history winners inside full grid.
         scored.append((mean(pnls),len(pnls),k,s))
     if not scored:
         return None

@@ -61,6 +61,8 @@ class CapitalBroker:
         return await self._request('DELETE','/api/v1/positions/'+quote(str(deal_id),safe=''))
     async def update_position(self,deal_id,stop_level=None,profit_level=None,limit_level=None):
         payload={}
+        # Capital rejects stopLevel/profitLevel that are not on the price grid
+        # (e.g. 4006.075). Pass through floats already snapped by protection_ai.
         if stop_level is not None:payload['stopLevel']=float(stop_level)
         if profit_level is not None or limit_level is not None:
             payload['profitLevel']=float(profit_level if profit_level is not None else limit_level)

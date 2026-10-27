@@ -1,13 +1,12 @@
-"""Evidence-led SL/TP evolution for ROBOT-OPENED positions only.
+"""Broker-native trailing SL for ROBOT-OPENED positions only.
 
-Learn from CLOSED, consecutive minute candles. Candidate trailing and take-profit
-policies compete against the original bracket on chronological, non-overlapping
-walk-forward windows; no lookahead candle from the current minute is used.
+Live trail uses Capital numbers only:
+  - bid/ask (ticks) and completed OHLC extremes *since the position opened*
+  - dealingRules minStopOrProfitDistance
+  - decimalPlacesFactor / tick price grid
 
-The evaluator is deliberately conservative about within-candle ambiguity: a stop
-is checked BEFORE a target and a trailing stop ratchets only AFTER that candle.
-Returns are price units, not cash P&L; commissions, slippage and financing are
-not simulated. A winning shadow candidate is not evidence of future profit.
+No invented retention / activation_r / TP-multiplier policy grid on the live path.
+Walk-forward `select_policy` remains as an offline research helper / tests only.
 """
 from datetime import timedelta
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
@@ -25,9 +24,103 @@ def _finite(v):
 
 
 def _quantize(v,tick,up):
+    """Snap to the broker price grid; return a clean float (no binary dust)."""
     q=Decimal(str(tick));val=Decimal(str(v))
-    return float((val/q).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR)*q)
+    if q<=0:raise ValueError('tick must be positive')
+    snapped=(val/q).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR)*q
+    return float(snapped)
 
+
+def _away_from_market(level,direction,bid,ask,minimum,tick):
+    """After quantize, step further if still inside broker min distance."""
+    q=Decimal(str(tick));lvl=Decimal(str(level))
+    mn=Decimal(str(minimum));b=Decimal(str(bid));a=Decimal(str(ask))
+    if direction=='BUY':
+        while b-lvl+Decimal('1e-12')<mn:
+            lvl-=q
+        return float(lvl)
+    while lvl-a+Decimal('1e-12')<mn:
+        lvl+=q
+    return float(lvl)
+
+
+def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prior_extreme=None):
+    """Best favorable price from live quotes + OHLC since open — nothing invented."""
+    if direction=='BUY':
+        tip=_finite(bid)
+        if tip is None:return None
+        if prior_extreme is not None:tip=max(tip,float(prior_extreme))
+        for row in candles or ():
+            t=candle_time(row.get('at'))
+            if opened_at and t and t<opened_at:continue
+            h=_finite(row.get('high'))
+            if h is not None:tip=max(tip,h)
+        return tip
+    if direction=='SELL':
+        tip=_finite(ask)
+        if tip is None:return None
+        if prior_extreme is not None:tip=min(tip,float(prior_extreme))
+        for row in candles or ():
+            t=candle_time(row.get('at'))
+            if opened_at and t and t<opened_at:continue
+            low=_finite(row.get('low'))
+            if low is not None:tip=min(tip,low)
+        return tip
+    return None
+
+
+def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
+    """Place SL at broker extreme ± min_distance on the broker tick grid.
+
+    BUY: stop = peak_bid_or_high − min_distance (floor).
+    SELL: stop = trough_ask_or_low + min_distance (ceil).
+    Never widens; never invents retention fractions.
+    """
+    if market.get('status')!='TRADEABLE':return None
+    direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
+    if sign is None:return None
+    entry=_finite(position.get('level'))
+    stop=_finite(position.get('stopLevel'))
+    tp=_finite(position.get('profitLevel'))
+    tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
+    minimum=_finite(market.get('min_distance'))
+    if any(v is None for v in (entry,stop,tp,tick,bid,ask,minimum)):
+        return None
+    if min(entry,stop,tp,tick,bid,ask)<=0 or minimum<0 or ask<bid:return None
+    if initial.get('owner')!='AUTO':return None
+    if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):
+        return None
+    if sign*(tp-stop)<=0:return None
+    exit_quote=bid if sign==1 else ask
+    if sign*(tp-exit_quote)<=0:return None  # already at/through TP
+    tip=_finite(extreme)
+    if tip is None:
+        tip=bid if sign==1 else ask
+    # Favorable tip only — do not trail into a loss vs entry using older OHLC.
+    if sign==1:
+        tip=max(tip,bid)
+        if tip<=entry:return None
+        desired=tip-minimum
+        new_stop=_quantize(desired,tick,up=False)
+        new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
+        if new_stop<=stop or new_stop>=tip or sign*(tp-new_stop)<=0:return None
+        if new_stop<stop+tick-1e-12:return None  # need ≥1 tick improvement
+    else:
+        tip=min(tip,ask)
+        if tip>=entry:return None
+        desired=tip+minimum
+        new_stop=_quantize(desired,tick,up=True)
+        new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
+        if new_stop>=stop or new_stop<=tip or sign*(tp-new_stop)<=0:return None
+        if new_stop>stop-tick+1e-12:return None
+    return {'stop_level':new_stop,'profit_level':None,
+            'reason':'broker tick/OHLC extreme ± minStop distance',
+            'extreme':tip,'min_distance':minimum,'tick':tick,
+            'observed_profit_distance':round(sign*(exit_quote-entry),5),
+            'bar_time':mark_time}
+
+
+# --- Offline research helper (not used on the live trail path) -----------------
 
 def _candles(rows):
     valid=[]
@@ -47,16 +140,14 @@ def _candles(rows):
 
 
 def _replay(window,direction,risk,profit,spread,retain,trigger,tp_mult):
-    """Price-unit outcome for one historical path; pessimistic stop-first OHLC."""
     sign=1 if direction=='BUY' else -1
     entry=window[0][4]
     peak=0.
     stop=-risk
     target=profit*tp_mult
     for b in window[1:]:
-        # In signed profit units: BUY worst=low, best=high; SELL inverse.
-        worst=(b[3] if sign==1 else b[2])  # low for BUY, high for SELL
-        best=(b[2] if sign==1 else b[3])   # high for BUY, low for SELL
+        worst=(b[3] if sign==1 else b[2])
+        best=(b[2] if sign==1 else b[3])
         worst=sign*(worst-entry)
         best=sign*(best-entry)
         if worst<=stop:return stop-spread
@@ -70,7 +161,6 @@ def _replay(window,direction,risk,profit,spread,retain,trigger,tp_mult):
 def _windows(rows,horizon=8):
     clean=_candles(rows)
     wins=[]
-    # Windows are non-overlapping, chronological, with a complete observed path.
     for k in range(0,len(clean)-horizon,horizon):
         w=clean[k:k+horizon+1]
         if len(w)==horizon+1 and all(w[i+1][0]-w[i][0]==timedelta(minutes=1) for i in range(horizon)):
@@ -79,11 +169,7 @@ def _windows(rows,horizon=8):
 
 
 def select_policy(rows,direction,risk,profit,spread):
-    """Return validated policy or None, with transparency about sample counts.
-
-    The candidate's held-out risk-adjusted score must beat keeping the initial
-    fixed bracket. Evaluation never sees future candles beyond available rows.
-    """
+    """Offline walk-forward research only — live engine does not call this."""
     if direction not in ('BUY','SELL') or min(risk,profit)<=0 or spread<0:
         return {'ready':False,'reason':'Invalid instrument or initial bracket'}
     windows=_windows(rows)
@@ -94,19 +180,17 @@ def select_policy(rows,direction,risk,profit,spread):
     train,holdout=windows[:split],windows[split:]
     if len(holdout)<5:
         return {'ready':False,'reason':'Insufficient untouched holdout paths','samples':count}
-    baseline=(0.0,1e9,1.0)  # retain=0 + never-trigger trailing, TP 1x
+    baseline=(0.0,1e9,1.0)
     candidates=[(retain,trigger,multi) for retain in (.35,.5,.65)
                 for trigger in (.8,1.2,1.6) for multi in (1.,1.25,1.5)]
     def measure(paths,policy):
         vals=[_replay(w,direction,risk,profit,spread,*policy)/risk for w in paths]
-        # Penalise left tail. This is not a calibrated expected return.
         return statistics.mean(vals)-.5*statistics.mean(max(0.,-v) for v in vals)
     base_train=measure(train,baseline)
     ranked=sorted(((measure(train,p),p) for p in candidates),reverse=True)
     candidate=ranked[0][1]
     val=measure(holdout,candidate)
     base_val=measure(holdout,baseline)
-    # Fail closed if the improvement fails in the unseen chronological segment.
     if val<=base_val+.04:
         return {'ready':False,'reason':'No trailing/target candidate improved forward holdout',
                 'samples':count,'validation_uplift_r':round(val-base_val,4)}
@@ -119,64 +203,5 @@ def select_policy(rows,direction,risk,profit,spread):
 
 
 def propose_update(position,market,initial,policy,bar_time):
-    """Calculate market-compatible changes. Never widen SL / remove protection.
-
-    Returns None for HOLD. No movement can exceed the broker's minimum distance;
-    bot-origin metadata and broker confirmation are verified by the engine.
-    """
-    if not policy.get('ready') or not bar_time:return None
-    if market.get('status')!='TRADEABLE':return None
-    direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
-    if sign is None:return None
-    entry=_finite(position.get('level'))
-    stop=_finite(position.get('stopLevel'))
-    tp=_finite(position.get('profitLevel'))
-    tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
-    minimum=_finite(market.get('min_distance'));spread=_finite(market.get('spread'))
-    risk=_finite(initial.get('original_risk'));original_tp=_finite(initial.get('original_profit'))
-    if any(v is None for v in (entry,stop,tp,tick,bid,ask,minimum,spread,risk,original_tp)):
-        return None
-    if min(entry,stop,tp,tick,bid,ask,risk,original_tp)<=0 or minimum<0 or spread<0 or ask<bid:return None
-    if initial.get('owner')!='AUTO':return None
-    if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):return None
-    # A profitable, ratcheted SL may cross the entry, but must stay on the
-    # correct side of the existing profit target.
-    if sign*(tp-stop)<=0:return None
-    exit_quote=bid if sign==1 else ask
-    # A broker close may be in flight if price has already crossed the TP.
-    # Never issue a modification against an effectively finished bracket.
-    if sign*(tp-exit_quote)<=0:return None
-    favorable=sign*(exit_quote-entry)
-    if favorable<=0:return None
-    activation=policy['activation_r']*risk
-    if favorable<activation:return None
-    # Broker may reject protection inside min distance from relevant close price.
-    guard=minimum+max(2*tick,spread*.2)
-    desired=entry+sign*(policy['retention']*favorable)
-    if sign==1:
-        desired=min(desired,bid-guard)
-        new_stop=_quantize(desired,tick,up=False)
-        stop_changed=new_stop>=stop+max(2*tick,spread*.1)
-    else:
-        desired=max(desired,ask+guard)
-        new_stop=_quantize(desired,tick,up=True)
-        stop_changed=new_stop<=stop-max(2*tick,spread*.1)
-    # TP may be EXTENDED, never pulled into the current spread. Trend evidence
-    # comes from the already completed OHLC context via the caller's gate.
-    new_tp=None
-    if initial.get('trend_aligned') and policy['tp_multiplier']>1.:
-        remaining=sign*(tp-exit_quote)
-        if 0<remaining<=risk:
-            target=entry+sign*(original_tp*policy['tp_multiplier'])
-            if sign==1:
-                target=max(target,ask+guard)
-                new_tp=_quantize(target,tick,up=True)
-                if new_tp<=tp+2*tick:new_tp=None
-            else:
-                target=min(target,bid-guard)
-                new_tp=_quantize(target,tick,up=False)
-                if new_tp>=tp-2*tick:new_tp=None
-    if not stop_changed and new_tp is None:return None
-    return {'stop_level':new_stop if stop_changed else None,'profit_level':new_tp,
-            'reason':'historical walk-forward policy + current favorable excursion',
-            'observed_profit_distance':round(favorable,5),'bar_time':bar_time}
+    """Compat wrapper: live path ignores invented policy and uses broker trail."""
+    return propose_broker_trail(position,market,initial,extreme=None,mark_time=bar_time)

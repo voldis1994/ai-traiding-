@@ -19,9 +19,9 @@ from .core import NeuralCore
 from .autonomy import AutoEvolution
 from .math_rules import stop_take
 from . import bracket_learn
-from .protection_ai import select_policy, propose_update
+from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
-from .market_context import market_features, candle_bucket, FEATURE_SCHEMA, FEATURE_DIM
+from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
 from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features
 
 DB=DATA/'robot.sqlite3'
@@ -1023,11 +1023,17 @@ class SingleTradeEngine:
         return None
     @staticmethod
     def _tick(market):
+        """Price increment for stopLevel/profitLevel (Capital order grid).
+
+        Prefer snapshot.decimalPlacesFactor — that is the price grid the broker
+        accepts on PUT. onePipMeans is a pip/value hint and can disagree (e.g.
+        0.025), which produced rejected trail levels like 4006.075.
+        """
         inst=market.get('instrument',{});snap=market.get('snapshot',{})
-        tick=_num(inst.get('onePipMeans'))
-        if tick and tick>0:return tick
         decimals=snap.get('decimalPlacesFactor')
         if isinstance(decimals,int) and 0<=decimals<=10:return 10.**(-decimals)
+        tick=_num(inst.get('onePipMeans'))
+        if tick and tick>0:return tick
         return None
     async def _account_and_candles(self):
         if self.tick_count-self.last_account_tick>=10:
@@ -1405,70 +1411,63 @@ class SingleTradeEngine:
         self.store.set(key,None)
 
     async def adapt_protection(self,p):
-        """Optional, evidenced SL/TP changes for ROBOT-OPENED positions only.
+        """Trail SL from broker ticks/OHLC + min distance — ROBOT positions only.
 
-        No extra risk, duplicate broker requests or unaudited shadow decisions.
-        A broker rejects an update -> keep old levels and retry on a NEW bar only;
-        uncertain PUT outcome -> suspend execution until explicit reconciliation.
+        No invented retention grid. PUT only when the broker-native stop improves
+        by ≥1 tick; short throttle avoids storms; reject → longer backoff.
         """
-        meta=self.store.get('adaptive_protection:'+str(p['dealId']))
+        key='adaptive_protection:'+str(p['dealId'])
+        meta=self.store.get(key)
         if not meta or meta.get('owner')!='AUTO':
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
             return
-        bar=self.market_context.get('bar_time')
-        if not bar or self.last_protection_bar==(p['dealId'],bar):return
-        self.last_protection_bar=(p['dealId'],bar)
-        runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{})
-        if runtime.get('bar_time')==bar or self.store.unresolved() or self.pending_order or self.pending_close:return
-        if not self.market_context.get('ready') or self.market.get('status')!='TRADEABLE':return
-        candles=self.store.candles(p['epic'],n=190,historical_only=True)
-        policy=select_policy(candles,p['direction'],float(meta['original_risk']),
-                             float(meta['original_profit']),float(self.market.get('spread') or 0))
-        if not policy.get('ready'):
-            self.protection_brief={'status':policy.get('reason'),'candidate_samples':policy.get('samples'),
-                                   'deal_id':p['dealId']}
-            return
-        # 5m and 15m confirmed moves must agree with the position before TP can
-        # be extended. HOLD/mixed bars never cause an optimistic extension.
-        returns=self.market_context.get('returns_bps',{})
-        sign=1 if p['direction']=='BUY' else -1
-        aligned=(sign*float(returns.get('5',0))>0 and sign*float(returns.get('15',0))>0)
-        evidence=dict(meta,trend_aligned=aligned)
-        proposal=propose_update(p,self.market,evidence,policy,bar)
-        self.protection_brief={'status':'Proposal validated' if proposal else 'No improvement required',
-                               'deal_id':p['dealId'],'evidence':policy,'trend_aligned':aligned,
-                               'proposal':proposal}
+        if self.store.unresolved() or self.pending_order or self.pending_close:return
+        if self.market.get('status')!='TRADEABLE':return
+        if self.market.get('tick') is None or self.market.get('min_distance') is None:return
+        opened=candle_time(meta.get('opened')) if meta.get('opened') else None
+        candles=self.store.candles(p['epic'],n=60,historical_only=True)
+        extreme=trail_extreme_from_broker(
+            p['direction'],self.market.get('bid'),self.market.get('ask'),
+            candles=candles,opened_at=opened,prior_extreme=meta.get('trail_extreme'))
+        if extreme is not None:
+            meta=dict(meta);meta['trail_extreme']=extreme
+            self.store.set(key,meta)
+        mark=self.market.get('time') or self.market_context.get('bar_time')
+        proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark)
+        self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
+                               'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal}
         if not proposal:return
-        # A 3-bar minimum interval prevents PUT storms and over-trading. The
-        # proposed stop never widens the downside, regardless of future policy.
-        previous=runtime.get('bar_time')
-        from .market_context import candle_time
-        if previous and candle_time(bar) and candle_time(previous):
-            wait=900 if runtime.get('status')=='REJECTED' else 180
-            if (candle_time(bar)-candle_time(previous)).total_seconds()<wait:return
-        stop=proposal['stop_level'];tp=proposal['profit_level']
+        runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{}) or {}
+        now_mono=time.monotonic()
+        wait=15.0 if runtime.get('status')=='REJECTED' else 3.0
+        last_mono=runtime.get('mono')
+        if last_mono is not None and (now_mono-float(last_mono))<wait:return
+        stop=proposal['stop_level'];tp=proposal.get('profit_level')
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
-            'tick':self.market['tick'],'reason':'ADAPTIVE','evidence':policy})
+            'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
+            'min_distance':self.market.get('min_distance')})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=tp)
             if await self._confirm_reconcile(receipt,oid,'PROTECT',p['dealId']):
                 self.store.set('adaptive_runtime:'+str(p['dealId']),{
-                    'bar_time':bar,'stop':stop,'profit':tp,'policy':policy,'status':'CONFIRMED'})
-                self.protection_brief['status']='Broker-confirmed adaptive update'
-                self.store.event('protection','Adaptive SL/TP levels verified by broker',{
-                    'deal_id':p['dealId'],'new_stop':stop,'new_profit':tp,
-                    'historical_samples':policy['samples'],'policy':policy})
+                    'mono':now_mono,'stop':stop,'profit':tp,'extreme':extreme,'status':'CONFIRMED',
+                    'mark':mark})
+                self.protection_brief['status']='Broker-confirmed trail update'
+                self.store.event('protection','Trail SL verified by broker',{
+                    'deal_id':p['dealId'],'new_stop':stop,'extreme':extreme,
+                    'min_distance':self.market.get('min_distance'),'tick':self.market.get('tick')})
             else:
-                # Rejected requests do not affect the existing broker SL/TP.
-                self.protection_brief['status']='Broker rejected candidate; old levels retained'
-                self.store.set('adaptive_runtime:'+str(p['dealId']),{'bar_time':bar,'status':'REJECTED'})
-                self.store.event('warning','Adaptive protection candidate rejected; original levels retained',
-                                 {'deal_id':p['dealId'],'stop':stop,'profit':tp})
+                self.protection_brief['status']='Broker rejected trail; old levels retained'
+                self.store.set('adaptive_runtime:'+str(p['dealId']),{
+                    'mono':now_mono,'status':'REJECTED','mark':mark})
+                self.store.event('warning','Trail SL rejected; original levels retained',
+                                 {'deal_id':p['dealId'],'stop':stop,'extreme':extreme,
+                                  'min_distance':self.market.get('min_distance'),'tick':self.market.get('tick')})
         except Exception as exc:
             self.store.order_update(oid,'UNCERTAIN')
             self.armed=False;self.execution_enabled=False
             self.protection_brief['status']='Uncertain broker PUT; automatic execution suspended'
-            self.store.event('error','Adaptive protection outcome uncertain; suspended for reconciliation',{
+            self.store.event('error','Trail protection outcome uncertain; suspended for reconciliation',{
                 'deal_id':p['dealId'],'type':type(exc).__name__,
                 'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                 'broker_error':_safe_broker_error(exc)})

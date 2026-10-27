@@ -1556,8 +1556,8 @@ class SingleTradeEngine:
     async def adapt_protection(self,p):
         """Trail SL behind broker extreme — ROBOT only; continues past BE.
 
-        Pre-BE gap = original_risk; after BE lock gap tightens (~35%) so SL keeps
-        following new highs/lows. Never tip±min (£0 Gold scratches).
+        Pre-BE gap = original_risk; after BE gap = recent M1 median range from
+        OHLC (same zone data), not a hardcoded fraction of R.
         """
         key='adaptive_protection:'+str(p['dealId'])
         meta=self.store.get(key)
@@ -1569,14 +1569,17 @@ class SingleTradeEngine:
         if self.market.get('tick') is None or self.market.get('min_distance') is None:return
         opened=candle_time(meta.get('opened')) if meta.get('opened') else None
         candles=self.store.candles(p['epic'],n=60,historical_only=True)
+        zone_range=ohlc_range_distance(candles,n=20)
         extreme=trail_extreme_from_broker(
             p['direction'],self.market.get('bid'),self.market.get('ask'),
             candles=candles,opened_at=opened,prior_extreme=meta.get('trail_extreme'))
-        if extreme is not None:
+        if extreme is not None or zone_range is not None:
             meta=dict(meta);meta['trail_extreme']=extreme
+            if zone_range is not None:meta['zone_range']=float(zone_range)
             self.store.set(key,meta)
         mark=self.market.get('time') or self.market_context.get('bar_time')
-        proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark)
+        proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
+                                      zone_range=float(zone_range) if zone_range is not None else None)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal}
         if not proposal:return

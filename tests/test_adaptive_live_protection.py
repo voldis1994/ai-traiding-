@@ -94,19 +94,23 @@ def test_trail_still_ratchets_when_take_profit_is_off():
     assert out and out['stop_level']==99.45
 
 
-def test_trail_continues_past_break_even_with_tighter_gap():
-    """After BE is locked, do not require another full 1R just to leave entry."""
-    # Stop already at BE+; tip at +1.35 with open gap 0.8 → old logic stayed ~BE.
+def test_trail_continues_past_break_even_using_ohlc_zone_gap():
+    """After BE, follow distance comes from OHLC median range — not 0.35*R."""
     p=_position(stop=100.05,profit=103.0)
-    buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
+    buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35,
+                             zone_range=0.4)
     assert buy is not None
     assert buy['be_locked'] is True
-    # trail_gap = max(min_distance=0.3, 0.8*0.35) → 0.3
-    assert buy['trail_gap']==pytest.approx(0.3)
+    # gap = max(min=0.3, min(open=0.8, zone=0.4)) → 0.4
+    assert buy['trail_gap']==pytest.approx(0.4)
     assert buy['stop_level']>100.05
-    assert buy['stop_level']==pytest.approx(101.35-0.3)
+    assert buy['stop_level']==pytest.approx(101.35-0.4,abs=0.02)
+    # Without OHLC yet → only broker min (still past BE, no magic %).
+    bare=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
+    assert bare and bare['trail_gap']==pytest.approx(0.3)
     sell=_position('SELL',stop=99.95,profit=97.0)
-    out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8),extreme=98.55)
+    out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8),extreme=98.55,
+                             zone_range=0.4)
     assert out and out['be_locked'] is True and out['stop_level']<99.95
 
 

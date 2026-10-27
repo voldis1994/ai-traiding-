@@ -69,13 +69,27 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
     return None
 
 
-def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
+def _post_be_trail_gap(open_gap,minimum,zone_range=None):
+    """After BE, gap from recent OHLC noise — not a magic fraction of R.
+
+    Uses median M1 high−low when provided; never wider than the opening risk;
+    never tighter than broker minStop.
+    """
+    open_gap=float(open_gap);minimum=float(minimum)
+    zr=_finite(zone_range)
+    if zr is not None and zr>0:
+        return max(minimum,min(open_gap,zr))
+    return max(minimum,min(open_gap,minimum))  # only broker floor until OHLC ready
+
+
+def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
+                         zone_range=None):
     """Trail SL behind broker extreme — past break-even, not stuck at BE.
 
     Before BE: gap = full opening risk (avoids tip±min £0 scratches; first
-    ratchet ≈ BE+). After BE is locked: gap tightens to ~35% of opening risk
-    (≥ broker min) so SL keeps climbing with new extremes instead of needing
-    another full 1R run just to leave break-even.
+    ratchet ≈ BE+). After BE: gap = recent M1 median range (OHLC zone), clamped
+    to [broker min, opening risk] — the robot measures the follow distance from
+    live candles, not a hardcoded 35% of R.
 
     BUY:  stop = peak − gap.  SELL: stop = trough + gap.
     """
@@ -103,7 +117,9 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
     # Stop already on the profit side of entry → BE (or better) is banked.
     be_locked=sign*(stop-entry)>=-1e-12
     if be_locked:
-        trail_gap=max(minimum,open_gap*0.35)
+        # Prefer zone_range from caller; fall back to value stored on open meta.
+        zr=zone_range if zone_range is not None else initial.get('zone_range')
+        trail_gap=_post_be_trail_gap(open_gap,minimum,zr)
     else:
         trail_gap=open_gap
     exit_quote=bid if sign==1 else ask
@@ -138,9 +154,10 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None
     return {'stop_level':new_stop,'profit_level':None,
-            'reason':('trail past BE (tight gap)' if be_locked
+            'reason':('trail past BE (OHLC zone gap)' if be_locked
                       else 'broker extreme ± opening stop distance (≥ minStop)'),
             'extreme':tip,'trail_gap':trail_gap,'open_gap':open_gap,
+            'zone_range':_finite(zone_range if zone_range is not None else initial.get('zone_range')),
             'be_locked':be_locked,'min_distance':minimum,'tick':tick,
             'observed_profit_distance':round(favorable,5),
             'bar_time':mark_time}

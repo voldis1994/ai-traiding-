@@ -534,11 +534,16 @@ class AdaptiveBrain:
         growth_interval=(self.FAST_GROWTH_INTERVAL if self.core.vbar>2.0
                          else self.GROWTH_INTERVAL)
         if self.core.steps%growth_interval==0:
+            from .self_params import get as sp_get
             z=np.asarray(result['z'])
-            if self.core.grow_if_needed(z,threshold=.65,nmax=None):
+            grow_th=float(sp_get(self.store,'grow_error_threshold',.55))
+            if self.core.grow_if_needed(z,threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron automatically added',{'neurons':self.core.n})
         if self.core.steps%80==0:
-            deleted=self.core.prune(min_age=80,threshold=-.01)
+            from .self_params import get as sp_get
+            deleted=self.core.prune(
+                min_age=int(sp_get(self.store,'prune_min_age',80)),
+                threshold=float(sp_get(self.store,'prune_utility_threshold',-.01)))
             if deleted:self.store.event('neural','Low utility neurons removed',
                 {'count':deleted,'neurons':self.core.n})
         cur=self.store.db.execute('''INSERT INTO signals
@@ -1291,7 +1296,7 @@ class SingleTradeEngine:
                     intent=self.policy.evaluate_neural_exit(
                         scores,p['direction'],
                         returns_bps=self.market_context.get('returns_bps'),
-                        opposite_streak=streak,need_streak=2)
+                        opposite_streak=streak,store=self.store)
                     if intent=='CLOSE':
                         self.store.event('exit','Neural CLOSE intent ignored — SL/TP/trail only',
                             {'deal_id':p['dealId'],'direction':p['direction'],'vote':vote,
@@ -1642,15 +1647,24 @@ class SingleTradeEngine:
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
                 shadow_action=shadow_action,require_broker_pnl=True)
-        repeats=2 if mode in ('reinforce_win','reinforce_win_ticks') else (
-            5 if mode not in ('flat_hold',) else 1)
+        from .self_params import load as load_self_params, evolve_from_feedback
+        sp=load_self_params(self.store)
+        if mode in ('reinforce_win','reinforce_win_ticks'):
+            repeats=int(sp['learn_win_repeats'])
+        elif mode in ('flat_hold',):
+            repeats=1
+        else:
+            repeats=int(sp['learn_loss_repeats'])
+        learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
         for _ in range(repeats):
-            step_loss=self.brain.core.learn(transition,label)
+            step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
             if step_loss is not None:losses.append(step_loss)
         # Independent shadow core trains on the same delayed label (side-by-side).
-        self._shadow_learn(transition,label)
+        self._shadow_learn(transition,label,lr=learn_lr)
+        if pnl_source=='broker' and pnl_value is not None:
+            evolve_from_feedback(self.store,broker_pnl=pnl_value)
         if transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
@@ -1673,7 +1687,8 @@ class SingleTradeEngine:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
             self._note_scratch_close(pnl_value,deal_id)
         if self.brain.core.last_z is not None:
-            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=.55,nmax=None):
+            grow_th=float(sp['grow_error_threshold'])
+            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
         self.brain.save()
@@ -1959,7 +1974,8 @@ class SingleTradeEngine:
                     'registry':self.feature_registry.snapshot(),
                     'profit':self.profit_learning.summary(),
                     'model_stack':len(self.model_validator.stack),
-                    'shadow_active':self.shadow_brain is not None},
+                    'shadow_active':self.shadow_brain is not None,
+                    'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
                 'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or [])}
@@ -1988,13 +2004,12 @@ class SingleTradeEngine:
                 {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n})
         return self.shadow_brain
 
-    def _shadow_learn(self,transition,label):
+    def _shadow_learn(self,transition,label,lr=None):
         shadow=self._ensure_shadow_brain()
         if transition is None or label not in (0,1,2):return
         z=transition.get('z')
         if z is None or len(np.asarray(z))!=shadow.d:return
-        # Align state length via learn's neuron_id mapping; z dim must match.
-        shadow.learn(transition,label)
+        shadow.learn(transition,label,lr=lr)
 
     def _shadow_scores_now(self):
         """One forward pass on live last_z for shadow journal (no LIVE order)."""

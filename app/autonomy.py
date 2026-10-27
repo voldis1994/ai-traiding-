@@ -307,23 +307,19 @@ class AutoEvolution:
 
     @staticmethod
     def evaluate_neural_exit(scores,current_direction,*,returns_bps=None,opposite_streak=0,
-                             need_streak=2):
+                             need_streak=None,store=None):
         """Score a CLOSE *intent* from full OHLC zone + multi-bar confirmation.
 
         Live engine does NOT market-delete on this signal (SL/TP/trail only).
-        Kept so intent can be logged and re-enabled later without rewriting gates.
-
-        Requires:
-          1) neural vote opposite the open side on this completed bar
-          2) 5m AND 15m returns agree with that exit direction (same OHLC zone
-             entry already sees via market_features)
-          3) opposite_streak ≥ need_streak (default 2 completed M1 bars)
+        need_streak comes from self_params (robot-owned), not a frozen default.
         """
+        if need_streak is None:
+            from .self_params import get as sp_get
+            need_streak=int(sp_get(store,'exit_need_streak',2))
         if current_direction not in ('BUY','SELL'):return 'HOLD'
         if not AutoEvolution._safe_scores(scores):return 'HOLD'
         action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores[a]))
         if action not in ('BUY','SELL') or action==current_direction:return 'HOLD'
-        # Zone from broker OHLC returns (bps): closing a BUY needs DOWN zone, etc.
         if not isinstance(returns_bps,dict):return 'HOLD'
         try:
             r5=float(returns_bps.get('5',0) or 0)
@@ -772,13 +768,19 @@ class AutoEvolution:
           same as live → same £; HOLD → 0; opposite → −£ (counterfactual proxy).
         """
         from .model_validation import compare_models
+        from .self_params import load as load_params, evolve_from_feedback
         engine._ensure_shadow_brain()
+        cfg=load_params(self.store)
+        min_trades=int(cfg['shadow_min_broker_trades'])
+        win=int(cfg['shadow_rollback_window'])
+        delta=float(cfg['shadow_rollback_delta'])
+        oos_frac=float(cfg['val_oos_frac'])
         hist=[r for r in (getattr(engine.profit_learning,'history',[]) or [])
               if r.get('actual_pnl') is not None]
-        if len(hist)<12:
+        if len(hist)<min_trades:
             self.last_reason='Shadow self-dev waiting for broker-£ closed trades'
             return None
-        cut=int(len(hist)*.7)
+        cut=int(len(hist)*(1.0-oos_frac))
         oos=hist[cut:]
         live_pnls=[];shadow_pnls=[]
         for r in oos:
@@ -791,11 +793,12 @@ class AutoEvolution:
                 shadow_pnls.append(pnl)
             else:
                 shadow_pnls.append(-pnl)
-        decision=compare_models(live_pnls,shadow_pnls)
-        if len(hist)>=20:
-            recent=sum(r['actual_pnl'] for r in hist[-10:])
-            prior=sum(r['actual_pnl'] for r in hist[-20:-10])
-            if recent<prior-.5:
+        decision=compare_models(live_pnls,shadow_pnls,store=self.store)
+        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')))
+        if len(hist)>=win*2:
+            recent=sum(r['actual_pnl'] for r in hist[-win:])
+            prior=sum(r['actual_pnl'] for r in hist[-2*win:-win])
+            if recent<prior-delta:
                 prev=engine.model_validator.mark_rollback('recent broker £ worse than prior window')
                 self.last_reason='Shadow rollback flagged: '+str((prev or {}).get('model_version'))
                 return {'rollback':True,'previous':prev,'decision':decision}
@@ -804,7 +807,8 @@ class AutoEvolution:
             'shadow_neurons':getattr(engine.shadow_brain,'n',None),
             'shadow_dim':getattr(engine.shadow_brain,'d',None),
             'samples':len(hist),
-            'method':'independent_core_broker_pnl'})
+            'method':'independent_core_broker_pnl',
+            'params':{'min_trades':min_trades,'window':win,'delta':delta}})
         self.last_reason=('Shadow core beats live on OOS broker £' if decision.get('promote')
                           else 'Shadow core not better than live on OOS broker £')
         return decision

@@ -15,13 +15,11 @@ import numpy as np
 from .feature_discovery import CANDIDATE_LIBRARY, compute_candidate, _build_library
 
 STORE_KEY = 'feature_validation_log_v1'
-MIN_BARS = 120
-MIN_FOLDS = 3
-MAX_CORR = 0.92
-MIN_FOLD_AGREE = 0.6
-MIN_NET_PNL = 1e-6  # must beat flat after costs on OOS
-HORIZON = 8
-MIN_SPREAD_COVERAGE = 0.7  # ≥70% of bars need a real per-bar spread
+
+
+def _cfg(store=None):
+    from .self_params import load
+    return load(store)
 
 
 def _series_for_feature(feature_id, bars, spreads, times):
@@ -48,7 +46,7 @@ def _corr(a,b):
     return float(np.corrcoef(x,y)[0,1])
 
 
-def _trade_net(closes, spreads, i, direction, horizon=HORIZON):
+def _trade_net(closes, spreads, i, direction, horizon):
     """Net price PnL for one round-trip after entry+exit spread costs."""
     j=i+horizon
     if j>=len(closes):return None
@@ -66,10 +64,9 @@ def _trade_net(closes, spreads, i, direction, horizon=HORIZON):
     return move-cost
 
 
-def net_pnl_curve(feature_values, closes, spreads, *, start, end, horizon=HORIZON):
+def net_pnl_curve(feature_values, closes, spreads, *, start, end, horizon=8):
     """Cumulative net PnL trading sign(feature): +1 long, -1 short, 0 flat."""
     pnls=[]
-    # feature_values index 0 ↔ bar index 60
     for local in range(start,end):
         bar_i=60+local
         if bar_i+horizon>=len(closes):break
@@ -83,27 +80,36 @@ def net_pnl_curve(feature_values, closes, spreads, *, start, end, horizon=HORIZO
             'max_dd':float(np.min(np.cumsum(pnls)-np.maximum.accumulate(np.cumsum(pnls))))}
 
 
-def walk_forward_net_pnl(feature_values, closes, spreads, *, folds=4):
+def walk_forward_net_pnl(feature_values, closes, spreads, *, folds=None, store=None):
     """Chronological folds scored by cumulative net PnL after per-bar costs."""
+    cfg=_cfg(store)
+    folds=int(cfg['val_min_folds']) if folds is None else int(folds)
+    horizon=int(cfg['val_horizon_bars'])
+    min_agree=float(cfg['val_min_fold_agree'])
+    min_net=float(cfg['val_min_net_pnl'])
+    min_bars=int(cfg['val_min_bars'])
     n=len(feature_values)
-    if n<MIN_BARS-60 or folds<2:return None
+    if n<min_bars-60 or folds<2:return None
     fold_nets=[];boundaries=np.linspace(0,n,folds+1,dtype=int)
     for f in range(folds):
         start,end=int(boundaries[f]),int(boundaries[f+1])
-        curve=net_pnl_curve(feature_values,closes,spreads,start=start,end=end)
+        curve=net_pnl_curve(feature_values,closes,spreads,start=start,end=end,horizon=horizon)
         fold_nets.append(None if curve is None or curve['n']<10 else curve['net'])
     usable=[e for e in fold_nets if e is not None]
-    if len(usable)<max(2,MIN_FOLDS-1):return None
+    if len(usable)<max(2,folds-1):return None
     signs=[1 if e>0 else (-1 if e<0 else 0) for e in usable]
     majority=max(set(signs),key=signs.count) if signs else 0
     agree=sum(1 for s in signs if s==majority and s!=0)/max(len(usable),1)
     mean_net=float(np.mean(usable))
     return {'fold_nets':fold_nets,'mean_net':mean_net,'agree':agree,
-            'stable':agree>=MIN_FOLD_AGREE and mean_net>MIN_NET_PNL}
+            'stable':agree>=min_agree and mean_net>min_net,
+            'horizon':horizon}
 
 
-def _normalize_spreads(spreads, n):
+def _normalize_spreads(spreads, n, *, store=None):
     """Accept list aligned to bars; reject flat-paste of a single live value."""
+    cfg=_cfg(store)
+    coverage=float(cfg['val_min_spread_coverage'])
     if spreads is None:return None,'no per-bar spreads'
     if len(spreads)!=n:return None,'spread length mismatch'
     vals=[]
@@ -114,9 +120,8 @@ def _normalize_spreads(spreads, n):
             v=float('nan')
         vals.append(v if math.isfinite(v) and v>=0 else float('nan'))
     finite=[v for v in vals if math.isfinite(v)]
-    if len(finite)<MIN_SPREAD_COVERAGE*n:
-        return None,f'spread coverage {len(finite)}/{n} < {MIN_SPREAD_COVERAGE:.0%}'
-    # Detect "one current spread copied onto history": ≥95% identical finite values.
+    if len(finite)<coverage*n:
+        return None,f'spread coverage {len(finite)}/{n} < {coverage:.0%}'
     if len(finite)>=20:
         uniq=len({round(v,10) for v in finite})
         if uniq==1:
@@ -125,40 +130,43 @@ def _normalize_spreads(spreads, n):
 
 
 def validate_feature(feature_id, bars, *, spreads=None, times=None,
-                     existing_matrix=None, existing_names=None):
+                     existing_matrix=None, existing_names=None, store=None):
     """Full independent check. bars = list of (o,h,l,c) chronological."""
-    _build_library()
+    cfg=_cfg(store)
+    _build_library(horizons=cfg.get('gen_horizons'))
     if feature_id not in CANDIDATE_LIBRARY:
         return {'approved':False,'reason':'unknown feature id'}
-    if not bars or len(bars)<MIN_BARS:
-        return {'approved':False,'reason':f'need ≥{MIN_BARS} completed bars'}
-    spreads_n,err=_normalize_spreads(spreads,len(bars))
+    min_bars=int(cfg['val_min_bars'])
+    if not bars or len(bars)<min_bars:
+        return {'approved':False,'reason':f'need ≥{min_bars} completed bars'}
+    spreads_n,err=_normalize_spreads(spreads,len(bars),store=store)
     if spreads_n is None:
         return {'approved':False,'reason':err}
     times=list(times or [None]*len(bars))
     closes=np.array([b[3] for b in bars],dtype=float)
     feat=_series_for_feature(feature_id,bars,spreads_n,times)
     if feat is None:return {'approved':False,'reason':'series failed'}
+    max_corr=float(cfg['val_max_corr'])
     if existing_matrix is not None and len(existing_matrix)==len(feat):
         names=list(existing_names or [])
         for j in range(existing_matrix.shape[1]):
             c=_corr(feat,existing_matrix[:,j])
-            if c is not None and abs(c)>=MAX_CORR:
+            if c is not None and abs(c)>=max_corr:
                 nm=names[j] if j<len(names) else str(j)
                 return {'approved':False,'reason':f'duplicate/collinear with {nm} (|ρ|={abs(c):.2f})',
                         'corr':c,'peer':nm}
-    wf=walk_forward_net_pnl(feat,closes,spreads_n,folds=4)
+    wf=walk_forward_net_pnl(feat,closes,spreads_n,store=store)
     if wf is None:
         return {'approved':False,'reason':'insufficient walk-forward net-PnL folds'}
     if not wf['stable']:
         return {'approved':False,'reason':'unstable or non-positive OOS net PnL',
                 'metrics':wf}
-    # Final OOS block cumulative net must stay positive after costs.
-    n=len(feat);cut=int(n*.7)
-    oos=net_pnl_curve(feat,closes,spreads_n,start=cut,end=n)
+    n=len(feat);cut=int(n*float(cfg['val_oos_frac']))
+    horizon=int(cfg['val_horizon_bars'])
+    oos=net_pnl_curve(feat,closes,spreads_n,start=cut,end=n,horizon=horizon)
     if oos is None or oos['n']<20:
         return {'approved':False,'reason':'OOS too thin for net PnL'}
-    if oos['net']<=MIN_NET_PNL:
+    if oos['net']<=float(cfg['val_min_net_pnl']):
         return {'approved':False,'reason':'OOS cumulative net PnL not positive after costs',
                 'metrics':wf,'oos':oos}
     name,formula,_=CANDIDATE_LIBRARY[feature_id]
@@ -182,14 +190,17 @@ class FeatureValidator:
 
     def validate_and_maybe_approve(self, feature_id, bars, *, spreads=None, times=None,
                                    existing_matrix=None, existing_names=None):
+        from .self_params import evolve_from_feedback
         result=validate_feature(feature_id,bars,spreads=spreads,times=times,
-                                existing_matrix=existing_matrix,existing_names=existing_names)
+                                existing_matrix=existing_matrix,existing_names=existing_names,
+                                store=self.store)
         entry={'feature_id':feature_id,'result':result,
                'at':datetime.now(timezone.utc).isoformat()}
         self._persist(entry)
         if not result.get('approved'):
             self.store.event('validation','Feature rejected',
                 {'id':feature_id,'reason':result.get('reason')})
+            evolve_from_feedback(self.store,feature_rejected=result)
             return result
         ok,why=self.registry.approve({
             'id':result['id'],'name':result['name'],'formula':result['formula'],
@@ -199,7 +210,9 @@ class FeatureValidator:
         if ok:
             self.store.event('validation','Feature approved into registry',
                 {'id':feature_id,'name':result['name'],'ohlc_dim':self.registry.ohlc_dim()})
+            evolve_from_feedback(self.store,feature_approved=feature_id)
         else:
             result['approved']=False
             result['reason']='validation passed but registry refused: '+why
+            evolve_from_feedback(self.store,feature_rejected=result)
         return result

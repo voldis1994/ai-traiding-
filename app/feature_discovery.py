@@ -21,9 +21,10 @@ import numpy as np
 from .market_context import candle_time, FEATURE_NAMES as BASE_NAMES
 
 STORE_KEY = 'feature_discovery_state_v1'
-BARS_BETWEEN_SEARCH = 30
-MAX_PROPOSALS_KEPT = 80
-GEN_HORIZONS = (3, 5, 8, 13, 21, 34)
+# Seeds only — runtime cadence/horizons come from self_params (robot-owned).
+_SEED_BARS_BETWEEN_SEARCH = 30
+_SEED_MAX_PROPOSALS_KEPT = 80
+_SEED_GEN_HORIZONS = (3, 5, 8, 13, 21, 34)
 
 
 def _shadows(bar, ref_c):
@@ -198,11 +199,12 @@ def _make_ret_diff(h1, h2):
     return fn
 
 
-def _generate_combinatorial():
-    """Open-ended OHLC algebra — new ids each horizon/op, not a fixed list of 12."""
+def _generate_combinatorial(horizons=None):
+    """Open-ended OHLC algebra — horizons come from self_params when provided."""
     global _GENERATED
-    if _GENERATED:return
-    for h in GEN_HORIZONS:
+    hs=tuple(horizons) if horizons else _SEED_GEN_HORIZONS
+    # Always (re)register for current horizon set; ids are stable per horizon.
+    for h in hs:
         _reg(f'gen_ret_{h}',f'gen_ret_{h}',f'(close/close[-{h}]-1)*1000',_make_ret(h))
         _reg(f'gen_range_pos_{h}',f'gen_range_pos_{h}',
              f'close location in last-{h} high-low',_make_range_pos(h))
@@ -212,19 +214,20 @@ def _generate_combinatorial():
              f'mean body/range over {h}',_make_body_mean(h))
         _reg(f'gen_spread_atr_{h}',f'gen_spread_atr_{h}',
              f'spread/ATR({h})',_make_spread_vs_atr(h))
-    for s,l in ((3,13),(5,21),(8,34),(5,34)):
+    pairs=[(hs[i],hs[j]) for i in range(len(hs)) for j in range(i+1,len(hs)) if hs[j]>=hs[i]*2][:8]
+    for s,l in pairs or ((3,13),(5,21)):
         _reg(f'gen_atr_ratio_{s}_{l}',f'gen_atr_ratio_{s}_{l}',
              f'ATR({s})/ATR({l})',_make_atr_ratio(s,l))
-    for a,b in ((3,8),(5,13),(8,21),(13,34),(5,34)):
+    for a,b in pairs or ((3,8),(5,13)):
         _reg(f'gen_ret_diff_{a}_{b}',f'gen_ret_diff_{a}_{b}',
              f'ret({a})-ret({b})',_make_ret_diff(a,b))
     _GENERATED=True
 
 
-def _build_library():
+def _build_library(horizons=None):
     if not CANDIDATE_LIBRARY:
         _seed_library()
-    _generate_combinatorial()
+    _generate_combinatorial(horizons=horizons)
 
 
 def compute_candidate(feature_id, bars, *, spread=0., bar_time=None):
@@ -273,24 +276,35 @@ class FeatureDiscovery:
         self.last_search_bar=raw.get('last_search_bar')
 
     def _save(self):
+        keep=int(self._params().get('max_proposals_kept',_SEED_MAX_PROPOSALS_KEPT))
         self.store.set(STORE_KEY,{
             'bars_seen':self.bars_seen,
-            'proposals':self.proposals[-MAX_PROPOSALS_KEPT:],
+            'proposals':self.proposals[-keep:],
             'last_search_bar':self.last_search_bar,
             'library_size':len(CANDIDATE_LIBRARY),
             'note':'OHLC/spread combinatorial algebra — no volume/DOM from Capital'})
+
+    def _params(self):
+        from .self_params import load as load_params
+        return load_params(self.store)
 
     def on_closed_bar(self, bar_time, bars, *, spread=0., registry=None):
         if not bar_time or not bars or len(bars)<61:return []
         if bar_time==self.last_search_bar:return []
         self.bars_seen+=1
         self.last_search_bar=bar_time
-        if self.bars_seen % BARS_BETWEEN_SEARCH != 0:
+        p=self._params()
+        every=max(1,int(p['bars_between_search']))
+        if self.bars_seen % every != 0:
             self._save();return []
         return self.search(bars,spread=spread,registry=registry,bar_time=bar_time)
 
-    def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=24):
-        """Propose up to `limit` finite candidates from seed + generated algebra."""
+    def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=None):
+        """Propose candidates; cadence/limit/horizons from self_params."""
+        p=self._params()
+        _build_library(horizons=p.get('gen_horizons'))
+        limit=int(p['search_limit'] if limit is None else limit)
+        keep=int(p['max_proposals_kept'])
         exclude=set(BASE_NAMES)
         if registry is not None:
             exclude |= set(registry.approved_names())|set(registry.approved_ids())
@@ -303,12 +317,14 @@ class FeatureDiscovery:
             found.append(proposal)
             self.proposals.append(proposal)
             if len(found)>=limit:break
-        self.proposals=self.proposals[-MAX_PROPOSALS_KEPT:]
+        self.proposals=self.proposals[-keep:]
         self._save()
         if found:
             self.store.event('discovery','Feature candidates proposed from OHLC algebra',
                 {'count':len(found),'library':len(CANDIDATE_LIBRARY),'bar_time':bar_time,
-                 'ids':[p['id'] for p in found[:12]]})
+                 'ids':[x['id'] for x in found[:12]],
+                 'bars_between_search':int(p['bars_between_search']),
+                 'search_limit':limit})
         return found
 
     def pending_proposals(self):

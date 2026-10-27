@@ -36,6 +36,14 @@ SELF_DEV_CYCLE = (
 )
 # Capital.com does not provide true volume / DOM — discovery never invents them.
 DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
+# Tunable knobs live in Store via app.self_params — not frozen magic in modules.
+SELF_TUNABLE = 'self_params_v1'
+IMMUTABLE = (
+    'capital_no_volume_dom',
+    'feature_layout_base_dynamic_external',
+    'actions_buy_sell_hold',
+    'broker_tick_min_stop_margin',
+)
 EXECUTION_GATES = (
     'manual_first_close',
     'news_calendar',

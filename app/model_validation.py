@@ -13,9 +13,11 @@ import numpy as np
 
 STORE_KEY = 'model_validation_log_v1'
 MODEL_STACK_KEY = 'model_version_stack_v1'
-MIN_OOS = 24
-MIN_LIFT = 0.0  # must beat incumbent net (strict >)
-MAX_DD_RATIO = 1.15  # candidate DD may not exceed incumbent by >15%
+
+
+def _cfg(store=None):
+    from .self_params import load
+    return load(store)
 
 
 def _equity_curve(pnls):
@@ -26,13 +28,14 @@ def _equity_curve(pnls):
     return eq,float(eq[-1]),float(dd.min()) if len(dd) else 0.
 
 
-def score_trade_pnls(pnls):
+def score_trade_pnls(pnls, *, store=None):
     """Net, max drawdown, stability (share of positive rolling windows)."""
+    cfg=_cfg(store)
+    min_oos=int(cfg['model_min_oos'])
     pnls=[float(x) for x in pnls if x is not None and math.isfinite(float(x))]
-    if len(pnls)<MIN_OOS:
-        return {'ok':False,'reason':f'need ≥{MIN_OOS} OOS outcomes','n':len(pnls)}
+    if len(pnls)<min_oos:
+        return {'ok':False,'reason':f'need ≥{min_oos} OOS outcomes','n':len(pnls)}
     _,net,dd=_equity_curve(pnls)
-    # Stability: fraction of non-overlapping blocks with positive sum.
     block=max(4,len(pnls)//5)
     pos=0;total=0
     for i in range(0,len(pnls)-block+1,block):
@@ -42,38 +45,43 @@ def score_trade_pnls(pnls):
     return {'ok':True,'n':len(pnls),'net':net,'max_dd':dd,'stability':stability}
 
 
-def compare_models(incumbent_pnls, candidate_pnls):
-    """Return promote decision with reasons — independent of LIVE path."""
-    inc=score_trade_pnls(incumbent_pnls)
-    cand=score_trade_pnls(candidate_pnls)
+def compare_models(incumbent_pnls, candidate_pnls, *, store=None):
+    """Return promote decision with reasons — thresholds from self_params."""
+    cfg=_cfg(store)
+    dd_ratio=float(cfg['model_max_dd_ratio'])
+    slack=float(cfg['model_stability_slack'])
+    inc=score_trade_pnls(incumbent_pnls,store=store)
+    cand=score_trade_pnls(candidate_pnls,store=store)
     if not cand.get('ok'):
         return {'promote':False,'reason':cand.get('reason','candidate weak'),'incumbent':inc,'candidate':cand}
     if not inc.get('ok'):
-        # Cold start: still require candidate stability.
         if cand['stability']<.4:
             return {'promote':False,'reason':'incumbent thin and candidate unstable',
                     'incumbent':inc,'candidate':cand}
         return {'promote':True,'reason':'cold-start candidate acceptable',
                 'incumbent':inc,'candidate':cand}
-    if cand['net']<=inc['net']+MIN_LIFT:
+    if cand['net']<=inc['net']:
         return {'promote':False,'reason':'candidate net PnL not better',
                 'incumbent':inc,'candidate':cand}
-    # Drawdown: more negative is worse.
-    if cand['max_dd']<inc['max_dd']*MAX_DD_RATIO and inc['max_dd']<0:
+    if cand['max_dd']<inc['max_dd']*dd_ratio and inc['max_dd']<0:
         return {'promote':False,'reason':'candidate drawdown worse than allowed',
                 'incumbent':inc,'candidate':cand}
-    if cand['stability']+1e-9<inc['stability']-0.05:
+    if cand['stability']+1e-9<inc['stability']-slack:
         return {'promote':False,'reason':'candidate less stable',
                 'incumbent':inc,'candidate':cand}
     return {'promote':True,'reason':'OOS net/risk/stability beat incumbent',
             'incumbent':inc,'candidate':cand}
 
 
-def walk_forward_split(rows, *, train_frac=0.7):
+def walk_forward_split(rows, *, train_frac=None, store=None):
     """Chronological split — caller must pre-sort by time."""
+    cfg=_cfg(store)
+    # self_params val_oos_frac is OOS share → train = 1 - oos.
+    if train_frac is None:
+        train_frac=1.0-float(cfg['val_oos_frac'])
     n=len(rows)
-    if n<MIN_OOS:return [],list(rows)
-    cut=int(n*train_frac)
+    if n<int(cfg['model_min_oos']):return [],list(rows)
+    cut=int(n*float(train_frac))
     return list(rows[:cut]),list(rows[cut:])
 
 
@@ -88,13 +96,15 @@ class ModelValidator:
         self.store.set(STORE_KEY,self.log[-60:])
 
     def evaluate(self, incumbent_pnls, candidate_pnls, *, meta=None):
-        decision=compare_models(incumbent_pnls,candidate_pnls)
+        from .self_params import evolve_from_feedback
+        decision=compare_models(incumbent_pnls,candidate_pnls,store=self.store)
         entry={'at':datetime.now(timezone.utc).isoformat(),
                'decision':decision,'meta':meta or {}}
         self._persist_log(entry)
         self.store.event('model_validation',
             'Candidate '+('PROMOTE' if decision['promote'] else 'REJECT'),
             {'reason':decision['reason'],'meta':meta or {}})
+        evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')))
         return decision
 
     def push_version(self, version_meta):

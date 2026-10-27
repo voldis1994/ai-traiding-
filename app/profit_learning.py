@@ -13,7 +13,7 @@ import math
 from datetime import datetime, timezone
 
 STORE_KEY = 'profit_learning_history_v1'
-MAX_ROWS = 400
+_SEED_MAX_ROWS = 400
 
 
 def _finite(x):
@@ -76,7 +76,9 @@ class ProfitLearning:
         self.history=list(self.store.get(STORE_KEY) or [])
 
     def _save(self):
-        self.store.set(STORE_KEY,self.history[-MAX_ROWS:])
+        from .self_params import get as sp_get
+        keep=int(sp_get(self.store,'profit_history_rows',_SEED_MAX_ROWS))
+        self.store.set(STORE_KEY,self.history[-keep:])
 
     def record_closed(self, *, deal_id, epic, direction, entry, exit_level,
                       broker_pnl, currency=None, spread=0., slip_bps=0.,

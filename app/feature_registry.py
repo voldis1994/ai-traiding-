@@ -14,7 +14,7 @@ from .market_context import FEATURE_NAMES as BASE_OHLC_NAMES, FEATURE_SCHEMA as 
 from .market_fusion import EXTERNAL_NAMES
 
 STORE_KEY = 'feature_registry_v1'
-# Soft capacity — enough room for combinatorial discoveries; not a magic "12 formulas".
+# Seed only — live cap is self_params.max_approved_features (robot-owned).
 MAX_APPROVED = 32
 
 
@@ -32,11 +32,16 @@ class FeatureRegistry:
         if store is not None:
             self.load()
 
+    def _cap(self):
+        if self.store is None:return MAX_APPROVED
+        from .self_params import get as sp_get
+        return int(sp_get(self.store,'max_approved_features',MAX_APPROVED))
+
     def load(self):
         raw=self.store.get(STORE_KEY) if self.store else None
         if isinstance(raw,dict) and isinstance(raw.get('approved'),list):
             self.approved=[x for x in raw['approved'] if isinstance(x,dict) and x.get('id') and x.get('name')]
-            self.approved=self.approved[:MAX_APPROVED]
+            self.approved=self.approved[:self._cap()]
         else:
             self.approved=[]
 
@@ -90,7 +95,7 @@ class FeatureRegistry:
         if self.has(fid) or name in self.approved_names() or name in BASE_OHLC_NAMES:
             return False,'duplicate'
         if name in EXTERNAL_NAMES:return False,'collides with external'
-        if len(self.approved)>=MAX_APPROVED:return False,'cap reached'
+        if len(self.approved)>=self._cap():return False,'cap reached'
         entry={
             'id':fid,'name':name,
             'formula':str(spec.get('formula') or ''),

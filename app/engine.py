@@ -1174,28 +1174,29 @@ class SingleTradeEngine:
                 p=self.positions[0]
                 if p.get('stopLevel') is None or p.get('profitLevel') is None:
                     await self.protect_position(p);return
-                # Exit uses the same OHLC zone as entry — never one red M1 alone.
+                # Live exit = broker SL / TP / trail only. Neural market-delete
+                # was matching M1 noise; the network still learns from cash P&L
+                # when those broker exits confirm. Intent is logged, never sent.
                 if (new_closed_bar and self.last_signal and
                     self.last_exit_processed_bar!=self.last_decision_bar):
                     self.last_exit_processed_bar=self.last_decision_bar
                     scores=self.last_signal['scores']
-                    vote=self.policy.neural_decision(scores)  # flat vote this bar
+                    vote=self.policy.neural_decision(scores)
                     streak_key='exit_opposite_streak:'+str(p['dealId'])
                     if vote in ('BUY','SELL') and vote!=p['direction']:
                         streak=int(self.store.get(streak_key) or 0)+1
                     else:
                         streak=0
                     self.store.set(streak_key,streak)
-                    decision=self.policy.evaluate_neural_exit(
+                    intent=self.policy.evaluate_neural_exit(
                         scores,p['direction'],
                         returns_bps=self.market_context.get('returns_bps'),
                         opposite_streak=streak,need_streak=2)
-                    if decision=='CLOSE':
-                        self.store.set(streak_key,0)
-                        self.store.event('exit','Neural CLOSE after zone+multi-bar confirmation',
+                    if intent=='CLOSE':
+                        self.store.event('exit','Neural CLOSE intent ignored — SL/TP/trail only',
                             {'deal_id':p['dealId'],'direction':p['direction'],'vote':vote,
-                             'streak':streak,'returns_bps':self.market_context.get('returns_bps')})
-                        await self.exit_position(p['dealId']);return
+                             'streak':streak,'returns_bps':self.market_context.get('returns_bps'),
+                             'neural_market_exit':False})
                 await self.adapt_protection(p)
             elif (len(self.positions)==0 and self.last_signal and
                   self.last_closed_step>=0 and new_closed_bar and
@@ -1753,6 +1754,8 @@ class SingleTradeEngine:
                 'threshold_unit':'neural_argmax_no_fixed_margin',
                 'neural_decision_bar':self.last_decision_bar,
                 'neural_entry_rule':'BUY/SELL/HOLD class winner on completed M1 candle',
+                'neural_market_exit':False,
+                'neural_exit_rule':'disabled — broker SL/TP/trail closes; neural learns from cash P&L',
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved()),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),

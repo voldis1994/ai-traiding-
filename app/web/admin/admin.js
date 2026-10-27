@@ -57,12 +57,14 @@ function renderCard(c){
   const pill=running?(paused?'pause':'on'):'off';
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';
   const broker=c.broker?`${c.broker.display_name}`:'nav brokera';
-  const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+  // Account cash currency wins over stale trade labels (GOLD quote USD).
+  const ccy=c.account_currency||a.currency||r.pnl_currency||'';
   const trades=(r.recent_trades||[]).slice(0,6).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
-    const tCcy=t.pnl_currency||ccy;
-    const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
-    return `<div><span>${t.direction||'?'} ${t.epic||''}${src}</span><span class="${cls}">${p==null?'—':money(p,tCcy)}</span></div>`;
+    const src=(t.pnl_source||'').toLowerCase();
+    const tCcy=(src==='ticks_only'||src==='price_size')?(t.pnl_currency||''):(ccy||t.pnl_currency||'');
+    const srcTag=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
+    return `<div><span>${t.direction||'?'} ${t.epic||''}${srcTag}</span><span class="${cls}">${p==null?'—':money(p,tCcy)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
   const el=document.createElement('article');
   el.className='card';

@@ -1174,13 +1174,27 @@ class SingleTradeEngine:
                 p=self.positions[0]
                 if p.get('stopLevel') is None or p.get('profitLevel') is None:
                     await self.protect_position(p);return
-                # Existing bracket supervision continues on each poll. Directional
-                # exits can happen only once on a NEW confirmed M1 bar.
+                # Exit uses the same OHLC zone as entry — never one red M1 alone.
                 if (new_closed_bar and self.last_signal and
                     self.last_exit_processed_bar!=self.last_decision_bar):
                     self.last_exit_processed_bar=self.last_decision_bar
-                    decision=self.policy.neural_decision(self.last_signal['scores'],p['direction'])
+                    scores=self.last_signal['scores']
+                    vote=self.policy.neural_decision(scores)  # flat vote this bar
+                    streak_key='exit_opposite_streak:'+str(p['dealId'])
+                    if vote in ('BUY','SELL') and vote!=p['direction']:
+                        streak=int(self.store.get(streak_key) or 0)+1
+                    else:
+                        streak=0
+                    self.store.set(streak_key,streak)
+                    decision=self.policy.evaluate_neural_exit(
+                        scores,p['direction'],
+                        returns_bps=self.market_context.get('returns_bps'),
+                        opposite_streak=streak,need_streak=2)
                     if decision=='CLOSE':
+                        self.store.set(streak_key,0)
+                        self.store.event('exit','Neural CLOSE after zone+multi-bar confirmation',
+                            {'deal_id':p['dealId'],'direction':p['direction'],'vote':vote,
+                             'streak':streak,'returns_bps':self.market_context.get('returns_bps')})
                         await self.exit_position(p['dealId']);return
                 await self.adapt_protection(p)
             elif (len(self.positions)==0 and self.last_signal and

@@ -294,17 +294,43 @@ class AutoEvolution:
 
     @staticmethod
     def neural_decision(scores,current_direction=None):
-        """AI-owned action on a CONFIRMED completed candle.
+        """Raw neural vote on one completed candle (scores only).
 
-        BUY/SELL/HOLD compete as outputs of the trained neural network.
-        No hard-coded confidence, MIN_EDGE, score-margin calibration or
-        delayed-label sample-count veto is imposed after the model votes.
-        Operational broker / bracket / news checks belong to the router.
+        Flat → BUY/SELL/HOLD. In a position this alone must NOT close — use
+        evaluate_neural_exit (zone + multi-bar confirmation).
         """
         if not AutoEvolution._safe_scores(scores):return 'HOLD'
         action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores[a]))
         if current_direction is None:return action
+        # Legacy callers: still report intent, but engine exits via evaluate_neural_exit.
         return 'CLOSE' if action in ('BUY','SELL') and action!=current_direction else 'HOLD'
+
+    @staticmethod
+    def evaluate_neural_exit(scores,current_direction,*,returns_bps=None,opposite_streak=0,
+                             need_streak=2):
+        """CLOSE only with full zone — not one red M1 flip.
+
+        Requires:
+          1) neural vote opposite the open side on this completed bar
+          2) 5m AND 15m returns agree with that exit direction (same OHLC zone
+             entry already sees via market_features)
+          3) opposite_streak ≥ need_streak (default 2 completed M1 bars)
+        """
+        if current_direction not in ('BUY','SELL'):return 'HOLD'
+        if not AutoEvolution._safe_scores(scores):return 'HOLD'
+        action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores[a]))
+        if action not in ('BUY','SELL') or action==current_direction:return 'HOLD'
+        # Zone from broker OHLC returns (bps): closing a BUY needs DOWN zone, etc.
+        if not isinstance(returns_bps,dict):return 'HOLD'
+        try:
+            r5=float(returns_bps.get('5',0) or 0)
+            r15=float(returns_bps.get('15',0) or 0)
+        except (TypeError,ValueError):
+            return 'HOLD'
+        if action=='SELL' and not (r5<0 and r15<0):return 'HOLD'
+        if action=='BUY' and not (r5>0 and r15>0):return 'HOLD'
+        if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
+        return 'CLOSE'
 
     def evaluate_neural_entry(self,scores):
         """Entry uses BUY/SELL only — HOLD is never an entry mode.

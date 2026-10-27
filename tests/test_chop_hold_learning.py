@@ -24,10 +24,11 @@ def test_second_flip_loss_learns_hold_not_opposite():
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition)})
         e._learn_closed_trade('s1',{'level':101,'profit':-0.2})
         assert store.get('last_trade_outcome')['mode']=='chop_hold_after_flip_loss'
-        # First loss alone still regrets toward opposite (no prior flip).
+        # First loss alone → HOLD (no automatic opposite training after a loss).
         store.set('last_trade_outcome',None)
         store.upsert_trade({'dealId':'s2','epic':'GOLD','size':'.14','direction':'BUY','level':100})
         store.set('entry_brain:s2',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition)})
         e._learn_closed_trade('s2',{'level':99,'profit':-0.15})
-        assert store.get('last_trade_outcome')['mode']=='regret_loss'
+        assert store.get('last_trade_outcome')['mode'] in (
+            'loss_hold_default','loss_abstain_hold')

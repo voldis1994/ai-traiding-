@@ -10,7 +10,7 @@ def install_synthetic_context(monkeypatch, *, direction='BUY'):
     up=direction=='BUY'
     returns={'1':1,'5':5,'15':15,'60':60} if up else {'1':-1,'5':-5,'15':-15,'60':-60}
     trend='UP' if up else 'DOWN'
-    def fake_context(rows,*,spread=0.,epic=None):
+    def fake_context(rows,*,spread=0.,epic=None,**_kw):
         counter[0]+=1
         stamp=(datetime(2026,10,13,15,0,tzinfo=timezone.utc)+timedelta(minutes=counter[0])).isoformat()
         return {'ready':True,'reason':'synthetic test context','epic':epic,

@@ -165,10 +165,42 @@ class NeuralCore:
         self.n=len(keep);self.deaths+=count
         return count
 
+    def expand_inputs(self, new_d, *, init_scale=0.01):
+        """Grow input dimension; preserve learned weights on existing columns.
+
+        New P columns / G rows get small noise so new features can train without
+        zero-gradient stuck state. Recurrent W,R,O,h,c unchanged.
+        """
+        new_d=int(new_d)
+        if new_d<self.d:raise ValueError('expand_inputs cannot shrink dimension')
+        if new_d==self.d:return False
+        extra=new_d-self.d
+        self.P=np.pad(self.P,((0,0),(0,extra)))
+        if init_scale:
+            self.P[:,self.d:] = self.rng.normal(0,init_scale,(self.n,extra))
+        self.G=np.pad(self.G,((0,extra),(0,0)))
+        if init_scale:
+            self.G[self.d:,:] = self.rng.normal(0,init_scale,(extra,self.n))
+        self.mu=np.append(self.mu,np.zeros(extra))
+        self.nu=np.append(self.nu,np.ones(extra))
+        self.last_z=np.append(self.last_z,np.zeros(extra))
+        self.last_transition=None
+        self.d=new_d
+        return True
+
+    def clone_architecture(self, *, n=None, seed=None):
+        """Shadow candidate with optional different neuron count; weights re-init.
+
+        Used for alternative-architecture search — NOT a live swap by itself.
+        """
+        n=int(n) if n is not None else self.n
+        seed=int(seed) if seed is not None else 7
+        return NeuralCore(n=max(8,n),d=self.d,seed=seed)
+
     def snapshot(self):
         return {'neurons':self.n,'steps':self.steps,'smoothed_error':self.vbar,
                 'mean_activation':float(np.mean(np.abs(self.h))),
                 'births':self.births,'pruned':self.deaths,'loss':self.last_loss,
                 'gradient_norm':self.last_grad,'utility_mean':float(np.mean(self.utility)),
                 'activations':self.h[:72].round(4).tolist(),'memory':self.c[:72].round(4).tolist(),
-                'edges':int(np.count_nonzero(self.W))}
+                'edges':int(np.count_nonzero(self.W)),'input_dim':self.d}

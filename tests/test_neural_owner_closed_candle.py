@@ -139,7 +139,7 @@ def test_new_manual_market_adopted_without_switch_button():
 def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     from app import engine as module
     clock=[datetime(2026,10,14,16,30,tzinfo=timezone.utc)]
-    def context(rows,*,spread=0.,epic=None):
+    def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.0,
                 'features':[.01]*FEATURE_DIM,'trend':'UP','regime':'ALIGNED',
@@ -177,7 +177,7 @@ def test_position_exit_never_market_deletes_neural_intent(monkeypatch):
     """Zone+streak may score CLOSE intent, but live exit is SL/TP/trail only."""
     from app import engine as module
     clock=[datetime(2026,10,14,17,10,tzinfo=timezone.utc)]
-    def context(rows,*,spread=0.,epic=None):
+    def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.,'features':[.02]*FEATURE_DIM,
                 'trend':'DOWN','regime':'ALIGNED',

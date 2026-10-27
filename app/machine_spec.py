@@ -20,9 +20,22 @@ PRIMARY_FEEDBACK = 'closed_trade_pnl_regret_or_chop_hold'
 FEATURE_SCHEMAS = {
     'ohlc_v3': {'schema': FEATURE_SCHEMA, 'dim': FEATURE_DIM},
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},
+    'dynamic': {'note': 'FeatureRegistry may append validated OHLC formulas; dims grow at runtime'},
 }
 # Present in autonomy templates / replay only — NOT a LIVE entry veto.
-SHADOW_ONLY = ('evolved_MIN_EDGE', 'legacy_60pct_gates', 'price_edge_v5_entry_filter')
+SHADOW_ONLY = ('evolved_MIN_EDGE', 'legacy_60pct_gates', 'price_edge_v5_entry_filter',
+               'shadow_architecture_probe', 'feature_discovery_proposals')
+SELF_DEV_CYCLE = (
+    'collect_ohlc',
+    'discover_candidates',
+    'walk_forward_validate_features',
+    'expand_neural_inputs',
+    'profit_learning_labels',
+    'shadow_compare_models',
+    'promote_or_rollback',
+)
+# Capital.com does not provide true volume / DOM — discovery never invents them.
+DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
 EXECUTION_GATES = (
     'manual_first_close',
     'news_calendar',

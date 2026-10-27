@@ -171,12 +171,12 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         store.upsert_trade({'dealId':'loss1','epic':'GOLD','size':'1','direction':'BUY','level':100})
         store.set('entry_brain:loss1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
-        # BUY that exited lower → loss → regret toward SELL (label 1), stronger repeats.
+        # BUY that exited lower → loss → HOLD (no automatic opposite), stronger repeats.
         engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
-        assert detail['mode']=='regret_loss'
-        assert detail['target']==1
+        assert detail['mode'] in ('loss_hold_default','loss_abstain_hold')
+        assert detail['target']==2
         assert detail['learn_repeats']==5
         assert detail['broker_pnl']==-12.5
         assert detail['pnl']==-12.5

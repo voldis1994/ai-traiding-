@@ -4,6 +4,9 @@ Only COMPLETE one-minute candles enter model inference and delayed training.
 The current forming minute is never a supervised feature. The 1/5/15/60
 minute lookbacks are measured in elapsed UTC time, not quote polling ticks.
 Outputs are dimensionless, finite and ordered consistently across instruments.
+
+Base feature count is fixed (shadow_v4). Approved dynamic features from the
+registry are appended when `approved` is provided — never invented mid-bar.
 """
 from datetime import datetime, timezone, timedelta
 import math
@@ -37,11 +40,13 @@ def candle_bucket(value):
     return dt.isoformat() if dt is not None else None
 
 
-def market_features(rows, *, now_utc=None, spread=0., epic=None):
+def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, schema=None):
     """Return a time-aligned feature snapshot or an explicit unavailable reason.
 
     Stored current-minute quote-derived OHLC is excluded. Bars must cover a
     continuous 60 minute window. Gaps or stale API data cause a safe HOLD.
+
+    `approved`: optional registry specs → append dynamic OHLC formulas (past bars only).
     """
     current=now_utc if now_utc is not None else datetime.now(timezone.utc)
     if current.tzinfo is None:current=current.replace(tzinfo=timezone.utc)
@@ -96,11 +101,20 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None):
     # Bound extreme one-minute gaps to avoid poison gradients; scale consistent.
     # Shadows already in [0,1]; wick imbalance in [-1,1] — clip with the rest.
     values=np.clip(values,-20.,20.).tolist()
+    dynamic_names=[]
+    if approved:
+        from .feature_discovery import compute_approved
+        extra=compute_approved(bars,approved,spread=spread,bar_time=latest.isoformat())
+        if extra is None:
+            return fail('Approved dynamic feature unavailable on this bar')
+        values.extend(extra)
+        dynamic_names=[(a.get('name') if isinstance(a,dict) else str(a)) for a in approved]
     direction=('UP' if ret(15)>0 and ret(60)>0 else
                'DOWN' if ret(15)<0 and ret(60)<0 else 'MIXED')
     # Short vs long sign disagreement = regime in transition (data, not a threshold).
     r5,r60=ret(5),ret(60)
     regime=('SHIFT' if (r5>0 and r60<0) or (r5<0 and r60>0) else 'ALIGNED')
+    out_schema=schema or FEATURE_SCHEMA
     return {'ready':True,'reason':'60-minute complete OHLC context','epic':epic,
             'bars':len(by_minute),'bar_time':latest.isoformat(),'close':c,
             'horizons_minutes':[1,5,15,60],
@@ -110,4 +124,7 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None):
             'range_position':round(values[7],4),
             'upper_shadow':round(float(up1),4),'lower_shadow':round(float(lo1),4),
             'wick_imbalance_5m':round(wick_imb,4),
-            'features':values,'feature_schema':FEATURE_SCHEMA}
+            'features':values,
+            'feature_names':list(FEATURE_NAMES)+dynamic_names,
+            'dynamic_names':dynamic_names,
+            'feature_schema':out_schema}

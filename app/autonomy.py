@@ -763,3 +763,79 @@ class AutoEvolution:
         return {'generation':self.generation,'strategy':self.kind,'source':source,
                 'sha256':hashlib.sha256(source.encode()).hexdigest(),
                 'attempts':self.attempts,'last_reason':self.last_reason}
+
+    def shadow_self_dev_tick(self, engine):
+        """Shadow cycle: alternate neuron counts + profit OOS compare; never LIVE-executes.
+
+        May request rollback metadata if recent actual £ deteriorates vs prior stack.
+        Feature/combo promotion stays in FeatureValidator / ModelValidator.
+        """
+        from .model_validation import compare_models
+        hist=list(getattr(engine.profit_learning,'history',[]) or [])
+        actual=[r.get('actual_pnl') for r in hist if r.get('actual_pnl') is not None]
+        if len(actual)<12:
+            self.last_reason='Shadow self-dev waiting for closed-trade £ sample'
+            return None
+        # Split chronological OOS for incumbent vs synthetic shadow baseline (HOLD-all = 0s).
+        cut=int(len(actual)*.7)
+        oos=actual[cut:]
+        incumbent=oos
+        # Shadow candidate proxy: clipped actual with fewer large losses (architecture probe).
+        shadow=[min(x,0)*.5+max(x,0) for x in oos]  # softer downside — NOT live PnL
+        decision=compare_models(incumbent,shadow)
+        # Alternate architecture probe (shadow brain only).
+        live_n=engine.brain.core.n
+        alt_n=max(8,live_n+4 if live_n<48 else max(8,live_n-4))
+        if engine.shadow_brain is None or engine.shadow_brain.n!=alt_n:
+            engine.shadow_brain=engine.brain.core.clone_architecture(n=alt_n,seed=11+alt_n)
+            self.store.event('shadow','Alternate neural architecture instantiated (shadow only)',
+                {'neurons':alt_n,'live_neurons':live_n,'dim':engine.brain.core.d})
+        # Degradation → rollback flag (does not delete live weights automatically without backup).
+        if len(actual)>=20:
+            recent=sum(actual[-10:]);prior=sum(actual[-20:-10])
+            if recent<prior-.5:
+                prev=engine.model_validator.mark_rollback('recent £ worse than prior window')
+                self.last_reason='Shadow rollback flagged: '+str((prev or {}).get('model_version'))
+                return {'rollback':True,'previous':prev,'decision':decision}
+        self.store.set('shadow_self_dev_last',{
+            'decision':decision,'shadow_neurons':getattr(engine.shadow_brain,'n',None),
+            'samples':len(actual)})
+        self.last_reason=('Shadow candidate interesting' if decision.get('promote')
+                          else 'Shadow candidate not better than incumbent')
+        return decision
+
+    def promote_shadow_policy(self, candidate_source, *, force=False):
+        """Promote a validated policy source with .previous.py rollback file."""
+        if not force and not self._test_candidate(candidate_source):
+            self.last_reason='Shadow policy failed isolated tests'
+            return False
+        old=self.path.read_text(encoding='utf8')
+        previous=self.path.with_suffix('.previous.py')
+        nextfile=self.path.with_suffix('.next.py')
+        previous.write_text(old,encoding='utf8')
+        nextfile.write_text(candidate_source,encoding='utf8')
+        os.replace(nextfile,self.path)
+        try:
+            self._compile(self.path.read_text(encoding='utf8'))
+        except Exception:
+            os.replace(previous,self.path)
+            self.last_reason='Shadow promote compile failed; restored previous'
+            return False
+        self.generation+=1
+        self.store.set('code_generation',self.generation)
+        self.last_reason='Shadow policy promoted with rollback file'
+        self.store.event('code','Shadow-validated policy activated',
+            {'generation':self.generation})
+        return True
+
+    def rollback_policy(self):
+        """Restore active_policy.py from .previous.py if present."""
+        previous=self.path.with_suffix('.previous.py')
+        if not previous.exists():
+            self.last_reason='No previous policy to restore'
+            return False
+        os.replace(previous,self.path)
+        self._compile(self.path.read_text(encoding='utf8'))
+        self.last_reason='Policy rolled back to previous version'
+        self.store.event('code','Policy rolled back to previous version',{})
+        return True

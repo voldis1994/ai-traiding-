@@ -40,9 +40,18 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         assert tied['action']=='BUY' and tied['proposal']=='BUY'
         entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27})
         assert entered['action']=='BUY'
+        # Raw vote still reports CLOSE intent; live exit needs zone + streak.
         assert p.neural_decision(score,current_direction='BUY')=='CLOSE'
         assert p.neural_decision(score,current_direction='SELL')=='HOLD'
         assert p.neural_decision({'BUY':float('nan'),'SELL':.6,'HOLD':.4})=='HOLD'
+        # One opposite M1 without DOWN zone / streak must NOT close a long.
+        assert AutoEvolution.evaluate_neural_exit(
+            score,'BUY',returns_bps={'5':-2,'15':-3},opposite_streak=1)=='HOLD'
+        assert AutoEvolution.evaluate_neural_exit(
+            score,'BUY',returns_bps={'5':-2,'15':-3},opposite_streak=2)=='CLOSE'
+        # Zone disagrees (still green 5m/15m) → hold even with streak.
+        assert AutoEvolution.evaluate_neural_exit(
+            score,'BUY',returns_bps={'5':1,'15':2},opposite_streak=5)=='HOLD'
 
 
 def test_second_manual_deal_changes_lot_and_recovers_after_closed():
@@ -154,9 +163,10 @@ def test_position_exit_decision_not_recomputed_per_quote(monkeypatch):
     from app import engine as module
     clock=[datetime(2026,10,14,17,10,tzinfo=timezone.utc)]
     def context(rows,*,spread=0.,epic=None):
+        # DOWN zone so SELL exit of a BUY can clear the multi-TF gate.
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
                 'bar_time':clock[0].isoformat(),'close':100.,'features':[.02]*FEATURE_DIM,
-                'trend':'MIXED','returns_bps':{'1':0,'5':0,'15':0,'60':0},
+                'trend':'DOWN','returns_bps':{'1':-1,'5':-4,'15':-5,'60':-6},
                 'feature_schema':FEATURE_SCHEMA}
     monkeypatch.setattr(module,'market_features',context)
     async def scenario():
@@ -169,16 +179,23 @@ def test_position_exit_decision_not_recomputed_per_quote(monkeypatch):
             exits=[]
             async def fake_exit(deal_id):exits.append(deal_id)
             e.exit_position=fake_exit
-            await e.poll()  # establish the initial 10-input schema
+            await e.poll()  # establish schema + streak 0
             exits.clear()
             brain.core.b=np.array([-4.,8.,-4.]) # SELL opposes manual BUY
             clock[0]+=timedelta(minutes=1)
             await e.poll()
-            assert exits==['m1']
+            assert exits==[]  # first opposite bar only — zone streak=1, no CLOSE yet
+            clock[0]+=timedelta(minutes=1)
+            await e.poll()
+            assert exits==['m1']  # second confirming bar + DOWN zone → CLOSE
             steps=brain.core.steps
             for _ in range(4):await e.poll()
             assert exits==['m1'] and brain.core.steps==steps
             clock[0]+=timedelta(minutes=1)
             await e.poll()
-            assert exits==['m1','m1'] and brain.core.steps==steps+1
+            # streak reset after close; need two more opposite bars
+            assert exits==['m1']
+            clock[0]+=timedelta(minutes=1)
+            await e.poll()
+            assert exits==['m1','m1'] and brain.core.steps==steps+2
     asyncio.run(scenario())

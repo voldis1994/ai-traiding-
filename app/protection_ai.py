@@ -85,22 +85,25 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
     if sign is None:return None
     entry=_finite(position.get('level'))
     stop=_finite(position.get('stopLevel'))
+    # TP is optional: Capital may show Take Profit Off after a trail PUT that
+    # only updates stopLevel. Trail must still ratchet SL without TP.
     tp=_finite(position.get('profitLevel'))
     tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
     minimum=_finite(market.get('min_distance'))
     gap=_finite(initial.get('original_risk'))
-    if any(v is None for v in (entry,stop,tp,tick,bid,ask,minimum)):
+    if any(v is None for v in (entry,stop,tick,bid,ask,minimum)):
         return None
-    if min(entry,stop,tp,tick,bid,ask)<=0 or minimum<0 or ask<bid:return None
+    positives=(entry,stop,tick,bid,ask)+( (tp,) if tp is not None else () )
+    if min(positives)<=0 or minimum<0 or ask<bid:return None
     if initial.get('owner')!='AUTO':return None
     if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):
         return None
-    if sign*(tp-stop)<=0:return None
+    if tp is not None and sign*(tp-stop)<=0:return None
     # Gap = opening SL distance (broker-confirmed). Floor at dealing min.
     if gap is None or gap<=0:gap=minimum
     gap=max(gap,minimum)
     exit_quote=bid if sign==1 else ask
-    if sign*(tp-exit_quote)<=0:return None  # already at/through TP
+    if tp is not None and sign*(tp-exit_quote)<=0:return None  # already at/through TP
     tip=_finite(extreme)
     if tip is None:
         tip=bid if sign==1 else ask
@@ -116,7 +119,8 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
         desired=min(desired,bid-minimum)
         new_stop=_quantize(desired,tick,up=False)
         new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
-        if new_stop<=stop or new_stop>=tip or sign*(tp-new_stop)<=0:return None
+        if new_stop<=stop or new_stop>=tip:return None
+        if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop<stop+tick-1e-12:return None
     else:
         tip=min(tip,ask)
@@ -125,7 +129,8 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None):
         desired=max(desired,ask+minimum)
         new_stop=_quantize(desired,tick,up=True)
         new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
-        if new_stop>=stop or new_stop<=tip or sign*(tp-new_stop)<=0:return None
+        if new_stop>=stop or new_stop<=tip:return None
+        if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None
     return {'stop_level':new_stop,'profit_level':None,
             'reason':'broker extreme ± opening stop distance (≥ minStop)',

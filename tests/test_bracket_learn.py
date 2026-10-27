@@ -32,15 +32,14 @@ def test_zone_at_open_computes_kappa_from_moves_not_grid():
     assert z['median_up']==3.0 and z['median_down']==1.0
     assert z['kappa']==3.0
     assert z['max_tp'] is not None
-    assert z['lookback'] is not None and z['lookback']>=8
+    assert z['lookback'] is not None and z['lookback']>=3
 
 
-def test_adaptive_lookback_grows_until_range_stable():
+def test_adaptive_lookback_picks_elbow_from_curve():
     from app.math_rules import adaptive_lookback,ohlc_range_distance
-    # Quiet regime then one spike early — lookback should settle once median stable.
     rows=[{'open':100,'high':100.5,'low':99.5,'close':100} for _ in range(40)]
     n=adaptive_lookback(rows)
-    assert 8<=n<=40
+    assert 3<=n<=40
     assert ohlc_range_distance(rows) is not None
 
 

@@ -30,30 +30,49 @@ def _median_decimal(values):
     return (values[mid-1]+values[mid])/2
 
 
-def adaptive_lookback(candles, *, min_bars=8):
-    """How many recent M1 bars to use — decided from the series, not a fixed 20/60.
+def _knee_index(values):
+    """Index of the elbow on a curve — pure geometry, no % threshold.
 
-    Grows the window until the median high−low stabilizes (change <10%) or the
-    available history ends. `min_bars` is only a statistics floor so a median
-    exists, not a trading-policy constant.
+    Maximises distance from each point to the chord between the first and last
+    samples (standard knee/elbow pick on the median-vs-lookback curve).
+    """
+    n=len(values)
+    if n<=1:return 0
+    if n==2:return 1
+    y0=float(values[0]);y1=float(values[-1])
+    best_i=0;best_d=-1.0
+    # Line from (0,y0) to (n-1,y1); distance of (i,yi) to that segment.
+    dx=float(n-1);dy=y1-y0
+    norm=(dx*dx+dy*dy)**0.5
+    if norm<=0:
+        return n-1
+    for i,yi in enumerate(values):
+        # | (yi-y0)*dx - i*dy | / norm   (2D cross-product distance)
+        d=abs((float(yi)-y0)*dx-float(i)*dy)/norm
+        if d>=best_d:
+            best_d=d;best_i=i
+    return best_i
+
+
+def adaptive_lookback(candles):
+    """How many recent M1 bars to use — analysed from the OHLC series itself.
+
+    Builds median(high−low) for every feasible window length, then picks the
+    elbow on that curve. No fixed 20/60 count and no hardcoded 10% stop rule.
+    Needs ≥3 bars only because a median is undefined below that.
     """
     rows=list(candles or [])
     if not rows:return 0
-    if len(rows)<=min_bars:return len(rows)
-    prev=None
-    chosen=min_bars
-    # Step through growing windows; stop when the zone stops shifting.
-    for n in range(min_bars,len(rows)+1):
+    if len(rows)<3:return len(rows)
+    series=[]  # (n, median_span)
+    for n in range(3,len(rows)+1):
         med=_median_decimal(_bar_spans(rows[-n:]))
         if med is None:continue
-        if prev is not None and prev>0:
-            change=abs(med-prev)/prev
-            if change<D('0.10'):
-                chosen=n
-                break
-        prev=med
-        chosen=n
-    return int(chosen)
+        series.append((n,med))
+    if not series:return len(rows)
+    if len(series)==1:return int(series[0][0])
+    knee=_knee_index([m for _,m in series])
+    return int(series[knee][0])
 
 
 def ohlc_range_distance(candles, n=None):

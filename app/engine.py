@@ -1554,10 +1554,10 @@ class SingleTradeEngine:
         self.store.set(key,None)
 
     async def adapt_protection(self,p):
-        """Trail SL behind broker extreme by opening-bracket risk — ROBOT only.
+        """Trail SL behind broker extreme — ROBOT only; continues past BE.
 
-        Gap = original_risk (≥ minStop). Not tip±min (that glued SL to market and
-        scratched Gold for £0). Throttle PUTs; reject → longer backoff.
+        Pre-BE gap = original_risk; after BE lock gap tightens (~35%) so SL keeps
+        following new highs/lows. Never tip±min (£0 Gold scratches).
         """
         key='adaptive_protection:'+str(p['dealId'])
         meta=self.store.get(key)

@@ -6,6 +6,10 @@ Separates:
 
 Does NOT invent volume. Costs = spread (+ slip_bps if provided).
 Persists history across restart via Store.
+
+Loss labels are NOT hardcoded to HOLD. After a loss the supervised target is
+whichever of BUY/SELL/HOLD the post-cost path actually rewarded — the brain
+must discover abstain vs reverse from outcomes, not from a fixed rule.
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from datetime import datetime, timezone
 
 STORE_KEY = 'profit_learning_history_v1'
 _SEED_MAX_ROWS = 400
+_ACTION_LABEL = {'BUY': 0, 'SELL': 1, 'HOLD': 2}
 
 
 def _finite(x):
@@ -50,24 +55,35 @@ def best_action_from_counterfactual(entry, exit_level, *, spread=0., slip_bps=0.
 
 def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                       entry=None, exit_level=None, spread=0., slip_bps=0.):
-    """Map £ outcome → BUY/SELL/HOLD class. Flip-loss → HOLD (no auto-opposite).
+    """Map £ outcome → BUY/SELL/HOLD from the path itself — no forced HOLD-on-loss.
+
+    Wins reinforce the taken side. Losses / flats use post-cost counterfactual
+    (BUY vs SELL vs HOLD≈0). flip_after_loss is audit-only (mode suffix), never
+    overrides the target to HOLD.
 
     Labels: 0=BUY, 1=SELL, 2=HOLD — same as NeuralCore.
+    label=None when there is nothing honest to supervise.
     """
     pnl=_finite(broker_pnl)
-    if flip_after_loss and pnl is not None and pnl<0:
-        return {'label':2,'mode':'chop_hold_after_flip_loss','actual_pnl':pnl,
-                'simulated':None}
+    sim=best_action_from_counterfactual(
+        entry,exit_level,spread=spread,slip_bps=slip_bps)
     if pnl is not None and pnl>0 and direction in ('BUY','SELL'):
-        return {'label':0 if direction=='BUY' else 1,'mode':'reinforce_win',
-                'actual_pnl':pnl,'simulated':None}
+        return {'label':_ACTION_LABEL[direction],'mode':'reinforce_win',
+                'actual_pnl':pnl,'simulated':sim}
     if pnl is not None and pnl<0 and direction in ('BUY','SELL'):
-        # Spec: do NOT automatically train the opposite side after a loss.
-        # Counterfactual is logged for audit; label stays HOLD unless flip path above.
-        sim=best_action_from_counterfactual(entry,exit_level,spread=spread,slip_bps=slip_bps)
-        mode='loss_abstain_hold' if sim and sim['best']=='HOLD' else 'loss_hold_default'
-        return {'label':2,'mode':mode,'actual_pnl':pnl,'simulated':sim}
-    return {'label':2,'mode':'flat_hold','actual_pnl':pnl,'simulated':None}
+        if sim and sim['best'] in _ACTION_LABEL:
+            prefix='flip_loss_counterfactual_' if flip_after_loss else 'loss_counterfactual_'
+            return {'label':_ACTION_LABEL[sim['best']],
+                    'mode':prefix+sim['best'].lower(),
+                    'actual_pnl':pnl,'simulated':sim}
+        return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
+                'simulated':None}
+    # Flat / unknown £ — still prefer path evidence over inventing HOLD.
+    if sim and sim['best'] in _ACTION_LABEL:
+        return {'label':_ACTION_LABEL[sim['best']],
+                'mode':'flat_counterfactual_'+sim['best'].lower(),
+                'actual_pnl':pnl,'simulated':sim}
+    return {'label':None,'mode':'flat_no_signal','actual_pnl':pnl,'simulated':None}
 
 
 class ProfitLearning:

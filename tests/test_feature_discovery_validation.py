@@ -175,14 +175,18 @@ def test_profit_learning_refuses_fake_plus_minus_one():
         assert pl.summary()['actual_net']==pytest.approx(2.5)
 
 
-def test_profit_learning_no_auto_opposite_after_loss():
+def test_profit_learning_loss_follows_counterfactual_not_forced_hold():
+    # Clear down-move after costs → SELL was best; no hardcoded HOLD-on-loss.
     d=label_from_profit('BUY',-1.0,entry=100,exit_level=99,spread=0.1)
-    assert d['label']==2
-    assert d['mode'] in ('loss_hold_default','loss_abstain_hold')
+    assert d['label']==1 and d['mode']=='loss_counterfactual_sell'
+    # Move inside spread → HOLD wins the counterfactual fairly.
+    inside=label_from_profit('BUY',-0.2,entry=100,exit_level=99.95,spread=0.3)
+    assert inside['label']==2 and inside['mode']=='loss_counterfactual_hold'
     win=label_from_profit('SELL',1.5,entry=100,exit_level=99)
     assert win['label']==1 and win['mode']=='reinforce_win'
-    flip=label_from_profit('SELL',-0.5,flip_after_loss=True)
-    assert flip['label']==2 and flip['mode']=='chop_hold_after_flip_loss'
+    # Flip flag is audit-only — still path-driven, never forces HOLD.
+    flip=label_from_profit('SELL',-0.5,flip_after_loss=True,entry=100,exit_level=101,spread=0.1)
+    assert flip['label']==0 and flip['mode']=='flip_loss_counterfactual_buy'
     assert hypothetical_pnl('BUY',100,101,spread=0.2)<1.0
 
 

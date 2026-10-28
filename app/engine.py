@@ -1689,17 +1689,21 @@ class SingleTradeEngine:
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
                 shadow_action=shadow_action,require_broker_pnl=True)
-            label=int(decision['label']);mode=decision['mode']
+            label=decision['label'];mode=decision['mode']
+            if label is not None:label=int(label)
         else:
-            # Tick-direction neural update only — profit_learning not polluted.
-            if flip_after_loss:
-                label,mode=2,'chop_hold_after_flip_loss'
-            elif pnl_sign>0:
+            # Tick path: same rule as £ — wins reinforce side; else counterfactual.
+            from .profit_learning import best_action_from_counterfactual
+            sim=best_action_from_counterfactual(entry,exit_level,spread=spread_cost)
+            if pnl_sign>0 and direction in ('BUY','SELL'):
                 label=0 if direction=='BUY' else 1;mode='reinforce_win_ticks'
-            elif pnl_sign<0:
-                label,mode=2,'loss_hold_ticks'
+            elif sim and sim['best'] in ('BUY','SELL','HOLD'):
+                label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
+                prefix=('flip_loss_counterfactual_' if flip_after_loss
+                        else ('loss_counterfactual_' if pnl_sign<0 else 'flat_counterfactual_'))
+                mode=prefix+sim['best'].lower()+'_ticks'
             else:
-                label,mode=2,'flat_hold'
+                label,mode=None,'ticks_no_counterfactual'
             self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,
                 exit_level=exit_level,broker_pnl=None,
@@ -1709,18 +1713,19 @@ class SingleTradeEngine:
                 shadow_action=shadow_action,require_broker_pnl=True)
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
-        if mode in ('reinforce_win','reinforce_win_ticks'):
+        if label is None:
+            repeats=0
+        elif mode in ('reinforce_win','reinforce_win_ticks'):
             repeats=int(sp['learn_win_repeats'])
-        elif mode in ('flat_hold',):
+        elif 'flat_counterfactual' in str(mode) or mode in ('flat_hold',):
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
-        # Penny scratches (loss but |£|≤0.05) must NOT spam HOLD into the core.
-        # Same cash band as entry_scratch_cooldown. Real losses still train HOLD hard.
-        # Exact £0 / flat broker rows keep the light flat_hold path (1 repeat) —
+        # Penny-loss closes must not spam any class into the core (HOLD trap).
+        # Exact £0 / flat broker rows still use the light counterfactual path —
         # Capital often snapshots UPL=0 at close while ticks still moved.
         scratch_hold=False
-        if label==2 and pnl_value is not None:
+        if pnl_value is not None:
             try:
                 cash=float(pnl_value)
                 scratch_hold=(-0.05<=cash<0.)

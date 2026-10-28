@@ -171,12 +171,12 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         store.upsert_trade({'dealId':'loss1','epic':'GOLD','size':'1','direction':'BUY','level':100})
         store.set('entry_brain:loss1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
-        # BUY that exited lower → loss → HOLD (no automatic opposite), stronger repeats.
+        # BUY that exited lower → loss → counterfactual SELL (path evidence, not forced HOLD).
         engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
-        assert detail['mode'] in ('loss_hold_default','loss_abstain_hold')
-        assert detail['target']==2
+        assert detail['mode']=='loss_counterfactual_sell'
+        assert detail['target']==1
         assert detail['learn_repeats']==5
         assert detail['scratch_hold_skip'] is False
         assert detail['broker_pnl']==-12.5
@@ -187,7 +187,7 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
 
 
 def test_scratch_loss_does_not_spam_hold_into_core():
-    """Penny-loss closes used to train HOLD × learn_loss_repeats → permanent HOLD."""
+    """Penny-loss closes must not train any class into the core (HOLD trap)."""
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
         brain.tick(100,.05,.01,'GOLD')
@@ -201,7 +201,6 @@ def test_scratch_loss_does_not_spam_hold_into_core():
         engine._learn_closed_trade('scratch1',{'level':100.0,'profit':-0.02})
         last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
         detail=json.loads(last['details'])
-        assert detail['target']==2
         assert detail['learn_repeats']==0
         assert detail['scratch_hold_skip'] is True
         assert detail['mode'].endswith('_scratch_skip')

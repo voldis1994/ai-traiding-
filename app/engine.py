@@ -1470,6 +1470,17 @@ class SingleTradeEngine:
         cur=(active.get('currency') or '').strip().upper()
         return cur or None
 
+    def _cash_pnl_currency(self,hint=None):
+        """Label broker cash with the *account* currency, never GOLD's USD quote.
+
+        Capital position/activity rows often carry instrument currency=USD while
+        upl/profit are already converted to the account (GBP). Trusting that USD
+        tag made the admin trade list show dollars on GBP accounts.
+        """
+        acct=self._account_currency()
+        if acct:return acct
+        return (hint or '').strip().upper() or None
+
     def _realized_trade_pnl(self,deal_id,entry,exit_level,direction,broker_pnl=None,currency=None):
         """Prefer broker cash P&L in account currency. Never invent price×size cash.
 
@@ -1478,8 +1489,7 @@ class SingleTradeEngine:
         and must not be stored as money.
         """
         if broker_pnl is not None and math.isfinite(broker_pnl):
-            ccy=(currency or self._account_currency() or '').strip().upper() or None
-            return float(broker_pnl),'broker',ccy
+            return float(broker_pnl),'broker',self._cash_pnl_currency(currency)
         return None,'ticks_only',None
 
     def _note_scratch_close(self,pnl_value,deal_id=None):
@@ -1502,7 +1512,8 @@ class SingleTradeEngine:
         deal_id=position.get('dealId')
         upl=_num(position.get('upl'))
         if not deal_id or upl is None or not math.isfinite(upl):return
-        ccy=(position.get('currency') or self._account_currency() or '').strip().upper() or None
+        # Ignore position.currency (often GOLD USD quote) — UPL is account cash.
+        ccy=self._cash_pnl_currency(position.get('currency'))
         self.store.set('last_upl:'+str(deal_id),{
             'upl':float(upl),'currency':ccy,'at':now(),
             'exit_hint':_num(position.get('level')) or _num((self.market or {}).get('mid'))})
@@ -1522,7 +1533,7 @@ class SingleTradeEngine:
                         val=_num(details.get(key) if details else None)
                         if val is None:val=_num(row.get(key))
                         if val is not None and math.isfinite(val):
-                            return float(val),(row.get('currency') or self._account_currency())
+                            return float(val),self._cash_pnl_currency(row.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
@@ -1535,7 +1546,7 @@ class SingleTradeEngine:
                     val=_num(row.get('pnl'))
                     if val is None:val=_num(row.get('cash'))
                     if val is not None and math.isfinite(val):
-                        return float(val),(row.get('currency') or self._account_currency())
+                        return float(val),self._cash_pnl_currency(row.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Transaction history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
@@ -1547,7 +1558,7 @@ class SingleTradeEngine:
         Order: confirm.profit → history/activity → last live UPL snapshot.
         """
         confirmation=confirmation or {}
-        ccy=self._account_currency()
+        ccy=self._cash_pnl_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
         for key in ('profit','pnl'):
             val=_num(confirmation.get(key))
             if val is not None and math.isfinite(val):
@@ -1558,12 +1569,12 @@ class SingleTradeEngine:
             await asyncio.sleep(.8)
             found=await self._pnl_from_broker_history(deal_id)
         if found:
-            pnl,hist_ccy=found
-            return pnl,'broker',hist_ccy or ccy
+            pnl,_hist_ccy=found
+            return pnl,'broker',ccy or _hist_ccy
         snap=self.store.get('last_upl:'+str(deal_id)) or {}
         upl=_num(snap.get('upl'))
         if upl is not None and math.isfinite(upl):
-            return float(upl),'broker',snap.get('currency') or ccy
+            return float(upl),'broker',ccy or self._cash_pnl_currency(snap.get('currency'))
         return None,'ticks_only',None
 
     def _learn_closed_trade(self,deal_id,confirmation):
@@ -1579,7 +1590,8 @@ class SingleTradeEngine:
         exit_level=_num(confirmation.get('level'))
         broker_pnl=_num(confirmation.get('profit'))
         if broker_pnl is None:broker_pnl=_num(confirmation.get('pnl'))
-        hint_ccy=(confirmation.get('pnl_currency') or confirmation.get('currency') or '').strip().upper() or None
+        hint_ccy=self._cash_pnl_currency(
+            confirmation.get('pnl_currency') or confirmation.get('currency'))
         # Allow overwrite when we finally have broker cash after a vanish guess.
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         # Even without a saved neural entry state, still record broker cash P&L.
@@ -1593,7 +1605,7 @@ class SingleTradeEngine:
                                        source=pnl_source,overwrite=overwrite)
                 if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
             elif exit_level is not None or broker_pnl is not None:
-                currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
+                currency=hint_ccy if broker_pnl is not None else None
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)

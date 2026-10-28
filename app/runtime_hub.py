@@ -88,18 +88,35 @@ class RuntimeHub:
         trades=store.trades(200)
         closed=[t for t in trades if t.get('closed')]
         open_rows=[t for t in trades if not t.get('closed')]
+        account_currency=(account_currency or '').strip().upper() or None
         # Only sum broker cash rows. price_size / ticks_only are not account money.
         by_ccy: dict[str,list[float]]={}
         signed=[]
+        recent=[]
         for t in closed:
-            if t.get('pnl') is None:continue
-            src=(t.get('pnl_source') or '').strip().lower()
-            # Skip non-cash proxies (GOLD price×size looked like USD vs GBP UPL).
+            row=dict(t)
+            src=(row.get('pnl_source') or '').strip().lower()
+            # Broker cash is always account currency; older rows may still say USD
+            # because GOLD position.currency was wrongly persisted as the label.
+            if (account_currency and row.get('pnl') is not None and
+                src not in ('ticks_only','price_size','pending_close_sync','position_disappeared')):
+                stored=(row.get('pnl_currency') or '').strip().upper()
+                if stored!=account_currency:
+                    row['pnl_currency']=account_currency
+                    if stored and row.get('deal_id'):
+                        try:
+                            store.close_trade(row['deal_id'],row.get('exit'),row.get('pnl'),
+                                              currency=account_currency,source=src or 'broker',
+                                              overwrite=True)
+                        except Exception:
+                            pass
+            recent.append(row)
+            if row.get('pnl') is None:continue
             if src in ('ticks_only','price_size','pending_close_sync','position_disappeared'):
                 continue
-            try:val=float(t['pnl'])
+            try:val=float(row['pnl'])
             except (TypeError,ValueError):continue
-            ccy=(t.get('pnl_currency') or account_currency or '?').upper()
+            ccy=(row.get('pnl_currency') or account_currency or '?').upper()
             by_ccy.setdefault(ccy,[]).append(val)
             signed.append(val)
         wins=sum(1 for p in signed if p>0)
@@ -121,7 +138,7 @@ class RuntimeHub:
             'wins':wins,
             'losses':losses,
             'win_rate':round(wins/max(1,wins+losses),3),
-            'recent_trades':closed[:12],
+            'recent_trades':recent[:12],
         }
 
     def admin_client_card(self,client: dict) -> dict:
@@ -175,7 +192,8 @@ class RuntimeHub:
                 'armed':bool(view.get('armed')),
                 'scores':view.get('scores') or card['scores'],
                 'action':view.get('action'),
-                'account_currency':account_currency or (pos.get('currency') or None),
+                # Never fall back to position.currency (GOLD quote USD ≠ account cash).
+                'account_currency':account_currency,
                 'evolution':{
                     'generation':int(evo.get('generation') or policy_info.get('generation') or 0),
                     'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),

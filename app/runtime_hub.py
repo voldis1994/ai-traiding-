@@ -85,12 +85,18 @@ class RuntimeHub:
         return list(self._runtimes.values())
 
     def _trade_stats(self,store: Store, account_currency: str|None=None) -> dict:
+        acct=(account_currency or '').strip().upper() or None
+        # Fix historical GOLD→USD tags so admin P&L matches Capital account cash.
+        if acct:
+            try:store.repair_broker_pnl_currency(acct)
+            except Exception:pass
         trades=store.trades(200)
         closed=[t for t in trades if t.get('closed')]
         open_rows=[t for t in trades if not t.get('closed')]
         # Only sum broker cash rows. price_size / ticks_only are not account money.
         by_ccy: dict[str,list[float]]={}
         signed=[]
+        recent=[]
         for t in closed:
             if t.get('pnl') is None:continue
             src=(t.get('pnl_source') or '').strip().lower()
@@ -99,9 +105,19 @@ class RuntimeHub:
                 continue
             try:val=float(t['pnl'])
             except (TypeError,ValueError):continue
-            ccy=(t.get('pnl_currency') or account_currency or '?').upper()
+            raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
+            # Broker-settled cash is always account currency — remapping display
+            # when Capital tagged the instrument quote (GOLD=USD) on cash rows.
+            if src=='broker' and acct:
+                ccy=acct
+            else:
+                ccy=raw_ccy or acct or '?'
+            row={**t,'pnl_currency':ccy}
             by_ccy.setdefault(ccy,[]).append(val)
-            signed.append(val)
+            # W/L next to account P&L must not mix other currency buckets.
+            if not acct or ccy==acct:
+                signed.append(val)
+            recent.append(row)
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         # Prefer a single currency total; if mixed, keep map and avoid one fake sum.
@@ -109,19 +125,19 @@ class RuntimeHub:
         if len(by_ccy)==1:
             ccy,vals=next(iter(by_ccy.items()))
             primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
-        elif account_currency and account_currency in by_ccy:
-            primary={'currency':account_currency,
-                     'realized_pnl':round(sum(by_ccy[account_currency]),4)}
+        elif acct and acct in by_ccy:
+            primary={'currency':acct,
+                     'realized_pnl':round(sum(by_ccy[acct]),4)}
         return {
             'closed_trades':len(closed),
             'open_trades_recorded':len(open_rows),
             'realized_pnl':primary['realized_pnl'] if primary else 0.0,
-            'pnl_currency':primary['currency'] if primary else (account_currency or None),
+            'pnl_currency':primary['currency'] if primary else acct,
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
             'win_rate':round(wins/max(1,wins+losses),3),
-            'recent_trades':closed[:12],
+            'recent_trades':recent[:12],
         }
 
     def admin_client_card(self,client: dict) -> dict:

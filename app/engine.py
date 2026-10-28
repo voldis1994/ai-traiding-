@@ -1689,17 +1689,21 @@ class SingleTradeEngine:
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
                 shadow_action=shadow_action,require_broker_pnl=True)
-            label=int(decision['label']);mode=decision['mode']
+            label=decision['label'];mode=decision['mode']
+            if label is not None:label=int(label)
         else:
-            # Tick-direction neural update only — profit_learning not polluted.
-            if flip_after_loss:
-                label,mode=2,'chop_hold_after_flip_loss'
-            elif pnl_sign>0:
+            # Tick path: same rule as £ — wins reinforce side; else counterfactual.
+            from .profit_learning import best_action_from_counterfactual
+            sim=best_action_from_counterfactual(entry,exit_level,spread=spread_cost)
+            if pnl_sign>0 and direction in ('BUY','SELL'):
                 label=0 if direction=='BUY' else 1;mode='reinforce_win_ticks'
-            elif pnl_sign<0:
-                label,mode=2,'loss_hold_ticks'
+            elif sim and sim['best'] in ('BUY','SELL','HOLD'):
+                label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
+                prefix=('flip_loss_counterfactual_' if flip_after_loss
+                        else ('loss_counterfactual_' if pnl_sign<0 else 'flat_counterfactual_'))
+                mode=prefix+sim['best'].lower()+'_ticks'
             else:
-                label,mode=2,'flat_hold'
+                label,mode=None,'ticks_no_counterfactual'
             self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,
                 exit_level=exit_level,broker_pnl=None,
@@ -1709,12 +1713,27 @@ class SingleTradeEngine:
                 shadow_action=shadow_action,require_broker_pnl=True)
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
-        if mode in ('reinforce_win','reinforce_win_ticks'):
+        if label is None:
+            repeats=0
+        elif mode in ('reinforce_win','reinforce_win_ticks'):
             repeats=int(sp['learn_win_repeats'])
-        elif mode in ('flat_hold',):
+        elif 'flat_counterfactual' in str(mode) or mode in ('flat_hold',):
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
+        # Penny-loss closes must not spam any class into the core (HOLD trap).
+        # Exact £0 / flat broker rows still use the light counterfactual path —
+        # Capital often snapshots UPL=0 at close while ticks still moved.
+        scratch_hold=False
+        if pnl_value is not None:
+            try:
+                cash=float(pnl_value)
+                scratch_hold=(-0.05<=cash<0.)
+            except (TypeError,ValueError):
+                scratch_hold=False
+        if scratch_hold:
+            repeats=0
+            mode=str(mode)+'_scratch_skip'
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
@@ -1722,13 +1741,14 @@ class SingleTradeEngine:
             step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
             if step_loss is not None:losses.append(step_loss)
         # Independent shadow core trains on the same delayed label (side-by-side).
-        self._shadow_learn(transition,label,lr=learn_lr)
+        if repeats>0:
+            self._shadow_learn(transition,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
             # Queue evidence only — commit when long-horizon £ proves improvement.
             evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
             from .self_params import maybe_commit_long_horizon
             maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
-        if transition.get('h') is not None and transition.get('c') is not None:
+        if repeats>0 and transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
         self.brain.labeled+=1
@@ -1749,7 +1769,7 @@ class SingleTradeEngine:
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
             self._note_scratch_close(pnl_value,deal_id)
-        if self.brain.core.last_z is not None:
+        if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
@@ -1760,13 +1780,14 @@ class SingleTradeEngine:
              'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
              'broker_pnl':broker_pnl,
              'realized_directional_ticks':realized_ticks,'target':label,
-             'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
+             'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+             'last_loss':losses[-1] if losses else None,
              'tick_size':tick,
              'bracket':bracket_learn.load_params(self.store)})
         try:
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),
-                               force=True,loss_trade=(pnl_sign<0))
+                               force=True,loss_trade=(pnl_sign<0 and not scratch_hold))
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

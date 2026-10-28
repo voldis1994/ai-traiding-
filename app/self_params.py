@@ -249,11 +249,18 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
     if broker_pnl is not None:
         pnl=_finite(broker_pnl)
         if pnl is not None:
-            if pnl<0:
+            # Scratch / penny closes (|£|≤0.05) must not ratchet HOLD repeats —
+            # that was the permanent-HOLD trap after a streak of £0 exits.
+            if pnl<0 and abs(pnl)>0.05:
                 p['learn_lr']=min(BOUNDS['learn_lr'][1],float(p['learn_lr'])*1.05)
-                p['learn_loss_repeats']=min(BOUNDS['learn_loss_repeats'][1],
-                    int(p['learn_loss_repeats'])+1)
-                notes.append('loss → slightly stronger learn step')
+                # Cap vs win path so losses cannot forever outvote BUY/SELL.
+                win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
+                cap=min(BOUNDS['learn_loss_repeats'][1],win_r+2)
+                cur=int(p['learn_loss_repeats'])
+                p['learn_loss_repeats']=min(cap,cur+1 if cur<cap else cur)
+                notes.append('meaningful loss → slightly stronger learn step')
+            elif pnl<0:
+                notes.append('scratch loss — no HOLD-repeat ratchet')
             elif pnl>0:
                 p['learn_lr']=max(BOUNDS['learn_lr'][0],float(p['learn_lr'])*0.98)
                 notes.append('win → calm LR')

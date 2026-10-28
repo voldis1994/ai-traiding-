@@ -37,6 +37,19 @@ def test_evolve_from_feedback_moves_knobs():
         assert load(store)['val_horizon_bars']>=DEFAULTS['val_horizon_bars']
 
 
+def test_scratch_loss_does_not_ratchet_hold_repeats():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load(store)['learn_loss_repeats']
+        evolve_from_feedback(store,broker_pnl=-0.02)
+        assert load(store)['learn_loss_repeats']==before
+        evolve_from_feedback(store,broker_pnl=-1.5)
+        after=load(store)['learn_loss_repeats']
+        win=load(store)['learn_win_repeats']
+        assert after<=win+2
+        assert after<=before  # default 5 was already above win+2 cap → soft pull-down
+
+
 def test_evolve_commit_false_activates_trial():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')

@@ -16,7 +16,7 @@ NEURAL_DT_SECONDS = 60
 DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight steps
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions
 # Closed-trade P&L regret is the primary corrective teacher (engine._learn_closed_trade).
-PRIMARY_FEEDBACK = 'closed_trade_pnl_regret_or_chop_hold'
+PRIMARY_FEEDBACK = 'closed_trade_pnl_counterfactual_buy_sell_hold'
 FEATURE_SCHEMAS = {
     'ohlc_v3': {'schema': FEATURE_SCHEMA, 'dim': FEATURE_DIM},
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},

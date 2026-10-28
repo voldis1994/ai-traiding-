@@ -749,6 +749,8 @@ class AutoEvolution:
         self.last_reason='Candidate promoted after isolated tests'
         self.store.set('evolution_last_reason',self.last_reason)
         self.store.set('code_generation',self.generation);self.store.set('policy_kind',kind)
+        from .learning_generation import bump as bump_generation
+        bump_generation(self.store,'policy_code_promoted')
         digest=hashlib.sha256(source.encode()).hexdigest()
         self.store.event('code','Python policy automatically generated, tested and activated',
             {'generation':self.generation,'type':kind,'required_edge':val,'hash':digest,
@@ -907,6 +909,8 @@ class AutoEvolution:
             return False
         self.generation+=1
         self.store.set('code_generation',self.generation)
+        from .learning_generation import bump as bump_generation
+        bump_generation(self.store,'shadow_policy_promoted')
         self.last_reason='Shadow policy promoted with rollback file'
         self.store.event('code','Shadow-validated policy activated',
             {'generation':self.generation})

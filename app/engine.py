@@ -1715,12 +1715,17 @@ class SingleTradeEngine:
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
-        # Penny / £0 scratches must NOT spam HOLD into the core (HOLD trap).
+        # Penny scratches (loss but |£|≤0.05) must NOT spam HOLD into the core.
         # Same cash band as entry_scratch_cooldown. Real losses still train HOLD hard.
+        # Exact £0 / flat broker rows keep the light flat_hold path (1 repeat) —
+        # Capital often snapshots UPL=0 at close while ticks still moved.
         scratch_hold=False
         if label==2 and pnl_value is not None:
-            try:scratch_hold=abs(float(pnl_value))<=0.05
-            except (TypeError,ValueError):scratch_hold=False
+            try:
+                cash=float(pnl_value)
+                scratch_hold=(-0.05<=cash<0.)
+            except (TypeError,ValueError):
+                scratch_hold=False
         if scratch_hold:
             repeats=0
             mode=str(mode)+'_scratch_skip'

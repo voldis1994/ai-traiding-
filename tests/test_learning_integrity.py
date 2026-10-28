@@ -187,7 +187,7 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
 
 
 def test_scratch_loss_does_not_spam_hold_into_core():
-    """£0 / penny closes used to train HOLD × learn_loss_repeats → permanent HOLD."""
+    """Penny-loss closes used to train HOLD × learn_loss_repeats → permanent HOLD."""
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
         brain.tick(100,.05,.01,'GOLD')

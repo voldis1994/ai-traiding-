@@ -121,13 +121,24 @@ class ModelValidator:
         if len(self.stack)<2:return None
         return self.stack[-2]
 
-    def mark_rollback(self, reason, *, restore_fn=None):
+    def rollback_target(self):
+        """Snapshot to restore: prior head if stack≥2, else sole baseline with weights."""
+        if len(self.stack)>=2:
+            return self.stack[-2]
+        if len(self.stack)==1:
+            sole=self.stack[0]
+            if sole.get('weights_path') or sole.get('approved_specs') is not None:
+                return sole
+        return None
+
+    def mark_rollback(self, reason, *, restore_fn=None, target=None):
         """Flag rollback and restore neural weights + feature registry snapshot.
 
         restore_fn(version_meta) → bool should reload AdaptiveBrain weights and
-        FeatureRegistry approved specs from the previous stack entry.
+        FeatureRegistry approved specs. `target` overrides previous_version()
+        (used when only a sole baseline snapshot exists).
         """
-        prev=self.previous_version()
+        prev=target if target is not None else self.previous_version()
         restored=False
         weights_path=None
         registry_restored=False

@@ -376,5 +376,7 @@ def maybe_commit_long_horizon(store, broker_pnls):
     store.event('self_params','Self-params committed after trial £ proof',
         {'events_applied':n_events,'trial_net':trial_net,'prior_net':prior_net,
          'horizon':need,'trial_started_at_trades':start})
+    from .learning_generation import bump as bump_generation
+    bump_generation(store,'self_params_trial_committed')
     return {'committed':True,'trial_net':trial_net,'prior_net':prior_net,
             'events_applied':n_events}

@@ -28,6 +28,7 @@ from .feature_discovery import FeatureDiscovery
 from .feature_validation import FeatureValidator
 from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
+from . import learning_generation
 
 DB=DATA/'robot.sqlite3'
 
@@ -1768,6 +1769,7 @@ class SingleTradeEngine:
             promoted=bracket_learn.evolve_from_history(self.store)
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
+                learning_generation.bump(self.store,'bracket_shape_promoted')
             self._note_scratch_close(pnl_value,deal_id)
         if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
@@ -2053,7 +2055,12 @@ class SingleTradeEngine:
                 'account':{'accountId':active.get('accountId'),'currency':active.get('currency'),
                            'balance':active.get('balance',{})},'error':self.last_error,
                 'pending_order':self.pending_order,'pending_close':self.pending_close,
-                'unresolved_orders':self.store.unresolved(),'code_generation':self.policy.generation,
+                'unresolved_orders':self.store.unresolved(),
+                # Paaudze = real brain advances (features/weights/brackets/params),
+                # not only shadow Python policy file swaps (LIVE uses neural vote).
+                'code_generation':learning_generation.display(self.store,self.policy.generation),
+                'learning_generation':learning_generation.current(self.store),
+                'policy_generation':self.policy.generation,
                 'position_age':self.position_age,'last_order_reference':self.last_order_ref,
                 'tick_count':self.tick_count,
                 'policy_decision':decision,
@@ -2200,6 +2207,7 @@ class SingleTradeEngine:
                 'weights_path':pre_path})
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
+            learning_generation.bump(self.store,'feature_registry_expanded')
             # Keep shadow dim aligned (insert dynamic before external if on fusion).
             if self.shadow_brain is not None and self.shadow_brain.d!=self.brain.core.d:
                 insert=old_ohlc if self.brain.feature_schema==self.brain.fusion_schema else None

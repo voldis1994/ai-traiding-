@@ -55,7 +55,9 @@ class AccountRuntime:
             'action':signal.get('action'),
             'confidence':signal.get('confidence'),
             'evolution':{
-                'generation':int(code.get('generation') or snap.get('code_generation') or 0),
+                'generation':int(snap.get('code_generation') or code.get('generation') or 0),
+                'learning_generation':int(snap.get('learning_generation') or 0),
+                'policy_generation':int(snap.get('policy_generation') or code.get('generation') or 0),
                 'strategy':code.get('strategy'),
                 'attempts':int(code.get('attempts') or 0),
                 'last_reason':code.get('last_reason'),
@@ -193,7 +195,13 @@ class RuntimeHub:
                 'action':view.get('action'),
                 'account_currency':account_currency or (pos.get('currency') or None),
                 'evolution':{
-                    'generation':int(evo.get('generation') or policy_info.get('generation') or 0),
+                    'generation':int(evo.get('generation') or snap.get('code_generation')
+                                     or policy_info.get('generation') or 0),
+                    'learning_generation':int(evo.get('learning_generation')
+                                             or snap.get('learning_generation') or 0),
+                    'policy_generation':int(evo.get('policy_generation')
+                                           or snap.get('policy_generation')
+                                           or policy_info.get('generation') or 0),
                     'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),
                     'neurons':neural.get('neurons'),
                     'steps':int(neural.get('steps') or 0),

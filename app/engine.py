@@ -1715,6 +1715,15 @@ class SingleTradeEngine:
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
+        # Penny / £0 scratches must NOT spam HOLD into the core (HOLD trap).
+        # Same cash band as entry_scratch_cooldown. Real losses still train HOLD hard.
+        scratch_hold=False
+        if label==2 and pnl_value is not None:
+            try:scratch_hold=abs(float(pnl_value))<=0.05
+            except (TypeError,ValueError):scratch_hold=False
+        if scratch_hold:
+            repeats=0
+            mode=str(mode)+'_scratch_skip'
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
@@ -1722,13 +1731,14 @@ class SingleTradeEngine:
             step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
             if step_loss is not None:losses.append(step_loss)
         # Independent shadow core trains on the same delayed label (side-by-side).
-        self._shadow_learn(transition,label,lr=learn_lr)
+        if repeats>0:
+            self._shadow_learn(transition,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
             # Queue evidence only — commit when long-horizon £ proves improvement.
             evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
             from .self_params import maybe_commit_long_horizon
             maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
-        if transition.get('h') is not None and transition.get('c') is not None:
+        if repeats>0 and transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
         self.brain.labeled+=1
@@ -1749,7 +1759,7 @@ class SingleTradeEngine:
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
             self._note_scratch_close(pnl_value,deal_id)
-        if self.brain.core.last_z is not None:
+        if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
@@ -1760,13 +1770,14 @@ class SingleTradeEngine:
              'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
              'broker_pnl':broker_pnl,
              'realized_directional_ticks':realized_ticks,'target':label,
-             'learn_repeats':repeats,'last_loss':losses[-1] if losses else None,
+             'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+             'last_loss':losses[-1] if losses else None,
              'tick_size':tick,
              'bracket':bracket_learn.load_params(self.store)})
         try:
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),
-                               force=True,loss_trade=(pnl_sign<0))
+                               force=True,loss_trade=(pnl_sign<0 and not scratch_hold))
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

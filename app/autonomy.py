@@ -760,6 +760,33 @@ class AutoEvolution:
                 'sha256':hashlib.sha256(source.encode()).hexdigest(),
                 'attempts':self.attempts,'last_reason':self.last_reason}
 
+    def _ensure_model_baseline(self, engine):
+        """Push one weight+registry snapshot if the stack is empty."""
+        mv=getattr(engine,'model_validator',None)
+        brain=getattr(engine,'brain',None)
+        if mv is None or brain is None:return None
+        if mv.stack:return mv.stack[-1]
+        path=None
+        if hasattr(brain,'backup_weights'):
+            try:path=brain.backup_weights(tag='baseline')
+            except Exception:path=None
+        specs=[]
+        reg=getattr(engine,'feature_registry',None)
+        if reg is not None:
+            specs=[dict(x) for x in (reg.approved or [])]
+        meta={
+            'model_version':int(getattr(brain,'model_version',0) or 0),
+            'feature_schema':getattr(brain,'feature_schema',None),
+            'ohlc_dim':getattr(brain,'ohlc_dim',None),
+            'fusion_dim':getattr(brain,'fusion_dim',None),
+            'approved':list(reg.approved_ids()) if reg is not None else [],
+            'approved_specs':specs,
+            'weights_path':path,
+            'note':'baseline seed',
+        }
+        mv.push_version(meta)
+        return meta
+
     def shadow_self_dev_tick(self, engine):
         """Side-by-side shadow NeuralCore vs live using *cash-comparable* paper £.
 
@@ -770,6 +797,8 @@ class AutoEvolution:
         from .self_params import (load as load_params, evolve_from_feedback,
                                   maybe_commit_long_horizon)
         engine._ensure_shadow_brain()
+        # Seed a baseline weight snapshot early so later rollbacks have a target.
+        self._ensure_model_baseline(engine)
         cfg=load_params(self.store)
         min_trades=int(cfg['shadow_min_broker_trades'])
         win=int(cfg['shadow_rollback_window'])
@@ -798,14 +827,24 @@ class AutoEvolution:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])
             if recent<prior-delta:
+                # Need a distinct prior snapshot — not the head we just seeded.
+                if engine.model_validator.previous_version() is None:
+                    self.last_reason=('Shadow wants rollback (recent £ worse); '
+                                      'waiting for a prior weight snapshot')
+                    return {'rollback':False,'reason':'no_prior_snapshot',
+                            'decision':decision}
                 restore=getattr(engine,'restore_neural_weights',None)
                 prev=engine.model_validator.mark_rollback(
                     'recent broker £ worse than prior window',
                     restore_fn=restore)
                 restored=bool(prev and prev.get('weights_restored'))
-                self.last_reason=('Shadow rollback '+
-                    ('restored weights+registry v' if restored else 'flagged v')+
-                    str((prev or {}).get('model_version')))
+                ver=prev.get('model_version') if prev else None
+                if restored:
+                    self.last_reason=f'Shadow rollback restored weights+registry v{ver}'
+                elif ver is not None:
+                    self.last_reason=f'Shadow rollback failed for v{ver}'
+                else:
+                    self.last_reason='Shadow rollback failed (snapshot incomplete)'
                 return {'rollback':True,'previous':prev,'decision':decision,
                         'weights_restored':restored,
                         'registry_restored':bool(prev and prev.get('registry_restored'))}

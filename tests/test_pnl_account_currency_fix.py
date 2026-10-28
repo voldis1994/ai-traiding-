@@ -93,12 +93,14 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
         assert 'USD' not in (stats.get('pnl_by_currency') or {})
 
 
-def test_shadow_rollback_without_prior_snapshot_not_vnone():
+def test_shadow_rollback_restores_when_recent_pound_worse():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
+        brain.tick(100,.05,.01,'GOLD')
         e=SingleTradeEngine(store,brain)
-        # Fill enough broker £ that recent window looks worse — but only one
-        # baseline on the stack after ensure, so previous_version is None.
+        # Mark weights so restore has a real file.
+        brain.core.P[:]+=0.25
+        brain.save()
         for i in range(30):
             e.profit_learning.history.append({
                 'actual_pnl':0.5 if i<15 else -0.4,
@@ -113,7 +115,31 @@ def test_shadow_rollback_without_prior_snapshot_not_vnone():
         out=e.policy.shadow_self_dev_tick(e)
         reason=e.policy.last_reason or ''
         assert 'vNone' not in reason
-        if out and out.get('rollback'):
-            assert out.get('previous',{}).get('model_version') is not None
-        else:
-            assert 'snapshot' in reason.lower() or 'waiting' in reason.lower() or out is not None
+        assert 'waiting for a prior weight snapshot' not in reason.lower()
+        # Checkpoint + rollback target (baseline or prior) must exist now.
+        assert len(e.model_validator.stack)>=1
+        assert e.model_validator.rollback_target() is not None
+        # Recent £ worse → rollback attempted (restored or seeded, never stuck).
+        assert out is not None
+        if out.get('rollback'):
+            assert out.get('weights_restored') is True
+            assert 'restored' in reason.lower()
+
+
+def test_weight_checkpoint_every_rollback_window():
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        brain.tick(100,.05,.01,'GOLD')
+        e=SingleTradeEngine(store,brain)
+        e.policy=AutoEvolution(store,Path(d)/'policy.py')
+        e.policy._ensure_model_baseline(e)
+        assert len(e.model_validator.stack)==1
+        # First window of trades → second snapshot.
+        e.policy._maybe_checkpoint_weights(e,n_trades=10,win=10)
+        assert len(e.model_validator.stack)==2
+        assert e.model_validator.previous_version() is not None
+        # Same window again → no duplicate.
+        e.policy._maybe_checkpoint_weights(e,n_trades=10,win=10)
+        assert len(e.model_validator.stack)==2
+        e.policy._maybe_checkpoint_weights(e,n_trades=20,win=10)
+        assert len(e.model_validator.stack)==3

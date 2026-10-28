@@ -1451,18 +1451,13 @@ class SingleTradeEngine:
             # deal for a NEW manual mandate.
             self.store.set('robot_open:'+str(p['dealId']),True)
             self.store.set('latest_robot_deal_id',p['dealId'])
-            entry=_num(p.get('level'));stop=_num(p.get('stopLevel'));tp=_num(p.get('profitLevel'))
-            sign=1 if p['direction']=='BUY' else -1
-            if all(v is not None for v in (entry,stop,tp)) and sign*(entry-stop)>0 and sign*(tp-entry)>0:
-                self.store.set('adaptive_protection:'+str(p['dealId']),{
-                    'owner':'AUTO','deal_id':p['dealId'],'epic':p['epic'],
-                    'original_risk':abs(entry-stop),'original_profit':abs(tp-entry),
-                    'opened':now()})
-                self.store.event('protection','Robot-opened position enrolled in adaptive SL/TP',
-                                 {'deal_id':p['dealId'],'initial_risk':abs(entry-stop),'initial_profit':abs(tp-entry)})
-            else:
-                self.store.event('warning','Adaptive protection unavailable: opening bracket missing or invalid',
-                                 {'deal_id':p['dealId']})
+            # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
+            self._enroll_adaptive_protection(p,force=True)
+        if kind=='PROTECT' and self.positions:
+            p=self.positions[0]
+            if p.get('dealId')==deal_id and self.store.get('robot_open:'+str(deal_id)):
+                # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
+                self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
             # Confirm often omits profit on CLOSE; fill from history/UPL before learn.
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
@@ -1777,6 +1772,42 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set(key,None)
 
+    def _enroll_adaptive_protection(self,p,*,force=False):
+        """Register robot deal for broker trail. Needs entry+SL; TP optional.
+
+        Capital often confirms OPEN with stopLevel set and Take Profit Off —
+        requiring TP here used to skip enrollment entirely, so trail never ran.
+        """
+        deal_id=p.get('dealId')
+        if not deal_id:return False
+        key='adaptive_protection:'+str(deal_id)
+        existing=self.store.get(key)
+        if existing and existing.get('owner')=='AUTO' and not force:
+            # Refresh missing original_profit if TP appeared later.
+            tp=_num(p.get('profitLevel'));entry=_num(p.get('level'))
+            if tp is not None and entry is not None and not existing.get('original_profit'):
+                sign=1 if p.get('direction')=='BUY' else -1
+                if sign*(tp-entry)>0:
+                    meta=dict(existing);meta['original_profit']=abs(tp-entry)
+                    self.store.set(key,meta)
+            return True
+        if not self.store.get('robot_open:'+str(deal_id)):
+            return False
+        entry=_num(p.get('level'));stop=_num(p.get('stopLevel'));tp=_num(p.get('profitLevel'))
+        direction=p.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
+        if entry is None or stop is None or sign is None:return False
+        if sign*(entry-stop)<=0:return False
+        meta={
+            'owner':'AUTO','deal_id':deal_id,'epic':p.get('epic'),
+            'original_risk':abs(entry-stop),
+            'original_profit':(abs(tp-entry) if tp is not None and sign*(tp-entry)>0 else None),
+            'opened':(existing or {}).get('opened') or now()}
+        self.store.set(key,meta)
+        self.store.event('protection','Robot-opened position enrolled in adaptive SL/TP',
+            {'deal_id':deal_id,'initial_risk':meta['original_risk'],
+             'initial_profit':meta['original_profit'],'tp_optional':tp is None})
+        return True
+
     async def adapt_protection(self,p):
         """Trail SL behind broker extreme — ROBOT only; continues past BE.
 
@@ -1784,6 +1815,9 @@ class SingleTradeEngine:
         OHLC (same zone data), not a hardcoded fraction of R.
         """
         key='adaptive_protection:'+str(p['dealId'])
+        # Late enroll if OPEN lacked TP / meta was never written.
+        if self.store.get('robot_open:'+str(p.get('dealId'))):
+            self._enroll_adaptive_protection(p)
         meta=self.store.get(key)
         if not meta or meta.get('owner')!='AUTO':
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}

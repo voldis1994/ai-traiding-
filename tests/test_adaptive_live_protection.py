@@ -264,6 +264,56 @@ def test_confirmed_sell_open_registers_persistent_adaptive_rights():
     asyncio.run(scenario())
 
 
+class OpenWithoutTakeProfitBroker(BrokerSimulation):
+    """Capital often confirms OPEN with SL set and Take Profit Off."""
+    async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None):
+        self.requests.append(('OPEN',epic,direction,size,stop_distance,profit_distance))
+        sign=1 if direction=='BUY' else -1
+        entry=self.price
+        self.open=[{'position':{'dealId':'ntp1','size':str(size),'direction':direction,
+            'level':entry,'stopLevel':entry-sign*float(stop_distance),
+            'profitLevel':None},'market':{'epic':epic}}]
+        return {'dealReference':'open-no-tp'}
+
+
+def test_open_without_tp_still_enrolls_trail():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            from app.engine import AdaptiveBrain
+            s=Store(Path(d)/'state.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
+            e=SingleTradeEngine(s,brain);b=OpenWithoutTakeProfitBroker()
+            e.attach(b);await e.sync();b.open=[];await e.sync()
+            e.market={'epic':'SIM','mid':100.,'bid':99.99,'ask':100.02,'spread':.03,
+                      'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
+            e.market_context={'ready':True}
+            await e.submit('BUY')
+            meta=s.get('adaptive_protection:ntp1')
+            assert meta and meta['owner']=='AUTO'
+            assert meta['original_risk']>0
+            assert meta.get('original_profit') in (None,0) or meta['original_profit'] is None
+            # Trail must still propose with TP Off once price runs.
+            e.positions=[{'dealId':'ntp1','epic':'SIM','direction':'BUY','level':100.,
+                          'stopLevel':99.2,'profitLevel':None,'size':'1'}]
+            e.market={'epic':'SIM','mid':101.4,'bid':101.35,'ask':101.45,'spread':.1,
+                      'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
+            prop=propose_broker_trail(e.positions[0],e.market,meta,extreme=101.35)
+            assert prop and prop['stop_level']>99.2
+    asyncio.run(scenario())
+
+
+def test_late_enroll_from_robot_open_when_meta_missing():
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        e=SingleTradeEngine(s,Brain())
+        s.set('robot_open:late1',True)
+        p={'dealId':'late1','epic':'GOLD','direction':'SELL','level':4015.,
+           'stopLevel':4020.,'profitLevel':None,'size':'.1'}
+        assert e._enroll_adaptive_protection(p)
+        meta=s.get('adaptive_protection:late1')
+        assert meta['owner']=='AUTO' and meta['original_risk']==pytest.approx(5.0)
+        assert meta['original_profit'] is None
+
+
 def test_tick_prefers_decimal_places_over_one_pip_means():
     from app.engine import SingleTradeEngine
     market={

@@ -1063,6 +1063,8 @@ class AutoEvolution:
                     if hasattr(engine,'_persist_shadow_state'):
                         engine._persist_shadow_state()
                     self.last_reason='Shadow weights promoted to LIVE neural core'
+                    self.store.set('neural_adapt_reason',
+                        'Shadow paper £ beat LIVE — weights copied into LIVE core')
                     self.store.event('learning','Shadow neural weights promoted to LIVE',
                         {'model_version':brain.model_version,
                          'shadow_neurons':shadow.n,'live_neurons':brain.core.n,

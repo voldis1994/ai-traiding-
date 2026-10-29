@@ -7,12 +7,14 @@ if errorlevel 1 (
   exit /b 1
 )
 echo ===============================================================
-echo  NEURAL TRADING AI - FRESH START (KEEP BACKUP)
+echo  NEURAL TRADING AI - FRESH LEARNING (KEEP CLIENTS)
 echo ===============================================================
 echo.
 echo STOP the robot first. Verify live positions and SL/TP at Capital.com.
 echo This utility does NOT close broker orders or contact the broker.
-echo Existing learning files will be MOVED to a timestamped backup.
+echo Neural weights / robot.sqlite3 / policy will be MOVED to a backup.
+echo PRESERVED: platform.sqlite3 (clients + broker APIs) and secret.key.
+echo You will NOT need to re-register clients.
 echo.
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" reset_learning.py
@@ -25,7 +27,7 @@ echo.
 if not "%RESULT%"=="0" (
   echo [INFO] Reset not completed. Review the message above.
 ) else (
-  echo [OK] Fresh start prepared. Double-click run_windows.bat next.
+  echo [OK] Learning wiped. Clients kept. Double-click run_windows.bat next.
 )
 pause
 popd

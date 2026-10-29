@@ -361,6 +361,9 @@ class RuntimeHub:
             try:await rt.engine.broker.close()
             except Exception:pass
             rt.engine.broker=None
+        # Close journal before admin learning-reset moves robot.sqlite3 aside.
+        try:rt.store.close()
+        except Exception:pass
 
     async def shutdown(self):
         async with self._lock:

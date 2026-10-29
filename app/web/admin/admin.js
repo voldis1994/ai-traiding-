@@ -100,11 +100,23 @@ function renderCard(c){
       <button type="button" class="btn tiny" data-act="stop" data-id="${c.id}">Stop</button>
       <button type="button" class="btn tiny" data-act="pause" data-id="${c.id}">Pause</button>
       <button type="button" class="btn tiny" data-act="resume" data-id="${c.id}">Resume</button>
+      <button type="button" class="btn tiny" data-act="wipe" data-id="${c.id}">Mācīties no jauna</button>
     </div>`;
   el.querySelectorAll('[data-act]').forEach(btn=>{
     btn.onclick=async()=>{
       try{
-        await api(`/api/admin/clients/${btn.dataset.id}/${btn.dataset.act}`,'POST');
+        if(btn.dataset.act==='wipe'){
+          const ok=confirm(
+            `Izdzēst mācīšanās vēsturi klientam #${btn.dataset.id}?\n`+
+            'Klienta login un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.');
+          if(!ok)return;
+          const typed=prompt('Ieraksti RESET, lai apstiprinātu:');
+          if(typed!=='RESET'){alert('Atcelts.');return}
+          await api('/api/admin/reset-learning','POST',{
+            confirmation:'RESET',client_id:Number(btn.dataset.id)});
+        }else{
+          await api(`/api/admin/clients/${btn.dataset.id}/${btn.dataset.act}`,'POST');
+        }
         await loadOverview();
       }catch(err){alert(err.message)}
     };
@@ -145,6 +157,21 @@ $('logoutBtn').onclick=async()=>{
   try{await api('/api/admin/logout','POST')}finally{show(true)}
 };
 $('refreshBtn').onclick=()=>loadOverview().catch(e=>alert(e.message));
+$('resetLearningBtn').onclick=async()=>{
+  const ok=confirm(
+    'Izdzēst VISU mācīšanās vēsturi (neironi, treidi, signāli, policy)?\n\n'+
+    'Klienti un brokera API paliek — nav jāreģistrē no jauna.\n'+
+    'Capital.com pozīcijas netiek aizvērtas.\n\n'+
+    'Visi roboti tiks apturēti. Pēc tam ieteicams restartēt run_windows.bat.');
+  if(!ok)return;
+  const typed=prompt('Ieraksti RESET (lielajiem burtiem), lai apstiprinātu:');
+  if(typed!=='RESET'){alert('Atcelts — vajag precīzi RESET.');return}
+  try{
+    const res=await api('/api/admin/reset-learning','POST',{confirmation:'RESET'});
+    alert(res.message||'Mācīšanās notīrīta. Klienti saglabāti.');
+    await loadOverview();
+  }catch(e){alert(e.message)}
+};
 $('createForm').onsubmit=async ev=>{
   ev.preventDefault();$('createMsg').textContent='';
   const data=Object.fromEntries(new FormData(ev.target).entries());

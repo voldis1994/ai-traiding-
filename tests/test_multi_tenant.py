@@ -140,16 +140,20 @@ def test_admin_and_client_portals(monkeypatch,tmp_path):
     monkeypatch.setattr('app.runtime_hub.create_broker',lambda *a,**k:LoginBroker())
 
     with TestClient(main.app) as client:
+        # `/` opens admin directly (operator local UX — no portal chooser).
+        assert client.get('/',follow_redirects=False).status_code==302
+        assert client.get('/',follow_redirects=False).headers['location']=='/admin'
         assert client.get('/').status_code==200
         assert client.get('/console',follow_redirects=False).status_code==302
         assert client.get('/console',follow_redirects=False).headers['location']=='/admin'
         assert client.get('/admin').status_code==200
         assert client.get('/app').status_code==200
+        assert client.get('/portal').status_code==200
         health=client.get('/api/health').json()
         assert health['portals']['client']=='/app'
         assert health['portals']['operator']=='/admin'
         assert health['portals']['admin']=='/admin'
-        assert health['portals']['home']=='/'
+        assert health['portals']['home']=='/admin'
 
         assert client.post('/api/admin/login',json={'username':'admin','password':'x'}).status_code==401
         assert client.post('/api/admin/login',json={'username':'admin','password':'admin123'}).status_code==200

@@ -18,9 +18,16 @@ DEFAULT_SL_SCALE=1.0
 MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 MIN_BATCH_SAMPLES=6
-SCRATCH_CASH=0.05
 # Exit reasons the adaptation layer understands.
 EXIT_REASONS=frozenset({'sl','tp','trail','vanish','manual','unknown'})
+
+
+def _scratch_band(store=None) -> float:
+    """Penny/scratch |£| band from self_params Store — not a frozen module constant."""
+    from .self_params import DEFAULTS, load
+    if store is not None:
+        return float(load(store)['scratch_pnl_abs'])
+    return float(DEFAULTS['scratch_pnl_abs'])
 
 
 def _finite(v):
@@ -51,7 +58,7 @@ def normalize_exit_reason(reason) -> str:
 
 def analyze_trade_path(*, direction=None, entry=None, exit_level=None,
                        stop_distance=None, adverse_path=None, volatility=None,
-                       costs=None, pnl=None) -> dict:
+                       costs=None, pnl=None, store=None, scratch_cash_band=None) -> dict:
     """Separate path / vol / cost facts from the raw cash P&L.
 
     adverse_path: absolute price move against the position (or inferred from
@@ -72,9 +79,11 @@ def analyze_trade_path(*, direction=None, entry=None, exit_level=None,
             adv=abs(signed)
         elif adv is None:
             adv=0.0
-    scratch_cash=pnl_n is not None and abs(pnl_n)<=SCRATCH_CASH
+    band=_finite(scratch_cash_band)
+    if band is None:band=_scratch_band(store)
+    scratch_cash=pnl_n is not None and abs(pnl_n)<=band
     cost_dominated=bool(
-        costs_n>0 and pnl_n is not None and abs(pnl_n)<=max(SCRATCH_CASH,1.5*costs_n))
+        costs_n>0 and pnl_n is not None and abs(pnl_n)<=max(band,1.5*costs_n))
     vs_vol=None
     if adv is not None and vol is not None and vol>1e-12:
         vs_vol=float(adv)/float(vol)
@@ -83,12 +92,13 @@ def analyze_trade_path(*, direction=None, entry=None, exit_level=None,
     if vs_vol is None and adv is not None and stop is not None and stop>1e-12:
         ratio=float(adv)/float(stop)
         noise_stop=ratio<=1.05
-        adverse_entry=ratio>1.05 and (pnl_n is not None and pnl_n<-SCRATCH_CASH)
+        adverse_entry=ratio>1.05 and (pnl_n is not None and pnl_n<-band)
     return {
         'adverse_path':adv,'volatility':vol,'costs':costs_n,
         'signed_move':signed,'scratch_cash':scratch_cash,
         'cost_dominated':cost_dominated,'noise_stop':noise_stop,
         'adverse_entry':adverse_entry,'vs_vol':vs_vol,
+        'scratch_pnl_abs':float(band),
     }
 
 
@@ -137,7 +147,7 @@ def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None,
     path=analyze_trade_path(
         direction=direction,entry=entry,exit_level=exit_level,
         stop_distance=stop_distance,adverse_path=adverse_path,
-        volatility=volatility,costs=costs,pnl=pnl_n)
+        volatility=volatility,costs=costs,pnl=pnl_n,store=store)
     hist=store.get('bracket_outcome_history',[]) or []
     if not isinstance(hist,list):hist=[]
     hist.append({
@@ -176,18 +186,20 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     k_m,s_m=mult['kappa'],mult['sl_scale']
     shape=float(kappa)*float(sl_scale)
     reason_x=normalize_exit_reason(exit_reason)
+    band=_scratch_band(store)
     path=analyze_trade_path(
         direction=direction,entry=entry,exit_level=exit_level,
         stop_distance=stop_distance,adverse_path=adverse_path,
-        volatility=volatility,costs=costs,pnl=pnl)
+        volatility=volatility,costs=costs,pnl=pnl,store=store,
+        scratch_cash_band=band)
     reason='hold'
-    if reason_x=='tp' or (pnl>SCRATCH_CASH and reason_x in ('trail','unknown','manual')):
+    if reason_x=='tp' or (pnl>band and reason_x in ('trail','unknown','manual')):
         k_m=min(MULT_KAPPA_MAX,k_m*1.05)
         s_m=min(MULT_SL_MAX,s_m*1.03)
-        reason='win_reinforce' if pnl>SCRATCH_CASH else 'tp_reinforce'
+        reason='win_reinforce' if pnl>band else 'tp_reinforce'
     elif reason_x=='trail':
         # Trail already managed the exit — do not treat as "SL too tight".
-        if pnl<-SCRATCH_CASH and shape>=1.6:
+        if pnl<-band and shape>=1.6:
             k_m=max(MULT_KAPPA_MIN,k_m*0.95)
             reason='trail_loss_cut_tp'
         else:
@@ -201,7 +213,7 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
             reason='scratch_cut_tp'
         else:
             reason='scratch_hold_sl'
-    elif reason_x=='sl' or (pnl<-SCRATCH_CASH and reason_x in ('unknown','manual')):
+    elif reason_x=='sl' or (pnl<-band and reason_x in ('unknown','manual')):
         if path['noise_stop'] and shape<1.6 and not path['adverse_entry']:
             # Stopped inside the noise band with a tight shape → give SL room.
             s_m=min(MULT_SL_MAX,s_m*1.12)
@@ -217,7 +229,7 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         else:
             # Loss without vol/path evidence — refuse to assume SL was tight.
             reason='loss_insufficient_context_hold'
-    elif pnl>SCRATCH_CASH:
+    elif pnl>band:
         k_m=min(MULT_KAPPA_MAX,k_m*1.05)
         s_m=min(MULT_SL_MAX,s_m*1.03)
         reason='win_reinforce'

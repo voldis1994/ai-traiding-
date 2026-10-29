@@ -118,13 +118,16 @@ def test_shadow_weights_persist_across_restart():
         assert np.allclose(shadow2.W,after['W'])
 
 
-def test_shadow_paper_defaults_nonzero_friction():
-    """Critical #4: defaults are non-ideal; delay defers open by ≥1 bar."""
-    from app.shadow_paper import DEFAULT_FILL_DELAY_BARS,DEFAULT_SLIP_BPS
-    assert DEFAULT_FILL_DELAY_BARS>=1
-    assert DEFAULT_SLIP_BPS>0
+def test_shadow_paper_reads_exec_friction_from_self_params():
+    """Critical #4: friction from Store self_params — not module constants."""
+    from app.self_params import DEFAULTS, save
+    assert DEFAULTS['exec_fill_delay_bars']>=1
+    assert DEFAULTS['exec_slip_bps']>0
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
+        # Seed delay=1 via self_params; journal must defer open.
+        save(store,{**DEFAULTS,'exec_fill_delay_bars':1,'exec_slip_bps':2.0},
+             reason='test')
         j=ShadowPaperJournal(store)
         assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='b1',
                         high=100.3,low=99.8,tick=0.1,
@@ -134,3 +137,11 @@ def test_shadow_paper_defaults_nonzero_friction():
         assert j.on_bar('HOLD',mid=100.1,spread=0.2,bar_time='b2',
                         high=100.2,low=100.0,tick=0.1) is None
         assert j.position is not None
+        # Robot can change delay to 0 — next journal opens immediately.
+        save(store,{**DEFAULTS,'exec_fill_delay_bars':0,'exec_slip_bps':1.0},
+             reason='evolved')
+        j2=ShadowPaperJournal(store)
+        assert j2.on_bar('BUY',mid=100.,spread=0.2,bar_time='c1',
+                        high=100.3,low=99.8,tick=0.1,
+                        stop_distance=2.0,profit_distance=4.0) is None
+        assert j2.position is not None

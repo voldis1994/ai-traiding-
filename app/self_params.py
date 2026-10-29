@@ -61,9 +61,11 @@ DEFAULTS = {
     'grow_error_threshold': 0.55,
     'prune_utility_threshold': -0.01,
     'prune_min_age': 80,
-    # Shadow/LIVE execution parity (critical #4) — never ideal zero friction.
+    # Shadow/LIVE execution parity (critical #4) — seeds only; evolve from £.
     'exec_slip_bps': 2.0,
     'exec_fill_delay_bars': 1,
+    # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
+    'scratch_pnl_abs': 0.05,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -97,8 +99,10 @@ BOUNDS = {
     'grow_error_threshold': (0.2, 2.0),
     'prune_utility_threshold': (-0.2, 0.0),
     'prune_min_age': (20, 500),
-    'exec_slip_bps': (0.5, 50.0),
-    'exec_fill_delay_bars': (1, 5),
+    # Soft rails only — operating values live in Store and move via evolve.
+    'exec_slip_bps': (0.1, 50.0),
+    'exec_fill_delay_bars': (0, 5),
+    'scratch_pnl_abs': (0.01, 0.5),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -263,23 +267,36 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
     if shadow_promote is True:
         p['shadow_min_broker_trades']=max(BOUNDS['shadow_min_broker_trades'][0],
             int(p['shadow_min_broker_trades'])-1)
-        notes.append('shadow earned trust — slightly lower sample floor')
+        # Shadow earned trust under current friction — ease delay one bar.
+        p['exec_fill_delay_bars']=max(BOUNDS['exec_fill_delay_bars'][0],
+            int(p['exec_fill_delay_bars'])-1)
+        notes.append('shadow earned trust — lower sample floor + ease fill delay')
     elif shadow_promote is False:
         p['model_max_dd_ratio']=max(BOUNDS['model_max_dd_ratio'][0],
             float(p['model_max_dd_ratio'])-0.02)
-        notes.append('shadow lost — tighter DD tolerance')
+        p['exec_fill_delay_bars']=min(BOUNDS['exec_fill_delay_bars'][1],
+            int(p['exec_fill_delay_bars'])+1)
+        p['exec_slip_bps']=min(BOUNDS['exec_slip_bps'][1],
+            float(p['exec_slip_bps'])*1.08)
+        notes.append('shadow lost — tighter DD + raise fill delay/slip')
     if broker_pnl is not None:
         pnl=_finite(broker_pnl)
         if pnl is not None:
-            # Scratch / penny closes (|£|≤0.05) must not ratchet HOLD repeats —
+            scratch=float(p.get('scratch_pnl_abs',DEFAULTS['scratch_pnl_abs']))
+            # Scratch / penny closes must not ratchet HOLD repeats —
             # that was the permanent-HOLD trap after a streak of £0 exits.
-            if pnl<0 and abs(pnl)>0.05:
+            if pnl<0 and abs(pnl)>scratch:
                 p['learn_lr']=min(BOUNDS['learn_lr'][1],float(p['learn_lr'])*1.05)
                 # Never let loss repeats exceed win repeats (symmetric teacher).
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 cur=int(p['learn_loss_repeats'])
                 p['learn_loss_repeats']=min(win_r,cur)
-                notes.append('meaningful loss → calm LR only; loss repeats capped at win')
+                # Adverse cash → assume more LIVE friction; raise shadow slip estimate.
+                p['exec_slip_bps']=min(BOUNDS['exec_slip_bps'][1],
+                    float(p['exec_slip_bps'])*1.05)
+                p['exec_fill_delay_bars']=min(BOUNDS['exec_fill_delay_bars'][1],
+                    int(p['exec_fill_delay_bars'])+1)
+                notes.append('meaningful loss → calm LR; raise exec slip/delay estimate')
             elif pnl<0:
                 notes.append('scratch loss — no HOLD-repeat ratchet')
             elif pnl>0:
@@ -287,7 +304,10 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 # Soft nudge win path so it stays ≥ loss path.
                 p['learn_win_repeats']=min(BOUNDS['learn_win_repeats'][1],max(win_r,int(p['learn_loss_repeats'])))
-                notes.append('win → calm LR; keep win repeats ≥ loss')
+                # Wins → slightly less assumed friction (fills were friendly).
+                p['exec_slip_bps']=max(BOUNDS['exec_slip_bps'][0],
+                    float(p['exec_slip_bps'])*0.99)
+                notes.append('win → calm LR; slight exec slip ease')
     return notes
 
 

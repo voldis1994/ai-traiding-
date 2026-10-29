@@ -4,9 +4,12 @@ Seed DEFAULTS are only the *first* values. Everything here is persisted in Store
 and nudged from outcomes (approve rate, OOS net, shadow compare, broker £).
 
 Nudges from single events are *queued* (commit=False), then activated as a
-*trial* so the robot actually trades under the new knobs. Commit only when
-broker £ earned *during the trial* beats the equal pre-trial window — never
-from profit earned while the draft was still idle.
+*trial* so the robot actually trades under the new knobs. Once a trial starts,
+those knobs are *frozen* for the whole evaluation window — further nudges
+queue for a later draft but must not mutate the version under test. Commit
+only when broker £ earned *during the trial* beats the equal pre-trial
+window — never from profit earned while the draft was still idle, and never
+for a param set that kept changing mid-trial.
 
 Honest immutable (NOT in this bag — physics / API / layout):
   - Capital has no volume/DOM (public liquidity is EXTERNAL fusion only)
@@ -181,7 +184,8 @@ def _pending(store):
     raw=store.get(PENDING_KEY) if store is not None else None
     if not isinstance(raw,dict):
         return {'events':[],'draft':None,'baseline_net':None,'marked_at_trades':0,
-                'trial_active':False,'trial_started_at_trades':0,'baseline_params':None}
+                'trial_active':False,'trial_started_at_trades':0,'baseline_params':None,
+                'trial_params':None,'trial_id':None}
     return {
         'events':list(raw.get('events') or []),
         'draft':raw.get('draft'),
@@ -190,6 +194,9 @@ def _pending(store):
         'trial_active':bool(raw.get('trial_active')),
         'trial_started_at_trades':int(raw.get('trial_started_at_trades') or 0),
         'baseline_params':raw.get('baseline_params'),
+        # Frozen param set under evaluation — never mutate while trial_active.
+        'trial_params':raw.get('trial_params'),
+        'trial_id':raw.get('trial_id'),
     }
 
 
@@ -203,7 +210,15 @@ def _save_pending(store, pending):
         'trial_active':bool(pending.get('trial_active')),
         'trial_started_at_trades':int(pending.get('trial_started_at_trades') or 0),
         'baseline_params':pending.get('baseline_params'),
+        'trial_params':pending.get('trial_params'),
+        'trial_id':pending.get('trial_id'),
     })
+
+
+def _clear_trial_fields():
+    return {'events':[],'draft':None,'baseline_net':None,'marked_at_trades':0,
+            'trial_active':False,'trial_started_at_trades':0,'baseline_params':None,
+            'trial_params':None,'trial_id':None}
 
 
 def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
@@ -277,10 +292,19 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
 
     commit=False → queue draft, then *activate as trial* so subsequent broker £
     is earned under the new knobs (proof requires trial-period £, not past £).
+    While a trial is active the frozen trial_params stay on the live bag —
+    further nudges only update the aspirational draft, never the version under
+    evaluation (audit #27).
     commit=True  → immediate save (tests / explicit force).
     """
     pending=_pending(store)
-    base=dict(pending['draft']) if isinstance(pending.get('draft'),dict) else load(store)
+    # While a trial is frozen, draft from the frozen set (not a mutating chain).
+    if pending.get('trial_active') and isinstance(pending.get('trial_params'),dict):
+        base=dict(pending['trial_params'])
+    elif isinstance(pending.get('draft'),dict):
+        base=dict(pending['draft'])
+    else:
+        base=load(store)
     # Ensure all keys present when starting from a partial draft.
     p={k:_clip(k,base.get(k,DEFAULTS[k])) for k in DEFAULTS}
     notes=_apply_nudge(p,feature_approved=feature_approved,feature_rejected=feature_rejected,
@@ -297,22 +321,34 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
                     if isinstance(feature_rejected,dict) else feature_rejected),
                 'shadow_promote':shadow_promote,
                 'broker_pnl':broker_pnl,
+                'trial_id':pending.get('trial_id'),
             })
-            pending['draft']=clean
             # First draft → activate trial under new params; mark trade index.
             if not pending.get('trial_active'):
                 pending['baseline_params']=load(store)
                 pending['trial_started_at_trades']=_broker_trade_count(store)
                 pending['trial_active']=True
-                save(store,clean,reason='trial activation (awaiting £ proof)')
+                pending['trial_params']=dict(clean)
+                pending['trial_id']=(
+                    f"t{_broker_trade_count(store)}_"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+                pending['draft']=dict(clean)
+                save(store,clean,reason=f"trial activation {pending['trial_id']}")
                 if store is not None:
                     store.event('self_params','Self-params trial activated',
-                        {'reason':msg,
-                         'trial_started_at_trades':pending['trial_started_at_trades']})
+                        {'reason':msg,'trial_id':pending['trial_id'],
+                         'trial_started_at_trades':pending['trial_started_at_trades'],
+                         'frozen':True})
             else:
-                # Trial already running — keep live knobs on the latest draft.
-                save(store,clean,reason='trial draft updated')
+                # Trial frozen — queue aspirational draft only; do NOT mutate live.
+                pending['draft']=clean
+                if store is not None:
+                    store.event('self_params','Self-params mid-trial draft queued (live frozen)',
+                        {'reason':msg,'trial_id':pending.get('trial_id')})
             _save_pending(store,pending)
+            # Callers that inspect return value during a trial see the frozen set.
+            if pending.get('trial_active') and isinstance(pending.get('trial_params'),dict):
+                return {k:_clip(k,pending['trial_params'].get(k,DEFAULTS[k])) for k in DEFAULTS}
         return clean
     save(store,clean,reason=msg)
     if store is not None and notes:
@@ -325,29 +361,35 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
 
 
 def maybe_commit_long_horizon(store, broker_pnls):
-    """Commit trial params only if £ earned *during the trial* beats pre-trial.
+    """Commit *frozen* trial params only if £ during the trial beats pre-trial.
 
     Profit from before trial_started_at_trades does not count — that was earned
-    under the old knobs and cannot prove the draft is better.
+    under the old knobs and cannot prove the draft is better. Mid-trial draft
+    mutations never become the committed set (audit #27).
     """
     if store is None:return {'committed':False,'reason':'no store'}
     pending=_pending(store)
-    if not pending.get('draft') and not pending.get('events'):
+    if not pending.get('draft') and not pending.get('events') and not pending.get('trial_params'):
         return {'committed':False,'reason':'no pending draft'}
     if not pending.get('trial_active'):
         return {'committed':False,'reason':'draft not yet on trial'}
-    cfg=load(store)
+    frozen=pending.get('trial_params')
+    if not isinstance(frozen,dict):
+        # Legacy pending without trial_params — treat live bag as the frozen set.
+        frozen=load(store)
+    cfg={k:_clip(k,frozen.get(k,DEFAULTS[k])) for k in DEFAULTS}
     need=int(cfg['self_params_horizon_trades'])
     pnls=[float(x) for x in (broker_pnls or [])
           if x is not None and math.isfinite(float(x))]
     start=int(pending.get('trial_started_at_trades') or 0)
+    trial_id=pending.get('trial_id')
     # Trades after trial activation only.
     trial=pnls[start:]
     prior=pnls[max(0,start-need):start]
     if len(trial)<need:
         return {'committed':False,'reason':f'need ≥{need} broker £ under trial',
                 'n_trial':len(trial),'pending':len(pending['events']),
-                'trial_started_at_trades':start}
+                'trial_started_at_trades':start,'trial_id':trial_id}
     trial_window=trial[:need]
     trial_net=float(sum(trial_window))
     trial_mean=trial_net/max(1,len(trial_window))
@@ -371,24 +413,28 @@ def maybe_commit_long_horizon(store, broker_pnls):
         baseline=pending.get('baseline_params') or DEFAULTS
         save(store,{k:_clip(k,baseline.get(k,DEFAULTS[k])) for k in DEFAULTS},
              reason='trial rejected — restored baseline')
-        _save_pending(store,{'events':[],'draft':None,'baseline_net':prior_net,
-                             'marked_at_trades':len(pnls),'trial_active':False,
-                             'trial_started_at_trades':0,'baseline_params':None})
+        cleared=_clear_trial_fields()
+        cleared['baseline_net']=prior_net
+        cleared['marked_at_trades']=len(pnls)
+        _save_pending(store,cleared)
         store.event('self_params','Self-params trial rejected; baseline restored',
             {'events':n_events,'trial_net':trial_net,'prior_net':prior_net,
-             'horizon':need,'mode':mode})
+             'horizon':need,'mode':mode,'trial_id':trial_id})
         return {'committed':False,'rejected':True,
                 'trial_net':trial_net,'prior_net':prior_net,'mode':mode,
+                'trial_id':trial_id,
                 'reason':'trial £ not better than available baseline'}
-    draft=pending.get('draft') or load(store)
-    save(store,draft,reason='long-horizon trial £ proof')
-    _save_pending(store,{'events':[],'draft':None,'baseline_net':trial_net,
-                         'marked_at_trades':len(pnls),'trial_active':False,
-                         'trial_started_at_trades':0,'baseline_params':None})
+    # Commit the frozen trial version — never a mid-trial draft that drifted.
+    save(store,cfg,reason=f'long-horizon trial £ proof {trial_id or ""}'.strip())
+    cleared=_clear_trial_fields()
+    cleared['baseline_net']=trial_net
+    cleared['marked_at_trades']=len(pnls)
+    _save_pending(store,cleared)
     store.event('self_params','Self-params committed after trial £ proof',
         {'events_applied':n_events,'trial_net':trial_net,'prior_net':prior_net,
-         'horizon':need,'trial_started_at_trades':start,'mode':mode})
+         'horizon':need,'trial_started_at_trades':start,'mode':mode,
+         'trial_id':trial_id,'frozen':True})
     from .learning_generation import bump as bump_generation
     bump_generation(store,'self_params_trial_committed')
     return {'committed':True,'trial_net':trial_net,'prior_net':prior_net,
-            'events_applied':n_events,'mode':mode}
+            'events_applied':n_events,'mode':mode,'trial_id':trial_id}

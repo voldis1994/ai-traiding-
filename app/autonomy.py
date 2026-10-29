@@ -932,7 +932,11 @@ class AutoEvolution:
         reg=getattr(engine,'feature_registry',None)
         if reg is not None:
             specs=[dict(x) for x in (reg.approved or [])]
-        meta={
+        from .instrument_isolation import label_backup_meta
+        epic=getattr(brain,'epic',None)
+        if not epic and getattr(engine,'mandate',None):
+            epic=engine.mandate.get('epic')
+        meta=label_backup_meta({
             'model_version':int(getattr(brain,'model_version',0) or 0),
             'feature_schema':getattr(brain,'feature_schema',None),
             'ohlc_dim':getattr(brain,'ohlc_dim',None),
@@ -941,7 +945,7 @@ class AutoEvolution:
             'approved_specs':specs,
             'weights_path':path,
             'note':str(note)[:80],
-        }
+        },epic)
         mv.push_version(meta)
         return meta
 

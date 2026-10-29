@@ -77,7 +77,30 @@ def test_evolve_commit_false_activates_trial():
         assert load(store)['bars_between_search']<=before
         assert pending['trial_started_at_trades']==8
         assert pending['baseline_params']['bars_between_search']==before
+        assert pending.get('trial_params')
+        assert pending.get('trial_id')
         assert snapshot(store)['pending_events']>=1
+
+
+def test_trial_params_frozen_while_evaluation_runs():
+    """Audit #27: mid-trial nudges must not mutate the version under test."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        store.set('profit_learning_history_v1',
+                  [{'actual_pnl':0.1,'mode':'reinforce_win'}]*8)
+        evolve_from_feedback(store,feature_approved='gen_ret_8',commit=False)
+        pending=store.get(PENDING_KEY)
+        frozen=dict(pending['trial_params'])
+        live_before=load(store)['bars_between_search']
+        assert live_before==frozen['bars_between_search']
+        # Another approve during the trial — draft may move, live must not.
+        evolve_from_feedback(store,feature_approved='gen_ret_13',commit=False)
+        assert load(store)['bars_between_search']==live_before
+        pending2=store.get(PENDING_KEY)
+        assert pending2['trial_id']==pending['trial_id']
+        assert pending2['trial_params']['bars_between_search']==frozen['bars_between_search']
+        # Aspirational draft may differ from frozen trial params.
+        assert pending2.get('draft')
 
 
 def test_maybe_commit_requires_trial_period_profit_proof():

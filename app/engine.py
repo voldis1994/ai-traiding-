@@ -2463,21 +2463,33 @@ class SingleTradeEngine:
         # two cannot re-train on restart (lost save ≺ double-train).
         self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.brain.save()
-        self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
-            {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
-             'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
-             'broker_pnl':broker_pnl,
-             'realized_directional_ticks':realized_ticks,'target':label,
-             'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
-             'last_loss':losses[-1] if losses else None,
-             'tick_size':tick,
-             'bracket':bracket_learn.load_params(self.store)})
+        weights_updated=bool(repeats>0 and losses)
+        if weights_updated:
+            learning_generation.bump(self.store,'closed_trade_weight_update',
+                                     kind='training_steps')
+            self.store.event('learning','Closed-trade P&L updated LIVE neural weights',
+                {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
+                 'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
+                 'broker_pnl':broker_pnl,
+                 'realized_directional_ticks':realized_ticks,'target':label,
+                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'last_loss':losses[-1] if losses else None,
+                 'weights_updated':True,'tick_size':tick,
+                 'bracket':bracket_learn.load_params(self.store)})
+        else:
+            # Honest: claim burned, weights unchanged (scratch / null label).
+            self.store.event('learning','Closed-trade recorded without weight update',
+                {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
+                 'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
+                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'target':label,'weights_updated':False})
         try:
             # Milestone evolve only — force=True every close inflated policy
             # attempts/Paaudze without changing LIVE neural entry.
-            self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
-                               self.brain.labeled,list(self.brain.history),
-                               force=False)
+            if weights_updated:
+                self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
+                                   self.brain.labeled,list(self.brain.history),
+                                   force=False)
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
@@ -2548,7 +2560,8 @@ class SingleTradeEngine:
             self.store.set(key,meta)
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
-                                      zone_range=float(zone_range) if zone_range is not None else None)
+                                      zone_range=float(zone_range) if zone_range is not None else None,
+                                      store=self.store)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal}
         if not proposal:return
@@ -3290,8 +3303,21 @@ class SingleTradeEngine:
             if pnl is not None:
                 try:
                     cash=float(pnl)
-                    if cash>0:label={'BUY':0,'SELL':1}.get(closed.get('direction'))
-                    elif cash<0:label=2
+                    direction=closed.get('direction')
+                    if cash>0:
+                        label={'BUY':0,'SELL':1}.get(direction)
+                    elif cash<0:
+                        # Same teacher as LIVE losses — counterfactual, not hardcode HOLD.
+                        from .profit_learning import best_action_from_counterfactual
+                        entry=_num(closed.get('entry'))
+                        exit_px=_num(closed.get('exit') or closed.get('exit_px'))
+                        sim=best_action_from_counterfactual(
+                            entry,exit_px,spread=float(spread or 0),
+                            slip_bps=slip_bps) if entry is not None and exit_px is not None else None
+                        if sim and sim.get('best') in ('BUY','SELL','HOLD'):
+                            label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
+                        else:
+                            label=2
                 except (TypeError,ValueError):
                     label=None
             if label is not None:

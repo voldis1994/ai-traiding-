@@ -148,12 +148,15 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
             'transition':brain._json_transition(brain.core.last_transition)})
         store.upsert_trade({'dealId':'deal1','epic':'GOLD','size':'0.5','direction':'SELL','level':100})
         engine._learn_closed_trade('deal1',{'level':99.8})
-        last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
+        last=[e for e in store.recent()
+              if 'updated LIVE neural weights' in e['message']
+              or 'without weight update' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['realized_directional_ticks']==pytest.approx(20.)
         assert detail['mode']=='reinforce_win_ticks'  # tick path — not fake £ in profit ledger
         assert detail['target']==1
         assert detail['learn_repeats']==2
+        assert detail.get('weights_updated') is True
         # Without broker profit, cash P&L stays blank (no fake GOLD USD price×size).
         assert store.trades(1)[0]['pnl'] is None
         assert detail['pnl_source']=='ticks_only'
@@ -173,12 +176,14 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
         # BUY that exited lower → loss → counterfactual SELL (path evidence, not forced HOLD).
         engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
-        last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
+        last=[e for e in store.recent()
+              if 'updated LIVE neural weights' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['mode']=='loss_counterfactual_sell'
         assert detail['target']==1
         assert detail['learn_repeats']==2
         assert detail['scratch_hold_skip'] is False
+        assert detail['weights_updated'] is True
         assert detail['broker_pnl']==-12.5
         assert detail['pnl']==-12.5
         assert store.trades(1)[0]['pnl']==pytest.approx(-12.5)
@@ -199,10 +204,12 @@ def test_scratch_loss_does_not_spam_hold_into_core():
         store.set('entry_brain:scratch1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
         engine._learn_closed_trade('scratch1',{'level':100.0,'profit':-0.02})
-        last=[e for e in store.recent() if 'P&L self-evaluation' in e['message']][0]
+        last=[e for e in store.recent()
+              if 'without weight update' in e['message']][0]
         detail=json.loads(last['details'])
         assert detail['learn_repeats']==0
         assert detail['scratch_hold_skip'] is True
+        assert detail['weights_updated'] is False
         assert detail['mode'].endswith('_scratch_skip')
         assert np.array_equal(before,brain.core.P)
         assert store.get('entry_brain:scratch1') is None

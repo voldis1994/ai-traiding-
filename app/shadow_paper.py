@@ -167,7 +167,7 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
 
 
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
-                     original_risk, tick, min_distance):
+                     original_risk, tick, min_distance, store=None):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
 
     Same BE / post-BE gap idea as `propose_broker_trail` — never flips on signal.
@@ -192,7 +192,11 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     else:
         tip=tip+half
     be_locked=sign*(stop-entry)>=-1e-12
-    trail_gap=open_gap if not be_locked else max(minimum,min(open_gap,max(2.0*minimum,0.35*open_gap)))
+    if be_locked:
+        from .protection_ai import _post_be_trail_gap
+        trail_gap=_post_be_trail_gap(open_gap,minimum,None,store=store)
+    else:
+        trail_gap=open_gap
     need=open_gap if not be_locked else trail_gap
     tip_fav=sign*(tip-entry)
     if tip_fav<need:return None
@@ -360,7 +364,8 @@ class ShadowPaperJournal:
                 high=hi,low=lo,mid=mid,spread=sp,
                 original_risk=pos.get('original_risk'),
                 tick=pos.get('tick') or tick,
-                min_distance=pos.get('min_distance') or min_distance)
+                min_distance=pos.get('min_distance') or min_distance,
+                store=self.store)
             if new_stop is not None:
                 pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
                 self.position=pos

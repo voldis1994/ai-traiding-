@@ -94,7 +94,7 @@ BOUNDS = {
 }
 
 IMMUTABLE_NOTE = (
-    'Capital: no volume/DOM (Yahoo GC/GLD + Coinbase/OKX PAXG are EXTERNAL). '
+    'Capital: no volume/DOM (per-instrument Yahoo/Coinbase/OKX liquidity is EXTERNAL). '
     'Layout: BASE|DYNAMIC|EXTERNAL. Actions: BUY/SELL/HOLD. '
     'Broker tick/min-stop/margin are exchange rules.'
 )

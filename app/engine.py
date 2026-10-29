@@ -721,14 +721,19 @@ class SingleTradeEngine:
         moment=time.monotonic()
         if self.last_liquidity_refresh and moment-self.last_liquidity_refresh<45:return
         self.last_liquidity_refresh=moment
-        result=await refresh_liquidity(self.liquidity_path)
+        epic=(self.mandate or {}).get('epic')
+        result=await refresh_liquidity(
+            self.liquidity_path, epic=epic, profile=self.instrument_profile)
         self.liquidity_feed_error=None if result.get('ok') else result.get('reason')
         if not result.get('ok'):
-            self.store.event('warning','Public gold liquidity feed incomplete',
-                             {'reason':result.get('reason'),'sources':result.get('sources')})
+            self.store.event('warning','Public liquidity feed incomplete for instrument',
+                             {'epic':epic,'reason':result.get('reason'),
+                              'sources':result.get('sources'),
+                              'routes':(result.get('routes') or {}).get('label')})
         else:
-            self.store.event('market','Public gold volume/DOM snapshot refreshed',
-                             {'sources':result.get('sources')})
+            self.store.event('market','Public volume/DOM snapshot refreshed',
+                             {'epic':epic,'sources':result.get('sources'),
+                              'routes':(result.get('routes') or {}).get('label')})
 
     def _schedule_liquidity_in_background(self):
         if self._liquidity_task is not None and not self._liquidity_task.done():return

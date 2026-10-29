@@ -120,7 +120,8 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
         return None
     liq = None
     if liquidity_path is not None:
-        liq = liquidity_features_from_path(liquidity_path, base.get('bar_time'), now=now)
+        liq = liquidity_features_from_path(
+            liquidity_path, base.get('bar_time'), now=now, epic=epic)
     if liq is None:
         return None
     ohlc = list(base['features'])

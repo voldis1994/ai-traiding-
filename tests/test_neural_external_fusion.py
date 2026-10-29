@@ -34,9 +34,9 @@ def calendar(path, *, currencies=('USD',),when=BASE+timedelta(hours=1)):
         'impact':'HIGH','currencies':list(currencies),'epics':[],'name':'CPI'}]}))
 
 
-def _liq(path, *, bar=BASE):
-    # Align fixture liquidity bars to the fusion bar timeline.
-    snap=liquidity_snapshot(bar=bar)
+def _liq(path, *, bar=BASE, epic='EURUSD'):
+    # Align fixture liquidity bars to the fusion bar timeline + epic.
+    snap=liquidity_snapshot(bar=bar, epic=epic)
     path.write_text(json.dumps(snap),encoding='utf-8')
     return path
 
@@ -170,8 +170,8 @@ def test_engine_poll_reaches_neurons_from_capital_reference_feed(tmp_path,monkey
                 items.append(row)
             return {'prices':items}
     calendar(tmp_path/'economic_calendar.json',when=BASE+timedelta(hours=3))
-    # Liquidity bars must cover the live clock minute used by market_features.
-    _liq(tmp_path/'liquidity_snapshot.json', bar=clock[0]-timedelta(minutes=1))
+    # Liquidity bars must cover the live clock minute; epic matches broker SIM mandate.
+    _liq(tmp_path/'liquidity_snapshot.json', bar=clock[0]-timedelta(minutes=1), epic='SIM')
 
     async def run():
         store=Store(tmp_path/'state.db')
@@ -188,17 +188,18 @@ def test_engine_poll_reaches_neurons_from_capital_reference_feed(tmp_path,monkey
         await engine.sync()
         broker.open=[]
         await engine.sync()
+        epic=(engine.mandate or {}).get('epic') or 'SIM'
         # Keep liquidity snapshot aligned to the completed M1 bar under test.
         bar_guess=clock[0].replace(second=0,microsecond=0)-timedelta(minutes=1)
-        _liq(engine.liquidity_path, bar=bar_guess)
+        _liq(engine.liquidity_path, bar=bar_guess, epic=epic)
         await engine.poll()
         # If fusion still not ready (bar_time mismatch), refresh to exact context bar.
         if not engine.latest_fusion_ready and engine.market_context.get('bar_time'):
             bt=datetime.fromisoformat(engine.market_context['bar_time'].replace('Z','+00:00'))
-            _liq(engine.liquidity_path, bar=bt)
+            _liq(engine.liquidity_path, bar=bt, epic=epic)
             # Force a second poll after liquidity aligned.
             clock[0]=clock[0]+timedelta(minutes=1)
-            _liq(engine.liquidity_path, bar=clock[0]-timedelta(minutes=1))
+            _liq(engine.liquidity_path, bar=clock[0]-timedelta(minutes=1), epic=epic)
             await engine.poll()
         state=engine.snapshot()
         assert brain.core.d==FUSION_DIM and brain.feature_schema==FUSION_SCHEMA

@@ -11,6 +11,27 @@ import torch.nn.functional as F
 
 ACTIONS=('BUY','SELL','HOLD')
 
+# Audit #17 — two distinct supervised objectives share the same NeuralCore.
+# Minute-direction (next M1 bar) is frequent and auxiliary; closed-trade P&L is
+# the primary corrective teacher. Relative weights keep M1 updates from washing
+# out sparse trade-PnL gradients (trade_pnl : minute_direction = 5 : 1).
+OBJECTIVE_MINUTE_DIRECTION = 'minute_direction'
+OBJECTIVE_TRADE_PNL = 'trade_pnl'
+OBJECTIVE_WEIGHTS = {
+    OBJECTIVE_MINUTE_DIRECTION: 0.2,
+    OBJECTIVE_TRADE_PNL: 1.0,
+}
+# Documented ratio used by AdaptiveBrain / machine_spec.
+MINUTE_VS_TRADE_WEIGHT_RATIO = (
+    OBJECTIVE_WEIGHTS[OBJECTIVE_MINUTE_DIRECTION]
+    / OBJECTIVE_WEIGHTS[OBJECTIVE_TRADE_PNL]
+)
+
+# Audit #18 — ordinary online updates snapshot prior weights, bound ΔW, and
+# restore when the same-example CE criterion worsens. Never "proven".
+WEIGHT_PARAM_NAMES = ('P', 'W', 'R', 'O', 'b', 'G', 'tau', 'tau_c')
+DEFAULT_MAX_WEIGHT_DELTA_NORM = 2.0
+
 
 def client_neural_seed(client_id) -> int:
     """Stable per-client init seed so fresh brains are not clones of default seed=7.
@@ -42,6 +63,7 @@ class NeuralCore:
         self.G=rng.normal(0,.12,(d,n))
         self.vbar=0.;self.steps=0;self.last_z=np.zeros(d);self.last_transition=None
         self.births=0;self.deaths=0;self.last_loss=None;self.last_grad=0.;self.accuracy=0.
+        self.last_learn_meta=None  # audit #17–18: objective + controlled-update status
         # Stable neuron identities let delayed examples survive network growth/pruning.
         self.neuron_ids=np.arange(n,dtype=np.int64);self.next_neuron_id=n
 
@@ -102,40 +124,160 @@ class NeuralCore:
     # regret while gradient clipping (max_norm=2) still bounds instability.
     DEFAULT_LR = 0.15
 
-    def learn(self,transition,label,lr=None,reconstruction_weight=.01):
-        """One-step BPTT supervised delayed price-direction class and reconstruction objective.
-        Model outputs are trained on market direction proxy, not financial returns.
+    def snapshot_weights(self):
+        """Copy trainable matrices for controlled update / restore (audit #18)."""
+        return {name: np.asarray(getattr(self, name), dtype=float).copy()
+                for name in WEIGHT_PARAM_NAMES}
+
+    def restore_weights(self, snap):
+        """Reload a prior weight snapshot. Returns False if shapes disagree."""
+        if not isinstance(snap, dict):
+            return False
+        for name in WEIGHT_PARAM_NAMES:
+            if name not in snap:
+                return False
+            cur = getattr(self, name)
+            arr = np.asarray(snap[name], dtype=float)
+            if arr.shape != np.asarray(cur).shape or not np.isfinite(arr).all():
+                return False
+        for name in WEIGHT_PARAM_NAMES:
+            setattr(self, name, np.asarray(snap[name], dtype=float).copy())
+        return True
+
+    @staticmethod
+    def weight_delta_norm(before, after):
+        """L2 norm of concatenated Δ across trainable params."""
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return float('inf')
+        total = 0.0
+        for name in WEIGHT_PARAM_NAMES:
+            if name not in before or name not in after:
+                return float('inf')
+            d = np.asarray(after[name], dtype=float) - np.asarray(before[name], dtype=float)
+            total += float(np.sum(d * d))
+        return float(np.sqrt(total))
+
+    def _ce_on_transition(self, transition, label):
+        """Forward-only cross-entropy for restore criterion (no grad)."""
+        if transition is None or label not in (0, 1, 2):
+            return None
+        aligned = self._aligned_state(
+            transition['h'], transition['c'], transition.get('neuron_ids'))
+        if aligned is None:
+            return None
+        z = np.asarray(transition['z'], dtype=float)
+        h, c = aligned
+        dt = float(transition['dt'])
+        if z.shape != (self.d,) or not np.isfinite(dt) or dt <= 0:
+            return None
+        lam = 1 - np.exp(-dt / np.maximum(self.tau, 0.01))
+        hn = h + lam * (np.tanh(self.P @ z + self.W @ h) - h)
+        gamma = 1 - np.exp(-dt / np.maximum(self.tau_c, 0.01))
+        cn = c + gamma * (np.tanh(0.5 * hn + 0.2 * c) - c)
+        logits = self.R @ hn + self.O @ cn + self.b
+        prob = self._softmax(logits)
+        p = max(float(prob[label]), 1e-15)
+        return float(-np.log(p))
+
+    def learn(self, transition, label, lr=None, reconstruction_weight=.01,
+              objective=None, max_delta_norm=None, restore_if_worsens=True):
+        """One-step BPTT with objective weighting + controlled ΔW (audit #17–18).
+
+        `objective` selects OBJECTIVE_WEIGHTS (minute_direction vs trade_pnl).
+        Prior weights are snapshotted; the step is projected onto
+        max_delta_norm; if same-example CE worsens, weights restore.
+        Ordinary learn never reports proven_improvement.
         """
-        if lr is None:lr=self.DEFAULT_LR
-        if not (isinstance(lr,(int,float)) and lr>0):raise ValueError('Learning rate must be positive')
-        if transition is None or label not in (0,1,2):return None
-        t=lambda value,grad=False:torch.tensor(value,dtype=torch.float64,requires_grad=grad)
-        tensors={name:t(getattr(self,name),True) for name in ('P','W','R','O','b','G','tau','tau_c')}
-        p,w,r,o,b,g,tau,tauc=(tensors[name] for name in ('P','W','R','O','b','G','tau','tau_c'))
-        aligned=self._aligned_state(transition['h'],transition['c'],transition.get('neuron_ids'))
-        if aligned is None:return None
-        z=t(transition['z']);h=t(aligned[0]);c=t(aligned[1]);dt=float(transition['dt'])
-        if tuple(z.shape)!=(self.d,) or not np.isfinite(float(dt)) or dt<=0:return None
-        lam=1-torch.exp(-dt/torch.clamp(tau,min=.01))
-        hn=h+lam*(torch.tanh(p@z+w@h)-h)
-        gamma=1-torch.exp(-dt/torch.clamp(tauc,min=.01))
-        cn=c+gamma*(torch.tanh(.5*hn+.2*c)-c)
-        logits=r@hn+o@cn+b
-        ce=F.cross_entropy(logits.unsqueeze(0),torch.tensor([label]))
-        reconstruction=F.mse_loss(g@hn,z)
-        loss=ce+reconstruction_weight*reconstruction
-        if not torch.isfinite(loss):return None
+        if lr is None:
+            lr = self.DEFAULT_LR
+        if not (isinstance(lr, (int, float)) and lr > 0):
+            raise ValueError('Learning rate must be positive')
+        if transition is None or label not in (0, 1, 2):
+            return None
+        obj = objective if objective in OBJECTIVE_WEIGHTS else None
+        obj_weight = float(OBJECTIVE_WEIGHTS[obj]) if obj else 1.0
+        eff_lr = float(lr) * obj_weight
+        if max_delta_norm is None:
+            max_delta_norm = DEFAULT_MAX_WEIGHT_DELTA_NORM
+        max_delta_norm = float(max_delta_norm)
+        prior = self.snapshot_weights()
+        ce_before = self._ce_on_transition(transition, label)
+
+        t = lambda value, grad=False: torch.tensor(value, dtype=torch.float64, requires_grad=grad)
+        tensors = {name: t(getattr(self, name), True) for name in WEIGHT_PARAM_NAMES}
+        p, w, r, o, b, g, tau, tauc = (tensors[name] for name in WEIGHT_PARAM_NAMES)
+        aligned = self._aligned_state(transition['h'], transition['c'], transition.get('neuron_ids'))
+        if aligned is None:
+            return None
+        z = t(transition['z']); h = t(aligned[0]); c = t(aligned[1]); dt = float(transition['dt'])
+        if tuple(z.shape) != (self.d,) or not np.isfinite(float(dt)) or dt <= 0:
+            return None
+        lam = 1 - torch.exp(-dt / torch.clamp(tau, min=.01))
+        hn = h + lam * (torch.tanh(p @ z + w @ h) - h)
+        gamma = 1 - torch.exp(-dt / torch.clamp(tauc, min=.01))
+        cn = c + gamma * (torch.tanh(.5 * hn + .2 * c) - c)
+        logits = r @ hn + o @ cn + b
+        ce = F.cross_entropy(logits.unsqueeze(0), torch.tensor([label]))
+        reconstruction = F.mse_loss(g @ hn, z)
+        loss = ce + reconstruction_weight * reconstruction
+        if not torch.isfinite(loss):
+            return None
         loss.backward()
-        norm=torch.nn.utils.clip_grad_norm_(list(tensors.values()),max_norm=2.)
-        if not torch.isfinite(norm):return None
-        for name,param in tensors.items():
-            grad=param.grad
-            if grad is None:continue
-            updated=getattr(self,name)-lr*grad.detach().numpy()
-            if name in ('tau','tau_c'):updated=np.clip(updated,.1,1000.)
-            if not np.isfinite(updated).all():return None
-            setattr(self,name,updated)
-        self.last_loss=float(loss.detach());self.last_grad=float(norm.detach())
+        norm = torch.nn.utils.clip_grad_norm_(list(tensors.values()), max_norm=2.)
+        if not torch.isfinite(norm):
+            return None
+        proposed = {}
+        for name, param in tensors.items():
+            grad = param.grad
+            if grad is None:
+                proposed[name] = getattr(self, name).copy()
+                continue
+            updated = getattr(self, name) - eff_lr * grad.detach().numpy()
+            if name in ('tau', 'tau_c'):
+                updated = np.clip(updated, .1, 1000.)
+            if not np.isfinite(updated).all():
+                return None
+            proposed[name] = updated
+
+        # Bound ΔW: project proposed step onto L2 ball of radius max_delta_norm.
+        clipped = False
+        delta_norm = self.weight_delta_norm(prior, proposed)
+        if (np.isfinite(max_delta_norm) and max_delta_norm > 0
+                and np.isfinite(delta_norm) and delta_norm > max_delta_norm):
+            scale = max_delta_norm / delta_norm
+            for name in WEIGHT_PARAM_NAMES:
+                proposed[name] = prior[name] + scale * (proposed[name] - prior[name])
+                if name in ('tau', 'tau_c'):
+                    proposed[name] = np.clip(proposed[name], .1, 1000.)
+            clipped = True
+            delta_norm = self.weight_delta_norm(prior, proposed)
+
+        for name in WEIGHT_PARAM_NAMES:
+            setattr(self, name, proposed[name])
+
+        restored = False
+        ce_after = self._ce_on_transition(transition, label)
+        if (restore_if_worsens and ce_before is not None and ce_after is not None
+                and ce_after > ce_before + 1e-12):
+            self.restore_weights(prior)
+            restored = True
+            delta_norm = 0.0
+            ce_after = ce_before
+
+        self.last_loss = float(loss.detach())
+        self.last_grad = float(norm.detach())
+        # Audit #18: weight change is never a proven trading improvement.
+        self.last_learn_meta = {
+            'objective': obj or 'unspecified',
+            'objective_weight': obj_weight,
+            'eff_lr': eff_lr,
+            'delta_norm': float(delta_norm) if np.isfinite(delta_norm) else None,
+            'clipped': clipped,
+            'restored': restored,
+            'ce_before': ce_before,
+            'ce_after': ce_after,
+            'proven_improvement': False,
+        }
         # h/c are detached persistent state, not overwritten during learning.
         return self.last_loss
 

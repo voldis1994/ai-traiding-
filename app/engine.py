@@ -811,14 +811,21 @@ class AdaptiveBrain:
 
     def learn_from_trade(self, transition, label, *, lr=None, won=False,
                          count_sample=True):
-        """Closed-trade P&L objective — separate from minute-direction (audit #17)."""
+        """Closed-trade P&L objective — separate from minute-direction (audit #17–18).
+
+        Uses OBJECTIVE_TRADE_PNL weight (1.0). Updates trade_* counters only —
+        never minute labeled/correct. Ordinary learn is never proven_improvement.
+        """
         from .core import OBJECTIVE_TRADE_PNL
         if transition is None or label not in (0,1,2):return None
         loss=self.core.learn(transition,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
-        if count_sample:
+        meta=getattr(self.core,'last_learn_meta',None) or {}
+        if count_sample and loss is not None:
             self.trade_labeled+=1
             self.trade_correct+=int(bool(won))
-        meta=getattr(self.core,'last_learn_meta',None) or {}
+        if meta.get('proven_improvement'):
+            meta=dict(meta);meta['proven_improvement']=False
+            self.core.last_learn_meta=meta
         self.store.event('learning','Trade-PnL objective update',{
             'objective':'trade_pnl',
             'objective_weight':self.TRADE_OBJECTIVE_WEIGHT,

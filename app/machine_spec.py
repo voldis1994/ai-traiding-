@@ -4,7 +4,13 @@ This module does not execute trades. It documents the LIVE decision path so
 version history (v3 features / v4 fusion / v6 argmax) is not confused with
 competing LIVE vetoes. Full Latvian explanation: PASMACISANAS_MASINA_LV.md
 """
-from .core import NeuralCore
+from .core import (
+    NeuralCore,
+    OBJECTIVE_WEIGHTS,
+    MINUTE_VS_TRADE_WEIGHT_RATIO,
+    OBJECTIVE_MINUTE_DIRECTION,
+    OBJECTIVE_TRADE_PNL,
+)
 from .market_context import FEATURE_DIM, FEATURE_SCHEMA
 from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 
@@ -17,6 +23,14 @@ DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight st
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions
 # Closed-trade P&L regret is the primary corrective teacher (engine._learn_closed_trade).
 PRIMARY_FEEDBACK = 'closed_trade_pnl_counterfactual_buy_sell_hold'
+# Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
+LEARN_OBJECTIVES = {
+    OBJECTIVE_MINUTE_DIRECTION: OBJECTIVE_WEIGHTS[OBJECTIVE_MINUTE_DIRECTION],
+    OBJECTIVE_TRADE_PNL: OBJECTIVE_WEIGHTS[OBJECTIVE_TRADE_PNL],
+}
+# MINUTE_VS_TRADE_WEIGHT_RATIO re-exported from core (0.2).
+# Audit #18: snapshot / bound ΔW / restore on CE worsen; never proven on ordinary learn.
+WEIGHT_UPDATE_POLICY = 'snapshot_bound_delta_restore_on_ce_worsen_never_proven'
 FEATURE_SCHEMAS = {
     'ohlc_v3': {'schema': FEATURE_SCHEMA, 'dim': FEATURE_DIM},
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},

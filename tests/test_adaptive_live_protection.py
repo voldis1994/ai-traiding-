@@ -55,11 +55,13 @@ def test_trail_uses_opening_risk_not_live_min_glue():
     buy=propose_broker_trail(_position(),_market(101.35,101.45),_meta(.8))
     assert buy and buy['stop_level']==100.55  # tip − opening risk
     assert buy['trail_gap']==.8
-    assert buy['profit_level'] is None
+    # Must re-send live TP so Capital does not turn Take Profit Off.
+    assert buy['profit_level']==101.6
     sellpos=_position('SELL',stop=100.8,profit=98.4)
     sell=propose_broker_trail(sellpos,_market(98.55,98.65),_meta(.8))
     assert sell and sell['stop_level']==99.45  # tip + opening risk
     assert sell['trail_gap']==.8
+    assert sell['profit_level']==98.4
 
 
 def test_trail_waits_until_favorable_covers_opening_gap():
@@ -74,44 +76,49 @@ def test_stop_never_widens_if_existing_better_and_no_manual_trade():
     assert propose_broker_trail(_position(),dict(_market(101.35,101.45),status='CLOSED'),_meta()) is None
 
 
-def test_broker_trail_does_not_invent_tp_extension():
+def test_broker_trail_preserves_live_tp_never_clears_it():
+    """Omitting profitLevel on Capital PUT turns TP Off — trail must re-send TP."""
     current=_market(bid=101.1,ask=101.2)
     p=_position(stop=99.2,profit=101.6)
     result=propose_broker_trail(p,current,_meta(.8))
-    assert result and result['profit_level'] is None
+    assert result and result['profit_level']==101.6
+    assert result['preserve_tp'] is True
     assert result['stop_level']==101.1-0.8
 
 
 def test_trail_still_ratchets_when_take_profit_is_off():
-    """Capital UI Take Profit Off must not freeze robot trailing SL."""
+    """If Capital already shows TP Off, trail SL still works — without inventing TP."""
     # Stop still below entry → opening gap path (not yet BE-locked).
     p=_position(stop=99.5,profit=None)
     buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8))
     assert buy and buy['stop_level']==100.55
     assert buy['profit_level'] is None
+    assert buy['preserve_tp'] is False
     sell=_position('SELL',stop=100.5,profit=None)
     out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8))
     assert out and out['stop_level']==99.45
 
 
 def test_trail_continues_past_break_even_using_ohlc_zone_gap():
-    """After BE, follow distance comes from OHLC median range — not 0.35*R."""
+    """After BE, follow distance from OHLC — never tip±minStop alone (early SL)."""
     p=_position(stop=100.05,profit=103.0)
     buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35,
                              zone_range=0.4)
     assert buy is not None
     assert buy['be_locked'] is True
-    # gap = max(min=0.3, min(open=0.8, zone=0.4)) → 0.4
-    assert buy['trail_gap']==pytest.approx(0.4)
+    # floor = max(0.3, min(0.8, max(0.6, 0.28))) = 0.6; then max(0.6, min(0.8, 0.4)) = 0.6
+    assert buy['trail_gap']==pytest.approx(0.6)
     assert buy['stop_level']>100.05
-    assert buy['stop_level']==pytest.approx(101.35-0.4,abs=0.02)
-    # Without OHLC yet → only broker min (still past BE, no magic %).
+    assert buy['stop_level']==pytest.approx(101.35-0.6,abs=0.02)
+    assert buy['profit_level']==103.0
+    # Without OHLC yet → half opening risk (not raw minStop).
     bare=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
-    assert bare and bare['trail_gap']==pytest.approx(0.3)
+    assert bare and bare['trail_gap']==pytest.approx(0.6)
     sell=_position('SELL',stop=99.95,profit=97.0)
     out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8),extreme=98.55,
                              zone_range=0.4)
     assert out and out['be_locked'] is True and out['stop_level']<99.95
+    assert out['profit_level']==97.0
 
 
 class Brain:
@@ -133,7 +140,11 @@ class UpdatingBroker(BrokerSimulation):
         if self.fail:raise TimeoutError('Uncertain broker response')
         if not self.return_old and not self.reject:
             if stop_level is not None:self.open[0]['position']['stopLevel']=float(stop_level)
-            if profit_level is not None:self.open[0]['position']['profitLevel']=float(profit_level)
+            # Mirror Capital: omitting profitLevel turns Take Profit Off.
+            if profit_level is not None:
+                self.open[0]['position']['profitLevel']=float(profit_level)
+            else:
+                self.open[0]['position']['profitLevel']=None
         return {'dealReference':'change1'}
     async def confirm(self,ref):return {'dealStatus':'REJECTED' if self.reject else 'ACCEPTED','dealId':'auto1'}
 
@@ -158,10 +169,26 @@ def test_live_update_protects_with_confirmation_and_throttle():
             await e.adapt_protection(e.positions[0])
             assert len(b.requests)==1
             assert b.open[0]['position']['stopLevel']>99.2
+            # Trail PUT must include profitLevel so Capital keeps TP.
+            assert b.requests[0][3]==101.6
+            assert b.open[0]['position']['profitLevel']==101.6
             assert not s.unresolved()
             assert s.get('adaptive_runtime:auto1')['status']=='CONFIRMED'
             await e.adapt_protection(e.positions[0])
             assert len(b.requests)==1
+    asyncio.run(scenario())
+
+
+def test_trail_put_never_clears_existing_take_profit():
+    """Regression: TP touched but never filled because trail wiped profitLevel."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            e,b,s=engine_fixture(d)
+            await e.sync()
+            live_tp=e.positions[0]['profitLevel']
+            await e.adapt_protection(e.positions[0])
+            assert b.requests and b.requests[0][3]==live_tp
+            assert e.positions[0]['profitLevel']==live_tp
     asyncio.run(scenario())
 
 

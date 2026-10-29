@@ -7,7 +7,9 @@ been detected in this authenticated session and broker confirmed its closure.
 import asyncio
 import json
 import math
+import os
 import re
+import resource
 import sqlite3
 import time
 from collections import deque
@@ -17,12 +19,18 @@ from pathlib import Path
 import numpy as np
 from .core import NeuralCore
 from .autonomy import AutoEvolution
-from .math_rules import stop_take, ohlc_range_distance
+from .math_rules import (stop_take, ohlc_range_distance,
+                         distances_meet_broker_min, levels_meet_broker_min,
+                         cash_risk, tick_value_from_instrument)
 from . import bracket_learn
+from . import hard_risk
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
-from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES
+from .market_fusion import (
+    FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES,
+    fusion_gap_reason,
+)
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
 from .feature_validation import FeatureValidator
@@ -211,12 +219,18 @@ class AdaptiveBrain:
     Background labels use the NEXT completed minute (HORIZON=1) so learning
     does not trail eight bars behind live decisions. Real closed-trade P&L is
     the primary corrective signal (see SingleTradeEngine._learn_closed_trade).
+    Audit #17: minute-direction and trade-PnL keep separate counters and
+    OBJECTIVE_WEIGHTS so frequent M1 labels cannot wash out trade learning.
     Uncalibrated softmax scores are not probabilities of profitable trades.
     """
     LABEL_VERSION=4  # v4: 1-bar market labels + trade P&L regret learning
     HORIZON=1        # same cadence as M1 decisions — not an 8-minute lag
     GROWTH_INTERVAL=8   # faster structural growth so the net adapts with trades
     FAST_GROWTH_INTERVAL=4  # sustained high reconstruction error
+    # Relative objective weights (core.OBJECTIVE_WEIGHTS): trade_pnl=1.0,
+    # minute_direction=0.2 → trade signal is 5× stronger per update step.
+    MINUTE_OBJECTIVE_WEIGHT=0.2
+    TRADE_OBJECTIVE_WEIGHT=1.0
 
     def __init__(self,store,n=16,data_dir=None,seed=7):
         self.store=store
@@ -229,6 +243,10 @@ class AdaptiveBrain:
         self._legacy_epic=self.store.get('legacy_brain_epic')
         self.history=deque(maxlen=1000)
         self.pending=deque()
+        # Audit #17: minute-direction vs trade-PnL tallies stay separate.
+        # `correct`/`labeled` remain the minute-direction aliases (UI/compat).
+        self.minute_correct=0;self.minute_labeled=0
+        self.trade_correct=0;self.trade_labeled=0
         self.correct=0;self.labeled=0;self.last_change=0.;self.last_mid=None
         self.prior_record=None;self.last_regime='LEARNING'
         self.feature_schema=None
@@ -254,6 +272,9 @@ class AdaptiveBrain:
 
     def _restore_context(self,epic):
         self.history=deque(maxlen=1000);self.pending=deque()
+        self.minute_correct=0;self.minute_labeled=0
+        # Trade-PnL counters are session/runtime (not rebuilt from minute signals).
+        self.trade_correct=0;self.trade_labeled=0
         self.correct=0;self.labeled=0;self.last_mid=None;self.last_change=0.
         self.prior_record=None;self.last_regime='LEARNING'
         # Old (one-tick) labels remain in the audit table, but must NOT silently
@@ -275,8 +296,11 @@ class AdaptiveBrain:
         good=self.store.db.execute('''SELECT action,label FROM signals
             WHERE epic=? AND label_version=? AND label IS NOT NULL''',(epic,self.LABEL_VERSION))
         for action,label in good:
-            self.labeled+=1
-            self.correct+=int(action==('BUY','SELL','HOLD')[int(label)])
+            # Signals table holds minute-direction labels only (audit #17).
+            self.minute_labeled+=1
+            self.minute_correct+=int(action==('BUY','SELL','HOLD')[int(label)])
+        self.labeled=self.minute_labeled
+        self.correct=self.minute_correct
 
     def _json_transition(self,transition):
         if transition is None:return None
@@ -301,50 +325,132 @@ class AdaptiveBrain:
         self.epic=epic
         self._restore_context(epic)
         self._restore_pending(epic)
+        # New/reset instrument context requires prep/eval before LIVE OPEN (audit #22).
+        # Warm brains with enough online labels can re-qualify via trading_readiness().
+        if self.labeled < 64:
+            try:
+                from . import model_readiness
+                model_readiness.reset_state(
+                    self.store,epic,
+                    reason='New/reset instrument — load candles then train/eval before LIVE OPEN')
+            except Exception:
+                pass
         self.store.event('learning','Instrument learning context activated',{'epic':epic})
 
+    def _reset_fresh_core(self):
+        self.core=NeuralCore(n=self.initial_neurons,seed=self.init_seed)
+        self.feature_schema=None
+        self.fusion_labels=0
+        self.ohlc_dim=FEATURE_DIM;self.fusion_dim=FUSION_DIM
+        self.ohlc_schema=FEATURE_SCHEMA;self.fusion_schema=FUSION_SCHEMA
+        self.model_version=0
+
+    def _core_snapshot(self):
+        """In-memory clone of weights + schema so a failed restore can roll back."""
+        c=self.core
+        names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G','neuron_ids')
+        arrays={n:getattr(c,n).copy() for n in names if hasattr(c,n)}
+        return {
+            'arrays':arrays,
+            'n':c.n,'d':c.d,'steps':c.steps,'vbar':c.vbar,
+            'births':c.births,'deaths':c.deaths,
+            'next_neuron_id':getattr(c,'next_neuron_id',c.n),
+            'feature_schema':self.feature_schema,'fusion_labels':self.fusion_labels,
+            'ohlc_dim':self.ohlc_dim,'fusion_dim':self.fusion_dim,
+            'ohlc_schema':self.ohlc_schema,'fusion_schema':self.fusion_schema,
+            'model_version':self.model_version,
+        }
+
+    def _apply_core_snapshot(self, snap):
+        c=self.core
+        for name,arr in snap['arrays'].items():
+            setattr(c,name,arr.copy())
+        c.n=int(snap['n']);c.d=int(snap['d'])
+        c.last_z=np.zeros(c.d)
+        c.steps=int(snap['steps']);c.vbar=float(snap['vbar'])
+        c.births=int(snap['births']);c.deaths=int(snap['deaths'])
+        c.next_neuron_id=int(snap['next_neuron_id'])
+        self.feature_schema=snap['feature_schema']
+        self.fusion_labels=int(snap['fusion_labels'])
+        self.ohlc_dim=int(snap['ohlc_dim']);self.fusion_dim=int(snap['fusion_dim'])
+        self.ohlc_schema=snap['ohlc_schema'];self.fusion_schema=snap['fusion_schema']
+        self.model_version=int(snap['model_version'])
+
+    def _read_weight_file(self, path, expected_epic=None):
+        """Parse + validate a .npz brain file. Raises on corrupt/mismatch. No mutate."""
+        path=Path(path)
+        with np.load(path,allow_pickle=False) as d:
+            file_epic=str(d['epic']) if 'epic' in d else ''
+            if expected_epic and file_epic and str(file_epic)!=str(expected_epic):
+                raise ValueError('Brain file instrument mismatch')
+            names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G')
+            arrays={name:d[name].copy() for name in names}
+            n=len(arrays['h']);d_in=arrays['P'].shape[1]
+            feature_schema=str(d['feature_schema']) if 'feature_schema' in d else None
+            ohlc_dim=int(d['ohlc_dim']) if 'ohlc_dim' in d else FEATURE_DIM
+            fusion_dim=int(d['fusion_dim']) if 'fusion_dim' in d else FUSION_DIM
+            ohlc_schema=str(d['ohlc_schema']) if 'ohlc_schema' in d else FEATURE_SCHEMA
+            fusion_schema=str(d['fusion_schema']) if 'fusion_schema' in d else FUSION_SCHEMA
+            if ((feature_schema==fusion_schema and d_in!=fusion_dim)
+                or (feature_schema==ohlc_schema and d_in!=ohlc_dim)
+                or (feature_schema==FUSION_SCHEMA and d_in!=FUSION_DIM and 'fusion_dim' not in d)
+                or (feature_schema==FEATURE_SCHEMA and d_in!=FEATURE_DIM and 'ohlc_dim' not in d)):
+                raise ValueError('Stored neural feature schema and input weights disagree')
+            for name in names:
+                arr=arrays[name]
+                if not np.isfinite(arr).all():
+                    raise ValueError(f'Non-finite weights in {name}')
+            if 'neuron_ids' in d:
+                neuron_ids=d['neuron_ids'].astype(np.int64).copy()
+                next_neuron_id=int(d['next_neuron_id'])
+            else:
+                neuron_ids=np.arange(n,dtype=np.int64)
+                next_neuron_id=n
+            if len(neuron_ids)!=n:
+                raise ValueError('neuron_ids length disagrees with core size')
+            meta={
+                'epic':file_epic,'n':n,'d':d_in,
+                'steps':int(d['steps']),'vbar':float(d['vbar']),
+                'births':int(d['births']) if 'births' in d else 0,
+                'deaths':int(d['deaths']) if 'deaths' in d else 0,
+                'feature_schema':feature_schema,
+                'fusion_labels':int(d['fusion_labels']) if 'fusion_labels' in d else 0,
+                'ohlc_dim':ohlc_dim,'fusion_dim':fusion_dim,
+                'ohlc_schema':ohlc_schema,'fusion_schema':fusion_schema,
+                'model_version':int(d['model_version']) if 'model_version' in d else 0,
+                'neuron_ids':neuron_ids,'next_neuron_id':next_neuron_id,
+            }
+            arrays['neuron_ids']=neuron_ids
+            return arrays,meta
+
+    def _apply_weight_payload(self, arrays, meta):
+        c=self.core
+        for name,arr in arrays.items():
+            setattr(c,name,arr.copy())
+        c.n=int(meta['n']);c.d=int(meta['d'])
+        c.last_z=np.zeros(c.d)
+        c.steps=int(meta['steps']);c.vbar=float(meta['vbar'])
+        c.births=int(meta['births']);c.deaths=int(meta['deaths'])
+        c.next_neuron_id=int(meta['next_neuron_id'])
+        self.feature_schema=meta['feature_schema']
+        self.fusion_labels=int(meta['fusion_labels'])
+        self.ohlc_dim=int(meta['ohlc_dim']);self.fusion_dim=int(meta['fusion_dim'])
+        self.ohlc_schema=meta['ohlc_schema'];self.fusion_schema=meta['fusion_schema']
+        self.model_version=int(meta['model_version'])
+
     def load(self,path=None,expected_epic=None):
+        """Boot-time load. Corrupt files reset to a fresh core (return False)."""
         path=Path(path) if path else self.path
-        if not path.exists():return
+        if not path.exists():return False
         try:
-            with np.load(path,allow_pickle=False) as d:
-                if expected_epic and 'epic' in d and str(d['epic'])!=expected_epic:
-                    raise ValueError('Brain file instrument mismatch')
-                names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G')
-                for name in names:setattr(self.core,name,d[name].copy())
-                self.core.n=len(self.core.h)
-                self.core.d=self.core.P.shape[1]
-                self.core.last_z=np.zeros(self.core.d)
-                self.core.steps=int(d['steps']);self.core.vbar=float(d['vbar'])
-                for name in ('births','deaths'):
-                    if name in d:setattr(self.core,name,int(d[name]))
-                self.feature_schema=str(d['feature_schema']) if 'feature_schema' in d else None
-                self.fusion_labels=int(d['fusion_labels']) if 'fusion_labels' in d else 0
-                self.ohlc_dim=int(d['ohlc_dim']) if 'ohlc_dim' in d else FEATURE_DIM
-                self.fusion_dim=int(d['fusion_dim']) if 'fusion_dim' in d else FUSION_DIM
-                self.ohlc_schema=str(d['ohlc_schema']) if 'ohlc_schema' in d else FEATURE_SCHEMA
-                self.fusion_schema=str(d['fusion_schema']) if 'fusion_schema' in d else FUSION_SCHEMA
-                self.model_version=int(d['model_version']) if 'model_version' in d else 0
-                if ((self.feature_schema==self.fusion_schema and self.core.d!=self.fusion_dim)
-                    or (self.feature_schema==self.ohlc_schema and self.core.d!=self.ohlc_dim)
-                    or (self.feature_schema==FUSION_SCHEMA and self.core.d!=FUSION_DIM and 'fusion_dim' not in d)
-                    or (self.feature_schema==FEATURE_SCHEMA and self.core.d!=FEATURE_DIM and 'ohlc_dim' not in d)):
-                    raise ValueError('Stored neural feature schema and input weights disagree')
-                if 'neuron_ids' in d:
-                    self.core.neuron_ids=d['neuron_ids'].astype(np.int64).copy()
-                    self.core.next_neuron_id=int(d['next_neuron_id'])
-                else:
-                    self.core.neuron_ids=np.arange(self.core.n,dtype=np.int64)
-                    self.core.next_neuron_id=self.core.n
+            arrays,meta=self._read_weight_file(path,expected_epic=expected_epic)
+            self._apply_weight_payload(arrays,meta)
+            return True
         except Exception as exc:
             self.store.event('error','Neural state load failed',{'type':type(exc).__name__,'file':path.name})
             # Never continue with a partly loaded/mismatched network.
-            self.core=NeuralCore(n=self.initial_neurons,seed=self.init_seed)
-            self.feature_schema=None
-            self.fusion_labels=0
-            self.ohlc_dim=FEATURE_DIM;self.fusion_dim=FUSION_DIM
-            self.ohlc_schema=FEATURE_SCHEMA;self.fusion_schema=FUSION_SCHEMA
-            self.model_version=0
+            self._reset_fresh_core()
+            return False
 
     def _restore_pending(self,epic):
         path=self._path_for(epic)
@@ -388,25 +494,66 @@ class AdaptiveBrain:
         src=self._path_for(self.epic) if self.epic else self.path
         if not src.exists():return None
         safe=''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(tag))[:48]
-        dest=src.with_name(f"{src.stem}.bak_{safe}_v{int(self.model_version)}.npz")
+        epic_tag=''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(self.epic or 'unknown'))[:24]
+        dest=src.with_name(f"{src.stem}.bak_{epic_tag}_{safe}_v{int(self.model_version)}.npz")
         import shutil
         shutil.copy2(src,dest)
         return str(dest)
 
-    def restore_weights(self, weights_path):
-        """Reload neural weights from a backup file into the live core."""
+    def restore_weights(self, weights_path, *, registry=None,
+                        expected_feature_schema=None, expected_ohlc_dim=None,
+                        expected_fusion_dim=None):
+        """Reload neural weights from a backup — fail closed on corrupt/mismatch.
+
+        Never reports success after silently resetting to a fresh core. Validates
+        instrument, feature schema, and (when provided) registry dims before
+        activating and saving.
+        """
         path=Path(weights_path)
         if not path.exists():
             self.store.event('error','Weight restore missing file',{'path':str(path)})
             return False
         before_ver=self.model_version
-        self.load(path,expected_epic=self.epic)
-        # Persist restored weights as the active brain file.
-        self.save()
+        snap=self._core_snapshot()
+        try:
+            arrays,meta=self._read_weight_file(path,expected_epic=self.epic)
+            file_epic=meta.get('epic') or ''
+            if self.epic and file_epic and str(file_epic)!=str(self.epic):
+                raise ValueError('Backup instrument does not match live epic')
+            if expected_feature_schema and meta.get('feature_schema') not in (
+                    None,expected_feature_schema):
+                raise ValueError('Backup feature_schema mismatch')
+            if expected_ohlc_dim is not None and int(meta['ohlc_dim'])!=int(expected_ohlc_dim):
+                raise ValueError('Backup ohlc_dim mismatch')
+            if expected_fusion_dim is not None and int(meta['fusion_dim'])!=int(expected_fusion_dim):
+                raise ValueError('Backup fusion_dim mismatch')
+            if registry is not None:
+                reg_ohlc=registry.ohlc_dim();reg_fus=registry.fusion_dim()
+                reg_os=registry.ohlc_schema();reg_fs=registry.fusion_schema()
+                fs=meta.get('feature_schema')
+                if fs in (reg_os,FEATURE_SCHEMA) and int(meta['d'])!=int(reg_ohlc):
+                    raise ValueError('Backup OHLC dim disagrees with feature registry')
+                if fs in (reg_fs,FUSION_SCHEMA) and int(meta['d'])!=int(reg_fus):
+                    raise ValueError('Backup fusion dim disagrees with feature registry')
+                if fs not in (None,reg_os,reg_fs,FEATURE_SCHEMA,FUSION_SCHEMA,
+                              meta.get('ohlc_schema'),meta.get('fusion_schema')):
+                    # Allow exact match to schemas stored in the file itself.
+                    if fs not in (meta.get('ohlc_schema'),meta.get('fusion_schema')):
+                        raise ValueError('Backup feature_schema not recognized for registry')
+            self._apply_weight_payload(arrays,meta)
+            # Persist restored weights as the active brain file only after validation.
+            self.save()
+        except Exception as exc:
+            self._apply_core_snapshot(snap)
+            self.store.event('error','Weight restore refused — live core unchanged',
+                {'path':path.name,'type':type(exc).__name__,'detail':str(exc)[:200],
+                 'epic':self.epic,'from_version':before_ver})
+            return False
         self.store.event('learning','Neural weights restored from backup',
             {'path':path.name,'from_version':before_ver,
              'model_version':self.model_version,'inputs':self.core.d,
-             'neurons':self.core.n})
+             'neurons':self.core.n,'epic':self.epic,
+             'feature_schema':self.feature_schema})
         return True
 
     def apply_registry(self, registry):
@@ -467,6 +614,8 @@ class AdaptiveBrain:
         self.core=NeuralCore(n=self.initial_neurons,d=self.ohlc_dim,seed=self.init_seed)
         self.feature_schema=self.ohlc_schema
         self.history=deque(maxlen=1000);self.pending=deque()
+        self.minute_correct=0;self.minute_labeled=0
+        self.trade_correct=0;self.trade_labeled=0
         self.correct=0;self.labeled=0
         self.last_change=0.;self.last_mid=None;self.prior_record=None
         self.last_regime='LEARNING'
@@ -551,6 +700,7 @@ class AdaptiveBrain:
 
         # Label an older observation, never the latest one and never another EPIC.
         # Do this before step/growth, so gradients always have a safe state mapping.
+        # Audit #17: minute-direction objective (weight 0.2) — not trade-PnL.
         if len(self.pending)>=self.HORIZON:
             past=self.pending.popleft()
             if past['epic']==epic:
@@ -559,14 +709,22 @@ class AdaptiveBrain:
                 if transition is not None:
                     self.core.update_utility(past['h'],past['c'],label,
                         neuron_ids=past.get('neuron_ids'))
-                    loss=self.core.learn(transition,label)
+                    from .core import OBJECTIVE_MINUTE_DIRECTION
+                    loss=self.core.learn(transition,label,
+                                         objective=OBJECTIVE_MINUTE_DIRECTION)
                     if loss is not None and self.feature_schema==self.fusion_schema:
                         self.fusion_labels+=1
-                    if loss is not None and (self.labeled+1)%100==0:
+                    if loss is not None and (self.minute_labeled+1)%100==0:
                         self.store.event('learning','Horizon-label learning checkpoint',
-                            {'loss':loss,'horizon':self.HORIZON,'epic':epic})
-                self.labeled+=1
-                self.correct+=int(past['action']==('BUY','SELL','HOLD')[label])
+                            {'loss':loss,'horizon':self.HORIZON,'epic':epic,
+                             'objective':'minute_direction',
+                             'objective_weight':self.MINUTE_OBJECTIVE_WEIGHT,
+                             'proven_improvement':False})
+                self.minute_labeled+=1
+                hit=int(past['action']==('BUY','SELL','HOLD')[label])
+                self.minute_correct+=hit
+                self.labeled=self.minute_labeled
+                self.correct=self.minute_correct
                 self.store.db.execute('UPDATE signals SET label=?,label_version=? WHERE id=? AND epic=?',
                     (str(label),self.LABEL_VERSION,past['signal_id'],epic))
                 self.store.db.commit()
@@ -618,9 +776,66 @@ class AdaptiveBrain:
         # training state when the Windows process is restarted or switched.
         self.save()
         result['market_regime']=self.last_regime
+        # Uncalibrated max softmax — NOT calibrated profit probability (audit #24).
         result['confidence']=max(result['scores'].values())
-        result['accuracy_proxy']=self.correct/self.labeled if self.labeled else None
+        result['model_score']=result['confidence']
+        # Minute-direction label hit-rate — NOT closed-trade win rate (audit #24).
+        result['minute_direction_accuracy']=self.correct/self.labeled if self.labeled else None
+        result['accuracy_proxy']=result['minute_direction_accuracy']
         return result
+
+    def trading_readiness(self):
+        """Prep/eval readiness for LIVE OPEN (audit #22)."""
+        from . import model_readiness
+        return model_readiness.trading_readiness(self.store,self)
+
+    def ensure_prep_eval(self,candles,*,tick_size=0.01,spread_fallback=0.0):
+        """Load candles → train split → holdout eval; block LIVE until ready."""
+        from . import model_readiness
+        return model_readiness.ensure_prep_eval(
+            self.store,self,candles,tick_size=tick_size,spread_fallback=spread_fallback)
+
+    def reset_prep_eval(self,reason='Model reset — prep/eval required before LIVE OPEN'):
+        from . import model_readiness
+        if self.epic:
+            return model_readiness.reset_state(self.store,self.epic,reason=reason)
+        return None
+
+    def mark_prep_ready(self,reason='Operator/test readiness override'):
+        """Explicit ready mark for tests/fixtures — not a score-edge bypass."""
+        from . import model_readiness
+        if not self.epic:return None
+        state=model_readiness.load_state(self.store,self.epic)
+        state.update({'ready':True,'stage':'ready','reason':reason})
+        return model_readiness.save_state(self.store,self.epic,state)
+
+    def learn_from_trade(self, transition, label, *, lr=None, won=False,
+                         count_sample=True):
+        """Closed-trade P&L objective — separate from minute-direction (audit #17–18).
+
+        Uses OBJECTIVE_TRADE_PNL weight (1.0). Updates trade_* counters only —
+        never minute labeled/correct. Ordinary learn is never proven_improvement.
+        """
+        from .core import OBJECTIVE_TRADE_PNL
+        if transition is None or label not in (0,1,2):return None
+        loss=self.core.learn(transition,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
+        meta=getattr(self.core,'last_learn_meta',None) or {}
+        if count_sample and loss is not None:
+            self.trade_labeled+=1
+            self.trade_correct+=int(bool(won))
+        if meta.get('proven_improvement'):
+            meta=dict(meta);meta['proven_improvement']=False
+            self.core.last_learn_meta=meta
+        self.store.event('learning','Trade-PnL objective update',{
+            'objective':'trade_pnl',
+            'objective_weight':self.TRADE_OBJECTIVE_WEIGHT,
+            'loss':loss,'won':bool(won),
+            'trade_labeled':self.trade_labeled,'trade_correct':self.trade_correct,
+            'minute_labeled':self.minute_labeled,
+            'restored':bool(meta.get('restored')),
+            'proven_improvement':False,
+        })
+        return loss
 
 
 from .external_risk import assess_news
@@ -628,7 +843,6 @@ from .calendar_feed import refresh_calendar
 from .liquidity_feed import refresh_liquidity
 from .instrument_profile import instrument_profile
 from .intermarket import IntermarketMonitor
-import os
 
 class SingleTradeEngine:
     def __init__(self,store,brain,policy_path=None):
@@ -646,6 +860,7 @@ class SingleTradeEngine:
         self.tick_count=0;self.latest_close_id=None
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
+        self.fusion_block_reason=None  # which EXTERNAL source blocks new fused entry
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
         self.last_entry_audit_key=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
@@ -803,6 +1018,7 @@ class SingleTradeEngine:
         self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
         self.last_error=None;self.account={};self.last_entry_audit_key=None
         self.latest_fusion_ready=False
+        self.fusion_block_reason=None
         self.last_calendar_refresh=0.;self.calendar_feed_error=None
         self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
@@ -830,11 +1046,42 @@ class SingleTradeEngine:
         self.last_closed_step=-1
         if self._unresolved_at_login:
             self.execution_enabled=False;self.store.event('warning','Previous order outcome unresolved; waiting for reconciliation')
+    def _reload_instrument_components(self):
+        """Rebind in-memory learning objects after an instrument bag switch."""
+        self.feature_registry=FeatureRegistry(self.store)
+        self.feature_discovery=FeatureDiscovery(self.store)
+        self.feature_validator=FeatureValidator(
+            self.store,self.feature_registry,discovery=self.feature_discovery)
+        self.profit_learning=ProfitLearning(self.store)
+        self.model_validator=ModelValidator(self.store)
+        from .shadow_paper import ShadowPaperJournal
+        self.shadow_paper=ShadowPaperJournal(self.store)
+        self.shadow_brain=None
+        self._last_self_dev_bar=None
+        if hasattr(self.brain,'apply_registry'):
+            try:self.brain.apply_registry(self.feature_registry)
+            except Exception as exc:
+                self.store.event('warning','Registry apply after instrument switch deferred',
+                    {'type':type(exc).__name__})
+
+    def _switch_instrument_learning(self, previous_epic, new_epic):
+        """Park P&L/shadow/SLTP/registry bags so markets never share live keys."""
+        from .instrument_isolation import switch_instrument_bag
+        if previous_epic and previous_epic==new_epic:return {'unchanged':True}
+        # Persist live neural weights for the outgoing instrument first.
+        if previous_epic and getattr(self.brain,'epic',None)==previous_epic:
+            try:self.brain.save()
+            except Exception:pass
+        result=switch_instrument_bag(self.store,previous_epic,new_epic)
+        self._reload_instrument_components()
+        return result
+
     async def prepare_new_instrument(self):
         """Explicit operator-authorized switch, no open/unresolved broker positions.
 
         The next first mobile trade becomes the NEW instrument mandate. Neural
-        files and historical trades from prior instruments are preserved.
+        weight files and per-epic learning bags from prior instruments are
+        preserved under instrument-scoped store keys (audit #29).
         """
         async with self.lock:
             if not self.broker:raise RuntimeError('Not connected to broker')
@@ -843,6 +1090,8 @@ class SingleTradeEngine:
             if self.positions:raise ValueError('Close all broker positions before switching')
             if self.store.unresolved():raise ValueError('Unresolved broker operation')
             previous=self.mandate['epic'] if self.mandate else None
+            if previous:
+                self._switch_instrument_learning(previous,None)
             self.mandate=None;self.store.set('mandate',None)
             self.last_signal=None;self.last_closed_step=-1
             self.last_entry_signal_step=-1;self.last_entry_audit_key=None
@@ -851,6 +1100,7 @@ class SingleTradeEngine:
             self.position_age=0;self.market={}
             self.market_context={'ready':False,'reason':'Waiting for a NEW manual trade in the selected market'}
             self.latest_fusion_ready=False
+            self.fusion_block_reason=None
             self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
             self.cancel_peer_refresh()
             self.cancel_calendar_refresh()
@@ -859,7 +1109,7 @@ class SingleTradeEngine:
             self._paused_for_mismatch=False;self.operator_paused=False
             self.armed=True;self.execution_enabled=True
             self.store.event('control','Market mandate cleared by operator; awaiting new first mobile trade',
-                             {'previous_epic':previous})
+                             {'previous_epic':previous,'instrument_bag_parked':bool(previous)})
             return {'ok':True,'previous_epic':previous,'next_step':'Open first trade manually on Capital.com'}
 
     @staticmethod
@@ -961,6 +1211,40 @@ class SingleTradeEngine:
             if requested is None:continue
             a=_num(actual);b=_num(requested)
             if a is None or b is None or abs(a-b)>tolerance:return False
+        return True
+
+    def _order_fully_matched(self, kind, req, deal_id, confirmation=None, ref=None):
+        """Full broker reconcile check — epic alone is never enough (audit #31).
+
+        OPEN: epic + direction + size, and when the confirm carries a dealId it
+        must identify the live position. CLOSE: deal gone. PROTECT: dealId + levels.
+        """
+        if kind=='CLOSE':
+            return not any(p.get('dealId')==deal_id for p in self.positions)
+        if kind=='PROTECT':
+            return (len(self.positions)==1 and self.positions[0].get('dealId')==deal_id and
+                    self._protection_matches(self.positions[0],req or {}))
+        if kind!='OPEN' or not req or not self.mandate:
+            return False
+        if len(self.positions)!=1:return False
+        p=self.positions[0]
+        try:
+            size_ok=Decimal(str(p.get('size')))==Decimal(str(req.get('size')))
+        except (ValueError,TypeError,ArithmeticError):
+            size_ok=False
+        epic_ok=(p.get('epic')==self.mandate.get('epic') and
+                 (req.get('epic') is None or p.get('epic')==req.get('epic')))
+        dir_ok=p.get('direction')==req.get('direction')
+        if not (epic_ok and dir_ok and size_ok):
+            return False
+        # Identifiable broker operation: confirm dealId must match live when present.
+        conf=confirmation or {}
+        conf_deal=conf.get('dealId') or conf.get('dealID')
+        if conf_deal is not None and str(p.get('dealId'))!=str(conf_deal):
+            return False
+        # dealReference already authenticated the accept; require it when provided.
+        if ref and conf.get('dealReference') not in (None,ref):
+            return False
         return True
 
     async def reconcile_outstanding(self):
@@ -1080,10 +1364,16 @@ class SingleTradeEngine:
                     exit_guess=_num(snap.get('exit_hint'))
                 conf={'level':exit_guess,'source':'position_disappeared'}
                 pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
-                if pnl is not None:
+                if pnl is not None and src=='broker':
                     conf['profit']=pnl
                     if ccy:conf['pnl_currency']=ccy
-                self._learn_closed_trade(prev_id,conf)
+                    self._learn_closed_trade(prev_id,conf)
+                else:
+                    # Audit #1: do not freeze last UPL as realized — mark pending and retry.
+                    self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
+                    self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+                    self.store.event('trade','Deal closed; broker cash P&L pending re-request',
+                                     {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
                 self.store.event('trade','Previous broker deal no longer open',
                                  {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
         if current:
@@ -1128,8 +1418,10 @@ class SingleTradeEngine:
                 self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
                 self.last_entry_audit_key=None
                 if not old or old['epic']!=p['epic']:
-                    # Switch model state BEFORE the manual deal can close; old
-                    # instrument step counters must never gate a new market.
+                    # Park prior instrument bags (P&L/shadow/SLTP/registry) then
+                    # switch model state BEFORE the manual deal can close.
+                    prev_epic=old['epic'] if old else None
+                    self._switch_instrument_learning(prev_epic,p['epic'])
                     if hasattr(self.brain,'_activate'):
                         self.brain._activate(p['epic'])
                     self.last_candle_tick=-20
@@ -1139,6 +1431,7 @@ class SingleTradeEngine:
                     self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
                     self.market_context={'ready':False,'reason':'Waiting for completed candles on newly adopted market'}
                     self.latest_fusion_ready=False
+                    self.fusion_block_reason=None
                     self.last_calendar_refresh=0.;self.calendar_feed_error=None
                     self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
                     self.market={}
@@ -1261,6 +1554,11 @@ class SingleTradeEngine:
     async def poll(self):
         async with self.lock:
             await self.sync()
+            # Audit #1: re-request pending realized cash without using UPL as final.
+            try:await self._retry_pending_broker_pnl()
+            except Exception as exc:
+                self.store.event('warning','Pending broker P&L retry failed',
+                                 {'type':type(exc).__name__})
             if not self.mandate:return
             # Do not delay managing SL/TP on an OPEN trade for a remote news feed.
             # External feeds gate future NEW entries only.
@@ -1322,6 +1620,8 @@ class SingleTradeEngine:
                 else:
                     await self.intermarket.refresh(self.broker,self.mandate['epic'],inst,candles)
             new_closed_bar=False
+            on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                       and getattr(self.brain,'fusion_schema',None) is not None)
             if self.market_context['ready']:
                 self.brain.last_regime=self.market_context['trend']
                 fused=fusion_features(self.market_context,self.intermarket.state,
@@ -1330,14 +1630,25 @@ class SingleTradeEngine:
                     fusion_schema=self.brain.fusion_schema,
                     liquidity_path=self.liquidity_path)
                 self.latest_fusion_ready=fused is not None
-                # Prefer fusion when ready. Transient peer/news gaps must NOT wipe
-                # the last neural vote (that created permanent HOLD / no-signal).
-                # Never invent zero external features — just keep the prior signal.
+                if fused is not None:
+                    self.fusion_block_reason=None
+                else:
+                    # Name the EXTERNAL source that blocks a new fused decision.
+                    self.fusion_block_reason=fusion_gap_reason(
+                        self.market_context,self.intermarket.state,
+                        self.mandate['epic'],self.news_calendar_path,
+                        self.instrument_profile['currencies'],
+                        now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
+                        liquidity_path=self.liquidity_path)
+                # Prefer fusion when ready. After fusion-model transition, a gap
+                # must NOT drive a NEW entry from a stale prior signal. Open
+                # position protection continues below regardless of fusion.
+                # Pre-fusion OHLC models may still tick on local features alone.
                 if fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
                         bar_time=self.market_context['bar_time'],external_features=True)
-                elif self.brain.feature_schema!=self.brain.fusion_schema:
+                elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=self.market_context['features'],
                         bar_time=self.market_context['bar_time'])
@@ -1353,10 +1664,19 @@ class SingleTradeEngine:
                     self.last_signal=next_signal
                     self.last_decision_bar=self.market_context['bar_time']
                     new_closed_bar=True
-                    self._run_self_development_cycle(candles,spread=ask-bid)
+                    # Audit #32: never run neural growth / feature search before
+                    # open-position protection. Flat books may self-dev now;
+                    # open books defer until after trail/protect below.
+                    if not self.positions:
+                        self._run_self_development_cycle(candles,spread=ask-bid)
+                elif on_fusion and fused is None and not self.positions:
+                    # Flat + fusion gap: stale signal must not authorize entry.
+                    # Keep last_signal for UI audit only when a position is open.
+                    self.last_signal=None
                 self.brain.last_regime=self.market_context['trend']
             else:
                 self.latest_fusion_ready=False
+                self.fusion_block_reason='ohlc: market context not ready'
                 self.last_signal=None  # Never trade stale/incomplete OHLC context.
             # Bind the decision-time neural state (captured in submit) to the deal.
             # Fallback: only if we never captured at entry (e.g. manual adopt).
@@ -1376,6 +1696,18 @@ class SingleTradeEngine:
                             'captured':'poll_fallback'})
             if new_closed_bar and self.brain.labeled:
                 self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
+            # Audit #22: historical candle load → chronological train → holdout eval
+            # before autonomous LIVE OPEN. Separate from the live tick above.
+            if (not self.positions and self.market_context.get('ready') and
+                hasattr(self.brain,'ensure_prep_eval')):
+                try:
+                    rd=self.brain.trading_readiness()
+                    if not rd.get('ready'):
+                        self.brain.ensure_prep_eval(
+                            candles,tick_size=tick or 0.01,spread_fallback=ask-bid)
+                except Exception as exc:
+                    self.store.event('warning','Prep/eval stage failed',
+                                    {'type':type(exc).__name__})
             if not self.armed or not self.execution_enabled:return
             if len(self.positions)==1:
                 p=self.positions[0]
@@ -1407,26 +1739,42 @@ class SingleTradeEngine:
                              'streak':streak,'returns_bps':self.market_context.get('returns_bps'),
                              'neural_market_exit':False})
                 await self.adapt_protection(p)
+                # Protection finished first — heavy self-dev only if resources allow
+                # and never instead of trail/protect (audit #32).
+                if new_closed_bar:
+                    self._run_self_development_cycle(candles,spread=ask-bid,
+                                                     defer_if_busy=True)
             elif (len(self.positions)==0 and self.last_signal and
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
-                self.last_entry_processed_bar=self.last_decision_bar
-                # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
-                evaluation=self._entry_evaluation()
-                action=evaluation['action']
-                self.last_policy_decision=action
-                self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
-                self.store.event('entry',
-                    'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
-                    {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
-                     'proposal':evaluation.get('proposal'), 'decision':action,
-                     'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
-                # One entry opportunity per completed M1 bar. The first new
-                # confirmed bar after a broker-verified close can already act.
-                if (action in ('BUY','SELL') and
-                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
-                    snap.get('marketStatus')=='TRADEABLE'):
-                    await self.submit(action,broker_market)
+                # After fusion transition, refuse new entries while EXTERNAL data
+                # is gapped — never act on a stale pre-gap neural vote.
+                on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                           and getattr(self.brain,'fusion_schema',None) is not None)
+                if on_fusion and not self.latest_fusion_ready:
+                    self.last_entry_reason='External fusion gap blocks new entry: '+(
+                        self.fusion_block_reason or 'aligned external neural inputs unavailable')
+                    self.store.event('entry','New entry blocked — fusion data gap',
+                        {'epic':self.mandate['epic'],'bar_time':self.market_context.get('bar_time'),
+                         'block':self.fusion_block_reason,'open_protection':'continues_if_position'})
+                else:
+                    self.last_entry_processed_bar=self.last_decision_bar
+                    # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
+                    evaluation=self._entry_evaluation()
+                    action=evaluation['action']
+                    self.last_policy_decision=action
+                    self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
+                    self.store.event('entry',
+                        'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
+                        {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                         'proposal':evaluation.get('proposal'), 'decision':action,
+                         'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                    # One entry opportunity per completed M1 bar. The first new
+                    # confirmed bar after a broker-verified close can already act.
+                    if (action in ('BUY','SELL') and
+                        self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                        snap.get('marketStatus')=='TRADEABLE'):
+                        await self.submit(action,broker_market)
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -1435,21 +1783,58 @@ class SingleTradeEngine:
         accuracy=self.brain.correct/self.brain.labeled if self.brain.labeled else None
         return self.policy.adaptive_threshold(accuracy,self.brain.labeled,self._spread_bps())
 
+    def _fusion_entry_blocked(self):
+        """True when fusion-schema model lacks fresh EXTERNAL inputs for a new entry."""
+        on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                   and getattr(self.brain,'fusion_schema',None) is not None)
+        return bool(on_fusion and not self.latest_fusion_ready)
+
+    def live_open_gates(self,action=None):
+        """Shared LIVE OPEN helper for poll/_entry_evaluation/submit (audit #22–#23).
+
+        Direction stays neural argmax; this only reports whether readiness +
+        utility gates currently allow submitting an OPEN. Other agents editing
+        submit should call this before placing an order.
+        """
+        readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
+        if not readiness.get('ready'):
+            return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
+                    'readiness':readiness,'economic_utility':None}
+        if action is not None and action not in ('BUY','SELL'):
+            return {'allowed':False,'reason':'No directional action','readiness':readiness,
+                    'economic_utility':None}
+        return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
+                'readiness':readiness,'economic_utility':None}
+
     def _entry_evaluation(self):
         if not self.market_context.get('ready',False):
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Market context unavailable: '+self.market_context.get('reason','unknown'),
                     'evidence':None}
+        if self._fusion_entry_blocked():
+            return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
+                    'reason':'External fusion gap blocks new entry: '+(
+                        self.fusion_block_reason or 'aligned external neural inputs unavailable'),
+                    'evidence':None,'fusion_gap':True,'fusion_block':self.fusion_block_reason}
         if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Waiting for same-instrument neural signal','evidence':None}
         ctx=self.market_context or {}
+        readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else None
+        history=list(self.brain.history)
         result=self.policy.evaluate_neural_entry(
             self.last_signal['scores'],
             returns_bps=ctx.get('returns_bps'),
             trend=ctx.get('trend'),
-            regime=ctx.get('regime'))
+            regime=ctx.get('regime'),
+            history=history,
+            readiness=readiness,
+            spread_bps=self._spread_bps())
         if result['action'] in ('BUY','SELL'):
+            gates=self.live_open_gates(result['action'])
+            if not gates['allowed']:
+                return dict(result,action='HOLD',reason=gates['reason'],
+                            readiness=gates.get('readiness'))
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
                 return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
@@ -1480,22 +1865,16 @@ class SingleTradeEngine:
             return False
         if status!='ACCEPTED':raise RuntimeError('Broker confirmation not final')
         await self.sync()
-        if kind=='OPEN':
+        req=None
+        if kind in ('OPEN','PROTECT'):
             req=json.loads(self.store.db.execute('SELECT payload FROM orders WHERE id=?',(order_id,)).fetchone()[0])
-            matched=(len(self.positions)==1 and self.positions[0]['epic']==self.mandate['epic'] and
-                     self.positions[0]['direction']==req['direction'] and
-                     Decimal(str(self.positions[0]['size']))==Decimal(str(req['size'])))
-        elif kind=='CLOSE':matched=not any(p['dealId']==deal_id for p in self.positions)
-        else:
-            req=json.loads(self.store.db.execute('SELECT payload FROM orders WHERE id=?',(order_id,)).fetchone()[0])
-            matched=(len(self.positions)==1 and self.positions[0]['dealId']==deal_id and
-                     self._protection_matches(self.positions[0],req))
+        matched=self._order_fully_matched(kind,req,deal_id,confirmation,ref)
         if not matched:
             for delay in (.5,1.,2.):
                 await asyncio.sleep(delay);await self.sync()
-                if kind=='OPEN' and len(self.positions)==1 and self.positions[0]['epic']==self.mandate['epic']:matched=True
-                if kind=='CLOSE' and not any(p['dealId']==deal_id for p in self.positions):matched=True
-                if kind=='PROTECT' and len(self.positions)==1 and self.positions[0]['dealId']==deal_id and self._protection_matches(self.positions[0],req):matched=True
+                # Retries must re-check the FULL match (epic+direction+size+deal),
+                # never epic alone (audit #31).
+                matched=self._order_fully_matched(kind,req,deal_id,confirmation,ref)
                 if matched:break
         if not matched:raise RuntimeError('Accepted request not reconciled with broker positions')
         self.store.order_update(order_id,'CONFIRMED',ref)
@@ -1513,16 +1892,21 @@ class SingleTradeEngine:
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
-            # Confirm often omits profit on CLOSE; fill from history/UPL before learn.
+            # Confirm often omits profit on CLOSE; fill from history before learn.
+            # Never promote last UPL to realized cash (audit #1).
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
-            if pnl is not None and _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
-                confirmation={**confirmation,'profit':pnl}
-            if _ccy and not confirmation.get('pnl_currency'):
-                confirmation={**confirmation,'pnl_currency':_ccy}
-            self._learn_closed_trade(deal_id,confirmation)
-            if src=='ticks_only':
-                self.store.event('warning','Close learned without broker cash P&L (ticks_only)',
-                                 {'deal_id':deal_id,'reference':ref})
+            if pnl is not None and src=='broker':
+                if _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
+                    confirmation={**confirmation,'profit':pnl}
+                if _ccy and not confirmation.get('pnl_currency'):
+                    confirmation={**confirmation,'pnl_currency':_ccy}
+                self._learn_closed_trade(deal_id,confirmation)
+            else:
+                exit_lvl=_num(confirmation.get('level'))
+                self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
+                self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
+                                 {'deal_id':deal_id,'reference':ref,'pnl_source':src})
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _account_currency(self):
@@ -1542,6 +1926,98 @@ class SingleTradeEngine:
         is still unknown, return None (repair later) instead of trusting the hint.
         """
         return self._account_currency()
+
+    def _account_equity(self):
+        """Best-effort account equity/balance for drawdown gating (audit #21)."""
+        account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
+        active=next((a for a in account if a.get('preferred') or
+                     a.get('accountId')==self.account.get('currentAccountId')),
+                    account[0] if account else {})
+        bal=active.get('balance') if isinstance(active,dict) else None
+        if isinstance(bal,dict):
+            for key in ('equity','balance','available'):
+                v=_num(bal.get(key))
+                if v is not None and v>0:return float(v)
+        return _num(bal) if not isinstance(bal,dict) else None
+
+    def _infer_exit_reason(self,deal_id,confirmation,*,entry=None,direction=None,
+                           exit_level=None,tick=None):
+        """Classify SL / TP / trail / vanish / manual for bracket learning (audit #19)."""
+        conf=confirmation or {}
+        raw=(conf.get('exit_reason') or conf.get('reason') or conf.get('closeReason')
+             or conf.get('actionType') or conf.get('activityType'))
+        if raw:
+            got=bracket_learn.normalize_exit_reason(raw)
+            if got!='unknown':return got
+        src=str(conf.get('source') or '')
+        if src=='position_disappeared':
+            # Try level proximity before falling back to vanish.
+            pass
+        elif src in ('manual','user'):
+            return 'manual'
+        meta=self.store.get('adaptive_protection:'+str(deal_id)) or {}
+        entry_n=_num(entry);exit_n=_num(exit_level);tick_n=_num(tick)
+        stop_dist=_num(meta.get('original_risk')) or _num(
+            (self.store.get('entry_brain:'+str(deal_id)) or {}).get('stop_distance'))
+        sign={'BUY':1,'SELL':-1}.get(direction)
+        if entry_n is not None and exit_n is not None and sign is not None:
+            move=sign*(exit_n-entry_n)
+            tol=max(float(tick_n or 0)*1.5,abs(float(stop_dist or 0))*0.15,1e-9)
+            profit_dist=_num((self.store.get('entry_brain:'+str(deal_id)) or {}).get('profit_distance'))
+            if stop_dist and move<=-(float(stop_dist)-tol):
+                if meta.get('owner')=='AUTO' and meta.get('trail_extreme') is not None:
+                    return 'trail'
+                return 'sl'
+            if profit_dist and move>=(float(profit_dist)-tol):
+                return 'tp'
+            if meta.get('owner')=='AUTO' and meta.get('trail_extreme') is not None and move<0:
+                return 'trail'
+        if src=='position_disappeared':
+            return 'vanish'
+        return 'unknown'
+
+    def _bracket_path_context(self,deal_id,confirmation,saved):
+        """Build exit/path/vol/cost context for post-trade SL/TP adaptation."""
+        saved=saved or {}
+        entry=_num(saved.get('entry'))
+        direction=saved.get('direction')
+        tick=_num(saved.get('tick_size'))
+        exit_level=_num((confirmation or {}).get('level'))
+        if exit_level is None:
+            exit_level=_num((self.market or {}).get('mid'))
+        stop_distance=_num(saved.get('stop_distance'))
+        meta=self.store.get('adaptive_protection:'+str(deal_id)) or {}
+        if stop_distance is None:
+            stop_distance=_num(meta.get('original_risk'))
+        exit_reason=self._infer_exit_reason(
+            deal_id,confirmation,entry=entry,direction=direction,
+            exit_level=exit_level,tick=tick)
+        # Recent M1 median range as vol context at close.
+        epic=saved.get('epic') or (self.mandate or {}).get('epic')
+        vol=None
+        if epic:
+            candles=self.store.candles(epic,n=60,historical_only=True)
+            zone=bracket_learn.zone_at_open(candles)
+            vol=_num(zone.get('range_distance'))
+        costs=_num(saved.get('entry_spread'))
+        adverse=None
+        if direction in ('BUY','SELL') and entry is not None and exit_level is not None:
+            sign=1 if direction=='BUY' else -1
+            signed=sign*(exit_level-entry)
+            adverse=abs(signed) if signed<0 else 0.0
+        return {
+            'exit_reason':exit_reason,'direction':direction,'entry':entry,
+            'exit_level':exit_level,'stop_distance':stop_distance,
+            'adverse_path':adverse,'volatility':vol,'costs':costs,
+        }
+
+    def _hard_risk_gate(self,*,proposed_risk=None):
+        """Operator hard limits before OPEN — neural cannot raise these (audit #20/#21)."""
+        equity=self._account_equity()
+        if equity is not None:
+            hard_risk.update_peak_equity(self.store,equity)
+        return hard_risk.entry_allowed(
+            self.store,proposed_risk=proposed_risk,equity=equity)
 
     def repair_broker_pnl_currencies(self):
         """Relabel mis-tagged broker cash rows (e.g. GOLD USD quote → account GBP)."""
@@ -1625,9 +2101,11 @@ class SingleTradeEngine:
         return None
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Never settle for ticks_only when Capital still has cash P&L somewhere.
+        """Confirm.profit → history/activity only.
 
-        Order: confirm.profit → history/activity → last live UPL snapshot.
+        Last live UPL is NEVER stored as confirmed realized P&L (audit #1).
+        When cash is still missing, return pending_broker_pnl so the caller
+        can mark the trade pending and re-request from the broker.
         """
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
@@ -1643,11 +2121,114 @@ class SingleTradeEngine:
         if found:
             pnl,hist_ccy=found
             return pnl,'broker',self._cash_currency(hist_ccy)
+        # Keep UPL only as a diagnostic hint — never as source='broker'.
         snap=self.store.get('last_upl:'+str(deal_id)) or {}
         upl=_num(snap.get('upl'))
         if upl is not None and math.isfinite(upl):
-            return float(upl),'broker',self._cash_currency(snap.get('currency'))
-        return None,'ticks_only',None
+            self.store.event('trade','Broker cash P&L still pending; UPL not used as realized',
+                             {'deal_id':deal_id,'last_upl':float(upl),
+                              'currency':self._cash_currency(snap.get('currency'))})
+        return None,'pending_broker_pnl',ccy
+
+    def _trade_already_learned(self,deal_id):
+        """True when this deal's outcome already trained the LIVE core (audit #2)."""
+        meta=self.store.get('learned_trade:'+str(deal_id))
+        return bool(isinstance(meta,dict) and meta.get('learned'))
+
+    def _mark_trade_learned(self,deal_id,*,mode=None,pnl=None,source=None):
+        self.store.set('learned_trade:'+str(deal_id),{
+            'learned':True,'at':now(),'mode':mode,'pnl':pnl,'source':source})
+
+    def _queue_pending_pnl(self,deal_id,*,exit_level=None):
+        pending=list(self.store.get('pending_broker_pnl_deals') or [])
+        deal=str(deal_id)
+        if deal not in [str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]:
+            pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
+            self.store.set('pending_broker_pnl_deals',pending[-40:])
+
+    async def _retry_pending_broker_pnl(self):
+        """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
+        pending=list(self.store.get('pending_broker_pnl_deals') or [])
+        if not pending or not self.broker:return
+        remaining=[]
+        for item in pending:
+            deal=str(item.get('deal_id') if isinstance(item,dict) else item)
+            pnl,src,ccy=await self._resolve_broker_pnl(deal,{})
+            if src!='broker' or pnl is None:
+                remaining.append(item if isinstance(item,dict) else {'deal_id':deal})
+                continue
+            exit_level=item.get('exit_level') if isinstance(item,dict) else None
+            already=self._trade_already_learned(deal)
+            self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
+            if already:
+                self.store.event('trade','Late broker P&L refined record without re-learning',
+                                 {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
+            else:
+                conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,'source':'pending_pnl_retry'}
+                self._learn_closed_trade(deal,conf)
+            self.store.set('last_upl:'+deal,None)
+        self.store.set('pending_broker_pnl_deals',remaining)
+
+    def _counterfactual_context(self,deal_id,saved,*,epic,entry,exit_level,tick,spread):
+        """Bars + SL/TP for path counterfactual (audit #15); empty → endpoint CF."""
+        stop_d=_num((saved or {}).get('stop_distance'))
+        profit_d=_num((saved or {}).get('profit_distance'))
+        prot=self.store.get('adaptive_protection:'+str(deal_id)) or {}
+        if stop_d is None:stop_d=_num(prot.get('original_risk'))
+        if profit_d is None:profit_d=_num(prot.get('original_profit'))
+        if stop_d is None or profit_d is None:
+            try:
+                row=self.store.db.execute(
+                    "SELECT payload FROM orders WHERE kind='OPEN' AND status!='UNCERTAIN' "
+                    "ORDER BY id DESC LIMIT 40").fetchall()
+                for (payload,) in row or ():
+                    try:data=json.loads(payload) if isinstance(payload,str) else (payload or {})
+                    except (TypeError,ValueError,json.JSONDecodeError):continue
+                    if data.get('epic') and epic and data.get('epic')!=epic:continue
+                    if stop_d is None:stop_d=_num(data.get('stop_distance'))
+                    if profit_d is None:profit_d=_num(data.get('profit_distance'))
+                    if stop_d is not None and profit_d is not None:break
+            except Exception:
+                pass
+        min_d=_num((self.market or {}).get('min_distance'))
+        bars=[]
+        bar_time=(saved or {}).get('bar_time')
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        if candles:
+            started=False
+            for c in candles:
+                at=c.get('at')
+                if bar_time and not started:
+                    if at is None or str(at)<str(bar_time):continue
+                    started=True
+                elif not bar_time and not started:
+                    tr=self.store.db.execute(
+                        'SELECT opened FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
+                    opened=(tr[0] if tr else None)
+                    if opened and at and str(at)<str(opened)[:19]:
+                        continue
+                    started=True
+                if not started:continue
+                mid=_num(c.get('close'));hi=_num(c.get('high'));lo=_num(c.get('low'))
+                if mid is None:continue
+                bars.append({'mid':mid,'high':hi if hi is not None else mid,
+                             'low':lo if lo is not None else mid,
+                             'spread':_num(c.get('spread')) if _num(c.get('spread')) is not None else spread,
+                             'at':at})
+            if len(bars)>120:bars=bars[:120]
+        # No invented 2-point path — without OHLC, profit_learning falls back to
+        # endpoint mid delta (still using shared one-RT cost rules).
+        return {
+            'bars':bars or None,
+            'stop_distance':stop_d,
+            'profit_distance':profit_d,
+            'tick':tick,
+            'min_distance':min_d,
+            'trail':True,
+        }
 
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
@@ -1656,6 +2237,7 @@ class SingleTradeEngine:
         the opposite action (regret). Wins reinforce. Cash P&L is stored only
         from broker profit (+ account currency). Without broker profit, learning
         still uses directional ticks — History cash stays blank rather than fake $.
+        Each deal trains LIVE weights at most once (audit #2).
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -1665,6 +2247,16 @@ class SingleTradeEngine:
         hint_ccy=(confirmation.get('pnl_currency') or confirmation.get('currency') or '').strip().upper() or None
         # Allow overwrite when we finally have broker cash after a vanish guess.
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
+        already_learned=self._trade_already_learned(deal_id)
+        # Late broker cash may refine the journal without repeating training.
+        if already_learned:
+            if broker_pnl is not None:
+                currency=hint_ccy or self._account_currency()
+                self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
+                                       source='broker',overwrite=True)
+                self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
+                                 {'deal_id':deal_id,'pnl':broker_pnl})
+            return
         # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
             row=self.store.db.execute(
@@ -1733,6 +2325,10 @@ class SingleTradeEngine:
                 shadow_action=max(('BUY','SELL','HOLD'),key=lambda a:float(sc.get(a,0)))
             except (TypeError,ValueError):
                 shadow_action=None
+        # Audit #15: path CF with same SL/TP/trail/costs (not entry→exit delta alone).
+        cf=self._counterfactual_context(deal_id,saved,epic=epic,entry=entry,
+                                        exit_level=exit_level,tick=tick,
+                                        spread=spread_cost)
         # Profit ledger: ONLY broker-confirmed £ — never ±1 tick fakes.
         if pnl_source=='broker' and pnl_value is not None:
             decision=self.profit_learning.record_closed(
@@ -1741,13 +2337,13 @@ class SingleTradeEngine:
                 currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True)
+                shadow_action=shadow_action,require_broker_pnl=True,**cf)
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
         else:
             # Tick path: same rule as £ — wins reinforce side; else counterfactual.
             from .profit_learning import best_action_from_counterfactual
-            sim=best_action_from_counterfactual(entry,exit_level,spread=spread_cost)
+            sim=best_action_from_counterfactual(entry,exit_level,spread=spread_cost,**cf)
             if pnl_sign>0 and direction in ('BUY','SELL'):
                 label=0 if direction=='BUY' else 1;mode='reinforce_win_ticks'
             elif sim and sim['best'] in ('BUY','SELL','HOLD'):
@@ -1763,7 +2359,7 @@ class SingleTradeEngine:
                 currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True)
+                shadow_action=shadow_action,require_broker_pnl=True,**cf)
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
         if label is None:
@@ -1790,12 +2386,15 @@ class SingleTradeEngine:
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
-        for _ in range(repeats):
-            step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
+        # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
+        # counters/weights from minute-direction; does not bump minute labeled.
+        for i in range(repeats):
+            step_loss=self.brain.learn_from_trade(
+                transition,label,lr=learn_lr,won=pnl_sign>0,count_sample=(i==0))
             if step_loss is not None:losses.append(step_loss)
-        # Independent shadow core trains on the same delayed label (side-by-side).
+        # Independent shadow core trains on same label using *its* decision-time h/c.
         if repeats>0:
-            self._shadow_learn(transition,label,lr=learn_lr)
+            self._shadow_learn(None,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
             # Queue evidence only — commit when long-horizon £ proves improvement.
             evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
@@ -1804,8 +2403,6 @@ class SingleTradeEngine:
         if repeats>0 and transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
-        self.brain.labeled+=1
-        self.brain.correct+=int(pnl_sign>0)
         self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                source=pnl_source,overwrite=overwrite)
         self.store.set('last_trade_outcome',{
@@ -1816,8 +2413,16 @@ class SingleTradeEngine:
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
             if bk is None or bs is None:
                 cur=bracket_learn.load_params(self.store);bk,bs=cur['kappa'],cur['sl_scale']
-            bracket_learn.record_outcome(self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
-                                         currency=currency,deal_id=deal_id)
+            # Audit #19: pass exit reason + path/vol/costs — never P&L alone.
+            path_ctx=self._bracket_path_context(deal_id,confirmation,saved)
+            bracket_learn.record_outcome(
+                self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
+                currency=currency,deal_id=deal_id,**path_ctx)
+            # Audit #21: operator daily loss / drawdown halt from realized cash.
+            hard_risk.record_realized_pnl(self.store,pnl_value)
+            equity=self._account_equity()
+            if equity is not None:
+                hard_risk.check_drawdown_halt(self.store,equity)
             promoted=bracket_learn.evolve_from_history(self.store)
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
@@ -1829,6 +2434,8 @@ class SingleTradeEngine:
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
         self.brain.save()
+        # Audit #2: this deal's experience may train LIVE only once.
+        self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
             {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
              'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
@@ -1928,6 +2535,18 @@ class SingleTradeEngine:
         # turns Take Profit Off — TP mark can be touched with no fill left.
         tp=proposal.get('profit_level')
         if tp is None:tp=_num(p.get('profitLevel'))
+        # Audit #9: skip trail PUT when SL/TP would violate broker min distance.
+        if not levels_meet_broker_min(p.get('direction'),stop,tp,
+                                      self.market.get('bid'),self.market.get('ask'),
+                                      self.market.get('min_distance')):
+            self.store.event('warning','Trail skipped: SL/TP below broker min distance',{
+                'deal_id':p.get('dealId'),'stop':stop,'profit':tp,
+                'min_distance':self.market.get('min_distance'),
+                'tick':self.market.get('tick'),'bid':self.market.get('bid'),
+                'ask':self.market.get('ask')})
+            self.protection_brief={'status':'Trail skipped: SL/TP below broker min',
+                                   'deal_id':p['dealId'],'proposal':proposal}
+            return
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
             'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
             'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None})
@@ -1979,6 +2598,15 @@ class SingleTradeEngine:
         result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
                          kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                          range_distance=float(rng) if rng is not None else 0)
+        # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
+        if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
+            self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
+                'deal_id':p.get('dealId'),
+                'stop_distance':float(result['stop_distance']),
+                'profit_distance':float(result['profit_distance']),
+                'min_distance':float(min_dist),'tick':float(tick),
+                'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
+            return
         stop=result['stop_level'] if p.get('stopLevel') is None else None
         profit=result['profit_level'] if p.get('profitLevel') is None else None
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
@@ -2011,7 +2639,14 @@ class SingleTradeEngine:
         if action not in ('BUY','SELL') or self.last_closed_step<0:return
         # Never submit when the learned market context is stale/incomplete.
         if not self.market_context.get('ready'):return
+        # After fusion transition: never open on a stale signal during EXTERNAL gap.
+        if self._fusion_entry_blocked():return
         if not self._external_entry_check(action)['entry_allowed']:return
+        # Audit #22–#23: prep/eval readiness (and utility via evaluate_neural_entry).
+        gates=self.live_open_gates(action)
+        if not gates.get('allowed'):
+            self.last_entry_reason=gates.get('reason') or 'LIVE OPEN blocked by readiness'
+            return
         self.pending_order=True
         try:
             await self.sync()
@@ -2039,6 +2674,33 @@ class SingleTradeEngine:
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
+            # Audit #9: after coeffs/rounding, refuse non-compliant SL/TP.
+            if not distances_meet_broker_min(brackets['stop_distance'],
+                                             brackets['profit_distance'],minimum):
+                self.store.event('warning','OPEN skipped: SL/TP below broker min distance',{
+                    'stop_distance':float(brackets['stop_distance']),
+                    'profit_distance':float(brackets['profit_distance']),
+                    'min_distance':float(minimum),'kappa':bp['kappa'],
+                    'raised_to_broker_min':brackets.get('raised_to_broker_min')})
+                return
+            # Audit #20/#21: fixed mandate size × SL × tick_value vs operator hard limits.
+            # Never auto-shrink size — block OPEN when cash risk exceeds the cap.
+            tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
+            proposed=None
+            if tick_val is not None:
+                try:
+                    proposed=float(cash_risk(size,brackets['stop_ticks'],tick_val))
+                except (ValueError,TypeError,ArithmeticError):
+                    proposed=None
+            gate=self._hard_risk_gate(proposed_risk=proposed)
+            if not gate.get('allowed'):
+                self.last_entry_reason=gate.get('reason') or 'hard risk blocked'
+                self.store.event('risk',self.last_entry_reason,{
+                    'proposed_risk':proposed,'size':str(size),
+                    'stop_ticks':int(brackets['stop_ticks']),
+                    'tick_value':float(tick_val) if tick_val is not None else None,
+                    'limits':gate.get('limits'),'direction':action})
+                return
             self.store.event('bracket','OHLC zone × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
@@ -2047,6 +2709,9 @@ class SingleTradeEngine:
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
+                'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
+                'cash_risk':proposed,
+                'tick_value':float(tick_val) if tick_val is not None else None,
                 'learn_samples':bp.get('nudge_samples')})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
@@ -2059,6 +2724,8 @@ class SingleTradeEngine:
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
                     'bracket_explored':bool(bp.get('explored')),
+                    'stop_distance':float(brackets['stop_distance']),
+                    'profit_distance':float(brackets['profit_distance']),
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
@@ -2090,8 +2757,33 @@ class SingleTradeEngine:
         evaluation=self._entry_evaluation() if not self.positions else None
         news=self._news_risk()
         intermarket=self.intermarket.state
-        decision=(self.policy.neural_decision(self.last_signal['scores'],self.positions[0]['direction'])
-            if self.last_signal else 'HOLD') if self.positions else evaluation['action']
+        readiness=(self.brain.trading_readiness()
+                   if hasattr(self.brain,'trading_readiness') else {'ready':False})
+        minute_acc=(self.brain.correct/self.brain.labeled) if self.brain.labeled else None
+        # Closed-trade win rate is separate from minute-direction accuracy (audit #24).
+        trade_wins=trade_losses=0
+        try:
+            for t in self.store.trades(200):
+                if not t.get('closed') or t.get('pnl') is None:continue
+                src=(t.get('pnl_source') or '').strip().lower()
+                if src in ('ticks_only','price_size','pending_close_sync','position_disappeared'):
+                    continue
+                try:val=float(t['pnl'])
+                except (TypeError,ValueError):continue
+                if val>0:trade_wins+=1
+                elif val<0:trade_losses+=1
+        except Exception:
+            pass
+        trade_n=trade_wins+trade_losses
+        trade_win_rate=(trade_wins/trade_n) if trade_n else None
+        # In a position neural_decision may report CLOSE — diagnostic only (audit #25).
+        raw_exit_intent=None
+        if self.positions and self.last_signal:
+            raw_exit_intent=self.policy.neural_decision(
+                self.last_signal['scores'],self.positions[0]['direction'])
+        decision=(raw_exit_intent if self.positions else
+                  (evaluation['action'] if evaluation else 'HOLD'))
+        gates=self.live_open_gates(evaluation['action'] if evaluation else None)
         return {'connected':bool(self.broker),'armed':self.armed,'execution_enabled':self.execution_enabled,
                 'mandate':self.mandate,'data_dir':str(self.store.path.parent),
                 'positions':self.positions,'market':self.market,'signal':self.last_signal,
@@ -2100,13 +2792,26 @@ class SingleTradeEngine:
                     external_features_learned=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                         and getattr(self.brain,'fusion_schema',None) is not None),
                     external_feed_ready=self.latest_fusion_ready,
+                    fusion_block_reason=self.fusion_block_reason,
                     external_trained_labels=getattr(self.brain,'fusion_labels',0),
                     model_version=getattr(self.brain,'model_version',0),
                     ohlc_dim=getattr(self.brain,'ohlc_dim',None),
                     fusion_dim=getattr(self.brain,'fusion_dim',None),
                     feature_registry=self.feature_registry.snapshot()),
-                'accuracy_proxy':self.brain.correct/max(1,self.brain.labeled),
+                # Audit #24: never merge minute-direction accuracy with trade win rate.
+                'minute_direction_accuracy':minute_acc,
+                'accuracy_proxy':minute_acc if minute_acc is not None else 0.,
+                'trade_win_rate':trade_win_rate,
+                'trade_wins':trade_wins,'trade_losses':trade_losses,
+                'model_score_is_calibrated_profit_probability':False,
+                'metric_labels':{
+                    'minute_direction_accuracy':'M1 direction label hit-rate (not profit)',
+                    'trade_win_rate':'Closed-trade win rate after broker cash settle',
+                    'model_score':'Uncalibrated softmax score (not profit probability)',
+                },
                 'labeled_samples':self.brain.labeled,'market_regime':self.brain.last_regime,
+                'model_readiness':readiness,
+                'prep_eval':readiness,
                 'market_context':self.market_context,'adaptive_protection':self.protection_brief,
                 'economic_news_risk':news,'intermarket_analysis':intermarket,
                 'instrument_profile':self.instrument_profile,
@@ -2124,39 +2829,51 @@ class SingleTradeEngine:
                 'policy_decision':decision,
                 'policy_proposal':evaluation['proposal'] if evaluation else decision,
                 'directional_advantage':self.policy.score_edge(self.last_signal['scores']) if self.last_signal else 0.,
+                'directional_advantage_is_trading_edge':False,
                 'directional_validation':evaluation.get('evidence') if evaluation else None,
+                'economic_utility':(evaluation or {}).get('economic_utility'),
                 'adaptive_threshold':None,
                 'policy_base_threshold':None,
                 'entry_margin_calibration':evaluation.get('calibration') if evaluation else None,
                 'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
-                'neural_entry_rule':'neural argmax BUY/SELL/HOLD — zone/SHIFT evidence only',
+                'neural_entry_rule':'neural argmax BUY/SELL/HOLD; readiness+utility separate; zone/SHIFT evidence only — not entry bans',
+                # Audit #25: neural CLOSE is diagnostic; live exit = broker SL/TP/trail.
                 'neural_market_exit':False,
-                'neural_exit_rule':'disabled — broker SL/TP/trail closes; neural learns from cash P&L',
-                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved()),
+                'neural_close_diagnostic_only':True,
+                'neural_close_executable':False,
+                'neural_exit_intent':raw_exit_intent,
+                'neural_exit_rule':'diagnostic CLOSE intent only — broker SL/TP/trail executes closes; neural market-delete is not a strategy',
+                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
                 'entry_policy_reason':evaluation.get('reason') if evaluation else None,
                 'entry_independent_samples':(evaluation.get('evidence') or {}).get('samples') if evaluation else None,
                 'entry_can_submit_now':bool(evaluation and evaluation.get('action') in ('BUY','SELL') and
+                    gates.get('allowed') and
                     self.market.get('status')=='TRADEABLE' and self.market_context.get('ready') and
                     self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and
                     self.execution_enabled and not self.store.unresolved() and
+                    not self._fusion_entry_blocked() and
                     self._external_entry_check(evaluation['action'])['entry_allowed'] and
                     self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
                     self.last_decision_bar is not None and
                     self.last_entry_processed_bar!=self.last_decision_bar),
+                'fusion_block_reason':self.fusion_block_reason,
+                # Audit #14: when fusion EXTERNAL data blocks, name that source
+                # before the generic prep/eval readiness message.
                 'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
                     'Unresolved broker operation' if self.store.unresolved() else
                     'Existing open position' if self.positions else
                     'No adoptive size this session — open a new manual trade' if not self.mandate else
                     'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
                     'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
+                    ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
+                        if self._fusion_entry_blocked() else
+                    ('Model prep/eval not ready: '+(readiness.get('reason') or ''))
+                        if not readiness.get('ready') else
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    'Waiting for aligned external neural inputs' if (
-                        getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
-                        and getattr(self.brain,'fusion_schema',None) is not None) else
                     'Waiting for signal'),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),
@@ -2182,48 +2899,195 @@ class SingleTradeEngine:
             spreads.append(float(sp) if sp is not None and sp>=0 else None)
         return bars,spreads,times
 
+    SHADOW_STATE_KEY='shadow_neural_state_v1'
+
     def _ensure_shadow_brain(self):
         """Independent shadow NeuralCore — same input dim, own weights (never LIVE)."""
         d=self.brain.core.d
+        created=False
         if self.shadow_brain is None or self.shadow_brain.d!=d:
             alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
             # Derive from live init_seed so shadow search is not identical across clients.
             base=int(getattr(self.brain,'init_seed',7) or 7)
             shadow_seed=(base^(0xA5A5+alt_n))%(2**31-1) or (base+alt_n+1)
+            saved=self.store.get(self.SHADOW_STATE_KEY) or {}
+            try:saved_n=int(saved.get('n') or 0)
+            except (TypeError,ValueError):saved_n=0
+            try:saved_d=int(saved.get('d') or -1)
+            except (TypeError,ValueError):saved_d=-1
+            use_n=saved_n if (saved_n>=8 and saved_d==d) else alt_n
             self.shadow_brain=self.brain.core.clone_architecture(
-                n=alt_n,seed=shadow_seed,copy_weights=False)
+                n=use_n,seed=shadow_seed,copy_weights=False)
+            self.shadow_brain.model_version=0
+            created=True
             self.store.event('shadow','Independent shadow neural core ready',
                 {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n,
                  'shadow_seed':shadow_seed})
+        if created:
+            self._restore_shadow_state()
         return self.shadow_brain
 
-    def _shadow_learn(self,transition,label,lr=None):
-        shadow=self._ensure_shadow_brain()
-        if transition is None or label not in (0,1,2):return
-        z=transition.get('z')
-        if z is None or len(np.asarray(z))!=shadow.d:return
-        shadow.learn(transition,label,lr=lr)
+    def _restore_shadow_state(self):
+        """Reload persisted shadow h/c + step counter after create/restart."""
+        shadow=self.shadow_brain
+        raw=self.store.get(self.SHADOW_STATE_KEY) or {}
+        if not isinstance(raw,dict) or shadow is None:return False
+        try:
+            h=np.asarray(raw.get('h'),dtype=float)
+            c=np.asarray(raw.get('c'),dtype=float)
+        except (TypeError,ValueError):
+            return False
+        if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):return False
+        if not (np.isfinite(h).all() and np.isfinite(c).all()):return False
+        if int(raw.get('d') or -1)!=shadow.d:return False
+        shadow.h=h;shadow.c=c
+        try:shadow.steps=int(raw.get('steps') or 0)
+        except (TypeError,ValueError):shadow.steps=0
+        try:shadow.model_version=int(raw.get('model_version') or 0)
+        except (TypeError,ValueError):shadow.model_version=0
+        tr=raw.get('last_transition')
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            try:
+                z=np.asarray(tr['z'],dtype=float)
+                th=np.asarray(tr['h'],dtype=float);tc=np.asarray(tr['c'],dtype=float)
+                if z.shape==(shadow.d,) and th.shape==(shadow.n,) and tc.shape==(shadow.n,):
+                    ids=tr.get('neuron_ids')
+                    shadow.last_transition={
+                        'z':z,'h':th,'c':tc,
+                        'dt':float(tr.get('dt') or 1.),
+                        'neuron_ids':(np.asarray(ids,dtype=np.int64)
+                                      if ids is not None else shadow.neuron_ids.copy()),
+                        'bar_time':tr.get('bar_time')}
+            except (TypeError,ValueError,KeyError):
+                pass
+        return True
 
-    def _shadow_scores_now(self):
-        """One forward pass on live last_z for shadow journal (no LIVE order)."""
+    def _persist_shadow_state(self):
+        """Persist shadow h/c and step counter after every completed-candle advance."""
+        shadow=self.shadow_brain
+        if shadow is None:return
+        tr=getattr(shadow,'last_transition',None)
+        payload={
+            'h':np.asarray(shadow.h,dtype=float).tolist(),
+            'c':np.asarray(shadow.c,dtype=float).tolist(),
+            'steps':int(getattr(shadow,'steps',0) or 0),
+            'n':int(shadow.n),'d':int(shadow.d),
+            'model_version':int(getattr(shadow,'model_version',0) or 0),
+            'neuron_ids':np.asarray(shadow.neuron_ids,dtype=np.int64).tolist(),
+        }
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            payload['last_transition']={
+                'z':np.asarray(tr['z'],dtype=float).tolist(),
+                'h':np.asarray(tr['h'],dtype=float).tolist(),
+                'c':np.asarray(tr['c'],dtype=float).tolist(),
+                'dt':float(tr.get('dt') or 1.),
+                'neuron_ids':np.asarray(
+                    tr.get('neuron_ids',shadow.neuron_ids),dtype=np.int64).tolist(),
+                'bar_time':tr.get('bar_time')}
+        self.store.set(self.SHADOW_STATE_KEY,payload)
+
+    def _shadow_decision_transition(self, preferred=None):
+        """Shadow's own decision-time state — never LIVE h/c."""
+        shadow=self._ensure_shadow_brain()
+        for cand in (preferred,getattr(shadow,'last_transition',None)):
+            if not isinstance(cand,dict):continue
+            z=cand.get('z')
+            if z is None:continue
+            z=np.asarray(z,dtype=float)
+            if z.shape!=(shadow.d,):continue
+            h=np.asarray(cand.get('h'),dtype=float)
+            c=np.asarray(cand.get('c'),dtype=float)
+            if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):continue
+            ids=cand.get('neuron_ids',shadow.neuron_ids)
+            return {'z':z,'h':h,'c':c,'dt':float(cand.get('dt') or 1.),
+                    'neuron_ids':np.asarray(ids,dtype=np.int64)}
+        return None
+
+    def _shadow_learn(self,transition,label,lr=None):
+        """Train shadow on *its* decision-time h/c — never LIVE recurrent state."""
+        shadow=self._ensure_shadow_brain()
+        if label not in (0,1,2):return None
+        own=self._shadow_decision_transition(
+            transition if (isinstance(transition,dict)
+                           and transition.get('h') is not None
+                           and len(np.asarray(transition.get('h')))==shadow.n)
+            else None)
+        if own is None and isinstance(transition,dict):
+            base=getattr(shadow,'last_transition',None)
+            if isinstance(base,dict) and base.get('h') is not None:
+                z=transition.get('z')
+                if z is not None and len(np.asarray(z))==shadow.d:
+                    own={'z':np.asarray(z,dtype=float),
+                         'h':np.asarray(base['h'],dtype=float),
+                         'c':np.asarray(base['c'],dtype=float),
+                         'dt':float(base.get('dt') or transition.get('dt') or 1.),
+                         'neuron_ids':np.asarray(
+                             base.get('neuron_ids',shadow.neuron_ids),dtype=np.int64)}
+        if own is None:return None
+        from .core import OBJECTIVE_TRADE_PNL
+        loss=shadow.learn(own,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
+        self._persist_shadow_state()
+        return loss
+
+    def _shadow_scores_now(self,*,advance=False,bar_time=None):
+        """Score with shadow weights on live z; optionally advance+persist h/c.
+
+        advance=True on each completed M1 candle so shadow is a real parallel
+        trajectory with its own decision-time state (not a LIVE h/c snapshot).
+        """
         shadow=self._ensure_shadow_brain()
         z=self.brain.core.last_z
         if z is None or len(z)!=shadow.d:return None
         try:
-            # Use shadow's own h/c — step advances shadow state on closed bars only
-            # via learn; here we score without mutating by using _forward snapshot.
-            hn,cn,logits=shadow._forward(
-                np.asarray(z,dtype=float),shadow.h,shadow.c,1.0)
+            z=np.asarray(z,dtype=float)
+            h0=shadow.h.copy();c0=shadow.c.copy()
+            hn,cn,logits=shadow._forward(z,h0,c0,1.0)
+            if advance:
+                shadow.last_transition={
+                    'z':z.copy(),'h':h0,'c':c0,'dt':1.0,
+                    'neuron_ids':shadow.neuron_ids.copy(),
+                    'bar_time':bar_time}
+                shadow.h=hn;shadow.c=cn
+                shadow.last_z=z.copy()
+                shadow.steps=int(getattr(shadow,'steps',0) or 0)+1
+                self._persist_shadow_state()
             prob=shadow._softmax(logits)
             return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
         except Exception:
             return None
 
-    def _run_self_development_cycle(self,candles,*,spread=0.):
-        """Discover → validate → expand (decision-time data only). Never blocks orders."""
+    def _resource_pressure(self):
+        """Lightweight host pressure probe — skip heavy self-dev when saturated."""
+        try:
+            load1,_,_=os.getloadavg()
+        except (AttributeError,OSError):
+            load1=0.
+        try:
+            # ru_maxrss is KiB on Linux.
+            rss_mb=float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)/1024.0
+        except Exception:
+            rss_mb=0.
+        cpus=os.cpu_count() or 1
+        high_load=load1>=max(2.0,0.85*cpus)
+        high_rss=rss_mb>=2048  # soft ceiling for discovery/validation work
+        return {'load1':load1,'rss_mb':rss_mb,'cpus':cpus,
+                'busy':bool(high_load or high_rss),
+                'high_load':high_load,'high_rss':high_rss}
+
+    def _run_self_development_cycle(self,candles,*,spread=0.,defer_if_busy=False):
+        """Discover → validate → expand (decision-time data only). Never blocks orders.
+
+        When defer_if_busy (open-position path), skip under host pressure so
+        trail/protect polls stay responsive (audit #32).
+        """
         from .historical_features import build_feature_matrix
         bar=self.market_context.get('bar_time')
         if not bar or bar==self._last_self_dev_bar:return
+        pressure=self._resource_pressure()
+        if defer_if_busy and pressure.get('busy'):
+            self.store.event('self_dev','Self-dev deferred — open-position protect priority',
+                {'bar_time':bar,**{k:pressure[k] for k in ('load1','rss_mb','high_load','high_rss')}})
+            return
         self._last_self_dev_bar=bar
         bars,spreads,times=self._bars_and_spreads_from_candles(candles)
         if len(bars)<120:return
@@ -2235,8 +3099,14 @@ class SingleTradeEngine:
             bar,window,spread=last_sp,registry=self.feature_registry)
         self._ensure_shadow_brain()
         # Independent shadow paper step on every closed ready bar (not LIVE remap).
-        self._shadow_paper_step(mid=self.market_context.get('close'),
-                                spread=last_sp,bar_time=bar)
+        # Advance+persist shadow h/c/steps on this completed candle first.
+        last_bar_ohlc=window[-1] if window else None
+        self._shadow_paper_step(
+            mid=self.market_context.get('close'),
+            spread=last_sp,bar_time=bar,
+            high=(last_bar_ohlc[1] if last_bar_ohlc else None),
+            low=(last_bar_ohlc[2] if last_bar_ohlc else None),
+            candles=candles)
         if not proposals:
             self.policy.shadow_self_dev_tick(self)
             return
@@ -2259,14 +3129,16 @@ class SingleTradeEngine:
                 pre_path=self.brain.backup_weights(
                     tag=f'v{int(self.brain.model_version)}')
             pre_specs=[dict(x) for x in self.feature_registry.approved]
-            self.model_validator.push_version({
+            from .instrument_isolation import label_backup_meta
+            epic=self.mandate['epic'] if self.mandate else getattr(self.brain,'epic',None)
+            self.model_validator.push_version(label_backup_meta({
                 'model_version':self.brain.model_version,
                 'feature_schema':self.brain.feature_schema,
                 'ohlc_dim':self.brain.ohlc_dim,
                 'fusion_dim':self.brain.fusion_dim,
                 'approved':self.feature_registry.approved_ids(),
                 'approved_specs':pre_specs,
-                'weights_path':pre_path})
+                'weights_path':pre_path},epic))
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
             learning_generation.bump(self.store,'feature_registry_expanded')
@@ -2283,50 +3155,121 @@ class SingleTradeEngine:
                 post_path=self.brain.backup_weights(
                     tag=f'v{int(self.brain.model_version)}')
             post_specs=[dict(x) for x in self.feature_registry.approved]
-            self.model_validator.push_version({
+            self.model_validator.push_version(label_backup_meta({
                 'model_version':self.brain.model_version,
                 'feature_schema':self.brain.feature_schema,
                 'ohlc_dim':self.brain.ohlc_dim,
                 'fusion_dim':self.brain.fusion_dim,
                 'approved':self.feature_registry.approved_ids(),
                 'approved_specs':post_specs,
-                'weights_path':post_path})
+                'weights_path':post_path},epic))
         self.policy.shadow_self_dev_tick(self)
 
-    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None):
-        """Advance independent shadow paper journal from current shadow vote."""
-        scores=self._shadow_scores_now()
+    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None,high=None,low=None,
+                           candles=None):
+        """Advance shadow state + paper journal with LIVE-identical execution rules.
+
+        Votes after advancing shadow h/c on this completed candle. Opens/closes
+        via SL/TP/trail (same stop_take + trail math as LIVE) — never flip-exit.
+        """
+        scores=self._shadow_scores_now(advance=True,bar_time=bar_time)
         if not scores or mid is None:return None
         try:
             action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))
         except (TypeError,ValueError):
             return None
-        # Scale price→£ from LIVE broker history so paper is cash-comparable.
         live=getattr(self.profit_learning,'history',[]) or []
         self.shadow_paper.update_cash_scale(live)
-        return self.shadow_paper.on_bar(
+        shadow=self.shadow_brain
+        shadow_tr=None
+        if shadow is not None and getattr(shadow,'last_transition',None):
+            shadow_tr=self.brain._json_transition(shadow.last_transition)
+        tick=None;minimum=None;stop_d=None;profit_d=None;kappa=None;sl_scale=None
+        try:
+            mkt=self.market or {}
+            tick=_num(mkt.get('tick'))
+            minimum=_num(mkt.get('min_distance'))
+            if tick is None or tick<=0:
+                tick=max(abs(float(spread or 0))/2.,1e-4)
+            if minimum is None or minimum<0:
+                minimum=float(tick)
+            rows=candles if candles is not None else (
+                self.store.candles(self.mandate['epic'],n=120,historical_only=True)
+                if self.mandate else [])
+            zone=bracket_learn.zone_at_open(rows)
+            rng=zone['range_distance'] or ohlc_range_distance(rows)
+            buffer=max(2*float(tick),2*abs(float(spread or 0)))
+            base_sl=max(float(minimum)+buffer,float(rng or 0))
+            bp=bracket_learn.propose_for_open(
+                self.store,ohlc_kappa=zone.get('kappa'),base_sl=base_sl,
+                max_tp=zone.get('max_tp'),candles=rows)
+            entry_proxy=float(mid)+abs(float(spread or 0))/2.
+            brackets=stop_take(entry_proxy,'BUY',tick,spread,minimum,
+                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
+                               range_distance=float(rng) if rng is not None else 0)
+            stop_d=float(brackets['stop_distance'])
+            profit_d=float(brackets['profit_distance'])
+            kappa=bp['kappa'];sl_scale=bp['sl_scale']
+        except Exception:
+            stop_d=profit_d=None
+        closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
-            cash_scale=self.shadow_paper.cash_scale)
+            cash_scale=self.shadow_paper.cash_scale,
+            high=high,low=low,tick=tick,min_distance=minimum,
+            stop_distance=stop_d,profit_distance=profit_d,
+            kappa=kappa,sl_scale=sl_scale,
+            model_version=int(getattr(shadow,'model_version',0) or 0),
+            slip_bps=0.,fill_delay_bars=0,
+            shadow_transition=shadow_tr)
+        if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
+            pnl=closed.get('paper_pnl')
+            if pnl is None:pnl=closed.get('price_pnl')
+            label=None
+            if pnl is not None:
+                try:
+                    cash=float(pnl)
+                    if cash>0:label={'BUY':0,'SELL':1}.get(closed.get('direction'))
+                    elif cash<0:label=2
+                except (TypeError,ValueError):
+                    label=None
+            if label is not None:
+                self._shadow_learn(closed.get('shadow_transition'),label)
+        return closed
 
     def restore_neural_weights(self, version_meta_or_path):
         """Rollback hook: restore feature registry + neural weights together.
 
         Accepts a full version_meta dict (preferred) or a bare weights path
-        string for older call sites/tests.
+        string for older call sites/tests. Fail closed: a corrupt weight file
+        must not report success (audit #30).
         """
         if isinstance(version_meta_or_path,dict):
             meta=version_meta_or_path
             path=meta.get('weights_path')
             specs=meta.get('approved_specs')
+            meta_epic=meta.get('epic') or meta.get('instrument')
         else:
-            meta=None;path=version_meta_or_path;specs=None
+            meta=None;path=version_meta_or_path;specs=None;meta_epic=None
+        if meta_epic and self.brain.epic and str(meta_epic)!=str(self.brain.epic):
+            self.store.event('error','Model snapshot refused — instrument mismatch',
+                {'backup_epic':meta_epic,'live_epic':self.brain.epic,'path':path})
+            return False
         # Registry first so layout matches the weight file about to load.
         if specs is not None:
             self.feature_registry.replace_approved(specs)
         ok=False
         if path and hasattr(self.brain,'restore_weights'):
-            ok=bool(self.brain.restore_weights(path))
-        if ok or specs is not None:
+            ok=bool(self.brain.restore_weights(
+                path,registry=self.feature_registry,
+                expected_ohlc_dim=(meta or {}).get('ohlc_dim') if isinstance(meta,dict) else None,
+                expected_fusion_dim=(meta or {}).get('fusion_dim') if isinstance(meta,dict) else None,
+                expected_feature_schema=(meta or {}).get('feature_schema') if isinstance(meta,dict) else None))
+        if path and not ok:
+            # Weight restore failed — do not claim success via registry-only path.
+            self.store.event('error','Model snapshot restore failed closed',
+                {'path':path,'registry_rolled':specs is not None})
+            return False
+        if ok or (specs is not None and not path):
             # Re-sync brain schema labels from restored registry without expanding.
             reg=self.feature_registry
             self.brain.ohlc_dim=reg.ohlc_dim()
@@ -2341,6 +3284,9 @@ class SingleTradeEngine:
                 {'weights':bool(ok),'registry':specs is not None,
                  'ohlc_dim':self.brain.ohlc_dim,
                  'approved':self.feature_registry.approved_ids(),
-                 'model_version':(meta or {}).get('model_version') if isinstance(meta,dict) else None})
-        return bool(ok or specs is not None)
+                 'model_version':(meta or {}).get('model_version') if isinstance(meta,dict) else None,
+                 'epic':self.brain.epic})
+            return True
+        return False
+
 

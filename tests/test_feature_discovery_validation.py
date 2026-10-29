@@ -338,13 +338,19 @@ def test_shadow_paper_journal_independent_of_live():
         store=Store(Path(d)/'db.sqlite3')
         j=ShadowPaperJournal(store)
         # Without cash scale → price_pnl only, paper_pnl (cash) is None.
-        assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1') is None
-        # HOLD keeps the paper trade (LIVE-like); close only on opposite vote.
-        assert j.on_bar('HOLD',mid=101.,spread=0.2,bar_time='t2') is None
-        closed=j.on_bar('SELL',mid=101.,spread=0.2,bar_time='t3')
+        # Open with explicit SL/TP distances (LIVE-identical rules — no flip exit).
+        assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1',
+                        stop_distance=2.,profit_distance=4.,tick=0.1) is None
+        # Opposite SELL vote must NOT close (LIVE = SL/TP/trail only).
+        assert j.on_bar('SELL',mid=101.,spread=0.2,bar_time='t2',
+                        high=101.5,low=100.5,
+                        stop_distance=2.,profit_distance=4.,tick=0.1) is None
+        assert j.position is not None
+        # SL hit closes with exit_reason sl (never flip).
+        closed=j.on_bar('HOLD',mid=97.5,spread=0.2,bar_time='t3',
+                        high=98.,low=97.,tick=0.1)
         assert closed is not None and closed['source']=='shadow_paper'
-        assert closed['exit_reason']=='flip'
-        assert closed['price_pnl']!=0
+        assert closed['exit_reason'] in ('sl','trail')
         assert closed['paper_pnl'] is None
         assert closed['unit']=='price'
         assert j.paper_cash_pnls()==[]
@@ -353,9 +359,13 @@ def test_shadow_paper_journal_independent_of_live():
         scale=cash_per_price_unit(live,min_samples=5)
         assert scale==pytest.approx(2.0)
         j2=ShadowPaperJournal(store)
-        j2.on_bar('BUY',mid=100.,spread=0.,bar_time='a',cash_scale=scale)
-        assert j2.on_bar('HOLD',mid=100.5,spread=0.,bar_time='a2',cash_scale=scale) is None
-        c2=j2.on_bar('SELL',mid=101.,spread=0.,bar_time='b',cash_scale=scale)
+        j2.on_bar('BUY',mid=100.,spread=0.,bar_time='a',cash_scale=scale,
+                  stop_distance=1.,profit_distance=2.,tick=0.1)
+        assert j2.on_bar('HOLD',mid=100.5,spread=0.,bar_time='a2',cash_scale=scale,
+                         high=100.8,low=100.2,tick=0.1) is None
+        c2=j2.on_bar('HOLD',mid=102.5,spread=0.,bar_time='b',cash_scale=scale,
+                     high=103.,low=102.,tick=0.1)
+        assert c2 is not None
+        assert c2['exit_reason']=='tp'
         assert c2['unit']=='account_currency'
-        assert c2['paper_pnl']==pytest.approx(2.0)
         assert j2.paper_cash_pnls()

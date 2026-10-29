@@ -13,7 +13,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .external_risk import _utc, assess_news
-from .liquidity_feed import LIQUIDITY_NAMES, liquidity_features_from_path
+from .liquidity_feed import (
+    LIQUIDITY_NAMES, liquidity_features_from_path, liquidity_observation_from_path,
+)
 from .market_context import FEATURE_NAMES, FEATURE_DIM, candle_time
 
 FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_liquidity_shadow_v6'
@@ -99,6 +101,36 @@ def news_features(epic, calendar_path, currencies, *, now=None):
         return out if all(math.isfinite(x) and 0<=x<=1 for x in out) else None
     except (KeyError, TypeError, ValueError, OSError):
         return None
+
+
+def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now=None,
+                      expected_ohlc_dim=None, liquidity_path=None):
+    """Which EXTERNAL source blocks a fused decision after fusion transition.
+
+    Returns None when fusion can be built; otherwise a short operator-facing
+    reason naming the blocking feed (peers / news / liquidity / OHLC dim).
+    """
+    if not isinstance(base, dict) or not base.get('ready'):
+        return 'ohlc: market context not ready'
+    ohlc = list(base.get('features') or [])
+    need = FEATURE_DIM if expected_ohlc_dim is None else int(expected_ohlc_dim)
+    if len(ohlc) != need:
+        return f'ohlc: feature dim {len(ohlc)} != expected {need}'
+    peers = peer_features(intermarket, base.get('bar_time'))
+    if peers is None:
+        status = (intermarket or {}).get('status') if isinstance(intermarket, dict) else None
+        detail = (intermarket or {}).get('reason') if isinstance(intermarket, dict) else None
+        return 'peers: ' + (detail or status or 'aligned peer features unavailable')
+    news = news_features(epic, calendar_path, currencies, now=now)
+    if news is None:
+        return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW'
+    if liquidity_path is None:
+        return 'liquidity: path not configured'
+    obs = liquidity_observation_from_path(
+        liquidity_path, base.get('bar_time'), now=now, epic=epic)
+    if not obs.get('ok') or obs.get('features') is None:
+        return 'liquidity: ' + (obs.get('reason') or 'volume/DOM observation unavailable')
+    return None
 
 
 def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=None,

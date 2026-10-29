@@ -1,9 +1,9 @@
 """SL/TP from OHLC at open + real cash learning when to raise / cut.
 
 Open moment: distances come from recent M1 adverse/favorable moves (same candles
-the neural net sees). After each broker £ result the robot *learns*:
-  - losses / scratches → raise SL room (or cut unreachable TP)
-  - wins → keep / gently reinforce the shape that paid
+the neural net sees). After each broker £ result the robot *learns* — but only
+after separately analysing exit reason, entry direction, price path, volatility,
+and costs (audit #19). A loss alone must NOT auto-conclude that SL was too tight.
 
 No hardcoded κ lottery. Learning is the adaptation layer, not a 5% cosmetic nudge.
 """
@@ -18,6 +18,9 @@ DEFAULT_SL_SCALE=1.0
 MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 MIN_BATCH_SAMPLES=6
+SCRATCH_CASH=0.05
+# Exit reasons the adaptation layer understands.
+EXIT_REASONS=frozenset({'sl','tp','trail','vanish','manual','unknown'})
 
 
 def _finite(v):
@@ -30,6 +33,63 @@ def _finite(v):
 
 def _clip(v,lo,hi):
     return float(max(lo,min(hi,float(v))))
+
+
+def normalize_exit_reason(reason) -> str:
+    if reason is None:return 'unknown'
+    r=str(reason).strip().lower()
+    aliases={
+        'stop':'sl','stop_loss':'sl','stop-loss':'sl','sl_hit':'sl',
+        'take_profit':'tp','take-profit':'tp','limit':'tp','tp_hit':'tp',
+        'trailing':'trail','trail_stop':'trail','trailing_stop':'trail',
+        'position_disappeared':'vanish','disappeared':'vanish','gone':'vanish',
+        'user':'manual','close':'manual','market_close':'manual',
+    }
+    r=aliases.get(r,r)
+    return r if r in EXIT_REASONS else 'unknown'
+
+
+def analyze_trade_path(*, direction=None, entry=None, exit_level=None,
+                       stop_distance=None, adverse_path=None, volatility=None,
+                       costs=None, pnl=None) -> dict:
+    """Separate path / vol / cost facts from the raw cash P&L.
+
+    adverse_path: absolute price move against the position (or inferred from
+    entry→exit when the move was adverse). Compared to volatility to decide
+    whether an SL hit was noise (tight stop) vs a genuine wrong-direction path.
+    """
+    pnl_n=_finite(pnl)
+    costs_n=abs(_finite(costs) or 0.0)
+    vol=_finite(volatility)
+    stop=_finite(stop_distance)
+    adv=_finite(adverse_path)
+    entry_n=_finite(entry);exit_n=_finite(exit_level)
+    signed=None
+    if direction in ('BUY','SELL') and entry_n is not None and exit_n is not None:
+        sign=1.0 if direction=='BUY' else -1.0
+        signed=sign*(exit_n-entry_n)
+        if adv is None and signed<0:
+            adv=abs(signed)
+        elif adv is None:
+            adv=0.0
+    scratch_cash=pnl_n is not None and abs(pnl_n)<=SCRATCH_CASH
+    cost_dominated=bool(
+        costs_n>0 and pnl_n is not None and abs(pnl_n)<=max(SCRATCH_CASH,1.5*costs_n))
+    vs_vol=None
+    if adv is not None and vol is not None and vol>1e-12:
+        vs_vol=float(adv)/float(vol)
+    noise_stop=bool(vs_vol is not None and vs_vol<=1.15)
+    adverse_entry=bool(vs_vol is not None and vs_vol>1.15)
+    if vs_vol is None and adv is not None and stop is not None and stop>1e-12:
+        ratio=float(adv)/float(stop)
+        noise_stop=ratio<=1.05
+        adverse_entry=ratio>1.05 and (pnl_n is not None and pnl_n<-SCRATCH_CASH)
+    return {
+        'adverse_path':adv,'volatility':vol,'costs':costs_n,
+        'signed_move':signed,'scratch_cash':scratch_cash,
+        'cost_dominated':cost_dominated,'noise_stop':noise_stop,
+        'adverse_entry':adverse_entry,'vs_vol':vs_vol,
+    }
 
 
 def load_params(store) -> dict:
@@ -64,51 +124,109 @@ def save_multipliers(store,kappa_mult: float,sl_mult: float,reason: str=''):
         store.set('bracket_learn_reason',reason)
 
 
-def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None):
-    """Append cash outcome and immediately learn raise/cut from that result."""
+def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None,
+                   exit_reason=None, direction=None, entry=None, exit_level=None,
+                   stop_distance=None, adverse_path=None, volatility=None,
+                   costs=None):
+    """Append cash outcome and learn raise/cut from analysed path — not P&L alone."""
     pnl_n=_finite(pnl)
     if pnl_n is None:return
     k=_finite(kappa);s=_finite(sl_scale)
     if k is None or s is None or k<=0 or s<1:return
+    reason=normalize_exit_reason(exit_reason)
+    path=analyze_trade_path(
+        direction=direction,entry=entry,exit_level=exit_level,
+        stop_distance=stop_distance,adverse_path=adverse_path,
+        volatility=volatility,costs=costs,pnl=pnl_n)
     hist=store.get('bracket_outcome_history',[]) or []
     if not isinstance(hist,list):hist=[]
     hist.append({
         'kappa':float(k),'sl_scale':float(s),'pnl':float(pnl_n),
-        'currency':currency,'deal_id':deal_id,
+        'currency':currency,'deal_id':deal_id,'exit_reason':reason,
+        'direction':direction,'adverse_path':path.get('adverse_path'),
+        'volatility':path.get('volatility'),'costs':path.get('costs'),
     })
     store.set('bracket_outcome_history',hist[-200:])
-    adapt_after_outcome(store,kappa=float(k),sl_scale=float(s),pnl=float(pnl_n))
+    return adapt_after_outcome(
+        store,kappa=float(k),sl_scale=float(s),pnl=float(pnl_n),
+        exit_reason=reason,direction=direction,entry=entry,exit_level=exit_level,
+        stop_distance=stop_distance,adverse_path=adverse_path,
+        volatility=volatility,costs=costs)
 
 
-def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float) -> dict:
-    """Learn from one closed trade: when to raise SL/TP room, when to cut TP.
+def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
+                        exit_reason=None, direction=None, entry=None,
+                        exit_level=None, stop_distance=None, adverse_path=None,
+                        volatility=None, costs=None) -> dict:
+    """Learn SL/TP multipliers from one closed trade — conditioned on context.
 
-    Signals (broker cash in account currency):
-      scratch |pnl|≤0.05 → SL too tight → raise sl_mult
-      loss < -0.05 with tight shape → raise sl_mult (need more room)
-      loss with already-wide shape → cut kappa_mult (TP was fantasy; SL hit first)
-      win > 0.05 → reinforce current multipliers slightly
+    Audit #19: do NOT auto-conclude that a loss means SL was too tight.
+    Separate analysis of exit reason, path, volatility, and costs first.
+
+      tp / profitable trail → reinforce shape that paid
+      vanish / unknown without path → hold (no SL widen)
+      scratch / cost-dominated → hold SL (was NOT "too tight" by default);
+                                  optionally cut κ when shape was already wide
+      sl + noise vs vol (tight shape) → raise SL room
+      sl + adverse entry path → hold SL (entry direction problem, not distance)
+      loss + already-wide shape → cut κ (TP fantasy)
+      win → reinforce gently
     """
     mult=load_multipliers(store)
     k_m,s_m=mult['kappa'],mult['sl_scale']
     shape=float(kappa)*float(sl_scale)
+    reason_x=normalize_exit_reason(exit_reason)
+    path=analyze_trade_path(
+        direction=direction,entry=entry,exit_level=exit_level,
+        stop_distance=stop_distance,adverse_path=adverse_path,
+        volatility=volatility,costs=costs,pnl=pnl)
     reason='hold'
-    if abs(pnl)<=0.05:
-        s_m=min(MULT_SL_MAX,s_m*1.10)
-        reason='scratch_raise_sl'
-    elif pnl<-0.05:
-        if shape<1.6:
-            s_m=min(MULT_SL_MAX,s_m*1.12)
-            reason='loss_tight_raise_sl'
+    if reason_x=='tp' or (pnl>SCRATCH_CASH and reason_x in ('trail','unknown','manual')):
+        k_m=min(MULT_KAPPA_MAX,k_m*1.05)
+        s_m=min(MULT_SL_MAX,s_m*1.03)
+        reason='win_reinforce' if pnl>SCRATCH_CASH else 'tp_reinforce'
+    elif reason_x=='trail':
+        # Trail already managed the exit — do not treat as "SL too tight".
+        if pnl<-SCRATCH_CASH and shape>=1.6:
+            k_m=max(MULT_KAPPA_MIN,k_m*0.95)
+            reason='trail_loss_cut_tp'
         else:
+            reason='trail_hold'
+    elif reason_x=='vanish':
+        reason='vanish_hold'
+    elif path['scratch_cash'] or path['cost_dominated']:
+        # Scratch ≠ SL too tight. Old heuristic (raise SL) removed (audit #19).
+        if shape>=1.6:
+            k_m=max(MULT_KAPPA_MIN,k_m*0.97)
+            reason='scratch_cut_tp'
+        else:
+            reason='scratch_hold_sl'
+    elif reason_x=='sl' or (pnl<-SCRATCH_CASH and reason_x in ('unknown','manual')):
+        if path['noise_stop'] and shape<1.6 and not path['adverse_entry']:
+            # Stopped inside the noise band with a tight shape → give SL room.
+            s_m=min(MULT_SL_MAX,s_m*1.12)
+            reason='sl_noise_raise_sl'
+        elif shape>=1.6:
+            # Wide brackets already had room; TP was fantasy — cut κ, do not
+            # widen SL further (even when the path was adverse).
             k_m=max(MULT_KAPPA_MIN,k_m*0.90)
             reason='loss_wide_cut_tp'
-    elif pnl>0.05:
+        elif path['adverse_entry']:
+            # Wrong-direction path beyond vol — widening SL would enlarge losses.
+            reason='loss_adverse_hold_sl'
+        else:
+            # Loss without vol/path evidence — refuse to assume SL was tight.
+            reason='loss_insufficient_context_hold'
+    elif pnl>SCRATCH_CASH:
         k_m=min(MULT_KAPPA_MAX,k_m*1.05)
         s_m=min(MULT_SL_MAX,s_m*1.03)
         reason='win_reinforce'
-    save_multipliers(store,k_m,s_m,reason=f'learned_{reason} pnl={pnl:.4f}')
-    return {'kappa_mult':k_m,'sl_mult':s_m,'reason':reason,'pnl':pnl}
+    save_multipliers(store,k_m,s_m,
+                     reason=f'learned_{reason} exit={reason_x} pnl={pnl:.4f}')
+    return {
+        'kappa_mult':k_m,'sl_mult':s_m,'reason':reason,'pnl':pnl,
+        'exit_reason':reason_x,'path':path,
+    }
 
 
 def _bar_moves(candles, n: int|None=None):

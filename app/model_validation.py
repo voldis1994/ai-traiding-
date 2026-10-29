@@ -24,20 +24,37 @@ def _cfg(store=None):
 
 
 def _equity_curve(pnls):
-    eq=np.cumsum(np.asarray(pnls,dtype=float))
-    if len(eq)==0:return eq,0.,0.
+    """Equity from starting capital 0 *before* the first trade.
+
+    Without the initial point, the first loss becomes the peak and is skipped
+    in max drawdown (12×−1 looked like −11). Prepending 0 makes max_dd = −12.
+    """
+    arr=np.asarray(list(pnls),dtype=float)
+    if len(arr)==0:return arr,0.,0.
+    eq=np.concatenate(([0.],np.cumsum(arr)))
     peak=np.maximum.accumulate(eq)
     dd=eq-peak
-    return eq,float(eq[-1]),float(dd.min()) if len(dd) else 0.
+    # Return post-trade equity series (excluding the starting 0) for callers
+    # that expect len(eq)==len(pnls); max_dd still includes the start point.
+    return eq[1:],float(eq[-1]),float(dd.min()) if len(dd) else 0.
 
 
-def score_trade_pnls(pnls, *, store=None):
-    """Net, max drawdown, stability (share of positive rolling windows)."""
+def _finite_pnls(pnls):
+    return [float(x) for x in pnls if x is not None and math.isfinite(float(x))]
+
+
+def score_trade_pnls(pnls, *, store=None, model_version=None):
+    """Net, max drawdown, stability (share of positive rolling windows).
+
+    `model_version` is recorded on the score so callers never mix versions into
+    one candidate number without noticing.
+    """
     cfg=_cfg(store)
     min_oos=int(cfg['model_min_oos'])
-    pnls=[float(x) for x in pnls if x is not None and math.isfinite(float(x))]
+    pnls=_finite_pnls(pnls)
     if len(pnls)<min_oos:
-        return {'ok':False,'reason':f'need ≥{min_oos} OOS outcomes','n':len(pnls)}
+        return {'ok':False,'reason':f'need ≥{min_oos} OOS outcomes','n':len(pnls),
+                'model_version':model_version}
     _,net,dd=_equity_curve(pnls)
     block=max(4,len(pnls)//5)
     pos=0;total=0
@@ -45,18 +62,116 @@ def score_trade_pnls(pnls, *, store=None):
         total+=1
         if sum(pnls[i:i+block])>0:pos+=1
     stability=pos/max(total,1)
-    return {'ok':True,'n':len(pnls),'net':net,'max_dd':dd,'stability':stability}
+    return {'ok':True,'n':len(pnls),'net':net,'max_dd':dd,'stability':stability,
+            'model_version':model_version}
 
 
-def compare_models(incumbent_pnls, candidate_pnls, *, store=None):
+def _row_time(row):
+    if not isinstance(row,dict):return None
+    for key in ('bar_time','at','closed_at','time'):
+        v=row.get(key)
+        if v:return str(v)
+    return None
+
+
+def _row_pnl(row, *, cash_key='actual_pnl'):
+    if isinstance(row,(int,float)):
+        return float(row) if math.isfinite(float(row)) else None
+    if not isinstance(row,dict):return None
+    for key in (cash_key,'paper_pnl','actual_pnl','pnl'):
+        if key in row and row[key] is not None:
+            try:
+                v=float(row[key])
+            except (TypeError,ValueError):
+                continue
+            if math.isfinite(v):return v
+    return None
+
+
+def _row_version(row):
+    if not isinstance(row,dict):return None
+    v=row.get('model_version')
+    if v is None:return None
+    try:return int(v)
+    except (TypeError,ValueError):return None
+
+
+def single_version_pnls(rows, *, cash_key='actual_pnl', model_version=None):
+    """Keep one model_version's cash outcomes — never mix versions in a score.
+
+    If `model_version` is None, use the latest version present in `rows`.
+    Rows without a version are kept only when *no* row is version-tagged
+    (legacy histories); otherwise they are dropped so mixed eras stay clean.
+    """
+    rows=list(rows or [])
+    versions=sorted({v for v in (_row_version(r) for r in rows) if v is not None})
+    if model_version is None and versions:
+        model_version=versions[-1]
+    out=[]
+    for r in rows:
+        ver=_row_version(r)
+        if versions:
+            if ver is None or int(ver)!=int(model_version):
+                continue
+        pnl=_row_pnl(r,cash_key=cash_key)
+        if pnl is None:continue
+        out.append({'pnl':pnl,'at':_row_time(r),'model_version':ver
+                    if ver is not None else model_version,'row':r})
+    return out,model_version
+
+
+def aligned_window_pnls(incumbent_rows, candidate_rows, *, oos_frac=0.7,
+                        inc_cash_key='actual_pnl', cand_cash_key='paper_pnl',
+                        incumbent_version=None, candidate_version=None):
+    """Same chronological OOS window + one model_version per side.
+
+    Cuts both series to the overlapping time span after each side's OOS cut so
+    shadow and LIVE are scored on comparable available data / cash risk.
+    """
+    inc,inc_ver=single_version_pnls(incumbent_rows,cash_key=inc_cash_key,
+                                    model_version=incumbent_version)
+    cand,cand_ver=single_version_pnls(candidate_rows,cash_key=cand_cash_key,
+                                      model_version=candidate_version)
+    oos_frac=float(oos_frac)
+    if oos_frac<0:oos_frac=0.
+    if oos_frac>1:oos_frac=1.
+    inc_cut=int(len(inc)*(1.0-oos_frac))
+    cand_cut=int(len(cand)*(1.0-oos_frac))
+    inc_oos=inc[inc_cut:]
+    cand_oos=cand[cand_cut:]
+    # Align by shared time bounds when timestamps exist on both sides.
+    inc_times=[x['at'] for x in inc_oos if x.get('at')]
+    cand_times=[x['at'] for x in cand_oos if x.get('at')]
+    if inc_times and cand_times:
+        start=max(min(inc_times),min(cand_times))
+        end=min(max(inc_times),max(cand_times))
+        if start<=end:
+            inc_oos=[x for x in inc_oos if not x.get('at') or start<=x['at']<=end]
+            cand_oos=[x for x in cand_oos if not x.get('at') or start<=x['at']<=end]
+    return {
+        'incumbent_pnls':[x['pnl'] for x in inc_oos],
+        'candidate_pnls':[x['pnl'] for x in cand_oos],
+        'incumbent_version':inc_ver,
+        'candidate_version':cand_ver,
+        'window_start':(max(min(inc_times),min(cand_times))
+                        if inc_times and cand_times else None),
+        'window_end':(min(max(inc_times),max(cand_times))
+                      if inc_times and cand_times else None),
+        'incumbent_n_total':len(inc),'candidate_n_total':len(cand),
+    }
+
+
+def compare_models(incumbent_pnls, candidate_pnls, *, store=None,
+                   incumbent_version=None, candidate_version=None):
     """Return promote decision with reasons — thresholds from self_params."""
     cfg=_cfg(store)
     dd_ratio=float(cfg['model_max_dd_ratio'])
     slack=float(cfg['model_stability_slack'])
-    inc=score_trade_pnls(incumbent_pnls,store=store)
-    cand=score_trade_pnls(candidate_pnls,store=store)
+    inc=score_trade_pnls(incumbent_pnls,store=store,model_version=incumbent_version)
+    cand=score_trade_pnls(candidate_pnls,store=store,model_version=candidate_version)
     if not cand.get('ok'):
-        return {'promote':False,'reason':cand.get('reason','candidate weak'),'incumbent':inc,'candidate':cand}
+        return {'promote':False,'reason':cand.get('reason','candidate weak'),
+                'incumbent':inc,'candidate':cand}
     if not inc.get('ok'):
         if cand['stability']<.4:
             return {'promote':False,'reason':'incumbent thin and candidate unstable',
@@ -109,7 +224,9 @@ class ModelValidator:
 
     def evaluate(self, incumbent_pnls, candidate_pnls, *, meta=None):
         from .self_params import evolve_from_feedback
-        decision=compare_models(incumbent_pnls,candidate_pnls,store=self.store)
+        decision=compare_models(incumbent_pnls,candidate_pnls,store=self.store,
+                                incumbent_version=(meta or {}).get('incumbent_version'),
+                                candidate_version=(meta or {}).get('candidate_version'))
         entry={'at':datetime.now(timezone.utc).isoformat(),
                'decision':decision,'meta':meta or {}}
         self._persist_log(entry)

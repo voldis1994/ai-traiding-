@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import numpy as np
 from .storage import DATA
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -337,29 +338,79 @@ class AutoEvolution:
         if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
         return 'CLOSE'
 
-    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None):
-        """LIVE entry = neural argmax only — no zone/SHIFT/trend hard vetoes.
+    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
+                              history=None,readiness=None,spread_bps=0.0):
+        """LIVE direction = neural argmax; readiness + economic utility are separate.
 
-        OHLC returns/trend/regime are logged as evidence for learning/audit, never
-        as hardcoded gates. Broker news / mandate / TRADEABLE stay in the engine.
+        Argmax chooses BUY/SELL/HOLD — zone/SHIFT/trend are evidence only, never
+        entry bans. A small BUY/SELL score edge is NOT proven trading advantage:
+        when ``readiness`` / ``history`` are supplied, LIVE OPEN also requires
+        prep/eval readiness and cost-adjusted economic utility (audit #22–#23).
+        Broker news / mandate / TRADEABLE stay in the engine.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
-                    'reason':'Invalid neural scores; no entry','evidence':None,'calibration':None}
+                    'reason':'Invalid neural scores; no entry','evidence':None,
+                    'calibration':None,'score_edge':None,'readiness':readiness,
+                    'economic_utility':None}
         buy=float(scores['BUY']);sell=float(scores['SELL']);hold=float(scores['HOLD'])
         direction='BUY' if buy>=sell else 'SELL'
         strength=buy if direction=='BUY' else sell
+        score_edge=self.score_edge(scores)
         evidence={'returns_bps':returns_bps,'trend':trend,'regime':regime,
-                  'scores':{'BUY':buy,'SELL':sell,'HOLD':hold}}
+                  'scores':{'BUY':buy,'SELL':sell,'HOLD':hold},
+                  'score_edge':score_edge,
+                  'score_edge_is_not_trading_advantage':True}
+        base={'proposal':direction,'threshold':None,'calibration':None,
+              'score_edge':score_edge,'readiness':readiness,'economic_utility':None,
+              'evidence':evidence}
         if hold>strength:
-            return {'action':'HOLD','proposal':direction,'threshold':None,
+            return {**base,'action':'HOLD',
                     'reason':(f'Neural HOLD dominates {direction} '
-                              f'({hold:.1%} > {strength:.1%})'),
-                    'evidence':evidence,'calibration':None}
-        return {'action':direction,'proposal':direction,'threshold':None,
+                              f'({hold:.1%} > {strength:.1%})')}
+        # --- Separate gate: model prep/eval readiness (audit #22) ---
+        if isinstance(readiness,dict) and readiness.get('ready') is False:
+            return {**base,'action':'HOLD',
+                    'reason':'Model prep/eval not ready for LIVE OPEN: '+(
+                        readiness.get('reason') or 'readiness gate')}
+        # --- Separate gate: economic utility after costs (audit #23) ---
+        # Argmax keeps the proposal; failure downgrades to HOLD (never flips side).
+        # A small score_edge alone is never treated as proven trading advantage.
+        economic=None
+        labeled=0
+        if history is not None:
+            labeled=sum(1 for r in history if r.get('label') in (0,1,2))
+        if history is not None and labeled>=64:
+            edge_floor=max(0.01,min(0.05,float(score_edge) if score_edge is not None else 0.01))
+            economic=self.directional_evidence(
+                direction,history,edge_floor,forward_holdout=True)
+            base['economic_utility']=economic
+            evidence['economic_utility']=economic
+            if not economic.get('allowed'):
+                return {**base,'action':'HOLD',
+                        'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
+                                  +str(economic.get('reason') or 'utility gate'))}
+        elif isinstance(readiness,dict) and readiness.get('ready'):
+            # Prep/eval holdout already measured cost-adjusted proxy — use that,
+            # still refusing to treat softmax edge as calibrated profit odds.
+            economic={
+                'allowed':True,'source':'prep_eval_holdout',
+                'samples':readiness.get('eval_samples'),
+                'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
+                'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
+                'reason':'Prep/eval holdout stands in for economic utility; '
+                         'score edge is not calibrated profit probability',
+            }
+            base['economic_utility']=economic
+            evidence['economic_utility']=economic
+        elif history is not None:
+            return {**base,'action':'HOLD',
+                    'reason':('Argmax '+direction+' blocked: need prep/eval readiness or '
+                              'cost-adjusted utility evidence (score edge is not enough)')}
+        return {**base,'action':direction,
                 'reason':(f'Neural argmax {direction} '
-                          f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%})'),
-                'evidence':evidence,'calibration':None}
+                          f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%}); '
+                          f'score edge {score_edge:.1%} is not calibrated profit probability')}
 
     @staticmethod
     def _minute_time(value):
@@ -380,7 +431,9 @@ class AutoEvolution:
 
         Use only already matured labels, and verify each minute exists. This
         prevents interpolating across market closures or missing data bars.
+        Costs via shared ``trade_costs.net_forward_bps`` (one RT spread in bps).
         """
+        from .trade_costs import net_forward_bps
         horizon=8
         if i+horizon>=len(rows) or rows[i].get('label') not in (0,1,2):
             return None
@@ -397,8 +450,8 @@ class AutoEvolution:
                 if current is None or abs(current-previous-60.)>.5:
                     return None
                 previous=current
-            signed=(1. if action=='BUY' else -1.)*(end-start)*10000./start
-            return signed-.5*(spread0+spread8)
+            return net_forward_bps(action,start,end,
+                                   spread_bps_entry=spread0,spread_bps_exit=spread8)
         except (KeyError,TypeError,ValueError,ZeroDivisionError):
             return None
 
@@ -732,6 +785,139 @@ class AutoEvolution:
 
     CHECKPOINT_TRADES_KEY='model_checkpoint_at_trades'
     ROLLBACK_COOLDOWN_KEY='model_rollback_cooldown_until_trades'
+    LAST_PROMOTE_KEY='shadow_last_promote_v1'
+
+    @staticmethod
+    def weight_checksum(core):
+        """Stable fingerprint of neural weights — blocks identical re-promote."""
+        if core is None:return None
+        h=hashlib.sha256()
+        for name in ('P','W','R','O','b','G','tau','tau_c'):
+            arr=getattr(core,name,None)
+            if arr is None:continue
+            h.update(np.ascontiguousarray(arr,dtype=np.float64).tobytes())
+        return h.hexdigest()[:40]
+
+    # --- Audit #18: controlled weight-update safety helpers -------------------
+
+    @staticmethod
+    def snapshot_core_weights(core):
+        """Prior-state snapshot before a batch/online weight update."""
+        if core is None:return None
+        if hasattr(core,'snapshot_weights'):
+            return core.snapshot_weights()
+        from .core import WEIGHT_PARAM_NAMES
+        return {n:np.asarray(getattr(core,n),dtype=float).copy()
+                for n in WEIGHT_PARAM_NAMES if hasattr(core,n)}
+
+    @staticmethod
+    def restore_core_weights(core, snap):
+        """Restore prior weights when post-update criterion worsens."""
+        if core is None or snap is None:return False
+        if hasattr(core,'restore_weights'):
+            return bool(core.restore_weights(snap))
+        from .core import WEIGHT_PARAM_NAMES
+        for n in WEIGHT_PARAM_NAMES:
+            if n not in snap:return False
+            setattr(core,n,np.asarray(snap[n],dtype=float).copy())
+        return True
+
+    @staticmethod
+    def weight_update_delta_norm(before, after):
+        from .core import NeuralCore
+        return NeuralCore.weight_delta_norm(before,after)
+
+    @staticmethod
+    def controlled_weight_learn(core, transition, label, *, lr=None,
+                                objective=None, max_delta_norm=None,
+                                restore_if_worsens=True, criterion_fn=None):
+        """Snapshot → bounded learn → optional criterion restore (audit #18).
+
+        Ordinary learn is never reported as proven_improvement. If
+        `criterion_fn(core) -> float` is supplied (higher=better) and the
+        post-update value is worse than pre-update, weights restore.
+        """
+        if core is None or not hasattr(core,'learn'):
+            return {'applied':False,'proven_improvement':False,'reason':'no_core'}
+        prior=AutoEvolution.snapshot_core_weights(core)
+        pre_crit=None
+        if criterion_fn is not None:
+            try:pre_crit=float(criterion_fn(core))
+            except Exception:pre_crit=None
+        loss=core.learn(transition,label,lr=lr,objective=objective,
+                        max_delta_norm=max_delta_norm,
+                        restore_if_worsens=restore_if_worsens)
+        meta=dict(getattr(core,'last_learn_meta',None) or {})
+        restored=bool(meta.get('restored'))
+        if (criterion_fn is not None and pre_crit is not None and not restored
+                and prior is not None):
+            try:post_crit=float(criterion_fn(core))
+            except Exception:post_crit=None
+            if post_crit is not None and post_crit<pre_crit:
+                AutoEvolution.restore_core_weights(core,prior)
+                restored=True
+                meta['restored']=True
+                meta['restore_reason']='external_criterion_worsened'
+                meta['criterion_before']=pre_crit
+                meta['criterion_after']=post_crit
+                if hasattr(core,'last_learn_meta'):
+                    core.last_learn_meta=meta
+        meta['proven_improvement']=False
+        if hasattr(core,'last_learn_meta'):
+            core.last_learn_meta=meta
+        after=AutoEvolution.snapshot_core_weights(core)
+        return {
+            'applied':loss is not None and not restored,
+            'loss':loss,
+            'restored':restored,
+            'clipped':bool(meta.get('clipped')),
+            'delta_norm':meta.get('delta_norm'),
+            'objective':meta.get('objective'),
+            'objective_weight':meta.get('objective_weight'),
+            'proven_improvement':False,
+            'meta':meta,
+            'weights_changed':(
+                prior is not None and after is not None and
+                AutoEvolution.weight_update_delta_norm(prior,after)>1e-15),
+        }
+
+    def _promote_evidence_boundary(self, live_hist, shadow_rows):
+        """Trade counts used as the evaluation frontier for anti-repeat promote."""
+        return {
+            'live_trades':len(live_hist or []),
+            'shadow_trades':len(shadow_rows or []),
+        }
+
+    def _promote_blocked_same_evidence(self, engine, live_hist, shadow_rows, checksum):
+        """True when checksum + trade boundary match the last promote.
+
+        model_id is stored for audit. After a successful promote the shadow
+        version may advance; blocking still hinges on identical weights and
+        no new evaluation trades — not on the bumped id alone.
+        """
+        del engine  # reserved for future model_id cross-checks
+        prev=self.store.get(self.LAST_PROMOTE_KEY) or {}
+        if not isinstance(prev,dict) or not prev:return False
+        boundary=self._promote_evidence_boundary(live_hist,shadow_rows)
+        same_checksum=(prev.get('weight_checksum') is not None and
+                       checksum is not None and
+                       str(prev.get('weight_checksum'))==str(checksum))
+        same_boundary=(int(prev.get('live_trades') or -1)==boundary['live_trades'] and
+                       int(prev.get('shadow_trades') or -1)==boundary['shadow_trades'])
+        return bool(same_checksum and same_boundary)
+
+    def _record_promote_evidence(self, engine, live_hist, shadow_rows, checksum):
+        boundary=self._promote_evidence_boundary(live_hist,shadow_rows)
+        shadow=getattr(engine,'shadow_brain',None)
+        meta={
+            'model_id':int(getattr(shadow,'model_version',0) or 0),
+            'weight_checksum':checksum,
+            'live_trades':boundary['live_trades'],
+            'shadow_trades':boundary['shadow_trades'],
+            'at':datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.set(self.LAST_PROMOTE_KEY,meta)
+        return meta
 
     def _push_model_snapshot(self, engine, *, note='checkpoint'):
         """Save neural weights + registry specs onto the model stack."""
@@ -746,7 +932,11 @@ class AutoEvolution:
         reg=getattr(engine,'feature_registry',None)
         if reg is not None:
             specs=[dict(x) for x in (reg.approved or [])]
-        meta={
+        from .instrument_isolation import label_backup_meta
+        epic=getattr(brain,'epic',None)
+        if not epic and getattr(engine,'mandate',None):
+            epic=engine.mandate.get('epic')
+        meta=label_backup_meta({
             'model_version':int(getattr(brain,'model_version',0) or 0),
             'feature_schema':getattr(brain,'feature_schema',None),
             'ohlc_dim':getattr(brain,'ohlc_dim',None),
@@ -755,7 +945,7 @@ class AutoEvolution:
             'approved_specs':specs,
             'weights_path':path,
             'note':str(note)[:80],
-        }
+        },epic)
         mv.push_version(meta)
         return meta
 
@@ -782,8 +972,9 @@ class AutoEvolution:
 
         Shadow runs its own paper journal. Price moves are scaled to account
         currency via LIVE broker_£/price ratios — never raw price units vs £.
+        Compare on the same time window / single model_version per side.
         """
-        from .model_validation import compare_models
+        from .model_validation import compare_models, aligned_window_pnls
         from .self_params import (load as load_params, evolve_from_feedback,
                                   maybe_commit_long_horizon)
         engine._ensure_shadow_brain()
@@ -800,17 +991,30 @@ class AutoEvolution:
         paper=getattr(engine,'shadow_paper',None)
         if paper is not None:
             paper.update_cash_scale(live_hist)
-        # Cash-only paper rows (unit=account_currency) — skip price-unit leftovers.
-        shadow_cash=(paper.paper_cash_pnls() if paper else [])
-        if len(live_hist)<min_trades or len(shadow_cash)<max(4,min_trades//2):
+        shadow_rows=(paper.paper_rows() if paper and hasattr(paper,'paper_rows')
+                     else [])
+        if not shadow_rows and paper is not None:
+            shadow_rows=[r for r in (paper.history or [])
+                         if r.get('unit')=='account_currency'
+                         and r.get('paper_pnl') is not None]
+        if len(live_hist)<min_trades or len(shadow_rows)<max(4,min_trades//2):
             self.last_reason=('Shadow self-dev waiting for broker £ + cash-scaled '
                               'paper trades')
             return None
-        live_cut=int(len(live_hist)*(1.0-oos_frac))
-        sh_cut=int(len(shadow_cash)*(1.0-oos_frac))
-        live_pnls=[float(r['actual_pnl']) for r in live_hist[live_cut:]]
-        shadow_pnls=list(shadow_cash[sh_cut:])
-        decision=compare_models(live_pnls,shadow_pnls,store=self.store)
+        aligned=aligned_window_pnls(
+            live_hist,shadow_rows,oos_frac=oos_frac,
+            inc_cash_key='actual_pnl',cand_cash_key='paper_pnl')
+        live_pnls=aligned['incumbent_pnls']
+        shadow_pnls=aligned['candidate_pnls']
+        decision=compare_models(
+            live_pnls,shadow_pnls,store=self.store,
+            incumbent_version=aligned.get('incumbent_version'),
+            candidate_version=aligned.get('candidate_version'))
+        decision=dict(decision,
+                      incumbent_version=aligned.get('incumbent_version'),
+                      candidate_version=aligned.get('candidate_version'),
+                      window_start=aligned.get('window_start'),
+                      window_end=aligned.get('window_end'))
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
         maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
@@ -818,7 +1022,13 @@ class AutoEvolution:
         if decision.get('promote') and getattr(engine,'shadow_brain',None) is not None:
             brain=getattr(engine,'brain',None)
             shadow=engine.shadow_brain
-            if (brain is not None and shadow is not None and
+            checksum=self.weight_checksum(shadow)
+            if self._promote_blocked_same_evidence(engine,live_hist,shadow_rows,checksum):
+                self.last_reason=('Shadow promote blocked — same model/checksum/'
+                                  'trade boundary as last promote')
+                decision=dict(decision,promote=False,weights_promoted=False,
+                              reason=self.last_reason)
+            elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
                 self._push_model_snapshot(engine,note='pre_shadow_promote')
                 if brain.core.copy_weights_from(shadow):
@@ -826,12 +1036,22 @@ class AutoEvolution:
                     try:brain.save()
                     except Exception:pass
                     from .learning_generation import bump as bump_generation
-                    bump_generation(self.store,'shadow_weights_promoted_to_live')
+                    bumped=bump_generation(
+                        self.store,'shadow_weights_promoted_to_live',
+                        kind='verified_candidate_promotes',
+                        weight_checksum=checksum)
+                    self._record_promote_evidence(
+                        engine,live_hist,shadow_rows,checksum)
+                    shadow.model_version=int(getattr(shadow,'model_version',0) or 0)+1
+                    if hasattr(engine,'_persist_shadow_state'):
+                        engine._persist_shadow_state()
                     self.last_reason='Shadow weights promoted to LIVE neural core'
                     self.store.event('learning','Shadow neural weights promoted to LIVE',
                         {'model_version':brain.model_version,
-                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n})
-                    decision=dict(decision,weights_promoted=True)
+                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n,
+                         'weight_checksum':checksum,'learning_generation':bumped})
+                    decision=dict(decision,weights_promoted=True,
+                                  weight_checksum=checksum)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])
@@ -868,12 +1088,21 @@ class AutoEvolution:
             'decision':decision,
             'shadow_neurons':getattr(engine.shadow_brain,'n',None),
             'shadow_dim':getattr(engine.shadow_brain,'d',None),
-            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_cash),
+            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_rows),
             'method':'independent_shadow_paper_cash',
+            'aligned_window':{
+                'start':aligned.get('window_start'),'end':aligned.get('window_end'),
+                'incumbent_version':aligned.get('incumbent_version'),
+                'candidate_version':aligned.get('candidate_version')},
             'paper_summary':paper.summary() if paper else None,
             'params':{'min_trades':min_trades,'window':win,'delta':delta}})
-        self.last_reason=('Shadow paper cash beats live OOS broker £' if decision.get('promote')
-                          else 'Shadow paper cash not better than live OOS broker £')
+        if decision.get('weights_promoted'):
+            pass
+        elif decision.get('promote'):
+            self.last_reason='Shadow paper cash beats live OOS broker £'
+        else:
+            self.last_reason=(decision.get('reason')
+                              or 'Shadow paper cash not better than live OOS broker £')
         return decision
 
     def promote_shadow_policy(self, candidate_source, *, force=False):

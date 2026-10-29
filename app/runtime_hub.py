@@ -54,7 +54,10 @@ class AccountRuntime:
                 'SELL':float(scores.get('SELL') or 0),
             },
             'action':signal.get('action'),
+            # Uncalibrated model score — not calibrated profit probability (audit #24).
             'confidence':signal.get('confidence'),
+            'model_score':signal.get('model_score',signal.get('confidence')),
+            'model_score_is_calibrated_profit_probability':False,
             'evolution':{
                 'generation':int(snap.get('code_generation') or code.get('generation') or 0),
                 'learning_generation':int(snap.get('learning_generation') or 0),
@@ -65,6 +68,8 @@ class AccountRuntime:
                 'labeled_samples':int(snap.get('labeled_samples') or 0),
                 'neurons':neural.get('neurons'),
                 'steps':neural.get('steps'),
+                # Minute-direction only — never alias as trade win rate (audit #24).
+                'minute_direction_accuracy':snap.get('minute_direction_accuracy'),
             },
             'bracket':snap.get('bracket') or {'kappa':2.0,'sl_scale':1.0},
             'bracket_learn_reason':snap.get('bracket_learn_reason'),
@@ -72,6 +77,10 @@ class AccountRuntime:
             'market_status':(snap.get('market') or {}).get('status'),
             'entry_block_reason':snap.get('entry_block_reason'),
             'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
+            'model_readiness':snap.get('model_readiness') or snap.get('prep_eval'),
+            'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',True)),
+            'neural_close_executable':False,
+            'neural_exit_intent':snap.get('neural_exit_intent'),
             'neural_seed':int(getattr(self.brain,'init_seed',0) or 0),
             'error':self.last_error or snap.get('error'),
             'tick_count':snap.get('tick_count') or 0,
@@ -144,7 +153,10 @@ class RuntimeHub:
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
+            # Closed-trade win rate — NOT minute-direction accuracy (audit #24).
             'win_rate':round(wins/max(1,wins+losses),3),
+            'trade_win_rate':round(wins/max(1,wins+losses),3),
+            'metric':'closed_trade_win_rate',
             'recent_trades':recent[:12],
         }
 
@@ -213,7 +225,12 @@ class RuntimeHub:
                     'labeled_samples':int(evo.get('labeled_samples') or snap.get('labeled_samples') or 0),
                     'neurons':neural.get('neurons'),
                     'steps':int(neural.get('steps') or 0),
-                    'accuracy_proxy':round(float(snap.get('accuracy_proxy') or 0),4),
+                    # Keep accuracy_proxy as minute-direction only; do not merge win rate.
+                    'accuracy_proxy':round(float(snap.get('minute_direction_accuracy')
+                                                 or snap.get('accuracy_proxy') or 0),4),
+                    'minute_direction_accuracy':(
+                        round(float(snap['minute_direction_accuracy']),4)
+                        if snap.get('minute_direction_accuracy') is not None else None),
                     'births':int(neural.get('births') or 0),
                     'pruned':int(neural.get('pruned') or 0),
                     'loss':neural.get('loss'),
@@ -232,6 +249,10 @@ class RuntimeHub:
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')
                                                or snap.get('entry_can_submit_now')),
+                    'model_readiness':snap.get('model_readiness') or view.get('model_readiness'),
+                    'neural_close_diagnostic_only':True,
+                    'neural_close_executable':False,
+                    'neural_exit_intent':snap.get('neural_exit_intent'),
                     'neural_seed':view.get('neural_seed'),
                     'error':view.get('error') or snap.get('error'),
                     'last_start_error':None,

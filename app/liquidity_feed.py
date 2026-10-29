@@ -26,8 +26,27 @@ COINBASE_BOOK = 'https://api.exchange.coinbase.com/products/{product}/book'
 OKX_CANDLES = 'https://www.okx.com/api/v5/market/candles'
 
 USER_AGENT = 'NeuralTradingAI/1.0 (+liquidity-context; not for Capital fill)'
-MAX_AGE_SEC = 180
+MAX_AGE_SEC = 180  # snapshot download freshness (updated_at)
 MIN_VOLUME_BARS = 20
+
+# Observation-time freshness (bar/book clock), independent of download time.
+# Reject too-old futures/ETF/crypto readings even if the JSON was just refreshed.
+MAX_OBSERVATION_AGE_SEC = {
+    'yahoo_futures': 180,
+    'yahoo_etf': 300,
+    'coinbase': 120,
+    'okx': 120,
+    'coinbase_book': 60,
+}
+
+# Max seconds a used M1 bar may lag the *needed* completed minute.
+# Exact match preferred; never silently grab an arbitrarily older bar.
+ALLOWED_BAR_SKEW_SEC = {
+    'yahoo_futures': 60,
+    'yahoo_etf': 120,
+    'coinbase': 0,
+    'okx': 0,
+}
 
 LIQUIDITY_NAMES = (
     'liq_vol_z_primary',
@@ -36,6 +55,13 @@ LIQUIDITY_NAMES = (
     'liq_book_imbalance',
     'liq_book_micro_bps',
     'liq_source_coverage',
+)
+
+AVAILABILITY_KEYS = (
+    'primary_volume',
+    'confirm_volume',
+    'volume_impulse',
+    'dom_book',
 )
 
 # CME FX futures (real volume) — spot Yahoo FX pairs usually report volume=0.
@@ -398,108 +424,335 @@ async def _get_json(client, url, *, params=None):
     return response.json()
 
 
-def _series_at(bars, bar_time_iso):
+def _source_kind(series_or_book):
+    """Map a series/book dict to a freshness/skew policy key."""
+    if not isinstance(series_or_book, dict):
+        return None
+    source = str(series_or_book.get('source') or '')
+    symbol = str(series_or_book.get('symbol') or '')
+    if source == 'coinbase' and series_or_book.get('imbalance') is not None:
+        return 'coinbase_book'
+    if source == 'coinbase':
+        return 'coinbase'
+    if source == 'okx':
+        return 'okx'
+    if source == 'yahoo_finance':
+        return 'yahoo_futures' if symbol.endswith('=F') else 'yahoo_etf'
+    return None
+
+
+def _exchange_label(source, symbol):
+    symbol = str(symbol or '')
+    source = str(source or '')
+    if source == 'coinbase':
+        return 'Coinbase'
+    if source == 'okx':
+        return 'OKX'
+    if source == 'yahoo_finance':
+        if symbol.endswith('=F'):
+            return 'CME'  # Yahoo futures tape (venue approx.)
+        return 'Yahoo/ETF'
+    return source or 'unknown'
+
+
+def _relation_for(routes, symbol, *, epic=None, is_book=False):
+    """actual = public tape for the same mapped asset; substitute = related proxy.
+
+    Capital never publishes volume/DOM — even 'actual' is venue-external.
+    PAXG for Capital GOLD is always a substitute and must be labeled as such.
+    """
+    routes = routes or {}
+    label = str(routes.get('label') or '')
+    symbol = str(symbol or '')
+    epic_u = str(epic or routes.get('epic') or '').upper()
+    # Tokenized gold book/volume standing in for Capital GOLD / XAU CFD.
+    if 'PAXG' in symbol.upper() and (
+            label.startswith('METAL_') or _has(epic_u, 'GOLD', 'XAU')
+            or label == 'METAL_GOLD'):
+        return 'substitute'
+    if label.startswith('CRYPTO_'):
+        asset = label.split('_', 1)[-1]
+        if asset and asset in symbol.upper().replace('-', ''):
+            return 'actual'
+        if symbol in (routes.get('coinbase'), routes.get('okx')):
+            return 'actual'
+        return 'substitute'
+    # Futures / ETF / cross-venue tapes for Capital CFDs are substitutes.
+    if symbol.endswith('=F') or source_is_etf_symbol(symbol):
+        return 'substitute'
+    if symbol in (routes.get('coinbase'), routes.get('okx')) and label.startswith('METAL_'):
+        return 'substitute'
+    return 'substitute' if is_book or routes.get('mapped') else 'unknown'
+
+
+def source_is_etf_symbol(symbol):
+    symbol = str(symbol or '')
+    if symbol.endswith('=F'):
+        return False
+    known = set(FX_ETF.values()) | {
+        'GLD', 'SLV', 'USO', 'UNG', 'QQQ', 'SPY', 'DIA', 'EWG', 'EZU', 'EWU',
+        'EWJ', 'EWH', 'CPER', 'WEAT', 'CORN', 'UUP',
+    }
+    return symbol in known or (len(symbol) <= 5 and symbol.isalpha())
+
+
+def _empty_availability():
+    return {k: False for k in AVAILABILITY_KEYS}
+
+
+def _series_at(bars, bar_time_iso, *, allowed_skew_sec=0):
+    """Locate volume for the needed minute without silent older-bar substitution.
+
+    Returns (hist_volumes_before_used, current_volume, used_bar) or (None, None, None).
+    `used_bar` carries the actual observation time. Skew > allowed_skew_sec rejects.
+    """
     target = candle_time(bar_time_iso)
     if target is None or not bars:
-        return None, None
-    target_iso = target.replace(second=0, microsecond=0).isoformat()
+        return None, None, None
+    target_ts = int(target.timestamp())
     exact = None
-    prior = []
+    candidates = []  # bars at or before target within skew window
+    hist_before = []
     for b in bars:
         bt = candle_time(b['t'])
         if bt is None:
             continue
-        iso = bt.replace(second=0, microsecond=0).isoformat()
-        if iso < target_iso:
-            prior.append(b['volume'])
-        elif iso == target_iso:
-            exact = b['volume']
-            prior.append(b['volume'])
-    if exact is None:
-        if not prior:
-            return None, None
-        return prior[:-1], prior[-1]
-    return prior[:-1], exact
+        b_ts = int(bt.timestamp())
+        if b_ts < target_ts:
+            hist_before.append(b['volume'])
+            lag = target_ts - b_ts
+            if lag <= max(0, int(allowed_skew_sec)):
+                candidates.append((lag, b))
+        elif b_ts == target_ts:
+            exact = b
+    if exact is not None:
+        return hist_before, exact['volume'], exact
+    if allowed_skew_sec <= 0 or not candidates:
+        # No exact bar and no permitted skew — never fall back to arbitrary history.
+        return None, None, None
+    candidates.sort(key=lambda x: x[0])
+    lag, used = candidates[0]
+    # History for z-score excludes the used bar itself (same as exact path).
+    used_ts = int(candle_time(used['t']).timestamp())
+    hist = [b['volume'] for b in bars
+            if candle_time(b['t']) is not None
+            and int(candle_time(b['t']).timestamp()) < used_ts]
+    return hist, used['volume'], used
 
 
-def build_liquidity_features(snapshot, bar_time, *, now=None, epic=None):
-    """Six bounded EXTERNAL features or None — never pads missing sources with fake volume."""
+def _observation_age_ok(obs_ts, now, *, kind):
+    if obs_ts is None or kind is None:
+        return False
+    max_age = MAX_OBSERVATION_AGE_SEC.get(kind)
+    if max_age is None:
+        return False
+    age = abs(now.timestamp() - float(obs_ts))
+    return age <= max_age
+
+
+def build_liquidity_observation(snapshot, bar_time, *, now=None, epic=None):
+    """Structured EXTERNAL volume/DOM observation for one completed M1 bar.
+
+    Separates download freshness from observation-time freshness, records the
+    actual bar/book clock used, labels substitutes (e.g. PAXG ≠ Capital GOLD),
+    and exposes availability flags so missing≠observed-neutral zero.
+    """
+    availability = _empty_availability()
+    out = {
+        'ok': False,
+        'features': None,
+        'availability': availability,
+        'series_used': [],
+        'book': None,
+        'coverage': 0.0,
+        'reason': None,
+        'target_bar': None,
+        'snapshot_updated_at': None,
+        'capital_instrument': epic,
+    }
     if not isinstance(snapshot, dict) or not snapshot.get('ok'):
-        return None
+        out['reason'] = 'snapshot unavailable'
+        return out
     if epic is not None and snapshot.get('epic') not in (None, epic):
-        # Snapshot belongs to another instrument mandate.
-        return None
+        out['reason'] = 'snapshot epic mismatch'
+        return out
     target = candle_time(bar_time)
     if target is None:
-        return None
+        out['reason'] = 'invalid bar_time'
+        return out
+    out['target_bar'] = target.replace(second=0, microsecond=0).isoformat()
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
-        return None
+        out['reason'] = 'now must be timezone-aware'
+        return out
+    now = now.astimezone(timezone.utc)
     updated = candle_time(snapshot.get('updated_at'))
     if updated is None:
-        return None
-    age = abs((now.astimezone(timezone.utc) - updated).total_seconds())
-    if age > MAX_AGE_SEC:
-        return None
+        out['reason'] = 'snapshot missing updated_at'
+        return out
+    out['snapshot_updated_at'] = updated.isoformat()
+    if abs((now - updated).total_seconds()) > MAX_AGE_SEC:
+        out['reason'] = 'snapshot download stale'
+        return out
 
+    routes = snapshot.get('routes') if isinstance(snapshot.get('routes'), dict) else {}
     series_list = []
     for series in snapshot.get('series') or []:
         if not isinstance(series, dict) or not series.get('bars'):
             continue
-        hist, cur = _series_at(series['bars'], bar_time)
-        if hist is None or cur is None:
+        kind = _source_kind(series)
+        if kind is None:
             continue
-        # Skip long-stale cash ETF tapes outside session.
-        last_ts = series['bars'][-1]['ts']
-        if series.get('source') == 'yahoo_finance' and not str(series.get('symbol', '')).endswith('=F'):
-            if abs(now.timestamp() - last_ts) > 6 * 3600:
-                continue
+        skew = ALLOWED_BAR_SKEW_SEC.get(kind, 0)
+        hist, cur, used = _series_at(series['bars'], bar_time, allowed_skew_sec=skew)
+        if hist is None or cur is None or used is None:
+            continue
+        obs_ts = used.get('ts')
+        if obs_ts is None:
+            bt = candle_time(used.get('t'))
+            obs_ts = int(bt.timestamp()) if bt is not None else None
+        if not _observation_age_ok(obs_ts, now, kind=kind):
+            # Too-old observation even if snapshot JSON was just refreshed.
+            continue
+        # Cash ETF outside session: extra guard (hours), still observation-based.
+        if kind == 'yahoo_etf' and abs(now.timestamp() - float(obs_ts)) > 6 * 3600:
+            continue
         z = _zscore(hist, cur)
         imp = _impulse(hist, cur)
         if z is None:
             continue
-        series_list.append({'z': z, 'impulse': imp, 'symbol': series.get('symbol')})
+        symbol = series.get('symbol')
+        source = series.get('source')
+        obs_time = candle_time(used.get('t'))
+        skew_sec = int(abs(target.timestamp() - (obs_ts or target.timestamp())))
+        meta = {
+            'role': 'primary' if not series_list else 'confirm',
+            'source': source,
+            'instrument': symbol,
+            'exchange': _exchange_label(source, symbol),
+            'relation': _relation_for(routes, symbol, epic=epic or snapshot.get('epic')),
+            'capital_instrument': epic or snapshot.get('epic'),
+            'observation_time': obs_time.isoformat() if obs_time else None,
+            'target_bar': out['target_bar'],
+            'skew_sec': skew_sec,
+            'within_skew': skew_sec <= skew,
+            'source_kind': kind,
+            'z': float(z),
+            'impulse': float(imp) if imp is not None else None,
+        }
+        series_list.append(meta)
 
-    if len(series_list) < 1:
-        return None
+    if not series_list:
+        out['reason'] = 'no fresh volume observation for target minute'
+        return out
 
     primary = series_list[0]
-    if len(series_list) >= 2:
-        confirm_z = float(series_list[1]['z'])
-        confirm_present = True
-    else:
-        confirm_z = 0.0
-        confirm_present = False
+    primary['role'] = 'primary'
+    availability['primary_volume'] = True
+    out['series_used'].append({k: primary[k] for k in primary if k not in ('z', 'impulse')})
 
-    impulse = primary['impulse']
+    confirm_present = len(series_list) >= 2
+    if confirm_present:
+        confirm = series_list[1]
+        confirm['role'] = 'confirm'
+        availability['confirm_volume'] = True
+        confirm_z = float(confirm['z'])
+        out['series_used'].append({k: confirm[k] for k in confirm if k not in ('z', 'impulse')})
+    else:
+        # Missing confirm: placeholder 0 is NOT an observed neutral reading.
+        confirm_z = 0.0
+
+    impulse = primary.get('impulse')
     if impulse is None:
         impulse = 0.0
-
-    book = snapshot.get('book')
-    book_ok = isinstance(book, dict) and _finite(book.get('imbalance')) is not None
-    if book_ok:
-        imbalance = float(book['imbalance'])
-        micro = float(book.get('micro_bps') or 0.0)
+        availability['volume_impulse'] = False
     else:
-        # No free L2 for most FX/futures — coverage reflects absence; do not invent pressure.
-        imbalance = 0.0
-        micro = 0.0
+        availability['volume_impulse'] = True
+        impulse = float(impulse)
 
+    book_raw = snapshot.get('book')
+    book_meta = None
+    imbalance = 0.0
+    micro = 0.0
+    book_ok = False
+    if isinstance(book_raw, dict) and _finite(book_raw.get('imbalance')) is not None:
+        b_kind = _source_kind({**book_raw, 'imbalance': book_raw.get('imbalance')}) or 'coinbase_book'
+        obs_at = candle_time(book_raw.get('observed_at')) or candle_time(snapshot.get('updated_at'))
+        obs_ts = obs_at.timestamp() if obs_at is not None else None
+        if _observation_age_ok(obs_ts, now, kind=b_kind):
+            book_ok = True
+            availability['dom_book'] = True
+            imbalance = float(book_raw['imbalance'])
+            micro = float(book_raw.get('micro_bps') or 0.0)
+            b_sym = book_raw.get('symbol')
+            b_src = book_raw.get('source') or 'coinbase'
+            relation = _relation_for(routes, b_sym, epic=epic or snapshot.get('epic'), is_book=True)
+            book_meta = {
+                'available': True,
+                'source': b_src,
+                'instrument': b_sym,
+                'exchange': _exchange_label(b_src, b_sym),
+                'relation': relation,
+                'capital_instrument': epic or snapshot.get('epic'),
+                'observation_time': obs_at.isoformat() if obs_at else None,
+                'coverage_slot': 'dom_book',
+                # Explicit human label — never "Capital GOLD book".
+                'label': (
+                    f"{b_sym} {_exchange_label(b_src, b_sym)} L2"
+                    + (f" (substitute for {epic or snapshot.get('epic')} — not Capital book)"
+                       if relation == 'substitute' else ' (external spot book — not Capital)')
+                ),
+                'imbalance': imbalance,
+                'micro_bps': micro,
+            }
+        else:
+            book_meta = {
+                'available': False,
+                'reason': 'book observation stale',
+                'instrument': book_raw.get('symbol'),
+                'source': book_raw.get('source'),
+                'relation': _relation_for(routes, book_raw.get('symbol'),
+                                         epic=epic or snapshot.get('epic'), is_book=True),
+            }
+    else:
+        book_meta = {
+            'available': False,
+            'reason': 'dom_book unavailable',
+            'instrument': None,
+            'source': None,
+            'relation': None,
+        }
+
+    out['book'] = book_meta
     slots = 3  # primary vol, confirm vol, book
     filled = 1 + (1 if confirm_present else 0) + (1 if book_ok else 0)
     coverage = filled / slots
+    out['coverage'] = coverage
+    out['availability'] = availability
 
-    out = [
+    features = [
         float(primary['z']), float(confirm_z), float(impulse),
         float(imbalance), float(micro), float(coverage),
     ]
-    if not all(math.isfinite(x) for x in out):
-        return None
-    if not (-1.0 <= out[0] <= 1.0 and -1.0 <= out[1] <= 1.0 and -1.0 <= out[2] <= 1.0):
-        return None
-    if not (-1.0 <= out[3] <= 1.0 and -1.0 <= out[4] <= 1.0 and 0.0 <= out[5] <= 1.0):
-        return None
+    if not all(math.isfinite(x) for x in features):
+        out['reason'] = 'non-finite features'
+        return out
+    if not (-1.0 <= features[0] <= 1.0 and -1.0 <= features[1] <= 1.0 and -1.0 <= features[2] <= 1.0):
+        out['reason'] = 'feature out of bounds'
+        return out
+    if not (-1.0 <= features[3] <= 1.0 and -1.0 <= features[4] <= 1.0 and 0.0 <= features[5] <= 1.0):
+        out['reason'] = 'feature out of bounds'
+        return out
+    out['ok'] = True
+    out['features'] = features
+    out['reason'] = None
     return out
+
+
+def build_liquidity_features(snapshot, bar_time, *, now=None, epic=None):
+    """Six bounded EXTERNAL features or None — never pads missing sources with fake volume."""
+    obs = build_liquidity_observation(snapshot, bar_time, now=now, epic=epic)
+    return obs.get('features') if obs.get('ok') else None
 
 
 async def refresh_liquidity(path, *, epic=None, profile=None, client=None, now=None):
@@ -554,7 +807,10 @@ async def refresh_liquidity(path, *, epic=None, profile=None, client=None, now=N
             try:
                 url = COINBASE_BOOK.format(product=product)
                 raw = await _get_json(client, url, params={'level': 2})
-                snapshot['book'] = _parse_coinbase_book(raw, product=product)
+                book = _parse_coinbase_book(raw, product=product)
+                # Book is a live snapshot — stamp observation clock (≠ download-only age).
+                book['observed_at'] = now.astimezone(timezone.utc).isoformat()
+                snapshot['book'] = book
                 snapshot['sources'].append('coinbase:book:' + product)
             except Exception as exc:
                 errors.append('coinbase_book:' + type(exc).__name__ + ':' + str(exc)[:60])
@@ -598,6 +854,14 @@ def load_liquidity_snapshot(path):
     except (OSError, ValueError, TypeError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def liquidity_observation_from_path(path, bar_time, *, now=None, epic=None):
+    snap = load_liquidity_snapshot(path)
+    if snap is None:
+        return build_liquidity_observation(
+            {'ok': False}, bar_time, now=now, epic=epic)
+    return build_liquidity_observation(snap, bar_time, now=now, epic=epic)
 
 
 def liquidity_features_from_path(path, bar_time, *, now=None, epic=None):

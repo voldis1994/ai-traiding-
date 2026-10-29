@@ -41,7 +41,8 @@ def test_resolve_uses_activity_profit_not_ticks_only():
     asyncio.run(scenario())
 
 
-def test_resolve_falls_back_to_last_upl_snapshot():
+def test_resolve_does_not_use_last_upl_as_realized():
+    """Audit #1: last UPL snapshot must not become confirmed realized cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -49,8 +50,8 @@ def test_resolve_falls_back_to_last_upl_snapshot():
             e.attach(HistoryBroker())
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
-            pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
-            assert pnl==pytest.approx(0.45) and src=='broker' and ccy=='GBP'
+            pnl,src,_ccy=await e._resolve_broker_pnl('d2',{})
+            assert pnl is None and src=='pending_broker_pnl'
     asyncio.run(scenario())
 
 

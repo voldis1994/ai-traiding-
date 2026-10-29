@@ -1,4 +1,4 @@
-"""SL/TP from OHLC at open; cash P&L teaches when to raise / cut."""
+"""SL/TP from OHLC at open; cash P&L teaches when to raise / cut (audit #19)."""
 import tempfile
 from pathlib import Path
 
@@ -53,36 +53,90 @@ def test_propose_uses_ohlc_not_random_fantasy_kappa():
         assert p['kappa']<5.0
 
 
-def test_loss_teaches_raise_sl_when_brackets_were_tight():
+def test_loss_without_path_context_does_not_auto_raise_sl():
+    """Audit #19: a bare loss is NOT proof that SL was too tight."""
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         before=load_multipliers(store)
         out=adapt_after_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.20)
-        assert out['reason']=='loss_tight_raise_sl'
+        assert out['reason']=='loss_insufficient_context_hold'
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+
+
+def test_sl_noise_vs_vol_raises_sl_when_tight():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=1.0,pnl=-0.20,exit_reason='sl',
+            direction='BUY',entry=100.0,exit_level=99.9,
+            stop_distance=0.1,adverse_path=0.1,volatility=0.12)
+        assert out['reason']=='sl_noise_raise_sl'
         assert load_multipliers(store)['sl_scale']>before['sl_scale']
+
+
+def test_adverse_path_beyond_vol_holds_sl():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=1.0,pnl=-1.50,exit_reason='sl',
+            direction='BUY',entry=100.0,exit_level=98.0,
+            stop_distance=2.0,adverse_path=2.0,volatility=0.5)
+        assert out['reason']=='loss_adverse_hold_sl'
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
 
 
 def test_wide_loss_teaches_cut_tp():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
-        adapt_after_outcome(store,kappa=2.5,sl_scale=1.5,pnl=-0.30)
+        adapt_after_outcome(
+            store,kappa=2.5,sl_scale=1.5,pnl=-0.30,exit_reason='sl',
+            direction='BUY',entry=100.0,exit_level=99.5,
+            stop_distance=0.5,adverse_path=0.5,volatility=0.4)
         assert load_multipliers(store)['kappa']<1.0
 
 
-def test_scratch_teaches_raise_sl():
+def test_scratch_does_not_raise_sl():
+    """Old heuristic test_scratch_teaches_raise_sl — inverted by audit #19."""
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
-        adapt_after_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.02)
-        assert load_multipliers(store)['sl_scale']>1.0
+        before=load_multipliers(store)
+        out=adapt_after_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.02)
+        assert out['reason']=='scratch_hold_sl'
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+
+
+def test_vanish_holds_without_widening_sl():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=1.0,pnl=-0.40,exit_reason='vanish')
+        assert out['reason']=='vanish_hold'
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+
+
+def test_tp_win_reinforces():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.2,sl_scale=1.0,pnl=0.80,exit_reason='tp')
+        assert out['reason'] in ('win_reinforce','tp_reinforce')
+        assert load_multipliers(store)['kappa']>=before['kappa']
 
 
 def test_record_outcome_learns_and_batch_raise_when_wide_wins():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         for _ in range(6):
-            record_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.4,currency='GBP')
+            record_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.4,currency='GBP',
+                           exit_reason='sl',direction='BUY',entry=100,exit_level=99.5,
+                           stop_distance=0.5,adverse_path=0.5,volatility=0.2)
         for _ in range(6):
-            record_outcome(store,kappa=2.0,sl_scale=1.5,pnl=0.8,currency='GBP')
+            record_outcome(store,kappa=2.0,sl_scale=1.5,pnl=0.8,currency='GBP',
+                           exit_reason='tp')
         promoted=evolve_from_history(store,min_samples=6)
         assert promoted is not None
         assert load_multipliers(store)['kappa']>=1.0

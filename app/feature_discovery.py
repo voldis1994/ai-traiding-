@@ -333,6 +333,13 @@ class FeatureDiscovery:
         age=self.search_rounds-int(meta.get('round') or 0)
         return age<REJECT_COOLDOWN_ROUNDS
 
+    def _already_selected_on_data(self, feature_id, fingerprint):
+        """Skip re-selecting a candidate already scored on this chronological window."""
+        if not fingerprint:return False
+        from .feature_validation import ATTEMPT_KEY
+        attempts=self.store.get(ATTEMPT_KEY) or {}
+        return f'{feature_id}:{fingerprint}' in attempts
+
     def on_closed_bar(self, bar_time, bars, *, spread=0., registry=None):
         if not bar_time or not bars or len(bars)<61:return []
         if bar_time==self.last_search_bar:return []
@@ -344,8 +351,13 @@ class FeatureDiscovery:
             self._save();return []
         return self.search(bars,spread=spread,registry=registry,bar_time=bar_time)
 
-    def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=None):
-        """Rotate through library; skip cooling-off rejects so other formulas get tried."""
+    def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=None,
+               times=None):
+        """Rotate through library; skip cooling-off rejects so other formulas get tried.
+
+        Also skips ids already selected/confirmed on the same data fingerprint so
+        candidate selection stays separate from a repeated final check on identical bars.
+        """
         p=self._params()
         horizons=p.get('gen_horizons')
         _build_library(horizons=horizons)
@@ -360,6 +372,8 @@ class FeatureDiscovery:
         library=[spec for spec in list_library(exclude_names=exclude)
                  if (not str(spec['id']).startswith('gen_')) or spec['id'] in mine]
         if not library:return []
+        from .feature_validation import data_fingerprint
+        fp=data_fingerprint(bars,times)
         self.search_rounds+=1
         n=len(library)
         start=self.cursor % n
@@ -369,10 +383,13 @@ class FeatureDiscovery:
             scanned+=1
             if self._is_cooling(spec['id']):
                 continue
+            if self._already_selected_on_data(spec['id'],fp):
+                continue
             val=compute_candidate(spec['id'],bars,spread=spread,bar_time=bar_time)
             if val is None:continue
             proposal={**spec,'value':val,'bar_time':bar_time,
-                      'status':'proposed','source':'ohlc_algebra'}
+                      'status':'proposed','source':'ohlc_algebra',
+                      'data_fingerprint':fp}
             found.append(proposal)
             self.proposals.append(proposal)
             if len(found)>=limit:break
@@ -384,10 +401,13 @@ class FeatureDiscovery:
             for fid,_ in oldest[:max(1,len(oldest)//3)]:
                 self.rejected.pop(fid,None)
             for spec in ordered:
+                if self._already_selected_on_data(spec['id'],fp):
+                    continue
                 val=compute_candidate(spec['id'],bars,spread=spread,bar_time=bar_time)
                 if val is None:continue
                 found.append({**spec,'value':val,'bar_time':bar_time,
-                              'status':'proposed','source':'ohlc_algebra_retry'})
+                              'status':'proposed','source':'ohlc_algebra_retry',
+                              'data_fingerprint':fp})
                 if len(found)>=limit:break
         self.proposals=self.proposals[-keep:]
         self._save()
@@ -396,7 +416,7 @@ class FeatureDiscovery:
                 {'count':len(found),'library':len(library),'bar_time':bar_time,
                  'ids':[x['id'] for x in found],'cursor':self.cursor,
                  'cooling':len([1 for k in self.rejected if self._is_cooling(k)]),
-                 'search_limit':limit})
+                 'search_limit':limit,'data_fingerprint':fp})
         return found
 
     def pending_proposals(self):

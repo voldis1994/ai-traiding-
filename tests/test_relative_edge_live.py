@@ -93,6 +93,7 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
             rows=history_for(direction)
             brain.history.extend(rows)
             brain.labeled=80;brain.correct=60
+            brain.mark_prep_ready('test fixture')
             # In this integration test the *model* emits moderate scores.
             sample={'BUY':.366,'SELL':.433,'HOLD':.201} if direction=='SELL' else {'BUY':.433,'SELL':.366,'HOLD':.201}
             original_tick=brain.tick

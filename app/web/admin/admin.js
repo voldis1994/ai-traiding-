@@ -93,7 +93,7 @@ function renderCard(c){
       <div><span>P&amp;L (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
       <div><span>W / L</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.win_rate)})</strong></div>
     </div>
-    <div class="muted small">${e.last_reason?('Evo: '+e.last_reason+' · '):''}${a.entry_block_reason||a.error||c.last_start_error||a.last_start_error||''}</div>
+    <div class="muted small">${a.entry_block_reason||a.error||c.last_start_error||a.last_start_error||''}${e.last_reason?(' · Evo: '+e.last_reason):''}</div>
     <div class="trades">${trades}</div>
     <div class="actions">
       <button type="button" class="btn tiny" data-act="start" data-id="${c.id}">Start</button>

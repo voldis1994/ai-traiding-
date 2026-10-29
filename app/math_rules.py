@@ -208,6 +208,52 @@ def position_size(max_risk, already_committed_risk, stop_ticks, tick_value, step
     return {'raw':raw,'floored':floor,'size':size,'estimated_risk':n*v*size+(c if size else 0)}
 
 
+def cash_risk(size, stop_ticks, tick_value):
+    """Cash at risk for a fixed size: size × stop_ticks × tick_value (audit #20)."""
+    q,n,v = map(D,(size,stop_ticks,tick_value))
+    if q <= 0 or n <= 0 or v <= 0:
+        raise ValueError('Invalid cash-risk inputs')
+    return q*n*v
+
+
+def tick_value_from_instrument(instrument, tick_size=None):
+    """Cash value of one price tick from Capital instrument fields.
+
+    Prefers valueOfOnePip; scales by tick/onePipMeans when the order grid tick
+    differs from the pip size. Returns None when the broker did not publish it.
+    """
+    inst = instrument or {}
+    pip_value = None
+    for key in ('valueOfOnePip','valueOfOnePoint','valueOfOneTick'):
+        try:
+            raw = inst.get(key)
+            if raw is None:continue
+            pip_value = D(raw)
+            if pip_value > 0:break
+            pip_value = None
+        except Exception:
+            pip_value = None
+    if pip_value is None or pip_value <= 0:
+        return None
+    pip_means = None
+    try:
+        pm = inst.get('onePipMeans')
+        if pm is not None:
+            pip_means = D(pm)
+            if pip_means <= 0:pip_means = None
+    except Exception:
+        pip_means = None
+    tick = None
+    try:
+        if tick_size is not None:
+            tick = D(tick_size)
+            if tick <= 0:tick = None
+    except Exception:
+        tick = None
+    if tick is not None and pip_means is not None and pip_means != tick:
+        return pip_value * (tick / pip_means)
+    return pip_value
+
 
 def pnl(entry, exit_price, direction, size, tick, tick_value, total_costs=0):
     """PDF: signed (Px-Pe)/delta * Vtick * Qpos - C."""

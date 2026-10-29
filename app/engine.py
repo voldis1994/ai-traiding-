@@ -1086,10 +1086,16 @@ class SingleTradeEngine:
                     exit_guess=_num(snap.get('exit_hint'))
                 conf={'level':exit_guess,'source':'position_disappeared'}
                 pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
-                if pnl is not None:
+                if pnl is not None and src=='broker':
                     conf['profit']=pnl
                     if ccy:conf['pnl_currency']=ccy
-                self._learn_closed_trade(prev_id,conf)
+                    self._learn_closed_trade(prev_id,conf)
+                else:
+                    # Audit #1: do not freeze last UPL as realized — mark pending and retry.
+                    self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
+                    self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+                    self.store.event('trade','Deal closed; broker cash P&L pending re-request',
+                                     {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
                 self.store.event('trade','Previous broker deal no longer open',
                                  {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
         if current:
@@ -1268,6 +1274,11 @@ class SingleTradeEngine:
     async def poll(self):
         async with self.lock:
             await self.sync()
+            # Audit #1: re-request pending realized cash without using UPL as final.
+            try:await self._retry_pending_broker_pnl()
+            except Exception as exc:
+                self.store.event('warning','Pending broker P&L retry failed',
+                                 {'type':type(exc).__name__})
             if not self.mandate:return
             # Do not delay managing SL/TP on an OPEN trade for a remote news feed.
             # External feeds gate future NEW entries only.
@@ -1560,16 +1571,21 @@ class SingleTradeEngine:
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
-            # Confirm often omits profit on CLOSE; fill from history/UPL before learn.
+            # Confirm often omits profit on CLOSE; fill from history before learn.
+            # Never promote last UPL to realized cash (audit #1).
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
-            if pnl is not None and _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
-                confirmation={**confirmation,'profit':pnl}
-            if _ccy and not confirmation.get('pnl_currency'):
-                confirmation={**confirmation,'pnl_currency':_ccy}
-            self._learn_closed_trade(deal_id,confirmation)
-            if src=='ticks_only':
-                self.store.event('warning','Close learned without broker cash P&L (ticks_only)',
-                                 {'deal_id':deal_id,'reference':ref})
+            if pnl is not None and src=='broker':
+                if _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
+                    confirmation={**confirmation,'profit':pnl}
+                if _ccy and not confirmation.get('pnl_currency'):
+                    confirmation={**confirmation,'pnl_currency':_ccy}
+                self._learn_closed_trade(deal_id,confirmation)
+            else:
+                exit_lvl=_num(confirmation.get('level'))
+                self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
+                self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
+                                 {'deal_id':deal_id,'reference':ref,'pnl_source':src})
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _account_currency(self):
@@ -1672,9 +1688,11 @@ class SingleTradeEngine:
         return None
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Never settle for ticks_only when Capital still has cash P&L somewhere.
+        """Confirm.profit → history/activity only.
 
-        Order: confirm.profit → history/activity → last live UPL snapshot.
+        Last live UPL is NEVER stored as confirmed realized P&L (audit #1).
+        When cash is still missing, return pending_broker_pnl so the caller
+        can mark the trade pending and re-request from the broker.
         """
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
@@ -1690,11 +1708,53 @@ class SingleTradeEngine:
         if found:
             pnl,hist_ccy=found
             return pnl,'broker',self._cash_currency(hist_ccy)
+        # Keep UPL only as a diagnostic hint — never as source='broker'.
         snap=self.store.get('last_upl:'+str(deal_id)) or {}
         upl=_num(snap.get('upl'))
         if upl is not None and math.isfinite(upl):
-            return float(upl),'broker',self._cash_currency(snap.get('currency'))
-        return None,'ticks_only',None
+            self.store.event('trade','Broker cash P&L still pending; UPL not used as realized',
+                             {'deal_id':deal_id,'last_upl':float(upl),
+                              'currency':self._cash_currency(snap.get('currency'))})
+        return None,'pending_broker_pnl',ccy
+
+    def _trade_already_learned(self,deal_id):
+        """True when this deal's outcome already trained the LIVE core (audit #2)."""
+        meta=self.store.get('learned_trade:'+str(deal_id))
+        return bool(isinstance(meta,dict) and meta.get('learned'))
+
+    def _mark_trade_learned(self,deal_id,*,mode=None,pnl=None,source=None):
+        self.store.set('learned_trade:'+str(deal_id),{
+            'learned':True,'at':now(),'mode':mode,'pnl':pnl,'source':source})
+
+    def _queue_pending_pnl(self,deal_id,*,exit_level=None):
+        pending=list(self.store.get('pending_broker_pnl_deals') or [])
+        deal=str(deal_id)
+        if deal not in [str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]:
+            pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
+            self.store.set('pending_broker_pnl_deals',pending[-40:])
+
+    async def _retry_pending_broker_pnl(self):
+        """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
+        pending=list(self.store.get('pending_broker_pnl_deals') or [])
+        if not pending or not self.broker:return
+        remaining=[]
+        for item in pending:
+            deal=str(item.get('deal_id') if isinstance(item,dict) else item)
+            pnl,src,ccy=await self._resolve_broker_pnl(deal,{})
+            if src!='broker' or pnl is None:
+                remaining.append(item if isinstance(item,dict) else {'deal_id':deal})
+                continue
+            exit_level=item.get('exit_level') if isinstance(item,dict) else None
+            already=self._trade_already_learned(deal)
+            self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
+            if already:
+                self.store.event('trade','Late broker P&L refined record without re-learning',
+                                 {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
+            else:
+                conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,'source':'pending_pnl_retry'}
+                self._learn_closed_trade(deal,conf)
+            self.store.set('last_upl:'+deal,None)
+        self.store.set('pending_broker_pnl_deals',remaining)
 
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
@@ -1703,6 +1763,7 @@ class SingleTradeEngine:
         the opposite action (regret). Wins reinforce. Cash P&L is stored only
         from broker profit (+ account currency). Without broker profit, learning
         still uses directional ticks — History cash stays blank rather than fake $.
+        Each deal trains LIVE weights at most once (audit #2).
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -1712,6 +1773,16 @@ class SingleTradeEngine:
         hint_ccy=(confirmation.get('pnl_currency') or confirmation.get('currency') or '').strip().upper() or None
         # Allow overwrite when we finally have broker cash after a vanish guess.
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
+        already_learned=self._trade_already_learned(deal_id)
+        # Late broker cash may refine the journal without repeating training.
+        if already_learned:
+            if broker_pnl is not None:
+                currency=hint_ccy or self._account_currency()
+                self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
+                                       source='broker',overwrite=True)
+                self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
+                                 {'deal_id':deal_id,'pnl':broker_pnl})
+            return
         # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
             row=self.store.db.execute(
@@ -1876,6 +1947,8 @@ class SingleTradeEngine:
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
         self.brain.save()
+        # Audit #2: this deal's experience may train LIVE only once.
+        self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
             {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
              'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,

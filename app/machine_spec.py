@@ -35,7 +35,11 @@ SELF_DEV_CYCLE = (
     'promote_or_rollback',
 )
 # Capital.com does not provide true volume / DOM — discovery never invents them.
+# Public multi-source liquidity (Yahoo GC=F/GLD + Coinbase/OKX PAXG + book) is
+# EXTERNAL fusion only — never a Capital fill substitute.
 DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
+EXTERNAL_LIQUIDITY = ('yahoo_gc_f_volume','yahoo_gld_volume','coinbase_paxg_volume',
+                      'coinbase_paxg_l2_book','okx_paxg_volume_backup')
 # Tunable knobs live in Store via app.self_params — not frozen magic in modules.
 SELF_TUNABLE = 'self_params_v1'
 IMMUTABLE = (
@@ -50,5 +54,5 @@ EXECUTION_GATES = (
     'tradeable_market',
     'one_position',
     'order_reconciliation',
-    # Fusion preferred when ready; transient peer gaps keep last neural vote.
+    # Fusion preferred when ready; transient peer/liquidity gaps keep last neural vote.
 )

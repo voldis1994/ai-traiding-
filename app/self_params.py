@@ -9,7 +9,7 @@ broker £ earned *during the trial* beats the equal pre-trial window — never
 from profit earned while the draft was still idle.
 
 Honest immutable (NOT in this bag — physics / API / layout):
-  - Capital has no volume/DOM
+  - Capital has no volume/DOM (public liquidity is EXTERNAL fusion only)
   - Feature vector layout [BASE|DYNAMIC|EXTERNAL]
   - BUY/SELL/HOLD three-class head
   - Broker tick / min-stop / margin rules
@@ -94,8 +94,9 @@ BOUNDS = {
 }
 
 IMMUTABLE_NOTE = (
-    'Capital: no volume/DOM. Layout: BASE|DYNAMIC|EXTERNAL. '
-    'Actions: BUY/SELL/HOLD. Broker tick/min-stop/margin are exchange rules.'
+    'Capital: no volume/DOM (Yahoo GC/GLD + Coinbase/OKX PAXG are EXTERNAL). '
+    'Layout: BASE|DYNAMIC|EXTERNAL. Actions: BUY/SELL/HOLD. '
+    'Broker tick/min-stop/margin are exchange rules.'
 )
 
 

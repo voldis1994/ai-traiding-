@@ -116,9 +116,9 @@ def test_fusion_layout_base_dynamic_external():
         reg=FeatureRegistry(store)
         reg.approve({'id':'session_phase_utc','name':'session_phase_utc','formula':'sin','source':'t'})
         ohlc=[.01]*(FEATURE_DIM+1)
-        peers=[.1]*6;news=[.2,.3]
-        # Manual compose matching fusion_features contract.
-        vec=ohlc+peers+news
+        peers=[.1]*6;news=[.2,.3];liq=[.0]*6
+        # Manual compose matching fusion_features contract (peers+news+liquidity).
+        vec=ohlc+peers+news+liq
         assert len(vec)==reg.fusion_dim()
         assert len(ohlc)==reg.ohlc_dim()
 

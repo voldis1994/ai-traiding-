@@ -496,7 +496,7 @@ class AdaptiveBrain:
         self.feature_schema=self.fusion_schema
         self.fusion_labels=0
         self.model_version+=1
-        self.store.event('learning','Cross-market and news features joined neural inputs; old weights preserved',
+        self.store.event('learning','Cross-market, news and public liquidity features joined neural inputs; old weights preserved',
             {'epic':self.epic,'feature_schema':self.fusion_schema,'inputs':self.fusion_dim,
              'preserved_steps':c.steps,'old_pending_labels_dropped':True,
              'model_version':self.model_version})
@@ -622,6 +622,7 @@ class AdaptiveBrain:
 
 from .external_risk import assess_news
 from .calendar_feed import refresh_calendar
+from .liquidity_feed import refresh_liquidity
 from .instrument_profile import instrument_profile
 from .intermarket import IntermarketMonitor
 import os
@@ -649,11 +650,15 @@ class SingleTradeEngine:
         self.last_calendar_refresh=0.0
         self._calendar_task=None
         self.calendar_feed_error=None
+        self.last_liquidity_refresh=0.0
+        self._liquidity_task=None
+        self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
         self.intermarket=IntermarketMonitor()
         self._peer_refresh_task=None
         self._peer_requested_bar=None
         self.news_calendar_path=self.store.path.parent/'economic_calendar.json' if hasattr(self.store,'path') else __import__('pathlib').Path('data/economic_calendar.json')
+        self.liquidity_path=self.store.path.parent/'liquidity_snapshot.json' if hasattr(self.store,'path') else __import__('pathlib').Path('data/liquidity_snapshot.json')
         # Autonomous self-development (OHLC discovery → validation → dim expand).
         self.feature_registry=FeatureRegistry(store)
         self.feature_discovery=FeatureDiscovery(store)
@@ -712,6 +717,29 @@ class SingleTradeEngine:
             self._calendar_task.cancel()
         self._calendar_task=None
 
+    async def _refresh_liquidity_if_due(self):
+        moment=time.monotonic()
+        if self.last_liquidity_refresh and moment-self.last_liquidity_refresh<45:return
+        self.last_liquidity_refresh=moment
+        result=await refresh_liquidity(self.liquidity_path)
+        self.liquidity_feed_error=None if result.get('ok') else result.get('reason')
+        if not result.get('ok'):
+            self.store.event('warning','Public gold liquidity feed incomplete',
+                             {'reason':result.get('reason'),'sources':result.get('sources')})
+        else:
+            self.store.event('market','Public gold volume/DOM snapshot refreshed',
+                             {'sources':result.get('sources')})
+
+    def _schedule_liquidity_in_background(self):
+        if self._liquidity_task is not None and not self._liquidity_task.done():return
+        if self.last_liquidity_refresh and time.monotonic()-self.last_liquidity_refresh<45:return
+        self._liquidity_task=asyncio.create_task(self._refresh_liquidity_if_due())
+
+    def cancel_liquidity_refresh(self):
+        if self._liquidity_task is not None and not self._liquidity_task.done():
+            self._liquidity_task.cancel()
+        self._liquidity_task=None
+
     def _external_entry_check(self,action):
         """Economic-event safety only. Peer movements are already neural inputs.
 
@@ -766,9 +794,11 @@ class SingleTradeEngine:
         self.last_error=None;self.account={};self.last_entry_audit_key=None
         self.latest_fusion_ready=False
         self.last_calendar_refresh=0.;self.calendar_feed_error=None
+        self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
         self.cancel_peer_refresh()
         self.cancel_calendar_refresh()
+        self.cancel_liquidity_refresh()
         self.intermarket=IntermarketMonitor()
         self.protection_brief={'status':'Waiting for robot-opened position'}
         self.last_protection_bar=None
@@ -814,6 +844,7 @@ class SingleTradeEngine:
             self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
             self.cancel_peer_refresh()
             self.cancel_calendar_refresh()
+            self.cancel_liquidity_refresh()
             self.intermarket=IntermarketMonitor()
             self._paused_for_mismatch=False;self.operator_paused=False
             self.armed=True;self.execution_enabled=True
@@ -1090,11 +1121,13 @@ class SingleTradeEngine:
                         self.brain._activate(p['epic'])
                     self.last_candle_tick=-20
                     self.cancel_peer_refresh();self.cancel_calendar_refresh()
+                    self.cancel_liquidity_refresh()
                     self.intermarket=IntermarketMonitor()
                     self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
                     self.market_context={'ready':False,'reason':'Waiting for completed candles on newly adopted market'}
                     self.latest_fusion_ready=False
                     self.last_calendar_refresh=0.;self.calendar_feed_error=None
+                    self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
                     self.market={}
                 self.store.set('mandate',self.mandate)
                 if fresh_session and open_in_flight:
@@ -1218,7 +1251,9 @@ class SingleTradeEngine:
             if not self.mandate:return
             # Do not delay managing SL/TP on an OPEN trade for a remote news feed.
             # External feeds gate future NEW entries only.
-            if not self.positions:await self._refresh_calendar_if_due()
+            if not self.positions:
+                await self._refresh_calendar_if_due()
+                await self._refresh_liquidity_if_due()
             broker_market=await self.broker.market(self.mandate['epic'])
             snap=broker_market.get('snapshot',{});inst=broker_market.get('instrument',{})
             bid=_num(snap.get('bid'));ask=_num(snap.get('offer'));tick=self._tick(broker_market)
@@ -1242,10 +1277,11 @@ class SingleTradeEngine:
                     return
 
             if self.positions:
-                # News download is background-only while an open position needs
-                # protection/SLTP management. Initial missing stops were already
-                # addressed above, before any secondary feed is scheduled.
+                # News/liquidity downloads are background-only while an open
+                # position needs protection/SLTP management. Initial missing
+                # stops were already addressed above.
                 self._schedule_calendar_in_background()
+                self._schedule_liquidity_in_background()
             # Unfinished quote candle is for the chart only, not learning/trading.
             bucket=now()[:16]+':00+00:00'
             existing=self.store.db.execute('SELECT open,high,low FROM candles WHERE epic=? AND at=?',(self.mandate['epic'],bucket)).fetchone()
@@ -1278,7 +1314,8 @@ class SingleTradeEngine:
                 fused=fusion_features(self.market_context,self.intermarket.state,
                     self.mandate['epic'],self.news_calendar_path,self.instrument_profile['currencies'],
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
-                    fusion_schema=self.brain.fusion_schema)
+                    fusion_schema=self.brain.fusion_schema,
+                    liquidity_path=self.liquidity_path)
                 self.latest_fusion_ready=fused is not None
                 # Prefer fusion when ready. Transient peer/news gaps must NOT wipe
                 # the last neural vote (that created permanent HOLD / no-signal).

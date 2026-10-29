@@ -2,7 +2,8 @@
 
 Capital.com does not expose true volume, DOM, or order-flow. Discovery may only
 append formulas over completed OHLC, spread, peers, and scheduled news.
-Approved extras expand neural input dim without rewriting base names.
+Public gold volume/DOM enters via market_fusion EXTERNAL (liquidity_feed), not
+discovery invent. Approved extras expand neural input dim without rewriting base names.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import json
 from typing import Any
 
 from .market_context import FEATURE_NAMES as BASE_OHLC_NAMES, FEATURE_SCHEMA as BASE_OHLC_SCHEMA
-from .market_fusion import EXTERNAL_NAMES
+from .market_fusion import EXTERNAL_NAMES, FUSION_SCHEMA
 
 STORE_KEY = 'feature_registry_v1'
 # Seed only — live cap is self_params.max_approved_features (robot-owned).
@@ -81,8 +82,11 @@ class FeatureRegistry:
         return f'{BASE_OHLC_SCHEMA}+dyn_{_digest(self.approved_ids())}'
 
     def fusion_schema(self):
-        base=f'{self.ohlc_schema()}_intermarket_news'
-        return base if self.approved else 'closed_m1_m5_m15_h1_intermarket_news_shadow_v5'
+        # Keep empty-registry schema identical to market_fusion.FUSION_SCHEMA so
+        # EXTERNAL upgrades (peers/news/liquidity) expand weights in lockstep.
+        if not self.approved:
+            return FUSION_SCHEMA
+        return f'{self.ohlc_schema()}_intermarket_news_liquidity'
 
     def has(self, feature_id):
         return feature_id in self.approved_ids()

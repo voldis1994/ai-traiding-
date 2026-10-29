@@ -13,9 +13,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .external_risk import _utc, assess_news
+from .liquidity_feed import LIQUIDITY_NAMES, liquidity_features_from_path
 from .market_context import FEATURE_NAMES, FEATURE_DIM, candle_time
 
-FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_shadow_v5'
+FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_liquidity_shadow_v6'
 EXTERNAL_NAMES = (
     'peer_corr_weighted_return_1m',
     'peer_corr_weighted_return_5m',
@@ -25,7 +26,7 @@ EXTERNAL_NAMES = (
     'peer_stable_coverage',
     'high_impact_event_ahead_6h',
     'high_impact_event_after_2h',
-)
+) + LIQUIDITY_NAMES
 FUSION_NAMES = FEATURE_NAMES + EXTERNAL_NAMES
 FUSION_DIM = len(FUSION_NAMES)  # default empty-registry size; runtime may grow
 
@@ -101,12 +102,12 @@ def news_features(epic, calendar_path, currencies, *, now=None):
 
 
 def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=None,
-                    expected_ohlc_dim=None, fusion_schema=None):
+                    expected_ohlc_dim=None, fusion_schema=None, liquidity_path=None):
     """Return complete fusion vector or None; never silently fill missing data.
 
     Layout (must match NeuralCore columns): [BASE_OHLC | DYNAMIC | EXTERNAL].
-    `base['features']` is already BASE+DYNAMIC from market_context; peers+news
-    are appended as EXTERNAL — never interleaved into the middle.
+    `base['features']` is already BASE+DYNAMIC from market_context; peers+news+
+    public gold liquidity are appended as EXTERNAL — never interleaved.
 
     `expected_ohlc_dim`: when registry has dynamic features, base['features'] must
     match that length. Default = FEATURE_DIM (static base only).
@@ -117,12 +118,17 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     news = news_features(epic,calendar_path,currencies,now=now)
     if peers is None or news is None:
         return None
+    liq = None
+    if liquidity_path is not None:
+        liq = liquidity_features_from_path(liquidity_path, base.get('bar_time'), now=now)
+    if liq is None:
+        return None
     ohlc = list(base['features'])
     need = FEATURE_DIM if expected_ohlc_dim is None else int(expected_ohlc_dim)
     if len(ohlc)!=need:
         return None
     # EXTERNAL only at the tail — same order expand_inputs uses when appending.
-    values = ohlc + list(peers) + list(news)
+    values = ohlc + list(peers) + list(news) + list(liq)
     if len(values)!=need+len(EXTERNAL_NAMES):
         return None
     if not all(math.isfinite(x) for x in values):

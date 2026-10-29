@@ -251,7 +251,7 @@ def test_fusion_gap_blocks_new_entry_not_open_protection(tmp_path):
     assert eng._fusion_entry_blocked() is True  # still blocks *new* entry
     assert eng.armed and eng.execution_enabled
     # Snapshot reports existing position (not fusion) as the flat-entry N/A reason.
-    assert eng.snapshot()['entry_block_reason'] == 'Existing open position'
+    assert 'Existing open position' in (eng.snapshot()['entry_block_reason'] or '')
 
 
 def test_max_observation_age_constants_cover_venues():

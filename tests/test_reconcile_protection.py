@@ -33,3 +33,15 @@ def test_incomplete_protection_remains_blocked(tmp_path):
     asyncio.run(engine.sync())
     assert engine.mandate['epic']=='GOLD'
     assert not engine.execution_enabled
+
+def test_reconcile_does_not_clear_mismatch_or_read_pause(tmp_path):
+    store=Store(tmp_path/'db.sqlite3')
+    engine=SingleTradeEngine(store,Brain());engine.broker=Broker([])
+    engine._paused_for_mismatch=True
+    engine.armed=False;engine.execution_enabled=False
+    assert asyncio.run(engine.reconcile_outstanding()) is True
+    assert engine.armed is False and engine.execution_enabled is False
+    engine._paused_for_mismatch=False
+    engine._paused_for_read=True
+    assert asyncio.run(engine.reconcile_outstanding()) is True
+    assert engine.armed is False and engine.execution_enabled is False

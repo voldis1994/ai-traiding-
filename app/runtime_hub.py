@@ -28,6 +28,7 @@ class AccountRuntime:
     worker_task: Optional[asyncio.Task]=None
     stream_task: Optional[asyncio.Task]=None
     last_error: Optional[str]=None
+    last_start_error: Optional[str]=None
     started: bool=False
 
     def client_view(self) -> dict:
@@ -82,6 +83,8 @@ class RuntimeHub:
         self.platform=platform
         self._runtimes: dict[int,AccountRuntime]={}  # client_id -> runtime
         self._lock=asyncio.Lock()
+        # Sticky start failures so admin sees why a client never came up after reboot.
+        self._start_errors: dict[int,str]={}
 
     def get(self,client_id: int) -> Optional[AccountRuntime]:
         return self._runtimes.get(int(client_id))
@@ -166,8 +169,9 @@ class RuntimeHub:
             },
             'activity':{
                 'tick_count':0,'market':None,'mandate':None,'position':None,
-                'entry_block_reason':None,'error':None,
+                'entry_block_reason':None,'error':None,'last_start_error':None,
             },
+            'last_start_error':self._start_errors.get(cid),
             'results':{
                 'closed_trades':0,'open_trades_recorded':0,'realized_pnl':0.0,
                 'pnl_currency':None,'pnl_by_currency':{},
@@ -230,11 +234,16 @@ class RuntimeHub:
                                                or snap.get('entry_can_submit_now')),
                     'neural_seed':view.get('neural_seed'),
                     'error':view.get('error') or snap.get('error'),
+                    'last_start_error':None,
                     'balance':((snap.get('account') or {}).get('balance') or {}),
                     'currency':account_currency,
                 },
+                'last_start_error':None,
             })
+            self._start_errors.pop(cid,None)
         else:
+            card['activity']['last_start_error']=self._start_errors.get(cid)
+            card['last_start_error']=self._start_errors.get(cid)
             data_dir=self.platform.account_data_dir(cid)
             db=data_dir/'robot.sqlite3'
             if db.is_file():
@@ -332,6 +341,8 @@ class RuntimeHub:
             rt.worker_task=asyncio.create_task(self._worker(rt),name=f'worker-c{client_id}')
             rt.stream_task=asyncio.create_task(stream.run(engine),name=f'stream-c{client_id}')
             rt.started=True
+            rt.last_start_error=None
+            self._start_errors.pop(client_id,None)
             self._runtimes[client_id]=rt
             return rt
 
@@ -339,17 +350,30 @@ class RuntimeHub:
         rt=self.get(client_id)
         if rt and rt.started and rt.engine.broker:
             return rt
+        # Dead broker object after errors — drop and reconnect instead of
+        # reporting "running" while execution is permanently paused.
+        if rt and rt.started and not rt.engine.broker:
+            await self.stop_client(client_id)
         broker=self.platform.get_broker_for_client(client_id)
         if not broker or not broker.get('active'):
             return None
-        return await self.start_account(broker)
+        try:
+            return await self.start_account(broker)
+        except Exception as exc:
+            msg=f'{type(exc).__name__}: {str(exc)[:160]}'
+            self._start_errors[int(client_id)]=msg
+            log.warning('Failed to start client %s: %s',client_id,type(exc).__name__)
+            raise
 
     async def start_all_active(self):
         for row in self.platform.list_active_broker_accounts():
+            cid=int(row.get('client_id') or 0)
             try:
                 await self.start_account(row)
             except Exception as exc:
-                log.warning('Failed to start client %s: %s',row.get('client_id'),type(exc).__name__)
+                msg=f'{type(exc).__name__}: {str(exc)[:160]}'
+                if cid:self._start_errors[cid]=msg
+                log.warning('Failed to start client %s: %s',cid or row.get('client_id'),type(exc).__name__)
 
     async def stop_client(self,client_id: int):
         async with self._lock:
@@ -364,8 +388,11 @@ class RuntimeHub:
                 task.cancel()
                 try:await task
                 except asyncio.CancelledError:pass
+        # Cancel ALL background feeders before closing the journal — liquidity
+        # was previously orphaned and could write to a closed store during reset.
         rt.engine.cancel_peer_refresh()
         rt.engine.cancel_calendar_refresh()
+        rt.engine.cancel_liquidity_refresh()
         try:rt.brain.save()
         except Exception:pass
         if rt.engine.broker:
@@ -382,6 +409,14 @@ class RuntimeHub:
             for client_id in ids:
                 await self._stop_unlocked(client_id)
 
+    @staticmethod
+    def _can_rearm_after_read(engine) -> bool:
+        """Read-only recovery must not clear mismatch / multi / operator pauses."""
+        return bool(
+            engine._paused_for_read and engine.mandate and not engine.operator_paused
+            and not engine._paused_for_mismatch and not engine._paused_for_multi
+            and not engine.store.unresolved() and len(engine.positions)<=1)
+
     async def _worker(self,rt: AccountRuntime):
         error_count=0
         engine=rt.engine
@@ -394,8 +429,7 @@ class RuntimeHub:
                     error_count=0
                     rt.last_error=None
                     engine.last_error=None
-                    if (engine._paused_for_read and engine.mandate and not engine.operator_paused
-                            and not store.unresolved() and len(engine.positions)<=1):
+                    if self._can_rearm_after_read(engine):
                         engine._paused_for_read=False
                         engine.armed=True
                         engine.execution_enabled=True
@@ -410,11 +444,14 @@ class RuntimeHub:
                 frames=traceback.extract_tb(exc.__traceback__)
                 local=next((f for f in reversed(frames) if '/app/' in f.filename.replace('\\','/')),
                            frames[-1] if frames else None)
-                store.event('error','Broker/engine cycle error',{
-                    'type':type(exc).__name__,'count':error_count,
-                    'source':Path(local.filename).name if local else None,
-                    'line':local.lineno if local else None,
-                    'client_id':rt.client_id})
+                try:
+                    store.event('error','Broker/engine cycle error',{
+                        'type':type(exc).__name__,'count':error_count,
+                        'source':Path(local.filename).name if local else None,
+                        'line':local.lineno if local else None,
+                        'client_id':rt.client_id})
+                except Exception:
+                    pass
                 if error_count>=3:
                     if engine.armed or engine.execution_enabled:
                         engine._paused_for_read=True

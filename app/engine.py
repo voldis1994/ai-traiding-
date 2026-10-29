@@ -61,7 +61,7 @@ def _num(value,default=None):
 class Store:
     def __init__(self,path=DB):
         self.path=Path(path)
-        self.db=sqlite3.connect(str(path),check_same_thread=False)
+        self.db=sqlite3.connect(str(path),check_same_thread=False,timeout=30)
         try:
             # Refuse trading against malformed state/order journals. Recovery is
             # always explicit; NEVER discard or recreate the old DB silently.
@@ -69,6 +69,7 @@ class Store:
             if check!=[('ok',)]:
                 raise sqlite3.DatabaseError('integrity_check failed: '+str(check[:3]))
             self.db.execute('PRAGMA journal_mode=WAL')
+            self.db.execute('PRAGMA busy_timeout=5000')
         except sqlite3.DatabaseError as exc:
             self.db.close()
             raise RuntimeError(
@@ -640,8 +641,8 @@ class SingleTradeEngine:
         self.pending_order=False;self.pending_close=False;self.lock=asyncio.Lock()
         self._pending_entry_brain=None  # neural state at the decision that opened the trade
         self.last_time=None;self.last_account_tick=0;self.last_candle_tick=-20
-        # Hub passes per-client policy_path so we never touch global DATA/active_policy.py.
-        self.policy=AutoEvolution(store,policy_path) if policy_path is not None else AutoEvolution(store)
+        # Prefer explicit path; AutoEvolution also defaults next to store journal.
+        self.policy=AutoEvolution(store,policy_path)
         self.tick_count=0;self.latest_close_id=None
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
@@ -1009,7 +1010,10 @@ class SingleTradeEngine:
                 self.store.order_update(item['id'],'CONFIRMED',reference)
                 self.store.event('reconcile','Recovered confirmed broker request',{'kind':kind,'reference':reference})
         self._unresolved_at_login=bool(self.store.unresolved())
-        if not self._unresolved_at_login and not self.operator_paused and not self._paused_for_multi:
+        # Never clear mismatch / read-only / operator pauses just because orders settled.
+        if (not self._unresolved_at_login and not self.operator_paused
+                and not self._paused_for_multi and not self._paused_for_mismatch
+                and not self._paused_for_read):
             self.armed=True;self.execution_enabled=True
         return not self._unresolved_at_login
 
@@ -2183,10 +2187,14 @@ class SingleTradeEngine:
         d=self.brain.core.d
         if self.shadow_brain is None or self.shadow_brain.d!=d:
             alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
+            # Derive from live init_seed so shadow search is not identical across clients.
+            base=int(getattr(self.brain,'init_seed',7) or 7)
+            shadow_seed=(base^(0xA5A5+alt_n))%(2**31-1) or (base+alt_n+1)
             self.shadow_brain=self.brain.core.clone_architecture(
-                n=alt_n,seed=11+alt_n,copy_weights=False)
+                n=alt_n,seed=shadow_seed,copy_weights=False)
             self.store.event('shadow','Independent shadow neural core ready',
-                {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n})
+                {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n,
+                 'shadow_seed':shadow_seed})
         return self.shadow_brain
 
     def _shadow_learn(self,transition,label,lr=None):

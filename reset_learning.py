@@ -49,11 +49,20 @@ def _is_learning_file(path: Path) -> bool:
     if name in KEEP_ROOT_NAMES:
         return False
     if name in ('robot.sqlite3', 'robot.sqlite3-wal', 'robot.sqlite3-shm',
-                'robot.sqlite3-journal', 'active_policy.py', 'policy.py'):
+                'robot.sqlite3-journal'):
+        return True
+    # Include rollback siblings (policy.previous.py / .next.py / .before_edge_v2.py).
+    # Leaving them after RESET lets AutoEvolution resurrect pre-wipe code.
+    if name == 'policy.py' or name.startswith('policy.') and name.endswith('.py'):
+        return True
+    if name == 'active_policy.py' or (name.startswith('active_policy.') and name.endswith('.py')):
         return True
     if name == 'brain.npz' or (name.startswith('brain_') and name.endswith('.npz')):
         return True
     if name.endswith('.npz') and 'brain' in name.lower():
+        return True
+    # Per-client market snapshots — not learning weights, but stale copies confuse audits.
+    if name in ('economic_calendar.json', 'liquidity_snapshot.json'):
         return True
     return False
 

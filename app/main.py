@@ -58,7 +58,7 @@ async def worker():
                 if store.unresolved():await engine.reconcile_outstanding()
                 await engine.poll()
                 error_count=0;engine.last_error=None
-                if engine._paused_for_read and engine.mandate and not engine.operator_paused and not store.unresolved() and len(engine.positions)<=1:
+                if RuntimeHub._can_rearm_after_read(engine):
                     engine._paused_for_read=False;engine.armed=True;engine.execution_enabled=True
                     store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
         except asyncio.CancelledError:raise
@@ -68,10 +68,13 @@ async def worker():
             frames=traceback.extract_tb(exc.__traceback__)
             local=next((f for f in reversed(frames) if '/app/' in f.filename.replace('\\','/')),
                 frames[-1] if frames else None)
-            store.event('error','Broker/engine cycle error',{
-                'type':type(exc).__name__,'count':error_count,
-                'source':Path(local.filename).name if local else None,
-                'line':local.lineno if local else None})
+            try:
+                store.event('error','Broker/engine cycle error',{
+                    'type':type(exc).__name__,'count':error_count,
+                    'source':Path(local.filename).name if local else None,
+                    'line':local.lineno if local else None})
+            except Exception:
+                pass
             if error_count>=3:
                 if engine.armed or engine.execution_enabled:engine._paused_for_read=True
                 engine.armed=False;engine.execution_enabled=False
@@ -79,7 +82,7 @@ async def worker():
 
 @asynccontextmanager
 async def lifespan(app):
-    global worker_task,stream_task
+    global worker_task,stream_task,store,brain,engine
     _bootstrap_admin()
     # Legacy global worker idles until /api/connect. Do NOT start its quote
     # stream by default — hub clients each own stream/worker; a shared stream
@@ -100,7 +103,13 @@ async def lifespan(app):
     await hub.shutdown()
     engine.cancel_peer_refresh()
     engine.cancel_calendar_refresh()
-    brain.save()
+    engine.cancel_liquidity_refresh()
+    # Skip save when ALL learning reset closed the legacy store (avoids resurrecting wipe).
+    try:
+        if getattr(store,'db',None) is not None:
+            brain.save()
+    except Exception:
+        pass
     if engine.broker:await engine.broker.close()
 
 app=FastAPI(title='Neural Trading AI',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
@@ -233,6 +242,13 @@ async def client_page_slash():return RedirectResponse('/app')
 @app.post('/api/connect')
 async def connect(data:Credentials):
     global stream_task
+    # Legacy console must not steal a hub client's Capital LIVE session.
+    dupes=platform.find_clients_with_api_key('capital_com',data.api_key.strip())
+    if dupes:
+        other=dupes[0]
+        raise HTTPException(409,
+            f"API atslēga jau pievienota klientam '{other['username']}' "
+            f"(id={other['client_id']}). Legacy /api/connect bloķēts.")
     if engine.broker:
         await engine.broker.close();engine.broker=None
     candidate=CapitalBroker(data.api_key,data.identifier,data.password,live=True)
@@ -459,8 +475,16 @@ async def admin_pause_client(client_id:int,_:dict=Depends(require_admin)):
 async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
     rt=hub.get(client_id)
     if not rt or not rt.started:raise HTTPException(409,'Robots nav palaists')
+    # Safety gates (not a blind re-arm). Guide phase may have no mandate yet —
+    # still allow unpause so the first manual trade can be adopted.
+    await rt.engine.reconcile_outstanding()
+    await rt.engine.sync()
     if rt.store.unresolved():
         raise HTTPException(409,'Nevar atsākt — neatrisināta brokera operācija')
+    if len(rt.engine.positions)>1:
+        raise HTTPException(409,'Vairākas atvērtas pozīcijas')
+    if rt.engine._paused_for_mismatch:
+        raise HTTPException(409,'Tirgus nesakrīt ar mandate — pārbaudi Capital pozīciju')
     rt.engine.armed=True;rt.engine.execution_enabled=True
     rt.engine.operator_paused=False;rt.engine._paused_for_read=False
     rt.store.event('control','Resumed by admin')
@@ -473,6 +497,7 @@ async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_adm
     Stops the affected robot runtime(s) first so SQLite/brain files can be moved.
     Capital.com positions are never touched. Type confirmation exactly: RESET.
     """
+    global store,brain,engine
     import reset_learning
     from .storage import DATA
     client_id=data.client_id
@@ -488,12 +513,26 @@ async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_adm
         DATA,data.confirmation,check_running=False,client_id=client_id)
     if not ok:
         raise HTTPException(400,message)
-    logging.warning('Admin learning reset ok client_id=%s',client_id if client_id is not None else 'ALL')
+    restarted=False
+    if client_id is None:
+        # Recreate legacy in-memory objects so shutdown cannot resurrect wiped weights.
+        store=Store();brain=AdaptiveBrain(store);engine=SingleTradeEngine(store,brain)
+        engine.quote_stream=stream
+    else:
+        # Per-client wipe left the robot stopped — start again so trading resumes.
+        try:
+            await hub.ensure_client_running(client_id)
+            restarted=True
+        except Exception as exc:
+            logging.warning('Post-reset start client %s: %s',client_id,type(exc).__name__)
+    logging.warning('Admin learning reset ok client_id=%s restarted=%s',
+                    client_id if client_id is not None else 'ALL',restarted)
     return {
         'ok':True,
         'message':message,
         'kept':['platform.sqlite3','secret.key'],
         'restart_recommended':client_id is None,
+        'robot_restarted':restarted,
         'clients_preserved':True,
     }
 

@@ -1356,6 +1356,25 @@ class SingleTradeEngine:
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                     fusion_schema=self.brain.fusion_schema,
                     liquidity_path=self.liquidity_path)
+                # After restart with an open position, peers/calendar/liquidity stay
+                # background-only — fusion never becomes ready and admin shows BUY/
+                # HOLD/SELL 0% forever. One blocking warm-up restores the first vote.
+                if (fused is None and self.last_signal is None
+                        and self.brain.feature_schema==self.brain.fusion_schema):
+                    try:
+                        await self._refresh_calendar_if_due()
+                        await self._refresh_liquidity_if_due()
+                        await self.intermarket.refresh(
+                            self.broker,self.mandate['epic'],inst,candles)
+                    except Exception as exc:
+                        self.store.event('warning','Fusion warm-up refresh failed',
+                            {'type':type(exc).__name__,'epic':self.mandate['epic']})
+                    fused=fusion_features(self.market_context,self.intermarket.state,
+                        self.mandate['epic'],self.news_calendar_path,
+                        self.instrument_profile['currencies'],
+                        now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
+                        fusion_schema=self.brain.fusion_schema,
+                        liquidity_path=self.liquidity_path)
                 self.latest_fusion_ready=fused is not None
                 # Prefer fusion when ready. Transient peer/news gaps must NOT wipe
                 # the last neural vote (that created permanent HOLD / no-signal).
@@ -2213,7 +2232,14 @@ class SingleTradeEngine:
                     self.last_entry_processed_bar!=self.last_decision_bar),
                 'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
                     'Unresolved broker operation' if self.store.unresolved() else
-                    'Existing open position' if self.positions else
+                    (('Existing open position · waiting for neural fusion vote'
+                      if self.last_signal is None and (
+                          getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                          and getattr(self.brain,'fusion_schema',None) is not None
+                          and not self.latest_fusion_ready)
+                      else 'Existing open position · waiting for first M1 neural vote'
+                      if self.last_signal is None
+                      else 'Existing open position') if self.positions else
                     'No adoptive size this session — open a new manual trade' if not self.mandate else
                     'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
                     'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
@@ -2222,7 +2248,7 @@ class SingleTradeEngine:
                     'Waiting for aligned external neural inputs' if (
                         getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                         and getattr(self.brain,'fusion_schema',None) is not None) else
-                    'Waiting for signal'),
+                    'Waiting for signal')),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),
                     'profit':self.profit_learning.summary(),

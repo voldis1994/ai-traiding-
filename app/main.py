@@ -81,16 +81,20 @@ async def worker():
 async def lifespan(app):
     global worker_task,stream_task
     _bootstrap_admin()
+    # Legacy global worker idles until /api/connect. Do NOT start its quote
+    # stream by default — hub clients each own stream/worker; a shared stream
+    # made multi-tenant look like one central decision engine.
     worker_task=asyncio.create_task(worker())
-    stream_task=asyncio.create_task(stream.run(engine))
+    stream_task=None
     try:
         await hub.start_all_active()
     except Exception as exc:
         logging.warning('Client runtime autostart issue: %s',type(exc).__name__)
     yield
     worker_task.cancel()
-    stream_task.cancel()
+    if stream_task is not None:stream_task.cancel()
     for t in (worker_task,stream_task):
+        if t is None:continue
         try:await t
         except asyncio.CancelledError:pass
     await hub.shutdown()
@@ -228,6 +232,7 @@ async def client_page_slash():return RedirectResponse('/app')
 # ---------- legacy operator Capital.com console ----------
 @app.post('/api/connect')
 async def connect(data:Credentials):
+    global stream_task
     if engine.broker:
         await engine.broker.close();engine.broker=None
     candidate=CapitalBroker(data.api_key,data.identifier,data.password,live=True)
@@ -249,6 +254,9 @@ async def connect(data:Credentials):
     except Exception as exc:
         await candidate.close();engine.broker=None
         raise HTTPException(502,'Broker position reconciliation failed') from exc
+    # Lazy-start legacy quote stream only when this console path is used.
+    if stream_task is None or stream_task.done():
+        stream_task=asyncio.create_task(stream.run(engine))
     store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized',
                 {'data_dir':str(DATA),'sqlite':str(store.path),
                  'mandate_requires_new_manual_trade':engine.mandate is None})
@@ -409,8 +417,12 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
     except Exception as exc:
         await candidate.close()
         raise _capital_connect_error(stage,exc) from None
-    account=platform.attach_broker(client_id,data.broker_type,data.display_name,
-                                   api_key,identifier,password)
+    try:
+        account=platform.attach_broker(client_id,data.broker_type,data.display_name,
+                                       api_key,identifier,password)
+    except ValueError as exc:
+        await candidate.close()
+        raise HTTPException(409,str(exc)) from None
     try:
         await hub.start_account(account,connected_broker=candidate)
     except Exception as exc:

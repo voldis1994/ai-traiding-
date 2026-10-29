@@ -45,6 +45,9 @@ function renderRobot(view){
   const paused=!!view.operator_paused || !view.execution_enabled;
   $('livePill').textContent=paused?t('paused'):t('live');
   $('runState').textContent=paused?t('paused'):t('live');
+  const block=view.entry_block_reason||'';
+  const canGo=!!view.entry_can_submit_now;
+  $('entryBlock').textContent=canGo?t('entryReady'):(block||t('entryWaiting'));
   $('robotError').textContent=view.error||'';
 }
 

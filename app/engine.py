@@ -217,11 +217,13 @@ class AdaptiveBrain:
     GROWTH_INTERVAL=8   # faster structural growth so the net adapts with trades
     FAST_GROWTH_INTERVAL=4  # sustained high reconstruction error
 
-    def __init__(self,store,n=16,data_dir=None):
+    def __init__(self,store,n=16,data_dir=None,seed=7):
         self.store=store
         self.path=(Path(data_dir) if data_dir else DATA)/'brain.npz'
         self.initial_neurons=n
-        self.core=NeuralCore(n=n)
+        # Per-client seed (hub) so fresh brains are not identical clones.
+        self.init_seed=int(seed)
+        self.core=NeuralCore(n=n,seed=self.init_seed)
         self.epic=None
         self._legacy_epic=self.store.get('legacy_brain_epic')
         self.history=deque(maxlen=1000)
@@ -291,7 +293,7 @@ class AdaptiveBrain:
             self.store.set('legacy_brain_epic',epic)
             # In-memory core already contains the legacy weights, if present.
         else:
-            self.core=NeuralCore(n=self.initial_neurons)
+            self.core=NeuralCore(n=self.initial_neurons,seed=self.init_seed)
             self.feature_schema=None  # Schema belongs to the selected EPIC, not the prior one.
             self.fusion_labels=0
             self.load(self._path_for(epic),expected_epic=epic)
@@ -336,7 +338,7 @@ class AdaptiveBrain:
         except Exception as exc:
             self.store.event('error','Neural state load failed',{'type':type(exc).__name__,'file':path.name})
             # Never continue with a partly loaded/mismatched network.
-            self.core=NeuralCore(n=self.initial_neurons)
+            self.core=NeuralCore(n=self.initial_neurons,seed=self.init_seed)
             self.feature_schema=None
             self.fusion_labels=0
             self.ohlc_dim=FEATURE_DIM;self.fusion_dim=FUSION_DIM
@@ -461,7 +463,7 @@ class AdaptiveBrain:
             if not backup.exists():
                 import shutil
                 shutil.copy2(path,backup)
-        self.core=NeuralCore(n=self.initial_neurons,d=self.ohlc_dim)
+        self.core=NeuralCore(n=self.initial_neurons,d=self.ohlc_dim,seed=self.init_seed)
         self.feature_schema=self.ohlc_schema
         self.history=deque(maxlen=1000);self.pending=deque()
         self.correct=0;self.labeled=0
@@ -628,7 +630,7 @@ from .intermarket import IntermarketMonitor
 import os
 
 class SingleTradeEngine:
-    def __init__(self,store,brain):
+    def __init__(self,store,brain,policy_path=None):
         self.store=store;self.brain=brain;self.broker=None
         self.armed=False;self.execution_enabled=False;self.mandate=None
         self.positions=[];self.account={};self.market={};self.last_signal=None;self.last_error=None
@@ -638,7 +640,9 @@ class SingleTradeEngine:
         self.pending_order=False;self.pending_close=False;self.lock=asyncio.Lock()
         self._pending_entry_brain=None  # neural state at the decision that opened the trade
         self.last_time=None;self.last_account_tick=0;self.last_candle_tick=-20
-        self.policy=AutoEvolution(store);self.tick_count=0;self.latest_close_id=None
+        # Hub passes per-client policy_path so we never touch global DATA/active_policy.py.
+        self.policy=AutoEvolution(store,policy_path) if policy_path is not None else AutoEvolution(store)
+        self.tick_count=0;self.latest_close_id=None
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'

@@ -31,6 +31,9 @@ window.NTA_I18N={
     size:'Lots',
     position:'Pozīcija',
     none:'Nav atvērtas pozīcijas',
+    entryBlock:'Ieejas statuss',
+    entryReady:'Gatavs iesniegt nākamo signālu',
+    entryWaiting:'Gaida ieejas nosacījumus',
     error:'Kļūda',
   },
   en:{
@@ -63,6 +66,9 @@ window.NTA_I18N={
     size:'Lot size',
     position:'Position',
     none:'No open position',
+    entryBlock:'Entry status',
+    entryReady:'Ready to submit next signal',
+    entryWaiting:'Waiting for entry conditions',
     error:'Error',
   },
   ru:{
@@ -95,6 +101,9 @@ window.NTA_I18N={
     size:'Лот',
     position:'Позиция',
     none:'Нет открытой позиции',
+    entryBlock:'Статус входа',
+    entryReady:'Готов подать следующий сигнал',
+    entryWaiting:'Ожидание условий входа',
     error:'Ошибка',
   },
 };

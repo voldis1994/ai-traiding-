@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .autonomy import AutoEvolution
 from .brokers import create_broker
+from .core import client_neural_seed
 from .engine import AdaptiveBrain, SingleTradeEngine, Store
 from .platform import PlatformStore
 from .stream import CapitalQuoteStream
@@ -69,6 +69,9 @@ class AccountRuntime:
             'bracket_learn_reason':snap.get('bracket_learn_reason'),
             'bracket_outcomes':int(snap.get('bracket_outcomes') or 0),
             'market_status':(snap.get('market') or {}).get('status'),
+            'entry_block_reason':snap.get('entry_block_reason'),
+            'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
+            'neural_seed':int(getattr(self.brain,'init_seed',0) or 0),
             'error':self.last_error or snap.get('error'),
             'tick_count':snap.get('tick_count') or 0,
         }
@@ -222,7 +225,10 @@ class RuntimeHub:
                     'market_status':(snap.get('market') or {}).get('status'),
                     'mandate':view.get('mandate'),
                     'position':view.get('position'),
-                    'entry_block_reason':snap.get('entry_block_reason'),
+                    'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
+                    'entry_can_submit_now':bool(view.get('entry_can_submit_now')
+                                               or snap.get('entry_can_submit_now')),
+                    'neural_seed':view.get('neural_seed'),
                     'error':view.get('error') or snap.get('error'),
                     'balance':((snap.get('account') or {}).get('balance') or {}),
                     'currency':account_currency,
@@ -277,12 +283,17 @@ class RuntimeHub:
                 await self._stop_unlocked(client_id)
             data_dir=self.platform.account_data_dir(client_id)
             store=Store(data_dir/'robot.sqlite3')
-            brain=AdaptiveBrain(store,data_dir=data_dir)
-            engine=SingleTradeEngine(store,brain)
-            engine.policy=AutoEvolution(store,data_dir/'policy.py')
+            # Unique init seed per client — shared public market data must not
+            # yield identical neural BUY/SELL clones across accounts.
+            seed=client_neural_seed(client_id)
+            brain=AdaptiveBrain(store,data_dir=data_dir,seed=seed)
+            engine=SingleTradeEngine(store,brain,policy_path=data_dir/'policy.py')
             stream=CapitalQuoteStream()
             engine.quote_stream=stream
             creds=self.platform.broker_credentials(broker_row)
+            store.event('learning','Per-client neural runtime started',
+                        {'client_id':client_id,'neural_seed':seed,
+                         'data_dir':str(data_dir)})
             broker=connected_broker
             owns_connect=broker is None
             if owns_connect:

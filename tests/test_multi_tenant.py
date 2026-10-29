@@ -1,14 +1,89 @@
 """Admin + client multi-tenant platform and portals."""
-import tempfile
 from pathlib import Path
 
+import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core import client_neural_seed
+from app.engine import AdaptiveBrain, Store
 from app.platform import PlatformStore
 from app.runtime_hub import RuntimeHub
 from app.security import hash_password, verify_password
 from app.brokers import list_brokers, create_broker
 from tests.test_integration import BrokerSimulation
+
+
+def test_client_neural_seeds_are_distinct():
+    """Fresh brains must not all clone seed=7 — identical weights ⇒ identical BUY."""
+    a=client_neural_seed(1)
+    b=client_neural_seed(2)
+    c=client_neural_seed(99)
+    assert a!=7 and b!=7 and c!=7
+    assert a!=b!=c
+    assert client_neural_seed(1)==a  # stable
+
+
+def test_adaptive_brain_seed_diverges_fresh_weights(tmp_path):
+    da=tmp_path/'a';db=tmp_path/'b';da.mkdir();db.mkdir()
+    s1=Store(da/'robot.sqlite3');s2=Store(db/'robot.sqlite3')
+    b1=AdaptiveBrain(s1,data_dir=da,seed=client_neural_seed(1))
+    b2=AdaptiveBrain(s2,data_dir=db,seed=client_neural_seed(2))
+    assert b1.init_seed!=b2.init_seed
+    assert not np.allclose(b1.core.P,b2.core.P)
+
+
+def test_hub_assigns_per_client_seed(tmp_path):
+    import asyncio
+    platform=PlatformStore(tmp_path/'platform.sqlite3',tmp_path/'secret.key')
+    hub=RuntimeHub(platform)
+    c1=platform.create_client('alice','pass1234','Alice','en')
+    c2=platform.create_client('bob','pass1234','Bob','en')
+    a1=platform.attach_broker(c1['id'],'capital_com','A','key-a','id-a','pw-a')
+    a2=platform.attach_broker(c2['id'],'capital_com','B','key-b','id-b','pw-b')
+
+    class LoginBroker(BrokerSimulation):
+        def __init__(self,*a,**k):
+            super().__init__();self.open=[]
+        async def connect(self):return {'authenticated':True}
+        async def close(self):pass
+        async def accounts(self):
+            return {'accounts':[{'accountId':'1','balance':{'balance':10,'available':10}}]}
+
+    import app.runtime_hub as rh
+    orig=rh.create_broker
+    rh.create_broker=lambda *a,**k:LoginBroker()
+
+    async def scenario():
+        try:
+            r1=await hub.start_account(a1)
+            r2=await hub.start_account(a2)
+            assert r1.brain.init_seed==client_neural_seed(c1['id'])
+            assert r2.brain.init_seed==client_neural_seed(c2['id'])
+            assert r1.brain.init_seed!=r2.brain.init_seed
+            assert not np.allclose(r1.brain.core.P,r2.brain.core.P)
+            view=r1.client_view()
+            assert 'entry_block_reason' in view
+            assert view['neural_seed']==r1.brain.init_seed
+            assert f"client_{c1['id']}" in str(r1.engine.policy.path)
+            assert f"client_{c2['id']}" in str(r2.engine.policy.path)
+            assert r1.engine.policy.path!=r2.engine.policy.path
+        finally:
+            await hub.shutdown()
+            rh.create_broker=orig
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_api_key_rejected(tmp_path):
+    store=PlatformStore(tmp_path/'platform.sqlite3',tmp_path/'secret.key')
+    a=store.create_client('one','pass1234','One','lv')
+    b=store.create_client('two','pass1234','Two','lv')
+    store.attach_broker(a['id'],'capital_com','One LIVE','SAME-KEY','id1','secret')
+    with pytest.raises(ValueError,match='API atslēga'):
+        store.attach_broker(b['id'],'capital_com','Two LIVE','SAME-KEY','id2','secret')
+    # Same client may re-attach / update own key
+    store.attach_broker(a['id'],'capital_com','One LIVE','SAME-KEY','id1','secret2')
 
 
 def test_password_hash_roundtrip():

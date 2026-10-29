@@ -4,16 +4,34 @@ Outputs are uncalibrated model scores, NOT proven trading forecasts. Delayed tar
 are explicit delayed price-direction proxies (the source PDF does not define y_t).
 Gradients flow through P,W,R,O,b,tau,tau_c,G for a one-step recurrent unroll.
 """
+import hashlib
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 ACTIONS=('BUY','SELL','HOLD')
 
+
+def client_neural_seed(client_id) -> int:
+    """Stable per-client init seed so fresh brains are not clones of default seed=7.
+
+    Public market features are shared; identical weights would yield identical BUY/SELL.
+    Each client must start from its own RNG seed. Existing brain.npz weights still win
+    on load — this only affects new/reset cores.
+    """
+    cid=int(client_id)
+    digest=hashlib.blake2b(f'nta-client-{cid}'.encode('utf8'),digest_size=4).digest()
+    seed=int.from_bytes(digest,'big')%(2**31-1)
+    if seed in (0,7):
+        seed=10007+cid
+    return int(seed)
+
+
 class NeuralCore:
     def __init__(self,n=16,d=3,seed=7):
         if n<1:raise ValueError('Neuron count must be positive')
-        rng=np.random.default_rng(seed);self.rng=rng
+        self.seed=int(seed)
+        rng=np.random.default_rng(self.seed);self.rng=rng
         self.n=n;self.d=d
         self.P=rng.normal(0,.12,(n,d));self.W=np.zeros((n,n))
         self.R=rng.normal(0,.12,(3,n));self.O=rng.normal(0,.12,(3,n));self.b=np.zeros(3)

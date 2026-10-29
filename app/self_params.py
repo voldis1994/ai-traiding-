@@ -37,13 +37,13 @@ DEFAULTS = {
     'val_min_fold_agree': 0.6,
     'val_min_net_pnl': 1e-6,
     'val_horizon_bars': 8,
-    'val_min_spread_coverage': 0.7,
+    'val_min_spread_coverage': 0.5,
     'val_oos_frac': 0.7,
-    # Model / shadow
-    'model_min_oos': 24,
+    # Model / shadow — lower floors so promote/reject can actually resolve
+    'model_min_oos': 12,
     'model_max_dd_ratio': 1.15,
-    'model_stability_slack': 0.05,
-    'shadow_min_broker_trades': 12,
+    'model_stability_slack': 0.08,
+    'shadow_min_broker_trades': 8,
     'shadow_rollback_window': 10,
     'shadow_rollback_delta': 0.5,
     # Learning

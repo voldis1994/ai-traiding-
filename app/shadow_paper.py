@@ -106,8 +106,10 @@ class ShadowPaperJournal:
         pos=self.position
         if pos is not None:
             direction=pos.get('direction')
-            # Close on HOLD or opposite vote — independent of LIVE.
-            if action=='HOLD' or (action in ('BUY','SELL') and action!=direction):
+            # HOLD = keep the paper position (same idea as LIVE holding to SL/TP).
+            # Closing on every HOLD made shadow ultra-high-frequency churn that
+            # almost never beat LIVE OOS £ — evolution looked permanently blocked.
+            if action in ('BUY','SELL') and action!=direction:
                 exit_side='SELL' if direction=='BUY' else 'BUY'
                 exit_px=_fill_price(exit_side,mid,sp)
                 price_pnl=_close_price_pnl(direction,float(pos['entry']),exit_px)
@@ -124,7 +126,7 @@ class ShadowPaperJournal:
                     'cash_scale':scale,
                     'unit':'account_currency' if cash is not None else 'price',
                     'spread':sp,
-                    'exit_reason':'hold' if action=='HOLD' else 'flip',
+                    'exit_reason':'flip',
                     'source':'shadow_paper'}
                 self.history.append(closed)
                 self.position=None

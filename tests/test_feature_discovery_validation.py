@@ -198,6 +198,10 @@ def test_model_validation_promote_and_rollback_stack():
         assert bad['promote'] is False
         good=compare_models([.05]*30,[.2]*30)
         assert good['promote'] is True
+        # Unequal lengths: better mean £/trade can promote even if total net is lower.
+        mean_win=compare_models([0.5]*24,[0.6]*12)
+        assert mean_win['promote'] is True
+        assert 'mean' in mean_win['reason'].lower()
         mv.push_version({'model_version':1});mv.push_version({'model_version':2})
         prev=mv.mark_rollback('test')
         assert prev and prev['model_version']==1
@@ -335,8 +339,11 @@ def test_shadow_paper_journal_independent_of_live():
         j=ShadowPaperJournal(store)
         # Without cash scale → price_pnl only, paper_pnl (cash) is None.
         assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1') is None
-        closed=j.on_bar('HOLD',mid=101.,spread=0.2,bar_time='t2')
+        # HOLD keeps the paper trade (LIVE-like); close only on opposite vote.
+        assert j.on_bar('HOLD',mid=101.,spread=0.2,bar_time='t2') is None
+        closed=j.on_bar('SELL',mid=101.,spread=0.2,bar_time='t3')
         assert closed is not None and closed['source']=='shadow_paper'
+        assert closed['exit_reason']=='flip'
         assert closed['price_pnl']!=0
         assert closed['paper_pnl'] is None
         assert closed['unit']=='price'
@@ -347,7 +354,8 @@ def test_shadow_paper_journal_independent_of_live():
         assert scale==pytest.approx(2.0)
         j2=ShadowPaperJournal(store)
         j2.on_bar('BUY',mid=100.,spread=0.,bar_time='a',cash_scale=scale)
-        c2=j2.on_bar('HOLD',mid=101.,spread=0.,bar_time='b',cash_scale=scale)
+        assert j2.on_bar('HOLD',mid=100.5,spread=0.,bar_time='a2',cash_scale=scale) is None
+        c2=j2.on_bar('SELL',mid=101.,spread=0.,bar_time='b',cash_scale=scale)
         assert c2['unit']=='account_currency'
         assert c2['paper_pnl']==pytest.approx(2.0)
         assert j2.paper_cash_pnls()

@@ -81,3 +81,14 @@ def test_missing_tick_value_blocks_when_max_risk_set():
         gate=hard_risk.entry_allowed(store,proposed_risk=None)
         assert gate['allowed'] is False
         assert 'could not be computed' in gate['reason']
+
+
+def test_defaults_never_none_and_always_enforce_max_risk():
+    assert hard_risk.DEFAULTS['max_risk_per_trade'] is not None
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'s.db')
+        # Fresh store → mandatory defaults; small proposed risk allowed.
+        gate=hard_risk.entry_allowed(store,proposed_risk=0.5)
+        assert gate['allowed'] is True
+        gate2=hard_risk.entry_allowed(store,proposed_risk=999.0)
+        assert gate2['allowed'] is False

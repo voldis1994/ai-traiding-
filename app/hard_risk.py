@@ -12,10 +12,12 @@ STORE_KEY = 'operator_hard_risk_v1'
 DAILY_KEY = 'operator_hard_risk_daily_v1'
 PEAK_KEY = 'operator_hard_risk_peak_equity'
 
+# Mandatory positive floors — None is never a valid monetary limit (critical #2).
+# Operator may tighten; neural may only tighten further. Clearing is refused.
 DEFAULTS = {
-    'max_risk_per_trade': None,
-    'daily_loss_limit': None,
-    'equity_drawdown_limit': None,
+    'max_risk_per_trade': 5.0,
+    'daily_loss_limit': 25.0,
+    'equity_drawdown_limit': 100.0,
     'trading_halted': False,
     'halt_reason': None,
 }
@@ -45,13 +47,22 @@ def _limit(v):
     return float(n)
 
 
+def _required_limit(v, key):
+    """Positive float only — fall back to mandatory DEFAULTS[key]."""
+    n = _limit(v)
+    if n is not None:
+        return float(n)
+    return float(DEFAULTS[key])
+
+
 def load(store) -> dict:
     raw = store.get(STORE_KEY) if store is not None else None
     out = dict(DEFAULTS)
     if isinstance(raw, dict):
         for k in LIMIT_KEYS:
             if k in raw:
-                out[k] = _limit(raw.get(k))
+                # Never restore None/0 — mandatory numeric floors always apply.
+                out[k] = _required_limit(raw.get(k), k)
         out['trading_halted'] = bool(raw.get('trading_halted'))
         reason = raw.get('halt_reason')
         out['halt_reason'] = str(reason) if reason else None
@@ -61,14 +72,19 @@ def load(store) -> dict:
 def save_operator(store, params: dict, *, reason: str = '') -> dict:
     if store is None:
         return dict(DEFAULTS)
+    prev = load(store)
     clean = {
-        'max_risk_per_trade': _limit(params.get('max_risk_per_trade')),
-        'daily_loss_limit': _limit(params.get('daily_loss_limit')),
-        'equity_drawdown_limit': _limit(params.get('equity_drawdown_limit')),
         'trading_halted': bool(params.get('trading_halted')),
         'halt_reason': (str(params['halt_reason'])
                         if params.get('halt_reason') else None),
     }
+    for k in LIMIT_KEYS:
+        if k in params:
+            parsed = _limit(params.get(k))
+            # Refuse to clear a mandatory limit; keep previous / default floor.
+            clean[k] = float(parsed) if parsed is not None else float(prev[k])
+        else:
+            clean[k] = float(prev[k])
     store.set(STORE_KEY, clean)
     if reason:
         store.set('operator_hard_risk_reason', reason)
@@ -80,10 +96,11 @@ def neural_may_not_raise(before: dict, after: dict) -> dict:
     for k in LIMIT_KEYS:
         prev = _limit(before.get(k))
         nxt = _limit(after.get(k))
+        # Mandatory floors: missing before → DEFAULTS, never invent looser via neural.
         if prev is None:
-            out[k] = None
+            out[k] = float(DEFAULTS[k])
         elif nxt is None:
-            out[k] = prev
+            out[k] = float(prev)
         else:
             out[k] = float(min(prev, nxt))
     if before.get('trading_halted'):
@@ -207,24 +224,24 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
                 'reason': 'trading halted: ' + (limits.get('halt_reason') or 'drawdown'),
                 'limits': limits,
             }
-    max_risk = limits.get('max_risk_per_trade')
+    # Critical #2: max risk per trade is always mandatory (never skip when unset).
+    max_risk = _required_limit(limits.get('max_risk_per_trade'), 'max_risk_per_trade')
     risk = _finite(proposed_risk)
-    if max_risk is not None:
-        if risk is None:
-            return {
-                'allowed': False,
-                'reason': ('OPEN blocked: max risk per trade is set but cash risk '
-                           'could not be computed (missing tick value)'),
-                'limits': limits,
-            }
-        if risk > float(max_risk) + 1e-12:
-            return {
-                'allowed': False,
-                'reason': (f"OPEN blocked: fixed size risk {risk:.4f} exceeds "
-                           f"max risk per trade {float(max_risk):.4f}"),
-                'limits': limits,
-                'proposed_risk': float(risk),
-            }
+    if risk is None:
+        return {
+            'allowed': False,
+            'reason': ('OPEN blocked: max risk per trade is mandatory but cash risk '
+                       'could not be computed (missing tick value)'),
+            'limits': limits,
+        }
+    if risk > float(max_risk) + 1e-12:
+        return {
+            'allowed': False,
+            'reason': (f"OPEN blocked: fixed size risk {risk:.4f} exceeds "
+                       f"max risk per trade {float(max_risk):.4f}"),
+            'limits': limits,
+            'proposed_risk': float(risk),
+        }
     return {'allowed': True, 'reason': 'ok', 'limits': limits, 'daily': daily,
             'proposed_risk': float(risk) if risk is not None else None}
 

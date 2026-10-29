@@ -23,9 +23,10 @@ STORE_KEY = 'shadow_paper_journal_v1'
 STATE_KEY = 'shadow_paper_state_v1'
 _SEED_MAX_ROWS = 400
 
-# Match LIVE defaults when engine does not pass explicit values.
-DEFAULT_FILL_DELAY_BARS = 0
-DEFAULT_SLIP_BPS = 0.
+# Critical #4: non-zero friction by default (matches self_params exec_* seeds).
+# Tests that need ideal fills must pass slip_bps=0 / fill_delay_bars=0 explicitly.
+DEFAULT_FILL_DELAY_BARS = 1
+DEFAULT_SLIP_BPS = 2.
 
 
 def _finite(x):

@@ -60,7 +60,10 @@ python -m pytest -q
 
 ## Svarīgi
 
-- LIVE lēmums = **neironu argmax** (BUY/SELL/HOLD), ne vecie 60%/MIN_EDGE vārti
+- LIVE lēmums = **neironu argmax** (BUY/SELL/HOLD); zone/SHIFT nav ieejas banu
+- Prep/eval (jauns/reset modelis) → chronoloģisks train/holdout **pirms** LIVE OPEN
+- M1 virziena precizitāte ≠ darījumu win rate; model score ≠ peļņas varbūtība
+- Neural CLOSE intent = **diagnostika**; izeja tikai SL/TP/trail
 - Background labels = **nākamā M1** svece; pēc aizvērta treida — **P&L pašnovērtējums** (mīnuss → regret)
 - Evolūcija pēc treida (`force`), lai nesekotu novecojušam režīmam
 - **Pēc restarta / login:** vecais adoptive size **netiek** atjaunots no SQLite — jāatver **jauna manuāla** pozīcija

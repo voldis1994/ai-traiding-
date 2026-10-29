@@ -86,12 +86,12 @@ function renderCard(c){
       <div><span>Soļi</span><br><strong>${e.steps??0}</strong></div>
       <div><span>Paaudze / mēģinājumi</span><br><strong>${e.generation??0} / ${e.attempts??0}</strong></div>
       <div><span>Mācību paraugi</span><br><strong>${e.labeled_samples??0}</strong></div>
-      <div><span>Precizitāte</span><br><strong>${pct(e.accuracy_proxy)}</strong></div>
+      <div><span>M1 virziena precizitāte</span><br><strong>${pct(e.minute_direction_accuracy??e.accuracy_proxy)}</strong></div>
       <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
       <div><span>Tirgus</span><br><strong>${a.market||'—'}</strong></div>
       <div><span>Ticki</span><br><strong>${a.tick_count??0}</strong></div>
       <div><span>P&amp;L (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
-      <div><span>W / L</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.win_rate)})</strong></div>
+      <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
     </div>
     <div class="muted small">${e.last_reason?('Evo: '+e.last_reason+' · '):''}${a.entry_block_reason||a.error||c.last_start_error||a.last_start_error||''}</div>
     <div class="trades">${trades}</div>

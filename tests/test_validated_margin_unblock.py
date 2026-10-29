@@ -80,6 +80,7 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
             await engine.sync()
             brain.history.extend(scored_history())
             brain.labeled=240;brain.correct=103
+            brain.mark_prep_ready('test fixture')
             original_tick=brain.tick
             def controlled_tick(*args,**kwargs):
                 result=original_tick(*args,**kwargs)

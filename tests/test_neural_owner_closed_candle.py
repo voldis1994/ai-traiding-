@@ -91,6 +91,7 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
                       'epic':'SIM','status':'TRADEABLE','min_distance':.15}
             e.market_context={'ready':True}
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
+            brain.mark_prep_ready('test fixture')
             await e.submit('BUY')
             orders=[r for r in broker.requests if r[0]=='OPEN']
             assert len(orders)==1 and orders[0][3]==Decimal('.5')
@@ -150,6 +151,7 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
             await e.poll()  # manual position adopted and protected
             broker.open=[];await e.sync()  # manually closed
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
+            brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([8.,-3.,-3.]) # BUY dominant
             # Same confirmed M1 bar already learned while manual was open.
             for _ in range(6): await e.poll()

@@ -843,7 +843,6 @@ from .calendar_feed import refresh_calendar
 from .liquidity_feed import refresh_liquidity
 from .instrument_profile import instrument_profile
 from .intermarket import IntermarketMonitor
-import os
 
 class SingleTradeEngine:
     def __init__(self,store,brain,policy_path=None):
@@ -2861,21 +2860,20 @@ class SingleTradeEngine:
                     self.last_decision_bar is not None and
                     self.last_entry_processed_bar!=self.last_decision_bar),
                 'fusion_block_reason':self.fusion_block_reason,
+                # Audit #14: when fusion EXTERNAL data blocks, name that source
+                # before the generic prep/eval readiness message.
                 'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
                     'Unresolved broker operation' if self.store.unresolved() else
                     'Existing open position' if self.positions else
                     'No adoptive size this session — open a new manual trade' if not self.mandate else
                     'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
                     'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
-                    ('Model prep/eval not ready: '+(readiness.get('reason') or ''))
-                        if not readiness.get('ready') else
                     ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
                         if self._fusion_entry_blocked() else
+                    ('Model prep/eval not ready: '+(readiness.get('reason') or ''))
+                        if not readiness.get('ready') else
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
-                        if (getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
-                            and getattr(self.brain,'fusion_schema',None) is not None) else
                     'Waiting for signal'),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),

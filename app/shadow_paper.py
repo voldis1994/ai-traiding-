@@ -23,9 +23,13 @@ STORE_KEY = 'shadow_paper_journal_v1'
 STATE_KEY = 'shadow_paper_state_v1'
 _SEED_MAX_ROWS = 400
 
-# Match LIVE defaults when engine does not pass explicit values.
-DEFAULT_FILL_DELAY_BARS = 0
-DEFAULT_SLIP_BPS = 0.
+def _store_exec_defaults(store):
+    """Operating friction comes from self_params Store — never frozen module constants."""
+    from .self_params import DEFAULTS, load
+    if store is not None:
+        sp=load(store)
+        return float(sp['exec_slip_bps']), int(sp['exec_fill_delay_bars'])
+    return float(DEFAULTS['exec_slip_bps']), int(DEFAULTS['exec_fill_delay_bars'])
 
 
 def _finite(x):
@@ -163,7 +167,7 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
 
 
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
-                     original_risk, tick, min_distance):
+                     original_risk, tick, min_distance, store=None):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
 
     Same BE / post-BE gap idea as `propose_broker_trail` — never flips on signal.
@@ -188,7 +192,11 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     else:
         tip=tip+half
     be_locked=sign*(stop-entry)>=-1e-12
-    trail_gap=open_gap if not be_locked else max(minimum,min(open_gap,max(2.0*minimum,0.35*open_gap)))
+    if be_locked:
+        from .protection_ai import _post_be_trail_gap
+        trail_gap=_post_be_trail_gap(open_gap,minimum,None,store=store)
+    else:
+        trail_gap=open_gap
     need=open_gap if not be_locked else trail_gap
     tip_fav=sign*(tip-entry)
     if tip_fav<need:return None
@@ -336,8 +344,12 @@ class ShadowPaperJournal:
             cs=_finite(cash_scale)
             if cs is not None:self.cash_scale=cs
         action=action if action in ('BUY','SELL','HOLD') else 'HOLD'
-        slip=DEFAULT_SLIP_BPS if slip_bps is None else float(slip_bps or 0)
-        delay=DEFAULT_FILL_DELAY_BARS if fill_delay_bars is None else max(0,int(fill_delay_bars))
+        if slip_bps is None or fill_delay_bars is None:
+            d_slip,d_delay=_store_exec_defaults(self.store)
+            if slip_bps is None:slip_bps=d_slip
+            if fill_delay_bars is None:fill_delay_bars=d_delay
+        slip=float(slip_bps)
+        delay=max(0,int(fill_delay_bars))
         hi=_finite(high);lo=_finite(low)
         if hi is None:hi=mid
         if lo is None:lo=mid
@@ -352,7 +364,8 @@ class ShadowPaperJournal:
                 high=hi,low=lo,mid=mid,spread=sp,
                 original_risk=pos.get('original_risk'),
                 tick=pos.get('tick') or tick,
-                min_distance=pos.get('min_distance') or min_distance)
+                min_distance=pos.get('min_distance') or min_distance,
+                store=self.store)
             if new_stop is not None:
                 pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
                 self.position=pos

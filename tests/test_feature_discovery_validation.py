@@ -358,18 +358,20 @@ def test_shadow_paper_journal_independent_of_live():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
         j=ShadowPaperJournal(store)
+        # Ideal fills for unit-path asserts; production uses non-zero exec_* defaults.
+        z=dict(slip_bps=0.,fill_delay_bars=0)
         # Without cash scale → price_pnl only, paper_pnl (cash) is None.
         # Open with explicit SL/TP distances (LIVE-identical rules — no flip exit).
         assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='t1',
-                        stop_distance=2.,profit_distance=4.,tick=0.1) is None
+                        stop_distance=2.,profit_distance=4.,tick=0.1,**z) is None
         # Opposite SELL vote must NOT close (LIVE = SL/TP/trail only).
         assert j.on_bar('SELL',mid=101.,spread=0.2,bar_time='t2',
                         high=101.5,low=100.5,
-                        stop_distance=2.,profit_distance=4.,tick=0.1) is None
+                        stop_distance=2.,profit_distance=4.,tick=0.1,**z) is None
         assert j.position is not None
         # SL hit closes with exit_reason sl (never flip).
         closed=j.on_bar('HOLD',mid=97.5,spread=0.2,bar_time='t3',
-                        high=98.,low=97.,tick=0.1)
+                        high=98.,low=97.,tick=0.1,**z)
         assert closed is not None and closed['source']=='shadow_paper'
         assert closed['exit_reason'] in ('sl','trail')
         assert closed['paper_pnl'] is None
@@ -381,11 +383,11 @@ def test_shadow_paper_journal_independent_of_live():
         assert scale==pytest.approx(2.0)
         j2=ShadowPaperJournal(store)
         j2.on_bar('BUY',mid=100.,spread=0.,bar_time='a',cash_scale=scale,
-                  stop_distance=1.,profit_distance=2.,tick=0.1)
+                  stop_distance=1.,profit_distance=2.,tick=0.1,**z)
         assert j2.on_bar('HOLD',mid=100.5,spread=0.,bar_time='a2',cash_scale=scale,
-                         high=100.8,low=100.2,tick=0.1) is None
+                         high=100.8,low=100.2,tick=0.1,**z) is None
         c2=j2.on_bar('HOLD',mid=102.5,spread=0.,bar_time='b',cash_scale=scale,
-                     high=103.,low=102.,tick=0.1)
+                     high=103.,low=102.,tick=0.1,**z)
         assert c2 is not None
         assert c2['exit_reason']=='tp'
         assert c2['unit']=='account_currency'

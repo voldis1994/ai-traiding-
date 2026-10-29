@@ -82,29 +82,46 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
     return None
 
 
-def _post_be_trail_gap(open_gap,minimum,zone_range=None):
+def _trail_knobs(store=None):
+    """Post-BE trail fractions from self_params Store — not frozen module constants."""
+    from .self_params import DEFAULTS, load
+    sp=load(store) if store is not None else dict(DEFAULTS)
+    return {
+        'min_mult':float(sp.get('trail_min_mult',DEFAULTS['trail_min_mult'])),
+        'open_frac':float(sp.get('trail_open_gap_frac',DEFAULTS['trail_open_gap_frac'])),
+        'fallback_frac':float(sp.get('trail_fallback_frac',DEFAULTS['trail_fallback_frac'])),
+    }
+
+
+def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
+                       min_mult=None,open_frac=None,fallback_frac=None):
     """After BE, follow distance from OHLC noise — never tip±minStop alone.
 
-    Floor is at least 2× broker min (or 35% of opening risk when that is wider),
-    so SL cannot glue to the tip and fire on mid/noise while the chart still
-    looks short of the mark. Cap at opening risk; prefer zone median when ready.
+    Floor uses Store-owned trail_min_mult / trail_open_gap_frac (seeds ~2× /
+    35%); robot evolves them from scratch/trail £. Cap at opening risk; prefer
+    zone median when ready.
     """
+    knobs=_trail_knobs(store)
+    if min_mult is not None:knobs['min_mult']=float(min_mult)
+    if open_frac is not None:knobs['open_frac']=float(open_frac)
+    if fallback_frac is not None:knobs['fallback_frac']=float(fallback_frac)
     open_gap=float(open_gap);minimum=float(minimum)
-    floor=max(minimum,min(open_gap,max(2.0*minimum,0.35*open_gap)))
+    floor=max(minimum,min(open_gap,max(knobs['min_mult']*minimum,
+                                       knobs['open_frac']*open_gap)))
     zr=_finite(zone_range)
     if zr is not None and zr>0:
         return max(floor,min(open_gap,zr))
-    # No OHLC zone yet — half opening risk, never only minStop.
-    return max(floor,min(open_gap,0.5*open_gap))
+    # No OHLC zone yet — Store fallback fraction, never only minStop.
+    return max(floor,min(open_gap,knobs['fallback_frac']*open_gap))
 
 
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
-                         zone_range=None):
+                         zone_range=None,store=None):
     """Trail SL behind broker extreme — past break-even, not stuck at BE.
 
     Before BE: gap = full opening risk (avoids tip±min £0 scratches; first
     ratchet ≈ BE+). After BE: gap = recent M1 median range (OHLC zone), with a
-    floor above raw minStop so SL does not fire “early” vs the chart.
+    Store-owned floor above raw minStop so SL does not fire “early” vs the chart.
 
     CRITICAL: always re-send live profitLevel on trail PUTs. Omitting TP on
     Capital update_position turns Take Profit Off — price can touch the old
@@ -138,7 +155,7 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if be_locked:
         # Prefer zone_range from caller; fall back to value stored on open meta.
         zr=zone_range if zone_range is not None else initial.get('zone_range')
-        trail_gap=_post_be_trail_gap(open_gap,minimum,zr)
+        trail_gap=_post_be_trail_gap(open_gap,minimum,zr,store=store)
     else:
         trail_gap=open_gap
     exit_quote=bid if sign==1 else ask

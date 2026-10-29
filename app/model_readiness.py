@@ -20,7 +20,7 @@ from .market_context import market_features, candle_time, FEATURE_DIM, MIN_BARS
 
 STORE_PREFIX = 'prep_eval:'
 
-# Minimum completed minutes after which a chronological prep/eval can run.
+# Seed aliases only — operating floors live in self_params Store and evolve.
 MIN_PREP_CANDLES = 96
 TRAIN_FRAC = 0.70
 # Holdout must be large enough for a meaningful minute-direction check.
@@ -29,6 +29,20 @@ MIN_HOLDOUT_BARS = 24
 MIN_ONLINE_LABELED = 64
 # Holdout minute-direction hit-rate floor (3-class; not a profit probability).
 MIN_HOLDOUT_MINUTE_ACC = 0.34
+
+
+def floors(store=None) -> dict:
+    """LIVE OPEN prep/eval floors from self_params — seeds until the robot evolves them."""
+    from .self_params import DEFAULTS, load
+    src = load(store) if store is not None else DEFAULTS
+    return {
+        'min_prep_candles': int(src.get('min_prep_candles', DEFAULTS['min_prep_candles'])),
+        'train_frac': float(src.get('train_frac', DEFAULTS['train_frac'])),
+        'min_holdout_bars': int(src.get('min_holdout_bars', DEFAULTS['min_holdout_bars'])),
+        'min_online_labeled': int(src.get('min_online_labeled', DEFAULTS['min_online_labeled'])),
+        'min_holdout_minute_acc': float(src.get(
+            'min_holdout_minute_acc', DEFAULTS['min_holdout_minute_acc'])),
+    }
 
 
 def _key(epic):
@@ -115,15 +129,20 @@ def _sorted_candles(candles):
     return [by[k] for k in sorted(by)]
 
 
-def chronological_split(candles, *, train_frac=TRAIN_FRAC):
+def chronological_split(candles, *, train_frac=None, store=None,
+                        min_prep_candles=None, min_holdout_bars=None):
     """Earlier bars = train, later bars = eval. Never reverse or shuffle."""
+    fl = floors(store)
+    frac = float(train_frac if train_frac is not None else fl['train_frac'])
+    need = int(min_prep_candles if min_prep_candles is not None else fl['min_prep_candles'])
+    hold_min = int(min_holdout_bars if min_holdout_bars is not None else fl['min_holdout_bars'])
     rows = _sorted_candles(candles)
     n = len(rows)
-    if n < MIN_PREP_CANDLES:
+    if n < need:
         return [], [], rows
-    cut = int(n * float(train_frac))
+    cut = int(n * frac)
     # Keep a contiguous embargo so the last train label cannot use first eval close.
-    cut = max(MIN_BARS + 8, min(n - MIN_HOLDOUT_BARS, cut))
+    cut = max(MIN_BARS + 8, min(n - hold_min, cut))
     train = rows[:cut]
     holdout = rows[cut:]
     return train, holdout, rows
@@ -197,6 +216,8 @@ def trading_readiness(store, brain):
     """Public readiness snapshot used by engine / UI / evaluate_neural_entry."""
     epic = getattr(brain, 'epic', None)
     state = load_state(store, epic)
+    fl = floors(store)
+    online_need = int(fl['min_online_labeled'])
     labeled = int(getattr(brain, 'labeled', 0) or 0)
     correct = int(getattr(brain, 'correct', 0) or 0)
     minute_acc = (correct / labeled) if labeled else None
@@ -204,14 +225,15 @@ def trading_readiness(store, brain):
     state['online_minute_direction_accuracy'] = (
         round(minute_acc, 4) if minute_acc is not None else None)
     state['online_labeled_samples'] = labeled
+    state['min_online_labeled'] = online_need
     if state.get('ready'):
         state['reason'] = state.get('reason') or 'Prep/eval passed — LIVE OPEN permitted'
         return state
     # Warm continue: prior online labels on this epic stand in for cold prep,
     # but still require a completed chronological record or enough labels.
-    if labeled >= MIN_ONLINE_LABELED and state.get('stage') in ('ready', 'evaluated', 'trained', 'idle'):
+    if labeled >= online_need and state.get('stage') in ('ready', 'evaluated', 'trained', 'idle'):
         # Promote warm brains that already have chronological online evidence.
-        if labeled >= MIN_ONLINE_LABELED and minute_acc is not None:
+        if labeled >= online_need and minute_acc is not None:
             state = dict(state)
             state.update({
                 'ready': True,
@@ -228,7 +250,9 @@ def trading_readiness(store, brain):
 
 def mark_candles_loaded(store, epic, candles):
     """Stage 1 — record chronological load only; does not train."""
-    _train, _hold, rows = chronological_split(candles)
+    fl = floors(store)
+    need = int(fl['min_prep_candles'])
+    _train, _hold, rows = chronological_split(candles, store=store)
     state = load_state(store, epic)
     if state.get('ready'):
         return state
@@ -239,8 +263,8 @@ def mark_candles_loaded(store, epic, candles):
         'eval_bars': len(_hold),
         'ready': False,
         'reason': (f'Historical candles loaded ({len(rows)}) — training not started yet'
-                   if len(rows) >= MIN_PREP_CANDLES else
-                   f'Need ≥{MIN_PREP_CANDLES} chronological candles for prep ({len(rows)} loaded)'),
+                   if len(rows) >= need else
+                   f'Need ≥{need} chronological candles for prep ({len(rows)} loaded)'),
     })
     return save_state(store, epic, state)
 
@@ -259,13 +283,17 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
     if existing.get('ready'):
         return existing
 
-    train, holdout, rows = chronological_split(candles)
+    fl = floors(store)
+    need = int(fl['min_prep_candles'])
+    hold_min = int(fl['min_holdout_bars'])
+    acc_floor = float(fl['min_holdout_minute_acc'])
+    train, holdout, rows = chronological_split(candles, store=store)
     state = mark_candles_loaded(store, epic, candles)
-    if len(rows) < MIN_PREP_CANDLES or len(train) < MIN_BARS + 8 or len(holdout) < MIN_HOLDOUT_BARS:
+    if len(rows) < need or len(train) < MIN_BARS + 8 or len(holdout) < hold_min:
         state['stage'] = 'candles_loaded'
         state['ready'] = False
         state['reason'] = (f'Insufficient chronological history for prep/eval '
-                           f'(have {len(rows)}, need ≥{MIN_PREP_CANDLES} with holdout)')
+                           f'(have {len(rows)}, need ≥{need} with holdout)')
         return save_state(store, epic, state)
 
     # --- Stage 2: TRAIN on earlier split only ---
@@ -361,9 +389,9 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
     # Ready when holdout has enough samples and either minute-direction is above
     # chance floor OR cost-adjusted mean proxy is non-negative with samples.
     passed = (
-        total >= MIN_HOLDOUT_BARS
+        total >= hold_min
         and minute_acc is not None
-        and minute_acc >= MIN_HOLDOUT_MINUTE_ACC
+        and minute_acc >= acc_floor
         and (mean_net is None or mean_net >= 0. or len(nets) < 8)
     )
     # Stricter when we have enough economic samples: require non-negative mean.
@@ -379,11 +407,13 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
         'holdout_net_bps_mean': round(mean_net, 4) if mean_net is not None else None,
         'train_steps': train_steps,
         'candles_loaded': len(rows),
+        'min_holdout_bars': hold_min,
+        'min_holdout_minute_acc': acc_floor,
         'reason': (
             'Prep/eval passed on chronological holdout — LIVE OPEN permitted'
             if passed else
             (f'Prep/eval holdout failed: minute-direction={minute_acc!s}, '
-             f'net_bps_mean={mean_net!s}, samples={total}/{MIN_HOLDOUT_BARS}')
+             f'net_bps_mean={mean_net!s}, samples={total}/{hold_min}')
         ),
     })
     save_state(store, epic, state)
@@ -391,7 +421,9 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
                 'Prep/eval '+('PASSED' if passed else 'BLOCKED')+' for LIVE OPEN',
                 {'epic': epic, 'train_steps': train_steps, 'eval_samples': total,
                  'minute_direction_accuracy': state['minute_direction_accuracy'],
-                 'holdout_net_bps_mean': state['holdout_net_bps_mean']})
+                 'holdout_net_bps_mean': state['holdout_net_bps_mean'],
+                 'floors': {'min_prep_candles': need, 'min_holdout_bars': hold_min,
+                            'min_holdout_minute_acc': acc_floor}})
     return state
 
 

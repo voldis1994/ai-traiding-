@@ -352,9 +352,38 @@ class NeuralCore:
         self.d=new_d
         return True
 
-    def copy_weights_from(self, other):
-        """Copy compatible weights from another core (shadow warm-start). Dim must match."""
+    def copy_weights_from(self, other, *, adopt_architecture=False):
+        """Copy weights from another core (shadow warm-start / promote).
+
+        Dim must match. By default copies min(n) slice (warm-start).
+        adopt_architecture=True: LIVE becomes shadow's full n + neuron_ids +
+        recurrent state so promote does not silently drop extra neurons.
+        """
         if not isinstance(other,NeuralCore) or other.d!=self.d:return False
+        if adopt_architecture and other.n!=self.n:
+            # Full architecture adoption — replace self with other's shape.
+            for name in WEIGHT_PARAM_NAMES:
+                setattr(self,name,np.asarray(getattr(other,name),dtype=float).copy())
+            self.n=int(other.n)
+            self.h=np.asarray(other.h,dtype=float).copy()
+            self.c=np.asarray(other.c,dtype=float).copy()
+            self.mu=np.asarray(other.mu,dtype=float).copy()
+            self.nu=np.asarray(other.nu,dtype=float).copy()
+            self.age=np.asarray(other.age,dtype=int).copy()
+            self.utility=np.asarray(other.utility,dtype=float).copy()
+            self.neuron_ids=np.asarray(other.neuron_ids,dtype=np.int64).copy()
+            self.next_neuron_id=int(getattr(other,'next_neuron_id',self.n))
+            self.steps=int(getattr(other,'steps',0) or 0)
+            self.vbar=float(getattr(other,'vbar',0.) or 0.)
+            self.births=int(getattr(other,'births',0) or 0)
+            self.deaths=int(getattr(other,'deaths',0) or 0)
+            lz=getattr(other,'last_z',None)
+            self.last_z=(np.asarray(lz,dtype=float).copy()
+                         if lz is not None else np.zeros(self.d))
+            self.last_transition=None
+            self.last_loss=getattr(other,'last_loss',None)
+            self.last_grad=float(getattr(other,'last_grad',0.) or 0.)
+            return True
         n=min(self.n,other.n)
         self.P[:n,:]=other.P[:n,:]
         self.W[:n,:n]=other.W[:n,:n]

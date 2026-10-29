@@ -380,7 +380,13 @@ class AutoEvolution:
         labeled=0
         if history is not None:
             labeled=sum(1 for r in history if r.get('label') in (0,1,2))
-        if history is not None and labeled>=64:
+        # Online utility floor from self_params (seed 64) — twin of prep warm path.
+        try:
+            from .self_params import get as sp_get
+            online_need=int(sp_get(self.store,'min_online_labeled',64))
+        except Exception:
+            online_need=64
+        if history is not None and labeled>=online_need:
             edge_floor=max(0.01,min(0.05,float(score_edge) if score_edge is not None else 0.01))
             economic=self.directional_evidence(
                 direction,history,edge_floor,forward_holdout=True)
@@ -692,12 +698,22 @@ class AutoEvolution:
                 constants[a.targets[0].id]=a.value.value
         return constants
     def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
-        """Search/promote policy candidates.
+        """Search/promote policy candidates (SHADOW / cosmetic — not LIVE entry).
 
-        Normal path: every 10 new labels (background).
-        force=True: run immediately after a closed trade so evolution keeps up
-        with live trading tempo; loss_trade lowers the sample floor.
+        LIVE OPEN uses neural argmax; policy.py constants are SHADOW_ONLY.
+        Default self_params.policy_evolve_enabled=0 keeps this off the hot path
+        so attempts/Paaudze are not inflated by unused policy-file churn.
+        Tests and explicit opt-in (Store=1) still exercise the search.
         """
+        try:
+            from .self_params import get as sp_get
+            enabled=int(sp_get(self.store,'policy_evolve_enabled',0))
+        except Exception:
+            enabled=0
+        if not enabled:
+            self.last_reason=('policy.evolve gated off (LIVE=neural argmax; '
+                              'set self_params.policy_evolve_enabled=1 to run)')
+            return None
         min_samples=4 if (force and loss_trade) else (6 if force else 10)
         if sample_count<min_samples:
             self.last_reason=f'Waiting for labels: {sample_count}/{min_samples}'
@@ -1048,7 +1064,9 @@ class AutoEvolution:
             elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
                 self._push_model_snapshot(engine,note='pre_shadow_promote')
-                if brain.core.copy_weights_from(shadow):
+                # Full architecture adopt — never silently drop shadow neurons
+                # when shadow.n != live.n (partial min(n) copy was a fake promote).
+                if brain.core.copy_weights_from(shadow,adopt_architecture=True):
                     brain.model_version=int(getattr(brain,'model_version',0) or 0)+1
                     try:brain.save()
                     except Exception:pass
@@ -1063,12 +1081,16 @@ class AutoEvolution:
                     if hasattr(engine,'_persist_shadow_state'):
                         engine._persist_shadow_state()
                     self.last_reason='Shadow weights promoted to LIVE neural core'
+                    self.store.set('neural_adapt_reason',
+                        'Shadow paper £ beat LIVE — weights copied into LIVE core')
                     self.store.event('learning','Shadow neural weights promoted to LIVE',
                         {'model_version':brain.model_version,
                          'shadow_neurons':shadow.n,'live_neurons':brain.core.n,
-                         'weight_checksum':checksum,'learning_generation':bumped})
+                         'weight_checksum':checksum,'learning_generation':bumped,
+                         'architecture_adopted':True})
                     decision=dict(decision,weights_promoted=True,
-                                  weight_checksum=checksum)
+                                  weight_checksum=checksum,
+                                  architecture_adopted=True)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])

@@ -1,4 +1,4 @@
-"""Paaudze tracks real brain advances, not only shadow policy file swaps."""
+"""Paaudze tracks real brain advances, not shadow policy-file churn."""
 import tempfile
 from pathlib import Path
 
@@ -7,16 +7,16 @@ from app.learning_generation import bump, current, display
 from app.self_params import DEFAULTS, save, evolve_from_feedback, maybe_commit_long_horizon
 
 
-def test_bump_advances_and_display_prefers_brain():
+def test_bump_advances_and_display_ignores_policy_file_gen():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
         assert current(store)==0
-        assert display(store,policy_generation=3)==3
+        # Policy generation must NOT inflate Paaudze.
+        assert display(store,policy_generation=526)==0
         assert bump(store,'feature_registry_expanded')==1
         assert bump(store,'bracket_shape_promoted')==2
         assert current(store)==2
-        assert display(store,policy_generation=1)==2
-        assert display(store,policy_generation=9)==9
+        assert display(store,policy_generation=999)==2
 
 
 def test_self_params_commit_bumps_generation():

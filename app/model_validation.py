@@ -63,17 +63,26 @@ def compare_models(incumbent_pnls, candidate_pnls, *, store=None):
                     'incumbent':inc,'candidate':cand}
         return {'promote':True,'reason':'cold-start candidate acceptable',
                 'incumbent':inc,'candidate':cand}
-    if cand['net']<=inc['net']:
-        return {'promote':False,'reason':'candidate net PnL not better',
-                'incumbent':inc,'candidate':cand}
+    # Fair when trade counts differ (shadow vs LIVE often unequal): mean £/trade.
+    inc_mean=inc['net']/max(1,inc['n'])
+    cand_mean=cand['net']/max(1,cand['n'])
+    better_net=cand['net']>inc['net']
+    better_mean=cand_mean>inc_mean
+    if not better_net and not better_mean:
+        return {'promote':False,'reason':'candidate net/mean £ not better',
+                'incumbent':inc,'candidate':cand,
+                'inc_mean':inc_mean,'cand_mean':cand_mean}
     if cand['max_dd']<inc['max_dd']*dd_ratio and inc['max_dd']<0:
         return {'promote':False,'reason':'candidate drawdown worse than allowed',
                 'incumbent':inc,'candidate':cand}
     if cand['stability']+1e-9<inc['stability']-slack:
         return {'promote':False,'reason':'candidate less stable',
                 'incumbent':inc,'candidate':cand}
-    return {'promote':True,'reason':'OOS net/risk/stability beat incumbent',
-            'incumbent':inc,'candidate':cand}
+    why=('OOS mean £/trade beat incumbent' if better_mean and not better_net
+         else 'OOS net/risk/stability beat incumbent')
+    return {'promote':True,'reason':why,
+            'incumbent':inc,'candidate':cand,
+            'inc_mean':inc_mean,'cand_mean':cand_mean}
 
 
 def walk_forward_split(rows, *, train_frac=None, store=None):

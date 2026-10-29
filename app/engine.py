@@ -1782,9 +1782,11 @@ class SingleTradeEngine:
              'tick_size':tick,
              'bracket':bracket_learn.load_params(self.store)})
         try:
+            # Milestone evolve only — force=True every close inflated policy
+            # attempts/Paaudze without changing LIVE neural entry.
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),
-                               force=True,loss_trade=(pnl_sign<0 and not scratch_hold))
+                               force=False)
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

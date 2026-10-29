@@ -28,9 +28,11 @@ def bump(store, reason):
 
 
 def display(store, policy_generation=0):
-    """Number shown as Paaudze: max(brain advances, policy file gen)."""
-    try:
-        policy = int(policy_generation or 0)
-    except (TypeError, ValueError):
-        policy = 0
-    return max(current(store), policy)
+    """Paaudze = brain advances only — never inflate with policy-file gen.
+
+    Policy Python swaps are research and do not change LIVE neural entry;
+    showing max(brain, policy) made 500+ generations look like progress.
+    `policy_generation` is kept for callers/UI that show it separately.
+    """
+    del policy_generation  # explicit: unused for Paaudze
+    return current(store)

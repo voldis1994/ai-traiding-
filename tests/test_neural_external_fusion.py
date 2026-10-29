@@ -8,8 +8,11 @@ from app.engine import AdaptiveBrain, Store
 from app.market_context import FEATURE_DIM
 from app.market_fusion import (FUSION_DIM, FUSION_SCHEMA, EXTERNAL_NAMES,
                                peer_features, news_features, fusion_features)
+from app.liquidity_feed import LIQUIDITY_NAMES
+from tests.test_liquidity_feed import _snapshot as liquidity_snapshot
 
 BASE=datetime(2026,10,14,17,0,tzinfo=timezone.utc)
+EXT_N=len(EXTERNAL_NAMES)
 
 
 def market_state(*, bar=BASE, change=2., stable=True):
@@ -31,25 +34,36 @@ def calendar(path, *, currencies=('USD',),when=BASE+timedelta(hours=1)):
         'impact':'HIGH','currencies':list(currencies),'epics':[],'name':'CPI'}]}))
 
 
-def fused(path, *, bar=BASE, change=2.):
+def _liq(path, *, bar=BASE, epic='EURUSD'):
+    # Align fixture liquidity bars to the fusion bar timeline + epic.
+    snap=liquidity_snapshot(bar=bar, epic=epic)
+    path.write_text(json.dumps(snap),encoding='utf-8')
+    return path
+
+
+def fused(path, *, bar=BASE, change=2., liq_path=None):
     return fusion_features({'ready':True,'bar_time':bar.isoformat(),
         'features':[.05]*FEATURE_DIM},market_state(bar=bar,change=change),
-        'EURUSD',path,['EUR','USD'],now=BASE)
+        'EURUSD',path,['EUR','USD'],now=BASE,liquidity_path=liq_path)
 
 
 def test_fused_input_has_crossmarket_and_news_with_no_future_candle(tmp_path):
     file=tmp_path/'calendar.json';calendar(file)
-    vector=fused(file)
-    assert vector and len(vector)==FUSION_DIM and len(EXTERNAL_NAMES)==8
+    liq=_liq(tmp_path/'liquidity_snapshot.json')
+    vector=fused(file,liq_path=liq)
+    assert vector and len(vector)==FUSION_DIM and len(EXTERNAL_NAMES)==8+len(LIQUIDITY_NAMES)
     assert vector[FEATURE_DIM:FEATURE_DIM+3]==pytest.approx([.2,.6,1.2])
-    assert vector[-2]==pytest.approx(5/6)
-    assert vector[-1]==0
+    # News dims sit before liquidity tail.
+    assert vector[FEATURE_DIM+6]==pytest.approx(5/6)
+    assert vector[FEATURE_DIM+7]==0
+    assert len(vector[FEATURE_DIM+8:])==len(LIQUIDITY_NAMES)
     # Missing peer bar is NOT converted into fake neutral data.
     stale=market_state(bar=BASE-timedelta(minutes=1))
     assert peer_features(stale,BASE.isoformat()) is None
     assert peer_features({'status':'UNAVAILABLE','peers':[]},BASE.isoformat()) is None
     assert fusion_features({'ready':True,'bar_time':BASE.isoformat(),
-        'features':[0.]*FEATURE_DIM},stale,'EURUSD',file,['EUR','USD'],now=BASE) is None
+        'features':[0.]*FEATURE_DIM},stale,'EURUSD',file,['EUR','USD'],now=BASE,
+        liquidity_path=liq) is None
     assert news_features('EURUSD',tmp_path/'missing.json',['EUR','USD'],now=BASE) is None
 
 
@@ -76,7 +90,7 @@ def test_v3_weights_are_preserved_and_external_gradients_learn(tmp_path):
     before=brain._path_for('EURUSD')
     assert before.exists()
     new_time=BASE+timedelta(minutes=15)
-    first=brain.tick(103,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.6]*8,
+    first=brain.tick(103,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.6]*EXT_N,
         bar_time=new_time.isoformat(),external_features=True)
     assert first and brain.feature_schema==FUSION_SCHEMA and brain.core.d==FUSION_DIM
     assert brain.core.steps==old_steps+1
@@ -88,7 +102,7 @@ def test_v3_weights_are_preserved_and_external_gradients_learn(tmp_path):
     start_labeled=brain.labeled
     for i in range(1,14):
         stamp=new_time+timedelta(minutes=i)
-        brain.tick(103+i*.15,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.4+i*.04]*8,
+        brain.tick(103+i*.15,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.4+i*.04]*EXT_N,
             bar_time=stamp.isoformat(),external_features=True)
     assert brain.labeled>start_labeled and brain.core.last_loss is not None
     # Actual supervised gradients train the new external input columns.
@@ -103,14 +117,14 @@ def test_v3_weights_are_preserved_and_external_gradients_learn(tmp_path):
     resumed.tick(50,.02,.01,'GOLD',features=[0.1]*FEATURE_DIM,
                  bar_time=BASE.isoformat())
     assert resumed.epic=='GOLD' and resumed.core.d==FEATURE_DIM
-    resumed.tick(105,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.8]*8,
+    resumed.tick(105,.02,.01,'EURUSD',features=[.1]*FEATURE_DIM+[.8]*EXT_N,
                  bar_time=(new_time+timedelta(minutes=14)).isoformat(),external_features=True)
     assert resumed.core.d==FUSION_DIM
 
 
 def test_invalid_input_never_poison_model(tmp_path):
     store=Store(tmp_path/'store.db');brain=AdaptiveBrain(store,data_dir=tmp_path)
-    assert brain.tick(100,.1,.01,'EURUSD',features=[0.]*FEATURE_DIM+[float('nan')]*8,
+    assert brain.tick(100,.1,.01,'EURUSD',features=[0.]*FEATURE_DIM+[float('nan')]*EXT_N,
                       bar_time=BASE.isoformat(),external_features=True) is None
     assert brain.core.d==3 and brain.core.steps==0
 
@@ -156,6 +170,8 @@ def test_engine_poll_reaches_neurons_from_capital_reference_feed(tmp_path,monkey
                 items.append(row)
             return {'prices':items}
     calendar(tmp_path/'economic_calendar.json',when=BASE+timedelta(hours=3))
+    # Liquidity bars must cover the live clock minute; epic matches broker SIM mandate.
+    _liq(tmp_path/'liquidity_snapshot.json', bar=clock[0]-timedelta(minutes=1), epic='SIM')
 
     async def run():
         store=Store(tmp_path/'state.db')
@@ -164,12 +180,27 @@ def test_engine_poll_reaches_neurons_from_capital_reference_feed(tmp_path,monkey
         engine.policy=AutoEvolution(store,tmp_path/'policy.py')
         broker=Broker();engine.attach(broker)
         engine.last_calendar_refresh=1.
+        engine.last_liquidity_refresh=1.
         async def no_remote_calendar():return None
+        async def no_remote_liquidity():return None
         engine._refresh_calendar_if_due=no_remote_calendar
+        engine._refresh_liquidity_if_due=no_remote_liquidity
         await engine.sync()
         broker.open=[]
         await engine.sync()
+        epic=(engine.mandate or {}).get('epic') or 'SIM'
+        # Keep liquidity snapshot aligned to the completed M1 bar under test.
+        bar_guess=clock[0].replace(second=0,microsecond=0)-timedelta(minutes=1)
+        _liq(engine.liquidity_path, bar=bar_guess, epic=epic)
         await engine.poll()
+        # If fusion still not ready (bar_time mismatch), refresh to exact context bar.
+        if not engine.latest_fusion_ready and engine.market_context.get('bar_time'):
+            bt=datetime.fromisoformat(engine.market_context['bar_time'].replace('Z','+00:00'))
+            _liq(engine.liquidity_path, bar=bt, epic=epic)
+            # Force a second poll after liquidity aligned.
+            clock[0]=clock[0]+timedelta(minutes=1)
+            _liq(engine.liquidity_path, bar=clock[0]-timedelta(minutes=1), epic=epic)
+            await engine.poll()
         state=engine.snapshot()
         assert brain.core.d==FUSION_DIM and brain.feature_schema==FUSION_SCHEMA
         assert state['neural']['external_features_learned'] is True

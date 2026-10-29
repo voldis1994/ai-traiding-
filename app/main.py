@@ -167,6 +167,10 @@ class LanguageBody(BaseModel):
 class PasswordBody(BaseModel):
     password:str=Field(min_length=4,max_length=256)
 
+class LearningResetBody(BaseModel):
+    confirmation:str=Field(min_length=1,max_length=32)
+    client_id:int|None=Field(default=None,ge=1)
+
 
 def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     """Explain the failed step, without ever exposing credentials, headers or response body."""
@@ -449,6 +453,37 @@ async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
     rt.engine.operator_paused=False;rt.engine._paused_for_read=False
     rt.store.event('control','Resumed by admin')
     return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+
+@app.post('/api/admin/reset-learning')
+async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_admin)):
+    """Wipe neural/trade/policy history; keep platform clients + broker credentials.
+
+    Stops the affected robot runtime(s) first so SQLite/brain files can be moved.
+    Capital.com positions are never touched. Type confirmation exactly: RESET.
+    """
+    import reset_learning
+    from .storage import DATA
+    client_id=data.client_id
+    if client_id is not None and not platform.get_client(client_id):
+        raise HTTPException(404,'Klients nav atrasts')
+    if client_id is None:
+        await hub.shutdown()
+        try:store.close()
+        except Exception:pass
+    else:
+        await hub.stop_client(client_id)
+    ok,message=reset_learning.fresh_start(
+        DATA,data.confirmation,check_running=False,client_id=client_id)
+    if not ok:
+        raise HTTPException(400,message)
+    logging.warning('Admin learning reset ok client_id=%s',client_id if client_id is not None else 'ALL')
+    return {
+        'ok':True,
+        'message':message,
+        'kept':['platform.sqlite3','secret.key'],
+        'restart_recommended':client_id is None,
+        'clients_preserved':True,
+    }
 
 # ---------- client portal API ----------
 @app.post('/api/client/login')

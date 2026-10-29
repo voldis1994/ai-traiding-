@@ -102,6 +102,13 @@ class Store:
         for name,kind in (('spread','REAL'),('tick_size','REAL'),('label_version','INTEGER')):
             if name not in columns:self.db.execute(f'ALTER TABLE signals ADD COLUMN {name} {kind}')
         self.db.commit()
+    def close(self):
+        """Release SQLite handles so learning reset can move robot.sqlite3 safely."""
+        db=getattr(self,'db',None)
+        if db is None:return
+        try:db.close()
+        except Exception:pass
+        self.db=None
     def event(self,kind,message,details=None):
         self.db.execute('INSERT INTO events(time,kind,message,details) VALUES(?,?,?,?)',
             (now(),kind,message,json.dumps(details or {},default=str)));self.db.commit()

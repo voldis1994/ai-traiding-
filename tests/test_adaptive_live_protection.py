@@ -208,6 +208,10 @@ def test_protection_reconciliation_uses_actual_requested_levels(tmp_path):
     assert e._protection_matches(p,{'stop':99.2,'tick':.01})
     assert not e._protection_matches(p,{'stop':100.,'tick':.01})
     assert not e._protection_matches(p,{'profit':102.,'tick':.01})
+    # Capital Take Profit Off after SL-only trail — still confirms stop match.
+    p_tp_off=dict(p);p_tp_off['profitLevel']=None
+    assert e._protection_matches(p_tp_off,{'stop':99.2,'tick':.01,'profit':None})
+    assert not e._protection_matches(p_tp_off,{'stop':99.2,'tick':.01,'profit':102.})
 
 
 def test_crossed_tp_or_poor_broker_rules_do_not_trigger_put():
@@ -349,13 +353,15 @@ def test_ohlc_range_widens_open_bracket_past_min_only():
     assert wide['stop_ticks']>=70
 
 
-def test_scratch_close_sets_entry_cooldown_after_streak():
+def test_scratch_close_logs_streak_without_hardcoded_cooldown():
     with tempfile.TemporaryDirectory() as d:
         s=Store(Path(d)/'t.sqlite3')
         e=SingleTradeEngine(s,Brain())
         e._note_scratch_close(0.0,'d1')
         assert s.get('entry_scratch_cooldown') in (None,0)
         e._note_scratch_close(-0.02,'d2')
-        assert s.get('entry_scratch_cooldown')==3
+        # No hardcoded re-entry ban — neural decides; streak is audit only.
+        assert s.get('entry_scratch_cooldown') in (None,0)
+        assert s.get('scratch_streak')==2
         e._note_scratch_close(-1.5,'d3')  # real loss resets streak
         assert s.get('scratch_streak')==0

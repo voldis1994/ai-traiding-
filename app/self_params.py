@@ -49,7 +49,7 @@ DEFAULTS = {
     # Learning
     'learn_lr': 0.15,
     'learn_win_repeats': 2,
-    'learn_loss_repeats': 5,
+    'learn_loss_repeats': 2,
     'profit_history_rows': 400,
     # Exit intent (logged only — LIVE still SL/TP/trail)
     'exit_need_streak': 2,
@@ -253,17 +253,19 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
             # that was the permanent-HOLD trap after a streak of £0 exits.
             if pnl<0 and abs(pnl)>0.05:
                 p['learn_lr']=min(BOUNDS['learn_lr'][1],float(p['learn_lr'])*1.05)
-                # Cap vs win path so losses cannot forever outvote BUY/SELL.
+                # Never let loss repeats exceed win repeats (symmetric teacher).
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
-                cap=min(BOUNDS['learn_loss_repeats'][1],win_r+2)
                 cur=int(p['learn_loss_repeats'])
-                p['learn_loss_repeats']=min(cap,cur+1 if cur<cap else cur)
-                notes.append('meaningful loss → slightly stronger learn step')
+                p['learn_loss_repeats']=min(win_r,cur)
+                notes.append('meaningful loss → calm LR only; loss repeats capped at win')
             elif pnl<0:
                 notes.append('scratch loss — no HOLD-repeat ratchet')
             elif pnl>0:
                 p['learn_lr']=max(BOUNDS['learn_lr'][0],float(p['learn_lr'])*0.98)
-                notes.append('win → calm LR')
+                win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
+                # Soft nudge win path so it stays ≥ loss path.
+                p['learn_win_repeats']=min(BOUNDS['learn_win_repeats'][1],max(win_r,int(p['learn_loss_repeats'])))
+                notes.append('win → calm LR; keep win repeats ≥ loss')
     return notes
 
 
@@ -345,16 +347,26 @@ def maybe_commit_long_horizon(store, broker_pnls):
         return {'committed':False,'reason':f'need ≥{need} broker £ under trial',
                 'n_trial':len(trial),'pending':len(pending['events']),
                 'trial_started_at_trades':start}
-    if len(prior)<need:
-        return {'committed':False,'reason':f'need ≥{need} pre-trial broker £ baseline',
-                'n_prior':len(prior),'n_trial':len(trial)}
-    # Compare the first `need` trial trades vs the last `need` pre-trial trades.
     trial_window=trial[:need]
     trial_net=float(sum(trial_window))
-    prior_net=float(sum(prior[-need:]))
+    trial_mean=trial_net/max(1,len(trial_window))
     n_events=len(pending['events'])
-    if trial_net<=0 or trial_net<=prior_net:
-        # Trial failed — restore pre-trial knobs; drop draft.
+    # Cold start / short prior used to stall forever (need≥N prior never arrived).
+    # Compare means when prior is shorter; with no prior, require trial_net>0.
+    if not prior:
+        prior_net=0.0
+        beat=trial_net>0
+        mode='cold_start_trial_net'
+    elif len(prior)<need:
+        prior_net=float(sum(prior))
+        prior_mean=prior_net/len(prior)
+        beat=trial_mean>0 and trial_mean>prior_mean
+        mode='short_prior_mean'
+    else:
+        prior_net=float(sum(prior[-need:]))
+        beat=trial_net>0 and trial_net>prior_net
+        mode='equal_window_net'
+    if not beat:
         baseline=pending.get('baseline_params') or DEFAULTS
         save(store,{k:_clip(k,baseline.get(k,DEFAULTS[k])) for k in DEFAULTS},
              reason='trial rejected — restored baseline')
@@ -363,11 +375,10 @@ def maybe_commit_long_horizon(store, broker_pnls):
                              'trial_started_at_trades':0,'baseline_params':None})
         store.event('self_params','Self-params trial rejected; baseline restored',
             {'events':n_events,'trial_net':trial_net,'prior_net':prior_net,
-             'horizon':need})
+             'horizon':need,'mode':mode})
         return {'committed':False,'rejected':True,
-                'trial_net':trial_net,'prior_net':prior_net,
-                'reason':'trial £ not better than pre-trial window'}
-    # Trial won — draft already live; clear pending to lock it in.
+                'trial_net':trial_net,'prior_net':prior_net,'mode':mode,
+                'reason':'trial £ not better than available baseline'}
     draft=pending.get('draft') or load(store)
     save(store,draft,reason='long-horizon trial £ proof')
     _save_pending(store,{'events':[],'draft':None,'baseline_net':trial_net,
@@ -375,8 +386,8 @@ def maybe_commit_long_horizon(store, broker_pnls):
                          'trial_started_at_trades':0,'baseline_params':None})
     store.event('self_params','Self-params committed after trial £ proof',
         {'events_applied':n_events,'trial_net':trial_net,'prior_net':prior_net,
-         'horizon':need,'trial_started_at_trades':start})
+         'horizon':need,'trial_started_at_trades':start,'mode':mode})
     from .learning_generation import bump as bump_generation
     bump_generation(store,'self_params_trial_committed')
     return {'committed':True,'trial_net':trial_net,'prior_net':prior_net,
-            'events_applied':n_events}
+            'events_applied':n_events,'mode':mode}

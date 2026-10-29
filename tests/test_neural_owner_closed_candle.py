@@ -25,10 +25,9 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         # 38%: previously forbidden by 60% and by 8.1pp margin
         score={'BUY':.32, 'SELL':.38, 'HOLD':.30}
         assert p.neural_decision(score)=='SELL'
-        # Bare scores alone never enter — need OHLC zone (no hardcode margin gate).
+        # LIVE entry = neural argmax — zone/SHIFT are evidence only, not vetoes.
         bare=p.evaluate_neural_entry(score)
-        assert bare['action']=='HOLD' and bare['proposal']=='SELL'
-        assert 'OHLC zone unavailable' in bare['reason']
+        assert bare['action']=='SELL' and bare['proposal']=='SELL'
         down={'5':-2,'15':-3,'60':-4}
         result=p.evaluate_neural_entry(score,returns_bps=down,trend='DOWN',regime='ALIGNED')
         assert result['action']=='SELL'
@@ -39,21 +38,19 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40},
             returns_bps={'5':-1,'15':-2,'60':-3},trend='DOWN')
         assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
-        # Without OHLC zone — no entry (must read market, not scores alone).
-        assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='HOLD'
+        assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='BUY'
         up={'5':2,'15':3,'60':4}
-        # Near-tie enters only when zone aligns UP.
         tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33},
             returns_bps=up,trend='UP',regime='ALIGNED')
         assert tied['action']=='BUY' and tied['proposal']=='BUY'
         entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27},
             returns_bps=up,trend='UP',regime='ALIGNED')
         assert entered['action']=='BUY'
-        # Against trend / mid-zone chop — HOLD (no hardcode cooldown).
+        # Against trend / SHIFT — still argmax (no hardcode veto).
         assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
-            returns_bps={'5':-2,'15':-3,'60':-4},trend='DOWN')['action']=='HOLD'
+            returns_bps={'5':-2,'15':-3,'60':-4},trend='DOWN')['action']=='BUY'
         assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
-            returns_bps={'5':2,'15':3,'60':-4},regime='SHIFT')['action']=='HOLD'
+            returns_bps={'5':2,'15':3,'60':-4},regime='SHIFT')['action']=='BUY'
         # Raw vote still reports CLOSE intent; live exit needs zone + streak.
         assert p.neural_decision(score,current_direction='BUY')=='CLOSE'
         assert p.neural_decision(score,current_direction='SELL')=='HOLD'

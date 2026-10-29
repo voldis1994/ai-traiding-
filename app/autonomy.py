@@ -380,7 +380,13 @@ class AutoEvolution:
         labeled=0
         if history is not None:
             labeled=sum(1 for r in history if r.get('label') in (0,1,2))
-        if history is not None and labeled>=64:
+        # Online utility floor from self_params (seed 64) — twin of prep warm path.
+        try:
+            from .self_params import get as sp_get
+            online_need=int(sp_get(self.store,'min_online_labeled',64))
+        except Exception:
+            online_need=64
+        if history is not None and labeled>=online_need:
             edge_floor=max(0.01,min(0.05,float(score_edge) if score_edge is not None else 0.01))
             economic=self.directional_evidence(
                 direction,history,edge_floor,forward_holdout=True)
@@ -692,12 +698,22 @@ class AutoEvolution:
                 constants[a.targets[0].id]=a.value.value
         return constants
     def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
-        """Search/promote policy candidates.
+        """Search/promote policy candidates (SHADOW / cosmetic — not LIVE entry).
 
-        Normal path: every 10 new labels (background).
-        force=True: run immediately after a closed trade so evolution keeps up
-        with live trading tempo; loss_trade lowers the sample floor.
+        LIVE OPEN uses neural argmax; policy.py constants are SHADOW_ONLY.
+        Default self_params.policy_evolve_enabled=0 keeps this off the hot path
+        so attempts/Paaudze are not inflated by unused policy-file churn.
+        Tests and explicit opt-in (Store=1) still exercise the search.
         """
+        try:
+            from .self_params import get as sp_get
+            enabled=int(sp_get(self.store,'policy_evolve_enabled',0))
+        except Exception:
+            enabled=0
+        if not enabled:
+            self.last_reason=('policy.evolve gated off (LIVE=neural argmax; '
+                              'set self_params.policy_evolve_enabled=1 to run)')
+            return None
         min_samples=4 if (force and loss_trade) else (6 if force else 10)
         if sample_count<min_samples:
             self.last_reason=f'Waiting for labels: {sample_count}/{min_samples}'

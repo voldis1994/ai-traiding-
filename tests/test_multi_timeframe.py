@@ -150,6 +150,9 @@ def test_market_context_for_real_broker_candles_and_minute_learning(monkeypatch)
 def test_evolution_not_retried_repeatedly_on_same_label_count():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3');policy=AutoEvolution(store,Path(d)/'policy.py')
+        # Opt into cosmetic policy.py search (gated off LIVE hot path by default).
+        from app.self_params import DEFAULTS, save
+        save(store,{**DEFAULTS,'policy_evolve_enabled':1},reason='test')
         policy.last_change=0
         policy.evolve(.4,20,[])
         previous=policy.attempts

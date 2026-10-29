@@ -60,6 +60,9 @@ DEFAULTS = {
     'grow_error_threshold': 0.55,
     'prune_utility_threshold': -0.01,
     'prune_min_age': 80,
+    # Shadow/LIVE execution parity (critical #4) — never ideal zero friction.
+    'exec_slip_bps': 2.0,
+    'exec_fill_delay_bars': 1,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -93,6 +96,8 @@ BOUNDS = {
     'grow_error_threshold': (0.2, 2.0),
     'prune_utility_threshold': (-0.2, 0.0),
     'prune_min_age': (20, 500),
+    'exec_slip_bps': (0.5, 50.0),
+    'exec_fill_delay_bars': (1, 5),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -131,7 +136,7 @@ def _clip(key, value):
                'val_horizon_bars','model_min_oos','shadow_min_broker_trades',
                'shadow_rollback_window','learn_win_repeats','learn_loss_repeats',
                'profit_history_rows','exit_need_streak','prune_min_age',
-               'self_params_horizon_trades'):
+               'exec_fill_delay_bars','self_params_horizon_trades'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

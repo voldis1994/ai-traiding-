@@ -83,7 +83,8 @@ class RealisticBroker:
     async def transactions(self,*,last_period=600,from_time=None,to_time=None,tx_type='TRADE'):
         return {'transactions':list(self.tx)}
 
-    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True):
+    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True,
+                       deal_id=None):
         return {'activities':list(self.acts)}
 
 

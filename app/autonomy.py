@@ -387,9 +387,26 @@ class AutoEvolution:
             base['economic_utility']=economic
             evidence['economic_utility']=economic
             if not economic.get('allowed'):
-                return {**base,'action':'HOLD',
-                        'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
-                                  +str(economic.get('reason') or 'utility gate'))}
+                # Do NOT permanently stall LIVE OPEN after ~64 M1 labels when
+                # prep/eval already passed — choppy GOLD often fails the 8-bar
+                # walk-forward proxy while argmax is still directional.
+                if isinstance(readiness,dict) and readiness.get('ready'):
+                    economic={
+                        'allowed':True,'source':'prep_eval_holdout_fallback',
+                        'online_utility_failed':True,
+                        'online_reason':economic.get('reason'),
+                        'samples':readiness.get('eval_samples'),
+                        'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
+                        'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
+                        'reason':('Online utility weak; prep/eval readiness stands in '
+                                  '(score edge is not calibrated profit probability)'),
+                    }
+                    base['economic_utility']=economic
+                    evidence['economic_utility']=economic
+                else:
+                    return {**base,'action':'HOLD',
+                            'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
+                                      +str(economic.get('reason') or 'utility gate'))}
         elif isinstance(readiness,dict) and readiness.get('ready'):
             # Prep/eval holdout already measured cost-adjusted proxy — use that,
             # still refusing to treat softmax edge as calibrated profit odds.

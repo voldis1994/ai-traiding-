@@ -2065,35 +2065,79 @@ class SingleTradeEngine:
             'upl':float(upl),'currency':ccy,'at':now(),
             'exit_hint':_num(position.get('level')) or _num((self.market or {}).get('mid'))})
 
-    async def _pnl_from_broker_history(self,deal_id):
+    def _history_lookback(self,deal_id,*,queued_at=None):
+        """Prefer absolute from_time from queue/trade open; else lastPeriod seconds."""
+        from_time=None
+        for raw in (queued_at,
+                    (self.store.db.execute(
+                        'SELECT opened FROM trades WHERE deal_id=?',(str(deal_id),)
+                        ).fetchone() or [None])[0]):
+            if not raw:continue
+            try:
+                # Capital accepts ISO-ish timestamps; keep store value if parseable.
+                from_time=str(raw).replace(' ','T')
+                if from_time.endswith('+00:00'):from_time=from_time[:-6]+'Z'
+                break
+            except Exception:
+                from_time=None
+        # 24h window covers overnight SL/TP after restart; queued_at narrows when known.
+        return {'from_time':from_time,'last_period':None if from_time else 86400}
+
+    @staticmethod
+    def _row_cash_pnl(row,details=None):
+        details=details if isinstance(details,dict) else {}
+        for key in ('profit','pnl','guaranteedStopProfit','realizedPnl','cash'):
+            val=_num(details.get(key))
+            if val is None:val=_num(row.get(key))
+            if val is not None and math.isfinite(val):
+                return float(val)
+        return None
+
+    def _transaction_matches_deal(self,row,deal):
+        """Capital tx.reference is often a short id, not the UUID dealId."""
+        deal=str(deal)
+        for key in ('reference','transactionId','dealId','dealReference','note'):
+            ref=str(row.get(key) or '')
+            if not ref:continue
+            if ref==deal or deal in ref or ref in deal:
+                return True
+        return False
+
+    async def _pnl_from_broker_history(self,deal_id,*,queued_at=None):
         """Pull closed-trade cash from Capital history/activity (not mid×size)."""
         if not self.broker or not deal_id:return None
         deal=str(deal_id)
+        look=self._history_lookback(deal,queued_at=queued_at)
         # Activity often names the dealId on SL/TP/USER closes.
         if hasattr(self.broker,'activity'):
             try:
-                payload=await self.broker.activity(last_period=1800,detailed=True)
+                kwargs=dict(detailed=True,deal_id=deal)
+                if look['from_time']:
+                    kwargs['from_time']=look['from_time'];kwargs['last_period']=None
+                else:
+                    kwargs['last_period']=look['last_period']
+                payload=await self.broker.activity(**kwargs)
                 for row in payload.get('activities') or []:
                     if str(row.get('dealId') or '')!=deal:continue
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
-                    for key in ('profit','pnl','guaranteedStopProfit','realizedPnl'):
-                        val=_num(details.get(key) if details else None)
-                        if val is None:val=_num(row.get(key))
-                        if val is not None and math.isfinite(val):
-                            # Cash settles in account currency — ignore quote tags.
-                            return float(val),self._cash_currency(row.get('currency'))
+                    val=self._row_cash_pnl(row,details)
+                    if val is not None:
+                        return float(val),self._cash_currency(row.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
         if hasattr(self.broker,'transactions'):
             try:
-                payload=await self.broker.transactions(last_period=1800,tx_type='TRADE')
+                kwargs=dict(tx_type='TRADE')
+                if look['from_time']:
+                    kwargs['from_time']=look['from_time'];kwargs['last_period']=None
+                else:
+                    kwargs['last_period']=look['last_period']
+                payload=await self.broker.transactions(**kwargs)
                 for row in payload.get('transactions') or []:
-                    ref=str(row.get('reference') or row.get('transactionId') or '')
-                    if deal not in ref and ref!=deal:continue
-                    val=_num(row.get('pnl'))
-                    if val is None:val=_num(row.get('cash'))
-                    if val is not None and math.isfinite(val):
+                    if not self._transaction_matches_deal(row,deal):continue
+                    val=self._row_cash_pnl(row)
+                    if val is not None:
                         return float(val),self._cash_currency(row.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Transaction history P&L lookup failed',
@@ -2114,10 +2158,14 @@ class SingleTradeEngine:
             if val is not None and math.isfinite(val):
                 return float(val),'broker',ccy
         # One quick retry — Capital journals can lag slightly after SL/TP fire.
-        found=await self._pnl_from_broker_history(deal_id)
+        queued=None
+        for item in (self.store.get('pending_broker_pnl_deals') or []):
+            if isinstance(item,dict) and str(item.get('deal_id'))==str(deal_id):
+                queued=item.get('queued_at');break
+        found=await self._pnl_from_broker_history(deal_id,queued_at=queued)
         if not found and (hasattr(self.broker,'activity') or hasattr(self.broker,'transactions')):
             await asyncio.sleep(.8)
-            found=await self._pnl_from_broker_history(deal_id)
+            found=await self._pnl_from_broker_history(deal_id,queued_at=queued)
         if found:
             pnl,hist_ccy=found
             return pnl,'broker',self._cash_currency(hist_ccy)
@@ -2153,10 +2201,14 @@ class SingleTradeEngine:
         remaining=[]
         for item in pending:
             deal=str(item.get('deal_id') if isinstance(item,dict) else item)
-            pnl,src,ccy=await self._resolve_broker_pnl(deal,{})
-            if src!='broker' or pnl is None:
+            queued=item.get('queued_at') if isinstance(item,dict) else None
+            # Pass queued_at so history lookback is not stuck on last 30 minutes.
+            found=await self._pnl_from_broker_history(deal,queued_at=queued)
+            if not found:
                 remaining.append(item if isinstance(item,dict) else {'deal_id':deal})
                 continue
+            pnl,hist_ccy=found
+            ccy=self._cash_currency(hist_ccy)
             exit_level=item.get('exit_level') if isinstance(item,dict) else None
             already=self._trade_already_learned(deal)
             self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
@@ -2168,6 +2220,36 @@ class SingleTradeEngine:
                 self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
+        # Flat book: also harvest Capital cash for open SQLite rows whose deal vanished
+        # before we queued pending (restart / missed sync).
+        if not self.positions:
+            await self._reconcile_orphan_open_trades()
+
+    async def _reconcile_orphan_open_trades(self):
+        """When flat, close SQLite rows still open if Capital history has cash P&L."""
+        if self.positions or not self.broker:return
+        try:
+            rows=self.store.db.execute(
+                'SELECT deal_id,exit FROM trades WHERE closed IS NULL '
+                'ORDER BY opened DESC LIMIT 20').fetchall()
+        except Exception:
+            return
+        for deal_id,exit_lvl in rows:
+            deal=str(deal_id)
+            found=await self._pnl_from_broker_history(deal)
+            if not found:continue
+            pnl,ccy=found
+            ccy=self._cash_currency(ccy)
+            conf={'level':_num(exit_lvl),'profit':pnl,'pnl_currency':ccy,
+                  'source':'orphan_history_reconcile'}
+            if self._trade_already_learned(deal):
+                self.store.close_trade(deal,_num(exit_lvl),pnl,currency=ccy,
+                                      source='broker',overwrite=True)
+            else:
+                self._learn_closed_trade(deal,conf)
+            self.store.event('reconcile','Orphan open trade closed from Capital history',
+                             {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
+            self.last_closed_step=max(self.last_closed_step,self.brain.core.steps)
 
     def _counterfactual_context(self,deal_id,saved,*,epic,entry,exit_level,tick,spread):
         """Bars + SL/TP for path counterfactual (audit #15); empty → endpoint CF."""
@@ -2872,9 +2954,18 @@ class SingleTradeEngine:
                         if self._fusion_entry_blocked() else
                     ('Model prep/eval not ready: '+(readiness.get('reason') or ''))
                         if not readiness.get('ready') else
-                    'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
+                    # Prefer the real HOLD/skip reason over a cosmetic M1-wait mask
+                    # when this bar was already evaluated (utility/news/steps).
+                    (self.last_entry_reason
+                     if (self.last_entry_processed_bar==self.last_decision_bar
+                         and self.last_decision_bar is not None
+                         and getattr(self,'last_policy_decision',None)=='HOLD'
+                         and self.last_entry_reason)
+                     else 'Waiting for next completed M1 candle'
+                     if self.last_entry_processed_bar==self.last_decision_bar
+                     and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    'Waiting for signal'),
+                    'Waiting for signal')),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),
                     'profit':self.profit_learning.summary(),

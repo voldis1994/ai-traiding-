@@ -21,8 +21,12 @@ class HistoryBroker:
                              'balance':{'balance':1000}}]}
     async def transactions(self,*,last_period=600,from_time=None,to_time=None,tx_type='TRADE'):
         return {'transactions':list(self.tx)}
-    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True):
-        return {'activities':list(self.acts)}
+    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True,
+                       deal_id=None):
+        acts=list(self.acts)
+        if deal_id:
+            acts=[a for a in acts if str(a.get('dealId') or '')==str(deal_id)]
+        return {'activities':acts}
 
 
 def test_resolve_uses_activity_profit_not_ticks_only():

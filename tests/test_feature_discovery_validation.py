@@ -161,6 +161,27 @@ def test_brain_apply_registry_expands_fusion_ready_network():
         assert grew and brain.ohlc_dim==FEATURE_DIM+1 and brain.core.d==FEATURE_DIM+1
 
 
+def test_registry_shrink_does_not_crash_start():
+    """After feature wipe, registry can be smaller than brain.npz — Start must live."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        brain=AdaptiveBrain(store,data_dir=d)
+        brain.tick(100,.05,.01,'GOLD',features=[.1]*FEATURE_DIM,bar_time=BASE.isoformat())
+        reg=FeatureRegistry(store)
+        reg.approve({'id':'gap_open_1m','name':'gap_open_1m','formula':'gap','source':'t'})
+        brain.apply_registry(reg)
+        assert brain.core.d==FEATURE_DIM+1
+        before_d=brain.core.d
+        before_ohlc=brain.ohlc_dim
+        # Wipe approved features (as "Mācīties no jauna" may) while weights stay large.
+        store.set('feature_registry_v1',{'approved':[]})
+        empty=FeatureRegistry(store)
+        assert empty.ohlc_dim()==FEATURE_DIM
+        assert brain.apply_registry(empty) is False
+        assert brain.core.d==before_d
+        assert brain.ohlc_dim==before_ohlc
+
+
 def test_profit_learning_refuses_fake_plus_minus_one():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')

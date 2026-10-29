@@ -85,8 +85,9 @@ def test_order_fully_matched_rejects_missing_deal_id(tmp_path):
         'OPEN',req,None,{'dealId':'d1'},'r') is True
 
 
-def test_exec_friction_self_params_nonzero():
-    """Critical #4: exec slip/delay seeds are non-zero."""
+def test_exec_friction_self_params_store_owned():
+    """Critical #4: exec slip/delay are Store seeds that the robot can change."""
+    from app.self_params import save, evolve_from_feedback
     assert SP_DEFAULTS['exec_slip_bps'] > 0
     assert SP_DEFAULTS['exec_fill_delay_bars'] >= 1
     with tempfile.TemporaryDirectory() as d:
@@ -94,6 +95,13 @@ def test_exec_friction_self_params_nonzero():
         sp=load_self_params(store)
         assert sp['exec_slip_bps'] > 0
         assert sp['exec_fill_delay_bars'] >= 1
+        # No frozen fallback — evolve moves the Store values.
+        before=sp['exec_slip_bps']
+        evolve_from_feedback(store,broker_pnl=-3.0)
+        assert load_self_params(store)['exec_slip_bps']>=before
+        save(store,{**SP_DEFAULTS,'exec_slip_bps':3.5,'exec_fill_delay_bars':2},
+             reason='manual')
+        assert load_self_params(store)['exec_slip_bps']==pytest.approx(3.5)
 
 
 def test_learn_claim_before_save_blocks_relearn():

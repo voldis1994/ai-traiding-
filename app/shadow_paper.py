@@ -23,10 +23,13 @@ STORE_KEY = 'shadow_paper_journal_v1'
 STATE_KEY = 'shadow_paper_state_v1'
 _SEED_MAX_ROWS = 400
 
-# Critical #4: non-zero friction by default (matches self_params exec_* seeds).
-# Tests that need ideal fills must pass slip_bps=0 / fill_delay_bars=0 explicitly.
-DEFAULT_FILL_DELAY_BARS = 1
-DEFAULT_SLIP_BPS = 2.
+def _store_exec_defaults(store):
+    """Operating friction comes from self_params Store — never frozen module constants."""
+    from .self_params import DEFAULTS, load
+    if store is not None:
+        sp=load(store)
+        return float(sp['exec_slip_bps']), int(sp['exec_fill_delay_bars'])
+    return float(DEFAULTS['exec_slip_bps']), int(DEFAULTS['exec_fill_delay_bars'])
 
 
 def _finite(x):
@@ -337,8 +340,12 @@ class ShadowPaperJournal:
             cs=_finite(cash_scale)
             if cs is not None:self.cash_scale=cs
         action=action if action in ('BUY','SELL','HOLD') else 'HOLD'
-        slip=DEFAULT_SLIP_BPS if slip_bps is None else float(slip_bps or 0)
-        delay=DEFAULT_FILL_DELAY_BARS if fill_delay_bars is None else max(0,int(fill_delay_bars))
+        if slip_bps is None or fill_delay_bars is None:
+            d_slip,d_delay=_store_exec_defaults(self.store)
+            if slip_bps is None:slip_bps=d_slip
+            if fill_delay_bars is None:fill_delay_bars=d_delay
+        slip=float(slip_bps)
+        delay=max(0,int(fill_delay_bars))
         hi=_finite(high);lo=_finite(low)
         if hi is None:hi=mid
         if lo is None:lo=mid

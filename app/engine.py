@@ -2050,14 +2050,18 @@ class SingleTradeEngine:
         if pnl_value is None:return
         try:val=abs(float(pnl_value))
         except (TypeError,ValueError):return
-        if val>0.05:
+        from .self_params import load as load_self_params, DEFAULTS as SP_DEFAULTS
+        band=float(load_self_params(self.store).get(
+            'scratch_pnl_abs',SP_DEFAULTS['scratch_pnl_abs']))
+        if val>band:
             self.store.set('scratch_streak',0)
             return
         streak=int(self.store.get('scratch_streak') or 0)+1
         self.store.set('scratch_streak',streak)
         if streak<2:return
         self.store.event('entry','Repeated scratch closes (neural still decides next entry)',
-                         {'pnl':pnl_value,'deal_id':deal_id,'streak':streak})
+                         {'pnl':pnl_value,'deal_id':deal_id,'streak':streak,
+                          'scratch_pnl_abs':band})
 
     def _snapshot_open_upl(self,position):
         """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
@@ -2390,11 +2394,13 @@ class SingleTradeEngine:
         # Penny-loss closes must not spam any class into the core (HOLD trap).
         # Exact £0 / flat broker rows still use the light counterfactual path —
         # Capital often snapshots UPL=0 at close while ticks still moved.
+        # Band is Store-owned (self_params.scratch_pnl_abs) — not a frozen constant.
+        scratch_band=float(sp['scratch_pnl_abs'])
         scratch_hold=False
         if pnl_value is not None:
             try:
                 cash=float(pnl_value)
-                scratch_hold=(-0.05<=cash<0.)
+                scratch_hold=(-scratch_band<=cash<0.)
             except (TypeError,ValueError):
                 scratch_hold=False
         if scratch_hold:
@@ -3263,11 +3269,11 @@ class SingleTradeEngine:
             kappa=bp['kappa'];sl_scale=bp['sl_scale']
         except Exception:
             stop_d=profit_d=None
-        # Critical #4: non-zero exec friction — never hardcode ideal 0 slip/delay.
+        # Critical #4: friction from Store self_params — robot evolves these.
         from .self_params import load as load_self_params
         sp=load_self_params(self.store)
-        slip_bps=float(sp.get('exec_slip_bps',2.0))
-        fill_delay_bars=int(sp.get('exec_fill_delay_bars',1))
+        slip_bps=float(sp['exec_slip_bps'])
+        fill_delay_bars=int(sp['exec_fill_delay_bars'])
         closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
             cash_scale=self.shadow_paper.cash_scale,

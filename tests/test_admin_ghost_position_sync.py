@@ -134,5 +134,6 @@ def test_open_position_keeps_scores_when_market_context_not_ready():
             pass  # keep
         assert e.last_signal['scores']['SELL']==pytest.approx(0.61)
         snap=e.snapshot()
-        assert snap['entry_block_reason']=='Existing open position'
+        assert 'Existing open position' in (snap['entry_block_reason'] or '')
+        assert 'p1' in (snap['entry_block_reason'] or '')
         assert snap['signal']['scores']['SELL']==pytest.approx(0.61)

@@ -2,6 +2,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.engine import Store
 from app.self_params import (DEFAULTS, STORE_KEY, PENDING_KEY, load, save, get,
                              evolve_from_feedback, maybe_commit_long_horizon,
@@ -47,6 +49,29 @@ def test_scratch_loss_does_not_ratchet_hold_repeats():
         after=load(store)['learn_loss_repeats']
         win=load(store)['learn_win_repeats']
         assert after<=win  # loss repeats never exceed win path
+
+
+def test_exec_friction_evolves_from_broker_and_shadow():
+    """PR #34 hardcodes must not freeze — Store evolves slip/delay from outcomes."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        slip0=load(store)['exec_slip_bps']
+        delay0=load(store)['exec_fill_delay_bars']
+        evolve_from_feedback(store,broker_pnl=-2.0)
+        assert load(store)['exec_slip_bps']>=slip0
+        assert load(store)['exec_fill_delay_bars']>=delay0
+        slip1=load(store)['exec_slip_bps']
+        evolve_from_feedback(store,broker_pnl=1.5)
+        assert load(store)['exec_slip_bps']<=slip1
+        delay1=load(store)['exec_fill_delay_bars']
+        slip_before_reject=load(store)['exec_slip_bps']
+        evolve_from_feedback(store,shadow_promote=False)
+        assert load(store)['exec_fill_delay_bars']>=delay1
+        assert load(store)['exec_slip_bps']>=slip_before_reject
+        # Scratch band is Store-owned and mutable.
+        assert 'scratch_pnl_abs' in DEFAULTS
+        p=load(store);p['scratch_pnl_abs']=0.08;save(store,p,reason='test')
+        assert get(store,'scratch_pnl_abs')==pytest.approx(0.08)
 
 
 def test_cold_start_trial_commits_or_rejects_without_prior_stall():

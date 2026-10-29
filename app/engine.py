@@ -327,7 +327,12 @@ class AdaptiveBrain:
         self._restore_pending(epic)
         # New/reset instrument context requires prep/eval before LIVE OPEN (audit #22).
         # Warm brains with enough online labels can re-qualify via trading_readiness().
-        if self.labeled < 64:
+        try:
+            from .self_params import get as sp_get
+            online_need=int(sp_get(self.store,'min_online_labeled',64))
+        except Exception:
+            online_need=64
+        if self.labeled < online_need:
             try:
                 from . import model_readiness
                 model_readiness.reset_state(
@@ -1237,10 +1242,10 @@ class SingleTradeEngine:
         dir_ok=p.get('direction')==req.get('direction')
         if not (epic_ok and dir_ok and size_ok):
             return False
-        # Identifiable broker operation: confirm dealId must match live when present.
+        # Critical #3: OPEN must bind broker-confirmed dealId to the live position.
         conf=confirmation or {}
         conf_deal=conf.get('dealId') or conf.get('dealID')
-        if conf_deal is not None and str(p.get('dealId'))!=str(conf_deal):
+        if conf_deal is None or str(p.get('dealId'))!=str(conf_deal):
             return False
         # dealReference already authenticated the accept; require it when provided.
         if ref and conf.get('dealReference') not in (None,ref):
@@ -1283,13 +1288,18 @@ class SingleTradeEngine:
             kind=item['kind']
             try:payload=json.loads(item['payload'])
             except (ValueError,TypeError):payload={}
-            matched=(kind=='OPEN' and len(positions)==1 and
-                positions[0]['epic']==payload.get('epic') and
-                positions[0]['direction']==payload.get('direction') and
-                Decimal(str(positions[0]['size']))==Decimal(str(payload.get('size')))) or \
-                (kind=='CLOSE' and not any(p['dealId']==item['deal_id'] for p in positions)) or \
-                (kind=='PROTECT' and any(p['dealId']==item['deal_id'] and
-                                    self._protection_matches(p,payload) for p in positions))
+            # Critical #3: full match incl. broker dealId — never epic/dir/size alone.
+            prev_positions=self.positions
+            prev_mandate=self.mandate
+            self.positions=positions
+            if kind=='OPEN' and not self.mandate and payload.get('epic'):
+                self.mandate={'epic':payload.get('epic')}
+            try:
+                matched=self._order_fully_matched(
+                    kind,payload,item.get('deal_id'),confirmed,reference)
+            finally:
+                self.positions=prev_positions
+                self.mandate=prev_mandate
             if matched:
                 self.store.order_update(item['id'],'CONFIRMED',reference)
                 self.store.event('reconcile','Recovered confirmed broker request',{'kind':kind,'reference':reference})
@@ -1694,8 +1704,16 @@ class SingleTradeEngine:
                             'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
                             'transition':self.brain._json_transition(tr),
                             'captured':'poll_fallback'})
+            # Cosmetic policy.py search — OFF by default (LIVE entry = neural argmax).
             if new_closed_bar and self.brain.labeled:
-                self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
+                try:
+                    from .self_params import get as sp_get
+                    if int(sp_get(self.store,'policy_evolve_enabled',0)):
+                        self.policy.evolve(
+                            self.brain.correct/self.brain.labeled,
+                            self.brain.labeled,list(self.brain.history))
+                except Exception:
+                    pass
             # Audit #22: historical candle load → chronological train → holdout eval
             # before autonomous LIVE OPEN. Separate from the live tick above.
             if (not self.positions and self.market_context.get('ready') and
@@ -2045,14 +2063,18 @@ class SingleTradeEngine:
         if pnl_value is None:return
         try:val=abs(float(pnl_value))
         except (TypeError,ValueError):return
-        if val>0.05:
+        from .self_params import load as load_self_params, DEFAULTS as SP_DEFAULTS
+        band=float(load_self_params(self.store).get(
+            'scratch_pnl_abs',SP_DEFAULTS['scratch_pnl_abs']))
+        if val>band:
             self.store.set('scratch_streak',0)
             return
         streak=int(self.store.get('scratch_streak') or 0)+1
         self.store.set('scratch_streak',streak)
         if streak<2:return
         self.store.event('entry','Repeated scratch closes (neural still decides next entry)',
-                         {'pnl':pnl_value,'deal_id':deal_id,'streak':streak})
+                         {'pnl':pnl_value,'deal_id':deal_id,'streak':streak,
+                          'scratch_pnl_abs':band})
 
     def _snapshot_open_upl(self,position):
         """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
@@ -2131,13 +2153,25 @@ class SingleTradeEngine:
         return None,'pending_broker_pnl',ccy
 
     def _trade_already_learned(self,deal_id):
-        """True when this deal's outcome already trained the LIVE core (audit #2)."""
+        """True when this deal is claimed or fully learned (audit #2 / critical #5)."""
         meta=self.store.get('learned_trade:'+str(deal_id))
-        return bool(isinstance(meta,dict) and meta.get('learned'))
+        return bool(isinstance(meta,dict) and (
+            meta.get('learned') or meta.get('claimed')))
+
+    def _claim_trade_learned(self,deal_id):
+        """Durable claim before weight mutation — crash cannot double-train (#5)."""
+        key='learned_trade:'+str(deal_id)
+        cur=self.store.get(key)
+        if isinstance(cur,dict) and (cur.get('learned') or cur.get('claimed')):
+            return False
+        self.store.set(key,{
+            'claimed':True,'learned':False,'at':now()})
+        return True
 
     def _mark_trade_learned(self,deal_id,*,mode=None,pnl=None,source=None):
         self.store.set('learned_trade:'+str(deal_id),{
-            'learned':True,'at':now(),'mode':mode,'pnl':pnl,'source':source})
+            'claimed':True,'learned':True,'at':now(),
+            'mode':mode,'pnl':pnl,'source':source})
 
     def _queue_pending_pnl(self,deal_id,*,exit_level=None):
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
@@ -2373,11 +2407,13 @@ class SingleTradeEngine:
         # Penny-loss closes must not spam any class into the core (HOLD trap).
         # Exact £0 / flat broker rows still use the light counterfactual path —
         # Capital often snapshots UPL=0 at close while ticks still moved.
+        # Band is Store-owned (self_params.scratch_pnl_abs) — not a frozen constant.
+        scratch_band=float(sp['scratch_pnl_abs'])
         scratch_hold=False
         if pnl_value is not None:
             try:
                 cash=float(pnl_value)
-                scratch_hold=(-0.05<=cash<0.)
+                scratch_hold=(-scratch_band<=cash<0.)
             except (TypeError,ValueError):
                 scratch_hold=False
         if scratch_hold:
@@ -2386,6 +2422,9 @@ class SingleTradeEngine:
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
+        # Critical #5: claim BEFORE any weight mutation so a crash between
+        # train/save/mark cannot double-apply the same deal on restart.
+        self._claim_trade_learned(deal_id)
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
         for i in range(repeats):
@@ -2433,24 +2472,39 @@ class SingleTradeEngine:
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
-        self.brain.save()
-        # Audit #2: this deal's experience may train LIVE only once.
+        # Critical #5: mark learned BEFORE brain.save() so a crash between the
+        # two cannot re-train on restart (lost save ≺ double-train).
         self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
-        self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
-            {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
-             'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
-             'broker_pnl':broker_pnl,
-             'realized_directional_ticks':realized_ticks,'target':label,
-             'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
-             'last_loss':losses[-1] if losses else None,
-             'tick_size':tick,
-             'bracket':bracket_learn.load_params(self.store)})
+        self.brain.save()
+        weights_updated=bool(repeats>0 and losses)
+        if weights_updated:
+            learning_generation.bump(self.store,'closed_trade_weight_update',
+                                     kind='training_steps')
+            self.store.event('learning','Closed-trade P&L updated LIVE neural weights',
+                {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
+                 'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
+                 'broker_pnl':broker_pnl,
+                 'realized_directional_ticks':realized_ticks,'target':label,
+                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'last_loss':losses[-1] if losses else None,
+                 'weights_updated':True,'tick_size':tick,
+                 'bracket':bracket_learn.load_params(self.store)})
+        else:
+            # Honest: claim burned, weights unchanged (scratch / null label).
+            self.store.event('learning','Closed-trade recorded without weight update',
+                {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
+                 'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
+                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'target':label,'weights_updated':False})
         try:
-            # Milestone evolve only — force=True every close inflated policy
-            # attempts/Paaudze without changing LIVE neural entry.
-            self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
-                               self.brain.labeled,list(self.brain.history),
-                               force=False)
+            # Cosmetic policy.py search — gated off LIVE hot path by default.
+            # force=True every close used to inflate attempts without changing
+            # LIVE neural entry (SHADOW_ONLY constants).
+            from .self_params import get as sp_get
+            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',0)):
+                self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
+                                   self.brain.labeled,list(self.brain.history),
+                                   force=False)
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
@@ -2521,7 +2575,8 @@ class SingleTradeEngine:
             self.store.set(key,meta)
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
-                                      zone_range=float(zone_range) if zone_range is not None else None)
+                                      zone_range=float(zone_range) if zone_range is not None else None,
+                                      store=self.store)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal}
         if not proposal:return
@@ -2928,7 +2983,8 @@ class SingleTradeEngine:
         return self.shadow_brain
 
     def _restore_shadow_state(self):
-        """Reload persisted shadow h/c + step counter after create/restart."""
+        """Reload persisted shadow weights + h/c + step counter after create/restart."""
+        from .core import WEIGHT_PARAM_NAMES
         shadow=self.shadow_brain
         raw=self.store.get(self.SHADOW_STATE_KEY) or {}
         if not isinstance(raw,dict) or shadow is None:return False
@@ -2940,11 +2996,35 @@ class SingleTradeEngine:
         if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):return False
         if not (np.isfinite(h).all() and np.isfinite(c).all()):return False
         if int(raw.get('d') or -1)!=shadow.d:return False
+        # Critical #1: restore trained shadow weight matrices when present.
+        weights=raw.get('weights')
+        if isinstance(weights,dict):
+            snap={}
+            try:
+                for name in WEIGHT_PARAM_NAMES:
+                    if name not in weights:raise KeyError(name)
+                    arr=np.asarray(weights[name],dtype=float)
+                    if arr.shape!=np.asarray(getattr(shadow,name)).shape:
+                        raise ValueError('shape')
+                    if not np.isfinite(arr).all():raise ValueError('nan')
+                    snap[name]=arr
+                if not shadow.restore_weights(snap):
+                    return False
+            except (TypeError,ValueError,KeyError):
+                # Corrupt weight blob — refuse partial restore (fail closed).
+                return False
         shadow.h=h;shadow.c=c
         try:shadow.steps=int(raw.get('steps') or 0)
         except (TypeError,ValueError):shadow.steps=0
         try:shadow.model_version=int(raw.get('model_version') or 0)
         except (TypeError,ValueError):shadow.model_version=0
+        ids_raw=raw.get('neuron_ids')
+        if ids_raw is not None:
+            try:
+                ids=np.asarray(ids_raw,dtype=np.int64)
+                if ids.shape==(shadow.n,):shadow.neuron_ids=ids
+            except (TypeError,ValueError):
+                pass
         tr=raw.get('last_transition')
         if isinstance(tr,dict) and tr.get('z') is not None:
             try:
@@ -2963,10 +3043,14 @@ class SingleTradeEngine:
         return True
 
     def _persist_shadow_state(self):
-        """Persist shadow h/c and step counter after every completed-candle advance."""
+        """Persist shadow weights + h/c + steps after every completed-candle advance."""
+        from .core import WEIGHT_PARAM_NAMES
         shadow=self.shadow_brain
         if shadow is None:return
         tr=getattr(shadow,'last_transition',None)
+        # Critical #1: include trainable matrices so restart keeps shadow learning.
+        weights={name:np.asarray(getattr(shadow,name),dtype=float).tolist()
+                 for name in WEIGHT_PARAM_NAMES}
         payload={
             'h':np.asarray(shadow.h,dtype=float).tolist(),
             'c':np.asarray(shadow.c,dtype=float).tolist(),
@@ -2974,6 +3058,7 @@ class SingleTradeEngine:
             'n':int(shadow.n),'d':int(shadow.d),
             'model_version':int(getattr(shadow,'model_version',0) or 0),
             'neuron_ids':np.asarray(shadow.neuron_ids,dtype=np.int64).tolist(),
+            'weights':weights,
         }
         if isinstance(tr,dict) and tr.get('z') is not None:
             payload['last_transition']={
@@ -3212,6 +3297,11 @@ class SingleTradeEngine:
             kappa=bp['kappa'];sl_scale=bp['sl_scale']
         except Exception:
             stop_d=profit_d=None
+        # Critical #4: friction from Store self_params — robot evolves these.
+        from .self_params import load as load_self_params
+        sp=load_self_params(self.store)
+        slip_bps=float(sp['exec_slip_bps'])
+        fill_delay_bars=int(sp['exec_fill_delay_bars'])
         closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
             cash_scale=self.shadow_paper.cash_scale,
@@ -3219,7 +3309,7 @@ class SingleTradeEngine:
             stop_distance=stop_d,profit_distance=profit_d,
             kappa=kappa,sl_scale=sl_scale,
             model_version=int(getattr(shadow,'model_version',0) or 0),
-            slip_bps=0.,fill_delay_bars=0,
+            slip_bps=slip_bps,fill_delay_bars=fill_delay_bars,
             shadow_transition=shadow_tr)
         if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
             pnl=closed.get('paper_pnl')
@@ -3228,8 +3318,21 @@ class SingleTradeEngine:
             if pnl is not None:
                 try:
                     cash=float(pnl)
-                    if cash>0:label={'BUY':0,'SELL':1}.get(closed.get('direction'))
-                    elif cash<0:label=2
+                    direction=closed.get('direction')
+                    if cash>0:
+                        label={'BUY':0,'SELL':1}.get(direction)
+                    elif cash<0:
+                        # Same teacher as LIVE losses — counterfactual, not hardcode HOLD.
+                        from .profit_learning import best_action_from_counterfactual
+                        entry=_num(closed.get('entry'))
+                        exit_px=_num(closed.get('exit') or closed.get('exit_px'))
+                        sim=best_action_from_counterfactual(
+                            entry,exit_px,spread=float(spread or 0),
+                            slip_bps=slip_bps) if entry is not None and exit_px is not None else None
+                        if sim and sim.get('best') in ('BUY','SELL','HOLD'):
+                            label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
+                        else:
+                            label=2
                 except (TypeError,ValueError):
                     label=None
             if label is not None:

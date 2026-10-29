@@ -3,6 +3,10 @@
 Audit #21: max risk per trade, daily loss limit, equity drawdown limit, and
 trading halt. The model must NOT raise these itself. Only an explicit operator
 save may set or loosen them; neural code may only tighten or leave unchanged.
+
+Critical #2 (revised): monetary limits default to None and are *mandatory to
+configure* — OPEN is blocked until the operator sets all three. Code must never
+invent surrogate floors (5 / 25 / 100) that override the operator's config.
 """
 from __future__ import annotations
 import math
@@ -12,6 +16,7 @@ STORE_KEY = 'operator_hard_risk_v1'
 DAILY_KEY = 'operator_hard_risk_daily_v1'
 PEAK_KEY = 'operator_hard_risk_peak_equity'
 
+# None = unset. Operator must configure; neural must not invent values.
 DEFAULTS = {
     'max_risk_per_trade': None,
     'daily_loss_limit': None,
@@ -45,6 +50,15 @@ def _limit(v):
     return float(n)
 
 
+def configured(limits: dict) -> bool:
+    """True when all three monetary limits are positive operator values."""
+    return all(_limit(limits.get(k)) is not None for k in LIMIT_KEYS)
+
+
+def missing_limits(limits: dict) -> list:
+    return [k for k in LIMIT_KEYS if _limit(limits.get(k)) is None]
+
+
 def load(store) -> dict:
     raw = store.get(STORE_KEY) if store is not None else None
     out = dict(DEFAULTS)
@@ -59,16 +73,24 @@ def load(store) -> dict:
 
 
 def save_operator(store, params: dict, *, reason: str = '') -> dict:
+    """Persist operator-chosen limits. Missing keys keep previous; None/0 clears.
+
+    Clearing a limit is allowed but OPEN then blocks until reconfigured — never
+    silently replaced with invented surrogate numbers.
+    """
     if store is None:
         return dict(DEFAULTS)
+    prev = load(store)
     clean = {
-        'max_risk_per_trade': _limit(params.get('max_risk_per_trade')),
-        'daily_loss_limit': _limit(params.get('daily_loss_limit')),
-        'equity_drawdown_limit': _limit(params.get('equity_drawdown_limit')),
         'trading_halted': bool(params.get('trading_halted')),
         'halt_reason': (str(params['halt_reason'])
                         if params.get('halt_reason') else None),
     }
+    for k in LIMIT_KEYS:
+        if k in params:
+            clean[k] = _limit(params.get(k))
+        else:
+            clean[k] = _limit(prev.get(k))
     store.set(STORE_KEY, clean)
     if reason:
         store.set('operator_hard_risk_reason', reason)
@@ -80,6 +102,7 @@ def neural_may_not_raise(before: dict, after: dict) -> dict:
     for k in LIMIT_KEYS:
         prev = _limit(before.get(k))
         nxt = _limit(after.get(k))
+        # Neural cannot invent a limit the operator never set.
         if prev is None:
             out[k] = None
         elif nxt is None:
@@ -187,6 +210,16 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
             'reason': 'trading halted: ' + (limits.get('halt_reason') or 'operator halt'),
             'limits': limits,
         }
+    # Critical #2: do not invent surrogate floors — block until operator configures.
+    missing = missing_limits(limits)
+    if missing:
+        return {
+            'allowed': False,
+            'reason': ('OPEN blocked: operator hard risk limits not configured '
+                       f"({', '.join(missing)})"),
+            'limits': limits,
+            'missing_limits': missing,
+        }
     daily = _daily_state(store, now=now)
     daily_cap = limits.get('daily_loss_limit')
     if daily_cap is not None and daily['realized_pnl'] <= -abs(float(daily_cap)):
@@ -207,32 +240,35 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
                 'reason': 'trading halted: ' + (limits.get('halt_reason') or 'drawdown'),
                 'limits': limits,
             }
-    max_risk = limits.get('max_risk_per_trade')
+    max_risk = float(limits['max_risk_per_trade'])
     risk = _finite(proposed_risk)
-    if max_risk is not None:
-        if risk is None:
-            return {
-                'allowed': False,
-                'reason': ('OPEN blocked: max risk per trade is set but cash risk '
-                           'could not be computed (missing tick value)'),
-                'limits': limits,
-            }
-        if risk > float(max_risk) + 1e-12:
-            return {
-                'allowed': False,
-                'reason': (f"OPEN blocked: fixed size risk {risk:.4f} exceeds "
-                           f"max risk per trade {float(max_risk):.4f}"),
-                'limits': limits,
-                'proposed_risk': float(risk),
-            }
+    if risk is None:
+        return {
+            'allowed': False,
+            'reason': ('OPEN blocked: max risk per trade is set but cash risk '
+                       'could not be computed (missing tick value)'),
+            'limits': limits,
+        }
+    if risk > float(max_risk) + 1e-12:
+        return {
+            'allowed': False,
+            'reason': (f"OPEN blocked: fixed size risk {risk:.4f} exceeds "
+                       f"max risk per trade {float(max_risk):.4f}"),
+            'limits': limits,
+            'proposed_risk': float(risk),
+        }
     return {'allowed': True, 'reason': 'ok', 'limits': limits, 'daily': daily,
             'proposed_risk': float(risk) if risk is not None else None}
 
 
 def snapshot(store) -> dict:
+    limits = load(store)
     return {
-        'limits': load(store),
+        'limits': limits,
+        'configured': configured(limits),
+        'missing_limits': missing_limits(limits),
         'daily': _daily_state(store),
         'peak_equity': _finite(store.get(PEAK_KEY)) if store is not None else None,
-        'note': 'Hard limits are operator/config-owned; neural cannot raise them.',
+        'note': ('Hard limits are operator/config-owned; neural cannot raise them. '
+                 'OPEN blocks until all three monetary limits are set.'),
     }

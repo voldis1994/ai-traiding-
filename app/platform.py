@@ -23,8 +23,10 @@ class PlatformStore:
         self.path=Path(path or PLATFORM_DB)
         self.path.parent.mkdir(parents=True,exist_ok=True)
         self.box=SecretBox(Path(secret_path or SECRET_KEY_PATH))
-        self.db=sqlite3.connect(str(self.path),check_same_thread=False)
+        self.db=sqlite3.connect(str(self.path),check_same_thread=False,timeout=30)
         self.db.row_factory=sqlite3.Row
+        try:self.db.execute('PRAGMA busy_timeout=5000')
+        except sqlite3.Error:pass
         self._migrate()
 
     def _migrate(self):

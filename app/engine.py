@@ -327,7 +327,12 @@ class AdaptiveBrain:
         self._restore_pending(epic)
         # New/reset instrument context requires prep/eval before LIVE OPEN (audit #22).
         # Warm brains with enough online labels can re-qualify via trading_readiness().
-        if self.labeled < 64:
+        try:
+            from .self_params import get as sp_get
+            online_need=int(sp_get(self.store,'min_online_labeled',64))
+        except Exception:
+            online_need=64
+        if self.labeled < online_need:
             try:
                 from . import model_readiness
                 model_readiness.reset_state(
@@ -1699,8 +1704,16 @@ class SingleTradeEngine:
                             'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
                             'transition':self.brain._json_transition(tr),
                             'captured':'poll_fallback'})
+            # Cosmetic policy.py search — OFF by default (LIVE entry = neural argmax).
             if new_closed_bar and self.brain.labeled:
-                self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
+                try:
+                    from .self_params import get as sp_get
+                    if int(sp_get(self.store,'policy_evolve_enabled',0)):
+                        self.policy.evolve(
+                            self.brain.correct/self.brain.labeled,
+                            self.brain.labeled,list(self.brain.history))
+                except Exception:
+                    pass
             # Audit #22: historical candle load → chronological train → holdout eval
             # before autonomous LIVE OPEN. Separate from the live tick above.
             if (not self.positions and self.market_context.get('ready') and
@@ -2484,9 +2497,11 @@ class SingleTradeEngine:
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'target':label,'weights_updated':False})
         try:
-            # Milestone evolve only — force=True every close inflated policy
-            # attempts/Paaudze without changing LIVE neural entry.
-            if weights_updated:
+            # Cosmetic policy.py search — gated off LIVE hot path by default.
+            # force=True every close used to inflate attempts without changing
+            # LIVE neural entry (SHADOW_ONLY constants).
+            from .self_params import get as sp_get
+            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',0)):
                 self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                    self.brain.labeled,list(self.brain.history),
                                    force=False)

@@ -562,9 +562,16 @@ class AdaptiveBrain:
                     loss=self.core.learn(transition,label)
                     if loss is not None and self.feature_schema==self.fusion_schema:
                         self.fusion_labels+=1
-                    if loss is not None and (self.labeled+1)%100==0:
-                        self.store.event('learning','Horizon-label learning checkpoint',
-                            {'loss':loss,'horizon':self.HORIZON,'epic':epic})
+                    if loss is not None:
+                        # Paaudze tracks real weight updates — not policy-file theater.
+                        if (self.labeled+1)%10==0:
+                            from . import learning_generation
+                            learning_generation.bump(self.store,'m1_horizon_weight_update')
+                            self.store.set('neural_adapt_reason',
+                                f'M1 label updated LIVE weights (loss={float(loss):.4f})')
+                        if (self.labeled+1)%100==0:
+                            self.store.event('learning','Horizon-label learning checkpoint',
+                                {'loss':loss,'horizon':self.HORIZON,'epic':epic})
                 self.labeled+=1
                 self.correct+=int(past['action']==('BUY','SELL','HOLD')[label])
                 self.store.db.execute('UPDATE signals SET label=?,label_version=? WHERE id=? AND epic=?',
@@ -1143,6 +1150,25 @@ class SingleTradeEngine:
                     self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
                     self.market={}
                 self.store.set('mandate',self.mandate)
+                # Capture entry neural state for THIS manual adopt so the close
+                # can train LIVE weights — without it, closes only log £ and skip learn.
+                key='entry_brain:'+str(deal_id)
+                tr=getattr(self.brain.core,'last_transition',None)
+                if self.store.get(key) is None and isinstance(tr,dict) and tr.get('h') is not None:
+                    try:
+                        hlen=len(np.asarray(tr.get('h')))
+                    except Exception:
+                        hlen=-1
+                    if hlen==getattr(self.brain.core,'n',None):
+                        tick_sz=_num((self.market or {}).get('tick'))
+                        self.store.set(key,{
+                            'epic':p['epic'],'direction':p.get('direction'),
+                            'entry':p.get('level'),'tick_size':tick_sz,
+                            'entry_spread':_num((self.market or {}).get('spread')),
+                            'transition':self.brain._json_transition(tr),
+                            'scores':(self.last_signal or {}).get('scores'),
+                            'shadow_scores':self._shadow_scores_now(),
+                            'captured':'manual_adopt'})
                 if fresh_session and open_in_flight:
                     self._supersede_stale_open_orders(deal_id)
                 self.store.event('adoption','Live broker position adopted for this session',
@@ -1150,7 +1176,8 @@ class SingleTradeEngine:
                      'direction':p.get('direction'),
                      'previous_epic':old['epic'] if old else None,
                      'fresh_session':fresh_session,
-                     'cleared_stale_open':bool(fresh_session and open_in_flight)})
+                     'cleared_stale_open':bool(fresh_session and open_in_flight),
+                     'entry_brain_saved':bool(self.store.get(key))})
             elif self.mandate is None and latest:
                 # Surface why WAITING FOR MOBILE TRADE persists despite an open deal.
                 self.store.event('warning','Open broker position not adopted yet',
@@ -1365,7 +1392,9 @@ class SingleTradeEngine:
                 if self.store.get(key) is None and self._pending_entry_brain:
                     pending=self._pending_entry_brain
                     if pending.get('direction')==p.get('direction') and pending.get('epic')==p.get('epic'):
-                        self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry')})
+                        self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry'),
+                                           'tick_size':pending.get('tick_size') or tick,
+                                           'entry_spread':pending.get('entry_spread') if pending.get('entry_spread') is not None else ask-bid})
                         self._pending_entry_brain=None
                 elif self.store.get(key) is None and self.brain.core.last_transition:
                     tr=self.brain.core.last_transition
@@ -1373,7 +1402,26 @@ class SingleTradeEngine:
                         self.store.set(key,{'epic':p['epic'],'direction':p['direction'],
                             'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
                             'transition':self.brain._json_transition(tr),
+                            'scores':(self.last_signal or {}).get('scores'),
+                            'shadow_scores':self._shadow_scores_now(),
                             'captured':'poll_fallback'})
+                else:
+                    # Fill missing tick/spread on manual-adopt snapshots so close can learn.
+                    saved=self.store.get(key)
+                    if isinstance(saved,dict) and (
+                            not saved.get('tick_size') or saved.get('entry_spread') is None
+                            or not saved.get('transition')):
+                        patch=dict(saved)
+                        if not patch.get('tick_size'):patch['tick_size']=tick
+                        if patch.get('entry_spread') is None:patch['entry_spread']=ask-bid
+                        if not patch.get('transition') and self.brain.core.last_transition:
+                            tr=self.brain.core.last_transition
+                            if len(tr['h'])==self.brain.core.n:
+                                patch['transition']=self.brain._json_transition(tr)
+                        if patch.get('entry') is None:patch['entry']=p.get('level')
+                        if not patch.get('shadow_scores'):
+                            patch['shadow_scores']=self._shadow_scores_now()
+                        self.store.set(key,patch)
             if new_closed_bar and self.brain.labeled:
                 self.policy.evolve(self.brain.correct/self.brain.labeled,self.brain.labeled,list(self.brain.history))
             if not self.armed or not self.execution_enabled:return
@@ -1828,6 +1876,12 @@ class SingleTradeEngine:
             if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
                 self.store.event('neural','Neuron added after closed-trade learning',
                                  {'neurons':self.brain.core.n,'deal_id':deal_id})
+        # Real adaptation proof: LIVE weights moved → Paaudze + UI reason.
+        if losses:
+            learning_generation.bump(self.store,'closed_trade_weight_update')
+            self.store.set('neural_adapt_reason',
+                f'Closed {direction} £{pnl_value} → LIVE learn×{repeats} mode={mode}')
+            self.brain.model_version=int(getattr(self.brain,'model_version',0) or 0)+1
         self.brain.save()
         self.store.event('learning','Closed-trade P&L self-evaluation updated the neural entry state',
             {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
@@ -1836,14 +1890,24 @@ class SingleTradeEngine:
              'realized_directional_ticks':realized_ticks,'target':label,
              'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
              'last_loss':losses[-1] if losses else None,
-             'tick_size':tick,
+             'tick_size':tick,'weights_updated':bool(losses),
+             'learning_generation':learning_generation.current(self.store),
              'bracket':bracket_learn.load_params(self.store)})
+        # Shadow vs LIVE promote check right after a real weight update.
+        if losses:
+            try:self.policy.shadow_self_dev_tick(self)
+            except Exception as exc:
+                self.store.event('warning','Post-trade shadow self-dev skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
         try:
-            # Milestone evolve only — force=True every close inflated policy
-            # attempts/Paaudze without changing LIVE neural entry.
+            # Policy file research only — NEVER treat as LIVE neural progress.
+            # Do not overwrite neural_adapt_reason with "No relative edge…".
+            before_reason=self.store.get('neural_adapt_reason')
             self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                self.brain.labeled,list(self.brain.history),
                                force=False)
+            if before_reason:
+                self.store.set('neural_adapt_reason',before_reason)
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
@@ -2119,6 +2183,7 @@ class SingleTradeEngine:
                 'code_generation':learning_generation.display(self.store,self.policy.generation),
                 'learning_generation':learning_generation.current(self.store),
                 'policy_generation':self.policy.generation,
+                'neural_adapt_reason':self.store.get('neural_adapt_reason'),
                 'position_age':self.position_age,'last_order_reference':self.last_order_ref,
                 'tick_count':self.tick_count,
                 'policy_decision':decision,
@@ -2204,16 +2269,24 @@ class SingleTradeEngine:
         if z is None or len(np.asarray(z))!=shadow.d:return
         shadow.learn(transition,label,lr=lr)
 
-    def _shadow_scores_now(self):
-        """One forward pass on live last_z for shadow journal (no LIVE order)."""
+    def _shadow_scores_now(self,*,advance=False):
+        """Score with shadow weights on live z; optionally advance shadow h/c.
+
+        advance=True on completed M1 bars so shadow is a real parallel trajectory,
+        not a frozen snapshot of LIVE state.
+        """
         shadow=self._ensure_shadow_brain()
         z=self.brain.core.last_z
         if z is None or len(z)!=shadow.d:return None
         try:
-            # Use shadow's own h/c — step advances shadow state on closed bars only
-            # via learn; here we score without mutating by using _forward snapshot.
-            hn,cn,logits=shadow._forward(
-                np.asarray(z,dtype=float),shadow.h,shadow.c,1.0)
+            z=np.asarray(z,dtype=float)
+            if advance:
+                # Same input evidence as LIVE, independent recurrent state + weights.
+                hn,cn,logits=shadow._forward(z,shadow.h,shadow.c,1.0)
+                shadow.h=hn;shadow.c=cn
+                shadow.steps=int(getattr(shadow,'steps',0) or 0)+1
+            else:
+                hn,cn,logits=shadow._forward(z,shadow.h,shadow.c,1.0)
             prob=shadow._softmax(logits)
             return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
         except Exception:
@@ -2295,7 +2368,7 @@ class SingleTradeEngine:
 
     def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None):
         """Advance independent shadow paper journal from current shadow vote."""
-        scores=self._shadow_scores_now()
+        scores=self._shadow_scores_now(advance=True)
         if not scores or mid is None:return None
         try:
             action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))

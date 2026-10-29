@@ -34,9 +34,10 @@ function renderRobot(view){
   $('scoreBuy').textContent=b+'%';$('scoreHold').textContent=h+'%';$('scoreSell').textContent=s+'%';
   $('barBuy').style.width=b+'%';$('barHold').style.width=h+'%';$('barSell').style.width=s+'%';
   const evo=view.evolution||{};
-  const coef=Number(evo.generation||0)+Math.min(0.99,(Number(evo.labeled_samples||0)/100));
+  const gen=Number(evo.learning_generation??evo.generation??0);
+  const coef=gen+Math.min(0.99,(Number(evo.labeled_samples||0)/100));
   $('evoCoef').textContent=coef.toFixed(2);
-  $('evoGen').textContent=String(evo.generation??0);
+  $('evoGen').textContent=String(gen);
   $('evoSamples').textContent=String(evo.labeled_samples??0);
   $('marketEpic').textContent=view.mandate?.epic||'—';
   $('marketSize').textContent=view.mandate?.size||'—';

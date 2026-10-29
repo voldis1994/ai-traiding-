@@ -22,7 +22,10 @@ from . import bracket_learn
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
-from .market_fusion import FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES
+from .market_fusion import (
+    FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES,
+    fusion_gap_reason,
+)
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
 from .feature_validation import FeatureValidator
@@ -646,6 +649,7 @@ class SingleTradeEngine:
         self.tick_count=0;self.latest_close_id=None
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
+        self.fusion_block_reason=None  # which EXTERNAL source blocks new fused entry
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
         self.last_entry_audit_key=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
@@ -803,6 +807,7 @@ class SingleTradeEngine:
         self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
         self.last_error=None;self.account={};self.last_entry_audit_key=None
         self.latest_fusion_ready=False
+        self.fusion_block_reason=None
         self.last_calendar_refresh=0.;self.calendar_feed_error=None
         self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
@@ -851,6 +856,7 @@ class SingleTradeEngine:
             self.position_age=0;self.market={}
             self.market_context={'ready':False,'reason':'Waiting for a NEW manual trade in the selected market'}
             self.latest_fusion_ready=False
+            self.fusion_block_reason=None
             self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
             self.cancel_peer_refresh()
             self.cancel_calendar_refresh()
@@ -1139,6 +1145,7 @@ class SingleTradeEngine:
                     self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
                     self.market_context={'ready':False,'reason':'Waiting for completed candles on newly adopted market'}
                     self.latest_fusion_ready=False
+                    self.fusion_block_reason=None
                     self.last_calendar_refresh=0.;self.calendar_feed_error=None
                     self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
                     self.market={}
@@ -1322,6 +1329,8 @@ class SingleTradeEngine:
                 else:
                     await self.intermarket.refresh(self.broker,self.mandate['epic'],inst,candles)
             new_closed_bar=False
+            on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                       and getattr(self.brain,'fusion_schema',None) is not None)
             if self.market_context['ready']:
                 self.brain.last_regime=self.market_context['trend']
                 fused=fusion_features(self.market_context,self.intermarket.state,
@@ -1330,14 +1339,25 @@ class SingleTradeEngine:
                     fusion_schema=self.brain.fusion_schema,
                     liquidity_path=self.liquidity_path)
                 self.latest_fusion_ready=fused is not None
-                # Prefer fusion when ready. Transient peer/news gaps must NOT wipe
-                # the last neural vote (that created permanent HOLD / no-signal).
-                # Never invent zero external features — just keep the prior signal.
+                if fused is not None:
+                    self.fusion_block_reason=None
+                else:
+                    # Name the EXTERNAL source that blocks a new fused decision.
+                    self.fusion_block_reason=fusion_gap_reason(
+                        self.market_context,self.intermarket.state,
+                        self.mandate['epic'],self.news_calendar_path,
+                        self.instrument_profile['currencies'],
+                        now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
+                        liquidity_path=self.liquidity_path)
+                # Prefer fusion when ready. After fusion-model transition, a gap
+                # must NOT drive a NEW entry from a stale prior signal. Open
+                # position protection continues below regardless of fusion.
+                # Pre-fusion OHLC models may still tick on local features alone.
                 if fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
                         bar_time=self.market_context['bar_time'],external_features=True)
-                elif self.brain.feature_schema!=self.brain.fusion_schema:
+                elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=self.market_context['features'],
                         bar_time=self.market_context['bar_time'])
@@ -1354,9 +1374,14 @@ class SingleTradeEngine:
                     self.last_decision_bar=self.market_context['bar_time']
                     new_closed_bar=True
                     self._run_self_development_cycle(candles,spread=ask-bid)
+                elif on_fusion and fused is None and not self.positions:
+                    # Flat + fusion gap: stale signal must not authorize entry.
+                    # Keep last_signal for UI audit only when a position is open.
+                    self.last_signal=None
                 self.brain.last_regime=self.market_context['trend']
             else:
                 self.latest_fusion_ready=False
+                self.fusion_block_reason='ohlc: market context not ready'
                 self.last_signal=None  # Never trade stale/incomplete OHLC context.
             # Bind the decision-time neural state (captured in submit) to the deal.
             # Fallback: only if we never captured at entry (e.g. manual adopt).
@@ -1410,23 +1435,34 @@ class SingleTradeEngine:
             elif (len(self.positions)==0 and self.last_signal and
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
-                self.last_entry_processed_bar=self.last_decision_bar
-                # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
-                evaluation=self._entry_evaluation()
-                action=evaluation['action']
-                self.last_policy_decision=action
-                self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
-                self.store.event('entry',
-                    'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
-                    {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
-                     'proposal':evaluation.get('proposal'), 'decision':action,
-                     'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
-                # One entry opportunity per completed M1 bar. The first new
-                # confirmed bar after a broker-verified close can already act.
-                if (action in ('BUY','SELL') and
-                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
-                    snap.get('marketStatus')=='TRADEABLE'):
-                    await self.submit(action,broker_market)
+                # After fusion transition, refuse new entries while EXTERNAL data
+                # is gapped — never act on a stale pre-gap neural vote.
+                on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                           and getattr(self.brain,'fusion_schema',None) is not None)
+                if on_fusion and not self.latest_fusion_ready:
+                    self.last_entry_reason='External fusion gap blocks new entry: '+(
+                        self.fusion_block_reason or 'aligned external neural inputs unavailable')
+                    self.store.event('entry','New entry blocked — fusion data gap',
+                        {'epic':self.mandate['epic'],'bar_time':self.market_context.get('bar_time'),
+                         'block':self.fusion_block_reason,'open_protection':'continues_if_position'})
+                else:
+                    self.last_entry_processed_bar=self.last_decision_bar
+                    # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
+                    evaluation=self._entry_evaluation()
+                    action=evaluation['action']
+                    self.last_policy_decision=action
+                    self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
+                    self.store.event('entry',
+                        'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
+                        {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                         'proposal':evaluation.get('proposal'), 'decision':action,
+                         'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                    # One entry opportunity per completed M1 bar. The first new
+                    # confirmed bar after a broker-verified close can already act.
+                    if (action in ('BUY','SELL') and
+                        self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                        snap.get('marketStatus')=='TRADEABLE'):
+                        await self.submit(action,broker_market)
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -1435,11 +1471,22 @@ class SingleTradeEngine:
         accuracy=self.brain.correct/self.brain.labeled if self.brain.labeled else None
         return self.policy.adaptive_threshold(accuracy,self.brain.labeled,self._spread_bps())
 
+    def _fusion_entry_blocked(self):
+        """True when fusion-schema model lacks fresh EXTERNAL inputs for a new entry."""
+        on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                   and getattr(self.brain,'fusion_schema',None) is not None)
+        return bool(on_fusion and not self.latest_fusion_ready)
+
     def _entry_evaluation(self):
         if not self.market_context.get('ready',False):
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Market context unavailable: '+self.market_context.get('reason','unknown'),
                     'evidence':None}
+        if self._fusion_entry_blocked():
+            return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
+                    'reason':'External fusion gap blocks new entry: '+(
+                        self.fusion_block_reason or 'aligned external neural inputs unavailable'),
+                    'evidence':None,'fusion_gap':True,'fusion_block':self.fusion_block_reason}
         if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Waiting for same-instrument neural signal','evidence':None}
@@ -2011,6 +2058,8 @@ class SingleTradeEngine:
         if action not in ('BUY','SELL') or self.last_closed_step<0:return
         # Never submit when the learned market context is stale/incomplete.
         if not self.market_context.get('ready'):return
+        # After fusion transition: never open on a stale signal during EXTERNAL gap.
+        if self._fusion_entry_blocked():return
         if not self._external_entry_check(action)['entry_allowed']:return
         self.pending_order=True
         try:
@@ -2100,6 +2149,7 @@ class SingleTradeEngine:
                     external_features_learned=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                         and getattr(self.brain,'fusion_schema',None) is not None),
                     external_feed_ready=self.latest_fusion_ready,
+                    fusion_block_reason=self.fusion_block_reason,
                     external_trained_labels=getattr(self.brain,'fusion_labels',0),
                     model_version=getattr(self.brain,'model_version',0),
                     ohlc_dim=getattr(self.brain,'ohlc_dim',None),
@@ -2142,21 +2192,25 @@ class SingleTradeEngine:
                     self.market.get('status')=='TRADEABLE' and self.market_context.get('ready') and
                     self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and
                     self.execution_enabled and not self.store.unresolved() and
+                    not self._fusion_entry_blocked() and
                     self._external_entry_check(evaluation['action'])['entry_allowed'] and
                     self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
                     self.last_decision_bar is not None and
                     self.last_entry_processed_bar!=self.last_decision_bar),
+                'fusion_block_reason':self.fusion_block_reason,
                 'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
                     'Unresolved broker operation' if self.store.unresolved() else
                     'Existing open position' if self.positions else
                     'No adoptive size this session — open a new manual trade' if not self.mandate else
                     'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
                     'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
+                    ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
+                        if self._fusion_entry_blocked() else
                     'Waiting for next completed M1 candle' if self.last_entry_processed_bar==self.last_decision_bar and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    'Waiting for aligned external neural inputs' if (
-                        getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
-                        and getattr(self.brain,'fusion_schema',None) is not None) else
+                    ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
+                        if (getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                            and getattr(self.brain,'fusion_schema',None) is not None) else
                     'Waiting for signal'),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),

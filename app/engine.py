@@ -9,7 +9,10 @@ import json
 import math
 import os
 import re
-import resource
+try:
+    import resource  # Unix-only; absent on Windows
+except ImportError:  # pragma: no cover - Windows
+    resource=None
 import sqlite3
 import time
 from collections import deque
@@ -3148,8 +3151,11 @@ class SingleTradeEngine:
         except (AttributeError,OSError):
             load1=0.
         try:
-            # ru_maxrss is KiB on Linux.
-            rss_mb=float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)/1024.0
+            # ru_maxrss is KiB on Linux; resource module does not exist on Windows.
+            if resource is None:
+                rss_mb=0.
+            else:
+                rss_mb=float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)/1024.0
         except Exception:
             rss_mb=0.
         cpus=os.cpu_count() or 1

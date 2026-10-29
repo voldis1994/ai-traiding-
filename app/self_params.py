@@ -66,6 +66,10 @@ DEFAULTS = {
     'exec_fill_delay_bars': 1,
     # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
     'scratch_pnl_abs': 0.05,
+    # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
+    'trail_min_mult': 2.0,
+    'trail_open_gap_frac': 0.35,
+    'trail_fallback_frac': 0.5,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -103,6 +107,9 @@ BOUNDS = {
     'exec_slip_bps': (0.1, 50.0),
     'exec_fill_delay_bars': (0, 5),
     'scratch_pnl_abs': (0.01, 0.5),
+    'trail_min_mult': (1.0, 4.0),
+    'trail_open_gap_frac': (0.15, 0.7),
+    'trail_fallback_frac': (0.25, 0.8),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -296,9 +303,21 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['exec_slip_bps'])*1.05)
                 p['exec_fill_delay_bars']=min(BOUNDS['exec_fill_delay_bars'][1],
                     int(p['exec_fill_delay_bars'])+1)
-                notes.append('meaningful loss → calm LR; raise exec slip/delay estimate')
+                # Losses → slightly wider post-BE trail gap (fewer early scratches).
+                p['trail_open_gap_frac']=min(BOUNDS['trail_open_gap_frac'][1],
+                    float(p['trail_open_gap_frac'])*1.04)
+                p['trail_min_mult']=min(BOUNDS['trail_min_mult'][1],
+                    float(p['trail_min_mult'])*1.03)
+                p['grow_error_threshold']=max(BOUNDS['grow_error_threshold'][0],
+                    float(p['grow_error_threshold'])*0.98)
+                notes.append('meaningful loss → raise friction/trail; ease grow threshold')
             elif pnl<0:
-                notes.append('scratch loss — no HOLD-repeat ratchet')
+                # Scratch band itself adapts — repeated pennies widen recognition.
+                p['scratch_pnl_abs']=min(BOUNDS['scratch_pnl_abs'][1],
+                    float(p['scratch_pnl_abs'])*1.05)
+                p['trail_open_gap_frac']=min(BOUNDS['trail_open_gap_frac'][1],
+                    float(p['trail_open_gap_frac'])*1.06)
+                notes.append('scratch loss — widen scratch band + trail gap')
             elif pnl>0:
                 p['learn_lr']=max(BOUNDS['learn_lr'][0],float(p['learn_lr'])*0.98)
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
@@ -307,7 +326,11 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 # Wins → slightly less assumed friction (fills were friendly).
                 p['exec_slip_bps']=max(BOUNDS['exec_slip_bps'][0],
                     float(p['exec_slip_bps'])*0.99)
-                notes.append('win → calm LR; slight exec slip ease')
+                p['scratch_pnl_abs']=max(BOUNDS['scratch_pnl_abs'][0],
+                    float(p['scratch_pnl_abs'])*0.99)
+                p['trail_open_gap_frac']=max(BOUNDS['trail_open_gap_frac'][0],
+                    float(p['trail_open_gap_frac'])*0.99)
+                notes.append('win → calm LR; slight ease of friction/scratch/trail')
     return notes
 
 

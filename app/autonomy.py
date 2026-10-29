@@ -1048,7 +1048,9 @@ class AutoEvolution:
             elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
                 self._push_model_snapshot(engine,note='pre_shadow_promote')
-                if brain.core.copy_weights_from(shadow):
+                # Full architecture adopt — never silently drop shadow neurons
+                # when shadow.n != live.n (partial min(n) copy was a fake promote).
+                if brain.core.copy_weights_from(shadow,adopt_architecture=True):
                     brain.model_version=int(getattr(brain,'model_version',0) or 0)+1
                     try:brain.save()
                     except Exception:pass
@@ -1068,9 +1070,11 @@ class AutoEvolution:
                     self.store.event('learning','Shadow neural weights promoted to LIVE',
                         {'model_version':brain.model_version,
                          'shadow_neurons':shadow.n,'live_neurons':brain.core.n,
-                         'weight_checksum':checksum,'learning_generation':bumped})
+                         'weight_checksum':checksum,'learning_generation':bumped,
+                         'architecture_adopted':True})
                     decision=dict(decision,weights_promoted=True,
-                                  weight_checksum=checksum)
+                                  weight_checksum=checksum,
+                                  architecture_adopted=True)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])

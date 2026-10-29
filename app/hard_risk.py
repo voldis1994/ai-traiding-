@@ -3,6 +3,10 @@
 Audit #21: max risk per trade, daily loss limit, equity drawdown limit, and
 trading halt. The model must NOT raise these itself. Only an explicit operator
 save may set or loosen them; neural code may only tighten or leave unchanged.
+
+Critical #2 (revised): monetary limits default to None and are *mandatory to
+configure* — OPEN is blocked until the operator sets all three. Code must never
+invent surrogate floors (5 / 25 / 100) that override the operator's config.
 """
 from __future__ import annotations
 import math
@@ -12,12 +16,11 @@ STORE_KEY = 'operator_hard_risk_v1'
 DAILY_KEY = 'operator_hard_risk_daily_v1'
 PEAK_KEY = 'operator_hard_risk_peak_equity'
 
-# Mandatory positive floors — None is never a valid monetary limit (critical #2).
-# Operator may tighten; neural may only tighten further. Clearing is refused.
+# None = unset. Operator must configure; neural must not invent values.
 DEFAULTS = {
-    'max_risk_per_trade': 5.0,
-    'daily_loss_limit': 25.0,
-    'equity_drawdown_limit': 100.0,
+    'max_risk_per_trade': None,
+    'daily_loss_limit': None,
+    'equity_drawdown_limit': None,
     'trading_halted': False,
     'halt_reason': None,
 }
@@ -47,12 +50,13 @@ def _limit(v):
     return float(n)
 
 
-def _required_limit(v, key):
-    """Positive float only — fall back to mandatory DEFAULTS[key]."""
-    n = _limit(v)
-    if n is not None:
-        return float(n)
-    return float(DEFAULTS[key])
+def configured(limits: dict) -> bool:
+    """True when all three monetary limits are positive operator values."""
+    return all(_limit(limits.get(k)) is not None for k in LIMIT_KEYS)
+
+
+def missing_limits(limits: dict) -> list:
+    return [k for k in LIMIT_KEYS if _limit(limits.get(k)) is None]
 
 
 def load(store) -> dict:
@@ -61,8 +65,7 @@ def load(store) -> dict:
     if isinstance(raw, dict):
         for k in LIMIT_KEYS:
             if k in raw:
-                # Never restore None/0 — mandatory numeric floors always apply.
-                out[k] = _required_limit(raw.get(k), k)
+                out[k] = _limit(raw.get(k))
         out['trading_halted'] = bool(raw.get('trading_halted'))
         reason = raw.get('halt_reason')
         out['halt_reason'] = str(reason) if reason else None
@@ -70,6 +73,11 @@ def load(store) -> dict:
 
 
 def save_operator(store, params: dict, *, reason: str = '') -> dict:
+    """Persist operator-chosen limits. Missing keys keep previous; None/0 clears.
+
+    Clearing a limit is allowed but OPEN then blocks until reconfigured — never
+    silently replaced with invented surrogate numbers.
+    """
     if store is None:
         return dict(DEFAULTS)
     prev = load(store)
@@ -80,11 +88,9 @@ def save_operator(store, params: dict, *, reason: str = '') -> dict:
     }
     for k in LIMIT_KEYS:
         if k in params:
-            parsed = _limit(params.get(k))
-            # Refuse to clear a mandatory limit; keep previous / default floor.
-            clean[k] = float(parsed) if parsed is not None else float(prev[k])
+            clean[k] = _limit(params.get(k))
         else:
-            clean[k] = float(prev[k])
+            clean[k] = _limit(prev.get(k))
     store.set(STORE_KEY, clean)
     if reason:
         store.set('operator_hard_risk_reason', reason)
@@ -96,11 +102,11 @@ def neural_may_not_raise(before: dict, after: dict) -> dict:
     for k in LIMIT_KEYS:
         prev = _limit(before.get(k))
         nxt = _limit(after.get(k))
-        # Mandatory floors: missing before → DEFAULTS, never invent looser via neural.
+        # Neural cannot invent a limit the operator never set.
         if prev is None:
-            out[k] = float(DEFAULTS[k])
+            out[k] = None
         elif nxt is None:
-            out[k] = float(prev)
+            out[k] = prev
         else:
             out[k] = float(min(prev, nxt))
     if before.get('trading_halted'):
@@ -204,6 +210,16 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
             'reason': 'trading halted: ' + (limits.get('halt_reason') or 'operator halt'),
             'limits': limits,
         }
+    # Critical #2: do not invent surrogate floors — block until operator configures.
+    missing = missing_limits(limits)
+    if missing:
+        return {
+            'allowed': False,
+            'reason': ('OPEN blocked: operator hard risk limits not configured '
+                       f"({', '.join(missing)})"),
+            'limits': limits,
+            'missing_limits': missing,
+        }
     daily = _daily_state(store, now=now)
     daily_cap = limits.get('daily_loss_limit')
     if daily_cap is not None and daily['realized_pnl'] <= -abs(float(daily_cap)):
@@ -224,13 +240,12 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
                 'reason': 'trading halted: ' + (limits.get('halt_reason') or 'drawdown'),
                 'limits': limits,
             }
-    # Critical #2: max risk per trade is always mandatory (never skip when unset).
-    max_risk = _required_limit(limits.get('max_risk_per_trade'), 'max_risk_per_trade')
+    max_risk = float(limits['max_risk_per_trade'])
     risk = _finite(proposed_risk)
     if risk is None:
         return {
             'allowed': False,
-            'reason': ('OPEN blocked: max risk per trade is mandatory but cash risk '
+            'reason': ('OPEN blocked: max risk per trade is set but cash risk '
                        'could not be computed (missing tick value)'),
             'limits': limits,
         }
@@ -247,9 +262,13 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
 
 
 def snapshot(store) -> dict:
+    limits = load(store)
     return {
-        'limits': load(store),
+        'limits': limits,
+        'configured': configured(limits),
+        'missing_limits': missing_limits(limits),
         'daily': _daily_state(store),
         'peak_equity': _finite(store.get(PEAK_KEY)) if store is not None else None,
-        'note': 'Hard limits are operator/config-owned; neural cannot raise them.',
+        'note': ('Hard limits are operator/config-owned; neural cannot raise them. '
+                 'OPEN blocks until all three monetary limits are set.'),
     }

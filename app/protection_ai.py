@@ -45,7 +45,12 @@ def _away_from_market(level,direction,bid,ask,minimum,tick):
 
 
 def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prior_extreme=None):
-    """Best favorable price from live quotes + OHLC since open — nothing invented."""
+    """Best favorable *exit-side* price from live quotes + OHLC since open.
+
+    Stored M1 high/low are midprices. Convert with per-bar spread when present
+    so BUY tip ≈ bid extreme and SELL tip ≈ ask extreme — mid highs alone
+    inflate the tip and glue SL too tight (early stop-outs vs the chart).
+    """
     if direction=='BUY':
         tip=_finite(bid)
         if tip is None:return None
@@ -54,7 +59,11 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
             t=candle_time(row.get('at'))
             if opened_at and t and t<opened_at:continue
             h=_finite(row.get('high'))
-            if h is not None:tip=max(tip,h)
+            if h is None:continue
+            sp=_finite(row.get('spread'))
+            # mid high → approximate bid high for BUY exit path
+            if sp is not None and sp>=0:h=h-0.5*sp
+            tip=max(tip,h)
         return tip
     if direction=='SELL':
         tip=_finite(ask)
@@ -64,22 +73,29 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
             t=candle_time(row.get('at'))
             if opened_at and t and t<opened_at:continue
             low=_finite(row.get('low'))
-            if low is not None:tip=min(tip,low)
+            if low is None:continue
+            sp=_finite(row.get('spread'))
+            # mid low → approximate ask low for SELL exit path
+            if sp is not None and sp>=0:low=low+0.5*sp
+            tip=min(tip,low)
         return tip
     return None
 
 
 def _post_be_trail_gap(open_gap,minimum,zone_range=None):
-    """After BE, gap from recent OHLC noise — not a magic fraction of R.
+    """After BE, follow distance from OHLC noise — never tip±minStop alone.
 
-    Uses median M1 high−low when provided; never wider than the opening risk;
-    never tighter than broker minStop.
+    Floor is at least 2× broker min (or 35% of opening risk when that is wider),
+    so SL cannot glue to the tip and fire on mid/noise while the chart still
+    looks short of the mark. Cap at opening risk; prefer zone median when ready.
     """
     open_gap=float(open_gap);minimum=float(minimum)
+    floor=max(minimum,min(open_gap,max(2.0*minimum,0.35*open_gap)))
     zr=_finite(zone_range)
     if zr is not None and zr>0:
-        return max(minimum,min(open_gap,zr))
-    return max(minimum,min(open_gap,minimum))  # only broker floor until OHLC ready
+        return max(floor,min(open_gap,zr))
+    # No OHLC zone yet — half opening risk, never only minStop.
+    return max(floor,min(open_gap,0.5*open_gap))
 
 
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
@@ -87,9 +103,12 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     """Trail SL behind broker extreme — past break-even, not stuck at BE.
 
     Before BE: gap = full opening risk (avoids tip±min £0 scratches; first
-    ratchet ≈ BE+). After BE: gap = recent M1 median range (OHLC zone), clamped
-    to [broker min, opening risk] — the robot measures the follow distance from
-    live candles, not a hardcoded 35% of R.
+    ratchet ≈ BE+). After BE: gap = recent M1 median range (OHLC zone), with a
+    floor above raw minStop so SL does not fire “early” vs the chart.
+
+    CRITICAL: always re-send live profitLevel on trail PUTs. Omitting TP on
+    Capital update_position turns Take Profit Off — price can touch the old
+    TP mark twice with no order left to fill.
 
     BUY:  stop = peak − gap.  SELL: stop = trough + gap.
     """
@@ -98,8 +117,8 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if sign is None:return None
     entry=_finite(position.get('level'))
     stop=_finite(position.get('stopLevel'))
-    # TP is optional: Capital may show Take Profit Off after a trail PUT that
-    # only updates stopLevel. Trail must still ratchet SL without TP.
+    # Preserve live TP when present. Trail still works if Capital already
+    # shows Take Profit Off (tp is None) — but we never *clear* a live TP.
     tp=_finite(position.get('profitLevel'))
     tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
     minimum=_finite(market.get('min_distance'))
@@ -153,14 +172,14 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         if new_stop>=stop or new_stop<=tip:return None
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None
-    return {'stop_level':new_stop,'profit_level':None,
+    return {'stop_level':new_stop,'profit_level':tp,
             'reason':('trail past BE (OHLC zone gap)' if be_locked
                       else 'broker extreme ± opening stop distance (≥ minStop)'),
             'extreme':tip,'trail_gap':trail_gap,'open_gap':open_gap,
             'zone_range':_finite(zone_range if zone_range is not None else initial.get('zone_range')),
             'be_locked':be_locked,'min_distance':minimum,'tick':tick,
             'observed_profit_distance':round(favorable,5),
-            'bar_time':mark_time}
+            'bar_time':mark_time,'preserve_tp':tp is not None}
 
 
 # --- Offline research helper (not used on the live trail path) -----------------

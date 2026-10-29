@@ -1873,10 +1873,14 @@ class SingleTradeEngine:
         wait=15.0 if runtime.get('status')=='REJECTED' else 3.0
         last_mono=runtime.get('mono')
         if last_mono is not None and (now_mono-float(last_mono))<wait:return
-        stop=proposal['stop_level'];tp=proposal.get('profit_level')
+        stop=proposal['stop_level']
+        # Always re-send live TP on trail. Omitting profitLevel on Capital PUT
+        # turns Take Profit Off — TP mark can be touched with no fill left.
+        tp=proposal.get('profit_level')
+        if tp is None:tp=_num(p.get('profitLevel'))
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
             'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
-            'min_distance':self.market.get('min_distance')})
+            'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=tp)
             if await self._confirm_reconcile(receipt,oid,'PROTECT',p['dealId']):
@@ -1885,7 +1889,7 @@ class SingleTradeEngine:
                     'mark':mark})
                 self.protection_brief['status']='Broker-confirmed trail update'
                 self.store.event('protection','Trail SL verified by broker',{
-                    'deal_id':p['dealId'],'new_stop':stop,'extreme':extreme,
+                    'deal_id':p['dealId'],'new_stop':stop,'profit_level':tp,'extreme':extreme,
                     'min_distance':self.market.get('min_distance'),'tick':self.market.get('tick')})
             else:
                 self.protection_brief['status']='Broker rejected trail; old levels retained'

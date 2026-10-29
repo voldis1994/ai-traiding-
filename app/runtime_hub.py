@@ -35,6 +35,23 @@ class AccountRuntime:
         snap=self.engine.snapshot()
         signal=snap.get('signal') or {}
         scores=signal.get('scores') or {}
+        # After restart last_signal is empty until the first completed M1+fusion
+        # vote — surface the latest journaled scores so admin is not stuck at 0%.
+        if not signal.get('action') and not any(scores.values()):
+            try:
+                rows=self.store.signals(1)
+                if rows:
+                    raw=rows[0].get('scores')
+                    if isinstance(raw,str):
+                        import json as _json
+                        raw=_json.loads(raw)
+                    if isinstance(raw,dict) and any(raw.values()):
+                        scores=raw
+                        signal={**signal,'action':rows[0].get('action'),
+                                'confidence':max((float(v) for v in raw.values() if v is not None),default=None),
+                                'from_journal':True}
+            except Exception:
+                pass
         neural=snap.get('neural') or {}
         mandate=snap.get('mandate')
         positions=snap.get('positions') or []
@@ -58,6 +75,7 @@ class AccountRuntime:
             'confidence':signal.get('confidence'),
             'model_score':signal.get('model_score',signal.get('confidence')),
             'model_score_is_calibrated_profit_probability':False,
+            'signal_from_journal':bool(signal.get('from_journal')),
             'evolution':{
                 # Paaudze = LIVE neural advances only (learning_generation).
                 'generation':int(snap.get('learning_generation') or snap.get('code_generation') or 0),

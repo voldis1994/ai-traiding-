@@ -1777,6 +1777,25 @@ class SingleTradeEngine:
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                     fusion_schema=self.brain.fusion_schema,
                     liquidity_path=self.liquidity_path)
+                # After restart with an open position, peers/calendar/liquidity stay
+                # background-only — fusion never becomes ready and admin shows BUY/
+                # HOLD/SELL 0% forever. One blocking warm-up restores the first vote.
+                if (fused is None and self.last_signal is None
+                        and self.brain.feature_schema==self.brain.fusion_schema):
+                    try:
+                        await self._refresh_calendar_if_due()
+                        await self._refresh_liquidity_if_due()
+                        await self.intermarket.refresh(
+                            self.broker,self.mandate['epic'],inst,candles)
+                    except Exception as exc:
+                        self.store.event('warning','Fusion warm-up refresh failed',
+                            {'type':type(exc).__name__,'epic':self.mandate['epic']})
+                    fused=fusion_features(self.market_context,self.intermarket.state,
+                        self.mandate['epic'],self.news_calendar_path,
+                        self.instrument_profile['currencies'],
+                        now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
+                        fusion_schema=self.brain.fusion_schema,
+                        liquidity_path=self.liquidity_path)
                 self.latest_fusion_ready=fused is not None
                 if fused is not None:
                     self.fusion_block_reason=None
@@ -3131,12 +3150,21 @@ class SingleTradeEngine:
                 self.store.event('error','Entry outcome uncertain; no automatic retry',{'type':type(exc).__name__})
         finally:self.pending_order=False
     def _existing_open_block_reason(self):
-        """Name the live deal + UPL so Admin is not a vague 'Existing open' freeze."""
+        """Name the live deal + UPL; explain 0% scores while waiting for first vote."""
         if not self.positions:return 'Existing open position'
         p=self.positions[0]
         deal=p.get('dealId')
         upl=_num(p.get('upl'))
-        bits=['Existing open position']
+        if self.last_signal is None:
+            fusion_cold=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                         and getattr(self.brain,'fusion_schema',None) is not None
+                         and not self.latest_fusion_ready)
+            head=('Existing open position · waiting for neural fusion vote'
+                  if fusion_cold else
+                  'Existing open position · waiting for first M1 neural vote')
+        else:
+            head='Existing open position'
+        bits=[head]
         if deal is not None:bits.append('deal '+str(deal))
         if upl is not None and math.isfinite(upl):
             bits.append('UPL {0:.2f}'.format(float(upl)))
@@ -3275,6 +3303,9 @@ class SingleTradeEngine:
                      if self.last_entry_processed_bar==self.last_decision_bar
                      and self.last_decision_bar is not None else
                     self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
+                    'Waiting for aligned external neural inputs' if (
+                        getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                        and getattr(self.brain,'fusion_schema',None) is not None) else
                     'Waiting for signal')),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),

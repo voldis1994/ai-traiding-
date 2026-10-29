@@ -2005,46 +2005,6 @@ class SingleTradeEngine:
             'adverse_path':adverse,'volatility':vol,'costs':costs,
         }
 
-    def _counterfactual_context(self,deal_id,saved,*,epic=None,entry=None,
-                                exit_level=None,tick=None,spread=0.):
-        """Bars + SL/TP distances for path counterfactual (audit #15)."""
-        saved=saved or {}
-        epic=epic or saved.get('epic') or (self.mandate or {}).get('epic')
-        stop_distance=_num(saved.get('stop_distance'))
-        profit_distance=_num(saved.get('profit_distance'))
-        meta=self.store.get('adaptive_protection:'+str(deal_id)) or {}
-        if stop_distance is None:
-            stop_distance=_num(meta.get('original_risk'))
-        tick_v=_num(tick) or _num(saved.get('tick_size')) or _num(self.market.get('tick'))
-        min_d=_num(self.market.get('min_distance'))
-        bars=[]
-        if epic:
-            # Chronological M1 bars at/after entry for path replay.
-            candles=self.store.candles(epic,n=120,historical_only=True) or []
-            entry_n=_num(entry) or _num(saved.get('entry'))
-            for row in candles:
-                try:
-                    mid=_num(row.get('close') or row.get('mid'))
-                    high=_num(row.get('high'));low=_num(row.get('low'))
-                    if mid is None:continue
-                    bars.append({'mid':mid,'high':high or mid,'low':low or mid,
-                                 'spread':_num(row.get('spread')) or spread})
-                except Exception:
-                    continue
-            # Prefer bars from near entry price if we can locate it.
-            if entry_n is not None and bars:
-                best_i=min(range(len(bars)),
-                           key=lambda i:abs(bars[i]['mid']-entry_n))
-                bars=bars[best_i:]
-        return {
-            'bars':bars or None,
-            'stop_distance':stop_distance,
-            'profit_distance':profit_distance,
-            'tick':tick_v,
-            'min_distance':min_d,
-            'trail':True,
-        }
-
     def _hard_risk_gate(self,*,proposed_risk=None):
         """Operator hard limits before OPEN — neural cannot raise these (audit #20/#21)."""
         equity=self._account_equity()

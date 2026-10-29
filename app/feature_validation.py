@@ -1,7 +1,9 @@
 """Walk-Forward / Out-of-Sample validation for discovered features.
 
-Uses per-bar spreads and cumulative net price PnL (after round-trip cost) —
-not a single live spread pasted onto history, and not mere up/down coincidence.
+Uses per-bar spreads and cumulative net price PnL after **one** round-trip
+cost via ``trade_costs.fill_to_fill_pnl`` (half-spread in + half-spread out;
+never |sp_i|+|sp_j| as two full widths). Not a single live spread pasted onto
+history, and not mere up/down coincidence.
 
 Approval is independent of LIVE trading — engine only expands dim after approve.
 """
@@ -47,7 +49,8 @@ def _corr(a,b):
 
 
 def _trade_net(closes, spreads, i, direction, horizon):
-    """Net price PnL for one round-trip after entry+exit spread costs."""
+    """Net price PnL for one round-trip after shared RT cost (no double spread)."""
+    from .trade_costs import fill_to_fill_pnl
     j=i+horizon
     if j>=len(closes):return None
     sp_i=spreads[i];sp_j=spreads[j]
@@ -58,10 +61,9 @@ def _trade_net(closes, spreads, i, direction, horizon):
         return None
     if not (math.isfinite(sp_i) and math.isfinite(sp_j)) or sp_i<0 or sp_j<0:
         return None
-    sign=1 if direction>0 else -1
-    move=sign*(float(closes[j])-float(closes[i]))
-    cost=abs(sp_i)+abs(sp_j)
-    return move-cost
+    side='BUY' if direction>0 else 'SELL'
+    return fill_to_fill_pnl(side,float(closes[i]),float(closes[j]),
+                            spread_entry=sp_i,spread_exit=sp_j)
 
 
 def net_pnl_curve(feature_values, closes, spreads, *, start, end, horizon=8):

@@ -338,29 +338,79 @@ class AutoEvolution:
         if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
         return 'CLOSE'
 
-    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None):
-        """LIVE entry = neural argmax only — no zone/SHIFT/trend hard vetoes.
+    def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
+                              history=None,readiness=None,spread_bps=0.0):
+        """LIVE direction = neural argmax; readiness + economic utility are separate.
 
-        OHLC returns/trend/regime are logged as evidence for learning/audit, never
-        as hardcoded gates. Broker news / mandate / TRADEABLE stay in the engine.
+        Argmax chooses BUY/SELL/HOLD — zone/SHIFT/trend are evidence only, never
+        entry bans. A small BUY/SELL score edge is NOT proven trading advantage:
+        when ``readiness`` / ``history`` are supplied, LIVE OPEN also requires
+        prep/eval readiness and cost-adjusted economic utility (audit #22–#23).
+        Broker news / mandate / TRADEABLE stay in the engine.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
-                    'reason':'Invalid neural scores; no entry','evidence':None,'calibration':None}
+                    'reason':'Invalid neural scores; no entry','evidence':None,
+                    'calibration':None,'score_edge':None,'readiness':readiness,
+                    'economic_utility':None}
         buy=float(scores['BUY']);sell=float(scores['SELL']);hold=float(scores['HOLD'])
         direction='BUY' if buy>=sell else 'SELL'
         strength=buy if direction=='BUY' else sell
+        score_edge=self.score_edge(scores)
         evidence={'returns_bps':returns_bps,'trend':trend,'regime':regime,
-                  'scores':{'BUY':buy,'SELL':sell,'HOLD':hold}}
+                  'scores':{'BUY':buy,'SELL':sell,'HOLD':hold},
+                  'score_edge':score_edge,
+                  'score_edge_is_not_trading_advantage':True}
+        base={'proposal':direction,'threshold':None,'calibration':None,
+              'score_edge':score_edge,'readiness':readiness,'economic_utility':None,
+              'evidence':evidence}
         if hold>strength:
-            return {'action':'HOLD','proposal':direction,'threshold':None,
+            return {**base,'action':'HOLD',
                     'reason':(f'Neural HOLD dominates {direction} '
-                              f'({hold:.1%} > {strength:.1%})'),
-                    'evidence':evidence,'calibration':None}
-        return {'action':direction,'proposal':direction,'threshold':None,
+                              f'({hold:.1%} > {strength:.1%})')}
+        # --- Separate gate: model prep/eval readiness (audit #22) ---
+        if isinstance(readiness,dict) and readiness.get('ready') is False:
+            return {**base,'action':'HOLD',
+                    'reason':'Model prep/eval not ready for LIVE OPEN: '+(
+                        readiness.get('reason') or 'readiness gate')}
+        # --- Separate gate: economic utility after costs (audit #23) ---
+        # Argmax keeps the proposal; failure downgrades to HOLD (never flips side).
+        # A small score_edge alone is never treated as proven trading advantage.
+        economic=None
+        labeled=0
+        if history is not None:
+            labeled=sum(1 for r in history if r.get('label') in (0,1,2))
+        if history is not None and labeled>=64:
+            edge_floor=max(0.01,min(0.05,float(score_edge) if score_edge is not None else 0.01))
+            economic=self.directional_evidence(
+                direction,history,edge_floor,forward_holdout=True)
+            base['economic_utility']=economic
+            evidence['economic_utility']=economic
+            if not economic.get('allowed'):
+                return {**base,'action':'HOLD',
+                        'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
+                                  +str(economic.get('reason') or 'utility gate'))}
+        elif isinstance(readiness,dict) and readiness.get('ready'):
+            # Prep/eval holdout already measured cost-adjusted proxy — use that,
+            # still refusing to treat softmax edge as calibrated profit odds.
+            economic={
+                'allowed':True,'source':'prep_eval_holdout',
+                'samples':readiness.get('eval_samples'),
+                'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
+                'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
+                'reason':'Prep/eval holdout stands in for economic utility; '
+                         'score edge is not calibrated profit probability',
+            }
+            base['economic_utility']=economic
+            evidence['economic_utility']=economic
+        elif history is not None:
+            return {**base,'action':'HOLD',
+                    'reason':('Argmax '+direction+' blocked: need prep/eval readiness or '
+                              'cost-adjusted utility evidence (score edge is not enough)')}
+        return {**base,'action':direction,
                 'reason':(f'Neural argmax {direction} '
-                          f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%})'),
-                'evidence':evidence,'calibration':None}
+                          f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%}); '
+                          f'score edge {score_edge:.1%} is not calibrated profit probability')}
 
     @staticmethod
     def _minute_time(value):
@@ -381,7 +431,9 @@ class AutoEvolution:
 
         Use only already matured labels, and verify each minute exists. This
         prevents interpolating across market closures or missing data bars.
+        Costs via shared ``trade_costs.net_forward_bps`` (one RT spread in bps).
         """
+        from .trade_costs import net_forward_bps
         horizon=8
         if i+horizon>=len(rows) or rows[i].get('label') not in (0,1,2):
             return None
@@ -398,8 +450,8 @@ class AutoEvolution:
                 if current is None or abs(current-previous-60.)>.5:
                     return None
                 previous=current
-            signed=(1. if action=='BUY' else -1.)*(end-start)*10000./start
-            return signed-.5*(spread0+spread8)
+            return net_forward_bps(action,start,end,
+                                   spread_bps_entry=spread0,spread_bps_exit=spread8)
         except (KeyError,TypeError,ValueError,ZeroDivisionError):
             return None
 
@@ -745,6 +797,89 @@ class AutoEvolution:
             if arr is None:continue
             h.update(np.ascontiguousarray(arr,dtype=np.float64).tobytes())
         return h.hexdigest()[:40]
+
+    # --- Audit #18: controlled weight-update safety helpers -------------------
+
+    @staticmethod
+    def snapshot_core_weights(core):
+        """Prior-state snapshot before a batch/online weight update."""
+        if core is None:return None
+        if hasattr(core,'snapshot_weights'):
+            return core.snapshot_weights()
+        from .core import WEIGHT_PARAM_NAMES
+        return {n:np.asarray(getattr(core,n),dtype=float).copy()
+                for n in WEIGHT_PARAM_NAMES if hasattr(core,n)}
+
+    @staticmethod
+    def restore_core_weights(core, snap):
+        """Restore prior weights when post-update criterion worsens."""
+        if core is None or snap is None:return False
+        if hasattr(core,'restore_weights'):
+            return bool(core.restore_weights(snap))
+        from .core import WEIGHT_PARAM_NAMES
+        for n in WEIGHT_PARAM_NAMES:
+            if n not in snap:return False
+            setattr(core,n,np.asarray(snap[n],dtype=float).copy())
+        return True
+
+    @staticmethod
+    def weight_update_delta_norm(before, after):
+        from .core import NeuralCore
+        return NeuralCore.weight_delta_norm(before,after)
+
+    @staticmethod
+    def controlled_weight_learn(core, transition, label, *, lr=None,
+                                objective=None, max_delta_norm=None,
+                                restore_if_worsens=True, criterion_fn=None):
+        """Snapshot → bounded learn → optional criterion restore (audit #18).
+
+        Ordinary learn is never reported as proven_improvement. If
+        `criterion_fn(core) -> float` is supplied (higher=better) and the
+        post-update value is worse than pre-update, weights restore.
+        """
+        if core is None or not hasattr(core,'learn'):
+            return {'applied':False,'proven_improvement':False,'reason':'no_core'}
+        prior=AutoEvolution.snapshot_core_weights(core)
+        pre_crit=None
+        if criterion_fn is not None:
+            try:pre_crit=float(criterion_fn(core))
+            except Exception:pre_crit=None
+        loss=core.learn(transition,label,lr=lr,objective=objective,
+                        max_delta_norm=max_delta_norm,
+                        restore_if_worsens=restore_if_worsens)
+        meta=dict(getattr(core,'last_learn_meta',None) or {})
+        restored=bool(meta.get('restored'))
+        if (criterion_fn is not None and pre_crit is not None and not restored
+                and prior is not None):
+            try:post_crit=float(criterion_fn(core))
+            except Exception:post_crit=None
+            if post_crit is not None and post_crit<pre_crit:
+                AutoEvolution.restore_core_weights(core,prior)
+                restored=True
+                meta['restored']=True
+                meta['restore_reason']='external_criterion_worsened'
+                meta['criterion_before']=pre_crit
+                meta['criterion_after']=post_crit
+                if hasattr(core,'last_learn_meta'):
+                    core.last_learn_meta=meta
+        meta['proven_improvement']=False
+        if hasattr(core,'last_learn_meta'):
+            core.last_learn_meta=meta
+        after=AutoEvolution.snapshot_core_weights(core)
+        return {
+            'applied':loss is not None and not restored,
+            'loss':loss,
+            'restored':restored,
+            'clipped':bool(meta.get('clipped')),
+            'delta_norm':meta.get('delta_norm'),
+            'objective':meta.get('objective'),
+            'objective_weight':meta.get('objective_weight'),
+            'proven_improvement':False,
+            'meta':meta,
+            'weights_changed':(
+                prior is not None and after is not None and
+                AutoEvolution.weight_update_delta_norm(prior,after)>1e-15),
+        }
 
     def _promote_evidence_boundary(self, live_hist, shadow_rows):
         """Trade counts used as the evaluation frontier for anti-repeat promote."""

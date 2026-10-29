@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from .trade_costs import fill_price as _shared_fill_price, half_spread
+
 STORE_KEY = 'shadow_paper_journal_v1'
 STATE_KEY = 'shadow_paper_state_v1'
 _SEED_MAX_ROWS = 400
@@ -35,13 +37,8 @@ def _finite(x):
 
 
 def _fill_price(direction, mid, spread, *, slip_bps=0.):
-    """Conservative fill: BUY pays ask, SELL hits bid (+ adverse slip_bps)."""
-    half=abs(float(spread or 0))/2.
-    mid=float(mid)
-    slip=abs(float(slip_bps or 0))/10000.*mid
-    if direction=='BUY':
-        return mid+half+slip
-    return mid-half-slip
+    """Conservative fill via shared trade_costs (BUY ask / SELL bid + slip)."""
+    return float(_shared_fill_price(direction,mid,spread,slip_bps=slip_bps))
 
 
 def _close_price_pnl(direction, entry, exit_px):
@@ -70,6 +67,101 @@ def cash_per_price_unit(live_rows, *, min_samples=5):
     return float(np.median(ratios))
 
 
+def _bar_mid_hl(bar, *, default_spread=0.):
+    """Normalize a path bar dict/tuple to (mid, high, low, spread)."""
+    if isinstance(bar,(list,tuple)):
+        if len(bar)>=4:
+            o,h,l,c=bar[0],bar[1],bar[2],bar[3]
+            sp=bar[4] if len(bar)>4 else default_spread
+            mid=_finite(c) if _finite(c) is not None else _finite(o)
+            return mid,_finite(h),_finite(l),_finite(sp) or 0.
+        if len(bar)==3:
+            mid,h,l=bar
+            return _finite(mid),_finite(h),_finite(l),float(default_spread or 0)
+    mid=_finite(bar.get('mid') if isinstance(bar,dict) else None)
+    if mid is None and isinstance(bar,dict):
+        mid=_finite(bar.get('close'))
+    if mid is None and isinstance(bar,dict):
+        mid=_finite(bar.get('price'))
+    high=_finite(bar.get('high')) if isinstance(bar,dict) else None
+    low=_finite(bar.get('low')) if isinstance(bar,dict) else None
+    sp=_finite(bar.get('spread')) if isinstance(bar,dict) else None
+    if sp is None:sp=float(default_spread or 0)
+    if high is None:high=mid
+    if low is None:low=mid
+    return mid,high,low,float(sp)
+
+
+def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
+                            profit_distance=None, tick=None, min_distance=None,
+                            slip_bps=0., trail=True):
+    """Replay BUY/SELL/HOLD on a full OHLC path with LIVE SL/TP/trail/costs.
+
+    Same execution rules as ShadowPaperJournal / LIVE: adverse fills, SL before
+    TP on the same bar, optional trail, never flip-exit on opposite signal.
+    HOLD → pnl 0. Price-unit pnl from fill-to-fill (spread embedded once).
+
+    bars: chronological mids after (and including) entry — dicts with
+    mid|close, high, low, optional per-bar spread; or OHLC tuples.
+    """
+    if action=='HOLD':
+        return {'pnl':0.,'reason':'hold','entry':None,'exit':None,'bars_held':0,
+                'path':True}
+    if action not in ('BUY','SELL') or not bars:
+        return None
+    slip=float(slip_bps or 0)
+    mid0,hi0,lo0,sp0=_bar_mid_hl(bars[0],default_spread=spread)
+    if mid0 is None or mid0<=0:return None
+    sp=float(spread if spread is not None else sp0) or float(sp0 or 0)
+    entry=_fill_price(action,mid0,sp,slip_bps=slip)
+    tick_v=_finite(tick)
+    if tick_v is None or tick_v<=0:
+        tick_v=max(half_spread(sp),1e-4)
+    min_d=_finite(min_distance)
+    if min_d is None or min_d<0:min_d=tick_v
+    sd=_finite(stop_distance)
+    pd=_finite(profit_distance)
+    if sd is None or sd<=0:
+        sd=max(2*tick_v,2*abs(sp))
+    if pd is None or pd<=0:
+        pd=sd
+    sign=1 if action=='BUY' else -1
+    stop=entry-sign*float(sd)
+    profit=entry+sign*float(pd)
+    original_risk=float(sd)
+    trailed=False
+    for i,bar in enumerate(bars):
+        mid,hi,lo,sp_i=_bar_mid_hl(bar,default_spread=sp)
+        if mid is None:continue
+        if hi is None:hi=mid
+        if lo is None:lo=mid
+        hi=max(hi,mid);lo=min(lo,mid)
+        sp_bar=float(sp_i if sp_i is not None else sp)
+        if trail:
+            new_stop=paper_trail_stop(
+                action,entry,stop,profit,high=hi,low=lo,mid=mid,spread=sp_bar,
+                original_risk=original_risk,tick=tick_v,min_distance=min_d)
+            if new_stop is not None:
+                stop=float(new_stop);trailed=True
+        hit=hit_sl_tp(action,high=hi,low=lo,stop=stop,profit=profit,
+                      mid=mid,spread=sp_bar,slip_bps=slip)
+        if hit is not None:
+            exit_px,reason=hit
+            if reason=='sl' and trailed:reason='trail'
+            pnl=_close_price_pnl(action,entry,exit_px)
+            return {'pnl':float(pnl),'reason':reason,'entry':float(entry),
+                    'exit':float(exit_px),'bars_held':i+1,'path':True,
+                    'stop':float(stop),'profit':float(profit)}
+    mid_l,_,_,sp_l=_bar_mid_hl(bars[-1],default_spread=sp)
+    if mid_l is None:return None
+    close_dir='SELL' if action=='BUY' else 'BUY'
+    exit_px=_fill_price(close_dir,mid_l,sp_l if sp_l is not None else sp,slip_bps=slip)
+    pnl=_close_price_pnl(action,entry,exit_px)
+    return {'pnl':float(pnl),'reason':'path_end','entry':float(entry),
+            'exit':float(exit_px),'bars_held':len(bars),'path':True,
+            'stop':float(stop),'profit':float(profit)}
+
+
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
                      original_risk, tick, min_distance):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
@@ -87,7 +179,7 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     if minimum is None or minimum<0:minimum=tick
     if gap is None or gap<=0:gap=max(minimum,abs(entry-stop))
     open_gap=max(float(gap),float(minimum))
-    half=abs(sp)/2.
+    half=half_spread(sp)
     bid=mid-half;ask=mid+half
     sign=1 if direction=='BUY' else -1
     tip=high if direction=='BUY' else low
@@ -125,7 +217,7 @@ def hit_sl_tp(direction, *, high, low, stop, profit, mid, spread, slip_bps=0.):
     high=_finite(high);low=_finite(low)
     stop=_finite(stop);profit=_finite(profit)
     if high is None or low is None:return None
-    half=abs(float(spread or 0))/2.
+    half=half_spread(spread)
     if direction=='BUY':
         if stop is not None and low-half<=stop:
             return float(stop),'sl'

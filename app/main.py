@@ -222,7 +222,13 @@ def _set_session_cookie(response:JSONResponse,name:str,value:str):
 
 # ---------- pages (stable public paths) ----------
 @app.get('/')
-async def portal_home():return FileResponse(WEB/'portal.html')
+async def portal_home():
+    # Local Windows operator UX: open Admin directly on 127.0.0.1.
+    return RedirectResponse('/admin', status_code=302)
+
+@app.get('/portal')
+async def portal_chooser():
+    return FileResponse(WEB/'portal.html')
 
 @app.get('/console')
 async def operator_console():
@@ -361,7 +367,8 @@ async def logout(_:bool=Depends(require_auth)):
 @app.get('/api/health')
 async def health():
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
-            'portals':{'home':'/','operator':'/admin','admin':'/admin','client':'/app'},
+            'portals':{'home':'/admin','operator':'/admin','admin':'/admin','client':'/app',
+                       'portal':'/portal'},
             'public_url':public_base_url(),
             'secure_cookies':cookie_secure(),
             'clients':len(platform.list_clients()),

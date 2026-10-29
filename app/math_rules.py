@@ -89,12 +89,77 @@ def ohlc_range_distance(candles, n=None):
     return _median_decimal(ranges)
 
 
+def _min_ticks(minimum, tick):
+    """Ceiling of broker min distance onto the price grid (0 when min is 0)."""
+    if minimum <= 0 or tick <= 0:
+        return 0
+    n = int((minimum / tick).to_integral_value(rounding=ROUND_CEILING))
+    return n if n >= 1 else 1
+
+
+def distances_meet_broker_min(stop_distance, profit_distance, min_distance, eps=None):
+    """True iff both SL and TP distances meet broker min after all rounding.
+
+    Audit #9: never send an order with non-compliant SL or TP. When min_distance
+    is 0/None, any positive finite distances are accepted.
+    """
+    try:
+        sd = D(stop_distance); pd = D(profit_distance)
+        mn = D(0 if min_distance is None else min_distance)
+    except Exception:
+        return False
+    if sd <= 0 or pd <= 0 or mn < 0:
+        return False
+    if mn == 0:
+        return True
+    tol = D(str(eps)) if eps is not None else D('0')
+    return sd + tol >= mn and pd + tol >= mn
+
+
+def levels_meet_broker_min(direction, stop_level, profit_level, bid, ask, min_distance, eps=None):
+    """True iff protect PUT levels stay ≥ broker min from live bid/ask.
+
+    Missing profit_level is allowed (Take Profit Off); stop_level is required.
+    """
+    if direction not in ('BUY', 'SELL'):
+        return False
+    try:
+        mn = D(0 if min_distance is None else min_distance)
+        b = D(bid); a = D(ask); stop = D(stop_level)
+    except Exception:
+        return False
+    if stop <= 0 or b <= 0 or a <= 0 or mn < 0 or a < b:
+        return False
+    tol = D(str(eps)) if eps is not None else D('0')
+    if direction == 'BUY':
+        if b - stop + tol < mn:
+            return False
+    else:
+        if stop - a + tol < mn:
+            return False
+    if profit_level is None:
+        return True
+    try:
+        tp = D(profit_level)
+    except Exception:
+        return False
+    if tp <= 0:
+        return False
+    if direction == 'BUY':
+        return tp - a + tol >= mn
+    return b - tp + tol >= mn
+
+
 def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_scale=1,
               range_distance=0):
     """Broker-min + optional broker OHLC range, × learned sl_scale; TP = kappa × SL.
 
     Default κ=1 (1:1), not a frozen 1:2. Learned/explored κ comes from cash P&L.
     Hard floor: dealing min + spread/tick buffer. Soft floor from broker M1 ranges.
+
+    Audit #9: after κ and tick snap, both SL and TP distances are raised to at
+    least the broker minimum when κ<1 would otherwise leave TP below min.
+    Callers must still refuse to send if distances_meet_broker_min is False.
     """
     entry, tick, spread, minimum, kappa, sl_scale, range_distance = map(
         D, (entry, tick_size, spread, min_distance, kappa, sl_scale, range_distance or 0))
@@ -114,13 +179,22 @@ def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_s
     rho = tick*sl_ticks
     tp_ticks = int((kappa*rho/tick).to_integral_value(rounding=ROUND_CEILING))
     if tp_ticks < 1:tp_ticks=1
-    profit_distance = tick*tp_ticks
+    # κ<1 (e.g. MULT_KAPPA_MIN=0.5) can leave TP < broker min after snap —
+    # raise both distances onto the min grid so the order is sendable.
+    floor_ticks = _min_ticks(minimum, tick)
+    raised = False
+    if floor_ticks and sl_ticks < floor_ticks:
+        sl_ticks = floor_ticks; rho = tick * sl_ticks; raised = True
+    if floor_ticks and tp_ticks < floor_ticks:
+        tp_ticks = floor_ticks; raised = True
+    profit_distance = tick * tp_ticks
     sign = D(1) if direction == 'BUY' else D(-1)
     return {'stop_distance':rho,'profit_distance':profit_distance,
             'stop_level':entry-sign*rho,'profit_level':entry+sign*profit_distance,
             'stop_ticks':sl_ticks,'profit_ticks':tp_ticks,'buffer':buffer,
             'range_distance':float(range_distance),
-            'kappa':float(kappa),'sl_scale':float(sl_scale)}
+            'kappa':float(kappa),'sl_scale':float(sl_scale),
+            'raised_to_broker_min':raised}
 
 
 def position_size(max_risk, already_committed_risk, stop_ticks, tick_value, step, minimum, maximum):
@@ -132,6 +206,7 @@ def position_size(max_risk, already_committed_risk, stop_ticks, tick_value, step
     floor = (min(raw,maximum)/step).to_integral_value(rounding=ROUND_FLOOR)*step
     size = floor if floor >= minimum and floor > 0 else D(0)
     return {'raw':raw,'floored':floor,'size':size,'estimated_risk':n*v*size+(c if size else 0)}
+
 
 
 def pnl(entry, exit_price, direction, size, tick, tick_value, total_costs=0):

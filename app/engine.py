@@ -17,7 +17,8 @@ from pathlib import Path
 import numpy as np
 from .core import NeuralCore
 from .autonomy import AutoEvolution
-from .math_rules import stop_take, ohlc_range_distance
+from .math_rules import (stop_take, ohlc_range_distance,
+                         distances_meet_broker_min, levels_meet_broker_min)
 from . import bracket_learn
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
@@ -2048,6 +2049,18 @@ class SingleTradeEngine:
         # turns Take Profit Off — TP mark can be touched with no fill left.
         tp=proposal.get('profit_level')
         if tp is None:tp=_num(p.get('profitLevel'))
+        # Audit #9: skip trail PUT when SL/TP would violate broker min distance.
+        if not levels_meet_broker_min(p.get('direction'),stop,tp,
+                                      self.market.get('bid'),self.market.get('ask'),
+                                      self.market.get('min_distance')):
+            self.store.event('warning','Trail skipped: SL/TP below broker min distance',{
+                'deal_id':p.get('dealId'),'stop':stop,'profit':tp,
+                'min_distance':self.market.get('min_distance'),
+                'tick':self.market.get('tick'),'bid':self.market.get('bid'),
+                'ask':self.market.get('ask')})
+            self.protection_brief={'status':'Trail skipped: SL/TP below broker min',
+                                   'deal_id':p['dealId'],'proposal':proposal}
+            return
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
             'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
             'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None})
@@ -2099,6 +2112,15 @@ class SingleTradeEngine:
         result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
                          kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                          range_distance=float(rng) if rng is not None else 0)
+        # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
+        if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
+            self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
+                'deal_id':p.get('dealId'),
+                'stop_distance':float(result['stop_distance']),
+                'profit_distance':float(result['profit_distance']),
+                'min_distance':float(min_dist),'tick':float(tick),
+                'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
+            return
         stop=result['stop_level'] if p.get('stopLevel') is None else None
         profit=result['profit_level'] if p.get('profitLevel') is None else None
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
@@ -2161,6 +2183,15 @@ class SingleTradeEngine:
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
+            # Audit #9: after coeffs/rounding, refuse non-compliant SL/TP.
+            if not distances_meet_broker_min(brackets['stop_distance'],
+                                             brackets['profit_distance'],minimum):
+                self.store.event('warning','OPEN skipped: SL/TP below broker min distance',{
+                    'stop_distance':float(brackets['stop_distance']),
+                    'profit_distance':float(brackets['profit_distance']),
+                    'min_distance':float(minimum),'kappa':bp['kappa'],
+                    'raised_to_broker_min':brackets.get('raised_to_broker_min')})
+                return
             self.store.event('bracket','OHLC zone × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
@@ -2169,6 +2200,7 @@ class SingleTradeEngine:
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
+                'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'learn_samples':bp.get('nudge_samples')})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:

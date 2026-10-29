@@ -568,26 +568,45 @@ class AdaptiveBrain:
         """
         if registry is None:return False
         old_ohlc=self.ohlc_dim
+        prev_ohlc_dim,prev_fus_dim=self.ohlc_dim,self.fusion_dim
+        prev_ohlc_s,prev_fus_s=self.ohlc_schema,self.fusion_schema
         ohlc_d=registry.ohlc_dim();fus_d=registry.fusion_dim()
         ohlc_s=registry.ohlc_schema();fus_s=registry.fusion_schema()
         grew=ohlc_d>self.ohlc_dim or fus_d>self.fusion_dim
-        self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
-        self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
-        if self.feature_schema in (None,'legacy_quote_v2'):return False
+        if self.feature_schema in (None,'legacy_quote_v2'):
+            self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
+            self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
+            return False
         fs=self.feature_schema or ''
-        on_fusion=(fs==self.fusion_schema or fs==FUSION_SCHEMA or 'intermarket_news' in fs)
-        if (fs==self.ohlc_schema or fs==FEATURE_SCHEMA or
+        # Resolve target from *proposed* registry dims before mutating self.
+        on_fusion=(fs==fus_s or fs==FUSION_SCHEMA or 'intermarket_news' in fs
+                   or fs==prev_fus_s)
+        if (fs==ohlc_s or fs==FEATURE_SCHEMA or fs==prev_ohlc_s or
                 (FEATURE_SCHEMA in fs and 'intermarket_news' not in fs)):
-            target=self.ohlc_dim;schema=self.ohlc_schema;insert_at=None
+            target=ohlc_d;schema=ohlc_s;insert_at=None
         elif on_fusion:
-            target=self.fusion_dim;schema=self.fusion_schema
-            # New dynamic slots land at old OHLC boundary (before EXTERNAL).
+            target=fus_d;schema=fus_s
             insert_at=old_ohlc if ohlc_d>old_ohlc else None
         else:
             return False
-        if self.core.d==target and self.feature_schema==schema:return False
+        if self.core.d==target and self.feature_schema==schema:
+            self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
+            self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
+            return False
         if self.core.d>target:
-            raise ValueError('Registry shrink is not supported without explicit rollback')
+            # After "Mācīties no jauna" / feature prune the Store registry can be
+            # smaller than a previously expanded brain.npz. Shrinking weights
+            # needs an explicit rollback path — never crash robot Start.
+            self.store.event('warning',
+                'Feature registry smaller than neural inputs; keeping expanded weights',
+                {'epic':self.epic,'brain_inputs':self.core.d,'registry_inputs':target,
+                 'schema':schema,'action':'skip_shrink'})
+            # Keep previous dims in sync with the live weight matrix.
+            self.ohlc_dim=prev_ohlc_dim;self.fusion_dim=prev_fus_dim
+            self.ohlc_schema=prev_ohlc_s;self.fusion_schema=prev_fus_s
+            return False
+        self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
+        self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
         if self.core.d<target:
             self.core.expand_inputs(target,insert_at=insert_at)
             self.pending.clear()
@@ -892,7 +911,11 @@ class SingleTradeEngine:
         from .shadow_paper import ShadowPaperJournal
         self.shadow_paper=ShadowPaperJournal(store)
         if hasattr(self.brain,'apply_registry'):
-            self.brain.apply_registry(self.feature_registry)
+            try:
+                self.brain.apply_registry(self.feature_registry)
+            except Exception as exc:
+                self.store.event('warning','Registry apply deferred at engine init',
+                    {'type':type(exc).__name__,'detail':str(exc)[:160]})
         self._last_self_dev_bar=None
         self.shadow_brain=None  # optional alternate architecture (never executes LIVE)
     def _news_risk(self, when=None):
@@ -1610,7 +1633,11 @@ class SingleTradeEngine:
             candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
             self.feature_registry.load()
             if hasattr(self.brain,'apply_registry'):
-                self.brain.apply_registry(self.feature_registry)
+                try:
+                    self.brain.apply_registry(self.feature_registry)
+                except Exception as exc:
+                    self.store.event('warning','Registry apply deferred in poll',
+                        {'type':type(exc).__name__,'detail':str(exc)[:160]})
             self.market_context=market_features(
                 candles,spread=ask-bid,epic=self.mandate['epic'],
                 approved=self.feature_registry.approved,

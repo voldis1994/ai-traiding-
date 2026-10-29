@@ -46,8 +46,21 @@ def test_scratch_loss_does_not_ratchet_hold_repeats():
         evolve_from_feedback(store,broker_pnl=-1.5)
         after=load(store)['learn_loss_repeats']
         win=load(store)['learn_win_repeats']
-        assert after<=win+2
-        assert after<=before  # default 5 was already above win+2 cap → soft pull-down
+        assert after<=win  # loss repeats never exceed win path
+
+
+def test_cold_start_trial_commits_or_rejects_without_prior_stall():
+    """Trial with no pre-trial £ must not hang forever waiting for prior≥N."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        # Floor of BOUNDS['self_params_horizon_trades'] is 8.
+        save(store,{**DEFAULTS,'self_params_horizon_trades':8},reason='test')
+        evolve_from_feedback(store,feature_approved='gen_ret_8',commit=False)
+        assert (store.get(PENDING_KEY) or {}).get('trial_active')
+        # No prior broker rows — positive trial window commits (no prior stall).
+        out=maybe_commit_long_horizon(store,[0.2]*8)
+        assert out['committed'] is True
+        assert out.get('mode')=='cold_start_trial_net'
 
 
 def test_evolve_commit_false_activates_trial():

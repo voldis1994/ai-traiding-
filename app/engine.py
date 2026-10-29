@@ -899,8 +899,12 @@ class SingleTradeEngine:
         return cleared
     @staticmethod
     def _protection_matches(live,payload):
-        """Reconcile requested levels, not merely pre-existing non-null stops."""
-        if not live or live.get('stopLevel') is None or live.get('profitLevel') is None:
+        """Reconcile requested levels, not merely pre-existing non-null stops.
+
+        Trail PUTs are often SL-only (profit=None) while Capital shows Take Profit
+        Off — requiring live.profitLevel used to suspend the robot after every trail.
+        """
+        if not live or live.get('stopLevel') is None:
             return False
         tick=_num(payload.get('tick'),.01) or .01
         tolerance=max(1e-6,.51*tick)
@@ -1223,9 +1227,9 @@ class SingleTradeEngine:
                          'instrument_name':inst.get('name') or inst.get('epic') or self.mandate['epic'],
                          'source':'WEBSOCKET' if streamed else 'REST'}
             # Broker protection is handled before slow secondary data calls.
-            # Missing TP alone must not abort the poll — trail still needs to run.
-            if len(self.positions)==1 and (self.positions[0].get('stopLevel') is None or
-                                           self.positions[0].get('profitLevel') is None):
+            # Missing SL → install bracket. Missing TP alone is valid (Capital TP Off
+            # after trail) — never invent TP every poll or trail cannot run.
+            if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
                 await self.protect_position(self.positions[0])
                 if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
                     return
@@ -1269,8 +1273,9 @@ class SingleTradeEngine:
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                     fusion_schema=self.brain.fusion_schema)
                 self.latest_fusion_ready=fused is not None
-                # Before the first verified external sample, retain legacy OHLC
-                # learning. Once upgraded, NEVER infer on incomplete external data.
+                # Prefer fusion when ready. Transient peer/news gaps must NOT wipe
+                # the last neural vote (that created permanent HOLD / no-signal).
+                # Never invent zero external features — just keep the prior signal.
                 if fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
@@ -1281,7 +1286,6 @@ class SingleTradeEngine:
                         bar_time=self.market_context['bar_time'])
                 else:
                     next_signal=None
-                    self.last_signal=None  # Old external features must not be reused.
                 if next_signal is not None:
                     next_signal=dict(next_signal,
                         model_version=self.brain.model_version,
@@ -1318,12 +1322,10 @@ class SingleTradeEngine:
             if not self.armed or not self.execution_enabled:return
             if len(self.positions)==1:
                 p=self.positions[0]
-                # Missing SL → install bracket. Missing TP alone must NOT block
-                # trail (Capital often shows Take Profit Off after SL-only PUTs).
+                # Missing SL → install bracket. Missing TP alone must NOT reinstall
+                # TP (Capital TP Off after trail is intentional for SL ratchet).
                 if p.get('stopLevel') is None:
                     await self.protect_position(p);return
-                if p.get('profitLevel') is None:
-                    await self.protect_position(p)
                 # Live exit = broker SL / TP / trail only. Neural market-delete
                 # was matching M1 noise; the network still learns from cash P&L
                 # when those broker exits confirm. Intent is logged, never sent.
@@ -1352,28 +1354,22 @@ class SingleTradeEngine:
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
                 self.last_entry_processed_bar=self.last_decision_bar
-                # Scratch cooldown: after £0 / -£0.02 spam, skip several M1 bars.
-                cool=int(self.store.get('entry_scratch_cooldown') or 0)
-                if cool>0:
-                    self.store.set('entry_scratch_cooldown',cool-1)
-                    self.store.event('entry','Scratch cooldown — skip re-entry this M1 bar',
-                                    {'remaining':cool-1,'bar_time':self.last_decision_bar})
-                else:
-                    evaluation=self._entry_evaluation()
-                    action=evaluation['action']
-                    self.last_policy_decision=action
-                    self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
-                    self.store.event('entry',
-                        'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
-                        {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
-                         'proposal':evaluation.get('proposal'), 'decision':action,
-                         'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
-                    # One entry opportunity per completed M1 bar. The first new
-                    # confirmed bar after a broker-verified close can already act.
-                    if (action in ('BUY','SELL') and
-                        self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
-                        snap.get('marketStatus')=='TRADEABLE'):
-                        await self.submit(action,broker_market)
+                # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
+                evaluation=self._entry_evaluation()
+                action=evaluation['action']
+                self.last_policy_decision=action
+                self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
+                self.store.event('entry',
+                    'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
+                    {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                     'proposal':evaluation.get('proposal'), 'decision':action,
+                     'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                # One entry opportunity per completed M1 bar. The first new
+                # confirmed bar after a broker-verified close can already act.
+                if (action in ('BUY','SELL') and
+                    self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                    snap.get('marketStatus')=='TRADEABLE'):
+                    await self.submit(action,broker_market)
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -1512,7 +1508,7 @@ class SingleTradeEngine:
         return None,'ticks_only',None
 
     def _note_scratch_close(self,pnl_value,deal_id=None):
-        """Repeated £0 / penny closes → cool re-entry (Capital history spam)."""
+        """Log repeated penny closes — no hardcoded re-entry ban (neural decides)."""
         if pnl_value is None:return
         try:val=abs(float(pnl_value))
         except (TypeError,ValueError):return
@@ -1522,8 +1518,7 @@ class SingleTradeEngine:
         streak=int(self.store.get('scratch_streak') or 0)+1
         self.store.set('scratch_streak',streak)
         if streak<2:return
-        self.store.set('entry_scratch_cooldown',3)
-        self.store.event('entry','Repeated scratch closes — cooling re-entry for 3 M1 bars',
+        self.store.event('entry','Repeated scratch closes (neural still decides next entry)',
                          {'pnl':pnl_value,'deal_id':deal_id,'streak':streak})
 
     def _snapshot_open_upl(self,position):
@@ -2070,9 +2065,9 @@ class SingleTradeEngine:
                 'adaptive_threshold':None,
                 'policy_base_threshold':None,
                 'entry_margin_calibration':evaluation.get('calibration') if evaluation else None,
-                'threshold_unit':'neural_argmax_no_fixed_margin',
+                'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
-                'neural_entry_rule':'BUY/SELL/HOLD class winner on completed M1 candle',
+                'neural_entry_rule':'neural argmax BUY/SELL/HOLD — zone/SHIFT evidence only',
                 'neural_market_exit':False,
                 'neural_exit_rule':'disabled — broker SL/TP/trail closes; neural learns from cash P&L',
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved()),

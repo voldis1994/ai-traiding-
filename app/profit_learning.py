@@ -71,10 +71,17 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
         return {'label':_ACTION_LABEL[direction],'mode':'reinforce_win',
                 'actual_pnl':pnl,'simulated':sim}
     if pnl is not None and pnl<0 and direction in ('BUY','SELL'):
-        if sim and sim['best'] in _ACTION_LABEL:
+        # Cash loss must never reinforce the side that just lost £ (price-unit
+        # sim can otherwise re-pick the same side after fees/FX). Choose among
+        # HOLD and the opposite path only.
+        if sim:
+            opposite='SELL' if direction=='BUY' else 'BUY'
+            opp_val=float(sim['sell'] if opposite=='SELL' else sim['buy'])
+            hold_val=0.
+            best=opposite if opp_val>hold_val else 'HOLD'
             prefix='flip_loss_counterfactual_' if flip_after_loss else 'loss_counterfactual_'
-            return {'label':_ACTION_LABEL[sim['best']],
-                    'mode':prefix+sim['best'].lower(),
+            return {'label':_ACTION_LABEL[best],
+                    'mode':prefix+best.lower(),
                     'actual_pnl':pnl,'simulated':sim}
         return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
                 'simulated':None}

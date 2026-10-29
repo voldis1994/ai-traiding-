@@ -193,7 +193,8 @@ class RuntimeHub:
                 'armed':bool(view.get('armed')),
                 'scores':view.get('scores') or card['scores'],
                 'action':view.get('action'),
-                'account_currency':account_currency or (pos.get('currency') or None),
+                # Never fall back to position.currency (GOLD quote USD ≠ account GBP).
+                'account_currency':account_currency,
                 'evolution':{
                     'generation':int(evo.get('generation') or snap.get('code_generation')
                                      or policy_info.get('generation') or 0),

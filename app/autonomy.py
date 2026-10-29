@@ -332,14 +332,10 @@ class AutoEvolution:
         return 'CLOSE'
 
     def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None):
-        """Enter only when neural vote and OHLC zone agree — no cooldown magic.
+        """LIVE entry = neural argmax only — no zone/SHIFT/trend hard vetoes.
 
-        HOLD is a real decision when:
-          - HOLD score dominates, or
-          - 5m/15m zone fights the vote (mid-chop / against short zone), or
-          - 15m+60m trend fights the vote, or
-          - short vs long regime is SHIFT (market changing).
-        Signs from broker returns — not hardcoded score margins or bar timers.
+        OHLC returns/trend/regime are logged as evidence for learning/audit, never
+        as hardcoded gates. Broker news / mandate / TRADEABLE stay in the engine.
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -347,50 +343,17 @@ class AutoEvolution:
         buy=float(scores['BUY']);sell=float(scores['SELL']);hold=float(scores['HOLD'])
         direction='BUY' if buy>=sell else 'SELL'
         strength=buy if direction=='BUY' else sell
+        evidence={'returns_bps':returns_bps,'trend':trend,'regime':regime,
+                  'scores':{'BUY':buy,'SELL':sell,'HOLD':hold}}
         if hold>strength:
             return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':(f'HOLD dominates {direction} ({hold:.1%} > {strength:.1%})'),
-                    'evidence':None,'calibration':None}
-        if not isinstance(returns_bps,dict):
-            return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':'OHLC zone unavailable; no entry without market context',
-                    'evidence':None,'calibration':None}
-        try:
-            r5=float(returns_bps.get('5',0) or 0)
-            r15=float(returns_bps.get('15',0) or 0)
-            r60=float(returns_bps.get('60',0) or 0)
-        except (TypeError,ValueError):
-            return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':'OHLC returns unreadable; no entry','evidence':None,'calibration':None}
-        # Regime shift: 5m and 60m disagree → sit out (feel the change, don't force).
-        if regime=='SHIFT' or (r5>0 and r60<0) or (r5<0 and r60>0):
-            return {'action':'HOLD','proposal':direction,'threshold':None,
-                    'reason':f'Regime SHIFT (5m vs 60m); skip {direction}',
-                    'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
-                    'calibration':None}
-        if direction=='BUY':
-            if not (r5>0 and r15>0):
-                return {'action':'HOLD','proposal':'BUY','threshold':None,
-                        'reason':'BUY vote but 5m/15m zone not UP — avoid mid-zone / chop entry',
-                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
-            if trend=='DOWN' or (r15<0 and r60<0):
-                return {'action':'HOLD','proposal':'BUY','threshold':None,
-                        'reason':'BUY against DOWN trend (15m/60m)',
-                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
-        else:
-            if not (r5<0 and r15<0):
-                return {'action':'HOLD','proposal':'SELL','threshold':None,
-                        'reason':'SELL vote but 5m/15m zone not DOWN — avoid mid-zone / chop entry',
-                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
-            if trend=='UP' or (r15>0 and r60>0):
-                return {'action':'HOLD','proposal':'SELL','threshold':None,
-                        'reason':'SELL against UP trend (15m/60m)',
-                        'evidence':{'returns_bps':returns_bps,'trend':trend},'calibration':None}
+                    'reason':(f'Neural HOLD dominates {direction} '
+                              f'({hold:.1%} > {strength:.1%})'),
+                    'evidence':evidence,'calibration':None}
         return {'action':direction,'proposal':direction,'threshold':None,
-                'reason':(f'Entry {direction}: neural vote + OHLC zone aligned '
-                          f'(trend={trend or "n/a"})'),
-                'evidence':{'returns_bps':returns_bps,'trend':trend,'regime':regime},
-                'calibration':None}
+                'reason':(f'Neural argmax {direction} '
+                          f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%})'),
+                'evidence':evidence,'calibration':None}
 
     @staticmethod
     def _minute_time(value):
@@ -846,6 +809,24 @@ class AutoEvolution:
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
         maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
+        # Real promote: shadow paper £ beat LIVE → copy shadow weights into LIVE.
+        if decision.get('promote') and getattr(engine,'shadow_brain',None) is not None:
+            brain=getattr(engine,'brain',None)
+            shadow=engine.shadow_brain
+            if (brain is not None and shadow is not None and
+                    getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
+                self._push_model_snapshot(engine,note='pre_shadow_promote')
+                if brain.core.copy_weights_from(shadow):
+                    brain.model_version=int(getattr(brain,'model_version',0) or 0)+1
+                    try:brain.save()
+                    except Exception:pass
+                    from .learning_generation import bump as bump_generation
+                    bump_generation(self.store,'shadow_weights_promoted_to_live')
+                    self.last_reason='Shadow weights promoted to LIVE neural core'
+                    self.store.event('learning','Shadow neural weights promoted to LIVE',
+                        {'model_version':brain.model_version,
+                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n})
+                    decision=dict(decision,weights_promoted=True)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])

@@ -50,5 +50,5 @@ EXECUTION_GATES = (
     'tradeable_market',
     'one_position',
     'order_reconciliation',
-    'fusion_ready_after_v4',
+    # Fusion preferred when ready; transient peer gaps keep last neural vote.
 )

@@ -177,7 +177,7 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         detail=json.loads(last['details'])
         assert detail['mode']=='loss_counterfactual_sell'
         assert detail['target']==1
-        assert detail['learn_repeats']==5
+        assert detail['learn_repeats']==2
         assert detail['scratch_hold_skip'] is False
         assert detail['broker_pnl']==-12.5
         assert detail['pnl']==-12.5

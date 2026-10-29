@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import numpy as np
 from .storage import DATA
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -732,6 +733,56 @@ class AutoEvolution:
 
     CHECKPOINT_TRADES_KEY='model_checkpoint_at_trades'
     ROLLBACK_COOLDOWN_KEY='model_rollback_cooldown_until_trades'
+    LAST_PROMOTE_KEY='shadow_last_promote_v1'
+
+    @staticmethod
+    def weight_checksum(core):
+        """Stable fingerprint of neural weights — blocks identical re-promote."""
+        if core is None:return None
+        h=hashlib.sha256()
+        for name in ('P','W','R','O','b','G','tau','tau_c'):
+            arr=getattr(core,name,None)
+            if arr is None:continue
+            h.update(np.ascontiguousarray(arr,dtype=np.float64).tobytes())
+        return h.hexdigest()[:40]
+
+    def _promote_evidence_boundary(self, live_hist, shadow_rows):
+        """Trade counts used as the evaluation frontier for anti-repeat promote."""
+        return {
+            'live_trades':len(live_hist or []),
+            'shadow_trades':len(shadow_rows or []),
+        }
+
+    def _promote_blocked_same_evidence(self, engine, live_hist, shadow_rows, checksum):
+        """True when checksum + trade boundary match the last promote.
+
+        model_id is stored for audit. After a successful promote the shadow
+        version may advance; blocking still hinges on identical weights and
+        no new evaluation trades — not on the bumped id alone.
+        """
+        del engine  # reserved for future model_id cross-checks
+        prev=self.store.get(self.LAST_PROMOTE_KEY) or {}
+        if not isinstance(prev,dict) or not prev:return False
+        boundary=self._promote_evidence_boundary(live_hist,shadow_rows)
+        same_checksum=(prev.get('weight_checksum') is not None and
+                       checksum is not None and
+                       str(prev.get('weight_checksum'))==str(checksum))
+        same_boundary=(int(prev.get('live_trades') or -1)==boundary['live_trades'] and
+                       int(prev.get('shadow_trades') or -1)==boundary['shadow_trades'])
+        return bool(same_checksum and same_boundary)
+
+    def _record_promote_evidence(self, engine, live_hist, shadow_rows, checksum):
+        boundary=self._promote_evidence_boundary(live_hist,shadow_rows)
+        shadow=getattr(engine,'shadow_brain',None)
+        meta={
+            'model_id':int(getattr(shadow,'model_version',0) or 0),
+            'weight_checksum':checksum,
+            'live_trades':boundary['live_trades'],
+            'shadow_trades':boundary['shadow_trades'],
+            'at':datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.set(self.LAST_PROMOTE_KEY,meta)
+        return meta
 
     def _push_model_snapshot(self, engine, *, note='checkpoint'):
         """Save neural weights + registry specs onto the model stack."""
@@ -782,8 +833,9 @@ class AutoEvolution:
 
         Shadow runs its own paper journal. Price moves are scaled to account
         currency via LIVE broker_£/price ratios — never raw price units vs £.
+        Compare on the same time window / single model_version per side.
         """
-        from .model_validation import compare_models
+        from .model_validation import compare_models, aligned_window_pnls
         from .self_params import (load as load_params, evolve_from_feedback,
                                   maybe_commit_long_horizon)
         engine._ensure_shadow_brain()
@@ -800,17 +852,30 @@ class AutoEvolution:
         paper=getattr(engine,'shadow_paper',None)
         if paper is not None:
             paper.update_cash_scale(live_hist)
-        # Cash-only paper rows (unit=account_currency) — skip price-unit leftovers.
-        shadow_cash=(paper.paper_cash_pnls() if paper else [])
-        if len(live_hist)<min_trades or len(shadow_cash)<max(4,min_trades//2):
+        shadow_rows=(paper.paper_rows() if paper and hasattr(paper,'paper_rows')
+                     else [])
+        if not shadow_rows and paper is not None:
+            shadow_rows=[r for r in (paper.history or [])
+                         if r.get('unit')=='account_currency'
+                         and r.get('paper_pnl') is not None]
+        if len(live_hist)<min_trades or len(shadow_rows)<max(4,min_trades//2):
             self.last_reason=('Shadow self-dev waiting for broker £ + cash-scaled '
                               'paper trades')
             return None
-        live_cut=int(len(live_hist)*(1.0-oos_frac))
-        sh_cut=int(len(shadow_cash)*(1.0-oos_frac))
-        live_pnls=[float(r['actual_pnl']) for r in live_hist[live_cut:]]
-        shadow_pnls=list(shadow_cash[sh_cut:])
-        decision=compare_models(live_pnls,shadow_pnls,store=self.store)
+        aligned=aligned_window_pnls(
+            live_hist,shadow_rows,oos_frac=oos_frac,
+            inc_cash_key='actual_pnl',cand_cash_key='paper_pnl')
+        live_pnls=aligned['incumbent_pnls']
+        shadow_pnls=aligned['candidate_pnls']
+        decision=compare_models(
+            live_pnls,shadow_pnls,store=self.store,
+            incumbent_version=aligned.get('incumbent_version'),
+            candidate_version=aligned.get('candidate_version'))
+        decision=dict(decision,
+                      incumbent_version=aligned.get('incumbent_version'),
+                      candidate_version=aligned.get('candidate_version'),
+                      window_start=aligned.get('window_start'),
+                      window_end=aligned.get('window_end'))
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
         maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
@@ -818,7 +883,13 @@ class AutoEvolution:
         if decision.get('promote') and getattr(engine,'shadow_brain',None) is not None:
             brain=getattr(engine,'brain',None)
             shadow=engine.shadow_brain
-            if (brain is not None and shadow is not None and
+            checksum=self.weight_checksum(shadow)
+            if self._promote_blocked_same_evidence(engine,live_hist,shadow_rows,checksum):
+                self.last_reason=('Shadow promote blocked — same model/checksum/'
+                                  'trade boundary as last promote')
+                decision=dict(decision,promote=False,weights_promoted=False,
+                              reason=self.last_reason)
+            elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
                 self._push_model_snapshot(engine,note='pre_shadow_promote')
                 if brain.core.copy_weights_from(shadow):
@@ -826,12 +897,22 @@ class AutoEvolution:
                     try:brain.save()
                     except Exception:pass
                     from .learning_generation import bump as bump_generation
-                    bump_generation(self.store,'shadow_weights_promoted_to_live')
+                    bumped=bump_generation(
+                        self.store,'shadow_weights_promoted_to_live',
+                        kind='verified_candidate_promotes',
+                        weight_checksum=checksum)
+                    self._record_promote_evidence(
+                        engine,live_hist,shadow_rows,checksum)
+                    shadow.model_version=int(getattr(shadow,'model_version',0) or 0)+1
+                    if hasattr(engine,'_persist_shadow_state'):
+                        engine._persist_shadow_state()
                     self.last_reason='Shadow weights promoted to LIVE neural core'
                     self.store.event('learning','Shadow neural weights promoted to LIVE',
                         {'model_version':brain.model_version,
-                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n})
-                    decision=dict(decision,weights_promoted=True)
+                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n,
+                         'weight_checksum':checksum,'learning_generation':bumped})
+                    decision=dict(decision,weights_promoted=True,
+                                  weight_checksum=checksum)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])
@@ -868,12 +949,21 @@ class AutoEvolution:
             'decision':decision,
             'shadow_neurons':getattr(engine.shadow_brain,'n',None),
             'shadow_dim':getattr(engine.shadow_brain,'d',None),
-            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_cash),
+            'live_samples':len(live_hist),'paper_cash_samples':len(shadow_rows),
             'method':'independent_shadow_paper_cash',
+            'aligned_window':{
+                'start':aligned.get('window_start'),'end':aligned.get('window_end'),
+                'incumbent_version':aligned.get('incumbent_version'),
+                'candidate_version':aligned.get('candidate_version')},
             'paper_summary':paper.summary() if paper else None,
             'params':{'min_trades':min_trades,'window':win,'delta':delta}})
-        self.last_reason=('Shadow paper cash beats live OOS broker £' if decision.get('promote')
-                          else 'Shadow paper cash not better than live OOS broker £')
+        if decision.get('weights_promoted'):
+            pass
+        elif decision.get('promote'):
+            self.last_reason='Shadow paper cash beats live OOS broker £'
+        else:
+            self.last_reason=(decision.get('reason')
+                              or 'Shadow paper cash not better than live OOS broker £')
         return decision
 
     def promote_shadow_policy(self, candidate_source, *, force=False):

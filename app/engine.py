@@ -1793,9 +1793,9 @@ class SingleTradeEngine:
         for _ in range(repeats):
             step_loss=self.brain.core.learn(transition,label,lr=learn_lr)
             if step_loss is not None:losses.append(step_loss)
-        # Independent shadow core trains on the same delayed label (side-by-side).
+        # Independent shadow core trains on same label using *its* decision-time h/c.
         if repeats>0:
-            self._shadow_learn(transition,label,lr=learn_lr)
+            self._shadow_learn(None,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
             # Queue evidence only — commit when long-horizon £ proves improvement.
             evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
@@ -2182,38 +2182,157 @@ class SingleTradeEngine:
             spreads.append(float(sp) if sp is not None and sp>=0 else None)
         return bars,spreads,times
 
+    SHADOW_STATE_KEY='shadow_neural_state_v1'
+
     def _ensure_shadow_brain(self):
         """Independent shadow NeuralCore — same input dim, own weights (never LIVE)."""
         d=self.brain.core.d
+        created=False
         if self.shadow_brain is None or self.shadow_brain.d!=d:
             alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
             # Derive from live init_seed so shadow search is not identical across clients.
             base=int(getattr(self.brain,'init_seed',7) or 7)
             shadow_seed=(base^(0xA5A5+alt_n))%(2**31-1) or (base+alt_n+1)
+            saved=self.store.get(self.SHADOW_STATE_KEY) or {}
+            try:saved_n=int(saved.get('n') or 0)
+            except (TypeError,ValueError):saved_n=0
+            try:saved_d=int(saved.get('d') or -1)
+            except (TypeError,ValueError):saved_d=-1
+            use_n=saved_n if (saved_n>=8 and saved_d==d) else alt_n
             self.shadow_brain=self.brain.core.clone_architecture(
-                n=alt_n,seed=shadow_seed,copy_weights=False)
+                n=use_n,seed=shadow_seed,copy_weights=False)
+            self.shadow_brain.model_version=0
+            created=True
             self.store.event('shadow','Independent shadow neural core ready',
                 {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n,
                  'shadow_seed':shadow_seed})
+        if created:
+            self._restore_shadow_state()
         return self.shadow_brain
 
-    def _shadow_learn(self,transition,label,lr=None):
-        shadow=self._ensure_shadow_brain()
-        if transition is None or label not in (0,1,2):return
-        z=transition.get('z')
-        if z is None or len(np.asarray(z))!=shadow.d:return
-        shadow.learn(transition,label,lr=lr)
+    def _restore_shadow_state(self):
+        """Reload persisted shadow h/c + step counter after create/restart."""
+        shadow=self.shadow_brain
+        raw=self.store.get(self.SHADOW_STATE_KEY) or {}
+        if not isinstance(raw,dict) or shadow is None:return False
+        try:
+            h=np.asarray(raw.get('h'),dtype=float)
+            c=np.asarray(raw.get('c'),dtype=float)
+        except (TypeError,ValueError):
+            return False
+        if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):return False
+        if not (np.isfinite(h).all() and np.isfinite(c).all()):return False
+        if int(raw.get('d') or -1)!=shadow.d:return False
+        shadow.h=h;shadow.c=c
+        try:shadow.steps=int(raw.get('steps') or 0)
+        except (TypeError,ValueError):shadow.steps=0
+        try:shadow.model_version=int(raw.get('model_version') or 0)
+        except (TypeError,ValueError):shadow.model_version=0
+        tr=raw.get('last_transition')
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            try:
+                z=np.asarray(tr['z'],dtype=float)
+                th=np.asarray(tr['h'],dtype=float);tc=np.asarray(tr['c'],dtype=float)
+                if z.shape==(shadow.d,) and th.shape==(shadow.n,) and tc.shape==(shadow.n,):
+                    ids=tr.get('neuron_ids')
+                    shadow.last_transition={
+                        'z':z,'h':th,'c':tc,
+                        'dt':float(tr.get('dt') or 1.),
+                        'neuron_ids':(np.asarray(ids,dtype=np.int64)
+                                      if ids is not None else shadow.neuron_ids.copy()),
+                        'bar_time':tr.get('bar_time')}
+            except (TypeError,ValueError,KeyError):
+                pass
+        return True
 
-    def _shadow_scores_now(self):
-        """One forward pass on live last_z for shadow journal (no LIVE order)."""
+    def _persist_shadow_state(self):
+        """Persist shadow h/c and step counter after every completed-candle advance."""
+        shadow=self.shadow_brain
+        if shadow is None:return
+        tr=getattr(shadow,'last_transition',None)
+        payload={
+            'h':np.asarray(shadow.h,dtype=float).tolist(),
+            'c':np.asarray(shadow.c,dtype=float).tolist(),
+            'steps':int(getattr(shadow,'steps',0) or 0),
+            'n':int(shadow.n),'d':int(shadow.d),
+            'model_version':int(getattr(shadow,'model_version',0) or 0),
+            'neuron_ids':np.asarray(shadow.neuron_ids,dtype=np.int64).tolist(),
+        }
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            payload['last_transition']={
+                'z':np.asarray(tr['z'],dtype=float).tolist(),
+                'h':np.asarray(tr['h'],dtype=float).tolist(),
+                'c':np.asarray(tr['c'],dtype=float).tolist(),
+                'dt':float(tr.get('dt') or 1.),
+                'neuron_ids':np.asarray(
+                    tr.get('neuron_ids',shadow.neuron_ids),dtype=np.int64).tolist(),
+                'bar_time':tr.get('bar_time')}
+        self.store.set(self.SHADOW_STATE_KEY,payload)
+
+    def _shadow_decision_transition(self, preferred=None):
+        """Shadow's own decision-time state — never LIVE h/c."""
+        shadow=self._ensure_shadow_brain()
+        for cand in (preferred,getattr(shadow,'last_transition',None)):
+            if not isinstance(cand,dict):continue
+            z=cand.get('z')
+            if z is None:continue
+            z=np.asarray(z,dtype=float)
+            if z.shape!=(shadow.d,):continue
+            h=np.asarray(cand.get('h'),dtype=float)
+            c=np.asarray(cand.get('c'),dtype=float)
+            if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):continue
+            ids=cand.get('neuron_ids',shadow.neuron_ids)
+            return {'z':z,'h':h,'c':c,'dt':float(cand.get('dt') or 1.),
+                    'neuron_ids':np.asarray(ids,dtype=np.int64)}
+        return None
+
+    def _shadow_learn(self,transition,label,lr=None):
+        """Train shadow on *its* decision-time h/c — never LIVE recurrent state."""
+        shadow=self._ensure_shadow_brain()
+        if label not in (0,1,2):return None
+        own=self._shadow_decision_transition(
+            transition if (isinstance(transition,dict)
+                           and transition.get('h') is not None
+                           and len(np.asarray(transition.get('h')))==shadow.n)
+            else None)
+        if own is None and isinstance(transition,dict):
+            base=getattr(shadow,'last_transition',None)
+            if isinstance(base,dict) and base.get('h') is not None:
+                z=transition.get('z')
+                if z is not None and len(np.asarray(z))==shadow.d:
+                    own={'z':np.asarray(z,dtype=float),
+                         'h':np.asarray(base['h'],dtype=float),
+                         'c':np.asarray(base['c'],dtype=float),
+                         'dt':float(base.get('dt') or transition.get('dt') or 1.),
+                         'neuron_ids':np.asarray(
+                             base.get('neuron_ids',shadow.neuron_ids),dtype=np.int64)}
+        if own is None:return None
+        loss=shadow.learn(own,label,lr=lr)
+        self._persist_shadow_state()
+        return loss
+
+    def _shadow_scores_now(self,*,advance=False,bar_time=None):
+        """Score with shadow weights on live z; optionally advance+persist h/c.
+
+        advance=True on each completed M1 candle so shadow is a real parallel
+        trajectory with its own decision-time state (not a LIVE h/c snapshot).
+        """
         shadow=self._ensure_shadow_brain()
         z=self.brain.core.last_z
         if z is None or len(z)!=shadow.d:return None
         try:
-            # Use shadow's own h/c — step advances shadow state on closed bars only
-            # via learn; here we score without mutating by using _forward snapshot.
-            hn,cn,logits=shadow._forward(
-                np.asarray(z,dtype=float),shadow.h,shadow.c,1.0)
+            z=np.asarray(z,dtype=float)
+            h0=shadow.h.copy();c0=shadow.c.copy()
+            hn,cn,logits=shadow._forward(z,h0,c0,1.0)
+            if advance:
+                shadow.last_transition={
+                    'z':z.copy(),'h':h0,'c':c0,'dt':1.0,
+                    'neuron_ids':shadow.neuron_ids.copy(),
+                    'bar_time':bar_time}
+                shadow.h=hn;shadow.c=cn
+                shadow.last_z=z.copy()
+                shadow.steps=int(getattr(shadow,'steps',0) or 0)+1
+                self._persist_shadow_state()
             prob=shadow._softmax(logits)
             return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
         except Exception:
@@ -2235,8 +2354,14 @@ class SingleTradeEngine:
             bar,window,spread=last_sp,registry=self.feature_registry)
         self._ensure_shadow_brain()
         # Independent shadow paper step on every closed ready bar (not LIVE remap).
-        self._shadow_paper_step(mid=self.market_context.get('close'),
-                                spread=last_sp,bar_time=bar)
+        # Advance+persist shadow h/c/steps on this completed candle first.
+        last_bar_ohlc=window[-1] if window else None
+        self._shadow_paper_step(
+            mid=self.market_context.get('close'),
+            spread=last_sp,bar_time=bar,
+            high=(last_bar_ohlc[1] if last_bar_ohlc else None),
+            low=(last_bar_ohlc[2] if last_bar_ohlc else None),
+            candles=candles)
         if not proposals:
             self.policy.shadow_self_dev_tick(self)
             return
@@ -2293,20 +2418,76 @@ class SingleTradeEngine:
                 'weights_path':post_path})
         self.policy.shadow_self_dev_tick(self)
 
-    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None):
-        """Advance independent shadow paper journal from current shadow vote."""
-        scores=self._shadow_scores_now()
+    def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None,high=None,low=None,
+                           candles=None):
+        """Advance shadow state + paper journal with LIVE-identical execution rules.
+
+        Votes after advancing shadow h/c on this completed candle. Opens/closes
+        via SL/TP/trail (same stop_take + trail math as LIVE) — never flip-exit.
+        """
+        scores=self._shadow_scores_now(advance=True,bar_time=bar_time)
         if not scores or mid is None:return None
         try:
             action=max(('BUY','SELL','HOLD'),key=lambda a:float(scores.get(a,0)))
         except (TypeError,ValueError):
             return None
-        # Scale price→£ from LIVE broker history so paper is cash-comparable.
         live=getattr(self.profit_learning,'history',[]) or []
         self.shadow_paper.update_cash_scale(live)
-        return self.shadow_paper.on_bar(
+        shadow=self.shadow_brain
+        shadow_tr=None
+        if shadow is not None and getattr(shadow,'last_transition',None):
+            shadow_tr=self.brain._json_transition(shadow.last_transition)
+        tick=None;minimum=None;stop_d=None;profit_d=None;kappa=None;sl_scale=None
+        try:
+            mkt=self.market or {}
+            tick=_num(mkt.get('tick'))
+            minimum=_num(mkt.get('min_distance'))
+            if tick is None or tick<=0:
+                tick=max(abs(float(spread or 0))/2.,1e-4)
+            if minimum is None or minimum<0:
+                minimum=float(tick)
+            rows=candles if candles is not None else (
+                self.store.candles(self.mandate['epic'],n=120,historical_only=True)
+                if self.mandate else [])
+            zone=bracket_learn.zone_at_open(rows)
+            rng=zone['range_distance'] or ohlc_range_distance(rows)
+            buffer=max(2*float(tick),2*abs(float(spread or 0)))
+            base_sl=max(float(minimum)+buffer,float(rng or 0))
+            bp=bracket_learn.propose_for_open(
+                self.store,ohlc_kappa=zone.get('kappa'),base_sl=base_sl,
+                max_tp=zone.get('max_tp'),candles=rows)
+            entry_proxy=float(mid)+abs(float(spread or 0))/2.
+            brackets=stop_take(entry_proxy,'BUY',tick,spread,minimum,
+                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
+                               range_distance=float(rng) if rng is not None else 0)
+            stop_d=float(brackets['stop_distance'])
+            profit_d=float(brackets['profit_distance'])
+            kappa=bp['kappa'];sl_scale=bp['sl_scale']
+        except Exception:
+            stop_d=profit_d=None
+        closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
-            cash_scale=self.shadow_paper.cash_scale)
+            cash_scale=self.shadow_paper.cash_scale,
+            high=high,low=low,tick=tick,min_distance=minimum,
+            stop_distance=stop_d,profit_distance=profit_d,
+            kappa=kappa,sl_scale=sl_scale,
+            model_version=int(getattr(shadow,'model_version',0) or 0),
+            slip_bps=0.,fill_delay_bars=0,
+            shadow_transition=shadow_tr)
+        if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
+            pnl=closed.get('paper_pnl')
+            if pnl is None:pnl=closed.get('price_pnl')
+            label=None
+            if pnl is not None:
+                try:
+                    cash=float(pnl)
+                    if cash>0:label={'BUY':0,'SELL':1}.get(closed.get('direction'))
+                    elif cash<0:label=2
+                except (TypeError,ValueError):
+                    label=None
+            if label is not None:
+                self._shadow_learn(closed.get('shadow_transition'),label)
+        return closed
 
     def restore_neural_weights(self, version_meta_or_path):
         """Rollback hook: restore feature registry + neural weights together.

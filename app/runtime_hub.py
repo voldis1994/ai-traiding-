@@ -115,14 +115,18 @@ class RuntimeHub:
         signed=[]
         recent=[]
         for t in closed:
-            if t.get('pnl') is None:continue
             src=(t.get('pnl_source') or '').strip().lower()
-            # Skip non-cash proxies (GOLD price×size looked like USD vs GBP UPL).
-            if src in ('ticks_only','price_size','pending_close_sync','position_disappeared'):
-                continue
-            try:val=float(t['pnl'])
-            except (TypeError,ValueError):continue
+            # Non-cash proxies never enter £ totals. pending_* rows may still be
+            # listed (null pnl) so Admin is not frozen on an old green strip while
+            # Capital already shows newer closes awaiting cash bind.
+            proxy=src in ('ticks_only','price_size','position_disappeared')
+            pending=src in ('pending_close_sync','pending_broker_pnl')
+            if proxy:continue
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
+            val=None
+            if t.get('pnl') is not None:
+                try:val=float(t['pnl'])
+                except (TypeError,ValueError):val=None
             # Broker-settled cash is always account currency — remapping display
             # when Capital tagged the instrument quote (GOLD=USD) on cash rows.
             if src=='broker' and acct:
@@ -130,11 +134,15 @@ class RuntimeHub:
             else:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
-            by_ccy.setdefault(ccy,[]).append(val)
-            # W/L next to account P&L must not mix other currency buckets.
-            if not acct or ccy==acct:
-                signed.append(val)
-            recent.append(row)
+            if val is not None and src=='broker':
+                by_ccy.setdefault(ccy,[]).append(val)
+                # W/L next to account P&L must not mix other currency buckets.
+                if not acct or ccy==acct:
+                    signed.append(val)
+                recent.append(row)
+            elif pending or (val is not None and not proxy):
+                # Surface closes that Capital already booked but cash bind lags.
+                recent.append(row)
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         # Prefer a single currency total; if mixed, keep map and avoid one fake sum.

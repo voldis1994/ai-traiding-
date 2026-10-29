@@ -1191,7 +1191,11 @@ class SingleTradeEngine:
             m=raw.get('market') if isinstance(raw.get('market'),dict) else {}
             direction=self._normalize_direction(p.get('direction'))
             epic=self._extract_epic(p,m)
-            out.append({'dealId':p.get('dealId') or p.get('dealID'),
+            deal=p.get('dealId') if p.get('dealId') is not None else p.get('dealID')
+            # Deal-less rows are not open positions — keeping them left Admin stuck
+            # on "Existing open position" with last_position_id=None (no close path).
+            if deal is None or str(deal).strip()=='':continue
+            out.append({'dealId':str(deal).strip(),
                 'epic':epic,
                 'instrument_name':self._extract_instrument_name(p,m),
                 'size':p.get('size'),'direction':direction,'level':p.get('level'),
@@ -1358,11 +1362,95 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__,'instrument_name':row.get('instrument_name')})
         return mapped
 
+    async def _record_vanished_deal(self,prev_id,*,exit_guess=None):
+        """Persist close + queue/learn Capital £ when a tracked deal is gone."""
+        self.last_closed_step=self.brain.core.steps
+        self.latest_close_id=prev_id
+        if exit_guess is None:
+            exit_guess=_num((self.market or {}).get('mid'))
+        # If our CLOSE confirm is in flight, do NOT learn yet — sync() runs
+        # before confirm profit/level and would train on mid + clear entry_brain.
+        if self.pending_close:
+            self.store.close_trade(prev_id,exit_guess,source='pending_close_sync')
+            # Still queue cash binding — confirm may fail after vanish; without
+            # this, Admin keeps filtering pending_close_sync (null £) forever.
+            self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+            self.store.event('trade','Deal closed pending broker confirm P&L',
+                             {'dealId':prev_id,'exit_guess':exit_guess})
+            return None,'pending_close_sync',None
+        # SL/TP/manual vanish: resolve Capital cash P&L — never settle for ticks_only
+        # when history/UPL still has account-currency profit.
+        if exit_guess is None:
+            # market may be {} after adopt; last UPL row has no level — keep None.
+            snap=self.store.get('last_upl:'+str(prev_id)) or {}
+            exit_guess=_num(snap.get('exit_hint'))
+        conf={'level':exit_guess,'source':'position_disappeared'}
+        pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
+        if pnl is not None and src=='broker':
+            conf['profit']=pnl
+            if ccy:conf['pnl_currency']=ccy
+            self._learn_closed_trade(prev_id,conf)
+        else:
+            # Audit #1: do not freeze last UPL as realized — mark pending and retry.
+            self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
+            self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+            self.store.event('trade','Deal closed; broker cash P&L pending re-request',
+                             {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
+        self.store.event('trade','Previous broker deal no longer open',
+                         {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
+        return pnl,src,ccy
+
+    async def _recover_ghost_open_after_positions_error(self,exc):
+        """positions() REST failed — Capital may already be flat on last_position_id.
+
+        Leaving self.positions unchanged freezes Admin on 'Existing open position',
+        blocks orphan £ reconcile, and clears neural scores while ON.
+        """
+        deal=self.last_position_id
+        if deal is None and self.positions:
+            deal=self.positions[0].get('dealId')
+        if deal is None:
+            return False
+        deal=str(deal)
+        found=None
+        try:
+            found=await self._pnl_from_broker_history(deal)
+        except Exception:
+            found=None
+        if not found:
+            self.store.event('warning','Positions sync failed; ghost open not confirmed closed',
+                {'deal_id':deal,'type':type(exc).__name__})
+            return False
+        pnl,ccy=found
+        exit_guess=_num((self.market or {}).get('mid'))
+        if exit_guess is None:
+            snap=self.store.get('last_upl:'+deal) or {}
+            exit_guess=_num(snap.get('exit_hint'))
+        # Clear ghost BEFORE learn so entry_block_reason cannot stay "Existing open".
+        self.positions=[]
+        self.position_age=0
+        self.last_position_id=None
+        self.last_closed_step=self.brain.core.steps
+        self.latest_close_id=deal
+        conf={'level':exit_guess,'profit':float(pnl),'pnl_currency':self._cash_currency(ccy),
+              'source':'ghost_positions_error_recover'}
+        self._learn_closed_trade(deal,conf)
+        self.store.event('reconcile',
+            'Cleared ghost open after positions API error; Capital history has cash close',
+            {'deal_id':deal,'pnl':float(pnl),'error':type(exc).__name__})
+        return True
+
     async def sync(self):
         if not self.broker:raise RuntimeError('Not connected')
-        latest=self._map_positions(await self.broker.positions())
+        try:
+            raw=await self.broker.positions()
+        except Exception as exc:
+            if await self._recover_ghost_open_after_positions_error(exc):
+                return self.positions
+            raise
+        latest=self._map_positions(raw)
         latest=await self._fill_missing_epic(latest)
-        prev_id=self.last_position_id
+        prev_id=str(self.last_position_id) if self.last_position_id is not None else None
         self.positions=latest
         if len(latest)>1:
             if not self._paused_for_multi:self.store.event('warning','Multiple open positions; autonomous execution suspended')
@@ -1371,37 +1459,9 @@ class SingleTradeEngine:
             self._paused_for_multi=False;self.armed=True;self.execution_enabled=True
             self.store.event('reconcile','Multiple-position conflict resolved; automatic execution resumed')
         current=latest[0]['dealId'] if len(latest)==1 else None
+        if current is not None:current=str(current)
         if prev_id and prev_id!=current:
-            self.last_closed_step=self.brain.core.steps
-            self.latest_close_id=prev_id
-            exit_guess=_num(self.market.get('mid'))
-            # If our CLOSE confirm is in flight, do NOT learn yet — sync() runs
-            # before confirm profit/level and would train on mid + clear entry_brain.
-            if self.pending_close:
-                self.store.close_trade(prev_id,exit_guess,source='pending_close_sync')
-                self.store.event('trade','Deal closed pending broker confirm P&L',
-                                 {'dealId':prev_id,'exit_guess':exit_guess})
-            else:
-                # SL/TP/manual vanish: resolve Capital cash P&L — never settle for ticks_only
-                # when history/UPL still has account-currency profit.
-                if exit_guess is None:
-                    # market may be {} after adopt; last UPL row has no level — keep None.
-                    snap=self.store.get('last_upl:'+str(prev_id)) or {}
-                    exit_guess=_num(snap.get('exit_hint'))
-                conf={'level':exit_guess,'source':'position_disappeared'}
-                pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
-                if pnl is not None and src=='broker':
-                    conf['profit']=pnl
-                    if ccy:conf['pnl_currency']=ccy
-                    self._learn_closed_trade(prev_id,conf)
-                else:
-                    # Audit #1: do not freeze last UPL as realized — mark pending and retry.
-                    self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
-                    self._queue_pending_pnl(prev_id,exit_level=exit_guess)
-                    self.store.event('trade','Deal closed; broker cash P&L pending re-request',
-                                     {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
-                self.store.event('trade','Previous broker deal no longer open',
-                                 {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
+            await self._record_vanished_deal(prev_id)
         if current:
             self.position_age=(self.position_age+1 if current==prev_id else 0)
             self.store.upsert_trade(latest[0])
@@ -1707,7 +1767,11 @@ class SingleTradeEngine:
             else:
                 self.latest_fusion_ready=False
                 self.fusion_block_reason='ohlc: market context not ready'
-                self.last_signal=None  # Never trade stale/incomplete OHLC context.
+                # Flat: never authorize entry on a stale signal. Open book: keep
+                # last scores for Admin (same policy as fusion-gap + open above);
+                # protection still runs from broker levels, not this signal.
+                if not self.positions:
+                    self.last_signal=None
             # Bind the decision-time neural state (captured in submit) to the deal.
             # Fallback: only if we never captured at entry (e.g. manual adopt).
             if len(self.positions)==1:
@@ -2878,8 +2942,8 @@ class SingleTradeEngine:
             for t in self.store.trades(200):
                 if not t.get('closed') or t.get('pnl') is None:continue
                 src=(t.get('pnl_source') or '').strip().lower()
-                if src in ('ticks_only','price_size','pending_close_sync','position_disappeared'):
-                    continue
+                # Match Admin card: only broker cash counts as W/L.
+                if src!='broker':continue
                 try:val=float(t['pnl'])
                 except (TypeError,ValueError):continue
                 if val>0:trade_wins+=1

@@ -265,13 +265,6 @@ def _series_at(bars, bar_time_iso):
     return prior[:-1], exact
 
 
-def _fresh_enough(series, *, now_ts, max_lag_sec=600):
-    if not series or not series.get('bars'):
-        return False
-    last_ts = series['bars'][-1]['ts']
-    return abs(int(now_ts) - int(last_ts)) <= max_lag_sec
-
-
 def build_liquidity_features(snapshot, bar_time, *, now=None):
     """Six bounded EXTERNAL features or None — never pads missing sources with zeros."""
     if not isinstance(snapshot, dict) or not snapshot.get('ok'):

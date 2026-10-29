@@ -43,9 +43,10 @@ DEFAULTS = {
     'model_min_oos': 12,
     'model_max_dd_ratio': 1.15,
     'model_stability_slack': 0.08,
-    'shadow_min_broker_trades': 8,
-    'shadow_rollback_window': 10,
-    'shadow_rollback_delta': 0.5,
+    # Low enough that shadow↔LIVE promote can resolve within a trading day.
+    'shadow_min_broker_trades': 6,
+    'shadow_rollback_window': 8,
+    'shadow_rollback_delta': 0.35,
     # Learning
     'learn_lr': 0.15,
     'learn_win_repeats': 2,

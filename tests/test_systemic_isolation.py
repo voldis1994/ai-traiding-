@@ -2,11 +2,13 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from app.core import client_neural_seed
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
 from app.feature_discovery import FeatureDiscovery, _combinatorial_ids, _build_library
-from app.runtime_hub import RuntimeHub
+from app.runtime_hub import AccountRuntime, RuntimeHub
+from app.stream import CapitalQuoteStream
 
 
 def test_policy_defaults_next_to_store_not_global_data(tmp_path):
@@ -63,3 +65,25 @@ def test_can_rearm_helper_respects_mismatch():
     assert RuntimeHub._can_rearm_after_read(E()) is False
     E._paused_for_mismatch=False
     assert RuntimeHub._can_rearm_after_read(E()) is True
+
+
+def test_client_view_hydrates_scores_from_journal_after_restart(tmp_path):
+    """Admin 0% BUY/HOLD/SELL after update — restore last journaled vote for display."""
+    d=tmp_path/'client_1';d.mkdir()
+    store=Store(d/'robot.sqlite3')
+    brain=AdaptiveBrain(store,data_dir=d,seed=11)
+    engine=SingleTradeEngine(store,brain,policy_path=d/'policy.py')
+    engine.mandate={'epic':'GOLD','size':'0.1'}
+    engine.last_signal=None
+    # Mimic a prior closed-candle vote still in SQLite after process restart.
+    store.db.execute(
+        'INSERT INTO signals(time,epic,action,scores,price,model_step,label) VALUES(?,?,?,?,?,?,?)',
+        ('2024-01-01T00:00:00+00:00','GOLD','BUY',
+         '{"BUY":0.55,"HOLD":0.20,"SELL":0.25}',100.0,10,None))
+    store.db.commit()
+    rt=AccountRuntime(client_id=1,account_id=1,data_dir=d,store=store,brain=brain,
+                      engine=engine,stream=CapitalQuoteStream(),started=True)
+    view=rt.client_view()
+    assert view['action']=='BUY'
+    assert view['scores']['BUY']==pytest.approx(0.55)
+    assert view['signal_from_journal'] is True

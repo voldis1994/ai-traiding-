@@ -35,6 +35,23 @@ class AccountRuntime:
         snap=self.engine.snapshot()
         signal=snap.get('signal') or {}
         scores=signal.get('scores') or {}
+        # After restart last_signal is empty until the first completed M1+fusion
+        # vote — surface the latest journaled scores so admin is not stuck at 0%.
+        if not signal.get('action') and not any(scores.values()):
+            try:
+                rows=self.store.signals(1)
+                if rows:
+                    raw=rows[0].get('scores')
+                    if isinstance(raw,str):
+                        import json as _json
+                        raw=_json.loads(raw)
+                    if isinstance(raw,dict) and any(raw.values()):
+                        scores=raw
+                        signal={**signal,'action':rows[0].get('action'),
+                                'confidence':max((float(v) for v in raw.values() if v is not None),default=None),
+                                'from_journal':True}
+            except Exception:
+                pass
         neural=snap.get('neural') or {}
         mandate=snap.get('mandate')
         positions=snap.get('positions') or []
@@ -55,13 +72,17 @@ class AccountRuntime:
             },
             'action':signal.get('action'),
             'confidence':signal.get('confidence'),
+            'signal_from_journal':bool(signal.get('from_journal')),
             'evolution':{
-                'generation':int(snap.get('code_generation') or code.get('generation') or 0),
+                # Paaudze = LIVE neural advances only (learning_generation).
+                'generation':int(snap.get('learning_generation') or snap.get('code_generation') or 0),
                 'learning_generation':int(snap.get('learning_generation') or 0),
                 'policy_generation':int(snap.get('policy_generation') or code.get('generation') or 0),
                 'strategy':code.get('strategy'),
                 'attempts':int(code.get('attempts') or 0),
-                'last_reason':code.get('last_reason'),
+                'last_reason':(snap.get('neural_adapt_reason') or code.get('last_reason')),
+                'neural_adapt_reason':snap.get('neural_adapt_reason'),
+                'model_version':neural.get('model_version') or snap.get('neural',{}).get('model_version'),
                 'labeled_samples':int(snap.get('labeled_samples') or 0),
                 'neurons':neural.get('neurons'),
                 'steps':neural.get('steps'),
@@ -203,8 +224,8 @@ class RuntimeHub:
                 # Never fall back to position.currency (GOLD quote USD ≠ account GBP).
                 'account_currency':account_currency,
                 'evolution':{
-                    'generation':int(evo.get('generation') or snap.get('code_generation')
-                                     or policy_info.get('generation') or 0),
+                    'generation':int(evo.get('learning_generation') or snap.get('learning_generation')
+                                     or evo.get('generation') or snap.get('code_generation') or 0),
                     'learning_generation':int(evo.get('learning_generation')
                                              or snap.get('learning_generation') or 0),
                     'policy_generation':int(evo.get('policy_generation')
@@ -221,7 +242,10 @@ class RuntimeHub:
                     'utility_mean':neural.get('utility_mean'),
                     'strategy':evo.get('strategy') or policy_info.get('strategy'),
                     'attempts':int(policy_info.get('attempts') or evo.get('attempts') or 0),
-                    'last_reason':policy_info.get('last_reason') or evo.get('last_reason'),
+                    'last_reason':(snap.get('neural_adapt_reason') or evo.get('neural_adapt_reason')
+                                   or evo.get('last_reason') or policy_info.get('last_reason')),
+                    'neural_adapt_reason':snap.get('neural_adapt_reason') or evo.get('neural_adapt_reason'),
+                    'model_version':neural.get('model_version'),
                 },
                 'activity':{
                     'tick_count':int(view.get('tick_count') or snap.get('tick_count') or 0),

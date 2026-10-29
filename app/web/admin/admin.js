@@ -84,7 +84,8 @@ function renderCard(c){
       <div><span>Signāls</span><br><strong>${c.action||'—'}</strong></div>
       <div><span>Neironi</span><br><strong>${e.neurons??'—'}</strong></div>
       <div><span>Soļi</span><br><strong>${e.steps??0}</strong></div>
-      <div><span>Paaudze / mēģinājumi</span><br><strong>${e.generation??0} / ${e.attempts??0}</strong></div>
+      <div><span>Paaudze (neironi)</span><br><strong>${e.learning_generation??e.generation??0}</strong></div>
+      <div><span>Modeļa versija</span><br><strong>${e.model_version??0}</strong></div>
       <div><span>Mācību paraugi</span><br><strong>${e.labeled_samples??0}</strong></div>
       <div><span>Precizitāte</span><br><strong>${pct(e.accuracy_proxy)}</strong></div>
       <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
@@ -93,7 +94,7 @@ function renderCard(c){
       <div><span>P&amp;L (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
       <div><span>W / L</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.win_rate)})</strong></div>
     </div>
-    <div class="muted small">${e.last_reason?('Evo: '+e.last_reason+' · '):''}${a.entry_block_reason||a.error||c.last_start_error||a.last_start_error||''}</div>
+    <div class="muted small">${e.neural_adapt_reason||e.last_reason||''}${(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)?(' · '+(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)):''}</div>
     <div class="trades">${trades}</div>
     <div class="actions">
       <button type="button" class="btn tiny" data-act="start" data-id="${c.id}">Start</button>

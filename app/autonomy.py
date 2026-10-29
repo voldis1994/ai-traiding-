@@ -18,6 +18,7 @@ from pathlib import Path
 from .storage import DATA
 
 ROOT=Path(__file__).resolve().parent.parent
+# Legacy default only — prefer store.path.parent/'policy.py' (hub always passes path).
 POLICY=DATA/'active_policy.py'
 
 # Whitelisted, explicit policy shapes. Each candidate is a whole Python module.
@@ -172,7 +173,12 @@ EDGE_POLICY_KINDS=('edge','edge_vs_hold','edge_hold_cushion')
 
 
 class AutoEvolution:
-    def __init__(self,store,path=POLICY):
+    def __init__(self,store,path=None):
+        # Bind policy file to the same directory as the robot journal when possible
+        # so multi-tenant clients never share DATA/active_policy.py by accident.
+        if path is None:
+            parent=Path(store.path).parent if hasattr(store,'path') and store.path else DATA
+            path=parent/'policy.py' if parent!=DATA else POLICY
         self.store=store;self.path=Path(path)
         self.path.parent.mkdir(parents=True,exist_ok=True)
         if not self.path.exists():self.path.write_text(DEFAULT,encoding='utf8')

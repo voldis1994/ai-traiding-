@@ -199,6 +199,23 @@ def _make_ret_diff(h1, h2):
     return fn
 
 
+def _combinatorial_ids(horizons=None):
+    """Ids that belong to one client's gen_horizons — not another client's leftovers."""
+    hs=tuple(horizons) if horizons else _SEED_GEN_HORIZONS
+    ids=set()
+    for h in hs:
+        ids.update({
+            f'gen_ret_{h}',f'gen_range_pos_{h}',f'gen_wick_imb_{h}',
+            f'gen_body_mean_{h}',f'gen_spread_atr_{h}',
+        })
+    pairs=[(hs[i],hs[j]) for i in range(len(hs)) for j in range(i+1,len(hs)) if hs[j]>=hs[i]*2][:8]
+    for s,l in pairs or ((3,13),(5,21)):
+        ids.add(f'gen_atr_ratio_{s}_{l}')
+    for a,b in pairs or ((3,8),(5,13)):
+        ids.add(f'gen_ret_diff_{a}_{b}')
+    return ids
+
+
 def _generate_combinatorial(horizons=None):
     """Open-ended OHLC algebra — horizons come from self_params when provided."""
     global _GENERATED
@@ -330,13 +347,18 @@ class FeatureDiscovery:
     def search(self, bars, *, spread=0., registry=None, bar_time=None, limit=None):
         """Rotate through library; skip cooling-off rejects so other formulas get tried."""
         p=self._params()
-        _build_library(horizons=p.get('gen_horizons'))
+        horizons=p.get('gen_horizons')
+        _build_library(horizons=horizons)
         limit=int(p['search_limit'] if limit is None else limit)
         keep=int(p['max_proposals_kept'])
         exclude=set(BASE_NAMES)
         if registry is not None:
             exclude |= set(registry.approved_names())|set(registry.approved_ids())
-        library=list_library(exclude_names=exclude)
+        # Scope gen_* proposals to THIS store's horizons — other clients may have
+        # registered extra gens into the process-global library.
+        mine=_combinatorial_ids(horizons)
+        library=[spec for spec in list_library(exclude_names=exclude)
+                 if (not str(spec['id']).startswith('gen_')) or spec['id'] in mine]
         if not library:return []
         self.search_rounds+=1
         n=len(library)
@@ -371,7 +393,7 @@ class FeatureDiscovery:
         self._save()
         if found:
             self.store.event('discovery','Feature candidates proposed (rotated library)',
-                {'count':len(found),'library':len(CANDIDATE_LIBRARY),'bar_time':bar_time,
+                {'count':len(found),'library':len(library),'bar_time':bar_time,
                  'ids':[x['id'] for x in found],'cursor':self.cursor,
                  'cooling':len([1 for k in self.rejected if self._is_cooling(k)]),
                  'search_limit':limit})

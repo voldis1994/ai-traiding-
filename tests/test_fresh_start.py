@@ -41,7 +41,10 @@ def _seed_platform(data: Path, *, clients=1):
 def _seed_learning(folder: Path):
     folder.mkdir(parents=True, exist_ok=True)
     for name in ('robot.sqlite3', 'robot.sqlite3-wal', 'robot.sqlite3-shm',
-                 'brain.npz', 'brain_abc.npz', 'policy.py', 'active_policy.py'):
+                 'brain.npz', 'brain_abc.npz', 'policy.py', 'active_policy.py',
+                 'policy.previous.py', 'policy.next.py', 'policy.before_edge_v2.py',
+                 'active_policy.previous.py', 'economic_calendar.json',
+                 'liquidity_snapshot.json'):
         (folder / name).write_bytes(b'old-learning-' + name.encode())
 
 
@@ -69,8 +72,10 @@ class TestFreshStart(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT username FROM admins').fetchone()[0], 'admin')
             conn.close()
 
-            # Learning artifacts gone from live data tree.
-            for name in ('robot.sqlite3', 'brain.npz', 'active_policy.py', 'policy.py'):
+            # Learning artifacts gone from live data tree (incl. policy rollback siblings).
+            for name in ('robot.sqlite3', 'brain.npz', 'active_policy.py', 'policy.py',
+                         'policy.previous.py', 'policy.next.py', 'policy.before_edge_v2.py',
+                         'active_policy.previous.py'):
                 self.assertFalse((data / name).exists(), name)
                 self.assertFalse((data / 'accounts' / 'client_1' / name).exists(), name)
 

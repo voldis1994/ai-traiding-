@@ -32,7 +32,7 @@ from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
 from .market_fusion import (
     FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES,
-    fusion_gap_reason,
+    fusion_gap_reason, fusion_liquidity_tail,
 )
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
@@ -913,6 +913,9 @@ class SingleTradeEngine:
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
         self.fusion_block_reason=None  # which EXTERNAL source blocks new fused entry
+        # Last good liquidity EXTERNAL tail — carry forward when public volume/DOM
+        # lags the completed M1 so OPEN does not miss the move waiting on the feed.
+        self._last_good_liquidity=None
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
         self.last_entry_audit_key=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
@@ -1075,6 +1078,7 @@ class SingleTradeEngine:
         self.last_error=None;self.account={};self.last_entry_audit_key=None
         self.latest_fusion_ready=False
         self.fusion_block_reason=None
+        self._last_good_liquidity=None
         self.last_calendar_refresh=0.;self.calendar_feed_error=None
         self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
@@ -1919,7 +1923,8 @@ class SingleTradeEngine:
                     self.mandate['epic'],self.news_calendar_path,self.instrument_profile['currencies'],
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                     fusion_schema=self.brain.fusion_schema,
-                    liquidity_path=self.liquidity_path)
+                    liquidity_path=self.liquidity_path,
+                    liquidity_fallback=self._last_good_liquidity)
                 # After restart with an open position, peers/calendar/liquidity stay
                 # background-only — fusion never becomes ready and admin shows BUY/
                 # HOLD/SELL 0% forever. One blocking warm-up restores the first vote.
@@ -1938,10 +1943,16 @@ class SingleTradeEngine:
                         self.instrument_profile['currencies'],
                         now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                         fusion_schema=self.brain.fusion_schema,
-                        liquidity_path=self.liquidity_path)
+                        liquidity_path=self.liquidity_path,
+                        liquidity_fallback=self._last_good_liquidity)
                 self.latest_fusion_ready=fused is not None
                 if fused is not None:
                     self.fusion_block_reason=None
+                    # Remember live (or carried) liquidity so a lagging public feed
+                    # cannot freeze the next M1 OPEN while the move finishes.
+                    tail=fusion_liquidity_tail(fused,ohlc_dim=self.brain.ohlc_dim)
+                    if tail is not None:
+                        self._last_good_liquidity=tail
                 else:
                     # Name the EXTERNAL source that blocks a new fused decision.
                     self.fusion_block_reason=fusion_gap_reason(
@@ -1949,7 +1960,8 @@ class SingleTradeEngine:
                         self.mandate['epic'],self.news_calendar_path,
                         self.instrument_profile['currencies'],
                         now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
-                        liquidity_path=self.liquidity_path)
+                        liquidity_path=self.liquidity_path,
+                        liquidity_fallback=self._last_good_liquidity)
                 # Prefer fusion when ready. After fusion-model transition, a gap
                 # must NOT drive a NEW entry from a stale prior signal. Open
                 # position protection continues below regardless of fusion.

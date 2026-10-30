@@ -25,6 +25,27 @@ def test_release_after_flat_clears_protect_and_rearms():
         assert e.armed and e.execution_enabled
 
 
+def test_release_after_flat_clears_stale_open_and_rearms():
+    """Leftover OPEN UNCERTAIN used to keep Execution paused after every close."""
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        e.armed=False;e.execution_enabled=False;e.operator_paused=False
+        e._unresolved_at_login=True
+        e._paused_for_read=True
+        e.positions=[]
+        oid=store.order('OPEN',None,{'epic':'GOLD','direction':'BUY','size':'0.02'})
+        store.order_update(oid,'UNCERTAIN','stale-open')
+        n=e._release_execution_after_flat('closed1')
+        assert n==1
+        assert not store.unresolved()
+        assert e.armed and e.execution_enabled
+        assert e._unresolved_at_login is False
+        assert e._paused_for_read is False
+        reason=e.snapshot().get('entry_block_reason') or ''
+        assert reason!='Execution paused'
+
+
 def test_release_respects_operator_pause():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
@@ -70,6 +91,41 @@ def test_vanished_deal_rearms_after_protect_uncertain():
     asyncio.run(scenario())
 
 
+def test_trail_exception_when_still_open_does_not_pause():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            e=SingleTradeEngine(store,brain)
+            broker=HistoryBroker()
+            broker.open=[{'position':{'dealId':'live1','size':'.02','direction':'BUY',
+                'level':100,'upl':0.01,'currency':'GBP','stopLevel':99.0},
+                'market':{'epic':'GOLD'}}]
+            e.attach(broker)
+            e.armed=True;e.execution_enabled=True
+            e.mandate={'epic':'GOLD','size':'0.02'}
+            e.positions=[{'dealId':'live1','epic':'GOLD','direction':'BUY','level':100.,
+                          'stopLevel':99.0,'profitLevel':None,'size':'0.02'}]
+            e.protection_brief={}
+            async def boom(*a,**k):
+                raise RuntimeError('broker blip')
+            broker.update_position=boom
+            oid=store.order('PROTECT','live1',{'stop':99.2,'profit':None,'tick':0.1})
+            # Simulate adapt_protection except-path: still open → must NOT pause.
+            try:
+                await broker.update_position('live1',stop_level=99.2,profit_level=None)
+            except Exception as exc:
+                if not await e._position_still_open('live1'):
+                    store.order_update(oid,'SUPERSEDED')
+                    e._release_execution_after_flat('live1')
+                else:
+                    store.order_update(oid,'SUPERSEDED')
+                    e.store.event('warning','Trail uncertain without pause',
+                                  {'type':type(exc).__name__})
+            assert e.armed and e.execution_enabled
+            assert not store.unresolved()
+    asyncio.run(scenario())
+
+
 def test_trail_exception_when_flat_does_not_pause():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
@@ -92,8 +148,6 @@ def test_trail_exception_when_flat_does_not_pause():
                 raise RuntimeError('position gone')
             broker.update_position=boom
             broker.open=[]  # already flat
-            # Force a trail proposal path by seeding prior extreme + forcing proposal:
-            # if no proposal, adapt returns early — call the except path via direct helper.
             assert await e._position_still_open('flat1') is False
             oid=store.order('PROTECT','flat1',{'stop':99.2,'profit':None,'tick':0.1})
             try:
@@ -106,4 +160,21 @@ def test_trail_exception_when_flat_does_not_pause():
                     raise AssertionError(exc)
             assert e.armed and e.execution_enabled
             assert not store.unresolved()
+    asyncio.run(scenario())
+
+
+def test_protect_missing_min_distance_does_not_disable_execution():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            e=SingleTradeEngine(store,brain)
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.armed=True;e.execution_enabled=True
+            e.mandate={'epic':'GOLD','size':'0.02'}
+            e.market={'tick':0.1,'mid':100.,'spread':0.1}  # no min_distance
+            await e.protect_position({
+                'dealId':'p1','epic':'GOLD','direction':'BUY','level':100.,
+                'stopLevel':None,'profitLevel':None})
+            assert e.armed and e.execution_enabled
     asyncio.run(scenario())

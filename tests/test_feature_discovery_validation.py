@@ -161,8 +161,8 @@ def test_brain_apply_registry_expands_fusion_ready_network():
         assert grew and brain.ohlc_dim==FEATURE_DIM+1 and brain.core.d==FEATURE_DIM+1
 
 
-def test_registry_shrink_does_not_crash_start():
-    """After feature wipe, registry can be smaller than brain.npz — Start must live."""
+def test_registry_shrink_realigns_brain_to_live_features():
+    """After feature wipe, brain must shrink — else fusion gap 13!=14 forever."""
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
         brain=AdaptiveBrain(store,data_dir=d)
@@ -171,15 +171,35 @@ def test_registry_shrink_does_not_crash_start():
         reg.approve({'id':'gap_open_1m','name':'gap_open_1m','formula':'gap','source':'t'})
         brain.apply_registry(reg)
         assert brain.core.d==FEATURE_DIM+1
-        before_d=brain.core.d
-        before_ohlc=brain.ohlc_dim
-        # Wipe approved features (as "Mācīties no jauna" may) while weights stay large.
+        assert brain.ohlc_dim==FEATURE_DIM+1
+        # Wipe approved features (as "Mācīties no jauna" may).
         store.set('feature_registry_v1',{'approved':[]})
         empty=FeatureRegistry(store)
         assert empty.ohlc_dim()==FEATURE_DIM
         assert brain.apply_registry(empty) is False
-        assert brain.core.d==before_d
-        assert brain.ohlc_dim==before_ohlc
+        assert brain.core.d==FEATURE_DIM
+        assert brain.ohlc_dim==FEATURE_DIM
+
+
+def test_fusion_registry_shrink_drops_dynamic_keeps_external():
+    """Guntis-style: fusion brain at 14 OHLC + EXTERNAL after wipe → 13 + EXTERNAL."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        brain=AdaptiveBrain(store,data_dir=d)
+        brain.tick(100,.05,.01,'GOLD',features=[.1]*FEATURE_DIM,bar_time=BASE.isoformat())
+        brain._extend_to_external_features()
+        assert brain.core.d==FUSION_DIM
+        reg=FeatureRegistry(store)
+        reg.approve({'id':'gap_open_1m','name':'gap_open_1m','formula':'gap','source':'t'})
+        brain.apply_registry(reg)
+        assert brain.ohlc_dim==FEATURE_DIM+1
+        assert brain.core.d==fusion_dim_for(FEATURE_DIM+1)
+        store.set('feature_registry_v1',{'approved':[]})
+        empty=FeatureRegistry(store)
+        brain.apply_registry(empty)
+        assert brain.ohlc_dim==FEATURE_DIM
+        assert brain.fusion_dim==FUSION_DIM
+        assert brain.core.d==FUSION_DIM
 
 
 def test_profit_learning_refuses_fake_plus_minus_one():

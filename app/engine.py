@@ -599,16 +599,34 @@ class AdaptiveBrain:
             self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
             return False
         if self.core.d>target:
-            # After "Mācīties no jauna" / feature prune the Store registry can be
-            # smaller than a previously expanded brain.npz. Shrinking weights
-            # needs an explicit rollback path — never crash robot Start.
-            self.store.event('warning',
-                'Feature registry smaller than neural inputs; keeping expanded weights',
-                {'epic':self.epic,'brain_inputs':self.core.d,'registry_inputs':target,
-                 'schema':schema,'action':'skip_shrink'})
-            # Keep previous dims in sync with the live weight matrix.
-            self.ohlc_dim=prev_ohlc_dim;self.fusion_dim=prev_fus_dim
-            self.ohlc_schema=prev_ohlc_s;self.fusion_schema=prev_fus_s
+            # Registry wiped DYNAMIC features but brain.npz stayed wide — that
+            # used to skip_shrink and freeze LIVE with fusion gap 13!=14.
+            # Drop DYNAMIC columns; keep BASE (+ EXTERNAL on fusion) weights.
+            # Fusion layout: remove at new OHLC end (before EXTERNAL block).
+            # OHLC-only: remove trailing DYNAMIC columns at `target`.
+            remove_at=ohlc_d if on_fusion else target
+            try:
+                self.core.shrink_inputs(target,remove_at=remove_at)
+            except (ValueError,AttributeError) as exc:
+                self.store.event('warning',
+                    'Feature registry smaller than neural inputs; shrink failed — keeping weights',
+                    {'epic':self.epic,'brain_inputs':self.core.d,'registry_inputs':target,
+                     'schema':schema,'error':str(exc)[:160],'action':'skip_shrink'})
+                self.ohlc_dim=prev_ohlc_dim;self.fusion_dim=prev_fus_dim
+                self.ohlc_schema=prev_ohlc_s;self.fusion_schema=prev_fus_s
+                return False
+            self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
+            self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
+            self.feature_schema=schema
+            self.pending.clear()
+            self.core.last_transition=None
+            self.model_version+=1
+            self.store.event('learning',
+                'Neural inputs shrunk to match FeatureRegistry (dropped DYNAMIC columns)',
+                {'epic':self.epic,'inputs':target,'schema':schema,
+                 'remove_at':remove_at,'layout':'base|dynamic|external',
+                 'model_version':self.model_version})
+            self.save()
             return False
         self.ohlc_dim=ohlc_d;self.fusion_dim=fus_d
         self.ohlc_schema=ohlc_s;self.fusion_schema=fus_s
@@ -1465,19 +1483,25 @@ class SingleTradeEngine:
         return pnl,src,ccy
 
     def _release_execution_after_flat(self,deal_id=None):
-        """After broker flat: drop PROTECT/CLOSE leftovers and re-arm if safe.
+        """After broker flat: drop journal leftovers and re-arm for the next OPEN.
 
-        Without this, every SL/TP fill that overlapped a trail PUT left
-        execution_enabled=False until manual Resume.
+        SL/TP fills often race trail PROTECT PUTs (UNCERTAIN) and used to leave
+        Execution paused until manual Resume. When Capital is flat we also drop
+        stale OPEN rows — leftover `_unresolved_at_login` must not keep freezing
+        every close.
         """
         deal=str(deal_id) if deal_id is not None else None
+        flat=not self.positions
         cleared=0
         for op in list(self.store.unresolved()):
             kind=op.get('kind')
             op_deal=str(op.get('deal_id') or '') or None
-            if kind not in ('PROTECT','CLOSE'):
-                continue
-            if deal is not None and op_deal not in (None,deal):
+            if kind in ('PROTECT','CLOSE'):
+                if deal is not None and op_deal not in (None,deal):
+                    continue
+            elif kind=='OPEN' and flat:
+                pass  # flat book: stale OPEN cannot be live
+            else:
                 continue
             self.store.order_update(op['id'],'SUPERSEDED',op.get('reference'))
             cleared+=1
@@ -1486,17 +1510,21 @@ class SingleTradeEngine:
                  'previous_status':op.get('status')})
         self._unresolved_at_login=bool(self.store.unresolved())
         self.pending_close=False
-        if (self.operator_paused or self._paused_for_multi or self._paused_for_mismatch
-                or self._paused_for_read or self._unresolved_at_login):
+        self.pending_order=False
+        if self.operator_paused or self._paused_for_multi or self._paused_for_mismatch:
             return cleared
         if self.positions:
             return cleared
+        # Flat + not operator/multi/mismatch: always re-arm. Read-path pause and
+        # leftover journal noise must not stick "Execution paused" after every close.
+        self._paused_for_read=False
+        self._unresolved_at_login=False
         was_paused=not (self.armed and self.execution_enabled)
         self.armed=True
         self.execution_enabled=True
-        if was_paused:
+        if was_paused or cleared:
             self.store.event('reconcile',
-                'Re-armed after broker flat (trail/protect race must not freeze OPEN)',
+                'Re-armed after broker flat (close must not freeze next OPEN)',
                 {'deal_id':deal,'cleared':cleared})
         return cleared
 
@@ -2230,6 +2258,8 @@ class SingleTradeEngine:
                 self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
                 self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
                                  {'deal_id':deal_id,'reference':ref,'pnl_source':src})
+            # Confirmed close must leave the robot armed for the next OPEN.
+            self._release_execution_after_flat(deal_id)
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _account_currency(self):
@@ -3140,10 +3170,10 @@ class SingleTradeEngine:
                     'deal_id':p.get('dealId'),'type':type(exc).__name__})
                 self._release_execution_after_flat(p.get('dealId'))
                 return
-            self.store.order_update(oid,'UNCERTAIN')
-            self.armed=False;self.execution_enabled=False
-            self.protection_brief['status']='Uncertain broker PUT; automatic execution suspended'
-            self.store.event('error','Trail protection outcome uncertain; suspended for reconciliation',{
+            # Keep live SL/TP; never freeze the whole robot on a trail glitch.
+            self.store.order_update(oid,'SUPERSEDED')
+            self.protection_brief['status']='Trail uncertain — kept live broker levels (not paused)'
+            self.store.event('warning','Trail protection uncertain; keeping live levels without pause',{
                 'deal_id':p['dealId'],'type':type(exc).__name__,
                 'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                 'broker_error':_safe_broker_error(exc)})
@@ -3155,8 +3185,9 @@ class SingleTradeEngine:
         if self.store.unresolved():return
         min_dist=self.market.get('min_distance');tick=self.market.get('tick');mid=self.market.get('mid')
         if min_dist is None or not tick or not mid:
-            self.store.event('warning','Protection not possible: unsupported broker distance/price rule')
-            self.execution_enabled=False;return
+            # Skip this tick — do NOT disable execution (that froze OPEN after every close).
+            self.store.event('warning','Protection deferred: unsupported broker distance/price rule')
+            return
         candles=self.store.candles(p.get('epic') or self.mandate.get('epic'),n=120,
                                    historical_only=True)
         zone=bracket_learn.zone_at_open(candles)
@@ -3191,8 +3222,11 @@ class SingleTradeEngine:
                     self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
                     self._release_execution_after_flat(p.get('dealId'))
                     return
-                self.armed=False;self.execution_enabled=False
-                self.store.event('error','Protection rejected or could not be reconciled',{'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),'requested_stop':str(stop),'requested_profit':str(profit)})
+                # Rejected while still open — keep existing levels, do not pause.
+                self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
+                self.store.event('warning','Protection rejected; kept live levels without pause',
+                    {'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),
+                     'requested_stop':str(stop),'requested_profit':str(profit)})
         except Exception as exc:
             if not await self._position_still_open(p.get('dealId')):
                 self.store.order_update(order_id,'SUPERSEDED')
@@ -3200,21 +3234,27 @@ class SingleTradeEngine:
                     'deal_id':p.get('dealId'),'type':type(exc).__name__})
                 self._release_execution_after_flat(p.get('dealId'))
                 return
-            self.store.order_update(order_id,'UNCERTAIN')
-            self.armed=False;self.execution_enabled=False
-            self.store.event('error','Position protection uncertain; trading suspended',{'type':type(exc).__name__, 'broker_status':getattr(getattr(exc,'response',None),'status_code',None), 'broker_error':_safe_broker_error(exc), 'deal_id':p.get('dealId'), 'stop_level':str(stop), 'take_profit_level':str(profit)})
+            self.store.order_update(order_id,'SUPERSEDED')
+            self.store.event('warning','Position protection uncertain; kept live levels without pause',
+                {'type':type(exc).__name__,
+                 'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
+                 'broker_error':_safe_broker_error(exc),'deal_id':p.get('dealId'),
+                 'stop_level':str(stop),'take_profit_level':str(profit)})
     async def exit_position(self,deal_id):
         if self.pending_order or self.pending_close or not self.execution_enabled:return
         self.pending_close=True
         oid=self.store.order('CLOSE',deal_id,{'deal_id':deal_id})
         try:
             receipt=await self.broker.close_position(deal_id)
-            if not await self._confirm_reconcile(receipt,oid,'CLOSE',deal_id):
-                if not await self._position_still_open(deal_id):
-                    self.store.order_update(oid,'SUPERSEDED',receipt.get('dealReference'))
-                    self._release_execution_after_flat(deal_id)
-                else:
-                    self.armed=False;self.execution_enabled=False
+            if await self._confirm_reconcile(receipt,oid,'CLOSE',deal_id):
+                self._release_execution_after_flat(deal_id)
+            elif not await self._position_still_open(deal_id):
+                self.store.order_update(oid,'SUPERSEDED',receipt.get('dealReference'))
+                self._release_execution_after_flat(deal_id)
+            else:
+                self.store.order_update(oid,'SUPERSEDED',receipt.get('dealReference'))
+                self.store.event('warning','CLOSE not reconciled while still open; not freezing robot',
+                    {'deal_id':deal_id,'reference':receipt.get('dealReference')})
         except Exception as exc:
             if not await self._position_still_open(deal_id):
                 self.store.order_update(oid,'SUPERSEDED')
@@ -3222,9 +3262,9 @@ class SingleTradeEngine:
                     {'deal_id':deal_id,'type':type(exc).__name__})
                 self._release_execution_after_flat(deal_id)
             else:
-                self.store.order_update(oid,'UNCERTAIN')
-                self.armed=False;self.execution_enabled=False
-                self.store.event('error','Exit outcome uncertain, execution suspended',{'type':type(exc).__name__})
+                self.store.order_update(oid,'SUPERSEDED')
+                self.store.event('warning','Exit outcome uncertain while still open; not freezing robot',
+                    {'type':type(exc).__name__,'deal_id':deal_id})
         finally:self.pending_close=False
     async def submit(self,action,broker_market=None):
         if self.pending_order or self.pending_close or self.positions or not self.armed or not self.execution_enabled or not self.mandate:return

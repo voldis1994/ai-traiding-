@@ -1459,7 +1459,57 @@ class SingleTradeEngine:
                              {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
         self.store.event('trade','Previous broker deal no longer open',
                          {'dealId':prev_id,'pnl':pnl,'pnl_source':src,'pnl_currency':ccy})
+        # SL/TP close often races a trail PROTECT PUT → UNCERTAIN + Execution paused.
+        # Broker is flat: clear that journal noise and re-arm for the next entry.
+        self._release_execution_after_flat(prev_id)
         return pnl,src,ccy
+
+    def _release_execution_after_flat(self,deal_id=None):
+        """After broker flat: drop PROTECT/CLOSE leftovers and re-arm if safe.
+
+        Without this, every SL/TP fill that overlapped a trail PUT left
+        execution_enabled=False until manual Resume.
+        """
+        deal=str(deal_id) if deal_id is not None else None
+        cleared=0
+        for op in list(self.store.unresolved()):
+            kind=op.get('kind')
+            op_deal=str(op.get('deal_id') or '') or None
+            if kind not in ('PROTECT','CLOSE'):
+                continue
+            if deal is not None and op_deal not in (None,deal):
+                continue
+            self.store.order_update(op['id'],'SUPERSEDED',op.get('reference'))
+            cleared+=1
+            self.store.event('reconcile','Cleared stale {0} after broker flat'.format(kind),
+                {'order_id':op['id'],'deal_id':op_deal or deal,
+                 'previous_status':op.get('status')})
+        self._unresolved_at_login=bool(self.store.unresolved())
+        self.pending_close=False
+        if (self.operator_paused or self._paused_for_multi or self._paused_for_mismatch
+                or self._paused_for_read or self._unresolved_at_login):
+            return cleared
+        if self.positions:
+            return cleared
+        was_paused=not (self.armed and self.execution_enabled)
+        self.armed=True
+        self.execution_enabled=True
+        if was_paused:
+            self.store.event('reconcile',
+                'Re-armed after broker flat (trail/protect race must not freeze OPEN)',
+                {'deal_id':deal,'cleared':cleared})
+        return cleared
+
+    async def _position_still_open(self,deal_id):
+        """Fresh broker check — True only if this deal is still listed open."""
+        if not deal_id or not self.broker:
+            return False
+        deal=str(deal_id)
+        try:
+            live=self._map_positions(await self.broker.positions())
+        except Exception:
+            live=list(self.positions or [])
+        return any(str(p.get('dealId'))==deal for p in live)
 
     async def _settle_deal_from_history_cash(self,deal,*,source='history_settle'):
         """Clear open book + bind Capital cash when history already shows the close."""
@@ -1484,6 +1534,7 @@ class SingleTradeEngine:
         self.store.event('reconcile',
             'Open deal settled from Capital history cash',
             {'deal_id':deal,'pnl':float(pnl),'source':source})
+        self._release_execution_after_flat(deal)
         return True
 
     async def _force_close_if_history_settled(self,deal):
@@ -2118,6 +2169,13 @@ class SingleTradeEngine:
         if status=='REJECTED':
             self.store.order_update(order_id,'REJECTED',ref)
             self.store.event('order','Broker rejected order',{'kind':kind,'reference':ref,'reason':confirmation.get('reason')})
+            # PROTECT rejected because SL/TP already closed the deal → not a hang.
+            if kind=='PROTECT' and deal_id and not await self._position_still_open(deal_id):
+                self.store.order_update(order_id,'SUPERSEDED',ref)
+                self.store.event('reconcile','PROTECT rejected after broker already flat',
+                    {'deal_id':deal_id,'reference':ref})
+                self._release_execution_after_flat(deal_id)
+                return True
             return False
         if status!='ACCEPTED':raise RuntimeError('Broker confirmation not final')
         await self.sync()
@@ -2132,7 +2190,16 @@ class SingleTradeEngine:
                 # never epic alone (audit #31).
                 matched=self._order_fully_matched(kind,req,deal_id,confirmation,ref)
                 if matched:break
-        if not matched:raise RuntimeError('Accepted request not reconciled with broker positions')
+        if not matched:
+            # Trail/protect raced broker SL/TP: deal already flat — not a freeze.
+            if kind=='PROTECT' and deal_id and not any(
+                    str(p.get('dealId'))==str(deal_id) for p in (self.positions or [])):
+                self.store.order_update(order_id,'SUPERSEDED',ref)
+                self.store.event('reconcile','PROTECT accepted but deal already flat',
+                    {'deal_id':deal_id,'reference':ref})
+                self._release_execution_after_flat(deal_id)
+                return True
+            raise RuntimeError('Accepted request not reconciled with broker positions')
         self.store.order_update(order_id,'CONFIRMED',ref)
         if kind=='OPEN' and self.positions:
             p=self.positions[0]
@@ -3065,6 +3132,14 @@ class SingleTradeEngine:
                                  {'deal_id':p['dealId'],'stop':stop,'extreme':extreme,
                                   'min_distance':self.market.get('min_distance'),'tick':self.market.get('tick')})
         except Exception as exc:
+            # Common: SL/TP filled while trail PUT was in flight.
+            if not await self._position_still_open(p.get('dealId')):
+                self.store.order_update(oid,'SUPERSEDED')
+                self.protection_brief={'status':'Trail skipped — deal already flat on broker'}
+                self.store.event('reconcile','Trail PUT raced broker close; not suspending',{
+                    'deal_id':p.get('dealId'),'type':type(exc).__name__})
+                self._release_execution_after_flat(p.get('dealId'))
+                return
             self.store.order_update(oid,'UNCERTAIN')
             self.armed=False;self.execution_enabled=False
             self.protection_brief['status']='Uncertain broker PUT; automatic execution suspended'
@@ -3112,9 +3187,19 @@ class SingleTradeEngine:
             if await self._confirm_reconcile(receipt,order_id,'PROTECT',p['dealId']):
                 self.protected.add(p['dealId'])
             else:
+                if not await self._position_still_open(p.get('dealId')):
+                    self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
+                    self._release_execution_after_flat(p.get('dealId'))
+                    return
                 self.armed=False;self.execution_enabled=False
                 self.store.event('error','Protection rejected or could not be reconciled',{'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),'requested_stop':str(stop),'requested_profit':str(profit)})
         except Exception as exc:
+            if not await self._position_still_open(p.get('dealId')):
+                self.store.order_update(order_id,'SUPERSEDED')
+                self.store.event('reconcile','PROTECT raced broker close; not suspending',{
+                    'deal_id':p.get('dealId'),'type':type(exc).__name__})
+                self._release_execution_after_flat(p.get('dealId'))
+                return
             self.store.order_update(order_id,'UNCERTAIN')
             self.armed=False;self.execution_enabled=False
             self.store.event('error','Position protection uncertain; trading suspended',{'type':type(exc).__name__, 'broker_status':getattr(getattr(exc,'response',None),'status_code',None), 'broker_error':_safe_broker_error(exc), 'deal_id':p.get('dealId'), 'stop_level':str(stop), 'take_profit_level':str(profit)})
@@ -3125,11 +3210,21 @@ class SingleTradeEngine:
         try:
             receipt=await self.broker.close_position(deal_id)
             if not await self._confirm_reconcile(receipt,oid,'CLOSE',deal_id):
-                self.armed=False;self.execution_enabled=False
+                if not await self._position_still_open(deal_id):
+                    self.store.order_update(oid,'SUPERSEDED',receipt.get('dealReference'))
+                    self._release_execution_after_flat(deal_id)
+                else:
+                    self.armed=False;self.execution_enabled=False
         except Exception as exc:
-            self.store.order_update(oid,'UNCERTAIN')
-            self.armed=False;self.execution_enabled=False
-            self.store.event('error','Exit outcome uncertain, execution suspended',{'type':type(exc).__name__})
+            if not await self._position_still_open(deal_id):
+                self.store.order_update(oid,'SUPERSEDED')
+                self.store.event('reconcile','CLOSE raced broker flat; not suspending',
+                    {'deal_id':deal_id,'type':type(exc).__name__})
+                self._release_execution_after_flat(deal_id)
+            else:
+                self.store.order_update(oid,'UNCERTAIN')
+                self.armed=False;self.execution_enabled=False
+                self.store.event('error','Exit outcome uncertain, execution suspended',{'type':type(exc).__name__})
         finally:self.pending_close=False
     async def submit(self,action,broker_market=None):
         if self.pending_order or self.pending_close or self.positions or not self.armed or not self.execution_enabled or not self.mandate:return

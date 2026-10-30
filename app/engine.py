@@ -1348,6 +1348,50 @@ class SingleTradeEngine:
             self.armed=True;self.execution_enabled=True
         return not self._unresolved_at_login
 
+    def clear_unresolved_on_operator_resume(self):
+        """Admin/client Resume: drop stale PENDING/UNCERTAIN so re-arm is not frozen.
+
+        reconcile_outstanding() already confirms what Capital can prove. Leftover
+        rows (common: PROTECT UNCERTAIN after trail TP Off, OPEN without ref)
+        used to hard-block Resume forever. Explicit Resume means the operator
+        accepts broker state and wants trading armed again.
+        """
+        leftover=list(self.store.unresolved())
+        if not leftover:
+            self._unresolved_at_login=False
+            return []
+        live_ids={str(p.get('dealId')) for p in (self.positions or []) if p.get('dealId')}
+        cleared=[]
+        for op in leftover:
+            kind=op.get('kind')
+            deal=str(op.get('deal_id') or '') or None
+            ref=op.get('reference')
+            if kind=='CLOSE' and deal and deal not in live_ids:
+                status='CONFIRMED'
+                why='CLOSE already flat on broker at operator resume'
+            elif kind=='OPEN' and len(live_ids)==1:
+                status='SUPERSEDED'
+                why='OPEN journal stale — live broker position already present'
+            elif kind=='PROTECT' and deal and deal in live_ids:
+                status='SUPERSEDED'
+                why='PROTECT uncertain — keep live SL/TP; operator resume accepts broker levels'
+            elif kind=='PROTECT' and deal and deal not in live_ids:
+                status='SUPERSEDED'
+                why='PROTECT for deal no longer open'
+            else:
+                status='SUPERSEDED'
+                why='Stale {0} cleared on operator resume'.format(kind or 'order')
+            self.store.order_update(op['id'],status,ref)
+            self.store.event('reconcile',why,{
+                'order_id':op['id'],'kind':kind,'deal_id':deal,
+                'previous_status':op.get('status'),'reference':ref,
+                'new_status':status})
+            cleared.append({'id':op['id'],'kind':kind,'status':status,'reason':why})
+        self._unresolved_at_login=bool(self.store.unresolved())
+        self.pending_order=False
+        self.pending_close=False
+        return cleared
+
     async def _fill_missing_epic(self,mapped):
         """If positions lack epic but have a name, resolve via Capital.com search."""
         if len(mapped)!=1:return mapped

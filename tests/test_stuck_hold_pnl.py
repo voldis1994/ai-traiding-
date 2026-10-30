@@ -41,10 +41,6 @@ def test_utility_still_blocks_without_readiness():
 def test_snapshot_shows_hold_reason_not_m1_wait_mask():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
-        from app import hard_risk
-        hard_risk.save_operator(store,{
-            'max_risk_per_trade':10,'daily_loss_limit':50,'equity_drawdown_limit':100},
-            reason='test')
         e=SingleTradeEngine(store,brain)
         e.armed=True;e.execution_enabled=True
         e.mandate={'epic':'GOLD','size':0.02}

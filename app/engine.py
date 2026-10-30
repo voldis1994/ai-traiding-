@@ -2010,12 +2010,8 @@ class SingleTradeEngine:
         if not readiness.get('ready'):
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
                     'readiness':readiness,'economic_utility':None,'hard_risk':None}
-        # After #42 catch-up: unset hard-risk limits block EVERY OPEN while
-        # protect/SL-TP still works — surface that before calling it a BUY.
+        # Hard-risk limits are informational only — they never gate LIVE OPEN.
         hr=hard_risk.preflight(self.store)
-        if not hr.get('allowed'):
-            return {'allowed':False,'reason':hr.get('reason') or 'Hard risk blocks OPEN',
-                    'readiness':readiness,'economic_utility':None,'hard_risk':hr}
         if action is not None and action not in ('BUY','SELL'):
             return {'allowed':False,'reason':'No directional action','readiness':readiness,
                     'economic_utility':None,'hard_risk':hr}
@@ -3140,8 +3136,7 @@ class SingleTradeEngine:
                     'min_distance':float(minimum),'kappa':bp['kappa'],
                     'raised_to_broker_min':brackets.get('raised_to_broker_min')})
                 return
-            # Audit #20/#21: fixed mandate size × SL × tick_value vs operator hard limits.
-            # Never auto-shrink size — block OPEN when cash risk exceeds the cap.
+            # Hard-risk is informational only — never block OPEN (operator request).
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
             proposed=None
             if tick_val is not None:
@@ -3150,14 +3145,12 @@ class SingleTradeEngine:
                 except (ValueError,TypeError,ArithmeticError):
                     proposed=None
             gate=self._hard_risk_gate(proposed_risk=proposed)
-            if not gate.get('allowed'):
-                self.last_entry_reason=gate.get('reason') or 'hard risk blocked'
-                self.store.event('risk',self.last_entry_reason,{
-                    'proposed_risk':proposed,'size':str(size),
-                    'stop_ticks':int(brackets['stop_ticks']),
-                    'tick_value':float(tick_val) if tick_val is not None else None,
-                    'limits':gate.get('limits'),'direction':action})
-                return
+            self.store.event('risk','OPEN cash-risk note (not a gate)',{
+                'proposed_risk':proposed,'size':str(size),
+                'stop_ticks':int(brackets['stop_ticks']),
+                'tick_value':float(tick_val) if tick_val is not None else None,
+                'limits':(gate or {}).get('limits'),'direction':action,
+                'open_gated':False})
             self.store.event('bracket','OHLC zone × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
@@ -3241,9 +3234,6 @@ class SingleTradeEngine:
             return 'No adoptive size this session — open a new manual trade'
         if self.last_closed_step<0:
             return 'Waiting for first manually opened trade to close'
-        hr=hard_risk.preflight(self.store)
-        if not hr.get('allowed'):
-            return hr.get('reason') or 'OPEN blocked: hard risk limits'
         if not self.market_context.get('ready'):
             return 'Market context unavailable: '+self.market_context.get('reason','')
         if self._fusion_entry_blocked():
@@ -3254,14 +3244,8 @@ class SingleTradeEngine:
         bar_done=(self.last_entry_processed_bar==self.last_decision_bar
                   and self.last_decision_bar is not None)
         reason=self.last_entry_reason
-        if bar_done and reason:
-            policy=getattr(self,'last_policy_decision',None)
-            text=str(reason)
-            # BUY that failed hard-risk in submit used to look like M1 wait.
-            if (policy=='HOLD' or text.startswith('OPEN blocked')
-                    or 'hard risk' in text.lower()
-                    or 'not configured' in text.lower()):
-                return reason
+        if bar_done and reason and getattr(self,'last_policy_decision',None)=='HOLD':
+            return reason
         if bar_done:
             return 'Waiting for next completed M1 candle'
         if self.last_signal:
@@ -3368,7 +3352,7 @@ class SingleTradeEngine:
                 'neural_exit_intent':raw_exit_intent,
                 'neural_exit_rule':'diagnostic CLOSE intent only — broker SL/TP/trail executes closes; neural market-delete is not a strategy',
                 'hard_risk':hr_snap,
-                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready') and hr_snap.get('configured')),
+                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
                 'entry_policy_reason':evaluation.get('reason') if evaluation else None,

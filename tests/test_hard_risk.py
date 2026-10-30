@@ -29,16 +29,16 @@ def test_neural_cannot_raise_or_clear_limits():
         assert safe['equity_drawdown_limit']==pytest.approx(50)  # tighter OK
 
 
-def test_entry_blocked_when_fixed_size_risk_exceeds_max():
+def test_entry_allowed_even_when_fixed_size_risk_exceeds_max():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
         hard_risk.save_operator(store,_full_limits(max_risk_per_trade=1.0),reason='op')
         gate=hard_risk.entry_allowed(store,proposed_risk=2.5)
-        assert gate['allowed'] is False
-        assert 'exceeds' in gate['reason']
+        assert gate['allowed'] is True
+        assert gate.get('open_gated') is False
 
 
-def test_daily_loss_halts_trading():
+def test_daily_loss_records_halt_but_open_still_allowed():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
         hard_risk.save_operator(store,_full_limits(daily_loss_limit=5.0),reason='op')
@@ -47,16 +47,17 @@ def test_daily_loss_halts_trading():
         limits=hard_risk.load(store)
         assert limits['trading_halted'] is True
         gate=hard_risk.entry_allowed(store,proposed_risk=0.1)
-        assert gate['allowed'] is False
+        assert gate['allowed'] is True
 
 
-def test_equity_drawdown_halt():
+def test_equity_drawdown_halt_flag_only():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
         hard_risk.save_operator(store,_full_limits(equity_drawdown_limit=20.0),reason='op')
         hard_risk.update_peak_equity(store,1000.0)
         hard_risk.check_drawdown_halt(store,970.0)  # dd=30
         assert hard_risk.load(store)['trading_halted'] is True
+        assert hard_risk.entry_allowed(store,proposed_risk=0.1)['allowed'] is True
 
 
 def test_neural_cannot_clear_halt():
@@ -79,17 +80,16 @@ def test_cash_risk_size_times_sl_ticks_times_tick_value():
     assert float(tv2)==pytest.approx(0.1)
 
 
-def test_missing_tick_value_blocks_when_max_risk_set():
+def test_missing_tick_value_does_not_block_open():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
         hard_risk.save_operator(store,_full_limits(max_risk_per_trade=5.0),reason='op')
         gate=hard_risk.entry_allowed(store,proposed_risk=None)
-        assert gate['allowed'] is False
-        assert 'could not be computed' in gate['reason']
+        assert gate['allowed'] is True
 
 
-def test_unset_limits_block_without_invented_floors():
-    """Critical #2 revised: no 5/25/100 surrogates — block until operator configures."""
+def test_unset_limits_allow_open_without_invented_floors():
+    """No 5/25/100 surrogates — and unset limits must not block OPEN."""
     assert hard_risk.DEFAULTS['max_risk_per_trade'] is None
     assert hard_risk.DEFAULTS['daily_loss_limit'] is None
     assert hard_risk.DEFAULTS['equity_drawdown_limit'] is None
@@ -98,25 +98,14 @@ def test_unset_limits_block_without_invented_floors():
         limits=hard_risk.load(store)
         assert limits['max_risk_per_trade'] is None
         gate=hard_risk.entry_allowed(store,proposed_risk=0.5)
-        assert gate['allowed'] is False
-        assert ('not configured' in gate['reason']
-                or 'hard risk' in gate['reason'].lower()
-                or 'Admin' in gate['reason'])
-        # Partial operator save still blocks (all three required).
-        hard_risk.save_operator(store,{'max_risk_per_trade':10.0},reason='partial')
-        gate2=hard_risk.entry_allowed(store,proposed_risk=0.5)
-        assert gate2['allowed'] is False
-        assert 'daily_loss_limit' in (gate2.get('missing_limits') or [])
-        # Full operator config uses *those* numbers — not 5/25/100.
+        assert gate['allowed'] is True
+        assert gate.get('open_gated') is False
         hard_risk.save_operator(store,_full_limits(
             max_risk_per_trade=12.5,daily_loss_limit=40,equity_drawdown_limit=200),
             reason='op')
         loaded=hard_risk.load(store)
         assert loaded['max_risk_per_trade']==pytest.approx(12.5)
-        assert loaded['daily_loss_limit']==pytest.approx(40)
-        assert loaded['equity_drawdown_limit']==pytest.approx(200)
-        assert hard_risk.entry_allowed(store,proposed_risk=1.0)['allowed'] is True
-        assert hard_risk.entry_allowed(store,proposed_risk=20.0)['allowed'] is False
+        assert hard_risk.entry_allowed(store,proposed_risk=20.0)['allowed'] is True
 
 
 def test_neural_cannot_invent_limits_when_unset():

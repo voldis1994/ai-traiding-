@@ -103,12 +103,22 @@ def news_features(epic, calendar_path, currencies, *, now=None):
         return None
 
 
+def _liquidity_vector_ok(values):
+    if not isinstance(values, (list, tuple)) or len(values) != len(LIQUIDITY_NAMES):
+        return False
+    return all(math.isfinite(float(x)) for x in values)
+
+
 def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now=None,
-                      expected_ohlc_dim=None, liquidity_path=None):
+                      expected_ohlc_dim=None, liquidity_path=None,
+                      liquidity_fallback=None):
     """Which EXTERNAL source blocks a fused decision after fusion transition.
 
     Returns None when fusion can be built; otherwise a short operator-facing
     reason naming the blocking feed (peers / news / liquidity / OHLC dim).
+
+    `liquidity_fallback`: last known good liquidity vector — when the live
+    minute has no volume observation, OPEN must not wait out the move.
     """
     if not isinstance(base, dict) or not base.get('ready'):
         return 'ohlc: market context not ready'
@@ -124,18 +134,23 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
     news = news_features(epic, calendar_path, currencies, now=now)
     if news is None:
         return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW'
-    if liquidity_path is None:
+    if liquidity_path is None and not _liquidity_vector_ok(liquidity_fallback):
         return 'liquidity: path not configured'
-    obs = liquidity_observation_from_path(
-        liquidity_path, base.get('bar_time'), now=now, epic=epic)
-    if not obs.get('ok') or obs.get('features') is None:
-        return 'liquidity: ' + (obs.get('reason') or 'volume/DOM observation unavailable')
+    obs = None
+    if liquidity_path is not None:
+        obs = liquidity_observation_from_path(
+            liquidity_path, base.get('bar_time'), now=now, epic=epic)
+    live_ok = bool(obs and obs.get('ok') and obs.get('features') is not None)
+    if not live_ok and not _liquidity_vector_ok(liquidity_fallback):
+        return 'liquidity: ' + ((obs or {}).get('reason')
+                                or 'volume/DOM observation unavailable')
     return None
 
 
 def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=None,
-                    expected_ohlc_dim=None, fusion_schema=None, liquidity_path=None):
-    """Return complete fusion vector or None; never silently fill missing data.
+                    expected_ohlc_dim=None, fusion_schema=None, liquidity_path=None,
+                    liquidity_fallback=None):
+    """Return complete fusion vector or None.
 
     Layout (must match NeuralCore columns): [BASE_OHLC | DYNAMIC | EXTERNAL].
     `base['features']` is already BASE+DYNAMIC from market_context; peers+news+
@@ -143,6 +158,10 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
 
     `expected_ohlc_dim`: when registry has dynamic features, base['features'] must
     match that length. Default = FEATURE_DIM (static base only).
+
+    When the live minute has no fresh volume/DOM, `liquidity_fallback` (last
+    good vector) is used so OPEN is not frozen waiting for a late public feed.
+    Peers/news/OHLC are never invented.
     """
     if not isinstance(base,dict) or not base.get('ready'):
         return None
@@ -154,6 +173,8 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     if liquidity_path is not None:
         liq = liquidity_features_from_path(
             liquidity_path, base.get('bar_time'), now=now, epic=epic)
+    if liq is None and _liquidity_vector_ok(liquidity_fallback):
+        liq = [float(x) for x in liquidity_fallback]
     if liq is None:
         return None
     ohlc = list(base['features'])
@@ -167,6 +188,19 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     if not all(math.isfinite(x) for x in values):
         return None
     return values
+
+
+def fusion_liquidity_tail(fused, *, ohlc_dim=None):
+    """Extract liquidity EXTERNAL tail from a fused vector (for carry-forward)."""
+    if not isinstance(fused, (list, tuple)):
+        return None
+    need = FEATURE_DIM if ohlc_dim is None else int(ohlc_dim)
+    start = need + (len(EXTERNAL_NAMES) - len(LIQUIDITY_NAMES))
+    end = start + len(LIQUIDITY_NAMES)
+    if len(fused) < end:
+        return None
+    tail = list(fused[start:end])
+    return tail if _liquidity_vector_ok(tail) else None
 
 
 def fusion_dim_for(ohlc_dim):

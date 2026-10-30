@@ -3353,7 +3353,7 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','OHLC structure zone × learned raise/cut at open',{
+            self.store.event('bracket','Market OHLC shares × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
@@ -3361,6 +3361,8 @@ class SingleTradeEngine:
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
                 'noise_distance':zone.get('noise_distance'),
                 'structure':zone.get('structure'),
+                'pull_share':zone.get('pull_share'),
+                'favor_share':zone.get('favor_share'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),

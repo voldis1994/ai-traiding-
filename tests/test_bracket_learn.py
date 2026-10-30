@@ -2,6 +2,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.bracket_learn import (
     DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,evolve_from_history,
     load_multipliers,load_params,propose_for_open,recent_reachable_move,
@@ -30,17 +32,18 @@ def test_zone_at_open_computes_kappa_from_moves_not_grid():
     z=zone_at_open(rows)
     assert z['ready'] is True
     assert z['median_up']==3.0 and z['median_down']==1.0
-    assert z['kappa']>=3.0
+    assert z['kappa']==3.0
     assert z['max_tp'] is not None
     assert z['lookback'] is not None and z['lookback']>=3
     assert z['noise_distance']==4.0
     assert z['structure']==4.0
+    assert z['pull_share']==pytest.approx(0.25)
+    assert z['favor_share']==pytest.approx(0.75)
 
 
-def test_zone_sl_uses_structure_not_one_bar_noise():
-    """Choppy 1-bar tips must not set SL — lookback swing pullback should."""
+def test_zone_sl_uses_market_shares_of_structure_not_hardcoded_fractions():
+    """SL/TP shares come from OHLC up/down vs span — not coded 1/3 or 1/2."""
     rows=[]
-    # Drift +0.5 over 20 bars with tiny 0.1 M1 noise → structure >> median span.
     px=100.0
     for i in range(40):
         o=px
@@ -49,10 +52,22 @@ def test_zone_sl_uses_structure_not_one_bar_noise():
     z=zone_at_open(rows)
     assert z['ready'] is True
     assert z['structure'] is not None and z['structure']>z['noise_distance']
-    # SL zone clears structure/3, not only 1-bar median noise.
-    assert z['range_distance']>=z['structure']/3.0-1e-9
-    assert z['range_distance']>z['noise_distance']-1e-9 or z['range_distance']>=z['median_down']
-    assert z['max_tp'] is not None and z['max_tp']>=z['structure']*0.5-1e-9
+    assert z['pull_share'] is not None and z['favor_share'] is not None
+    # Structure scaled by *observed* pull/favor shares from this window.
+    assert z['range_distance']>=z['structure']*z['pull_share']-1e-9
+    assert z['max_tp']>=z['structure']*z['favor_share']-1e-9
+
+
+def test_scratch_on_sl_raises_learned_sl_scale():
+    """Robot widens itself from scratch SL £ — market said stop was too tight."""
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=1.0,pnl=-0.04,exit_reason='sl',
+            stop_distance=0.2,volatility=0.3,adverse_path=0.15)
+        assert out['reason']=='scratch_sl_raise_sl'
+        assert load_multipliers(store)['sl_scale']>before['sl_scale']
 
 
 def test_adaptive_lookback_picks_elbow_from_curve():
@@ -163,10 +178,11 @@ def test_record_outcome_learns_and_batch_raise_when_wide_wins():
 
 
 def test_recent_reachable_move_from_candles():
-    rows=[{'open':100,'high':100+i*0.1,'low':100,'close':100} for i in range(10)]
-    rows.append({'open':100,'high':108,'low':100,'close':104})
+    # Upper-half median of spans — no fixed 90%ile; quiet bars + larger cluster.
+    rows=[{'open':100,'high':100.2,'low':100,'close':100} for _ in range(8)]
+    rows+=[{'open':100,'high':107,'low':100,'close':103} for _ in range(5)]
     got=recent_reachable_move(rows,n=60)
-    assert got is not None and got>=6.8
+    assert got is not None and got>=6.0
 
 
 def test_save_and_load_reject_invalid():

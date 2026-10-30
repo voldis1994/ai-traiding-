@@ -195,8 +195,8 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
 
       tp / profitable trail → reinforce shape that paid
       vanish / unknown without path → hold (no SL widen)
-      scratch / cost-dominated → hold SL (was NOT "too tight" by default);
-                                  optionally cut κ when shape was already wide
+      scratch on SL → raise SL (market noise beat the stop — robot widens itself)
+      scratch / cost-dominated otherwise → hold SL; cut κ if shape already wide
       sl + noise vs vol (tight shape) → raise SL room
       sl + adverse entry path → hold SL (entry direction problem, not distance)
       loss + already-wide shape → cut κ (TP fantasy)
@@ -229,8 +229,12 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     elif reason_x=='vanish':
         reason='vanish_hold'
     elif path['scratch_cash'] or path['cost_dominated']:
-        # Scratch ≠ SL too tight. Old heuristic (raise SL) removed (audit #19).
-        if shape>=wide:
+        # Scratch on SL: this market's noise beat the stop — widen from £ evidence.
+        # Scratch on TP / cost-only: do not invent "SL too tight".
+        if reason_x=='sl' and not path.get('adverse_entry'):
+            s_m=min(MULT_SL_MAX,s_m*float(sched['bracket_sl_noise_step']))
+            reason='scratch_sl_raise_sl'
+        elif shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_scratch_kappa_step']))
             reason='scratch_cut_tp'
         else:
@@ -302,11 +306,12 @@ def kappa_from_ohlc(candles, n: int|None=None) -> float|None:
 
 
 def recent_reachable_move(candles, n: int|None=None) -> float|None:
-    _,_,spans,used=_bar_moves(candles,n)
+    """Robust reachable M1 span — median of the larger half by rank (no fixed %ile)."""
+    _,_,spans,_used=_bar_moves(candles,n)
     if len(spans)<5:return None
-    spans=sorted(spans)
-    robust=spans[max(0,int(len(spans)*0.9)-1)]
-    return float(max(robust,spans[-1]*0.85))
+    ordered=sorted(spans)
+    upper=ordered[len(ordered)//2:]
+    return float(median(upper)) if upper else float(median(ordered))
 
 
 def _window_structure(candles, n: int|None=None) -> float|None:
@@ -331,20 +336,21 @@ def _window_structure(candles, n: int|None=None) -> float|None:
 
 
 def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
-    """SL/TP from recent OHLC — SL clears structure pullback, TP aims at the swing.
+    """SL/TP from *this* market window — no hardcoded 1/3 or 1/2 of structure.
 
-    Previously `range_distance` was only median M1 high−low (noise). That put SL
-    near broker-min on Gold and scratched every 1–3 minutes. Now OPEN uses the
-    lookback peak−trough: SL ≥ max(noise, adverse, structure/3), TP targets at
-    least half the swing so the robot can hold a fuller move.
+    Shares come from OHLC itself: pull_share = median_down/median_span,
+    favor_share = median_up/median_span. Those observed bar shares scale the
+    lookback peak−trough so OPEN tracks how this instrument actually pulls
+    back and extends. Learned κ / sl_scale in propose_for_open then adapts
+    further from cash £ outcomes.
     """
     ups,downs,spans,used=_bar_moves(candles,n)
-    # Reach uses the same adaptive window (or a wider explicit one if given).
     reach=recent_reachable_move(candles,reach_n if reach_n is not None else used)
     structure=_window_structure(candles,used)
     if len(spans)<5:
         return {'kappa':DEFAULT_KAPPA,'range_distance':0.0,'max_tp':reach,
                 'noise_distance':0.0,'structure':structure,
+                'pull_share':None,'favor_share':None,
                 'median_up':None,'median_down':None,'ready':False,'lookback':used}
     med_span=float(median(spans))
     med_up=float(median(ups)) if ups else med_span
@@ -355,22 +361,26 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
         kappa=med_up/med_down
     if not math.isfinite(kappa) or kappa<=0:
         kappa=DEFAULT_KAPPA
-    kappa=max(float(kappa),0.5)
-    # Structure pullback ≈ room for the swing to develop without noise stop-out.
-    pullback=(float(structure)/3.0) if structure and structure>0 else 0.0
-    sl_distance=max(med_span,med_down,pullback)
-    target_bits=[x for x in (reach,med_up,(float(structure)*0.5 if structure else None))
-                 if x is not None and float(x)>0]
+    # How much of a typical bar is adverse vs favorable — measured here, not coded.
+    if med_span>1e-12:
+        pull_share=float(med_down/med_span)
+        favor_share=float(med_up/med_span)
+    else:
+        pull_share=1.0
+        favor_share=1.0
+    if not math.isfinite(pull_share) or pull_share<0:pull_share=1.0
+    if not math.isfinite(favor_share) or favor_share<0:favor_share=1.0
+    struct_sl=(float(structure)*pull_share) if structure and structure>0 else 0.0
+    struct_tp=(float(structure)*favor_share) if structure and structure>0 else 0.0
+    sl_distance=max(med_span,med_down,struct_sl)
+    target_bits=[x for x in (reach,med_up,struct_tp) if x is not None and float(x)>0]
     max_tp=float(max(target_bits)) if target_bits else (float(reach) if reach else None)
-    # Prefer a reward:risk that can reach the swing when OHLC kappa is tiny.
-    if sl_distance>1e-12 and max_tp is not None and max_tp>sl_distance:
-        kappa=max(kappa,float(max_tp)/float(sl_distance))
     return {
         'kappa':float(kappa),
-        # OPEN + protect read this as the SL zone (structure-aware, not 1-bar tip).
         'range_distance':float(sl_distance),
         'noise_distance':float(med_span),
         'structure':float(structure) if structure is not None else None,
+        'pull_share':float(pull_share),'favor_share':float(favor_share),
         'max_tp':float(max_tp) if max_tp is not None else None,
         'median_up':med_up,'median_down':med_down,
         'ready':True,'lookback':used,

@@ -99,7 +99,6 @@ function renderCard(c){
     <div class="actions">
       <button type="button" class="btn tiny" data-act="start" data-id="${c.id}">Start</button>
       <button type="button" class="btn tiny" data-act="stop" data-id="${c.id}">Stop</button>
-      <button type="button" class="btn tiny" data-act="pause" data-id="${c.id}">Pause</button>
       <button type="button" class="btn tiny" data-act="resume" data-id="${c.id}">Resume</button>
       <button type="button" class="btn tiny" data-act="wipe" data-id="${c.id}">Mācīties no jauna</button>
     </div>`;

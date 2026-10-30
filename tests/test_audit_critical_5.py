@@ -24,12 +24,12 @@ def _op_limits(**kw):
 
 
 def test_hard_risk_no_forced_surrogate_floors():
-    """Pre-test #1: PR #34 must not invent 5/25/100 over operator config."""
+    """Defaults stay None (no 5/25/100) and OPEN is never gated by hard-risk."""
     for k in ('max_risk_per_trade','daily_loss_limit','equity_drawdown_limit'):
         assert hard_risk.DEFAULTS[k] is None
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
-        assert hard_risk.entry_allowed(store,proposed_risk=0.1)['allowed'] is False
+        assert hard_risk.entry_allowed(store,proposed_risk=0.1)['allowed'] is True
         hard_risk.save_operator(store,_op_limits(
             max_risk_per_trade=7.5,daily_loss_limit=33,equity_drawdown_limit=150),
             reason='chosen')
@@ -38,6 +38,7 @@ def test_hard_risk_no_forced_surrogate_floors():
         assert lim['daily_loss_limit']==pytest.approx(33)
         assert lim['equity_drawdown_limit']==pytest.approx(150)
         assert hard_risk.entry_allowed(store,proposed_risk=1.0)['allowed'] is True
+        assert hard_risk.entry_allowed(store,proposed_risk=100.0)['allowed'] is True
 
 
 def test_reconcile_open_requires_deal_id_binding(tmp_path):

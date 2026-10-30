@@ -1,12 +1,9 @@
-"""Operator-owned hard risk limits — independent of neural / self_params.
+"""Optional operator hard-risk bookkeeping — does NOT gate LIVE OPEN.
 
-Audit #21: max risk per trade, daily loss limit, equity drawdown limit, and
-trading halt. The model must NOT raise these itself. Only an explicit operator
-save may set or loosen them; neural code may only tighten or leave unchanged.
-
-Critical #2 (revised): monetary limits default to None and are *mandatory to
-configure* — OPEN is blocked until the operator sets all three. Code must never
-invent surrogate floors (5 / 25 / 100) that override the operator's config.
+Audit #21 originally required max risk / daily loss / drawdown. That silently
+froze every AI OPEN after #42 while manual SL/TP still worked. Operator asked
+to remove the OPEN risk gate entirely — limits may still be stored for Admin
+visibility, but entry_allowed / preflight never block a new trade.
 """
 from __future__ import annotations
 import math
@@ -203,74 +200,45 @@ def check_drawdown_halt(store, equity) -> dict:
 
 
 def preflight(store) -> dict:
-    """Halt + configured check for Admin/entry_block — no proposed cash risk yet.
-
-    submit() still calls entry_allowed() with the real size×SL cash risk.
-    """
+    """OPEN is never blocked by hard-risk (operator request: remove risk gate)."""
     limits = load(store)
-    if limits.get('trading_halted'):
-        return {
-            'allowed': False,
-            'reason': 'trading halted: ' + (limits.get('halt_reason') or 'operator halt'),
-            'limits': limits,
-        }
-    missing = missing_limits(limits)
-    if missing:
-        return {
-            'allowed': False,
-            'reason': ('OPEN blocked: set Admin hard risk limits '
-                       f"({', '.join(missing)}) — max £/trade, daily loss, drawdown"),
-            'limits': limits,
-            'missing_limits': missing,
-        }
-    return {'allowed': True, 'reason': 'ok', 'limits': limits}
+    return {
+        'allowed': True,
+        'reason': 'hard risk does not gate OPEN',
+        'limits': limits,
+        'missing_limits': missing_limits(limits),
+        'open_gated': False,
+    }
 
 
 def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
+    """Always allow LIVE OPEN — hard-risk limits are informational only.
+
+    Daily/drawdown bookkeeping may still update peak equity / halt flags for
+    Admin display, but they must not freeze new entries.
+    """
     limits = load(store)
-    pre = preflight(store)
-    if not pre.get('allowed'):
-        return pre
-    limits = pre.get('limits') or limits
+    if equity is not None:
+        update_peak_equity(store, equity)
+        # Record drawdown halt flag for Admin, but do not block OPEN.
+        check_drawdown_halt(store, equity)
+        limits = load(store)
     daily = _daily_state(store, now=now)
     daily_cap = limits.get('daily_loss_limit')
     if daily_cap is not None and daily['realized_pnl'] <= -abs(float(daily_cap)):
-        halt(store, f"daily loss limit hit: realized={daily['realized_pnl']:.4f}")
-        return {
-            'allowed': False,
-            'reason': (f"daily loss limit reached "
-                       f"({daily['realized_pnl']:.4f} \u2264 -{float(daily_cap):.4f})"),
-            'limits': load(store),
-            'daily': daily,
-        }
-    if equity is not None:
-        check_drawdown_halt(store, equity)
+        # Keep halt flag for visibility; OPEN still allowed.
+        halt(store, f"daily loss limit hit: realized={daily['realized_pnl']:.4f} "
+                    f"limit=-{float(daily_cap):.4f}")
         limits = load(store)
-        if limits.get('trading_halted'):
-            return {
-                'allowed': False,
-                'reason': 'trading halted: ' + (limits.get('halt_reason') or 'drawdown'),
-                'limits': limits,
-            }
-    max_risk = float(limits['max_risk_per_trade'])
     risk = _finite(proposed_risk)
-    if risk is None:
-        return {
-            'allowed': False,
-            'reason': ('OPEN blocked: max risk per trade is set but cash risk '
-                       'could not be computed (missing tick value)'),
-            'limits': limits,
-        }
-    if risk > float(max_risk) + 1e-12:
-        return {
-            'allowed': False,
-            'reason': (f"OPEN blocked: fixed size risk {risk:.4f} exceeds "
-                       f"max risk per trade {float(max_risk):.4f}"),
-            'limits': limits,
-            'proposed_risk': float(risk),
-        }
-    return {'allowed': True, 'reason': 'ok', 'limits': limits, 'daily': daily,
-            'proposed_risk': float(risk) if risk is not None else None}
+    return {
+        'allowed': True,
+        'reason': 'ok — hard risk does not gate OPEN',
+        'limits': limits,
+        'daily': daily,
+        'proposed_risk': float(risk) if risk is not None else None,
+        'open_gated': False,
+    }
 
 
 def snapshot(store) -> dict:
@@ -281,7 +249,8 @@ def snapshot(store) -> dict:
         'missing_limits': missing_limits(limits),
         'daily': _daily_state(store),
         'peak_equity': _finite(store.get(PEAK_KEY)) if store is not None else None,
-        'note': ('Hard limits are operator/config-owned; neural cannot raise them. '
-                 'OPEN blocks until Admin sets all three monetary limits.'),
+        'note': ('Hard-risk limits are optional/informational. '
+                 'They do not block LIVE OPEN.'),
+        'open_gated': False,
         'preflight': preflight(store),
     }

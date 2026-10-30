@@ -14,8 +14,7 @@ LEGACY_MODULES = {
 def legacy_offline_external_gate(request,monkeypatch):
     if request.module.__name__.split('.')[-1] not in LEGACY_MODULES:
         return
-    from app import hard_risk
-    from app.engine import SingleTradeEngine, Store
+    from app.engine import SingleTradeEngine
     from app.intermarket import IntermarketMonitor
     async def test_only_calendar_refresh(self):
         self.last_calendar_refresh=1.0
@@ -24,16 +23,6 @@ def legacy_offline_external_gate(request,monkeypatch):
         self.state={'status':'READY','entry_allowed':True,'reason':'Test fixture cross-market readiness',
                     'peers':[]}
         return self.state
-    # After #42 OPEN requires operator hard-risk — seed generous limits for
-    # legacy broker/order cycle tests (production Admin must still configure).
-    _orig_init=SingleTradeEngine.__init__
-    def _init_with_hard_risk(self,store,*args,**kwargs):
-        _orig_init(self,store,*args,**kwargs)
-        if isinstance(store,Store) and not hard_risk.configured(hard_risk.load(store)):
-            hard_risk.save_operator(store,{
-                'max_risk_per_trade':1000,'daily_loss_limit':5000,
-                'equity_drawdown_limit':10000},reason='legacy_test_fixture')
-    monkeypatch.setattr(SingleTradeEngine,'__init__',_init_with_hard_risk)
     monkeypatch.setattr(SingleTradeEngine,'_refresh_calendar_if_due',test_only_calendar_refresh)
     monkeypatch.setattr(SingleTradeEngine,'_news_risk',lambda self: {
         'enabled':True,'entry_allowed':True,'status':'CLEAR','reason':'Test-only external safety fixture'})

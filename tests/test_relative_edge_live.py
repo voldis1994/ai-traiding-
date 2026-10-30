@@ -5,7 +5,6 @@ from pathlib import Path
 from decimal import Decimal
 import numpy as np
 
-from app import hard_risk
 from app.autonomy import AutoEvolution, TEMPLATES
 from app.engine import Store, AdaptiveBrain, SingleTradeEngine
 from tests.test_integration import BrokerSimulation
@@ -84,9 +83,6 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
         install_synthetic_context(monkeypatch, direction=direction)
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
-            hard_risk.save_operator(s,{
-                'max_risk_per_trade':100,'daily_loss_limit':500,'equity_drawdown_limit':1000},
-                reason='test')
             e=SingleTradeEngine(s,brain);e.policy=AutoEvolution(s,Path(d)/'policy.py')
             broker=BrokerSimulation();e.attach(broker)
             await e.poll()  # manual adoption + existing protection

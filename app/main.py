@@ -76,8 +76,15 @@ async def worker():
             except Exception:
                 pass
             if error_count>=3:
-                if engine.armed or engine.execution_enabled:engine._paused_for_read=True
-                engine.armed=False;engine.execution_enabled=False
+                # Never auto-pause — only operator Pause freezes OPEN.
+                try:
+                    store.event('warning',
+                        'Repeated broker/engine errors; keeping execution live',
+                        {'count':error_count})
+                except Exception:
+                    pass
+                if hasattr(engine,'_ensure_live_unless_operator_paused'):
+                    engine._ensure_live_unless_operator_paused()
         await asyncio.sleep(3 if error_count<3 else 10)
 
 @asynccontextmanager

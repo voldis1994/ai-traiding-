@@ -1101,7 +1101,25 @@ class SingleTradeEngine:
         self._seen_initial=False
         self.last_closed_step=-1
         if self._unresolved_at_login:
-            self.execution_enabled=False;self.store.event('warning','Previous order outcome unresolved; waiting for reconciliation')
+            # Never auto-pause — clear stale journal noise; operator Pause is the only freeze.
+            self.store.event('warning',
+                'Previous order outcome unresolved at login; clearing without pause')
+            self.clear_unresolved_on_operator_resume()
+            self._ensure_live_unless_operator_paused()
+    def _ensure_live_unless_operator_paused(self):
+        """Only explicit operator Pause may freeze OPEN. Auto-pause paths are banned."""
+        if self.operator_paused:
+            self.armed=False
+            self.execution_enabled=False
+            return False
+        self._paused_for_read=False
+        self._paused_for_multi=False
+        self._paused_for_mismatch=False
+        self._unresolved_at_login=False
+        self.armed=True
+        self.execution_enabled=True
+        return True
+
     def _reload_instrument_components(self):
         """Rebind in-memory learning objects after an instrument bag switch."""
         self.feature_registry=FeatureRegistry(self.store)
@@ -1511,20 +1529,13 @@ class SingleTradeEngine:
         self._unresolved_at_login=bool(self.store.unresolved())
         self.pending_close=False
         self.pending_order=False
-        if self.operator_paused or self._paused_for_multi or self._paused_for_mismatch:
-            return cleared
+        was_frozen=not (self.armed and self.execution_enabled)
+        self._ensure_live_unless_operator_paused()
         if self.positions:
             return cleared
-        # Flat + not operator/multi/mismatch: always re-arm. Read-path pause and
-        # leftover journal noise must not stick "Execution paused" after every close.
-        self._paused_for_read=False
-        self._unresolved_at_login=False
-        was_paused=not (self.armed and self.execution_enabled)
-        self.armed=True
-        self.execution_enabled=True
-        if was_paused or cleared:
+        if (was_frozen or cleared) and not self.operator_paused:
             self.store.event('reconcile',
-                'Re-armed after broker flat (close must not freeze next OPEN)',
+                'Re-armed after broker flat (auto-pause removed)',
                 {'deal_id':deal,'cleared':cleared})
         return cleared
 
@@ -1612,11 +1623,14 @@ class SingleTradeEngine:
         prev_id=str(self.last_position_id) if self.last_position_id is not None else None
         self.positions=latest
         if len(latest)>1:
-            if not self._paused_for_multi:self.store.event('warning','Multiple open positions; autonomous execution suspended')
-            self.armed=False;self.execution_enabled=False;self._paused_for_multi=True
-        elif self._paused_for_multi and len(latest)<=1 and not self.operator_paused and not self.store.unresolved():
-            self._paused_for_multi=False;self.armed=True;self.execution_enabled=True
-            self.store.event('reconcile','Multiple-position conflict resolved; automatic execution resumed')
+            # Do not pause — submit() already refuses OPEN while any position is open.
+            if not self._paused_for_multi:
+                self.store.event('warning',
+                    'Multiple open positions; new OPEN skipped until flat (not paused)')
+            self._paused_for_multi=True
+        elif self._paused_for_multi:
+            self._paused_for_multi=False
+            self.store.event('reconcile','Multiple-position conflict resolved')
         current=latest[0]['dealId'] if len(latest)==1 else None
         if current is not None:current=str(current)
         if prev_id and prev_id!=current:
@@ -1762,18 +1776,14 @@ class SingleTradeEngine:
             except (ValueError,TypeError,ArithmeticError):mismatch=True
         if mismatch:
             if not self._paused_for_mismatch:
-                self.store.event('warning','Position instrument/size differs from adopted trade; execution suspended')
+                self.store.event('warning',
+                    'Position instrument/size differs from adopted trade; OPEN skipped (not paused)')
             self._paused_for_mismatch=True
-            self.execution_enabled=False;self.armed=False
         elif self._paused_for_mismatch:
-            # Only clear this specific pause when the broker reports a safe
-            # position state. Other pauses and unresolved orders remain blocking.
             self._paused_for_mismatch=False
-            if (len(latest)<=1 and not self.operator_paused and
-                not self._paused_for_multi and not self._paused_for_read and
-                not self.store.unresolved() and not self._unresolved_at_login):
-                self.armed=True;self.execution_enabled=True
-                self.store.event('reconcile','Position mismatch resolved; execution resumed')
+            self.store.event('reconcile','Position mismatch resolved')
+        # Operator Pause is the ONLY freeze — every sync re-arms otherwise.
+        self._ensure_live_unless_operator_paused()
         return self.positions
     @staticmethod
     def _min_distance(market,price):
@@ -3375,10 +3385,12 @@ class SingleTradeEngine:
                             'entry':self.positions[0].get('level') if self.positions[0].get('level') is not None else pending.get('entry')})
                     self._pending_entry_brain=None
             except Exception as exc:
-                self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
-                self.execution_enabled=False;self.armed=False
+                self.store.order_update(oid,'SUPERSEDED',self.last_order_ref)
                 self._pending_entry_brain=None
-                self.store.event('error','Entry outcome uncertain; no automatic retry',{'type':type(exc).__name__})
+                self.store.event('error',
+                    'Entry outcome uncertain; no automatic retry (not paused)',
+                    {'type':type(exc).__name__})
+                self._ensure_live_unless_operator_paused()
         finally:self.pending_order=False
     def _existing_open_block_reason(self):
         """Name the live deal + UPL; explain 0% scores while waiting for first vote."""
@@ -3403,10 +3415,17 @@ class SingleTradeEngine:
 
     def _compose_entry_block_reason(self,*,readiness,evaluation,decision):
         """Name the real OPEN blocker — never mask hard-risk as M1 wait."""
-        if not self.armed or not self.execution_enabled:
-            return 'Execution paused'
+        # Auto-pause is banned — heal sticky armed flags before reporting.
+        self._ensure_live_unless_operator_paused()
+        if self.operator_paused:
+            return 'Paused by operator'
         if self.store.unresolved():
-            return 'Unresolved broker operation'
+            # Flat leftovers must not freeze Admin forever.
+            if not self.positions:
+                self.clear_unresolved_on_operator_resume()
+                self._ensure_live_unless_operator_paused()
+            if self.store.unresolved():
+                return 'Unresolved broker operation'
         if self.positions:
             return self._existing_open_block_reason()
         if not self.mandate:

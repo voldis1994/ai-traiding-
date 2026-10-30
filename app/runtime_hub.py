@@ -555,8 +555,10 @@ class RuntimeHub:
                 except Exception:
                     pass
                 if error_count>=3:
-                    if engine.armed or engine.execution_enabled:
-                        engine._paused_for_read=True
-                    engine.armed=False
-                    engine.execution_enabled=False
+                    # Log only — never auto-pause (operator Pause is the only freeze).
+                    store.event('warning',
+                        'Repeated broker/engine errors; keeping execution live',
+                        {'count':error_count,'client_id':rt.client_id})
+                    if hasattr(engine,'_ensure_live_unless_operator_paused'):
+                        engine._ensure_live_unless_operator_paused()
                 await asyncio.sleep(3 if error_count<3 else 10)

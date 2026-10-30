@@ -25,23 +25,25 @@ def test_protection_verified_without_receipt(tmp_path):
     assert asyncio.run(engine.reconcile_outstanding()) is True
     assert store.unresolved()==[]
 
-def test_incomplete_protection_remains_blocked(tmp_path):
+def test_incomplete_protection_stays_unresolved_but_not_paused(tmp_path):
+    """PROTECT not fully matched stays in journal — sync must NOT freeze execution."""
     store=Store(tmp_path/'db.sqlite3');store.order('PROTECT','deal1',{'stop':4171,'profit':4165})
     engine=SingleTradeEngine(store,Brain());engine.broker=Broker([position(4171,None)])
     assert asyncio.run(engine.reconcile_outstanding()) is False
     assert len(store.unresolved())==1
     asyncio.run(engine.sync())
     assert engine.mandate['epic']=='GOLD'
-    assert not engine.execution_enabled
+    assert engine.execution_enabled and engine.armed
+    assert engine.operator_paused is False
 
-def test_reconcile_does_not_clear_mismatch_or_read_pause(tmp_path):
+def test_reconcile_alone_does_not_toggle_armed(tmp_path):
+    """reconcile_outstanding does not re-arm by itself; sync/_ensure_live does."""
     store=Store(tmp_path/'db.sqlite3')
     engine=SingleTradeEngine(store,Brain());engine.broker=Broker([])
-    engine._paused_for_mismatch=True
+    engine.operator_paused=True
     engine.armed=False;engine.execution_enabled=False
     assert asyncio.run(engine.reconcile_outstanding()) is True
     assert engine.armed is False and engine.execution_enabled is False
-    engine._paused_for_mismatch=False
-    engine._paused_for_read=True
-    assert asyncio.run(engine.reconcile_outstanding()) is True
-    assert engine.armed is False and engine.execution_enabled is False
+    engine.operator_paused=False
+    engine._ensure_live_unless_operator_paused()
+    assert engine.armed and engine.execution_enabled

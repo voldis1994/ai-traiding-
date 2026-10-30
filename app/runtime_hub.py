@@ -99,6 +99,7 @@ class AccountRuntime:
             'entry_block_reason':snap.get('entry_block_reason'),
             'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
             'model_readiness':snap.get('model_readiness') or snap.get('prep_eval'),
+            'hard_risk':snap.get('hard_risk'),
             'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',True)),
             'neural_close_executable':False,
             'neural_exit_intent':snap.get('neural_exit_intent'),
@@ -305,7 +306,55 @@ class RuntimeHub:
         if store is not None:
             try:card['results']=self._trade_stats(store,card.get('account_currency'))
             except Exception:pass
+            try:
+                from . import hard_risk
+                card['hard_risk']=hard_risk.snapshot(store)
+            except Exception:
+                card['hard_risk']=None
+        else:
+            card['hard_risk']=None
         return card
+
+    def _client_store(self,client_id: int,*,create: bool=False):
+        """Live runtime store, or on-disk robot.sqlite3 when the robot is stopped."""
+        cid=int(client_id)
+        rt=self.get(cid)
+        if rt and rt.started and rt.store is not None:
+            return rt.store
+        data_dir=self.platform.account_data_dir(cid)
+        data_dir.mkdir(parents=True,exist_ok=True)
+        db=data_dir/'robot.sqlite3'
+        if not db.is_file() and not create:
+            raise FileNotFoundError(str(db))
+        return Store(db)
+
+    def client_hard_risk(self,client_id: int) -> dict:
+        from . import hard_risk
+        return hard_risk.snapshot(self._client_store(client_id))
+
+    def save_client_hard_risk(self,client_id: int,*,max_risk_per_trade,daily_loss_limit,
+                              equity_drawdown_limit,clear_halt: bool=False) -> dict:
+        """Operator sets all three monetary limits — required for LIVE OPEN."""
+        from . import hard_risk
+        # Allow configuring before first Start — creates robot.sqlite3 if needed.
+        store=self._client_store(client_id,create=True)
+        saved=hard_risk.save_operator(store,{
+            'max_risk_per_trade':max_risk_per_trade,
+            'daily_loss_limit':daily_loss_limit,
+            'equity_drawdown_limit':equity_drawdown_limit,
+            'trading_halted':False if clear_halt else hard_risk.load(store).get('trading_halted'),
+            'halt_reason':None if clear_halt else hard_risk.load(store).get('halt_reason'),
+        },reason='admin_hard_risk')
+        if clear_halt:
+            hard_risk.clear_halt(store,operator=True)
+        if not hard_risk.configured(saved):
+            raise ValueError('All three hard risk limits must be positive numbers')
+        store.event('risk','Operator hard risk limits saved',{
+            'max_risk_per_trade':saved.get('max_risk_per_trade'),
+            'daily_loss_limit':saved.get('daily_loss_limit'),
+            'equity_drawdown_limit':saved.get('equity_drawdown_limit'),
+            'configured':True})
+        return hard_risk.snapshot(store)
 
     def admin_overview(self) -> dict:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]

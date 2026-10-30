@@ -120,7 +120,9 @@ class BrokerSimulation:
         self.requests=[];self.price=100.;self.fail_on_order=False
     async def positions(self):return json.loads(json.dumps(self.open))
     async def market(self,epic):return {'snapshot':{'bid':self.price,'offer':self.price+.02,'marketStatus':'TRADEABLE',
-        'decimalPlacesFactor':2},'instrument':{'onePipMeans':.01},
+        'decimalPlacesFactor':2},
+        # valueOfOnePip required so hard-risk cash_risk can be computed for OPEN.
+        'instrument':{'onePipMeans':.01,'valueOfOnePip':1.0},
         'dealingRules':{'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'}}}
     async def accounts(self):return {'accounts':[{'preferred':True,'accountId':'SIM','currency':'USD','balance':{'balance':1000}}]}
     async def prices(self,epic,resolution='MINUTE',maximum=80):return {'prices':[]}

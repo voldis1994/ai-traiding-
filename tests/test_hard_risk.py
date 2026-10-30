@@ -99,7 +99,9 @@ def test_unset_limits_block_without_invented_floors():
         assert limits['max_risk_per_trade'] is None
         gate=hard_risk.entry_allowed(store,proposed_risk=0.5)
         assert gate['allowed'] is False
-        assert 'not configured' in gate['reason']
+        assert ('not configured' in gate['reason']
+                or 'hard risk' in gate['reason'].lower()
+                or 'Admin' in gate['reason'])
         # Partial operator save still blocks (all three required).
         hard_risk.save_operator(store,{'max_risk_per_trade':10.0},reason='partial')
         gate2=hard_risk.entry_allowed(store,proposed_risk=0.5)

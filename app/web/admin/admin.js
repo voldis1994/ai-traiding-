@@ -50,6 +50,28 @@ function renderSummary(s){
     <div class="stat"><span>Realizētais P&amp;L (konta valūta)</span><b class="${pnlClass(s.realized_pnl_all)}">${pnlLabel}</b></div>`;
 }
 
+function hardRiskForm(c){
+  const hr=c.hard_risk||{};
+  const lim=hr.limits||{};
+  const configured=!!hr.configured;
+  const missing=(hr.missing_limits||[]).join(', ');
+  const warn=configured?'':'OPEN bloķēts — iestati 3 limitus (konta valūtā)';
+  const v=k=>lim[k]!=null&&Number.isFinite(Number(lim[k]))?Number(lim[k]):'';
+  return `<form class="hard-risk" data-hr="${c.id}">
+    <div class="hr-head"><strong>Hard risk (OPEN)</strong>
+      <span class="muted small">${configured?'OK':('Nav '+missing)}${warn?(' · '+warn):''}</span>
+    </div>
+    <div class="hr-grid">
+      <label>Max £/treids<input name="max_risk_per_trade" type="number" min="0.01" step="0.01" required value="${v('max_risk_per_trade')}" placeholder="10"></label>
+      <label>Dienas zaud. lim.<input name="daily_loss_limit" type="number" min="0.01" step="0.01" required value="${v('daily_loss_limit')}" placeholder="50"></label>
+      <label>Drawdown lim.<input name="equity_drawdown_limit" type="number" min="0.01" step="0.01" required value="${v('equity_drawdown_limit')}" placeholder="100"></label>
+      <label class="hr-halt"><input name="clear_halt" type="checkbox"> Noņemt halt</label>
+      <button type="submit" class="btn tiny">Saglabāt risku</button>
+    </div>
+    <p class="hr-msg muted small"></p>
+  </form>`;
+}
+
 function renderCard(c){
   const e=c.evolution||{},a=c.activity||{},r=c.results||{},sc=c.scores||{};
   const running=!!c.robot_running;
@@ -95,6 +117,7 @@ function renderCard(c){
       <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
     </div>
     <div class="muted small">${e.neural_adapt_reason||e.last_reason||''}${(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)?(' · '+(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)):''}</div>
+    ${hardRiskForm(c)}
     <div class="trades">${trades}</div>
     <div class="actions">
       <button type="button" class="btn tiny" data-act="start" data-id="${c.id}">Start</button>
@@ -122,6 +145,26 @@ function renderCard(c){
       }catch(err){alert(err.message)}
     };
   });
+  const hrForm=el.querySelector('form.hard-risk');
+  if(hrForm){
+    hrForm.onsubmit=async ev=>{
+      ev.preventDefault();
+      const msg=hrForm.querySelector('.hr-msg');
+      msg.textContent='Saglabā…';
+      const fd=new FormData(hrForm);
+      const body={
+        max_risk_per_trade:Number(fd.get('max_risk_per_trade')),
+        daily_loss_limit:Number(fd.get('daily_loss_limit')),
+        equity_drawdown_limit:Number(fd.get('equity_drawdown_limit')),
+        clear_halt:fd.get('clear_halt')==='on',
+      };
+      try{
+        await api(`/api/admin/clients/${c.id}/hard-risk`,'POST',body);
+        msg.textContent='Hard risk saglabāts — OPEN atļauts, ja pārējie vārti OK.';
+        await loadOverview();
+      }catch(err){msg.textContent=err.message}
+    };
+  }
   return el;
 }
 

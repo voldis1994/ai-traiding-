@@ -184,6 +184,13 @@ class LearningResetBody(BaseModel):
     confirmation:str=Field(min_length=1,max_length=32)
     client_id:int|None=Field(default=None,ge=1)
 
+class HardRiskBody(BaseModel):
+    """Operator hard risk — required before LIVE OPEN (audit #20–21 / #42)."""
+    max_risk_per_trade:float=Field(gt=0,le=1_000_000)
+    daily_loss_limit:float=Field(gt=0,le=1_000_000)
+    equity_drawdown_limit:float=Field(gt=0,le=1_000_000)
+    clear_halt:bool=Field(default=False)
+
 
 def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     """Explain the failed step, without ever exposing credentials, headers or response body."""
@@ -496,6 +503,31 @@ async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
     rt.engine.operator_paused=False;rt.engine._paused_for_read=False
     rt.store.event('control','Resumed by admin')
     return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+
+@app.get('/api/admin/clients/{client_id}/hard-risk')
+async def admin_get_hard_risk(client_id:int,_:dict=Depends(require_admin)):
+    if not platform.get_client(client_id):raise HTTPException(404,'Client not found')
+    try:
+        snap=hub.client_hard_risk(client_id)
+    except FileNotFoundError:
+        raise HTTPException(404,'Klientam vēl nav robota datu') from None
+    return {'ok':True,'hard_risk':snap}
+
+@app.post('/api/admin/clients/{client_id}/hard-risk')
+async def admin_set_hard_risk(client_id:int,data:HardRiskBody,_:dict=Depends(require_admin)):
+    """Save operator hard-risk limits so LIVE OPEN can proceed after #42."""
+    if not platform.get_client(client_id):raise HTTPException(404,'Client not found')
+    try:
+        snap=hub.save_client_hard_risk(
+            client_id,
+            max_risk_per_trade=data.max_risk_per_trade,
+            daily_loss_limit=data.daily_loss_limit,
+            equity_drawdown_limit=data.equity_drawdown_limit,
+            clear_halt=data.clear_halt)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from None
+    return {'ok':True,'hard_risk':snap,
+            'card':hub.admin_client_card(platform.get_client(client_id))}
 
 @app.post('/api/admin/reset-learning')
 async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_admin)):

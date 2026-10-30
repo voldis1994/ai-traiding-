@@ -3,10 +3,17 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+from app import hard_risk
 from app.autonomy import AutoEvolution
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
 from tests.market_helpers import install_synthetic_context, priced_horizon_history
 from tests.test_integration import BrokerSimulation
+
+
+def _allow_open(store):
+    hard_risk.save_operator(store,{
+        'max_risk_per_trade':100,'daily_loss_limit':500,'equity_drawdown_limit':1000},
+        reason='test')
 
 
 def scored_history(*, action='SELL', fail_holdout=False):
@@ -70,6 +77,7 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
     async def run():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'data.sqlite3')
+            _allow_open(store)
             brain=AdaptiveBrain(store,data_dir=d)
             engine=SingleTradeEngine(store,brain)
             engine.policy=AutoEvolution(store,Path(d)/'policy.py')

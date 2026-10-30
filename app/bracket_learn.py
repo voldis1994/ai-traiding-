@@ -309,13 +309,42 @@ def recent_reachable_move(candles, n: int|None=None) -> float|None:
     return float(max(robust,spans[-1]*0.85))
 
 
+def _window_structure(candles, n: int|None=None) -> float|None:
+    """Peak-to-trough over the lookback — the swing, not 1-bar noise."""
+    rows=list(candles or [])
+    if not rows:return None
+    if n is None:
+        from .math_rules import adaptive_lookback
+        n=adaptive_lookback(rows) or len(rows)
+    hi=lo=None
+    for row in rows[-max(1,int(n)):]:
+        try:
+            h=float(row['high']);l=float(row['low'])
+        except (KeyError,TypeError,ValueError):
+            continue
+        if h<=0 or l<=0 or h<l:continue
+        hi=h if hi is None else max(hi,h)
+        lo=l if lo is None else min(lo,l)
+    if hi is None or lo is None or hi<=lo:return None
+    span=float(hi-lo)
+    return span if math.isfinite(span) and span>0 else None
+
+
 def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
-    """SL/TP shape from recent OHLC at the open — lookback sized from the data."""
+    """SL/TP from recent OHLC — SL clears structure pullback, TP aims at the swing.
+
+    Previously `range_distance` was only median M1 high−low (noise). That put SL
+    near broker-min on Gold and scratched every 1–3 minutes. Now OPEN uses the
+    lookback peak−trough: SL ≥ max(noise, adverse, structure/3), TP targets at
+    least half the swing so the robot can hold a fuller move.
+    """
     ups,downs,spans,used=_bar_moves(candles,n)
     # Reach uses the same adaptive window (or a wider explicit one if given).
     reach=recent_reachable_move(candles,reach_n if reach_n is not None else used)
+    structure=_window_structure(candles,used)
     if len(spans)<5:
         return {'kappa':DEFAULT_KAPPA,'range_distance':0.0,'max_tp':reach,
+                'noise_distance':0.0,'structure':structure,
                 'median_up':None,'median_down':None,'ready':False,'lookback':used}
     med_span=float(median(spans))
     med_up=float(median(ups)) if ups else med_span
@@ -327,10 +356,22 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
     if not math.isfinite(kappa) or kappa<=0:
         kappa=DEFAULT_KAPPA
     kappa=max(float(kappa),0.5)
+    # Structure pullback ≈ room for the swing to develop without noise stop-out.
+    pullback=(float(structure)/3.0) if structure and structure>0 else 0.0
+    sl_distance=max(med_span,med_down,pullback)
+    target_bits=[x for x in (reach,med_up,(float(structure)*0.5 if structure else None))
+                 if x is not None and float(x)>0]
+    max_tp=float(max(target_bits)) if target_bits else (float(reach) if reach else None)
+    # Prefer a reward:risk that can reach the swing when OHLC kappa is tiny.
+    if sl_distance>1e-12 and max_tp is not None and max_tp>sl_distance:
+        kappa=max(kappa,float(max_tp)/float(sl_distance))
     return {
         'kappa':float(kappa),
-        'range_distance':med_span,
-        'max_tp':float(reach) if reach is not None else None,
+        # OPEN + protect read this as the SL zone (structure-aware, not 1-bar tip).
+        'range_distance':float(sl_distance),
+        'noise_distance':float(med_span),
+        'structure':float(structure) if structure is not None else None,
+        'max_tp':float(max_tp) if max_tp is not None else None,
         'median_up':med_up,'median_down':med_down,
         'ready':True,'lookback':used,
     }

@@ -330,12 +330,15 @@ async def pause(_:bool=Depends(require_auth)):
 async def resume(_:bool=Depends(require_auth)):
     await engine.reconcile_outstanding()
     await engine.sync()
-    if engine.store.unresolved():raise HTTPException(409,'Unresolved broker operation; reconciliation required')
+    cleared=engine.clear_unresolved_on_operator_resume()
+    if engine.store.unresolved():
+        raise HTTPException(409,'Unresolved broker operation; reconciliation required')
     if not engine.mandate:raise HTTPException(409,'First mobile position not yet adopted')
     if len(engine.positions)>1:raise HTTPException(409,'Multiple positions')
     engine.armed=True;engine.execution_enabled=True;engine.operator_paused=False;engine._paused_for_read=False
-    store.event('control','Autonomous cycle resumed by operator')
-    return {'ok':True}
+    store.event('control','Autonomous cycle resumed by operator',
+                {'cleared_unresolved':len(cleared or [])})
+    return {'ok':True,'cleared_unresolved':cleared}
 
 @app.post('/api/prepare-new-market')
 async def prepare_new_market(_:bool=Depends(require_auth)):
@@ -493,6 +496,8 @@ async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
     # still allow unpause so the first manual trade can be adopted.
     await rt.engine.reconcile_outstanding()
     await rt.engine.sync()
+    # Stale PENDING/UNCERTAIN (esp. PROTECT after trail) used to freeze Resume.
+    cleared=rt.engine.clear_unresolved_on_operator_resume()
     if rt.store.unresolved():
         raise HTTPException(409,'Nevar atsākt — neatrisināta brokera operācija')
     if len(rt.engine.positions)>1:
@@ -501,8 +506,9 @@ async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
         raise HTTPException(409,'Tirgus nesakrīt ar mandate — pārbaudi Capital pozīciju')
     rt.engine.armed=True;rt.engine.execution_enabled=True
     rt.engine.operator_paused=False;rt.engine._paused_for_read=False
-    rt.store.event('control','Resumed by admin')
-    return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+    rt.store.event('control','Resumed by admin',{'cleared_unresolved':len(cleared or [])})
+    return {'ok':True,'cleared_unresolved':cleared,
+            'card':hub.admin_client_card(platform.get_client(client_id))}
 
 @app.get('/api/admin/clients/{client_id}/hard-risk')
 async def admin_get_hard_risk(client_id:int,_:dict=Depends(require_admin)):
@@ -668,10 +674,11 @@ async def client_resume(client=Depends(require_client)):
     if not rt or not rt.engine.broker:raise HTTPException(409,'Robot not connected')
     await rt.engine.reconcile_outstanding()
     await rt.engine.sync()
+    cleared=rt.engine.clear_unresolved_on_operator_resume()
     if rt.store.unresolved():raise HTTPException(409,'Unresolved broker operation')
     if not rt.engine.mandate:raise HTTPException(409,'Complete the first manual trade first')
     if len(rt.engine.positions)>1:raise HTTPException(409,'Multiple positions')
     rt.engine.armed=True;rt.engine.execution_enabled=True
     rt.engine.operator_paused=False;rt.engine._paused_for_read=False
-    rt.store.event('control','Resumed by client')
-    return {'ok':True,'view':rt.client_view()}
+    rt.store.event('control','Resumed by client',{'cleared_unresolved':len(cleared or [])})
+    return {'ok':True,'cleared_unresolved':cleared,'view':rt.client_view()}

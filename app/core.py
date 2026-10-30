@@ -352,6 +352,32 @@ class NeuralCore:
         self.d=new_d
         return True
 
+    def shrink_inputs(self, new_d, *, remove_at):
+        """Drop input columns so dims match a smaller FeatureRegistry.
+
+        Used when approved DYNAMIC features were wiped but brain.npz still has
+        the old width — keeping expanded weights forever blocks fusion
+        (`ohlc feature dim 13 != expected 14`). Layout stays
+        [BASE_OHLC | DYNAMIC | EXTERNAL]; remove_at is the first DYNAMIC index.
+        """
+        new_d=int(new_d)
+        if new_d>self.d:raise ValueError('shrink_inputs cannot grow dimension')
+        if new_d==self.d:return False
+        at=int(remove_at)
+        drop=self.d-new_d
+        if drop<=0:raise ValueError('nothing to shrink')
+        if at<0 or at+drop>self.d:raise ValueError('remove_at out of range')
+        keep=lambda arr,axis:np.concatenate([arr.take(range(0,at),axis=axis),
+                                            arr.take(range(at+drop,arr.shape[axis]),axis=axis)],axis=axis)
+        self.P=keep(self.P,1)
+        self.G=keep(self.G,0)
+        self.mu=keep(self.mu,0)
+        self.nu=keep(self.nu,0)
+        self.last_z=keep(self.last_z,0)
+        self.last_transition=None
+        self.d=new_d
+        return True
+
     def copy_weights_from(self, other, *, adopt_architecture=False):
         """Copy weights from another core (shadow warm-start / promote).
 

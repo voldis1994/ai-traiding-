@@ -2009,12 +2009,18 @@ class SingleTradeEngine:
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
         if not readiness.get('ready'):
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
-                    'readiness':readiness,'economic_utility':None}
+                    'readiness':readiness,'economic_utility':None,'hard_risk':None}
+        # After #42 catch-up: unset hard-risk limits block EVERY OPEN while
+        # protect/SL-TP still works — surface that before calling it a BUY.
+        hr=hard_risk.preflight(self.store)
+        if not hr.get('allowed'):
+            return {'allowed':False,'reason':hr.get('reason') or 'Hard risk blocks OPEN',
+                    'readiness':readiness,'economic_utility':None,'hard_risk':hr}
         if action is not None and action not in ('BUY','SELL'):
             return {'allowed':False,'reason':'No directional action','readiness':readiness,
-                    'economic_utility':None}
+                    'economic_utility':None,'hard_risk':hr}
         return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
-                'readiness':readiness,'economic_utility':None}
+                'readiness':readiness,'economic_utility':None,'hard_risk':hr}
 
     def _entry_evaluation(self):
         if not self.market_context.get('ready',False):
@@ -3223,6 +3229,49 @@ class SingleTradeEngine:
             bits.append('UPL {0:.2f}'.format(float(upl)))
         return ' — '.join(bits)
 
+    def _compose_entry_block_reason(self,*,readiness,evaluation,decision):
+        """Name the real OPEN blocker — never mask hard-risk as M1 wait."""
+        if not self.armed or not self.execution_enabled:
+            return 'Execution paused'
+        if self.store.unresolved():
+            return 'Unresolved broker operation'
+        if self.positions:
+            return self._existing_open_block_reason()
+        if not self.mandate:
+            return 'No adoptive size this session — open a new manual trade'
+        if self.last_closed_step<0:
+            return 'Waiting for first manually opened trade to close'
+        hr=hard_risk.preflight(self.store)
+        if not hr.get('allowed'):
+            return hr.get('reason') or 'OPEN blocked: hard risk limits'
+        if not self.market_context.get('ready'):
+            return 'Market context unavailable: '+self.market_context.get('reason','')
+        if self._fusion_entry_blocked():
+            return ('External fusion gap blocks new entry: '+(
+                self.fusion_block_reason or 'aligned external neural inputs unavailable'))
+        if not readiness.get('ready'):
+            return 'Model prep/eval not ready: '+(readiness.get('reason') or '')
+        bar_done=(self.last_entry_processed_bar==self.last_decision_bar
+                  and self.last_decision_bar is not None)
+        reason=self.last_entry_reason
+        if bar_done and reason:
+            policy=getattr(self,'last_policy_decision',None)
+            text=str(reason)
+            # BUY that failed hard-risk in submit used to look like M1 wait.
+            if (policy=='HOLD' or text.startswith('OPEN blocked')
+                    or 'hard risk' in text.lower()
+                    or 'not configured' in text.lower()):
+                return reason
+        if bar_done:
+            return 'Waiting for next completed M1 candle'
+        if self.last_signal:
+            return self._signal_reason(decision,self.market.get('status'),evaluation)
+        on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                   and getattr(self.brain,'fusion_schema',None) is not None)
+        if on_fusion:
+            return 'Waiting for aligned external neural inputs'
+        return 'Waiting for signal'
+
     def snapshot(self):
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or a.get('accountId')==self.account.get('currentAccountId')),account[0] if account else {})
@@ -3231,6 +3280,7 @@ class SingleTradeEngine:
         intermarket=self.intermarket.state
         readiness=(self.brain.trading_readiness()
                    if hasattr(self.brain,'trading_readiness') else {'ready':False})
+        hr_snap=hard_risk.snapshot(self.store)
         minute_acc=(self.brain.correct/self.brain.labeled) if self.brain.labeled else None
         # Closed-trade win rate is separate from minute-direction accuracy (audit #24).
         trade_wins=trade_losses=0
@@ -3317,7 +3367,8 @@ class SingleTradeEngine:
                 'neural_close_executable':False,
                 'neural_exit_intent':raw_exit_intent,
                 'neural_exit_rule':'diagnostic CLOSE intent only — broker SL/TP/trail executes closes; neural market-delete is not a strategy',
-                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
+                'hard_risk':hr_snap,
+                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready') and hr_snap.get('configured')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
                 'entry_policy_reason':evaluation.get('reason') if evaluation else None,
@@ -3333,33 +3384,8 @@ class SingleTradeEngine:
                     self.last_decision_bar is not None and
                     self.last_entry_processed_bar!=self.last_decision_bar),
                 'fusion_block_reason':self.fusion_block_reason,
-                # Audit #14: when fusion EXTERNAL data blocks, name that source
-                # before the generic prep/eval readiness message.
-                'entry_block_reason':('Execution paused' if not self.armed or not self.execution_enabled else
-                    'Unresolved broker operation' if self.store.unresolved() else
-                    self._existing_open_block_reason() if self.positions else
-                    'No adoptive size this session — open a new manual trade' if not self.mandate else
-                    'Waiting for first manually opened trade to close' if self.last_closed_step<0 else
-                    'Market context unavailable: '+self.market_context.get('reason','') if not self.market_context.get('ready') else
-                    ('External fusion gap blocks new entry: '+(self.fusion_block_reason or 'aligned external neural inputs unavailable'))
-                        if self._fusion_entry_blocked() else
-                    ('Model prep/eval not ready: '+(readiness.get('reason') or ''))
-                        if not readiness.get('ready') else
-                    # Prefer the real HOLD/skip reason over a cosmetic M1-wait mask
-                    # when this bar was already evaluated (utility/news/steps).
-                    (self.last_entry_reason
-                     if (self.last_entry_processed_bar==self.last_decision_bar
-                         and self.last_decision_bar is not None
-                         and getattr(self,'last_policy_decision',None)=='HOLD'
-                         and self.last_entry_reason)
-                     else 'Waiting for next completed M1 candle'
-                     if self.last_entry_processed_bar==self.last_decision_bar
-                     and self.last_decision_bar is not None else
-                    self._signal_reason(decision,self.market.get('status'),evaluation) if self.last_signal else
-                    'Waiting for aligned external neural inputs' if (
-                        getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
-                        and getattr(self.brain,'fusion_schema',None) is not None) else
-                    'Waiting for signal')),
+                'entry_block_reason':self._compose_entry_block_reason(
+                    readiness=readiness,evaluation=evaluation,decision=decision),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),
                     'profit':self.profit_learning.summary(),

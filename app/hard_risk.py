@@ -202,7 +202,11 @@ def check_drawdown_halt(store, equity) -> dict:
     return load(store)
 
 
-def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
+def preflight(store) -> dict:
+    """Halt + configured check for Admin/entry_block — no proposed cash risk yet.
+
+    submit() still calls entry_allowed() with the real size×SL cash risk.
+    """
     limits = load(store)
     if limits.get('trading_halted'):
         return {
@@ -210,16 +214,24 @@ def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
             'reason': 'trading halted: ' + (limits.get('halt_reason') or 'operator halt'),
             'limits': limits,
         }
-    # Critical #2: do not invent surrogate floors — block until operator configures.
     missing = missing_limits(limits)
     if missing:
         return {
             'allowed': False,
-            'reason': ('OPEN blocked: operator hard risk limits not configured '
-                       f"({', '.join(missing)})"),
+            'reason': ('OPEN blocked: set Admin hard risk limits '
+                       f"({', '.join(missing)}) — max £/trade, daily loss, drawdown"),
             'limits': limits,
             'missing_limits': missing,
         }
+    return {'allowed': True, 'reason': 'ok', 'limits': limits}
+
+
+def entry_allowed(store, *, proposed_risk=None, equity=None, now=None) -> dict:
+    limits = load(store)
+    pre = preflight(store)
+    if not pre.get('allowed'):
+        return pre
+    limits = pre.get('limits') or limits
     daily = _daily_state(store, now=now)
     daily_cap = limits.get('daily_loss_limit')
     if daily_cap is not None and daily['realized_pnl'] <= -abs(float(daily_cap)):
@@ -270,5 +282,6 @@ def snapshot(store) -> dict:
         'daily': _daily_state(store),
         'peak_equity': _finite(store.get(PEAK_KEY)) if store is not None else None,
         'note': ('Hard limits are operator/config-owned; neural cannot raise them. '
-                 'OPEN blocks until all three monetary limits are set.'),
+                 'OPEN blocks until Admin sets all three monetary limits.'),
+        'preflight': preflight(store),
     }

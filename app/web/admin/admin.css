@@ -35,6 +35,14 @@ a{color:var(--ok)}
 .trades{margin-top:8px;font-size:11px;color:var(--muted);max-height:90px;overflow:auto}
 .trades div{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px solid #1a2233}
 .pnl-pos{color:var(--ok)}.pnl-neg{color:var(--bad)}
+.hard-risk{margin:10px 0;padding:10px;border:1px solid var(--line);border-radius:10px;background:#0b101a}
+.hr-head{display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;margin-bottom:8px;font-size:12px}
+.hr-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end}
+.hr-grid label{margin:0;font-size:11px}
+.hr-grid input[type=number]{margin-top:4px;padding:8px}
+.hr-halt{display:flex!important;align-items:center;gap:6px;font-size:11px}
+.hr-halt input{width:auto;margin:0}
+.hr-msg{min-height:14px;margin:6px 0 0}
 .setup summary{cursor:pointer;list-style:none}.setup summary::-webkit-details-marker{display:none}
 @media(max-width:860px){.grid,.summary{grid-template-columns:1fr 1fr}.cards{grid-template-columns:1fr}}
 @media(max-width:520px){.summary{grid-template-columns:1fr}}

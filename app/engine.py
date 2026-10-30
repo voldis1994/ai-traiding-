@@ -3316,7 +3316,8 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # SL/TP computed from the same M1 OHLC the neural net already sees.
+            # SL/TP from OHLC structure (lookback swing), not 1-bar noise tip —
+            # noise-only SL scratched Gold every 1–3 minutes and missed the move.
             candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
             zone=bracket_learn.zone_at_open(candles)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
@@ -3352,12 +3353,14 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','OHLC zone × learned raise/cut at open',{
+            self.store.event('bracket','OHLC structure zone × learned raise/cut at open',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
+                'noise_distance':zone.get('noise_distance'),
+                'structure':zone.get('structure'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),

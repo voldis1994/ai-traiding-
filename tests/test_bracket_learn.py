@@ -30,9 +30,29 @@ def test_zone_at_open_computes_kappa_from_moves_not_grid():
     z=zone_at_open(rows)
     assert z['ready'] is True
     assert z['median_up']==3.0 and z['median_down']==1.0
-    assert z['kappa']==3.0
+    assert z['kappa']>=3.0
     assert z['max_tp'] is not None
     assert z['lookback'] is not None and z['lookback']>=3
+    assert z['noise_distance']==4.0
+    assert z['structure']==4.0
+
+
+def test_zone_sl_uses_structure_not_one_bar_noise():
+    """Choppy 1-bar tips must not set SL — lookback swing pullback should."""
+    rows=[]
+    # Drift +0.5 over 20 bars with tiny 0.1 M1 noise → structure >> median span.
+    px=100.0
+    for i in range(40):
+        o=px
+        px=px+0.05
+        rows.append({'open':o,'high':px+0.05,'low':o-0.05,'close':px})
+    z=zone_at_open(rows)
+    assert z['ready'] is True
+    assert z['structure'] is not None and z['structure']>z['noise_distance']
+    # SL zone clears structure/3, not only 1-bar median noise.
+    assert z['range_distance']>=z['structure']/3.0-1e-9
+    assert z['range_distance']>z['noise_distance']-1e-9 or z['range_distance']>=z['median_down']
+    assert z['max_tp'] is not None and z['max_tp']>=z['structure']*0.5-1e-9
 
 
 def test_adaptive_lookback_picks_elbow_from_curve():

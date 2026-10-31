@@ -23,6 +23,16 @@ DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight st
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions
 # Closed-trade P&L regret is the primary corrective teacher (engine._learn_closed_trade).
 PRIMARY_FEEDBACK = 'closed_trade_pnl_counterfactual_buy_sell_hold'
+# One LIVE machine loop — not separate argmax / bracket / risk policies.
+# perceive(scores) → decide(argmax+edge) → risk(κ/sl via aggression) → settle(£) → learn.
+UNIFIED_CYCLE = (
+    'perceive_decision',
+    'compose_open',
+    'broker_settle',
+    'unified_cycle.settle',
+    'bracket_learn + neural trade_pnl',
+)
+UNIFIED_CYCLE_STORE = 'unified_cycle_v1'
 # Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
 LEARN_OBJECTIVES = {
     OBJECTIVE_MINUTE_DIRECTION: OBJECTIVE_WEIGHTS[OBJECTIVE_MINUTE_DIRECTION],

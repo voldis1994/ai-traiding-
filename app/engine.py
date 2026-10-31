@@ -27,6 +27,7 @@ from .math_rules import (stop_take, ohlc_range_distance,
                          cash_risk, tick_value_from_instrument)
 from . import bracket_learn
 from . import hard_risk
+from . import unified_cycle
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
@@ -2195,6 +2196,18 @@ class SingleTradeEngine:
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
                 return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
+            # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
+            edge=unified_cycle.edge_allows_open(
+                self.last_signal['scores'],result,
+                unified_cycle.load_state(self.store))
+            if not edge['allowed']:
+                return dict(result,action='HOLD',reason=edge['reason'],
+                            unified_cycle=edge)
+            result=dict(result,unified_cycle=edge)
+        else:
+            result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
+                (self.last_signal or {}).get('scores'),result,
+                unified_cycle.load_state(self.store)))
         return result
 
     def _signal_reason(self,action,market_status=None,evaluation=None):
@@ -2811,6 +2824,18 @@ class SingleTradeEngine:
             'trail':True,
         }
 
+    def _settle_unified_cycle(self,*,pnl,action=None,exit_reason=None,deal_id=None):
+        """Fold broker £ into the single LIVE cycle bus (aggression / streaks)."""
+        cycle=unified_cycle.settle(
+            self.store,pnl=pnl,action=action,exit_reason=exit_reason)
+        self.store.event('cycle','Unified cycle settled from broker £',{
+            'deal_id':deal_id,'pnl':pnl,'action':action,
+            'exit_reason':exit_reason,
+            'aggression':cycle.get('aggression'),
+            'loss_streak':cycle.get('loss_streak'),
+            'win_streak':cycle.get('win_streak')})
+        return cycle
+
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
 
@@ -2847,13 +2872,17 @@ class SingleTradeEngine:
                     deal_id,row[0],exit_level,row[1],broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker':
+                    self._settle_unified_cycle(pnl=pnl_value,action=row[1],deal_id=deal_id)
+                    self._note_scratch_close(pnl_value,deal_id)
             elif exit_level is not None or broker_pnl is not None:
                 currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
-                if broker_pnl is not None:self._note_scratch_close(broker_pnl,deal_id)
+                if broker_pnl is not None:
+                    self._settle_unified_cycle(pnl=broker_pnl,deal_id=deal_id)
+                    self._note_scratch_close(broker_pnl,deal_id)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -2875,7 +2904,9 @@ class SingleTradeEngine:
                     deal_id,entry,exit_level or entry,direction,broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker':
+                    self._settle_unified_cycle(pnl=pnl_value,action=direction,deal_id=deal_id)
+                    self._note_scratch_close(pnl_value,deal_id)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
@@ -3006,6 +3037,10 @@ class SingleTradeEngine:
                 currency=currency,deal_id=deal_id,**path_ctx)
             # Audit #21: operator daily loss / drawdown halt from realized cash.
             hard_risk.record_realized_pnl(self.store,pnl_value)
+            # One feedback bus: £ → cycle aggression / streak for next OPEN.
+            self._settle_unified_cycle(
+                pnl=pnl_value,action=direction,
+                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id)
             equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
@@ -3316,16 +3351,39 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # SL/TP from OHLC structure (lookback swing), not 1-bar noise tip —
-            # noise-only SL scratched Gold every 1–3 minutes and missed the move.
+            # One cycle: OHLC zone × learned raise/cut × cycle aggression/edge.
+            # Lot stays mandate; direction stays neural; κ/sl width coordinated here.
             candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
             zone=bracket_learn.zone_at_open(candles)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
-            bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
-                                             base_sl=base_sl,max_tp=zone.get('max_tp'),
-                                             candles=candles)
+            learned=bracket_learn.load_multipliers(self.store)
+            cycle_state=unified_cycle.load_state(self.store)
+            scores=(self.last_signal or {}).get('scores')
+            evaluation={'action':action,'score_edge':(
+                self.policy.score_edge(scores) if scores else None)}
+            pkg=unified_cycle.compose_open(
+                action=action,scores=scores,evaluation=evaluation,zone=zone,
+                learned=learned,cycle_state=cycle_state,base_sl=base_sl,
+                max_tp=zone.get('max_tp'))
+            if pkg.get('blocked') or pkg.get('action') not in ('BUY','SELL'):
+                self.last_entry_reason=pkg.get('reason') or 'Unified cycle HOLD'
+                self.store.event('entry','OPEN skipped — unified cycle edge gate',{
+                    'reason':self.last_entry_reason,'decision':pkg.get('decision'),
+                    'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
+                return
+            bp={'kappa':pkg['kappa'],'sl_scale':pkg['sl_scale'],'explored':False,
+                'kappa_mult':learned.get('kappa'),'sl_mult':learned.get('sl_scale'),
+                'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
+                'lookback':zone.get('lookback'),
+                'nudge_samples':len(self.store.get('bracket_outcome_history',[]) or []),
+                'aggression':pkg.get('aggression'),'edge_scale':pkg.get('edge_scale')}
+            bracket_learn.save_params(
+                self.store,bp['kappa'],bp['sl_scale'],
+                reason=(f"unified_cycle k_mult={learned['kappa']:.3f} "
+                        f"sl_mult={learned['sl_scale']:.3f} "
+                        f"agg={float(pkg.get('aggression') or 1):.3f}"))
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
@@ -3353,9 +3411,10 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','Market OHLC shares × learned raise/cut at open',{
+            self.store.event('bracket','Unified cycle OPEN: OHLC × learn × aggression',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
+                'aggression':bp.get('aggression'),'edge_scale':bp.get('edge_scale'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
@@ -3380,6 +3439,7 @@ class SingleTradeEngine:
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
                     'bracket_explored':bool(bp.get('explored')),
+                    'cycle_aggression':bp.get('aggression'),
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
                 }
@@ -3401,6 +3461,7 @@ class SingleTradeEngine:
                         self.store.set(key,{**pending,
                             'entry':self.positions[0].get('level') if self.positions[0].get('level') is not None else pending.get('entry')})
                     self._pending_entry_brain=None
+                    unified_cycle.note_open(self.store,action=action)
             except Exception as exc:
                 self.store.order_update(oid,'SUPERSEDED',self.last_order_ref)
                 self._pending_entry_brain=None
@@ -3594,7 +3655,8 @@ class SingleTradeEngine:
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
-                'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or [])}
+                'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or []),
+                'unified_cycle':unified_cycle.load_state(self.store)}
 
     def _bars_and_spreads_from_candles(self,candles):
         """Chronological OHLC + per-bar spreads (None when unknown — never invent)."""

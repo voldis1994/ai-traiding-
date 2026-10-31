@@ -359,9 +359,8 @@ class AutoEvolution:
         calibration=self.calibrate_entry_margin(
             direction,history or [],baseline)
         selected=float(calibration.get('selected',baseline) or baseline)
-        # If holdout could not lower, still allow adaptive base (spread/accuracy).
-        floor=max(unified_cycle.ENTRY_EDGE_MIN,
-                  min(unified_cycle.ENTRY_EDGE_MAX,selected))
+        # Snap to 0.01 steps (0.06→0.07, never 0.065) inside rails.
+        floor=unified_cycle.quantize_entry_edge(selected)
         meta=unified_cycle.set_calibrated_floor(
             self.store,floor,
             method=calibration.get('method') or 'adaptive_threshold',

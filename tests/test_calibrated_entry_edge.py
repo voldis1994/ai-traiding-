@@ -39,11 +39,12 @@ def test_spread_raises_calibrated_floor_within_rails():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         policy = _policy(store, d)
-        # spread_bps=10 → cost bump ≈ 0.02 → ~0.08
+        # spread_bps=10 → cost bump ≈ 0.02 → ~0.08 (snapped to 0.01)
         floor, detail = policy.calibrate_live_entry_floor(
             'BUY', history=[], spread_bps=10.0, accuracy=None, samples=0)
         assert floor > 0.06
         assert floor <= uc.ENTRY_EDGE_MAX
+        assert abs(round(floor / uc.ENTRY_EDGE_STEP) * uc.ENTRY_EDGE_STEP - floor) < 1e-9
         assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(floor)
         meta = uc.calibration_meta(store)
         assert meta['floor'] == pytest.approx(floor)
@@ -104,3 +105,23 @@ def test_rails_clip_extreme_calibration():
         assert low['floor'] == pytest.approx(uc.ENTRY_EDGE_MIN)
         high = uc.set_calibrated_floor(store, 0.99, method='too_high')
         assert high['floor'] == pytest.approx(uc.ENTRY_EDGE_MAX)
+
+
+def test_entry_edge_only_whole_hundredths():
+    """0.06 → next 0.07; never 0.065 / 0.086."""
+    assert uc.quantize_entry_edge(0.06) == pytest.approx(0.06)
+    assert uc.quantize_entry_edge(0.065) in (0.06, 0.07)
+    assert uc.quantize_entry_edge(0.065) == round(uc.quantize_entry_edge(0.065), 2)
+    assert uc.quantize_entry_edge(0.086) == pytest.approx(0.09)
+    assert uc.quantize_entry_edge(0.084) == pytest.approx(0.08)
+    assert uc.quantize_entry_edge(0.071) == pytest.approx(0.07)
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        meta = uc.set_calibrated_floor(store, 0.086, method='dust')
+        assert meta['floor'] == pytest.approx(0.09)
+        assert str(meta['floor']).rstrip('0').endswith('9') or meta['floor'] == 0.09
+        # Persist + reload stays on hundredth grid.
+        assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(0.09)
+        # Allowed grid only.
+        for x in (0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12):
+            assert uc.quantize_entry_edge(x) == pytest.approx(x)

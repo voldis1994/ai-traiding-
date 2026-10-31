@@ -7,7 +7,7 @@ import pytest
 from app.bracket_learn import (
     DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,evolve_from_history,
     load_multipliers,load_params,propose_for_open,recent_reachable_move,
-    record_outcome,save_params,zone_at_open,
+    record_outcome,save_multipliers,save_params,zone_at_open,
 )
 from app.engine import Store
 from app.math_rules import stop_take
@@ -58,16 +58,44 @@ def test_zone_sl_uses_market_shares_of_structure_not_hardcoded_fractions():
     assert z['max_tp']>=z['structure']*z['favor_share']-1e-9
 
 
-def test_scratch_on_sl_raises_learned_sl_scale():
-    """Robot widens itself from scratch SL £ — market said stop was too tight."""
+def test_scratch_on_sl_does_not_raise_risk():
+    """Scratch must not widen SL — that ratcheted £ losses with fixed lot size."""
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         before=load_multipliers(store)
         out=adapt_after_outcome(
             store,kappa=1.0,sl_scale=1.0,pnl=-0.04,exit_reason='sl',
             stop_distance=0.2,volatility=0.3,adverse_path=0.15)
-        assert out['reason']=='scratch_sl_raise_sl'
-        assert load_multipliers(store)['sl_scale']>before['sl_scale']
+        assert out['reason']=='scratch_hold_sl'
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+
+
+def test_win_reinforces_kappa_not_sl_width():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        before=load_multipliers(store)
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=1.0,pnl=0.80,exit_reason='tp')
+        assert out['reason'] in ('win_reinforce','tp_reinforce')
+        assert load_multipliers(store)['kappa']>=before['kappa']
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+
+
+def test_growing_sl_loss_streak_cuts_risk():
+    """Rising |£| SL losses with fixed lot → cut sl_scale, do not widen again."""
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save_multipliers(store,1.0,2.0,reason='seed_wide')
+        store.set('bracket_outcome_history',[
+            {'kappa':1.0,'sl_scale':1.5,'pnl':-0.50,'exit_reason':'sl'},
+            {'kappa':1.0,'sl_scale':1.8,'pnl':-0.80,'exit_reason':'sl'},
+        ])
+        out=adapt_after_outcome(
+            store,kappa=1.0,sl_scale=2.0,pnl=-1.34,exit_reason='sl',
+            stop_distance=1.0,volatility=0.2,adverse_path=1.0)
+        assert out['reason']=='sl_loss_streak_cut_risk'
+        assert out.get('growing_sl_losses') is True
+        assert load_multipliers(store)['sl_scale']<2.0
 
 
 def test_adaptive_lookback_picks_elbow_from_curve():

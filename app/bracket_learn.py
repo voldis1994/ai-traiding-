@@ -184,6 +184,30 @@ def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None,
         volatility=volatility,costs=costs)
 
 
+def _recent_sl_losses_growing(store, pnl) -> bool:
+    """True when the last SL losses show rising |£| — risk ratchet already hurt."""
+    hist=store.get('bracket_outcome_history',[]) or []
+    if not isinstance(hist,list):
+        return False
+    losses=[]
+    for row in reversed(hist):
+        if normalize_exit_reason(row.get('exit_reason'))!='sl':
+            continue
+        p=_finite(row.get('pnl'))
+        if p is None or p>=0:
+            continue
+        losses.append(abs(float(p)))
+        if len(losses)>=3:
+            break
+    cur=_finite(pnl)
+    if cur is not None and cur<0:
+        losses.insert(0,abs(float(cur)))
+    if len(losses)<3:
+        return False
+    # Newest first: each prior loss was smaller → risk is climbing.
+    return losses[0]+1e-9>=losses[1]>=losses[2]-1e-9
+
+
 def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
                         exit_reason=None, direction=None, entry=None,
                         exit_level=None, stop_distance=None, adverse_path=None,
@@ -191,16 +215,14 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     """Learn SL/TP multipliers from one closed trade — conditioned on context.
 
     Audit #19: do NOT auto-conclude that a loss means SL was too tight.
-    Separate analysis of exit reason, path, volatility, and costs first.
+    Cash risk must not ratchet up after every scratch/win — lot stays fixed,
+    but wider SL was growing £ losses (£0.50→£1.34) while decisions stayed wrong.
 
-      tp / profitable trail → reinforce shape that paid
-      vanish / unknown without path → hold (no SL widen)
-      scratch on SL → raise SL (market noise beat the stop — robot widens itself)
-      scratch / cost-dominated otherwise → hold SL; cut κ if shape already wide
-      sl + noise vs vol (tight shape) → raise SL room
-      sl + adverse entry path → hold SL (entry direction problem, not distance)
-      loss + already-wide shape → cut κ (TP fantasy)
-      win → reinforce gently
+      tp / win → reinforce κ only (not SL width)
+      scratch → never widen SL; cut κ if already wide
+      growing SL-loss streak → cut sl_scale back toward 1
+      sl + noise + tight shape + NOT growing losses → rare SL room
+      sl + adverse / wide / thin evidence → hold or cut κ
     """
     mult=load_multipliers(store)
     k_m,s_m=mult['kappa'],mult['sl_scale']
@@ -214,13 +236,13 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         stop_distance=stop_distance,adverse_path=adverse_path,
         volatility=volatility,costs=costs,pnl=pnl,store=store,
         scratch_cash_band=band)
+    growing=_recent_sl_losses_growing(store,pnl)
     reason='hold'
     if reason_x=='tp' or (pnl>band and reason_x in ('trail','unknown','manual')):
+        # Win reinforces TP ambition only — do not widen SL (that raises £ risk).
         k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        s_m=min(MULT_SL_MAX,s_m*float(sched['bracket_win_sl_step']))
         reason='win_reinforce' if pnl>band else 'tp_reinforce'
     elif reason_x=='trail':
-        # Trail already managed the exit — do not treat as "SL too tight".
         if pnl<-band and shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_trail_loss_kappa_step']))
             reason='trail_loss_cut_tp'
@@ -229,41 +251,35 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     elif reason_x=='vanish':
         reason='vanish_hold'
     elif path['scratch_cash'] or path['cost_dominated']:
-        # Scratch on SL: this market's noise beat the stop — widen from £ evidence.
-        # Scratch on TP / cost-only: do not invent "SL too tight".
-        if reason_x=='sl' and not path.get('adverse_entry'):
-            s_m=min(MULT_SL_MAX,s_m*float(sched['bracket_sl_noise_step']))
-            reason='scratch_sl_raise_sl'
-        elif shape>=wide:
+        # Scratch is chop / spread — widening SL only grew the next £ hole.
+        if shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_scratch_kappa_step']))
             reason='scratch_cut_tp'
         else:
             reason='scratch_hold_sl'
     elif reason_x=='sl' or (pnl<-band and reason_x in ('unknown','manual')):
-        if path['noise_stop'] and shape<wide and not path['adverse_entry']:
-            # Stopped inside the noise band with a tight shape → give SL room.
+        if growing and s_m>1.0+1e-9:
+            # |£| SL losses climbing with fixed lot → cut risk back.
+            s_m=max(MULT_SL_MIN,s_m*float(sched['bracket_batch_cut_step']))
+            k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_loss_wide_kappa_step']))
+            reason='sl_loss_streak_cut_risk'
+        elif path['noise_stop'] and shape<wide and not path['adverse_entry']:
             s_m=min(MULT_SL_MAX,s_m*float(sched['bracket_sl_noise_step']))
             reason='sl_noise_raise_sl'
         elif shape>=wide:
-            # Wide brackets already had room; TP was fantasy — cut κ, do not
-            # widen SL further (even when the path was adverse).
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_loss_wide_kappa_step']))
             reason='loss_wide_cut_tp'
         elif path['adverse_entry']:
-            # Wrong-direction path beyond vol — widening SL would enlarge losses.
             reason='loss_adverse_hold_sl'
         else:
-            # Loss without vol/path evidence — refuse to assume SL was tight.
             reason='loss_insufficient_context_hold'
     elif pnl>band:
         k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        s_m=min(MULT_SL_MAX,s_m*float(sched['bracket_win_sl_step']))
         reason='win_reinforce'
     save_multipliers(store,k_m,s_m,
                      reason=f'learned_{reason} exit={reason_x} pnl={pnl:.4f}')
-    # Nudge the teacher schedule itself from the adapt reason (queued trial).
     if reason not in ('hold','trail_hold','vanish_hold','scratch_hold_sl',
-                      'loss_insufficient_context_hold'):
+                      'loss_insufficient_context_hold','loss_adverse_hold_sl'):
         try:
             from .self_params import evolve_from_feedback
             evolve_from_feedback(store,bracket_reason=reason,commit=False)
@@ -271,7 +287,7 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
             pass
     return {
         'kappa_mult':k_m,'sl_mult':s_m,'reason':reason,'pnl':pnl,
-        'exit_reason':reason_x,'path':path,
+        'exit_reason':reason_x,'path':path,'growing_sl_losses':growing,
         'shape_wide':wide,'schedule':{k:sched[k] for k in (
             'bracket_vs_vol_noise','bracket_shape_wide','bracket_sl_noise_step')},
     }

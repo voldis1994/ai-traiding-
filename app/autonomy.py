@@ -349,29 +349,41 @@ class AutoEvolution:
     def apply_evolved_policy_entry(self,scores,direction,*,evidence=None):
         """Run active_policy.decide on flat entry — HOLD veto or confirm side.
 
-        Never flips neural side (BUY↔SELL). CLOSE on flat → HOLD. Fault → HOLD
-        with reason (decision() already tries previous/DEFAULT restore).
+        MIN_EDGE is overridden with unified_cycle.entry_edge_floor (same units as
+        score_edge) so neural ΔW + £ settle are felt at OPEN — not blocked by a
+        frozen policy constant. Never flips neural side. CLOSE on flat → HOLD.
         """
         evidence=evidence if isinstance(evidence,dict) else {}
+        from . import unified_cycle
+        cycle=unified_cycle.load_state(self.store)
+        edge_floor=unified_cycle.min_open_margin(cycle)
         try:
-            pol=self.decision(scores,current_direction=None,age=0)
+            # Same scale bus as compose_open / edge_allows_open.
+            pol=self.decision(scores,current_direction=None,age=0,threshold=edge_floor)
         except Exception as exc:
-            evidence['evolved_policy']={'fault':type(exc).__name__,'action':'HOLD'}
+            evidence['evolved_policy']={'fault':type(exc).__name__,'action':'HOLD',
+                                        'entry_edge_floor':edge_floor}
             return 'HOLD',(
                 f'Evolved policy fault on entry ({type(exc).__name__}); HOLD'),evidence
-        evidence['evolved_policy']={'action':pol,'path':str(self.path),
-                                    'generation':int(getattr(self,'generation',0) or 0)}
+        evidence['evolved_policy']={
+            'action':pol,'path':str(self.path),
+            'generation':int(getattr(self,'generation',0) or 0),
+            'entry_edge_floor':edge_floor,
+            'score_edge':AutoEvolution.score_edge(scores),
+        }
         if pol in ('HOLD','CLOSE'):
             return 'HOLD',(
                 f'Evolved policy {pol} vetoes neural {direction} '
-                f'(gen={evidence["evolved_policy"]["generation"]})'),evidence
+                f'(edge_floor={edge_floor:.3f}, '
+                f'gen={evidence["evolved_policy"]["generation"]})'),evidence
         if pol in ('BUY','SELL') and pol!=direction:
             return 'HOLD',(
                 f'Evolved policy {pol} disagrees with neural {direction}; HOLD '
                 f'(no silent side flip)'),evidence
         return direction,(
             f'Neural {direction} confirmed by evolved policy '
-            f'(gen={evidence["evolved_policy"]["generation"]})'),evidence
+            f'(edge_floor={edge_floor:.3f}, '
+            f'gen={evidence["evolved_policy"]["generation"]})'),evidence
 
     def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
                               history=None,readiness=None,spread_bps=0.0):
@@ -469,6 +481,9 @@ class AutoEvolution:
             action,reason,evidence=self.apply_evolved_policy_entry(
                 scores,direction,evidence=evidence)
             base['evidence']=evidence
+            ep=(evidence or {}).get('evolved_policy') or {}
+            if ep.get('entry_edge_floor') is not None:
+                base['threshold']=ep['entry_edge_floor']
             return {**base,'action':action,'reason':reason}
         return {**base,'action':direction,
                 'reason':(f'Neural argmax {direction} '

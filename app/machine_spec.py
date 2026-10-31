@@ -32,8 +32,12 @@ UNIFIED_CYCLE = (
     'compose_open',
     'broker_settle',
     'unified_cycle.settle',
+    'note_weight_update',  # ΔW → shared entry_edge_floor
     'bracket_learn + neural trade_pnl',
 )
+# Shared score_edge units: settle(£) + note_weight_update(ΔW) → entry_edge_floor
+# → min_open_margin / policy MIN_EDGE override — weights felt at OPEN.
+UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor'
 UNIFIED_CYCLE_STORE = 'unified_cycle_v1'
 # Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
 LEARN_OBJECTIVES = {

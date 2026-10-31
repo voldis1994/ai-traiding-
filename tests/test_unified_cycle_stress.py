@@ -36,7 +36,8 @@ def sandbox():
 def test_perceive_survives_poison_scores(scores):
     d = uc.perceive_decision(scores)
     assert d['action'] in ('BUY', 'SELL', 'HOLD')
-    assert math.isfinite(d['margin'])
+    # Unknown / poison scores → margin None (not invented weak 0.0).
+    assert d['margin'] is None or math.isfinite(d['margin'])
     assert math.isfinite(d['confidence'])
 
 

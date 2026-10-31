@@ -18,6 +18,13 @@ STORE_KEY = 'unified_cycle_v1'
 AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
+# Shared LIVE entry edge floor — SAME units as neural score_edge / policy MIN_EDGE.
+# Without this bus, ΔW could move scores while a frozen 0.06 policy gate still
+# vetoed — weights changed but OPEN behavior did not ("mērogi neizjūt svarus").
+ENTRY_EDGE_DEFAULT = 0.06
+ENTRY_EDGE_MIN = 0.02
+ENTRY_EDGE_MAX = 0.20
+
 
 def _finite(v):
     try:
@@ -53,13 +60,14 @@ def _score_value(scores, key) -> float | None:
 def default_state():
     return {
         'aggression': 1.0,
+        'entry_edge_floor': ENTRY_EDGE_DEFAULT,
         'loss_streak': 0,
         'win_streak': 0,
         'last_pnl': None,
         'last_action': None,
         'opens': 0,
         'settlements': 0,
-        'version': 1,
+        'version': 2,
     }
 
 
@@ -72,11 +80,14 @@ def load_state(store) -> dict:
                 out[k] = raw[k]
         out['aggression'] = _clip(
             _finite(out.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX)
+        out['entry_edge_floor'] = _clip(
+            _finite(out.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+            ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
         out['loss_streak'] = _safe_int(out.get('loss_streak'), 0)
         out['win_streak'] = _safe_int(out.get('win_streak'), 0)
         out['opens'] = _safe_int(out.get('opens'), 0)
         out['settlements'] = _safe_int(out.get('settlements'), 0)
-        out['version'] = _safe_int(out.get('version'), 1) or 1
+        out['version'] = _safe_int(out.get('version'), 2) or 2
         out['last_pnl'] = _finite(out.get('last_pnl'))
         if out.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
             out['last_action'] = None
@@ -89,17 +100,28 @@ def save_state(store, state: dict) -> dict:
         clean.update({k: state.get(k, clean[k]) for k in clean})
     clean['aggression'] = _clip(
         _finite(clean.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX)
+    clean['entry_edge_floor'] = _clip(
+        _finite(clean.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     clean['loss_streak'] = _safe_int(clean.get('loss_streak'), 0)
     clean['win_streak'] = _safe_int(clean.get('win_streak'), 0)
     clean['opens'] = _safe_int(clean.get('opens'), 0)
     clean['settlements'] = _safe_int(clean.get('settlements'), 0)
-    clean['version'] = _safe_int(clean.get('version'), 1) or 1
+    clean['version'] = _safe_int(clean.get('version'), 2) or 2
     clean['last_pnl'] = _finite(clean.get('last_pnl'))
     if clean.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
         clean['last_action'] = None
     if store is not None:
         store.set(STORE_KEY, clean)
     return clean
+
+
+def entry_edge_floor(store=None, cycle_state=None) -> float:
+    """Single LIVE edge unit shared by cycle gate + policy MIN_EDGE override."""
+    state = cycle_state if isinstance(cycle_state, dict) else load_state(store)
+    return _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
 
 
 def score_margin(scores) -> float | None:
@@ -129,6 +151,8 @@ def perceive_decision(scores, evaluation=None) -> dict:
     margin = _finite(evaluation.get('score_edge'))
     if margin is None:
         margin = score_margin(scores)
+    # Missing scores → margin stays None. Do NOT invent 0.0 ("weak edge") —
+    # that falsely blocked explicit submit / lot-recovery when no signal yet.
     conf = None
     if isinstance(scores, dict):
         finite_scores = [_finite(scores.get(k)) for k in ('BUY', 'SELL', 'HOLD')]
@@ -137,7 +161,7 @@ def perceive_decision(scores, evaluation=None) -> dict:
             conf = max(finite_scores)
     return {
         'action': action,
-        'margin': float(margin) if margin is not None else 0.0,
+        'margin': float(margin) if margin is not None else None,
         'confidence': float(conf) if conf is not None else 0.0,
         'reason': evaluation.get('reason'),
         'proposal': evaluation.get('proposal') or action,
@@ -145,14 +169,45 @@ def perceive_decision(scores, evaluation=None) -> dict:
 
 
 def min_open_margin(state: dict) -> float:
-    """After losses, demand a clearer neural edge before the next OPEN."""
-    losses = _safe_int((state or {}).get('loss_streak'), 0)
-    # Data-driven floor from streak length — no frozen 0.06 tip; scales with pain.
-    return float(min(0.20, 0.02 * max(0, losses)))
+    """LIVE entry floor in score_edge units — shared with policy MIN_EDGE.
+
+    Combines evolved ``entry_edge_floor`` with a loss-streak raise so one £
+    feedback bus gates both compose_open and decide(), instead of a frozen
+    0.06 policy tip ignoring neural weight moves.
+    """
+    state = state or default_state()
+    base = _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    losses = _safe_int(state.get('loss_streak'), 0)
+    streak_bump = float(min(0.12, 0.015 * max(0, losses)))
+    return float(min(ENTRY_EDGE_MAX, base + streak_bump))
 
 
 # Back-compat alias used while the module settled.
 _min_open_margin = min_open_margin
+
+
+def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
+    """After neural trade_pnl ΔW, open/close the shared edge floor so weights are felt.
+
+    Win + real ΔW → lower entry_edge_floor (learned preference may OPEN).
+    Loss update → raise floor. Restored/zero ΔW → no edge move.
+    """
+    state = load_state(store)
+    d = _finite(delta_norm)
+    if d is not None and d <= 1e-9:
+        return state
+    floor = _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    if won:
+        # Stronger ΔW → slightly more room to express the new weights.
+        step = 0.94 if (d is not None and d >= 0.15) else 0.97
+        state['entry_edge_floor'] = _clip(floor * step, ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    else:
+        state['entry_edge_floor'] = _clip(floor * 1.04, ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    return save_state(store, state)
 
 
 def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
@@ -161,12 +216,14 @@ def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
     decision = perceive_decision(scores, evaluation)
     need = min_open_margin(state)
     act = decision['action']
-    if act in ('BUY', 'SELL') and float(decision['margin']) < need:
+    margin = decision['margin']
+    # Only gate when edge is known — no scores ≠ automatic weak-edge veto.
+    if act in ('BUY', 'SELL') and margin is not None and float(margin) < need:
         return {
             'allowed': False,
             'action': 'HOLD',
             'reason': (
-                f'Unified cycle: edge {decision["margin"]:.3f} < required {need:.3f} '
+                f'Unified cycle: edge {float(margin):.3f} < required {need:.3f} '
                 f'after {int(state.get("loss_streak") or 0)} loss streak'),
             'decision': decision,
             'min_margin': need,
@@ -194,7 +251,10 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     state = dict(cycle_state or default_state())
     decision = perceive_decision(scores, evaluation)
     act = action if action in ('BUY', 'SELL', 'HOLD') else decision['action']
-    margin = float(decision['margin'])
+    # Known margin only; missing scores skip the weak-edge HOLD (not invent 0).
+    raw_margin = decision['margin']
+    known_margin = raw_margin is not None
+    margin = float(raw_margin) if known_margin else 0.0
     aggression = _clip(_finite(state.get('aggression')) or 1.0,
                        AGGRESSION_MIN, AGGRESSION_MAX)
     need = min_open_margin(state)
@@ -203,7 +263,7 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     base_hint = _finite(base_sl)
     if base_hint is None:
         base_hint = _finite(zone.get('range_distance')) or 0.0
-    if act in ('BUY', 'SELL') and margin < need:
+    if act in ('BUY', 'SELL') and known_margin and margin < need:
         return {
             'action': 'HOLD',
             'kappa': None,
@@ -250,13 +310,16 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
 
 
 def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
-    """Fold broker £ into cycle aggression / streaks — one feedback bus."""
+    """Fold broker £ into aggression, streaks, AND shared entry_edge_floor."""
     state = load_state(store)
     p = _finite(pnl)
     state['settlements'] = _safe_int(state.get('settlements'), 0) + 1
     state['last_pnl'] = p
     state['last_action'] = action if action in ('BUY', 'SELL', 'HOLD', None) else None
     agg = _finite(state.get('aggression')) or 1.0
+    floor = _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     if p is None:
         return save_state(store, state)
     if p < 0:
@@ -265,11 +328,19 @@ def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
         # Cool aggression after losses so the next OPEN is tighter / pickier.
         step = 0.96 if state['loss_streak'] >= 2 else 0.98
         state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
+        # Raise shared edge floor — policy MIN_EDGE override sees the same unit.
+        state['entry_edge_floor'] = _clip(
+            floor * (1.06 if state['loss_streak'] >= 2 else 1.03),
+            ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     elif p > 0:
         state['win_streak'] = _safe_int(state.get('win_streak'), 0) + 1
         state['loss_streak'] = 0
         step = 1.02 if state['win_streak'] >= 2 else 1.01
         state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
+        # Lower floor so neural weight gains after £+ can actually OPEN next.
+        state['entry_edge_floor'] = _clip(
+            floor * (0.95 if state['win_streak'] >= 2 else 0.98),
+            ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     else:
         # Flat £ — mild cool-off, do not treat as a win.
         state['aggression'] = _clip(agg * 0.995, AGGRESSION_MIN, AGGRESSION_MAX)

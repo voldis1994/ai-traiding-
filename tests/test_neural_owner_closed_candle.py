@@ -31,7 +31,8 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         down={'5':-2,'15':-3,'60':-4}
         result=p.evaluate_neural_entry(score,returns_bps=down,trend='DOWN',regime='ALIGNED')
         assert result['action']=='SELL'
-        assert result['threshold'] is None
+        # Shared entry_edge_floor is exposed as threshold when policy LIVE executes.
+        assert result['threshold'] is None or isinstance(result['threshold'],(int,float))
         assert result['evidence'] is not None
         assert p.neural_decision({'BUY':.34,'SELL':.33,'HOLD':.33})=='BUY'
         assert p.neural_decision({'BUY':.25,'SELL':.35,'HOLD':.40})=='HOLD'
@@ -94,6 +95,8 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
             e.market_context={'ready':True}
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
+            # Clear neural edge so shared entry_edge_floor does not invent HOLD.
+            e.last_signal={'action':'BUY','scores':{'BUY':0.70,'SELL':0.20,'HOLD':0.10}}
             await e.submit('BUY')
             orders=[r for r in broker.requests if r[0]=='OPEN']
             assert len(orders)==1 and orders[0][3]==Decimal('.5')

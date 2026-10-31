@@ -3005,10 +3005,19 @@ class SingleTradeEngine:
         self._claim_trade_learned(deal_id)
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
+        last_delta=None
         for i in range(repeats):
             step_loss=self.brain.learn_from_trade(
                 transition,label,lr=learn_lr,won=pnl_sign>0,count_sample=(i==0))
             if step_loss is not None:losses.append(step_loss)
+            meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+            if meta.get('delta_norm') is not None:
+                last_delta=meta.get('delta_norm')
+        # Couple ΔW → shared entry_edge_floor so weight moves are felt at OPEN
+        # (same units as policy MIN_EDGE / cycle min_open_margin).
+        if repeats>0 and label is not None:
+            unified_cycle.note_weight_update(
+                self.store,won=pnl_sign>0,delta_norm=last_delta)
         # Independent shadow core trains on same label using *its* decision-time h/c.
         if repeats>0:
             self._shadow_learn(None,label,lr=learn_lr)

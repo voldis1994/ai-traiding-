@@ -27,8 +27,27 @@ def _finite(v):
         return None
 
 
+def _safe_int(v, default=0) -> int:
+    """Non-negative int from Store junk (NaN / str / None → default)."""
+    n = _finite(v)
+    if n is None:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return int(default)
+    if not math.isfinite(float(n)):
+        return int(default)
+    return max(0, int(n))
+
+
 def _clip(v, lo, hi):
     return float(max(lo, min(hi, float(v))))
+
+
+def _score_value(scores, key) -> float | None:
+    if not isinstance(scores, dict):
+        return None
+    return _finite(scores.get(key))
 
 
 def default_state():
@@ -53,8 +72,14 @@ def load_state(store) -> dict:
                 out[k] = raw[k]
         out['aggression'] = _clip(
             _finite(out.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX)
-        out['loss_streak'] = max(0, int(out.get('loss_streak') or 0))
-        out['win_streak'] = max(0, int(out.get('win_streak') or 0))
+        out['loss_streak'] = _safe_int(out.get('loss_streak'), 0)
+        out['win_streak'] = _safe_int(out.get('win_streak'), 0)
+        out['opens'] = _safe_int(out.get('opens'), 0)
+        out['settlements'] = _safe_int(out.get('settlements'), 0)
+        out['version'] = _safe_int(out.get('version'), 1) or 1
+        out['last_pnl'] = _finite(out.get('last_pnl'))
+        if out.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
+            out['last_action'] = None
     return out
 
 
@@ -64,6 +89,14 @@ def save_state(store, state: dict) -> dict:
         clean.update({k: state.get(k, clean[k]) for k in clean})
     clean['aggression'] = _clip(
         _finite(clean.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX)
+    clean['loss_streak'] = _safe_int(clean.get('loss_streak'), 0)
+    clean['win_streak'] = _safe_int(clean.get('win_streak'), 0)
+    clean['opens'] = _safe_int(clean.get('opens'), 0)
+    clean['settlements'] = _safe_int(clean.get('settlements'), 0)
+    clean['version'] = _safe_int(clean.get('version'), 1) or 1
+    clean['last_pnl'] = _finite(clean.get('last_pnl'))
+    if clean.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
+        clean['last_action'] = None
     if store is not None:
         store.set(STORE_KEY, clean)
     return clean
@@ -88,8 +121,9 @@ def perceive_decision(scores, evaluation=None) -> dict:
     evaluation = evaluation if isinstance(evaluation, dict) else {}
     action = evaluation.get('action')
     if action not in ('BUY', 'SELL', 'HOLD'):
-        if isinstance(scores, dict) and set(scores) >= {'BUY', 'SELL', 'HOLD'}:
-            action = max(('BUY', 'SELL', 'HOLD'), key=lambda a: float(scores.get(a, 0) or 0))
+        vals = {a: _score_value(scores, a) for a in ('BUY', 'SELL', 'HOLD')}
+        if all(v is not None for v in vals.values()):
+            action = max(('BUY', 'SELL', 'HOLD'), key=lambda a: vals[a])
         else:
             action = 'HOLD'
     margin = _finite(evaluation.get('score_edge'))
@@ -97,10 +131,10 @@ def perceive_decision(scores, evaluation=None) -> dict:
         margin = score_margin(scores)
     conf = None
     if isinstance(scores, dict):
-        try:
-            conf = max(float(scores[k]) for k in ('BUY', 'SELL', 'HOLD'))
-        except (TypeError, ValueError, KeyError):
-            conf = None
+        finite_scores = [_finite(scores.get(k)) for k in ('BUY', 'SELL', 'HOLD')]
+        finite_scores = [v for v in finite_scores if v is not None]
+        if finite_scores:
+            conf = max(finite_scores)
     return {
         'action': action,
         'margin': float(margin) if margin is not None else 0.0,
@@ -112,7 +146,7 @@ def perceive_decision(scores, evaluation=None) -> dict:
 
 def min_open_margin(state: dict) -> float:
     """After losses, demand a clearer neural edge before the next OPEN."""
-    losses = int(state.get('loss_streak') or 0)
+    losses = _safe_int((state or {}).get('loss_streak'), 0)
     # Data-driven floor from streak length — no frozen 0.06 tip; scales with pain.
     return float(min(0.20, 0.02 * max(0, losses)))
 
@@ -164,22 +198,26 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     aggression = _clip(_finite(state.get('aggression')) or 1.0,
                        AGGRESSION_MIN, AGGRESSION_MAX)
     need = min_open_margin(state)
+    zone = zone if isinstance(zone, dict) else {}
+    tp_hint = _finite(max_tp) if max_tp is not None else _finite(zone.get('max_tp'))
+    base_hint = _finite(base_sl)
+    if base_hint is None:
+        base_hint = _finite(zone.get('range_distance')) or 0.0
     if act in ('BUY', 'SELL') and margin < need:
         return {
             'action': 'HOLD',
             'kappa': None,
             'sl_scale': None,
-            'base_sl': base_sl,
-            'max_tp': max_tp if max_tp is not None else (zone or {}).get('max_tp'),
+            'base_sl': float(base_hint),
+            'max_tp': float(tp_hint) if tp_hint is not None else None,
             'blocked': True,
             'reason': (
                 f'Unified cycle: edge {margin:.3f} < required {need:.3f} '
-                f'after {int(state.get("loss_streak") or 0)} loss streak'),
+                f'after {_safe_int(state.get("loss_streak"), 0)} loss streak'),
             'decision': decision,
             'aggression': aggression,
             'min_margin': need,
         }
-    zone = zone if isinstance(zone, dict) else {}
     learned = learned if isinstance(learned, dict) else {}
     kappa = _finite(zone.get('kappa')) or 1.0
     # Blend zone κ with learned multiplier, then damp/raise with cycle aggression.
@@ -190,9 +228,9 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     # Strong edge → full learned width. Never invent lot size.
     edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.10)
     sl_scale = max(1.0, float(s_mult) * float(aggression) * float(edge_scale))
-    tp = max_tp if max_tp is not None else zone.get('max_tp')
-    base = float(base_sl or zone.get('range_distance') or 0)
-    if base > 0 and tp and float(tp) > 0:
+    tp = tp_hint
+    base = float(base_hint)
+    if base > 0 and tp is not None and tp > 0:
         room = float(tp) / (base * sl_scale)
         if kappa > room:
             kappa = max(0.5, room)
@@ -215,36 +253,31 @@ def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
     """Fold broker £ into cycle aggression / streaks — one feedback bus."""
     state = load_state(store)
     p = _finite(pnl)
-    state['settlements'] = int(state.get('settlements') or 0) + 1
+    state['settlements'] = _safe_int(state.get('settlements'), 0) + 1
     state['last_pnl'] = p
-    state['last_action'] = action
+    state['last_action'] = action if action in ('BUY', 'SELL', 'HOLD', None) else None
+    agg = _finite(state.get('aggression')) or 1.0
     if p is None:
         return save_state(store, state)
     if p < 0:
-        state['loss_streak'] = int(state.get('loss_streak') or 0) + 1
+        state['loss_streak'] = _safe_int(state.get('loss_streak'), 0) + 1
         state['win_streak'] = 0
         # Cool aggression after losses so the next OPEN is tighter / pickier.
         step = 0.96 if state['loss_streak'] >= 2 else 0.98
-        state['aggression'] = _clip(
-            float(state.get('aggression') or 1.0) * step,
-            AGGRESSION_MIN, AGGRESSION_MAX)
+        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
     elif p > 0:
-        state['win_streak'] = int(state.get('win_streak') or 0) + 1
+        state['win_streak'] = _safe_int(state.get('win_streak'), 0) + 1
         state['loss_streak'] = 0
         step = 1.02 if state['win_streak'] >= 2 else 1.01
-        state['aggression'] = _clip(
-            float(state.get('aggression') or 1.0) * step,
-            AGGRESSION_MIN, AGGRESSION_MAX)
+        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
     else:
         # Flat £ — mild cool-off, do not treat as a win.
-        state['aggression'] = _clip(
-            float(state.get('aggression') or 1.0) * 0.995,
-            AGGRESSION_MIN, AGGRESSION_MAX)
+        state['aggression'] = _clip(agg * 0.995, AGGRESSION_MIN, AGGRESSION_MAX)
     return save_state(store, state)
 
 
 def note_open(store, *, action=None) -> dict:
     state = load_state(store)
-    state['opens'] = int(state.get('opens') or 0) + 1
-    state['last_action'] = action
+    state['opens'] = _safe_int(state.get('opens'), 0) + 1
+    state['last_action'] = action if action in ('BUY', 'SELL', 'HOLD', None) else None
     return save_state(store, state)

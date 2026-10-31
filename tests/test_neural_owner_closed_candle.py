@@ -25,13 +25,14 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         # 38%: previously forbidden by 60% and by 8.1pp margin
         score={'BUY':.32, 'SELL':.38, 'HOLD':.30}
         assert p.neural_decision(score)=='SELL'
-        # LIVE entry = neural argmax — zone/SHIFT are evidence only, not vetoes.
+        # LIVE: neural proposes; evolved policy (default MIN_EDGE=0.06) confirms.
         bare=p.evaluate_neural_entry(score)
         assert bare['action']=='SELL' and bare['proposal']=='SELL'
         down={'5':-2,'15':-3,'60':-4}
         result=p.evaluate_neural_entry(score,returns_bps=down,trend='DOWN',regime='ALIGNED')
         assert result['action']=='SELL'
-        assert result['threshold'] is None
+        # Shared entry_edge_floor is exposed as threshold when policy LIVE executes.
+        assert result['threshold'] is None or isinstance(result['threshold'],(int,float))
         assert result['evidence'] is not None
         assert p.neural_decision({'BUY':.34,'SELL':.33,'HOLD':.33})=='BUY'
         assert p.neural_decision({'BUY':.25,'SELL':.35,'HOLD':.40})=='HOLD'
@@ -40,13 +41,15 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
         assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='BUY'
         up={'5':2,'15':3,'60':4}
+        # Tiny edge 0.01 < default MIN_EDGE 0.06 → evolved policy HOLDs (proposal still BUY).
         tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33},
             returns_bps=up,trend='UP',regime='ALIGNED')
-        assert tied['action']=='BUY' and tied['proposal']=='BUY'
+        assert tied['action']=='HOLD' and tied['proposal']=='BUY'
+        assert 'evolved policy' in tied['reason'].lower() or 'vetoes' in tied['reason'].lower()
         entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27},
             returns_bps=up,trend='UP',regime='ALIGNED')
         assert entered['action']=='BUY'
-        # Against trend / SHIFT — still argmax (no hardcode veto).
+        # Against trend / SHIFT — no hardcode zone veto; policy may still confirm clear edge.
         assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
             returns_bps={'5':-2,'15':-3,'60':-4},trend='DOWN')['action']=='BUY'
         assert p.evaluate_neural_entry({'BUY':.8,'SELL':.1,'HOLD':.1},
@@ -92,6 +95,8 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
             e.market_context={'ready':True}
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
+            # Clear neural edge so shared entry_edge_floor does not invent HOLD.
+            e.last_signal={'action':'BUY','scores':{'BUY':0.70,'SELL':0.20,'HOLD':0.10}}
             await e.submit('BUY')
             orders=[r for r in broker.requests if r[0]=='OPEN']
             assert len(orders)==1 and orders[0][3]==Decimal('.5')

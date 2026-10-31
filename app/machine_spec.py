@@ -15,7 +15,9 @@ from .market_context import FEATURE_DIM, FEATURE_SCHEMA
 from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 
 # Pipeline: F_learn ∘ F_broker ∘ F_order ∘ F_decision ∘ F_neuron
-LIVE_DECISION_RULE = 'neural_argmax_buy_sell_hold'
+# Neural argmax proposes side; promoted policy.py decide() confirms or HOLDs
+# when self_params.policy_live_execute=1 (default ON with policy_evolve_enabled).
+LIVE_DECISION_RULE = 'neural_argmax_then_evolved_policy_gate'
 LIVE_DECISION_BAR = 'completed_broker_M1'
 POLL_SECONDS = 3
 NEURAL_DT_SECONDS = 60
@@ -23,6 +25,20 @@ DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight st
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions
 # Closed-trade P&L regret is the primary corrective teacher (engine._learn_closed_trade).
 PRIMARY_FEEDBACK = 'closed_trade_pnl_counterfactual_buy_sell_hold'
+# One LIVE machine loop — not separate argmax / bracket / risk policies.
+# perceive(scores) → decide(argmax+edge) → risk(κ/sl via aggression) → settle(£) → learn.
+UNIFIED_CYCLE = (
+    'perceive_decision',
+    'compose_open',
+    'broker_settle',
+    'unified_cycle.settle',  # aggression/streaks → exit width only
+    'bracket_learn + neural trade_pnl',  # exits + entry score quality
+    'policy_evolve',  # new strategies; MIN_EDGE stays 0.06
+)
+# Fixed score_edge gate (0.06). Learning improves scores/exits/strategies —
+# not the threshold.
+UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor_fixed_0.06'
+UNIFIED_CYCLE_STORE = 'unified_cycle_v1'
 # Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
 LEARN_OBJECTIVES = {
     OBJECTIVE_MINUTE_DIRECTION: OBJECTIVE_WEIGHTS[OBJECTIVE_MINUTE_DIRECTION],
@@ -36,9 +52,23 @@ FEATURE_SCHEMAS = {
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},
     'dynamic': {'note': 'FeatureRegistry may append validated OHLC formulas; dims grow at runtime'},
 }
-# Present in autonomy templates / replay only — NOT a LIVE entry veto.
-SHADOW_ONLY = ('evolved_MIN_EDGE', 'legacy_60pct_gates', 'price_edge_v5_entry_filter',
+# Still research-only (not the LIVE decide() gate) — except hold_shadow teaches
+# LIVE weights lightly when opposite would have hit TP after a HOLD abstention.
+SHADOW_ONLY = ('legacy_60pct_gates', 'price_edge_v5_entry_filter',
                'shadow_architecture_probe', 'feature_discovery_proposals')
+# HOLD abstention → replay opposite with same SL/TP; teach if opposite hit TP.
+HOLD_SHADOW_OPPOSITE = (
+    'hold_shadow.enqueue',
+    'hold_shadow.resolve_ready',
+    'learn_from_trade(opposite) when opposite_hit_tp',
+)
+# Evolved policy.py is LIVE when policy_live_execute=1 — listed for clarity.
+LIVE_POLICY_EXECUTION = (
+    'policy_evolve_enabled',
+    'policy_live_execute',
+    'autonomy.evolve_promote',
+    'evaluate_neural_entry.apply_evolved_policy_entry',
+)
 SELF_DEV_CYCLE = (
     'collect_ohlc',
     'discover_candidates',
@@ -47,6 +77,8 @@ SELF_DEV_CYCLE = (
     'profit_learning_labels',
     'shadow_compare_models',
     'promote_or_rollback',
+    'evolve_policy_python',
+    'execute_promoted_policy_on_live_entry',
 )
 # Capital.com does not provide true volume / DOM — discovery never invents them.
 # Public multi-source liquidity is resolved per instrument (FX futures, metals,

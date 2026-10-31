@@ -68,11 +68,14 @@ def test_prep_eval_blocks_until_holdout_passes_and_separates_stages():
 def test_argmax_kept_but_score_edge_is_not_utility_without_readiness():
     with tempfile.TemporaryDirectory() as d:
         p = AutoEvolution(Store(Path(d) / 'db.sqlite3'), Path(d) / 'pol.py')
-        scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # small edge
-        # No readiness/history → argmax only (unit path).
+        # Small edge 0.05 < default MIN_EDGE 0.06 → evolved policy HOLDs.
+        weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
+        weak_out = p.evaluate_neural_entry(weak)
+        assert weak_out['action'] == 'HOLD' and weak_out['proposal'] == 'BUY'
+        assert weak_out['evidence']['score_edge_is_not_trading_advantage'] is True
+        scores = {'BUY': 0.48, 'SELL': 0.30, 'HOLD': 0.22}  # edge clears policy
         bare = p.evaluate_neural_entry(scores)
         assert bare['action'] == 'BUY'
-        assert bare['score_edge_is_not_trading_advantage'] if False else True
         assert bare['evidence']['score_edge_is_not_trading_advantage'] is True
         # Explicit not-ready blocks LIVE OPEN despite argmax.
         blocked = p.evaluate_neural_entry(
@@ -142,8 +145,8 @@ def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic(
         assert snap['neural_close_diagnostic_only'] is True
         assert snap['neural_close_executable'] is False
         assert snap['neural_market_exit'] is False
-        assert 'zone/SHIFT' in snap['neural_entry_rule']
-        assert 'not entry bans' in snap['neural_entry_rule']
+        assert 'evolved policy' in snap['neural_entry_rule'].lower()
+        assert 'policy_live_execute' in snap['neural_entry_rule']
         assert snap['metric_labels']['minute_direction_accuracy']
         assert 'win rate' in snap['metric_labels']['trade_win_rate'].lower() or 'Win' in snap['metric_labels']['trade_win_rate']
 

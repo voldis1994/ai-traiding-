@@ -90,8 +90,11 @@ DEFAULTS = {
     'min_holdout_bars': 24,
     'min_online_labeled': 64,
     'min_holdout_minute_acc': 0.34,
-    # Cosmetic policy.py AutoEvolution — OFF by default (LIVE entry = neural argmax).
-    'policy_evolve_enabled': 0,
+    # Policy.py search + LIVE entry gate — ON so promoted strategies actually execute.
+    # Neural argmax still proposes side; evolved decide() may HOLD or confirm.
+    'policy_evolve_enabled': 1,
+    # When 1, evaluate_neural_entry consults active_policy.py before OPEN.
+    'policy_live_execute': 1,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -151,6 +154,7 @@ BOUNDS = {
     'min_online_labeled': (24, 200),
     'min_holdout_minute_acc': (0.30, 0.50),
     'policy_evolve_enabled': (0, 1),
+    'policy_live_execute': (0, 1),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -191,7 +195,7 @@ def _clip(key, value):
                'profit_history_rows','exit_need_streak','prune_min_age',
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
-               'min_online_labeled','policy_evolve_enabled'):
+               'min_online_labeled','policy_evolve_enabled','policy_live_execute'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

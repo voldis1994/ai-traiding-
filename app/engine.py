@@ -27,6 +27,7 @@ from .math_rules import (stop_take, ohlc_range_distance,
                          cash_risk, tick_value_from_instrument)
 from . import bracket_learn
 from . import hard_risk
+from . import unified_cycle
 from .protection_ai import propose_broker_trail, trail_extreme_from_broker
 from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
@@ -39,6 +40,7 @@ from .feature_discovery import FeatureDiscovery
 from .feature_validation import FeatureValidator
 from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
+from . import hold_shadow
 from . import learning_generation
 
 DB=DATA/'robot.sqlite3'
@@ -2045,7 +2047,7 @@ class SingleTradeEngine:
             if new_closed_bar and self.brain.labeled:
                 try:
                     from .self_params import get as sp_get
-                    if int(sp_get(self.store,'policy_evolve_enabled',0)):
+                    if int(sp_get(self.store,'policy_evolve_enabled',1)):
                         self.policy.evolve(
                             self.brain.correct/self.brain.labeled,
                             self.brain.labeled,list(self.brain.history))
@@ -2064,6 +2066,12 @@ class SingleTradeEngine:
                     self.store.event('warning','Prep/eval stage failed',
                                     {'type':type(exc).__name__})
             if not self.armed or not self.execution_enabled:return
+            # Resolve HOLD→opposite shadows on every new M1 bar (even when in trade).
+            if new_closed_bar:
+                try:self._resolve_hold_shadows()
+                except Exception as exc:
+                    self.store.event('warning','hold_shadow resolve skipped',
+                                    {'type':type(exc).__name__})
             if len(self.positions)==1:
                 p=self.positions[0]
                 # Missing SL → install bracket. Missing TP alone must NOT reinstall
@@ -2124,6 +2132,10 @@ class SingleTradeEngine:
                         {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
                          'proposal':evaluation.get('proposal'), 'decision':action,
                          'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                    # HOLD with a directional proposal → shadow opposite path later
+                    # (same brackets) so abstention does not collapse to forever-HOLD.
+                    if action=='HOLD' and evaluation.get('proposal') in ('BUY','SELL'):
+                        self._enqueue_hold_shadow(evaluation)
                     # One entry opportunity per completed M1 bar. The first new
                     # confirmed bar after a broker-verified close can already act.
                     if (action in ('BUY','SELL') and
@@ -2195,6 +2207,18 @@ class SingleTradeEngine:
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
                 return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
+            # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
+            edge=unified_cycle.edge_allows_open(
+                self.last_signal['scores'],result,
+                unified_cycle.load_state(self.store))
+            if not edge['allowed']:
+                return dict(result,action='HOLD',reason=edge['reason'],
+                            unified_cycle=edge)
+            result=dict(result,unified_cycle=edge)
+        else:
+            result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
+                (self.last_signal or {}).get('scores'),result,
+                unified_cycle.load_state(self.store)))
         return result
 
     def _signal_reason(self,action,market_status=None,evaluation=None):
@@ -2811,6 +2835,142 @@ class SingleTradeEngine:
             'trail':True,
         }
 
+    def _settle_unified_cycle(self,*,pnl,action=None,exit_reason=None,deal_id=None):
+        """Fold broker £ into the single LIVE cycle bus (aggression / streaks)."""
+        cycle=unified_cycle.settle(
+            self.store,pnl=pnl,action=action,exit_reason=exit_reason)
+        self.store.event('cycle','Unified cycle settled from broker £',{
+            'deal_id':deal_id,'pnl':pnl,'action':action,
+            'exit_reason':exit_reason,
+            'aggression':cycle.get('aggression'),
+            'loss_streak':cycle.get('loss_streak'),
+            'win_streak':cycle.get('win_streak')})
+        return cycle
+
+    def _would_be_brackets(self,proposal):
+        """SL/TP distances OPEN would use for proposal — for hold-shadow only."""
+        if proposal not in ('BUY','SELL') or not self.mandate:
+            return None
+        epic=self.mandate.get('epic')
+        mid=self.market.get('mid')
+        tick=self.market.get('tick')
+        spread=self.market.get('spread')
+        minimum=self.market.get('min_distance')
+        if None in (mid,tick,spread) or not epic:
+            return None
+        try:
+            candles=self.store.candles(epic,n=120,historical_only=True)
+        except Exception:
+            candles=[]
+        if len(candles)<20:
+            return None
+        zone=bracket_learn.zone_at_open(candles)
+        rng=zone['range_distance'] or ohlc_range_distance(candles)
+        buffer=max(2*float(tick),2*float(spread))
+        min_d=float(minimum) if minimum is not None else float(tick)
+        base_sl=max(min_d+buffer,float(rng or 0))
+        learned=bracket_learn.load_multipliers(self.store)
+        cycle_state=unified_cycle.load_state(self.store)
+        scores=(self.last_signal or {}).get('scores')
+        # Force evaluation action so compose_open still yields κ/sl when edge
+        # was the reason LIVE HOLDed (we need distances, not another HOLD).
+        edge=self.policy.score_edge(scores) if scores else 0.5
+        # Use a strong synthetic edge for bracket *shape* only — not for LIVE.
+        pkg=unified_cycle.compose_open(
+            action=proposal,scores=scores or {
+                'BUY':0.7 if proposal=='BUY' else 0.15,
+                'SELL':0.7 if proposal=='SELL' else 0.15,'HOLD':0.15},
+            evaluation={'action':proposal,'score_edge':max(0.2,float(edge or 0))},
+            zone=zone,learned=learned,cycle_state=cycle_state,base_sl=base_sl,
+            max_tp=zone.get('max_tp'))
+        kappa=pkg.get('kappa') or 1.0
+        sl_scale=pkg.get('sl_scale') or 1.0
+        if pkg.get('blocked'):
+            kappa=float(zone.get('kappa') or 1.0)*(learned.get('kappa') or 1.0)
+            sl_scale=max(1.0,float(learned.get('sl_scale') or 1.0))
+        entry=float(mid)
+        brackets=stop_take(entry,proposal,tick,spread,min_d,
+                           kappa=float(kappa),sl_scale=float(sl_scale),
+                           range_distance=float(rng) if rng is not None else 0)
+        return {
+            'entry':entry,'tick':float(tick),'spread':float(spread),
+            'min_distance':min_d,
+            'stop_distance':float(brackets['stop_distance']),
+            'profit_distance':float(brackets['profit_distance']),
+            'epic':epic,
+        }
+
+    def _enqueue_hold_shadow(self,evaluation):
+        """When LIVE HOLDs a BUY/SELL proposal, queue opposite-path shadow."""
+        proposal=evaluation.get('proposal')
+        if proposal not in ('BUY','SELL'):
+            return None
+        if not self.brain.core.last_transition:
+            return None
+        brackets=self._would_be_brackets(proposal)
+        if not brackets:
+            return None
+        tr=self.brain._json_transition(self.brain.core.last_transition)
+        row=hold_shadow.enqueue(
+            self.store,proposal=proposal,
+            reason=evaluation.get('reason') or self.last_entry_reason,
+            bar_time=self.last_decision_bar or self.market_context.get('bar_time'),
+            epic=brackets['epic'],entry=brackets['entry'],
+            spread=brackets['spread'],
+            stop_distance=brackets['stop_distance'],
+            profit_distance=brackets['profit_distance'],
+            tick=brackets['tick'],min_distance=brackets['min_distance'],
+            transition=tr,scores=(self.last_signal or {}).get('scores'))
+        if row:
+            self.store.event('hold_shadow','Queued opposite-path shadow for HOLD abstention',{
+                'proposal':proposal,'opposite':row.get('opposite'),
+                'bar_time':row.get('bar_time'),
+                'stop_distance':row.get('stop_distance'),
+                'profit_distance':row.get('profit_distance')})
+        return row
+
+    def _hold_shadow_candles_after(self,bar_time,epic):
+        bars=[]
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        started=not bool(bar_time)
+        for c in candles:
+            at=c.get('at')
+            if not started:
+                if at is None or str(at)<str(bar_time):
+                    continue
+                started=True
+            mid=_num(c.get('close'));hi=_num(c.get('high'));lo=_num(c.get('low'))
+            if mid is None:
+                continue
+            bars.append({
+                'mid':mid,'high':hi if hi is not None else mid,
+                'low':lo if lo is not None else mid,
+                'spread':_num(c.get('spread')),'at':at})
+        return bars
+
+    def _resolve_hold_shadows(self):
+        """Replay matured HOLD abstentions; teach opposite if it hit TP."""
+        from .self_params import load as load_self_params
+        def _learn(label,transition,mode,detail):
+            # One light trade_pnl step — scores move toward opposite without
+            # LIVE flip and without moving the fixed 0.06 floor.
+            lr=float(load_self_params(self.store).get('learn_lr',0.15))
+            self.brain.learn_from_trade(
+                transition,int(label),lr=lr,won=True,count_sample=True)
+            learning_generation.bump(self.store,'hold_shadow_opposite_tp')
+            self.store.event('hold_shadow','Taught opposite after missed TP on HOLD',{
+                'mode':mode,'label':int(label),
+                'opposite':detail.get('opposite'),
+                'opposite_pnl':detail.get('opposite_pnl'),
+                'proposal_pnl':detail.get('proposal_pnl')})
+        outcomes=hold_shadow.resolve_ready(
+            self.store,candles_after=self._hold_shadow_candles_after,
+            learn_callback=_learn,horizon=hold_shadow.HORIZON_BARS)
+        return outcomes
+
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
 
@@ -2847,13 +3007,17 @@ class SingleTradeEngine:
                     deal_id,row[0],exit_level,row[1],broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker':
+                    self._settle_unified_cycle(pnl=pnl_value,action=row[1],deal_id=deal_id)
+                    self._note_scratch_close(pnl_value,deal_id)
             elif exit_level is not None or broker_pnl is not None:
                 currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
-                if broker_pnl is not None:self._note_scratch_close(broker_pnl,deal_id)
+                if broker_pnl is not None:
+                    self._settle_unified_cycle(pnl=broker_pnl,deal_id=deal_id)
+                    self._note_scratch_close(broker_pnl,deal_id)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -2875,7 +3039,9 @@ class SingleTradeEngine:
                     deal_id,entry,exit_level or entry,direction,broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker':
+                    self._settle_unified_cycle(pnl=pnl_value,action=direction,deal_id=deal_id)
+                    self._note_scratch_close(pnl_value,deal_id)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
@@ -2974,10 +3140,19 @@ class SingleTradeEngine:
         self._claim_trade_learned(deal_id)
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
+        last_delta=None
         for i in range(repeats):
             step_loss=self.brain.learn_from_trade(
                 transition,label,lr=learn_lr,won=pnl_sign>0,count_sample=(i==0))
             if step_loss is not None:losses.append(step_loss)
+            meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+            if meta.get('delta_norm') is not None:
+                last_delta=meta.get('delta_norm')
+        # ΔW already updated neural scores (entry quality). Entry floor stays
+        # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
+        if repeats>0 and label is not None:
+            unified_cycle.note_weight_update(
+                self.store,won=pnl_sign>0,delta_norm=last_delta)
         # Independent shadow core trains on same label using *its* decision-time h/c.
         if repeats>0:
             self._shadow_learn(None,label,lr=learn_lr)
@@ -3006,6 +3181,10 @@ class SingleTradeEngine:
                 currency=currency,deal_id=deal_id,**path_ctx)
             # Audit #21: operator daily loss / drawdown halt from realized cash.
             hard_risk.record_realized_pnl(self.store,pnl_value)
+            # One feedback bus: £ → cycle aggression / streak for next OPEN.
+            self._settle_unified_cycle(
+                pnl=pnl_value,action=direction,
+                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id)
             equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
@@ -3060,7 +3239,7 @@ class SingleTradeEngine:
             # Do not overwrite neural_adapt_reason with "No relative edge…".
             before_reason=self.store.get('neural_adapt_reason')
             from .self_params import get as sp_get
-            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',0)):
+            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',1)):
                 self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                    self.brain.labeled,list(self.brain.history),
                                    force=False)
@@ -3316,16 +3495,39 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # SL/TP from OHLC structure (lookback swing), not 1-bar noise tip —
-            # noise-only SL scratched Gold every 1–3 minutes and missed the move.
+            # One cycle: OHLC zone × learned raise/cut × cycle aggression/edge.
+            # Lot stays mandate; direction stays neural; κ/sl width coordinated here.
             candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
             zone=bracket_learn.zone_at_open(candles)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
-            bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
-                                             base_sl=base_sl,max_tp=zone.get('max_tp'),
-                                             candles=candles)
+            learned=bracket_learn.load_multipliers(self.store)
+            cycle_state=unified_cycle.load_state(self.store)
+            scores=(self.last_signal or {}).get('scores')
+            evaluation={'action':action,'score_edge':(
+                self.policy.score_edge(scores) if scores else None)}
+            pkg=unified_cycle.compose_open(
+                action=action,scores=scores,evaluation=evaluation,zone=zone,
+                learned=learned,cycle_state=cycle_state,base_sl=base_sl,
+                max_tp=zone.get('max_tp'))
+            if pkg.get('blocked') or pkg.get('action') not in ('BUY','SELL'):
+                self.last_entry_reason=pkg.get('reason') or 'Unified cycle HOLD'
+                self.store.event('entry','OPEN skipped — unified cycle edge gate',{
+                    'reason':self.last_entry_reason,'decision':pkg.get('decision'),
+                    'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
+                return
+            bp={'kappa':pkg['kappa'],'sl_scale':pkg['sl_scale'],'explored':False,
+                'kappa_mult':learned.get('kappa'),'sl_mult':learned.get('sl_scale'),
+                'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
+                'lookback':zone.get('lookback'),
+                'nudge_samples':len(self.store.get('bracket_outcome_history',[]) or []),
+                'aggression':pkg.get('aggression'),'edge_scale':pkg.get('edge_scale')}
+            bracket_learn.save_params(
+                self.store,bp['kappa'],bp['sl_scale'],
+                reason=(f"unified_cycle k_mult={learned['kappa']:.3f} "
+                        f"sl_mult={learned['sl_scale']:.3f} "
+                        f"agg={float(pkg.get('aggression') or 1):.3f}"))
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
@@ -3353,9 +3555,10 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','Market OHLC shares × learned raise/cut at open',{
+            self.store.event('bracket','Unified cycle OPEN: OHLC × learn × aggression',{
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                 'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
+                'aggression':bp.get('aggression'),'edge_scale':bp.get('edge_scale'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
@@ -3380,6 +3583,7 @@ class SingleTradeEngine:
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
                     'bracket_explored':bool(bp.get('explored')),
+                    'cycle_aggression':bp.get('aggression'),
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
                 }
@@ -3401,6 +3605,7 @@ class SingleTradeEngine:
                         self.store.set(key,{**pending,
                             'entry':self.positions[0].get('level') if self.positions[0].get('level') is not None else pending.get('entry')})
                     self._pending_entry_brain=None
+                    unified_cycle.note_open(self.store,action=action)
             except Exception as exc:
                 self.store.order_update(oid,'SUPERSEDED',self.last_order_ref)
                 self._pending_entry_brain=None
@@ -3559,7 +3764,7 @@ class SingleTradeEngine:
                 'entry_margin_calibration':evaluation.get('calibration') if evaluation else None,
                 'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
-                'neural_entry_rule':'neural argmax BUY/SELL/HOLD; readiness+utility separate; zone/SHIFT evidence only — not entry bans',
+                'neural_entry_rule':'neural argmax proposes; evolved policy.py confirms or HOLDs when policy_live_execute=1; readiness+utility separate',
                 # Audit #25: neural CLOSE is diagnostic; live exit = broker SL/TP/trail.
                 'neural_market_exit':False,
                 'neural_close_diagnostic_only':True,
@@ -3591,10 +3796,12 @@ class SingleTradeEngine:
                     'model_stack':len(self.model_validator.stack),
                     'shadow_active':self.shadow_brain is not None,
                     'shadow_paper':self.shadow_paper.summary(),
+                    'hold_shadow':hold_shadow.strategy_evidence(self.store),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
-                'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or [])}
+                'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or []),
+                'unified_cycle':unified_cycle.load_state(self.store)}
 
     def _bars_and_spreads_from_candles(self,candles):
         """Chronological OHLC + per-bar spreads (None when unknown — never invent)."""

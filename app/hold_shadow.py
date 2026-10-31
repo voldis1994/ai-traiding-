@@ -29,8 +29,9 @@ HORIZON_BARS = 45
 MAX_PENDING = 12
 MAX_HISTORY = 200
 # When opposite TP rate is high, expose a strategy hint (evolve / UI).
-STRATEGY_HINT_MIN = 20
-STRATEGY_HINT_RATE = 0.55
+# Low floor so reverse-vs-HOLD evidence shows early — not after dozens of HOLDs.
+STRATEGY_HINT_MIN = 5
+STRATEGY_HINT_RATE = 0.50
 
 _ACTION_LABEL = {'BUY': 0, 'SELL': 1, 'HOLD': 2}
 

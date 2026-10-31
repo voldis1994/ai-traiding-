@@ -90,11 +90,15 @@ def test_strategy_hint_after_enough_opposite_tps():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         stats = hs.default_stats()
-        stats['resolved'] = 25
-        stats['opposite_hit_tp'] = 16  # 64% ≥ 55%
+        stats['resolved'] = 5
+        stats['opposite_hit_tp'] = 3  # 60% ≥ 50%, n≥5
         stats = hs._update_strategy_hint(stats)
         assert stats['strategy_hint']
         assert 'opposite hit TP' in stats['strategy_hint']
+        # Below min sample — no hint yet.
+        cold = hs._update_strategy_hint({**hs.default_stats(), 'resolved': 3,
+                                         'opposite_hit_tp': 3})
+        assert cold['strategy_hint'] is None
         ev = hs.strategy_evidence(store)
         assert ev['pending'] == 0
 

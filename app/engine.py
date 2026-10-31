@@ -40,6 +40,7 @@ from .feature_discovery import FeatureDiscovery
 from .feature_validation import FeatureValidator
 from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
+from . import hold_shadow
 from . import learning_generation
 
 DB=DATA/'robot.sqlite3'
@@ -2065,6 +2066,12 @@ class SingleTradeEngine:
                     self.store.event('warning','Prep/eval stage failed',
                                     {'type':type(exc).__name__})
             if not self.armed or not self.execution_enabled:return
+            # Resolve HOLD→opposite shadows on every new M1 bar (even when in trade).
+            if new_closed_bar:
+                try:self._resolve_hold_shadows()
+                except Exception as exc:
+                    self.store.event('warning','hold_shadow resolve skipped',
+                                    {'type':type(exc).__name__})
             if len(self.positions)==1:
                 p=self.positions[0]
                 # Missing SL → install bracket. Missing TP alone must NOT reinstall
@@ -2125,6 +2132,10 @@ class SingleTradeEngine:
                         {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
                          'proposal':evaluation.get('proposal'), 'decision':action,
                          'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
+                    # HOLD with a directional proposal → shadow opposite path later
+                    # (same brackets) so abstention does not collapse to forever-HOLD.
+                    if action=='HOLD' and evaluation.get('proposal') in ('BUY','SELL'):
+                        self._enqueue_hold_shadow(evaluation)
                     # One entry opportunity per completed M1 bar. The first new
                     # confirmed bar after a broker-verified close can already act.
                     if (action in ('BUY','SELL') and
@@ -2835,6 +2846,130 @@ class SingleTradeEngine:
             'loss_streak':cycle.get('loss_streak'),
             'win_streak':cycle.get('win_streak')})
         return cycle
+
+    def _would_be_brackets(self,proposal):
+        """SL/TP distances OPEN would use for proposal — for hold-shadow only."""
+        if proposal not in ('BUY','SELL') or not self.mandate:
+            return None
+        epic=self.mandate.get('epic')
+        mid=self.market.get('mid')
+        tick=self.market.get('tick')
+        spread=self.market.get('spread')
+        minimum=self.market.get('min_distance')
+        if None in (mid,tick,spread) or not epic:
+            return None
+        try:
+            candles=self.store.candles(epic,n=120,historical_only=True)
+        except Exception:
+            candles=[]
+        if len(candles)<20:
+            return None
+        zone=bracket_learn.zone_at_open(candles)
+        rng=zone['range_distance'] or ohlc_range_distance(candles)
+        buffer=max(2*float(tick),2*float(spread))
+        min_d=float(minimum) if minimum is not None else float(tick)
+        base_sl=max(min_d+buffer,float(rng or 0))
+        learned=bracket_learn.load_multipliers(self.store)
+        cycle_state=unified_cycle.load_state(self.store)
+        scores=(self.last_signal or {}).get('scores')
+        # Force evaluation action so compose_open still yields κ/sl when edge
+        # was the reason LIVE HOLDed (we need distances, not another HOLD).
+        edge=self.policy.score_edge(scores) if scores else 0.5
+        # Use a strong synthetic edge for bracket *shape* only — not for LIVE.
+        pkg=unified_cycle.compose_open(
+            action=proposal,scores=scores or {
+                'BUY':0.7 if proposal=='BUY' else 0.15,
+                'SELL':0.7 if proposal=='SELL' else 0.15,'HOLD':0.15},
+            evaluation={'action':proposal,'score_edge':max(0.2,float(edge or 0))},
+            zone=zone,learned=learned,cycle_state=cycle_state,base_sl=base_sl,
+            max_tp=zone.get('max_tp'))
+        kappa=pkg.get('kappa') or 1.0
+        sl_scale=pkg.get('sl_scale') or 1.0
+        if pkg.get('blocked'):
+            kappa=float(zone.get('kappa') or 1.0)*(learned.get('kappa') or 1.0)
+            sl_scale=max(1.0,float(learned.get('sl_scale') or 1.0))
+        entry=float(mid)
+        brackets=stop_take(entry,proposal,tick,spread,min_d,
+                           kappa=float(kappa),sl_scale=float(sl_scale),
+                           range_distance=float(rng) if rng is not None else 0)
+        return {
+            'entry':entry,'tick':float(tick),'spread':float(spread),
+            'min_distance':min_d,
+            'stop_distance':float(brackets['stop_distance']),
+            'profit_distance':float(brackets['profit_distance']),
+            'epic':epic,
+        }
+
+    def _enqueue_hold_shadow(self,evaluation):
+        """When LIVE HOLDs a BUY/SELL proposal, queue opposite-path shadow."""
+        proposal=evaluation.get('proposal')
+        if proposal not in ('BUY','SELL'):
+            return None
+        if not self.brain.core.last_transition:
+            return None
+        brackets=self._would_be_brackets(proposal)
+        if not brackets:
+            return None
+        tr=self.brain._json_transition(self.brain.core.last_transition)
+        row=hold_shadow.enqueue(
+            self.store,proposal=proposal,
+            reason=evaluation.get('reason') or self.last_entry_reason,
+            bar_time=self.last_decision_bar or self.market_context.get('bar_time'),
+            epic=brackets['epic'],entry=brackets['entry'],
+            spread=brackets['spread'],
+            stop_distance=brackets['stop_distance'],
+            profit_distance=brackets['profit_distance'],
+            tick=brackets['tick'],min_distance=brackets['min_distance'],
+            transition=tr,scores=(self.last_signal or {}).get('scores'))
+        if row:
+            self.store.event('hold_shadow','Queued opposite-path shadow for HOLD abstention',{
+                'proposal':proposal,'opposite':row.get('opposite'),
+                'bar_time':row.get('bar_time'),
+                'stop_distance':row.get('stop_distance'),
+                'profit_distance':row.get('profit_distance')})
+        return row
+
+    def _hold_shadow_candles_after(self,bar_time,epic):
+        bars=[]
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        started=not bool(bar_time)
+        for c in candles:
+            at=c.get('at')
+            if not started:
+                if at is None or str(at)<str(bar_time):
+                    continue
+                started=True
+            mid=_num(c.get('close'));hi=_num(c.get('high'));lo=_num(c.get('low'))
+            if mid is None:
+                continue
+            bars.append({
+                'mid':mid,'high':hi if hi is not None else mid,
+                'low':lo if lo is not None else mid,
+                'spread':_num(c.get('spread')),'at':at})
+        return bars
+
+    def _resolve_hold_shadows(self):
+        """Replay matured HOLD abstentions; teach opposite if it hit TP."""
+        from .self_params import load as load_self_params
+        def _learn(label,transition,mode,detail):
+            # One light trade_pnl step — scores move toward opposite without
+            # LIVE flip and without moving the fixed 0.06 floor.
+            lr=float(load_self_params(self.store).get('learn_lr',0.15))
+            self.brain.learn_from_trade(
+                transition,int(label),lr=lr,won=True,count_sample=True)
+            learning_generation.bump(self.store,'hold_shadow_opposite_tp')
+            self.store.event('hold_shadow','Taught opposite after missed TP on HOLD',{
+                'mode':mode,'label':int(label),
+                'opposite':detail.get('opposite'),
+                'opposite_pnl':detail.get('opposite_pnl'),
+                'proposal_pnl':detail.get('proposal_pnl')})
+        outcomes=hold_shadow.resolve_ready(
+            self.store,candles_after=self._hold_shadow_candles_after,
+            learn_callback=_learn,horizon=hold_shadow.HORIZON_BARS)
+        return outcomes
 
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
@@ -3661,6 +3796,7 @@ class SingleTradeEngine:
                     'model_stack':len(self.model_validator.stack),
                     'shadow_active':self.shadow_brain is not None,
                     'shadow_paper':self.shadow_paper.summary(),
+                    'hold_shadow':hold_shadow.strategy_evidence(self.store),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),

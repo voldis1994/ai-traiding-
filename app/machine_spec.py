@@ -52,9 +52,16 @@ FEATURE_SCHEMAS = {
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},
     'dynamic': {'note': 'FeatureRegistry may append validated OHLC formulas; dims grow at runtime'},
 }
-# Still research-only (not the LIVE decide() gate).
+# Still research-only (not the LIVE decide() gate) — except hold_shadow teaches
+# LIVE weights lightly when opposite would have hit TP after a HOLD abstention.
 SHADOW_ONLY = ('legacy_60pct_gates', 'price_edge_v5_entry_filter',
                'shadow_architecture_probe', 'feature_discovery_proposals')
+# HOLD abstention → replay opposite with same SL/TP; teach if opposite hit TP.
+HOLD_SHADOW_OPPOSITE = (
+    'hold_shadow.enqueue',
+    'hold_shadow.resolve_ready',
+    'learn_from_trade(opposite) when opposite_hit_tp',
+)
 # Evolved policy.py is LIVE when policy_live_execute=1 — listed for clarity.
 LIVE_POLICY_EXECUTION = (
     'policy_evolve_enabled',

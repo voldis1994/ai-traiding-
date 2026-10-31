@@ -18,13 +18,13 @@ STORE_KEY = 'unified_cycle_v1'
 AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
-# Fixed LIVE entry edge — SAME units as neural score_edge / policy MIN_EDGE.
-# Operator choice: keep 0.06 stable. Improvement comes from better scores
-# (neural ΔW), better exits (bracket κ/sl + aggression), and new strategies
-# (policy evolve) — not from moving this gate with £/ΔW.
+# LIVE entry edge in score_edge units (shared with policy MIN_EDGE).
+# Default seed 0.06; the machine may recalibrate from holdout history + spread
+# inside soft rails. £ settle / ΔW do NOT move this gate.
 ENTRY_EDGE_DEFAULT = 0.06
-ENTRY_EDGE_MIN = 0.06
-ENTRY_EDGE_MAX = 0.06
+ENTRY_EDGE_MIN = 0.03
+ENTRY_EDGE_MAX = 0.12
+CALIB_META_KEY = 'entry_edge_calibration_v1'
 
 
 def _finite(v):
@@ -118,8 +118,11 @@ def save_state(store, state: dict) -> dict:
 
 
 def entry_edge_floor(store=None, cycle_state=None) -> float:
-    """Fixed LIVE edge (0.06) shared by cycle gate + policy MIN_EDGE override."""
-    return float(ENTRY_EDGE_DEFAULT)
+    """LIVE edge shared by cycle gate + policy MIN_EDGE (calibrated or default)."""
+    state = cycle_state if isinstance(cycle_state, dict) else load_state(store)
+    return _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
 
 
 def score_margin(scores) -> float | None:
@@ -167,29 +170,50 @@ def perceive_decision(scores, evaluation=None) -> dict:
 
 
 def min_open_margin(state: dict = None) -> float:
-    """Fixed LIVE entry floor (0.06) — shared with policy MIN_EDGE.
+    """LIVE entry floor — calibrated value in state, else default 0.06.
 
-    Does not ratchet with £ streaks or ΔW. Learning improves *who* clears
-    this bar (neural scores / evolved strategies) and *how* exits are shaped
-    (brackets + aggression), not the bar itself.
+    Does not ratchet with £ streaks or ΔW. Recalibration is only via
+    ``set_calibrated_floor`` (holdout + spread), clipped to soft rails.
     """
-    return float(ENTRY_EDGE_DEFAULT)
+    state = state or default_state()
+    return _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
 
 
 # Back-compat alias used while the module settled.
 _min_open_margin = min_open_margin
 
 
-def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
-    """Neural ΔW is applied in the brain; entry floor stays fixed at 0.06.
-
-    Kept as a no-op hook so engine/sim call sites stay stable. Weights improve
-    entry quality via scores; they do not loosen/tighten MIN_EDGE.
-    """
+def set_calibrated_floor(store, value, *, method='holdout', detail=None) -> dict:
+    """Persist holdout/spread-calibrated edge — never from last £ win/loss."""
     state = load_state(store)
-    # Pin floor — never let stale Store values drift the gate.
-    state['entry_edge_floor'] = ENTRY_EDGE_DEFAULT
-    return save_state(store, state)
+    floor = _clip(_finite(value) or ENTRY_EDGE_DEFAULT, ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    state['entry_edge_floor'] = floor
+    save_state(store, state)
+    meta = {
+        'floor': floor,
+        'method': str(method or 'holdout'),
+        'detail': detail if isinstance(detail, dict) else {},
+    }
+    if store is not None:
+        store.set(CALIB_META_KEY, meta)
+    return meta
+
+
+def calibration_meta(store) -> dict:
+    raw = store.get(CALIB_META_KEY) if store is not None else None
+    if isinstance(raw, dict):
+        return raw
+    return {'floor': ENTRY_EDGE_DEFAULT, 'method': 'default', 'detail': {}}
+
+
+def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
+    """Neural ΔW updates scores; does not move the entry floor.
+
+    Floor changes only through holdout calibration (``set_calibrated_floor``).
+    """
+    return load_state(store)
 
 
 def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
@@ -294,15 +318,18 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
 def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
     """Fold broker £ into aggression / streaks for exit width — not entry floor.
 
-    Entry gate stays 0.06. Aggression still shapes κ/sl on the next OPEN so
-    exits improve from £ feedback without moving MIN_EDGE.
+    Calibrated entry_edge_floor is preserved (clipped to rails). Aggression
+    still shapes κ/sl on the next OPEN so exits improve from £ feedback.
     """
     state = load_state(store)
     p = _finite(pnl)
     state['settlements'] = _safe_int(state.get('settlements'), 0) + 1
     state['last_pnl'] = p
     state['last_action'] = action if action in ('BUY', 'SELL', 'HOLD', None) else None
-    state['entry_edge_floor'] = ENTRY_EDGE_DEFAULT
+    # Keep calibrated floor; do not reset to 0.06 on every settle.
+    state['entry_edge_floor'] = _clip(
+        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
+        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     agg = _finite(state.get('aggression')) or 1.0
     if p is None:
         return save_state(store, state)

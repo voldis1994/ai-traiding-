@@ -53,6 +53,8 @@ class Snapshot:
     losses: int
     scratches: int
     aggression: float
+    entry_edge_floor: float
+    min_open_margin: float
     loss_streak: int
     win_streak: int
     kappa_mult: float
@@ -70,6 +72,7 @@ class Snapshot:
     opens: int
     settlements: int
     edge_holds: int
+    policy_vetoes: int
     hold_skips: int
     rolling20_pnl: float | None
     rolling20_win_rate: float | None
@@ -139,7 +142,7 @@ def _scores_action(scores):
 
 
 def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
-              wins, losses, scratches) -> Snapshot:
+              wins, losses, scratches, policy_vetoes=0) -> Snapshot:
     cycle = unified_cycle.load_state(store)
     mult = bracket_learn.load_multipliers(store)
     sp = self_params.load(store)
@@ -155,6 +158,9 @@ def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
         win_rate=(wins / w) if w else None,
         wins=wins, losses=losses, scratches=scratches,
         aggression=float(cycle['aggression']),
+        entry_edge_floor=float(cycle.get('entry_edge_floor')
+                               or unified_cycle.ENTRY_EDGE_DEFAULT),
+        min_open_margin=float(unified_cycle.min_open_margin(cycle)),
         loss_streak=int(cycle['loss_streak']),
         win_streak=int(cycle['win_streak']),
         kappa_mult=float(mult['kappa']),
@@ -172,6 +178,7 @@ def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
         opens=int(cycle['opens']),
         settlements=int(cycle['settlements']),
         edge_holds=int(edge_holds),
+        policy_vetoes=int(policy_vetoes),
         hold_skips=int(hold_skips),
         rolling20_pnl=float(sum(recent)) if recent else None,
         rolling20_win_rate=(r_wins / r_n) if r_n else None,
@@ -180,7 +187,8 @@ def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
 
 
 def _close_trade(store, brain, policy, *, direction, entry, stop_d, profit_d,
-                 exit_px, exit_reason, transition, scores, deal_id):
+                 exit_px, exit_reason, transition, scores, deal_id,
+                 couple_weights=True, freeze_edge_floor=False):
     sign = 1 if direction == 'BUY' else -1
     move = sign * (exit_px - entry)
     pnl = _cash(move)
@@ -191,6 +199,12 @@ def _close_trade(store, brain, policy, *, direction, entry, stop_d, profit_d,
         pnl = abs(_cash(profit_d))
 
     cycle = unified_cycle.settle(store, pnl=pnl, action=direction, exit_reason=exit_reason)
+    if freeze_edge_floor:
+        # Legacy scale break: £ settle must not move OPEN edge gate.
+        st = unified_cycle.load_state(store)
+        st['entry_edge_floor'] = unified_cycle.ENTRY_EDGE_DEFAULT
+        unified_cycle.save_state(store, st)
+        cycle = st
     zone_k = store.get('bracket_kappa') or 1.0
     zone_s = store.get('bracket_sl_scale') or 1.0
     path = bracket_learn.record_outcome(
@@ -204,6 +218,7 @@ def _close_trade(store, brain, policy, *, direction, entry, stop_d, profit_d,
     # Neural teacher — same rules as engine: win reinforce, else counterfactual HOLD-ish.
     label = None
     mode = 'skip'
+    last_delta = None
     if transition is not None:
         if pnl > float(self_params.load(store)['scratch_pnl_abs']):
             label = 0 if direction == 'BUY' else 1
@@ -222,9 +237,16 @@ def _close_trade(store, brain, policy, *, direction, entry, stop_d, profit_d,
                 brain.learn_from_trade(
                     transition, label, lr=float(sp['learn_lr']),
                     won=pnl > 0, count_sample=(i == 0))
+                meta = getattr(brain.core, 'last_learn_meta', None) or {}
+                if meta.get('delta_norm') is not None:
+                    last_delta = meta.get('delta_norm')
             if repeats > 0:
                 learning_generation.bump(store, 'closed_trade_weight_update')
                 brain.model_version = int(getattr(brain, 'model_version', 0) or 0) + 1
+                # Same as engine: ΔW → shared entry_edge_floor so weights are felt.
+                if couple_weights and not freeze_edge_floor:
+                    unified_cycle.note_weight_update(
+                        store, won=pnl > 0, delta_norm=last_delta)
 
     self_params.evolve_from_feedback(store, broker_pnl=pnl, commit=False)
     from app.profit_learning import ProfitLearning
@@ -239,26 +261,32 @@ def _close_trade(store, brain, policy, *, direction, entry, stop_d, profit_d,
         'deal_id': deal_id, 'direction': direction, 'entry': entry,
         'exit': exit_px, 'exit_reason': exit_reason, 'pnl': pnl,
         'aggression': cycle['aggression'],
+        'entry_edge_floor': cycle.get('entry_edge_floor'),
         'loss_streak': cycle['loss_streak'], 'win_streak': cycle['win_streak'],
         'bracket_reason': (path or {}).get('reason') if isinstance(path, dict) else None,
         'promoted': bool(promoted), 'learn_mode': mode,
         'kappa_mult': bracket_learn.load_multipliers(store)['kappa'],
         'sl_mult': bracket_learn.load_multipliers(store)['sl_scale'],
+        'delta_norm': last_delta,
         'scores': scores,
     }
 
 
-def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
+def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
+        *, couple_weights: bool = True, policy_live: bool = True,
+        freeze_edge_floor: bool = False,
+        milestones: tuple | None = None) -> SimResult:
     started = datetime.now(timezone.utc).isoformat(timespec='seconds')
     tmp = tempfile.TemporaryDirectory()
     data = Path(tmp.name)
     store = Store(data / 'robot.sqlite3')
     brain = AdaptiveBrain(store, data_dir=data, seed=seed)
     policy = AutoEvolution(store, data / 'policy.py')
+    marks = milestones if milestones is not None else MILESTONES
 
     zero = asdict(_snapshot(
         store, brain, n_trades=0, pnls=[], edge_holds=0, hold_skips=0,
-        wins=0, losses=0, scratches=0))
+        wins=0, losses=0, scratches=0, policy_vetoes=0))
 
     bars = _gen_ohlc(max_bars, seed)
     # Warm candles buffer for zone_at_open
@@ -268,14 +296,17 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
     trades = []
     pnls = []
     series = []
-    milestones = []
+    milestone_rows = []
     edge_holds = 0
+    policy_vetoes = 0
     hold_skips = 0
     wins = losses = scratches = 0
     deal_seq = 0
+    floor_min = float(zero['entry_edge_floor'])
+    floor_max = float(zero['entry_edge_floor'])
 
     # Milestone 0
-    milestones.append(zero)
+    milestone_rows.append(zero)
 
     for i, bar in enumerate(bars):
         if len(trades) >= n_trades:
@@ -332,7 +363,8 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
                     direction=d, entry=entry, stop_d=stop_d, profit_d=profit_d,
                     exit_px=float(exit_px), exit_reason=exit_reason,
                     transition=open_pos['transition'], scores=open_pos.get('scores'),
-                    deal_id=f'sim-{deal_seq}')
+                    deal_id=f'sim-{deal_seq}', couple_weights=couple_weights,
+                    freeze_edge_floor=freeze_edge_floor)
                 trades.append(row)
                 pnls.append(row['pnl'])
                 band = float(self_params.load(store)['scratch_pnl_abs'])
@@ -342,30 +374,47 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
                     wins += 1
                 else:
                     losses += 1
+                st = unified_cycle.load_state(store)
+                fl = float(st.get('entry_edge_floor') or unified_cycle.ENTRY_EDGE_DEFAULT)
+                floor_min = min(floor_min, fl)
+                floor_max = max(floor_max, fl)
                 snap = _snapshot(
                     store, brain, n_trades=len(trades), pnls=pnls,
                     edge_holds=edge_holds, hold_skips=hold_skips,
-                    wins=wins, losses=losses, scratches=scratches)
+                    wins=wins, losses=losses, scratches=scratches,
+                    policy_vetoes=policy_vetoes)
                 series.append(asdict(snap))
-                if len(trades) in MILESTONES:
-                    milestones.append(asdict(snap))
+                if len(trades) in marks:
+                    milestone_rows.append(asdict(snap))
                 open_pos = None
             continue
 
-        # Flat — decide OPEN via unified cycle.
+        # Flat — decide OPEN via policy LIVE + unified cycle (same scale bus).
         if len(candle_buf) < 40:
             continue
-        action = _scores_action(scores)
-        if action not in ('BUY', 'SELL'):
+        neural = _scores_action(scores)
+        if neural not in ('BUY', 'SELL'):
             hold_skips += 1
             continue
+        action = neural
+        if policy_live:
+            # Bypass readiness/history gates so we isolate edge-floor coupling;
+            # still runs evolved decide() with shared MIN_EDGE override.
+            ev = policy.evaluate_neural_entry(
+                scores, readiness={'ready': True, 'eval_samples': 100,
+                                   'minute_direction_accuracy': 0.55,
+                                   'holdout_net_bps_mean': 1.0})
+            if ev.get('action') not in ('BUY', 'SELL'):
+                policy_vetoes += 1
+                continue
+            action = ev['action']
         zone = bracket_learn.zone_at_open(candle_buf)
         rng = zone['range_distance'] or ohlc_range_distance(candle_buf)
         buffer = max(2 * TICK, 2 * SPREAD)
         base_sl = max(float(MIN_DIST) + buffer, float(rng or 0))
         learned = bracket_learn.load_multipliers(store)
         cycle_state = unified_cycle.load_state(store)
-        edge = policy.score_edge(scores) if scores else 0.0
+        edge = policy.score_edge(scores) if scores else None
         pkg = unified_cycle.compose_open(
             action=action, scores=scores,
             evaluation={'action': action, 'score_edge': edge},
@@ -403,7 +452,8 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
             stop_d=open_pos['stop_d'], profit_d=open_pos['profit_d'],
             exit_px=mid, exit_reason='manual',
             transition=open_pos['transition'], scores=open_pos.get('scores'),
-            deal_id=f'sim-{deal_seq}')
+            deal_id=f'sim-{deal_seq}', couple_weights=couple_weights,
+            freeze_edge_floor=freeze_edge_floor)
         trades.append(row)
         pnls.append(row['pnl'])
         if row['pnl'] > 0:
@@ -415,23 +465,33 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
         snap = _snapshot(
             store, brain, n_trades=len(trades), pnls=pnls,
             edge_holds=edge_holds, hold_skips=hold_skips,
-            wins=wins, losses=losses, scratches=scratches)
+            wins=wins, losses=losses, scratches=scratches,
+            policy_vetoes=policy_vetoes)
         series.append(asdict(snap))
-        if len(trades) in MILESTONES and not any(
-                m.get('n_trades') == len(trades) for m in milestones):
-            milestones.append(asdict(snap))
+        if len(trades) in marks and not any(
+                m.get('n_trades') == len(trades) for m in milestone_rows):
+            milestone_rows.append(asdict(snap))
 
     finished = datetime.now(timezone.utc).isoformat(timespec='seconds')
     final = series[-1] if series else zero
     first10 = pnls[:10]
     last20 = pnls[-20:] if len(pnls) >= 20 else pnls
+    last100 = pnls[-100:] if len(pnls) >= 100 else pnls
     summary = {
         'trades_completed': len(trades),
         'bars_used': i + 1 if bars else 0,
         'cumulative_pnl': final.get('cumulative_pnl'),
         'win_rate': final.get('win_rate'),
+        'couple_weights': couple_weights,
+        'freeze_edge_floor': freeze_edge_floor,
+        'policy_live': policy_live,
         'aggression_start': zero['aggression'],
         'aggression_end': final.get('aggression'),
+        'entry_edge_floor_start': zero['entry_edge_floor'],
+        'entry_edge_floor_end': final.get('entry_edge_floor'),
+        'entry_edge_floor_min': floor_min,
+        'entry_edge_floor_max': floor_max,
+        'min_open_margin_end': final.get('min_open_margin'),
         'kappa_mult_start': zero['kappa_mult'],
         'kappa_mult_end': final.get('kappa_mult'),
         'sl_mult_start': zero['sl_mult'],
@@ -439,16 +499,24 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
         'neurons_start': zero['neurons'],
         'neurons_end': final.get('neurons'),
         'trade_labeled': final.get('trade_labeled'),
+        'trade_correct': final.get('trade_correct'),
+        'minute_labeled': final.get('minute_labeled'),
+        'minute_acc': final.get('minute_acc'),
         'edge_holds': edge_holds,
+        'policy_vetoes': policy_vetoes,
         'hold_skips': hold_skips,
         'first10_pnl': float(sum(first10)) if first10 else 0.0,
         'last20_pnl': float(sum(last20)) if last20 else 0.0,
+        'last100_pnl': float(sum(last100)) if last100 else 0.0,
         'first10_win_rate': (
             sum(1 for p in first10 if p > 0) /
             max(1, sum(1 for p in first10 if p != 0))),
         'last20_win_rate': (
             sum(1 for p in last20 if p > 0) /
             max(1, sum(1 for p in last20 if p != 0))) if last20 else None,
+        'last100_win_rate': (
+            sum(1 for p in last100 if p > 0) /
+            max(1, sum(1 for p in last100 if p != 0))) if last100 else None,
         'learning_generation': final.get('learning_generation'),
         'disclaimer': (
             'Synthetic OHLC + cash scale — proves self-state evolution, '
@@ -458,34 +526,73 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000) -> SimResult:
     result = SimResult(
         seed=seed, n_target=n_trades, n_trades=len(trades),
         n_bars=summary['bars_used'], started_at=started, finished_at=finished,
-        zero_state=zero, milestones=milestones, trades=trades,
+        zero_state=zero, milestones=milestone_rows, trades=trades,
         series=series, summary=summary)
     tmp.cleanup()
     return result
+
+
+def _print_run(tag, r):
+    s = r.summary
+    print(
+        f'{tag} seed={r.seed} trades={r.n_trades} pnl={s["cumulative_pnl"]:.2f} '
+        f'wr={s["win_rate"]:.3f} '
+        f'floor {s["entry_edge_floor_start"]:.3f}→{s["entry_edge_floor_end"]:.3f} '
+        f'[{s["entry_edge_floor_min"]:.3f}..{s["entry_edge_floor_max"]:.3f}] '
+        f'agg {s["aggression_start"]:.3f}→{s["aggression_end"]:.3f} '
+        f'κ {s["kappa_mult_start"]:.3f}→{s["kappa_mult_end"]:.3f} '
+        f'edge_holds={s["edge_holds"]} policy_vetoes={s["policy_vetoes"]} '
+        f'last20={s["last20_pnl"]:.2f} last100={s["last100_pnl"]:.2f}'
+    )
 
 
 def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('/opt/cursor/artifacts')
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = [29, 7, 101]
-    runs = []
-    for s in seeds:
-        r = run(n_trades=100, seed=s, max_bars=10000)
-        runs.append(asdict(r))
-        print(f'seed={s} trades={r.n_trades} pnl={r.summary["cumulative_pnl"]:.2f} '
-              f'agg {r.summary["aggression_start"]:.3f}→{r.summary["aggression_end"]:.3f} '
-              f'κ {r.summary["kappa_mult_start"]:.3f}→{r.summary["kappa_mult_end"]:.3f} '
-              f'sl {r.summary["sl_mult_start"]:.3f}→{r.summary["sl_mult_end"]:.3f} '
-              f'edge_holds={r.summary["edge_holds"]}')
-    primary = runs[0]
+    modes = (
+        # Full fix: £ settle + ΔW move shared entry_edge_floor → OPEN.
+        ('coupled', dict(couple_weights=True, policy_live=True,
+                         freeze_edge_floor=False)),
+        # Legacy break: floor stuck at 0.06 — weights/£ not felt at OPEN gate.
+        ('frozen_floor', dict(couple_weights=False, policy_live=True,
+                              freeze_edge_floor=True)),
+    )
+    compare_100 = []
+    for label, kw in modes:
+        for s in seeds:
+            r = run(n_trades=100, seed=s, max_bars=12000, **kw)
+            compare_100.append({'mode': label, 'seed': s,
+                                'summary': r.summary, 'milestones': r.milestones})
+            _print_run(f'100/{label}', r)
+
+    # Long-horizon check on primary seed — does the core keep improving?
+    long_marks = (0, 50, 100, 250, 500, 750, 1000)
+    long_runs = []
+    for label, kw in modes:
+        r = run(n_trades=1000, seed=29, max_bars=80000, milestones=long_marks, **kw)
+        long_runs.append({
+            'mode': label, 'seed': 29,
+            'summary': r.summary,
+            'milestones': r.milestones,
+        })
+        _print_run(f'1000/{label}', r)
+
+    # Coupled primary for drop-in replacement of previous artifact shape.
+    primary_row = next(x for x in compare_100 if x['mode'] == 'coupled' and x['seed'] == 29)
     payload = {
-        'primary': primary,
-        'runs': [{
-            'seed': r['seed'],
-            'summary': r['summary'],
-            'milestones': r['milestones'],
-        } for r in runs],
+        'primary': {
+            'seed': 29,
+            'summary': primary_row['summary'],
+            'milestones': primary_row['milestones'],
+        },
+        'compare_100': compare_100,
+        'compare_1000': long_runs,
         'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'note': (
+            'coupled = settle(£)+note_weight_update(ΔW) share entry_edge_floor '
+            'with policy MIN_EDGE. frozen_floor = legacy scale break '
+            '(floor stuck at 0.06).'),
     }
     path = out_dir / 'zero_start_cycle_sim.json'
     path.write_text(json.dumps(payload, indent=2), encoding='utf-8')

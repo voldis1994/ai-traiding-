@@ -349,9 +349,10 @@ class AutoEvolution:
     def apply_evolved_policy_entry(self,scores,direction,*,evidence=None):
         """Run active_policy.decide on flat entry — HOLD veto or confirm side.
 
-        MIN_EDGE is overridden with unified_cycle.entry_edge_floor (same units as
-        score_edge) so neural ΔW + £ settle are felt at OPEN — not blocked by a
-        frozen policy constant. Never flips neural side. CLOSE on flat → HOLD.
+        MIN_EDGE is overridden with the fixed unified_cycle floor (0.06, same
+        units as score_edge). Improvement is via better scores / evolved
+        strategies clearing that bar — the bar itself does not move.
+        Never flips neural side. CLOSE on flat → HOLD.
         """
         evidence=evidence if isinstance(evidence,dict) else {}
         from . import unified_cycle

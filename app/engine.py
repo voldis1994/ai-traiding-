@@ -3013,8 +3013,8 @@ class SingleTradeEngine:
             meta=getattr(self.brain.core,'last_learn_meta',None) or {}
             if meta.get('delta_norm') is not None:
                 last_delta=meta.get('delta_norm')
-        # Couple ΔW → shared entry_edge_floor so weight moves are felt at OPEN
-        # (same units as policy MIN_EDGE / cycle min_open_margin).
+        # ΔW already updated neural scores (entry quality). Entry floor stays
+        # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
         if repeats>0 and label is not None:
             unified_cycle.note_weight_update(
                 self.store,won=pnl_sign>0,delta_norm=last_delta)

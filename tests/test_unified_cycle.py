@@ -35,13 +35,14 @@ def test_compose_open_allows_explicit_action_without_scores():
     assert uc.edge_allows_open(None, {'action': 'BUY'}, uc.default_state())['allowed'] is True
 
 
-def test_edge_allows_open_blocks_after_loss_streak():
+def test_edge_allows_open_blocks_weak_edge_at_fixed_floor():
     state = uc.default_state()
-    state['loss_streak'] = 3  # floor 0.06 + streak bump → need > 0.05
-    scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # margin 0.05
+    state['loss_streak'] = 3  # streak must NOT raise the 0.06 gate
+    scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # margin 0.05 < 0.06
     gate = uc.edge_allows_open(scores, {'action': 'BUY'}, state)
     assert gate['allowed'] is False
     assert gate['action'] == 'HOLD'
+    assert gate['min_margin'] == pytest.approx(0.06)
     assert 'Unified cycle' in gate['reason']
 
 
@@ -74,8 +75,8 @@ def test_compose_open_damps_with_aggression():
 
 def test_compose_open_hold_when_edge_too_weak():
     state = uc.default_state()
-    state['loss_streak'] = 5  # need 0.10
-    scores = {'BUY': 0.42, 'SELL': 0.40, 'HOLD': 0.18}  # margin 0.02
+    state['loss_streak'] = 5  # still need fixed 0.06
+    scores = {'BUY': 0.42, 'SELL': 0.40, 'HOLD': 0.18}  # margin 0.02 < 0.06
     pkg = uc.compose_open(
         action='BUY', scores=scores, evaluation={'action': 'BUY'},
         zone={'kappa': 1.5}, learned={'kappa': 1.0, 'sl_scale': 1.0},
@@ -83,6 +84,7 @@ def test_compose_open_hold_when_edge_too_weak():
     assert pkg['blocked'] is True
     assert pkg['action'] == 'HOLD'
     assert pkg['kappa'] is None
+    assert pkg['min_margin'] == pytest.approx(0.06)
 
 
 def test_settle_cools_aggression_on_losses_and_warms_on_wins():
@@ -112,37 +114,37 @@ def test_note_open_increments_counter():
         assert b['last_action'] == 'SELL'
 
 
-def test_min_open_margin_scales_with_streak_and_shared_floor():
-    # Base floor 0.06 + streak bump; capped at ENTRY_EDGE_MAX.
+def test_min_open_margin_stays_fixed_at_006():
+    # Streak / stored floor must not move the gate — always 0.06.
     assert uc.min_open_margin({'loss_streak': 0}) == pytest.approx(0.06)
-    assert uc.min_open_margin({'loss_streak': 1}) == pytest.approx(0.06 + 0.015)
-    # streak_bump capped at 0.12 → 0.06+0.12=0.18 (still below ENTRY_EDGE_MAX)
-    assert uc.min_open_margin({'loss_streak': 20}) == pytest.approx(0.18)
-    low = uc.min_open_margin({'loss_streak': 0, 'entry_edge_floor': 0.03})
-    assert low == pytest.approx(0.03)
+    assert uc.min_open_margin({'loss_streak': 1}) == pytest.approx(0.06)
+    assert uc.min_open_margin({'loss_streak': 20}) == pytest.approx(0.06)
+    assert uc.min_open_margin({'loss_streak': 0, 'entry_edge_floor': 0.03}) == pytest.approx(0.06)
+    assert uc.min_open_margin({'entry_edge_floor': 0.18}) == pytest.approx(0.06)
 
 
-def test_settle_and_weight_update_move_shared_entry_edge_floor():
-    """£+ / ΔW lower the floor so neural weight gains can OPEN — felt at the end."""
+def test_settle_and_weight_update_do_not_move_entry_edge_floor():
+    """£ / ΔW may move aggression; entry floor stays 0.06."""
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         before = uc.load_state(store)['entry_edge_floor']
+        assert before == pytest.approx(0.06)
         uc.settle(store, pnl=1.5, action='BUY')
-        mid = uc.load_state(store)['entry_edge_floor']
-        assert mid < before
+        assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(0.06)
+        assert uc.load_state(store)['aggression'] > 0.99
         uc.note_weight_update(store, won=True, delta_norm=0.20)
-        after = uc.load_state(store)['entry_edge_floor']
-        assert after < mid
+        assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(0.06)
         uc.settle(store, pnl=-1.0, action='SELL')
-        assert uc.load_state(store)['entry_edge_floor'] > after
+        assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(0.06)
+        assert uc.load_state(store)['aggression'] < 1.0
 
 
-def test_policy_live_uses_same_edge_floor_as_cycle():
-    """Policy MIN_EDGE override == cycle min_open_margin — one scale bus."""
+def test_policy_live_uses_same_fixed_edge_floor_as_cycle():
+    """Policy MIN_EDGE override == fixed 0.06 cycle floor."""
     with sandbox() as d:
         from app.autonomy import AutoEvolution, TEMPLATES
         store = Store(Path(d) / 'db.sqlite3')
-        # Raise floor so weak edge is vetoed by BOTH buses at the same threshold.
+        # Stale raised floor in Store must be ignored.
         st = uc.load_state(store)
         st['entry_edge_floor'] = 0.12
         uc.save_state(store, st)
@@ -152,17 +154,13 @@ def test_policy_live_uses_same_edge_floor_as_cycle():
                 confidence=0.60, reversal=0.30, min_hold=3, margin=0.02),
             encoding='utf8')
         policy = AutoEvolution(store, path)
-        scores = {'BUY': 0.42, 'SELL': 0.30, 'HOLD': 0.28}  # edge 0.12 exactly borderline
-        # score_edge = 0.42-0.30 = 0.12; floor 0.12 → need strictly < so HOLD if < 
-        # Actually edge 0.12 vs floor 0.12: scores[action]-runner < MIN_EDGE → 0.12 < 0.12 false, so allows
-        # Use weaker:
-        scores = {'BUY': 0.40, 'SELL': 0.30, 'HOLD': 0.30}  # edge 0.10 < 0.12
+        scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # edge 0.05 < 0.06
         out = policy.evaluate_neural_entry(scores, readiness={'ready': True})
         assert out['action'] == 'HOLD'
-        assert out['evidence']['evolved_policy']['entry_edge_floor'] == pytest.approx(
-            uc.min_open_margin(uc.load_state(store)))
+        assert out['evidence']['evolved_policy']['entry_edge_floor'] == pytest.approx(0.06)
         gate = uc.edge_allows_open(scores, {'action': 'BUY'}, uc.load_state(store))
         assert gate['allowed'] is False
+        assert gate['min_margin'] == pytest.approx(0.06)
 
 
 def test_machine_spec_documents_unified_cycle():
@@ -170,5 +168,5 @@ def test_machine_spec_documents_unified_cycle():
     assert machine_spec.UNIFIED_CYCLE_STORE == 'unified_cycle_v1'
     assert 'compose_open' in machine_spec.UNIFIED_CYCLE
     assert 'unified_cycle.settle' in machine_spec.UNIFIED_CYCLE
-    assert 'note_weight_update' in machine_spec.UNIFIED_CYCLE
-    assert machine_spec.UNIFIED_CYCLE_EDGE_BUS == 'entry_edge_floor'
+    assert 'policy_evolve' in machine_spec.UNIFIED_CYCLE
+    assert 'fixed' in machine_spec.UNIFIED_CYCLE_EDGE_BUS

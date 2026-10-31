@@ -550,36 +550,25 @@ def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('/opt/cursor/artifacts')
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = [29, 7, 101]
-    modes = (
-        # Full fix: £ settle + ΔW move shared entry_edge_floor → OPEN.
-        ('coupled', dict(couple_weights=True, policy_live=True,
-                         freeze_edge_floor=False)),
-        # Legacy break: floor stuck at 0.06 — weights/£ not felt at OPEN gate.
-        ('frozen_floor', dict(couple_weights=False, policy_live=True,
-                              freeze_edge_floor=True)),
-    )
+    # Fixed 0.06 entry floor — learn via scores / brackets / strategies only.
+    mode_kw = dict(couple_weights=True, policy_live=True, freeze_edge_floor=False)
     compare_100 = []
-    for label, kw in modes:
-        for s in seeds:
-            r = run(n_trades=100, seed=s, max_bars=12000, **kw)
-            compare_100.append({'mode': label, 'seed': s,
-                                'summary': r.summary, 'milestones': r.milestones})
-            _print_run(f'100/{label}', r)
+    for s in seeds:
+        r = run(n_trades=100, seed=s, max_bars=12000, **mode_kw)
+        compare_100.append({'mode': 'fixed_006', 'seed': s,
+                            'summary': r.summary, 'milestones': r.milestones})
+        _print_run('100/fixed_006', r)
 
-    # Long-horizon check on primary seed — does the core keep improving?
     long_marks = (0, 50, 100, 250, 500, 750, 1000)
-    long_runs = []
-    for label, kw in modes:
-        r = run(n_trades=1000, seed=29, max_bars=80000, milestones=long_marks, **kw)
-        long_runs.append({
-            'mode': label, 'seed': 29,
-            'summary': r.summary,
-            'milestones': r.milestones,
-        })
-        _print_run(f'1000/{label}', r)
+    r1000 = run(n_trades=1000, seed=29, max_bars=80000, milestones=long_marks, **mode_kw)
+    long_runs = [{
+        'mode': 'fixed_006', 'seed': 29,
+        'summary': r1000.summary,
+        'milestones': r1000.milestones,
+    }]
+    _print_run('1000/fixed_006', r1000)
 
-    # Coupled primary for drop-in replacement of previous artifact shape.
-    primary_row = next(x for x in compare_100 if x['mode'] == 'coupled' and x['seed'] == 29)
+    primary_row = next(x for x in compare_100 if x['seed'] == 29)
     payload = {
         'primary': {
             'seed': 29,
@@ -590,9 +579,8 @@ def main():
         'compare_1000': long_runs,
         'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'note': (
-            'coupled = settle(£)+note_weight_update(ΔW) share entry_edge_floor '
-            'with policy MIN_EDGE. frozen_floor = legacy scale break '
-            '(floor stuck at 0.06).'),
+            'entry_edge_floor fixed at 0.06. Learning improves neural scores, '
+            'bracket exits (κ/sl + aggression), and evolved strategies — not the gate.'),
     }
     path = out_dir / 'zero_start_cycle_sim.json'
     path.write_text(json.dumps(payload, indent=2), encoding='utf-8')

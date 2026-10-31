@@ -31,13 +31,13 @@ UNIFIED_CYCLE = (
     'perceive_decision',
     'compose_open',
     'broker_settle',
-    'unified_cycle.settle',
-    'note_weight_update',  # ΔW → shared entry_edge_floor
-    'bracket_learn + neural trade_pnl',
+    'unified_cycle.settle',  # aggression/streaks → exit width only
+    'bracket_learn + neural trade_pnl',  # exits + entry score quality
+    'policy_evolve',  # new strategies; MIN_EDGE stays 0.06
 )
-# Shared score_edge units: settle(£) + note_weight_update(ΔW) → entry_edge_floor
-# → min_open_margin / policy MIN_EDGE override — weights felt at OPEN.
-UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor'
+# Fixed score_edge gate (0.06). Learning improves scores/exits/strategies —
+# not the threshold.
+UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor_fixed_0.06'
 UNIFIED_CYCLE_STORE = 'unified_cycle_v1'
 # Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
 LEARN_OBJECTIVES = {

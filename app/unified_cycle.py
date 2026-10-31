@@ -18,12 +18,13 @@ STORE_KEY = 'unified_cycle_v1'
 AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
-# Shared LIVE entry edge floor — SAME units as neural score_edge / policy MIN_EDGE.
-# Without this bus, ΔW could move scores while a frozen 0.06 policy gate still
-# vetoed — weights changed but OPEN behavior did not ("mērogi neizjūt svarus").
+# Fixed LIVE entry edge — SAME units as neural score_edge / policy MIN_EDGE.
+# Operator choice: keep 0.06 stable. Improvement comes from better scores
+# (neural ΔW), better exits (bracket κ/sl + aggression), and new strategies
+# (policy evolve) — not from moving this gate with £/ΔW.
 ENTRY_EDGE_DEFAULT = 0.06
-ENTRY_EDGE_MIN = 0.02
-ENTRY_EDGE_MAX = 0.20
+ENTRY_EDGE_MIN = 0.06
+ENTRY_EDGE_MAX = 0.06
 
 
 def _finite(v):
@@ -117,11 +118,8 @@ def save_state(store, state: dict) -> dict:
 
 
 def entry_edge_floor(store=None, cycle_state=None) -> float:
-    """Single LIVE edge unit shared by cycle gate + policy MIN_EDGE override."""
-    state = cycle_state if isinstance(cycle_state, dict) else load_state(store)
-    return _clip(
-        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
-        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    """Fixed LIVE edge (0.06) shared by cycle gate + policy MIN_EDGE override."""
+    return float(ENTRY_EDGE_DEFAULT)
 
 
 def score_margin(scores) -> float | None:
@@ -168,20 +166,14 @@ def perceive_decision(scores, evaluation=None) -> dict:
     }
 
 
-def min_open_margin(state: dict) -> float:
-    """LIVE entry floor in score_edge units — shared with policy MIN_EDGE.
+def min_open_margin(state: dict = None) -> float:
+    """Fixed LIVE entry floor (0.06) — shared with policy MIN_EDGE.
 
-    Combines evolved ``entry_edge_floor`` with a loss-streak raise so one £
-    feedback bus gates both compose_open and decide(), instead of a frozen
-    0.06 policy tip ignoring neural weight moves.
+    Does not ratchet with £ streaks or ΔW. Learning improves *who* clears
+    this bar (neural scores / evolved strategies) and *how* exits are shaped
+    (brackets + aggression), not the bar itself.
     """
-    state = state or default_state()
-    base = _clip(
-        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
-        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
-    losses = _safe_int(state.get('loss_streak'), 0)
-    streak_bump = float(min(0.12, 0.015 * max(0, losses)))
-    return float(min(ENTRY_EDGE_MAX, base + streak_bump))
+    return float(ENTRY_EDGE_DEFAULT)
 
 
 # Back-compat alias used while the module settled.
@@ -189,24 +181,14 @@ _min_open_margin = min_open_margin
 
 
 def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
-    """After neural trade_pnl ΔW, open/close the shared edge floor so weights are felt.
+    """Neural ΔW is applied in the brain; entry floor stays fixed at 0.06.
 
-    Win + real ΔW → lower entry_edge_floor (learned preference may OPEN).
-    Loss update → raise floor. Restored/zero ΔW → no edge move.
+    Kept as a no-op hook so engine/sim call sites stay stable. Weights improve
+    entry quality via scores; they do not loosen/tighten MIN_EDGE.
     """
     state = load_state(store)
-    d = _finite(delta_norm)
-    if d is not None and d <= 1e-9:
-        return state
-    floor = _clip(
-        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
-        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
-    if won:
-        # Stronger ΔW → slightly more room to express the new weights.
-        step = 0.94 if (d is not None and d >= 0.15) else 0.97
-        state['entry_edge_floor'] = _clip(floor * step, ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
-    else:
-        state['entry_edge_floor'] = _clip(floor * 1.04, ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
+    # Pin floor — never let stale Store values drift the gate.
+    state['entry_edge_floor'] = ENTRY_EDGE_DEFAULT
     return save_state(store, state)
 
 
@@ -310,37 +292,31 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
 
 
 def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
-    """Fold broker £ into aggression, streaks, AND shared entry_edge_floor."""
+    """Fold broker £ into aggression / streaks for exit width — not entry floor.
+
+    Entry gate stays 0.06. Aggression still shapes κ/sl on the next OPEN so
+    exits improve from £ feedback without moving MIN_EDGE.
+    """
     state = load_state(store)
     p = _finite(pnl)
     state['settlements'] = _safe_int(state.get('settlements'), 0) + 1
     state['last_pnl'] = p
     state['last_action'] = action if action in ('BUY', 'SELL', 'HOLD', None) else None
+    state['entry_edge_floor'] = ENTRY_EDGE_DEFAULT
     agg = _finite(state.get('aggression')) or 1.0
-    floor = _clip(
-        _finite(state.get('entry_edge_floor')) or ENTRY_EDGE_DEFAULT,
-        ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     if p is None:
         return save_state(store, state)
     if p < 0:
         state['loss_streak'] = _safe_int(state.get('loss_streak'), 0) + 1
         state['win_streak'] = 0
-        # Cool aggression after losses so the next OPEN is tighter / pickier.
+        # Cool aggression after losses → tighter SL/κ on next OPEN (exits).
         step = 0.96 if state['loss_streak'] >= 2 else 0.98
         state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
-        # Raise shared edge floor — policy MIN_EDGE override sees the same unit.
-        state['entry_edge_floor'] = _clip(
-            floor * (1.06 if state['loss_streak'] >= 2 else 1.03),
-            ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     elif p > 0:
         state['win_streak'] = _safe_int(state.get('win_streak'), 0) + 1
         state['loss_streak'] = 0
         step = 1.02 if state['win_streak'] >= 2 else 1.01
         state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
-        # Lower floor so neural weight gains after £+ can actually OPEN next.
-        state['entry_edge_floor'] = _clip(
-            floor * (0.95 if state['win_streak'] >= 2 else 0.98),
-            ENTRY_EDGE_MIN, ENTRY_EDGE_MAX)
     else:
         # Flat £ — mild cool-off, do not treat as a win.
         state['aggression'] = _clip(agg * 0.995, AGGRESSION_MIN, AGGRESSION_MAX)

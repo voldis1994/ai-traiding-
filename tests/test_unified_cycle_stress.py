@@ -94,9 +94,10 @@ def test_thousand_losses_aggression_stays_bounded_not_dead():
         state = uc.load_state(store)
         assert state['aggression'] == pytest.approx(uc.AGGRESSION_MIN)
         assert state['loss_streak'] == 1000
-        # Edge gate becomes strict but finite — strong edge must still be allowed.
+        # Entry floor stays fixed at 0.06 even after many losses; aggression cools.
         need = uc.min_open_margin(state)
-        assert need == pytest.approx(0.20)
+        assert need == pytest.approx(0.06)
+        assert state['entry_edge_floor'] == pytest.approx(0.06)
         strong = {'BUY': 0.95, 'SELL': 0.10, 'HOLD': 0.10}  # margin 0.85
         gate = uc.edge_allows_open(strong, {'action': 'BUY'}, state)
         assert gate['allowed'] is True

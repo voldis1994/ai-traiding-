@@ -33,26 +33,22 @@ def test_policy_evolve_and_live_execute_on_by_default():
 
 def test_evolved_policy_can_veto_neural_entry():
     with sandbox() as d:
-        from app import unified_cycle as uc
         store = Store(Path(d) / 'db.sqlite3')
-        # Shared floor (not frozen file margin) drives LIVE veto.
-        st = uc.load_state(store)
-        st['entry_edge_floor'] = 0.18
-        uc.save_state(store, st)
+        # Fixed 0.06 floor — weak neural edge is HOLD; file margin ignored.
         path = Path(d) / 'policy.py'
         path.write_text(
             TEMPLATES['edge'].format(
                 confidence=0.60, reversal=0.30, min_hold=3, margin=0.02),
             encoding='utf8')
         policy = AutoEvolution(store, path)
-        scores = {'BUY': 0.42, 'SELL': 0.30, 'HOLD': 0.28}  # edge 0.12 < 0.18
+        scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # edge 0.05 < 0.06
         out = policy.evaluate_neural_entry(
             scores, readiness={'ready': True}, history=None)
         assert out['action'] == 'HOLD'
         assert 'evolved policy' in out['reason'].lower() or 'vetoes' in out['reason'].lower()
         assert out['proposal'] == 'BUY'  # neural still proposes
         assert out['evidence']['evolved_policy']['action'] == 'HOLD'
-        assert out['evidence']['evolved_policy']['entry_edge_floor'] == pytest.approx(0.18)
+        assert out['evidence']['evolved_policy']['entry_edge_floor'] == pytest.approx(0.06)
 
 
 def test_evolved_policy_confirms_clear_edge():

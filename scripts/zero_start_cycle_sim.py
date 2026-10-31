@@ -426,9 +426,12 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
 
         def _hs_learn(label, transition, mode, detail):
             sp = self_params.load(store)
-            brain.learn_from_trade(
-                transition, int(label), lr=float(sp['learn_lr']),
-                won=True, count_sample=True)
+            lr = float(sp['learn_lr'])
+            repeats = max(1, int(sp.get('hold_shadow_repeats', 4)))
+            for i in range(repeats):
+                brain.learn_from_trade(
+                    transition, int(label), lr=lr,
+                    won=True, count_sample=(i == 0))
             learning_generation.bump(store, 'hold_shadow_opposite_tp')
 
         hold_shadow.resolve_ready(

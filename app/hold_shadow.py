@@ -25,13 +25,16 @@ PENDING_KEY = 'hold_shadow_pending_v1'
 STATS_KEY = 'hold_shadow_stats_v1'
 HISTORY_KEY = 'hold_shadow_history_v1'
 
-HORIZON_BARS = 45
+# Max bars to wait if neither side has hit TP/SL yet. Learning fires as soon as
+# a decisive exit appears — not after a fixed 45-minute delay.
+HORIZON_BARS = 15
+MIN_RESOLVE_BARS = 1
 MAX_PENDING = 12
 MAX_HISTORY = 200
 # When opposite TP rate is high, expose a strategy hint (evolve / UI).
-# Low floor so reverse-vs-HOLD evidence shows early — not after dozens of HOLDs.
 STRATEGY_HINT_MIN = 5
 STRATEGY_HINT_RATE = 0.50
+DECISIVE_EXITS = frozenset(('tp', 'sl', 'trail'))
 
 _ACTION_LABEL = {'BUY': 0, 'SELL': 1, 'HOLD': 2}
 
@@ -217,13 +220,24 @@ def resolve_one(case: dict, bars: list) -> dict | None:
         trail=case.get('trail', True))
 
 
+def _path_decisive(detail: dict) -> bool:
+    """True when proposal or opposite already hit TP/SL/trail on the path."""
+    if not detail:
+        return False
+    for key in ('proposal_sim', 'opposite_sim'):
+        sim = detail.get(key) or {}
+        if sim.get('reason') in DECISIVE_EXITS:
+            return True
+    return False
+
+
 def resolve_ready(store, *, candles_after, learn_callback=None,
                   horizon=HORIZON_BARS) -> list:
-    """Resolve pending cases that have enough path; optionally teach opposite.
+    """Resolve pending HOLD shadows as soon as a side hits TP/SL — not after N idle bars.
 
-    ``candles_after(bar_time, epic)`` → list of bar dicts (mid/high/low/spread)
-    starting at/after the abstention bar.
-    ``learn_callback(label, transition, mode, detail)`` applies one light update.
+    ``candles_after(bar_time, epic)`` → bars from the abstention bar onward.
+    ``learn_callback(label, transition, mode, detail)`` applies weight updates.
+    Waits only while both sides are still open; forces resolve at ``horizon``.
     """
     pending = load_pending(store)
     if not pending:
@@ -231,22 +245,28 @@ def resolve_ready(store, *, candles_after, learn_callback=None,
     still = []
     outcomes = []
     stats = load_stats(store)
+    horizon = max(int(MIN_RESOLVE_BARS), int(horizon or HORIZON_BARS))
     for case in pending:
         bars = []
         try:
             bars = list(candles_after(case.get('bar_time'), case.get('epic')) or [])
         except Exception:
             bars = []
-        if len(bars) < max(8, int(horizon) // 3):
-            # Not enough path yet — keep waiting (cap age via bars_seen proxy).
+        if len(bars) < int(MIN_RESOLVE_BARS):
             case = dict(case)
             case['bars_seen'] = len(bars)
             still.append(case)
             continue
-        path = bars[:int(horizon)]
+        path = bars[:horizon]
         detail = resolve_one(case, path)
         if detail is None:
             stats['skipped'] = int(stats.get('skipped') or 0) + 1
+            continue
+        # Keep waiting only if neither side has exited yet AND horizon not reached.
+        if not _path_decisive(detail) and len(bars) < horizon:
+            case = dict(case)
+            case['bars_seen'] = len(bars)
+            still.append(case)
             continue
         stats['resolved'] = int(stats.get('resolved') or 0) + 1
         if detail['opposite_hit_tp']:
@@ -280,6 +300,7 @@ def resolve_ready(store, *, candles_after, learn_callback=None,
             'opposite_pnl': detail['opposite_pnl'],
             'proposal_pnl': detail['proposal_pnl'],
             'path_bars': len(path),
+            'bars_held_opp': (detail.get('opposite_sim') or {}).get('bars_held'),
             'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         }
         outcomes.append(out)

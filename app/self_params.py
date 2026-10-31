@@ -50,10 +50,13 @@ DEFAULTS = {
     'shadow_min_broker_trades': 6,
     'shadow_rollback_window': 8,
     'shadow_rollback_delta': 0.35,
-    # Learning
-    'learn_lr': 0.15,
-    'learn_win_repeats': 2,
-    'learn_loss_repeats': 2,
+    # Learning — faster defaults so closed-trade + HOLD-shadow teach right away
+    # (weights move on the close bar, not after a long idle wait).
+    'learn_lr': 0.28,
+    'learn_win_repeats': 4,
+    'learn_loss_repeats': 5,
+    # HOLD opposite-TP teach uses win-strength × this multiplier (floored at 1).
+    'hold_shadow_repeats': 4,
     'profit_history_rows': 400,
     # Exit intent (logged only — LIVE still SL/TP/trail)
     'exit_need_streak': 2,
@@ -123,6 +126,7 @@ BOUNDS = {
     'learn_lr': (0.01, 0.5),
     'learn_win_repeats': (1, 8),
     'learn_loss_repeats': (1, 12),
+    'hold_shadow_repeats': (1, 8),
     'profit_history_rows': (50, 2000),
     'exit_need_streak': (1, 8),
     'grow_error_threshold': (0.2, 2.0),
@@ -192,6 +196,7 @@ def _clip(key, value):
                'max_approved_features','val_min_bars','val_min_folds',
                'val_horizon_bars','model_min_oos','shadow_min_broker_trades',
                'shadow_rollback_window','learn_win_repeats','learn_loss_repeats',
+               'hold_shadow_repeats',
                'profit_history_rows','exit_need_streak','prune_min_age',
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',

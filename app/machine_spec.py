@@ -15,7 +15,9 @@ from .market_context import FEATURE_DIM, FEATURE_SCHEMA
 from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 
 # Pipeline: F_learn ∘ F_broker ∘ F_order ∘ F_decision ∘ F_neuron
-LIVE_DECISION_RULE = 'neural_argmax_buy_sell_hold'
+# Neural argmax proposes side; promoted policy.py decide() confirms or HOLDs
+# when self_params.policy_live_execute=1 (default ON with policy_evolve_enabled).
+LIVE_DECISION_RULE = 'neural_argmax_then_evolved_policy_gate'
 LIVE_DECISION_BAR = 'completed_broker_M1'
 POLL_SECONDS = 3
 NEURAL_DT_SECONDS = 60
@@ -46,9 +48,16 @@ FEATURE_SCHEMAS = {
     'fusion_v4': {'schema': FUSION_SCHEMA, 'dim': FUSION_DIM},
     'dynamic': {'note': 'FeatureRegistry may append validated OHLC formulas; dims grow at runtime'},
 }
-# Present in autonomy templates / replay only — NOT a LIVE entry veto.
-SHADOW_ONLY = ('evolved_MIN_EDGE', 'legacy_60pct_gates', 'price_edge_v5_entry_filter',
+# Still research-only (not the LIVE decide() gate).
+SHADOW_ONLY = ('legacy_60pct_gates', 'price_edge_v5_entry_filter',
                'shadow_architecture_probe', 'feature_discovery_proposals')
+# Evolved policy.py is LIVE when policy_live_execute=1 — listed for clarity.
+LIVE_POLICY_EXECUTION = (
+    'policy_evolve_enabled',
+    'policy_live_execute',
+    'autonomy.evolve_promote',
+    'evaluate_neural_entry.apply_evolved_policy_entry',
+)
 SELF_DEV_CYCLE = (
     'collect_ohlc',
     'discover_candidates',
@@ -57,6 +66,8 @@ SELF_DEV_CYCLE = (
     'profit_learning_labels',
     'shadow_compare_models',
     'promote_or_rollback',
+    'evolve_policy_python',
+    'execute_promoted_policy_on_live_entry',
 )
 # Capital.com does not provide true volume / DOM — discovery never invents them.
 # Public multi-source liquidity is resolved per instrument (FX futures, metals,

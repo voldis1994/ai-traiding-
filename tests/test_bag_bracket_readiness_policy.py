@@ -73,22 +73,24 @@ def test_readiness_floors_evolve_from_shadow_promote():
         assert load(store)['min_online_labeled']>=before-2
 
 
-def test_policy_evolve_gated_off_by_default():
+def test_policy_evolve_on_by_default_can_gate_off():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
-        assert int(DEFAULTS['policy_evolve_enabled'])==0
-        assert int(get(store,'policy_evolve_enabled',0))==0
+        assert int(DEFAULTS['policy_evolve_enabled'])==1
+        assert int(get(store,'policy_evolve_enabled',1))==1
         policy=AutoEvolution(store,Path(d)/'policy.py')
         policy.last_change=0
         before=policy.attempts
-        assert policy.evolve(.4,20,[]) is None
-        assert policy.attempts==before
-        assert 'gated off' in (policy.last_reason or '').lower()
-        # Opt-in restores search path.
-        save(store,{**DEFAULTS,'policy_evolve_enabled':1},reason='test')
-        policy.last_change=0
+        # Default ON — search runs even with empty history (no promote).
         policy.evolve(.4,20,[])
         assert policy.attempts==before+1
+        # Opt-out still gates the search path.
+        save(store,{**DEFAULTS,'policy_evolve_enabled':0},reason='test')
+        policy.last_change=0
+        mid=policy.attempts
+        assert policy.evolve(.4,20,[]) is None
+        assert policy.attempts==mid
+        assert 'gated off' in (policy.last_reason or '').lower()
 
 
 def test_engine_activate_uses_store_online_floor():

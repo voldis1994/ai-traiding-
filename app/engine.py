@@ -2046,7 +2046,7 @@ class SingleTradeEngine:
             if new_closed_bar and self.brain.labeled:
                 try:
                     from .self_params import get as sp_get
-                    if int(sp_get(self.store,'policy_evolve_enabled',0)):
+                    if int(sp_get(self.store,'policy_evolve_enabled',1)):
                         self.policy.evolve(
                             self.brain.correct/self.brain.labeled,
                             self.brain.labeled,list(self.brain.history))
@@ -3095,7 +3095,7 @@ class SingleTradeEngine:
             # Do not overwrite neural_adapt_reason with "No relative edge…".
             before_reason=self.store.get('neural_adapt_reason')
             from .self_params import get as sp_get
-            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',0)):
+            if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',1)):
                 self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                    self.brain.labeled,list(self.brain.history),
                                    force=False)
@@ -3620,7 +3620,7 @@ class SingleTradeEngine:
                 'entry_margin_calibration':evaluation.get('calibration') if evaluation else None,
                 'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
-                'neural_entry_rule':'neural argmax BUY/SELL/HOLD; readiness+utility separate; zone/SHIFT evidence only — not entry bans',
+                'neural_entry_rule':'neural argmax proposes; evolved policy.py confirms or HOLDs when policy_live_execute=1; readiness+utility separate',
                 # Audit #25: neural CLOSE is diagnostic; live exit = broker SL/TP/trail.
                 'neural_market_exit':False,
                 'neural_close_diagnostic_only':True,

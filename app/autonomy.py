@@ -338,15 +338,49 @@ class AutoEvolution:
         if int(opposite_streak or 0)<max(1,int(need_streak)):return 'HOLD'
         return 'CLOSE'
 
+    def _policy_live_execute_on(self):
+        """Promoted policy.py may gate LIVE OPEN when enabled (default ON)."""
+        try:
+            from .self_params import get as sp_get
+            return int(sp_get(self.store,'policy_live_execute',1))==1
+        except Exception:
+            return True
+
+    def apply_evolved_policy_entry(self,scores,direction,*,evidence=None):
+        """Run active_policy.decide on flat entry — HOLD veto or confirm side.
+
+        Never flips neural side (BUY↔SELL). CLOSE on flat → HOLD. Fault → HOLD
+        with reason (decision() already tries previous/DEFAULT restore).
+        """
+        evidence=evidence if isinstance(evidence,dict) else {}
+        try:
+            pol=self.decision(scores,current_direction=None,age=0)
+        except Exception as exc:
+            evidence['evolved_policy']={'fault':type(exc).__name__,'action':'HOLD'}
+            return 'HOLD',(
+                f'Evolved policy fault on entry ({type(exc).__name__}); HOLD'),evidence
+        evidence['evolved_policy']={'action':pol,'path':str(self.path),
+                                    'generation':int(getattr(self,'generation',0) or 0)}
+        if pol in ('HOLD','CLOSE'):
+            return 'HOLD',(
+                f'Evolved policy {pol} vetoes neural {direction} '
+                f'(gen={evidence["evolved_policy"]["generation"]})'),evidence
+        if pol in ('BUY','SELL') and pol!=direction:
+            return 'HOLD',(
+                f'Evolved policy {pol} disagrees with neural {direction}; HOLD '
+                f'(no silent side flip)'),evidence
+        return direction,(
+            f'Neural {direction} confirmed by evolved policy '
+            f'(gen={evidence["evolved_policy"]["generation"]})'),evidence
+
     def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
                               history=None,readiness=None,spread_bps=0.0):
-        """LIVE direction = neural argmax; readiness + economic utility are separate.
+        """LIVE: neural argmax proposes; evolved policy may confirm or HOLD.
 
         Argmax chooses BUY/SELL/HOLD — zone/SHIFT/trend are evidence only, never
-        entry bans. A small BUY/SELL score edge is NOT proven trading advantage:
-        when ``readiness`` / ``history`` are supplied, LIVE OPEN also requires
-        prep/eval readiness and cost-adjusted economic utility (audit #22–#23).
-        Broker news / mandate / TRADEABLE stay in the engine.
+        entry bans. When ``policy_live_execute`` is on (default), promoted
+        ``active_policy.py`` / ``policy.py`` decide() gates OPEN. Readiness +
+        economic utility remain separate (audit #22–#23).
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -430,10 +464,17 @@ class AutoEvolution:
             return {**base,'action':'HOLD',
                     'reason':('Argmax '+direction+' blocked: need prep/eval readiness or '
                               'cost-adjusted utility evidence (score edge is not enough)')}
+        # --- Evolved strategy executes: confirm or HOLD (default ON) ---
+        if self._policy_live_execute_on():
+            action,reason,evidence=self.apply_evolved_policy_entry(
+                scores,direction,evidence=evidence)
+            base['evidence']=evidence
+            return {**base,'action':action,'reason':reason}
         return {**base,'action':direction,
                 'reason':(f'Neural argmax {direction} '
                           f'(BUY {buy:.1%} / SELL {sell:.1%} / HOLD {hold:.1%}); '
-                          f'score edge {score_edge:.1%} is not calibrated profit probability')}
+                          f'score edge {score_edge:.1%} is not calibrated profit probability; '
+                          f'evolved policy LIVE execute off')}
 
     @staticmethod
     def _minute_time(value):
@@ -698,21 +739,20 @@ class AutoEvolution:
                 constants[a.targets[0].id]=a.value.value
         return constants
     def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
-        """Search/promote policy candidates (SHADOW / cosmetic — not LIVE entry).
+        """Search/promote policy candidates that LIVE entry can execute.
 
-        LIVE OPEN uses neural argmax; policy.py constants are SHADOW_ONLY.
-        Default self_params.policy_evolve_enabled=0 keeps this off the hot path
-        so attempts/Paaudze are not inflated by unused policy-file churn.
-        Tests and explicit opt-in (Store=1) still exercise the search.
+        Default self_params.policy_evolve_enabled=1 runs the search. Promoted
+        modules are consulted by evaluate_neural_entry when policy_live_execute=1
+        (also default ON) — neural proposes side, decide() confirms or HOLDs.
         """
         try:
             from .self_params import get as sp_get
-            enabled=int(sp_get(self.store,'policy_evolve_enabled',0))
+            enabled=int(sp_get(self.store,'policy_evolve_enabled',1))
         except Exception:
-            enabled=0
+            enabled=1
         if not enabled:
-            self.last_reason=('policy.evolve gated off (LIVE=neural argmax; '
-                              'set self_params.policy_evolve_enabled=1 to run)')
+            self.last_reason=('policy.evolve gated off; '
+                              'set self_params.policy_evolve_enabled=1 to run')
             return None
         min_samples=4 if (force and loss_trade) else (6 if force else 10)
         if sample_count<min_samples:

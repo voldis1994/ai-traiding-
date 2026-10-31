@@ -108,16 +108,17 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
             'returns_bps': {'1': 1, '5': 2, '15': 3, '60': 4},
         }
         e.last_decision_bar = hold_bar
-        # Weak BUY edge 0.05 < fixed 0.06 → policy HOLD, proposal BUY.
+        # Weak BUY edge 0.05 < calibrated seed ~0.06 → policy HOLD, proposal BUY.
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         e.last_signal = {'action': 'BUY', 'scores': weak}
 
-        # ── 1) Policy + cycle agree: HOLD at fixed 0.06 ─────────────────────
+        # ── 1) Policy + cycle agree: HOLD at calibrated floor ───────────────
         out = e.policy.evaluate_neural_entry(weak, readiness={'ready': True})
         assert out['action'] == 'HOLD'
         assert out['proposal'] == 'BUY'
-        assert out['evidence']['evolved_policy']['entry_edge_floor'] == pytest.approx(0.06)
-        assert uc.min_open_margin(uc.load_state(store)) == pytest.approx(0.06)
+        floor = out['evidence']['evolved_policy']['entry_edge_floor']
+        assert floor > 0.05  # weak 0.05 must stay below gate
+        assert uc.min_open_margin(uc.load_state(store)) == pytest.approx(floor)
         gate = uc.edge_allows_open(weak, {'action': 'BUY'}, uc.load_state(store))
         assert gate['allowed'] is False
 
@@ -157,14 +158,13 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         assert learning_generation.current(store) > gen_before
         assert int(brain.trade_labeled) >= labeled_before  # count_sample may bump
 
-        # ── 4) £ settle moves aggression, NOT the 0.06 floor ────────────────
+        # ── 4) £ settle moves aggression, NOT the calibrated floor ──────────
         before_floor = uc.load_state(store)['entry_edge_floor']
         uc.settle(store, pnl=-2.0, action='BUY')
         st = uc.load_state(store)
-        assert st['entry_edge_floor'] == pytest.approx(0.06)
         assert st['entry_edge_floor'] == pytest.approx(before_floor)
         assert st['aggression'] < 1.0
-        assert uc.min_open_margin(st) == pytest.approx(0.06)
+        assert uc.min_open_margin(st) == pytest.approx(before_floor)
 
         # ── 5) Clear edge still confirms OPEN under same fixed floor ────────
         strong = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}

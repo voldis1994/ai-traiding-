@@ -2952,20 +2952,25 @@ class SingleTradeEngine:
         return bars
 
     def _resolve_hold_shadows(self):
-        """Replay matured HOLD abstentions; teach opposite if it hit TP."""
+        """Resolve HOLD shadows as soon as a side hits TP/SL; teach opposite immediately."""
         from .self_params import load as load_self_params
         def _learn(label,transition,mode,detail):
-            # One light trade_pnl step — scores move toward opposite without
-            # LIVE flip and without moving the fixed 0.06 floor.
-            lr=float(load_self_params(self.store).get('learn_lr',0.15))
-            self.brain.learn_from_trade(
-                transition,int(label),lr=lr,won=True,count_sample=True)
+            # Strong opposite teach on the close bar — same lr bus as closed-trade.
+            sp=load_self_params(self.store)
+            lr=float(sp.get('learn_lr',0.28))
+            repeats=max(1,int(sp.get('hold_shadow_repeats',4)))
+            for i in range(repeats):
+                self.brain.learn_from_trade(
+                    transition,int(label),lr=lr,won=True,count_sample=(i==0))
             learning_generation.bump(self.store,'hold_shadow_opposite_tp')
             self.store.event('hold_shadow','Taught opposite after missed TP on HOLD',{
                 'mode':mode,'label':int(label),
                 'opposite':detail.get('opposite'),
                 'opposite_pnl':detail.get('opposite_pnl'),
-                'proposal_pnl':detail.get('proposal_pnl')})
+                'proposal_pnl':detail.get('proposal_pnl'),
+                'learn_repeats':repeats,
+                'path_bars':detail.get('path_bars') or
+                            (detail.get('opposite_sim') or {}).get('bars_held')})
         outcomes=hold_shadow.resolve_ready(
             self.store,candles_after=self._hold_shadow_candles_after,
             learn_callback=_learn,horizon=hold_shadow.HORIZON_BARS)
@@ -3247,6 +3252,13 @@ class SingleTradeEngine:
                 self.store.set('neural_adapt_reason',before_reason)
         except Exception as exc:
             self.store.event('warning','Trade-timed evolution skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
+        # Immediately after a real close: flush any HOLD shadows that already
+        # hit TP/SL on available candles — do not wait for a later poll cycle.
+        try:
+            self._resolve_hold_shadows()
+        except Exception as exc:
+            self.store.event('warning','Post-close hold_shadow resolve skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set(key,None)
 

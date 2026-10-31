@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import bracket_learn
+from app import hold_shadow
 from app import learning_generation
 from app import self_params
 from app import unified_cycle
@@ -73,6 +74,8 @@ class Snapshot:
     settlements: int
     edge_holds: int
     policy_vetoes: int
+    hold_shadow_taught: int
+    hold_shadow_opp_tp: int
     hold_skips: int
     rolling20_pnl: float | None
     rolling20_win_rate: float | None
@@ -146,6 +149,7 @@ def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
     cycle = unified_cycle.load_state(store)
     mult = bracket_learn.load_multipliers(store)
     sp = self_params.load(store)
+    hs = hold_shadow.load_stats(store)
     recent = pnls[-20:] if pnls else []
     r_wins = sum(1 for p in recent if p > 0)
     r_loss = sum(1 for p in recent if p < 0)
@@ -179,6 +183,8 @@ def _snapshot(store, brain, *, n_trades, pnls, edge_holds, hold_skips,
         settlements=int(cycle['settlements']),
         edge_holds=int(edge_holds),
         policy_vetoes=int(policy_vetoes),
+        hold_shadow_taught=int(hs.get('taught_opposite') or 0),
+        hold_shadow_opp_tp=int(hs.get('opposite_hit_tp') or 0),
         hold_skips=int(hold_skips),
         rolling20_pnl=float(sum(recent)) if recent else None,
         rolling20_win_rate=(r_wins / r_n) if r_n else None,
@@ -389,6 +395,34 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
                 open_pos = None
             continue
 
+        # Resolve matured HOLD→opposite shadows every flat bar.
+        def _candles_after(bar_time, epic):
+            out = []
+            started = not bool(bar_time)
+            for c in candle_buf:
+                at = c.get('at')
+                if not started:
+                    if at is None or str(at) < str(bar_time):
+                        continue
+                    started = True
+                out.append({
+                    'mid': float(c['close']),
+                    'high': float(c['high']), 'low': float(c['low']),
+                    'spread': float(c.get('spread') or SPREAD), 'at': at,
+                })
+            return out
+
+        def _hs_learn(label, transition, mode, detail):
+            sp = self_params.load(store)
+            brain.learn_from_trade(
+                transition, int(label), lr=float(sp['learn_lr']),
+                won=True, count_sample=True)
+            learning_generation.bump(store, 'hold_shadow_opposite_tp')
+
+        hold_shadow.resolve_ready(
+            store, candles_after=_candles_after, learn_callback=_hs_learn,
+            horizon=hold_shadow.HORIZON_BARS)
+
         # Flat — decide OPEN via policy LIVE + unified cycle (same scale bus).
         if len(candle_buf) < 40:
             continue
@@ -397,6 +431,7 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
             hold_skips += 1
             continue
         action = neural
+        proposal = neural
         if policy_live:
             # Bypass readiness/history gates so we isolate edge-floor coupling;
             # still runs evolved decide() with shared MIN_EDGE override.
@@ -406,8 +441,43 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
                                    'holdout_net_bps_mean': 1.0})
             if ev.get('action') not in ('BUY', 'SELL'):
                 policy_vetoes += 1
+                proposal = ev.get('proposal') or neural
+                # Queue opposite-path shadow under same would-be brackets.
+                zone = bracket_learn.zone_at_open(candle_buf)
+                rng = zone['range_distance'] or ohlc_range_distance(candle_buf)
+                buffer = max(2 * TICK, 2 * SPREAD)
+                base_sl = max(float(MIN_DIST) + buffer, float(rng or 0))
+                learned = bracket_learn.load_multipliers(store)
+                pkg_shape = unified_cycle.compose_open(
+                    action=proposal, scores=scores,
+                    evaluation={'action': proposal, 'score_edge': 0.25},
+                    zone=zone, learned=learned,
+                    cycle_state=unified_cycle.load_state(store),
+                    base_sl=base_sl, max_tp=zone.get('max_tp'))
+                kappa = pkg_shape.get('kappa') or 1.0
+                sl_scale = pkg_shape.get('sl_scale') or 1.0
+                if pkg_shape.get('blocked'):
+                    kappa = float(zone.get('kappa') or 1.0) * (learned.get('kappa') or 1.0)
+                    sl_scale = max(1.0, float(learned.get('sl_scale') or 1.0))
+                br = stop_take(
+                    mid, proposal, TICK, SPREAD, MIN_DIST,
+                    kappa=float(kappa), sl_scale=float(sl_scale),
+                    range_distance=float(rng) if rng is not None else 0)
+                tr = (brain._json_transition(brain.core.last_transition)
+                      if brain.core.last_transition is not None else None)
+                if tr is not None and proposal in ('BUY', 'SELL'):
+                    hold_shadow.enqueue(
+                        store, proposal=proposal,
+                        reason=ev.get('reason') or 'policy HOLD',
+                        bar_time=bar.get('at'), epic=EPIC, entry=float(mid),
+                        spread=SPREAD,
+                        stop_distance=float(br['stop_distance']),
+                        profit_distance=float(br['profit_distance']),
+                        tick=TICK, min_distance=MIN_DIST, transition=tr,
+                        scores=scores)
                 continue
             action = ev['action']
+            proposal = action
         zone = bracket_learn.zone_at_open(candle_buf)
         rng = zone['range_distance'] or ohlc_range_distance(candle_buf)
         buffer = max(2 * TICK, 2 * SPREAD)
@@ -422,6 +492,23 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
             base_sl=base_sl, max_tp=zone.get('max_tp'))
         if pkg.get('blocked') or pkg.get('action') not in ('BUY', 'SELL'):
             edge_holds += 1
+            tr = (brain._json_transition(brain.core.last_transition)
+                  if brain.core.last_transition is not None else None)
+            if tr is not None and proposal in ('BUY', 'SELL'):
+                # Same brackets OPEN would have used if edge cleared.
+                br = stop_take(
+                    mid, proposal, TICK, SPREAD, MIN_DIST,
+                    kappa=1.0, sl_scale=1.0,
+                    range_distance=float(rng) if rng is not None else 0)
+                hold_shadow.enqueue(
+                    store, proposal=proposal,
+                    reason=pkg.get('reason') or 'cycle edge HOLD',
+                    bar_time=bar.get('at'), epic=EPIC, entry=float(mid),
+                    spread=SPREAD,
+                    stop_distance=float(br['stop_distance']),
+                    profit_distance=float(br['profit_distance']),
+                    tick=TICK, min_distance=MIN_DIST, transition=tr,
+                    scores=scores)
             continue
         brackets = stop_take(
             mid, action, TICK, SPREAD, MIN_DIST,
@@ -504,6 +591,10 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
         'minute_acc': final.get('minute_acc'),
         'edge_holds': edge_holds,
         'policy_vetoes': policy_vetoes,
+        'hold_shadow_taught': hold_shadow.load_stats(store).get('taught_opposite'),
+        'hold_shadow_opp_tp': hold_shadow.load_stats(store).get('opposite_hit_tp'),
+        'hold_shadow_resolved': hold_shadow.load_stats(store).get('resolved'),
+        'hold_shadow_hint': hold_shadow.strategy_evidence(store).get('strategy_hint'),
         'hold_skips': hold_skips,
         'first10_pnl': float(sum(first10)) if first10 else 0.0,
         'last20_pnl': float(sum(last20)) if last20 else 0.0,
@@ -538,10 +629,10 @@ def _print_run(tag, r):
         f'{tag} seed={r.seed} trades={r.n_trades} pnl={s["cumulative_pnl"]:.2f} '
         f'wr={s["win_rate"]:.3f} '
         f'floor {s["entry_edge_floor_start"]:.3f}→{s["entry_edge_floor_end"]:.3f} '
-        f'[{s["entry_edge_floor_min"]:.3f}..{s["entry_edge_floor_max"]:.3f}] '
         f'agg {s["aggression_start"]:.3f}→{s["aggression_end"]:.3f} '
         f'κ {s["kappa_mult_start"]:.3f}→{s["kappa_mult_end"]:.3f} '
-        f'edge_holds={s["edge_holds"]} policy_vetoes={s["policy_vetoes"]} '
+        f'edge_holds={s["edge_holds"]} vetoes={s["policy_vetoes"]} '
+        f'hs_taught={s.get("hold_shadow_taught")} hs_opp_tp={s.get("hold_shadow_opp_tp")} '
         f'last20={s["last20_pnl"]:.2f} last100={s["last100_pnl"]:.2f}'
     )
 
@@ -550,40 +641,36 @@ def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('/opt/cursor/artifacts')
     out_dir.mkdir(parents=True, exist_ok=True)
     seeds = [29, 7, 101]
-    # Fixed 0.06 entry floor — learn via scores / brackets / strategies only.
+    # Fixed 0.06 + policy LIVE + HOLD opposite shadow.
     mode_kw = dict(couple_weights=True, policy_live=True, freeze_edge_floor=False)
-    compare_100 = []
-    for s in seeds:
-        r = run(n_trades=100, seed=s, max_bars=12000, **mode_kw)
-        compare_100.append({'mode': 'fixed_006', 'seed': s,
-                            'summary': r.summary, 'milestones': r.milestones})
-        _print_run('100/fixed_006', r)
-
     long_marks = (0, 50, 100, 250, 500, 750, 1000)
-    r1000 = run(n_trades=1000, seed=29, max_bars=80000, milestones=long_marks, **mode_kw)
-    long_runs = [{
-        'mode': 'fixed_006', 'seed': 29,
-        'summary': r1000.summary,
-        'milestones': r1000.milestones,
-    }]
-    _print_run('1000/fixed_006', r1000)
+    compare_1000 = []
+    for s in seeds:
+        r = run(n_trades=1000, seed=s, max_bars=80000, milestones=long_marks, **mode_kw)
+        compare_1000.append({
+            'mode': 'fixed_006_hold_shadow', 'seed': s,
+            'summary': r.summary, 'milestones': r.milestones,
+        })
+        _print_run('1000/stress', r)
 
-    primary_row = next(x for x in compare_100 if x['seed'] == 29)
+    primary = compare_1000[0]
     payload = {
         'primary': {
-            'seed': 29,
-            'summary': primary_row['summary'],
-            'milestones': primary_row['milestones'],
+            'seed': primary['seed'],
+            'summary': primary['summary'],
+            'milestones': primary['milestones'],
         },
-        'compare_100': compare_100,
-        'compare_1000': long_runs,
+        'compare_1000': compare_1000,
         'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'note': (
-            'entry_edge_floor fixed at 0.06. Learning improves neural scores, '
-            'bracket exits (κ/sl + aggression), and evolved strategies — not the gate.'),
+            '1000-trade stress: fixed entry_edge_floor 0.06, policy LIVE, '
+            'HOLD→opposite shadow teach when opposite hits TP.'),
     }
-    path = out_dir / 'zero_start_cycle_sim.json'
+    path = out_dir / 'zero_start_cycle_sim_1000_stress.json'
     path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    # Also refresh the main artifact pointer.
+    (out_dir / 'zero_start_cycle_sim.json').write_text(
+        json.dumps(payload, indent=2), encoding='utf-8')
     print('wrote', path)
     return path
 

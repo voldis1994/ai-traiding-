@@ -346,18 +346,51 @@ class AutoEvolution:
         except Exception:
             return True
 
-    def apply_evolved_policy_entry(self,scores,direction,*,evidence=None):
+    def calibrate_live_entry_floor(self,direction,*,history=None,spread_bps=0.0,
+                                   accuracy=None,samples=0):
+        """Compute LIVE MIN_EDGE from adaptive base + holdout — not from last £.
+
+        Returns (floor, calibration_detail). Soft rails are applied when
+        persisted via unified_cycle.set_calibrated_floor.
+        """
+        from . import unified_cycle
+        baseline=self.adaptive_threshold(
+            accuracy,samples,spread_bps,base=unified_cycle.ENTRY_EDGE_DEFAULT)
+        calibration=self.calibrate_entry_margin(
+            direction,history or [],baseline)
+        selected=float(calibration.get('selected',baseline) or baseline)
+        # Snap to 0.01 steps (0.06→0.07, never 0.065) inside rails.
+        floor=unified_cycle.quantize_entry_edge(selected)
+        meta=unified_cycle.set_calibrated_floor(
+            self.store,floor,
+            method=calibration.get('method') or 'adaptive_threshold',
+            detail={
+                'baseline':baseline,
+                'selected':selected,
+                'reason':calibration.get('reason'),
+                'spread_bps':spread_bps,
+                'accuracy':accuracy,
+                'samples':samples,
+                'train_precision':calibration.get('train_precision'),
+                'validation_precision':calibration.get('validation_precision'),
+            })
+        return float(meta['floor']), {**calibration, 'persisted': meta}
+
+    def apply_evolved_policy_entry(self,scores,direction,*,evidence=None,
+                                   history=None,spread_bps=0.0,
+                                   accuracy=None,samples=0):
         """Run active_policy.decide on flat entry — HOLD veto or confirm side.
 
-        MIN_EDGE is overridden with the fixed unified_cycle floor (0.06, same
-        units as score_edge). Improvement is via better scores / evolved
-        strategies clearing that bar — the bar itself does not move.
+        MIN_EDGE comes from holdout/spread calibration (soft rails), shared with
+        compose_open via unified_cycle.entry_edge_floor. Never from £ streak.
         Never flips neural side. CLOSE on flat → HOLD.
         """
         evidence=evidence if isinstance(evidence,dict) else {}
         from . import unified_cycle
-        cycle=unified_cycle.load_state(self.store)
-        edge_floor=unified_cycle.min_open_margin(cycle)
+        edge_floor,calibration=self.calibrate_live_entry_floor(
+            direction,history=history,spread_bps=spread_bps,
+            accuracy=accuracy,samples=samples)
+        evidence['entry_edge_calibration']=calibration
         try:
             # Same scale bus as compose_open / edge_allows_open.
             pol=self.decision(scores,current_direction=None,age=0,threshold=edge_floor)
@@ -371,6 +404,7 @@ class AutoEvolution:
             'generation':int(getattr(self,'generation',0) or 0),
             'entry_edge_floor':edge_floor,
             'score_edge':AutoEvolution.score_edge(scores),
+            'calibration_method':(calibration or {}).get('method'),
         }
         if pol in ('HOLD','CLOSE'):
             return 'HOLD',(
@@ -479,9 +513,23 @@ class AutoEvolution:
                               'cost-adjusted utility evidence (score edge is not enough)')}
         # --- Evolved strategy executes: confirm or HOLD (default ON) ---
         if self._policy_live_execute_on():
+            # Accuracy/samples from readiness when available — feed calibration.
+            acc=None;samp=0
+            if isinstance(readiness,dict):
+                try:
+                    if readiness.get('minute_direction_accuracy') is not None:
+                        acc=float(readiness['minute_direction_accuracy'])
+                except (TypeError,ValueError):
+                    acc=None
+                try:samp=int(readiness.get('eval_samples') or labeled or 0)
+                except (TypeError,ValueError):samp=int(labeled or 0)
+            else:
+                samp=int(labeled or 0)
             action,reason,evidence=self.apply_evolved_policy_entry(
-                scores,direction,evidence=evidence)
+                scores,direction,evidence=evidence,history=history,
+                spread_bps=spread_bps,accuracy=acc,samples=samp)
             base['evidence']=evidence
+            base['calibration']=evidence.get('entry_edge_calibration')
             ep=(evidence or {}).get('evolved_policy') or {}
             if ep.get('entry_edge_floor') is not None:
                 base['threshold']=ep['entry_edge_floor']

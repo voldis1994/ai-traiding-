@@ -155,7 +155,8 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
         assert detail['realized_directional_ticks']==pytest.approx(20.)
         assert detail['mode']=='reinforce_win_ticks'  # tick path — not fake £ in profit ledger
         assert detail['target']==1
-        assert detail['learn_repeats']==2
+        from app.self_params import DEFAULTS as _sp
+        assert detail['learn_repeats']==int(_sp['learn_win_repeats'])
         assert detail.get('weights_updated') is True
         # Without broker profit, cash P&L stays blank (no fake GOLD USD price×size).
         assert store.trades(1)[0]['pnl'] is None
@@ -181,7 +182,8 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         detail=json.loads(last['details'])
         assert detail['mode']=='loss_counterfactual_sell'
         assert detail['target']==1
-        assert detail['learn_repeats']==2
+        from app.self_params import DEFAULTS as _sp
+        assert detail['learn_repeats']==int(_sp['learn_loss_repeats'])
         assert detail['scratch_hold_skip'] is False
         assert detail['weights_updated'] is True
         assert detail['broker_pnl']==-12.5

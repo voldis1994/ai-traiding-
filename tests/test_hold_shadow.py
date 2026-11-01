@@ -86,6 +86,60 @@ def test_enqueue_and_resolve_teaches_opposite():
         assert hs.load_pending(store) == []
 
 
+def test_resolve_learns_immediately_when_tp_hits_few_bars():
+    """Do not wait for a 45-bar idle window — teach on the first decisive exit."""
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        transition = {
+            'z': [0.2] * 8, 'h': [0.0] * 4, 'c': [0.0] * 4,
+            'dt': 60., 'neuron_ids': list(range(4)),
+        }
+        hs.enqueue(
+            store, proposal='BUY', reason='weak edge',
+            bar_time='b0', epic='GOLD', entry=100.0, spread=0.2,
+            stop_distance=1.0, profit_distance=1.0, tick=0.1,
+            min_distance=0.2, transition=transition)
+        taught = []
+
+        def learn(label, tr, mode, detail):
+            taught.append(detail)
+
+        # Only a handful of bars — enough for SELL opposite to hit TP.
+        short = _bars_trend('down', n=5, step=0.6)
+
+        outs = hs.resolve_ready(
+            store, candles_after=lambda *_: short, learn_callback=learn,
+            horizon=hs.HORIZON_BARS)
+        assert outs, 'must resolve as soon as TP/SL hits, not after full horizon'
+        assert outs[0]['taught'] is True
+        assert outs[0]['path_bars'] <= 5
+        assert outs[0]['opposite_hit_tp'] is True
+        assert taught
+        assert hs.load_pending(store) == []
+
+
+def test_resolve_waits_while_both_sides_still_open():
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        hs.enqueue(
+            store, proposal='BUY', reason='weak',
+            bar_time='b0', epic='GOLD', entry=100.0, spread=0.2,
+            stop_distance=5.0, profit_distance=5.0, tick=0.1,
+            min_distance=0.2,
+            transition={
+                'z': [0.1] * 8, 'h': [0.] * 4, 'c': [0.] * 4,
+                'dt': 60., 'neuron_ids': list(range(4)),
+            })
+        flat = [{'mid': 100., 'high': 100.05, 'low': 99.95, 'spread': 0.2,
+                 'at': f'b{i}'} for i in range(3)]
+        outs = hs.resolve_ready(
+            store, candles_after=lambda *_: flat, learn_callback=None,
+            horizon=15)
+        assert outs == []
+        assert len(hs.load_pending(store)) == 1
+        assert hs.load_pending(store)[0].get('bars_seen') == 3
+
+
 def test_strategy_hint_after_enough_opposite_tps():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')

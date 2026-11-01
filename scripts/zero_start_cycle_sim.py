@@ -310,6 +310,8 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
     deal_seq = 0
     floor_min = float(zero['entry_edge_floor'])
     floor_max = float(zero['entry_edge_floor'])
+    # Chronological score/label history for holdout edge calibration.
+    decision_history = []
 
     # Milestone 0
     milestone_rows.append(zero)
@@ -376,10 +378,20 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
                 band = float(self_params.load(store)['scratch_pnl_abs'])
                 if abs(row['pnl']) <= band:
                     scratches += 1
+                    label = 2
                 elif row['pnl'] > 0:
                     wins += 1
+                    label = 0 if d == 'BUY' else 1
                 else:
                     losses += 1
+                    label = 2  # loss → HOLD-ish for calibration history
+                sc = open_pos.get('scores') or scores
+                if isinstance(sc, dict):
+                    decision_history.append({
+                        'label': label, 'scores': dict(sc),
+                        'spread_bps': 10000.0 * SPREAD / max(1e-9, float(entry)),
+                        'at': bar.get('at'),
+                    })
                 st = unified_cycle.load_state(store)
                 fl = float(st.get('entry_edge_floor') or unified_cycle.ENTRY_EDGE_DEFAULT)
                 floor_min = min(floor_min, fl)
@@ -414,9 +426,12 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
 
         def _hs_learn(label, transition, mode, detail):
             sp = self_params.load(store)
-            brain.learn_from_trade(
-                transition, int(label), lr=float(sp['learn_lr']),
-                won=True, count_sample=True)
+            lr = float(sp['learn_lr'])
+            repeats = max(1, int(sp.get('hold_shadow_repeats', 4)))
+            for i in range(repeats):
+                brain.learn_from_trade(
+                    transition, int(label), lr=lr,
+                    won=True, count_sample=(i == 0))
             learning_generation.bump(store, 'hold_shadow_opposite_tp')
 
         hold_shadow.resolve_ready(
@@ -433,12 +448,24 @@ def run(n_trades: int = 100, seed: int = 29, max_bars: int = 8000,
         action = neural
         proposal = neural
         if policy_live:
-            # Bypass readiness/history gates so we isolate edge-floor coupling;
-            # still runs evolved decide() with shared MIN_EDGE override.
+            # LIVE path: calibrate MIN_EDGE from history + spread, then gate.
+            m_acc = (brain.minute_correct / brain.minute_labeled
+                     if brain.minute_labeled else 0.55)
+            spread_bps = 10000.0 * SPREAD / max(1e-9, float(mid))
             ev = policy.evaluate_neural_entry(
-                scores, readiness={'ready': True, 'eval_samples': 100,
-                                   'minute_direction_accuracy': 0.55,
-                                   'holdout_net_bps_mean': 1.0})
+                scores,
+                history=decision_history[-400:],
+                readiness={
+                    'ready': True,
+                    'eval_samples': max(40, brain.minute_labeled or 0),
+                    'minute_direction_accuracy': float(m_acc),
+                    'holdout_net_bps_mean': 1.0,
+                },
+                spread_bps=spread_bps)
+            st_cal = unified_cycle.load_state(store)
+            fl = float(st_cal.get('entry_edge_floor') or unified_cycle.ENTRY_EDGE_DEFAULT)
+            floor_min = min(floor_min, fl)
+            floor_max = max(floor_max, fl)
             if ev.get('action') not in ('BUY', 'SELL'):
                 policy_vetoes += 1
                 proposal = ev.get('proposal') or neural
@@ -663,8 +690,8 @@ def main():
         'compare_1000': compare_1000,
         'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'note': (
-            '1000-trade stress: fixed entry_edge_floor 0.06, policy LIVE, '
-            'HOLD→opposite shadow teach when opposite hits TP.'),
+            '1000-trade stress: holdout+spread calibrated entry_edge_floor '
+            '(rails 0.03–0.12), policy LIVE, HOLD→opposite shadow teach.'),
     }
     path = out_dir / 'zero_start_cycle_sim_1000_stress.json'
     path.write_text(json.dumps(payload, indent=2), encoding='utf-8')

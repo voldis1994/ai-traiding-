@@ -7,7 +7,8 @@ import pytest
 from app.engine import Store
 from app.self_params import (DEFAULTS, STORE_KEY, PENDING_KEY, load, save, get,
                              evolve_from_feedback, maybe_commit_long_horizon,
-                             snapshot, IMMUTABLE_NOTE)
+                             snapshot, IMMUTABLE_NOTE, quantize_learn_lr,
+                             LEARN_LR_STEP)
 from app.feature_discovery import FeatureDiscovery
 from app.feature_validation import validate_feature
 
@@ -37,6 +38,31 @@ def test_evolve_from_feedback_moves_knobs():
         assert after<=before
         evolve_from_feedback(store,feature_rejected={'reason':'unstable or non-positive OOS net PnL'})
         assert load(store)['val_horizon_bars']>=DEFAULTS['val_horizon_bars']
+
+
+def test_learn_lr_only_two_decimal_places():
+    """learn_lr must be 0.28 / 0.29 / 0.30 — never 0.294 or 0.123."""
+    assert LEARN_LR_STEP == 0.01
+    assert quantize_learn_lr(0.294) == pytest.approx(0.29)
+    assert quantize_learn_lr(0.123) == pytest.approx(0.12)
+    assert quantize_learn_lr(0.286) == pytest.approx(0.29)
+    assert quantize_learn_lr(0.28) == pytest.approx(0.28)
+    assert quantize_learn_lr(None) == pytest.approx(DEFAULTS['learn_lr'])
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save(store,{**DEFAULTS,'learn_lr':0.12345},reason='poison float')
+        assert get(store,'learn_lr') == pytest.approx(0.12)
+        # Meaningful loss bumps exactly one hundredth.
+        before=get(store,'learn_lr')
+        evolve_from_feedback(store,broker_pnl=-1.5)
+        after=load(store)['learn_lr']
+        assert after == pytest.approx(round(before+0.01,2))
+        assert round(after,2) == after
+        # Win softens by exactly one hundredth.
+        evolve_from_feedback(store,broker_pnl=1.5)
+        soft=load(store)['learn_lr']
+        assert soft == pytest.approx(round(after-0.01,2))
+        assert soft == round(soft,2)
 
 
 def test_scratch_loss_does_not_ratchet_hold_repeats():

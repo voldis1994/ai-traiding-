@@ -52,6 +52,7 @@ DEFAULTS = {
     'shadow_rollback_delta': 0.35,
     # Learning — faster defaults so closed-trade + HOLD-shadow teach right away
     # (weights move on the close bar, not after a long idle wait).
+    # learn_lr is always 0.01 steps (0.28, 0.29, 0.30…) — never 0.294 / 0.123.
     'learn_lr': 0.28,
     'learn_win_repeats': 4,
     'learn_loss_repeats': 5,
@@ -123,7 +124,7 @@ BOUNDS = {
     'shadow_min_broker_trades': (6, 60),
     'shadow_rollback_window': (5, 40),
     'shadow_rollback_delta': (0.05, 5.0),
-    'learn_lr': (0.01, 0.5),
+    'learn_lr': (0.01, 0.50),
     'learn_win_repeats': (1, 8),
     'learn_loss_repeats': (1, 12),
     'hold_shadow_repeats': (1, 8),
@@ -168,6 +169,9 @@ IMMUTABLE_NOTE = (
     'Broker tick/min-stop/margin are exchange rules.'
 )
 
+# learn_lr moves only in whole hundredths — same discipline as entry_edge.
+LEARN_LR_STEP = 0.01
+
 
 def _finite(v):
     try:
@@ -175,6 +179,17 @@ def _finite(v):
         return n if math.isfinite(n) else None
     except (TypeError,ValueError):
         return None
+
+
+def quantize_learn_lr(v) -> float:
+    """Snap learn_lr to 0.01 steps within rails: 0.28 → 0.29, never 0.294."""
+    n=_finite(v)
+    if n is None:
+        n=float(DEFAULTS['learn_lr'])
+    step=float(LEARN_LR_STEP)
+    snapped=round(round(n/step)*step,2)
+    lo,hi=BOUNDS['learn_lr']
+    return max(float(lo),min(float(hi),snapped))
 
 
 def _clip(key, value):
@@ -189,6 +204,8 @@ def _clip(key, value):
                 continue
             if 2<=ih<=120 and ih not in out:out.append(ih)
         return sorted(out) or list(DEFAULTS['gen_horizons'])
+    if key=='learn_lr':
+        return quantize_learn_lr(value)
     bounds=BOUNDS.get(key)
     n=_finite(value)
     if n is None:return DEFAULTS[key]
@@ -383,7 +400,8 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
             # Scratch / penny closes must not ratchet HOLD repeats —
             # that was the permanent-HOLD trap after a streak of £0 exits.
             if pnl<0 and abs(pnl)>scratch:
-                p['learn_lr']=min(BOUNDS['learn_lr'][1],float(p['learn_lr'])*1.05)
+                # Whole 0.01 steps only — never 0.28*1.05=0.294.
+                p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])+LEARN_LR_STEP)
                 # Never let loss repeats exceed win repeats (symmetric teacher).
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 cur=int(p['learn_loss_repeats'])
@@ -409,7 +427,7 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['trail_open_gap_frac'])*1.06)
                 notes.append('scratch loss — widen scratch band + trail gap')
             elif pnl>0:
-                p['learn_lr']=max(BOUNDS['learn_lr'][0],float(p['learn_lr'])*0.98)
+                p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 # Soft nudge win path so it stays ≥ loss path.
                 p['learn_win_repeats']=min(BOUNDS['learn_win_repeats'][1],max(win_r,int(p['learn_loss_repeats'])))

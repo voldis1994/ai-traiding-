@@ -298,16 +298,22 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
         }
     learned = learned if isinstance(learned, dict) else {}
     kappa = _finite(zone.get('kappa')) or 1.0
-    # Blend zone κ with learned multiplier, then damp/raise with cycle aggression.
+    # Blend zone κ with learned multiplier. Aggression may *tighten* after losses
+    # (agg<1) but must not invent wider SL/TP than OHLC on a win streak (agg>1).
     k_mult = _finite(learned.get('kappa')) or 1.0
     s_mult = max(1.0, _finite(learned.get('sl_scale')) or 1.0)
-    kappa = float(kappa) * float(k_mult) * float(aggression)
-    # Weak edge → keep SL closer to zone (aggression already ≤1 after losses).
-    # Strong edge → full learned width. Never invent lot size.
-    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.10)
-    sl_scale = max(1.0, float(s_mult) * float(aggression) * float(edge_scale))
+    width_agg = min(1.0, float(aggression))
+    kappa = float(kappa) * float(k_mult) * float(width_agg)
+    # Edge may mildly tighten when weak; never inflate SL past OHLC via edge_scale>1.
+    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
+    sl_scale = max(1.0, float(s_mult) * float(width_agg) * float(edge_scale))
+    # Learned sl_mult cannot push SL past the OHLC adverse range when base is that range.
+    ohlc_sl = _finite(zone.get('range_distance'))
     tp = tp_hint
     base = float(base_hint)
+    if ohlc_sl is not None and ohlc_sl > 0 and base > 0:
+        # Cap so base * sl_scale ≤ OHLC range (no fantasy SL wider than candles).
+        sl_scale = min(float(sl_scale), max(1.0, float(ohlc_sl) / base))
     if base > 0 and tp is not None and tp > 0:
         room = float(tp) / (base * sl_scale)
         if kappa > room:
@@ -324,6 +330,8 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
         'aggression': aggression,
         'min_margin': need,
         'edge_scale': float(edge_scale),
+        'width_agg': float(width_agg),
+        'ohlc_sl_cap': float(ohlc_sl) if ohlc_sl is not None else None,
     }
 
 

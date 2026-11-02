@@ -238,10 +238,19 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         scratch_cash_band=band)
     growing=_recent_sl_losses_growing(store,pnl)
     reason='hold'
+    last_open=store.get('bracket_last_open_meta') if store is not None else None
+    if not isinstance(last_open,dict):
+        last_open={}
+    at_ohlc_tp=bool(last_open.get('tp_at_ohlc_cap') or last_open.get('capped_to_ohlc'))
     if reason_x=='tp' or (pnl>band and reason_x in ('trail','unknown','manual')):
-        # Win reinforces TP ambition only — do not widen SL (that raises £ risk).
-        k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        reason='win_reinforce' if pnl>band else 'tp_reinforce'
+        # Win may reinforce κ only while OHLC still had TP headroom.
+        # If last OPEN was already capped to reachable max_tp, do not invent
+        # a farther fantasy target for the next trade.
+        if at_ohlc_tp:
+            reason='tp_at_ohlc_cap_hold'
+        else:
+            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
+            reason='win_reinforce' if pnl>band else 'tp_reinforce'
     elif reason_x=='trail':
         if pnl<-band and shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_trail_loss_kappa_step']))
@@ -274,12 +283,16 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         else:
             reason='loss_insufficient_context_hold'
     elif pnl>band:
-        k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        reason='win_reinforce'
+        if at_ohlc_tp:
+            reason='tp_at_ohlc_cap_hold'
+        else:
+            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
+            reason='win_reinforce'
     save_multipliers(store,k_m,s_m,
                      reason=f'learned_{reason} exit={reason_x} pnl={pnl:.4f}')
     if reason not in ('hold','trail_hold','vanish_hold','scratch_hold_sl',
-                      'loss_insufficient_context_hold','loss_adverse_hold_sl'):
+                      'loss_insufficient_context_hold','loss_adverse_hold_sl',
+                      'tp_at_ohlc_cap_hold'):
         try:
             from .self_params import evolve_from_feedback
             evolve_from_feedback(store,bracket_reason=reason,commit=False)
@@ -403,6 +416,119 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
     }
 
 
+def clamp_open_brackets(*, stop_distance, profit_distance, zone, tick,
+                        min_distance=0) -> dict:
+    """Snap OPEN SL/TP onto OHLC-reachable rails — multipliers cannot invent fantasy.
+
+    - SL ≤ zone ``range_distance`` (observed adverse M1 move)
+    - TP ≤ zone ``max_tp`` (reachable favorable span)
+    Broker min still floors both. Tick-snapped for the order grid.
+    """
+    from decimal import ROUND_CEILING
+    from .math_rules import D
+
+    z = zone if isinstance(zone, dict) else {}
+    try:
+        tick_f = float(tick)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    if not math.isfinite(tick_f) or tick_f <= 0:
+        tick_f = 0.01
+    try:
+        mn = float(min_distance or 0)
+    except (TypeError, ValueError):
+        mn = 0.0
+    if not math.isfinite(mn) or mn < 0:
+        mn = 0.0
+    sd = _finite(stop_distance)
+    pd = _finite(profit_distance)
+    if sd is None or sd <= 0 or pd is None or pd <= 0:
+        return {
+            'stop_distance': stop_distance, 'profit_distance': profit_distance,
+            'capped_to_ohlc': False, 'sl_cap': None, 'tp_cap': None,
+            'tp_at_ohlc_cap': False, 'sl_at_ohlc_cap': False,
+        }
+    ohlc_sl = _finite(z.get('range_distance'))
+    if ohlc_sl is None or ohlc_sl <= 0:
+        ohlc_sl = _finite(z.get('noise_distance'))
+    ohlc_tp = _finite(z.get('max_tp'))
+    sl_cap = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else None
+    tp_cap = float(ohlc_tp) if ohlc_tp is not None and ohlc_tp > 0 else None
+    capped = False
+    sl_at = False
+    tp_at = False
+    if sl_cap is not None and sd > sl_cap + 1e-12:
+        sd = sl_cap
+        capped = True
+        sl_at = True
+    if tp_cap is not None and pd > tp_cap + 1e-12:
+        pd = tp_cap
+        capped = True
+        tp_at = True
+    floor = max(mn, tick_f)
+    if sd < floor:
+        sd = floor
+    if pd < floor:
+        pd = floor
+    # Tick snap (ceil) so broker grid stays valid after a cut.
+    q = D(str(tick_f))
+    sl_ticks = int((D(str(sd)) / q).to_integral_value(rounding=ROUND_CEILING))
+    tp_ticks = int((D(str(pd)) / q).to_integral_value(rounding=ROUND_CEILING))
+    if sl_ticks < 1:
+        sl_ticks = 1
+    if tp_ticks < 1:
+        tp_ticks = 1
+    sd = float(q * sl_ticks)
+    pd = float(q * tp_ticks)
+    # Re-enforce OHLC caps after ceil snap (ceil can nudge 1 tick over).
+    if sl_cap is not None and sd > sl_cap + tick_f * 0.5:
+        sl_ticks = max(1, int((D(str(sl_cap)) / q).to_integral_value(rounding=ROUND_CEILING)))
+        # Prefer not exceeding cap: floor ticks if ceil overshoots.
+        while sl_ticks > 1 and float(q * sl_ticks) > sl_cap + 1e-12:
+            sl_ticks -= 1
+        sd = float(q * sl_ticks)
+        capped = True
+        sl_at = True
+    if tp_cap is not None and pd > tp_cap + tick_f * 0.5:
+        tp_ticks = max(1, int((D(str(tp_cap)) / q).to_integral_value(rounding=ROUND_CEILING)))
+        while tp_ticks > 1 and float(q * tp_ticks) > tp_cap + 1e-12:
+            tp_ticks -= 1
+        pd = float(q * tp_ticks)
+        capped = True
+        tp_at = True
+    if sd < floor:
+        sd = floor
+    if pd < floor:
+        pd = floor
+    return {
+        'stop_distance': float(sd),
+        'profit_distance': float(pd),
+        'capped_to_ohlc': bool(capped),
+        'sl_cap': sl_cap,
+        'tp_cap': tp_cap,
+        'tp_at_ohlc_cap': bool(tp_at or (
+            tp_cap is not None and abs(pd - tp_cap) <= tick_f * 1.01)),
+        'sl_at_ohlc_cap': bool(sl_at or (
+            sl_cap is not None and abs(sd - sl_cap) <= tick_f * 1.01)),
+    }
+
+
+def note_open_bracket_meta(store, meta: dict) -> dict:
+    """Remember whether the last OPEN was already at OHLC TP/SL ceiling."""
+    clean = {
+        'capped_to_ohlc': bool((meta or {}).get('capped_to_ohlc')),
+        'tp_at_ohlc_cap': bool((meta or {}).get('tp_at_ohlc_cap')),
+        'sl_at_ohlc_cap': bool((meta or {}).get('sl_at_ohlc_cap')),
+        'sl_cap': _finite((meta or {}).get('sl_cap')),
+        'tp_cap': _finite((meta or {}).get('tp_cap')),
+        'stop_distance': _finite((meta or {}).get('stop_distance')),
+        'profit_distance': _finite((meta or {}).get('profit_distance')),
+    }
+    if store is not None:
+        store.set('bracket_last_open_meta', clean)
+    return clean
+
+
 def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
                      candles=None) -> dict:
@@ -421,6 +547,10 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
     kappa*=learned['kappa']
     sl_scale=max(1.0,float(learned['sl_scale']))
     base=float(base_sl or zone.get('range_distance') or 0)
+    # Learned sl_mult cannot invent SL wider than OHLC adverse range.
+    ohlc_sl=_finite(zone.get('range_distance'))
+    if ohlc_sl is not None and ohlc_sl>0 and base>0:
+        sl_scale=min(float(sl_scale),max(1.0,float(ohlc_sl)/base))
     if base>0 and max_tp and max_tp>0:
         room=max_tp/(base*sl_scale)
         if kappa>room:
@@ -435,6 +565,7 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
         'kappa_mult':learned['kappa'],'sl_mult':learned['sl_scale'],
         'lookback':zone.get('lookback'),
+        'ohlc_sl_cap':float(ohlc_sl) if ohlc_sl is not None else None,
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }
 

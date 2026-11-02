@@ -2920,11 +2920,16 @@ class SingleTradeEngine:
         brackets=stop_take(entry,proposal,tick,spread,min_d,
                            kappa=float(kappa),sl_scale=float(sl_scale),
                            range_distance=float(rng) if rng is not None else 0)
+        fitted=bracket_learn.clamp_open_brackets(
+            stop_distance=brackets['stop_distance'],
+            profit_distance=brackets['profit_distance'],
+            zone=zone,tick=tick,min_distance=min_d)
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
-            'stop_distance':float(brackets['stop_distance']),
-            'profit_distance':float(brackets['profit_distance']),
+            'stop_distance':float(fitted['stop_distance']),
+            'profit_distance':float(fitted['profit_distance']),
+            'capped_to_ohlc':bool(fitted.get('capped_to_ohlc')),
             'epic':epic,
         }
 
@@ -3571,6 +3576,27 @@ class SingleTradeEngine:
             brackets=stop_take(entry,action,tick,spread,minimum,
                                kappa=bp['kappa'],sl_scale=bp['sl_scale'],
                                range_distance=float(rng) if rng is not None else 0)
+            # OHLC rails: multipliers must not invent SL/TP beyond reachable candles.
+            fitted=bracket_learn.clamp_open_brackets(
+                stop_distance=brackets['stop_distance'],
+                profit_distance=brackets['profit_distance'],
+                zone=zone,tick=tick,min_distance=minimum)
+            if fitted.get('capped_to_ohlc'):
+                sign=1 if action=='BUY' else -1
+                sd=float(fitted['stop_distance']);pd=float(fitted['profit_distance'])
+                brackets={**brackets,
+                    'stop_distance':sd,'profit_distance':pd,
+                    'stop_level':float(entry)-sign*sd,
+                    'profit_level':float(entry)+sign*pd,
+                    'stop_ticks':int(round(sd/float(tick))) if tick else brackets.get('stop_ticks'),
+                    'profit_ticks':int(round(pd/float(tick))) if tick else brackets.get('profit_ticks'),
+                    'capped_to_ohlc':True,
+                    'ohlc_sl_cap':fitted.get('sl_cap'),
+                    'ohlc_tp_cap':fitted.get('tp_cap')}
+            bracket_learn.note_open_bracket_meta(self.store,{
+                **fitted,
+                'stop_distance':float(brackets['stop_distance']),
+                'profit_distance':float(brackets['profit_distance'])})
             # Audit #9: after coeffs/rounding, refuse non-compliant SL/TP.
             if not distances_meet_broker_min(brackets['stop_distance'],
                                              brackets['profit_distance'],minimum):
@@ -3608,6 +3634,8 @@ class SingleTradeEngine:
                 'favor_share':zone.get('favor_share'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
+                'capped_to_ohlc':bool(brackets.get('capped_to_ohlc') or fitted.get('capped_to_ohlc')),
+                'ohlc_sl_cap':fitted.get('sl_cap'),'ohlc_tp_cap':fitted.get('tp_cap'),
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,

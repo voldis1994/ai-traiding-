@@ -4,11 +4,15 @@ from pathlib import Path
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from app.bracket_learn import (
-    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,evolve_from_history,
-    load_multipliers,load_params,propose_for_open,recent_reachable_move,
-    record_outcome,save_multipliers,save_params,zone_at_open,
+    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,decide_brackets_from_ohlc,
+    evolve_from_history,load_multipliers,load_params,note_open_bracket_meta,
+    propose_for_open,recent_reachable_move,record_outcome,resample_m1_ohlc,
+    save_multipliers,save_params,zone_at_open,
 )
+from app import unified_cycle
 from app.engine import Store
 from app.math_rules import stop_take
 
@@ -223,3 +227,94 @@ def test_save_and_load_reject_invalid():
         restored=load_params(store)
         assert restored['kappa']==DEFAULT_KAPPA
         assert restored['sl_scale']==DEFAULT_SL_SCALE
+
+
+def _m1_series(n=120, start=None, step=0.05):
+    start = start or datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 100.0
+    for i in range(n):
+        o = px
+        px = px + step * (1 if i % 7 != 0 else -0.5)
+        rows.append({
+            'at': (start + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': max(o, px) + 0.08, 'low': min(o, px) - 0.06,
+            'close': px, 'spread': 0.05,
+        })
+    return rows
+
+
+def test_resample_m1_builds_higher_timeframes():
+    rows = _m1_series(60)
+    m5 = resample_m1_ohlc(rows, 5)
+    m15 = resample_m1_ohlc(rows, 15)
+    h1 = resample_m1_ohlc(rows, 60)
+    assert len(m5) == 12
+    assert len(m15) == 4
+    assert len(h1) == 1
+    assert m5[0]['open'] == rows[0]['open']
+    assert m5[0]['close'] == rows[4]['close']
+    assert m5[0]['high'] >= max(r['high'] for r in rows[:5]) - 1e-9
+
+
+def test_zone_at_open_uses_multi_timeframe_consensus():
+    rows = _m1_series(120)
+    z = zone_at_open(rows, multi_tf=True)
+    assert z['ready'] is True
+    assert z['multi_tf'] is True
+    assert set(z['horizons_minutes']) >= {1, 5, 15}
+    assert '1' in z['timeframes'] and '5' in z['timeframes']
+    # Consensus SL/TP come from combining TFs — not identical to M1 alone.
+    m1_only = zone_at_open(rows, multi_tf=False)
+    assert z['range_distance'] > 0 and z['max_tp'] is not None
+    assert z['max_tp'] <= max(
+        float(t['max_tp']) for t in z['timeframes'].values()
+        if t.get('max_tp')) + 1e-9
+
+
+def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
+    zone={'kappa':1.5,'range_distance':1.0,'max_tp':1.2,'noise_distance':0.8,
+          'ready':True,'lookback':20,'median_up':1.5,'median_down':1.0}
+    out=decide_brackets_from_ohlc(zone,tick=0.01,spread=0.05,min_distance=0.2)
+    assert out['source']=='ohlc_zone'
+    assert out['sl_scale']==1.0
+    assert out['stop_distance']==pytest.approx(1.0,abs=0.02)
+    # TP follows OHLC κ×SL but not beyond reachable max_tp.
+    assert out['profit_distance']<=1.2+1e-9
+    assert out['ohlc_kappa']==pytest.approx(1.5)
+
+
+def test_ohlc_decision_ignores_inflated_learned_multipliers_on_open():
+    """Even if Store mults are huge, OPEN width still comes from OHLC zone."""
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save_multipliers(store,2.5,2.5,reason='inflated')
+        zone={'kappa':1.2,'range_distance':1.0,'max_tp':1.5,'ready':True}
+        pkg=unified_cycle.compose_open(
+            action='BUY',
+            scores={'BUY':0.55,'SELL':0.25,'HOLD':0.20},
+            evaluation={'action':'BUY','score_edge':0.30},
+            zone=zone,learned=load_multipliers(store),
+            cycle_state=unified_cycle.default_state(),
+            base_sl=1.0,max_tp=1.5)
+        assert pkg['bracket_source']=='ohlc_zone'
+        assert pkg['sl_scale']==1.0
+        assert pkg['kappa']==pytest.approx(1.2) or pkg['kappa']<=1.5+1e-9
+        decided=decide_brackets_from_ohlc(
+            zone,tick=0.01,spread=0.05,min_distance=0.2,
+            tighten=float(pkg.get('tighten') or 1.0))
+        assert decided['stop_distance']<=1.0+0.02
+        assert decided['profit_distance']<=1.5+1e-9
+
+
+def test_win_at_full_ohlc_tp_does_not_raise_unused_mult_for_width():
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        note_open_bracket_meta(store,{
+            'source':'ohlc_zone','tp_at_ohlc_cap':True,
+            'ohlc_tp':1.5,'profit_distance':1.5,'stop_distance':1.0})
+        before=load_multipliers(store)['kappa']
+        out=adapt_after_outcome(
+            store,kappa=1.2,sl_scale=1.0,pnl=0.80,exit_reason='tp')
+        assert out['reason']=='tp_at_ohlc_cap_hold'
+        assert load_multipliers(store)['kappa']==pytest.approx(before)

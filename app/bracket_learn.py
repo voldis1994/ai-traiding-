@@ -238,10 +238,19 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         scratch_cash_band=band)
     growing=_recent_sl_losses_growing(store,pnl)
     reason='hold'
+    last_open=store.get('bracket_last_open_meta') if store is not None else None
+    if not isinstance(last_open,dict):
+        last_open={}
+    at_ohlc_tp=bool(last_open.get('tp_at_ohlc_cap') or last_open.get('capped_to_ohlc'))
     if reason_x=='tp' or (pnl>band and reason_x in ('trail','unknown','manual')):
-        # Win reinforces TP ambition only — do not widen SL (that raises £ risk).
-        k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        reason='win_reinforce' if pnl>band else 'tp_reinforce'
+        # Win may reinforce κ only while OHLC still had TP headroom.
+        # If last OPEN was already capped to reachable max_tp, do not invent
+        # a farther fantasy target for the next trade.
+        if at_ohlc_tp:
+            reason='tp_at_ohlc_cap_hold'
+        else:
+            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
+            reason='win_reinforce' if pnl>band else 'tp_reinforce'
     elif reason_x=='trail':
         if pnl<-band and shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_trail_loss_kappa_step']))
@@ -274,12 +283,16 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         else:
             reason='loss_insufficient_context_hold'
     elif pnl>band:
-        k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-        reason='win_reinforce'
+        if at_ohlc_tp:
+            reason='tp_at_ohlc_cap_hold'
+        else:
+            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
+            reason='win_reinforce'
     save_multipliers(store,k_m,s_m,
                      reason=f'learned_{reason} exit={reason_x} pnl={pnl:.4f}')
     if reason not in ('hold','trail_hold','vanish_hold','scratch_hold_sl',
-                      'loss_insufficient_context_hold','loss_adverse_hold_sl'):
+                      'loss_insufficient_context_hold','loss_adverse_hold_sl',
+                      'tp_at_ohlc_cap_hold'):
         try:
             from .self_params import evolve_from_feedback
             evolve_from_feedback(store,bracket_reason=reason,commit=False)
@@ -351,15 +364,63 @@ def _window_structure(candles, n: int|None=None) -> float|None:
     return span if math.isfinite(span) and span>0 else None
 
 
-def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
-    """SL/TP from *this* market window — no hardcoded 1/3 or 1/2 of structure.
+# Same horizons the neural market context already reads (M1/M5/M15/H1).
+BRACKET_TF_MINUTES = (1, 5, 15, 60)
 
-    Shares come from OHLC itself: pull_share = median_down/median_span,
-    favor_share = median_up/median_span. Those observed bar shares scale the
-    lookback peak−trough so OPEN tracks how this instrument actually pulls
-    back and extends. Learned κ / sl_scale in propose_for_open then adapts
-    further from cash £ outcomes.
+
+def resample_m1_ohlc(candles, minutes: int) -> list:
+    """Build higher-TF OHLC by packing sequential completed M1 bars.
+
+    Uses elapsed-bar packs (5/15/60 M1 → M5/M15/H1), matching the neural
+    multi-horizon tape — not a single minute window alone.
     """
+    from .market_context import candle_time
+    m = max(1, int(minutes))
+    cleaned = []
+    for raw in candles or []:
+        dt = candle_time(raw.get('at'))
+        if dt is None:
+            continue
+        try:
+            o, h, l, c = (float(raw[k]) for k in ('open', 'high', 'low', 'close'))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not all(math.isfinite(v) for v in (o, h, l, c)) or min(o, h, l, c) <= 0 or h < l:
+            continue
+        cleaned.append({
+            'at': dt.isoformat(), 'open': o, 'high': h, 'low': l, 'close': c,
+            'spread': _finite(raw.get('spread')), '_dt': dt,
+        })
+    cleaned.sort(key=lambda r: r['_dt'])
+    if m <= 1:
+        out1 = []
+        for r in cleaned:
+            row = {k: r[k] for k in ('at', 'open', 'high', 'low', 'close')}
+            if r.get('spread') is not None:
+                row['spread'] = r['spread']
+            out1.append(row)
+        return out1
+    out = []
+    for i in range(0, len(cleaned) - m + 1, m):
+        chunk = cleaned[i:i + m]
+        if len(chunk) < m:
+            break
+        spreads = [c['spread'] for c in chunk if c.get('spread') is not None]
+        row = {
+            'at': chunk[-1]['at'],
+            'open': chunk[0]['open'],
+            'high': max(c['high'] for c in chunk),
+            'low': min(c['low'] for c in chunk),
+            'close': chunk[-1]['close'],
+        }
+        if spreads:
+            row['spread'] = float(sum(spreads) / len(spreads))
+        out.append(row)
+    return out
+
+
+def _zone_single_tf(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
+    """SL/TP geometry from one OHLC series (one timeframe)."""
     ups,downs,spans,used=_bar_moves(candles,n)
     reach=recent_reachable_move(candles,reach_n if reach_n is not None else used)
     structure=_window_structure(candles,used)
@@ -377,7 +438,6 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
         kappa=med_up/med_down
     if not math.isfinite(kappa) or kappa<=0:
         kappa=DEFAULT_KAPPA
-    # How much of a typical bar is adverse vs favorable — measured here, not coded.
     if med_span>1e-12:
         pull_share=float(med_down/med_span)
         favor_share=float(med_up/med_span)
@@ -403,38 +463,253 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
     }
 
 
+def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
+                 multi_tf: bool=True) -> dict:
+    """SL/TP from the whole tape — M1+M5+M15+H1 consensus, not one timeframe alone.
+
+    Each TF builds its own OHLC geometry (adverse/favor/reach). The OPEN decision
+    is the median across ready timeframes so micro M1 noise cannot dominate and
+    a single slow bar cannot invent an unreachable target by itself.
+    """
+    rows = list(candles or [])
+    if not multi_tf or len(rows) < 20:
+        out = _zone_single_tf(rows, n=n, reach_n=reach_n)
+        out['horizons_minutes'] = [1]
+        out['timeframes'] = {'1': {k: out.get(k) for k in (
+            'kappa', 'range_distance', 'max_tp', 'ready', 'lookback')}}
+        out['multi_tf'] = False
+        return out
+
+    per = {}
+    for minutes in BRACKET_TF_MINUTES:
+        tf_rows = rows if minutes == 1 else resample_m1_ohlc(rows, minutes)
+        # Need enough TF bars for a meaningful median geometry.
+        need = 5 if minutes == 1 else 5
+        if len(tf_rows) < need:
+            continue
+        z = _zone_single_tf(tf_rows, n=(n if minutes == 1 else None),
+                            reach_n=(reach_n if minutes == 1 else None))
+        z['tf_minutes'] = int(minutes)
+        z['tf_bars'] = len(tf_rows)
+        per[int(minutes)] = z
+
+    ready = [z for z in per.values()
+             if z.get('ready') and _finite(z.get('range_distance'))
+             and float(z['range_distance']) > 0]
+    if not ready:
+        out = _zone_single_tf(rows, n=n, reach_n=reach_n)
+        out['horizons_minutes'] = [1]
+        out['timeframes'] = {'1': {k: out.get(k) for k in (
+            'kappa', 'range_distance', 'max_tp', 'ready', 'lookback')}}
+        out['multi_tf'] = False
+        return out
+
+    ranges = [float(z['range_distance']) for z in ready]
+    kappas = [float(z['kappa']) for z in ready]
+    tps = [float(z['max_tp']) for z in ready
+           if _finite(z.get('max_tp')) and float(z['max_tp']) > 0]
+    noises = [float(z['noise_distance']) for z in ready
+              if _finite(z.get('noise_distance')) and float(z['noise_distance']) > 0]
+    pulls = [float(z['pull_share']) for z in ready if _finite(z.get('pull_share'))]
+    favors = [float(z['favor_share']) for z in ready if _finite(z.get('favor_share'))]
+    ups = [float(z['median_up']) for z in ready if _finite(z.get('median_up'))]
+    downs = [float(z['median_down']) for z in ready if _finite(z.get('median_down'))]
+    # Longer TF structure when available — whole-swing context.
+    structure = None
+    for minutes in (60, 15, 5, 1):
+        z = per.get(minutes) or {}
+        if z.get('ready') and _finite(z.get('structure')) and float(z['structure']) > 0:
+            structure = float(z['structure'])
+            break
+
+    # Consensus across TFs: median SL/κ; TP reach = tightest ready TF
+    # (whole picture must agree the target is reachable on every horizon).
+    sl = float(median(ranges))
+    kappa = float(median(kappas))
+    max_tp = float(min(tps)) if tps else None
+    noise = float(median(noises)) if noises else sl
+    pull = float(median(pulls)) if pulls else None
+    favor = float(median(favors)) if favors else None
+    med_up = float(median(ups)) if ups else None
+    med_down = float(median(downs)) if downs else None
+
+    return {
+        'kappa': float(kappa),
+        'range_distance': float(sl),
+        'noise_distance': float(noise),
+        'structure': float(structure) if structure is not None else None,
+        'pull_share': float(pull) if pull is not None else None,
+        'favor_share': float(favor) if favor is not None else None,
+        'max_tp': float(max_tp) if max_tp is not None else None,
+        'median_up': med_up,
+        'median_down': med_down,
+        'ready': True,
+        'lookback': (per.get(1) or {}).get('lookback'),
+        'multi_tf': True,
+        'horizons_minutes': sorted(per.keys()),
+        'timeframes': {
+            str(m): {
+                'kappa': z.get('kappa'),
+                'range_distance': z.get('range_distance'),
+                'max_tp': z.get('max_tp'),
+                'ready': z.get('ready'),
+                'lookback': z.get('lookback'),
+                'tf_bars': z.get('tf_bars'),
+            } for m, z in per.items()
+        },
+    }
+
+
+def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
+                              tighten=1.0) -> dict:
+    """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
+
+    Decision from candles:
+      SL = observed adverse range (``range_distance``), floored by broker min
+      κ  = observed favor/adverse ratio (``zone.kappa``)
+      TP = κ×SL, but not beyond reachable favor span (``max_tp``)
+
+    ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
+    *same* OHLC decision, never an invented wider target.
+    """
+    from .math_rules import stop_take
+
+    z = zone if isinstance(zone, dict) else {}
+    try:
+        tick_f = float(tick)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    if not math.isfinite(tick_f) or tick_f <= 0:
+        tick_f = 0.01
+    try:
+        sp = float(spread or 0.)
+    except (TypeError, ValueError):
+        sp = 0.
+    if not math.isfinite(sp) or sp < 0:
+        sp = 0.
+    try:
+        mn = float(min_distance or 0.)
+    except (TypeError, ValueError):
+        mn = 0.
+    if not math.isfinite(mn) or mn < 0:
+        mn = 0.
+    t = _finite(tighten)
+    if t is None or t <= 0:
+        t = 1.0
+    t = max(0.7, min(1.0, float(t)))
+    ohlc_sl = _finite(z.get('range_distance'))
+    if ohlc_sl is None or ohlc_sl <= 0:
+        ohlc_sl = _finite(z.get('noise_distance'))
+    ohlc_kappa = _finite(z.get('kappa')) or DEFAULT_KAPPA
+    if ohlc_kappa <= 0 or not math.isfinite(ohlc_kappa):
+        ohlc_kappa = DEFAULT_KAPPA
+    ohlc_tp = _finite(z.get('max_tp'))
+    buffer = max(2.0 * tick_f, 2.0 * sp)
+    floor = mn + buffer if (mn + buffer) > 0 else tick_f
+    # Core decision: SL from OHLC adverse move (or broker floor if quieter).
+    raw_sl = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else floor
+    stop_d = max(floor, raw_sl) * t
+    # TP from OHLC κ, limited by what this window actually reaches.
+    raw_tp = float(ohlc_kappa) * stop_d
+    if ohlc_tp is not None and ohlc_tp > 0:
+        profit_d = min(raw_tp, float(ohlc_tp) * t)
+    else:
+        profit_d = raw_tp
+    profit_d = max(floor, profit_d)
+    # Effective κ after reachable-span decision (for tagging / learning).
+    eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
+    # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
+    entry = 1000.0  # levels unused by callers that only need distances
+    snapped = stop_take(
+        entry, 'BUY', tick_f, sp, mn,
+        kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+        range_distance=stop_d)
+    return {
+        'stop_distance': float(snapped['stop_distance']),
+        'profit_distance': float(snapped['profit_distance']),
+        'kappa': float(snapped.get('kappa') or eff_kappa),
+        'sl_scale': 1.0,
+        'ohlc_kappa': float(ohlc_kappa),
+        'ohlc_sl': float(raw_sl),
+        'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
+        'tighten': float(t),
+        'source': 'ohlc_zone',
+        'ready': bool(z.get('ready')),
+        'lookback': z.get('lookback'),
+        'median_up': z.get('median_up'),
+        'median_down': z.get('median_down'),
+        'pull_share': z.get('pull_share'),
+        'favor_share': z.get('favor_share'),
+        'stop_ticks': snapped.get('stop_ticks'),
+        'profit_ticks': snapped.get('profit_ticks'),
+        'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
+    }
+
+
+def note_open_bracket_meta(store, meta: dict) -> dict:
+    """Remember the OHLC decision used on the last OPEN (for learn feedback)."""
+    clean = {
+        'source': str((meta or {}).get('source') or 'ohlc_zone'),
+        'ohlc_kappa': _finite((meta or {}).get('ohlc_kappa')),
+        'ohlc_sl': _finite((meta or {}).get('ohlc_sl')),
+        'ohlc_tp': _finite((meta or {}).get('ohlc_tp')),
+        'stop_distance': _finite((meta or {}).get('stop_distance')),
+        'profit_distance': _finite((meta or {}).get('profit_distance')),
+        'tighten': _finite((meta or {}).get('tighten')),
+        # Kept for older learn path: TP already used full reachable span.
+        'tp_at_ohlc_cap': bool(
+            (meta or {}).get('tp_at_ohlc_cap')
+            or (
+                _finite((meta or {}).get('ohlc_tp')) is not None
+                and _finite((meta or {}).get('profit_distance')) is not None
+                and abs(float(meta['profit_distance']) - float(meta['ohlc_tp']))
+                <= max(1e-9, 0.02 * float(meta['ohlc_tp']))
+            )),
+        'capped_to_ohlc': False,
+    }
+    if store is not None:
+        store.set('bracket_last_open_meta', clean)
+    return clean
+
+
 def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
-                     candles=None) -> dict:
-    """Zone distances × learned raise/cut multipliers; TP still capped by reach."""
+                     candles=None, tick: float=0.01, spread: float=0.,
+                     min_distance: float=0., tighten: float=1.0) -> dict:
+    """OHLC zone decides κ / SL / TP — learned multipliers do not set width."""
     zone=zone_at_open(candles or []) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
         'range_distance':float(base_sl or 0),'max_tp':max_tp,'ready':bool(ohlc_kappa),
         'lookback':None,
     }
-    if max_tp is None:
-        max_tp=zone.get('max_tp')
-    kappa=float(zone.get('kappa') or DEFAULT_KAPPA)
     if ohlc_kappa and ohlc_kappa>0:
-        kappa=0.5*kappa+0.5*float(ohlc_kappa)
+        # Blend two OHLC κ readings (caller hint + zone) — still candle-driven.
+        zk=_finite(zone.get('kappa')) or DEFAULT_KAPPA
+        zone=dict(zone)
+        zone['kappa']=0.5*float(zk)+0.5*float(ohlc_kappa)
+    if base_sl is not None and _finite(base_sl) and float(base_sl)>0:
+        zone=dict(zone)
+        # Prefer explicit OHLC base when caller already measured range.
+        zone['range_distance']=float(base_sl)
+    if max_tp is not None:
+        zone=dict(zone);zone['max_tp']=max_tp
+    decided=decide_brackets_from_ohlc(
+        zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten)
+    save_params(store,decided['kappa'],1.0,
+                reason=(f"ohlc_zone κ={decided.get('ohlc_kappa')} "
+                        f"sl={decided.get('ohlc_sl')} tp={decided.get('ohlc_tp')}"))
     learned=load_multipliers(store)
-    kappa*=learned['kappa']
-    sl_scale=max(1.0,float(learned['sl_scale']))
-    base=float(base_sl or zone.get('range_distance') or 0)
-    if base>0 and max_tp and max_tp>0:
-        room=max_tp/(base*sl_scale)
-        if kappa>room:
-            kappa=max(0.5,room)
-    save_params(store,kappa,sl_scale,
-                reason=(f"ohlc×learn k_mult={learned['kappa']:.3f} "
-                        f"sl_mult={learned['sl_scale']:.3f}"))
     return {
-        'kappa':float(kappa),'sl_scale':float(sl_scale),'explored':False,
-        'max_tp':max_tp,'base_sl':base_sl or zone.get('range_distance'),
-        'ohlc_kappa':ohlc_kappa,'zone_ready':bool(zone.get('ready')),
+        'kappa':float(decided['kappa']),'sl_scale':1.0,'explored':False,
+        'max_tp':decided.get('ohlc_tp'),'base_sl':decided.get('ohlc_sl'),
+        'ohlc_kappa':decided.get('ohlc_kappa'),
+        'zone_ready':bool(zone.get('ready')),
         'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
         'kappa_mult':learned['kappa'],'sl_mult':learned['sl_scale'],
         'lookback':zone.get('lookback'),
+        'stop_distance':decided['stop_distance'],
+        'profit_distance':decided['profit_distance'],
+        'bracket_source':'ohlc_zone',
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }
 

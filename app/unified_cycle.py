@@ -296,34 +296,38 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'aggression': aggression,
             'min_margin': need,
         }
-    learned = learned if isinstance(learned, dict) else {}
+    # SL/TP width is an OHLC decision (zone κ / range / max_tp) — not learned
+    # multipliers. Aggression may only *tighten* after losses (≤1).
+    del learned  # width ignores raise/cut mults; keep arg for call-site compat
     kappa = _finite(zone.get('kappa')) or 1.0
-    # Blend zone κ with learned multiplier, then damp/raise with cycle aggression.
-    k_mult = _finite(learned.get('kappa')) or 1.0
-    s_mult = max(1.0, _finite(learned.get('sl_scale')) or 1.0)
-    kappa = float(kappa) * float(k_mult) * float(aggression)
-    # Weak edge → keep SL closer to zone (aggression already ≤1 after losses).
-    # Strong edge → full learned width. Never invent lot size.
-    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.10)
-    sl_scale = max(1.0, float(s_mult) * float(aggression) * float(edge_scale))
+    if kappa <= 0:
+        kappa = 1.0
+    ohlc_sl = _finite(zone.get('range_distance'))
     tp = tp_hint
     base = float(base_hint)
+    tighten = min(1.0, float(aggression))
+    # Weak edge → slightly tighter fraction of the *same* OHLC plan.
+    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
+    tighten = min(tighten, float(edge_scale))
     if base > 0 and tp is not None and tp > 0:
-        room = float(tp) / (base * sl_scale)
+        room = float(tp) / base
         if kappa > room:
             kappa = max(0.5, room)
     return {
         'action': act if act in ('BUY', 'SELL') else decision['action'],
         'kappa': float(kappa),
-        'sl_scale': float(sl_scale),
+        'sl_scale': 1.0,
         'base_sl': base,
         'max_tp': float(tp) if tp is not None else None,
         'blocked': False,
-        'reason': 'Unified cycle OPEN',
+        'reason': 'Unified cycle OPEN (OHLC zone decides SL/TP)',
         'decision': decision,
         'aggression': aggression,
         'min_margin': need,
         'edge_scale': float(edge_scale),
+        'tighten': float(tighten),
+        'ohlc_sl': float(ohlc_sl) if ohlc_sl is not None else None,
+        'bracket_source': 'ohlc_zone',
     }
 
 

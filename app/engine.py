@@ -2887,12 +2887,12 @@ class SingleTradeEngine:
         if None in (mid,tick,spread) or not epic:
             return None
         try:
-            candles=self.store.candles(epic,n=120,historical_only=True)
+            candles=self.store.candles(epic,n=190,historical_only=True)
         except Exception:
             candles=[]
         if len(candles)<20:
             return None
-        zone=bracket_learn.zone_at_open(candles)
+        zone=bracket_learn.zone_at_open(candles,multi_tf=True)
         rng=zone['range_distance'] or ohlc_range_distance(candles)
         buffer=max(2*float(tick),2*float(spread))
         min_d=float(minimum) if minimum is not None else float(tick)
@@ -2911,20 +2911,19 @@ class SingleTradeEngine:
             evaluation={'action':proposal,'score_edge':max(0.2,float(edge or 0))},
             zone=zone,learned=learned,cycle_state=cycle_state,base_sl=base_sl,
             max_tp=zone.get('max_tp'))
-        kappa=pkg.get('kappa') or 1.0
-        sl_scale=pkg.get('sl_scale') or 1.0
-        if pkg.get('blocked'):
-            kappa=float(zone.get('kappa') or 1.0)*(learned.get('kappa') or 1.0)
-            sl_scale=max(1.0,float(learned.get('sl_scale') or 1.0))
+        # Even if edge gate HOLDs LIVE, shadow still needs OHLC-decided distances.
+        tighten=float(pkg.get('tighten') or min(1.0,float(
+            (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
-        brackets=stop_take(entry,proposal,tick,spread,min_d,
-                           kappa=float(kappa),sl_scale=float(sl_scale),
-                           range_distance=float(rng) if rng is not None else 0)
+        decided=bracket_learn.decide_brackets_from_ohlc(
+            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten)
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
-            'stop_distance':float(brackets['stop_distance']),
-            'profit_distance':float(brackets['profit_distance']),
+            'stop_distance':float(decided['stop_distance']),
+            'profit_distance':float(decided['profit_distance']),
+            'bracket_source':'ohlc_zone',
+            'ohlc_kappa':decided.get('ohlc_kappa'),
             'epic':epic,
         }
 
@@ -3535,10 +3534,9 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # One cycle: OHLC zone × learned raise/cut × cycle aggression/edge.
-            # Lot stays mandate; direction stays neural; κ/sl width coordinated here.
-            candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
-            zone=bracket_learn.zone_at_open(candles)
+            # OHLC zone decides SL/TP across M1/M5/M15/H1; cycle only gates edge.
+            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
@@ -3557,20 +3555,34 @@ class SingleTradeEngine:
                     'reason':self.last_entry_reason,'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
                 return
-            bp={'kappa':pkg['kappa'],'sl_scale':pkg['sl_scale'],'explored':False,
+            decided=bracket_learn.decide_brackets_from_ohlc(
+                zone,tick=tick,spread=spread,min_distance=minimum,
+                tighten=float(pkg.get('tighten') or 1.0))
+            sign=1 if action=='BUY' else -1
+            sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
+            brackets={
+                'stop_distance':sd,'profit_distance':pd,
+                'stop_level':float(entry)-sign*sd,
+                'profit_level':float(entry)+sign*pd,
+                'stop_ticks':decided.get('stop_ticks'),
+                'profit_ticks':decided.get('profit_ticks'),
+                'kappa':decided.get('kappa'),'sl_scale':1.0,
+                'raised_to_broker_min':decided.get('raised_to_broker_min'),
+                'bracket_source':'ohlc_zone',
+            }
+            bp={'kappa':decided['kappa'],'sl_scale':1.0,'explored':False,
                 'kappa_mult':learned.get('kappa'),'sl_mult':learned.get('sl_scale'),
                 'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
                 'lookback':zone.get('lookback'),
                 'nudge_samples':len(self.store.get('bracket_outcome_history',[]) or []),
-                'aggression':pkg.get('aggression'),'edge_scale':pkg.get('edge_scale')}
+                'aggression':pkg.get('aggression'),'edge_scale':pkg.get('edge_scale'),
+                'tighten':decided.get('tighten'),'bracket_source':'ohlc_zone'}
             bracket_learn.save_params(
-                self.store,bp['kappa'],bp['sl_scale'],
-                reason=(f"unified_cycle k_mult={learned['kappa']:.3f} "
-                        f"sl_mult={learned['sl_scale']:.3f} "
-                        f"agg={float(pkg.get('aggression') or 1):.3f}"))
-            brackets=stop_take(entry,action,tick,spread,minimum,
-                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
-                               range_distance=float(rng) if rng is not None else 0)
+                self.store,bp['kappa'],1.0,
+                reason=(f"ohlc_zone κ={decided.get('ohlc_kappa')} "
+                        f"sl={decided.get('ohlc_sl')} tp={decided.get('ohlc_tp')} "
+                        f"tighten={float(decided.get('tighten') or 1):.3f}"))
+            bracket_learn.note_open_bracket_meta(self.store,decided)
             # Audit #9: after coeffs/rounding, refuse non-compliant SL/TP.
             if not distances_meet_broker_min(brackets['stop_distance'],
                                              brackets['profit_distance'],minimum):
@@ -3595,10 +3607,11 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','Unified cycle OPEN: OHLC × learn × aggression',{
-                'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
-                'kappa_mult':bp.get('kappa_mult'),'sl_mult':bp.get('sl_mult'),
-                'aggression':bp.get('aggression'),'edge_scale':bp.get('edge_scale'),
+            self.store.event('bracket','OPEN brackets decided from multi-TF OHLC',{
+                'kappa':bp['kappa'],'sl_scale':1.0,
+                'ohlc_kappa':decided.get('ohlc_kappa'),
+                'ohlc_sl':decided.get('ohlc_sl'),'ohlc_tp':decided.get('ohlc_tp'),
+                'tighten':decided.get('tighten'),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
@@ -3606,8 +3619,12 @@ class SingleTradeEngine:
                 'structure':zone.get('structure'),
                 'pull_share':zone.get('pull_share'),
                 'favor_share':zone.get('favor_share'),
+                'multi_tf':bool(zone.get('multi_tf')),
+                'horizons_minutes':zone.get('horizons_minutes'),
+                'timeframes':zone.get('timeframes'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
+                'bracket_source':'ohlc_zone_multi_tf',
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,

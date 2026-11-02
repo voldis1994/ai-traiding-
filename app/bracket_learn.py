@@ -416,16 +416,19 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
     }
 
 
-def clamp_open_brackets(*, stop_distance, profit_distance, zone, tick,
-                        min_distance=0) -> dict:
-    """Snap OPEN SL/TP onto OHLC-reachable rails — multipliers cannot invent fantasy.
+def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
+                              tighten=1.0) -> dict:
+    """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
-    - SL ≤ zone ``range_distance`` (observed adverse M1 move)
-    - TP ≤ zone ``max_tp`` (reachable favorable span)
-    Broker min still floors both. Tick-snapped for the order grid.
+    Decision from candles:
+      SL = observed adverse range (``range_distance``), floored by broker min
+      κ  = observed favor/adverse ratio (``zone.kappa``)
+      TP = κ×SL, but not beyond reachable favor span (``max_tp``)
+
+    ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
+    *same* OHLC decision, never an invented wider target.
     """
-    from decimal import ROUND_CEILING
-    from .math_rules import D
+    from .math_rules import stop_take
 
     z = zone if isinstance(zone, dict) else {}
     try:
@@ -435,94 +438,90 @@ def clamp_open_brackets(*, stop_distance, profit_distance, zone, tick,
     if not math.isfinite(tick_f) or tick_f <= 0:
         tick_f = 0.01
     try:
-        mn = float(min_distance or 0)
+        sp = float(spread or 0.)
     except (TypeError, ValueError):
-        mn = 0.0
+        sp = 0.
+    if not math.isfinite(sp) or sp < 0:
+        sp = 0.
+    try:
+        mn = float(min_distance or 0.)
+    except (TypeError, ValueError):
+        mn = 0.
     if not math.isfinite(mn) or mn < 0:
-        mn = 0.0
-    sd = _finite(stop_distance)
-    pd = _finite(profit_distance)
-    if sd is None or sd <= 0 or pd is None or pd <= 0:
-        return {
-            'stop_distance': stop_distance, 'profit_distance': profit_distance,
-            'capped_to_ohlc': False, 'sl_cap': None, 'tp_cap': None,
-            'tp_at_ohlc_cap': False, 'sl_at_ohlc_cap': False,
-        }
+        mn = 0.
+    t = _finite(tighten)
+    if t is None or t <= 0:
+        t = 1.0
+    t = max(0.7, min(1.0, float(t)))
     ohlc_sl = _finite(z.get('range_distance'))
     if ohlc_sl is None or ohlc_sl <= 0:
         ohlc_sl = _finite(z.get('noise_distance'))
+    ohlc_kappa = _finite(z.get('kappa')) or DEFAULT_KAPPA
+    if ohlc_kappa <= 0 or not math.isfinite(ohlc_kappa):
+        ohlc_kappa = DEFAULT_KAPPA
     ohlc_tp = _finite(z.get('max_tp'))
-    sl_cap = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else None
-    tp_cap = float(ohlc_tp) if ohlc_tp is not None and ohlc_tp > 0 else None
-    capped = False
-    sl_at = False
-    tp_at = False
-    if sl_cap is not None and sd > sl_cap + 1e-12:
-        sd = sl_cap
-        capped = True
-        sl_at = True
-    if tp_cap is not None and pd > tp_cap + 1e-12:
-        pd = tp_cap
-        capped = True
-        tp_at = True
-    floor = max(mn, tick_f)
-    if sd < floor:
-        sd = floor
-    if pd < floor:
-        pd = floor
-    # Tick snap (ceil) so broker grid stays valid after a cut.
-    q = D(str(tick_f))
-    sl_ticks = int((D(str(sd)) / q).to_integral_value(rounding=ROUND_CEILING))
-    tp_ticks = int((D(str(pd)) / q).to_integral_value(rounding=ROUND_CEILING))
-    if sl_ticks < 1:
-        sl_ticks = 1
-    if tp_ticks < 1:
-        tp_ticks = 1
-    sd = float(q * sl_ticks)
-    pd = float(q * tp_ticks)
-    # Re-enforce OHLC caps after ceil snap (ceil can nudge 1 tick over).
-    if sl_cap is not None and sd > sl_cap + tick_f * 0.5:
-        sl_ticks = max(1, int((D(str(sl_cap)) / q).to_integral_value(rounding=ROUND_CEILING)))
-        # Prefer not exceeding cap: floor ticks if ceil overshoots.
-        while sl_ticks > 1 and float(q * sl_ticks) > sl_cap + 1e-12:
-            sl_ticks -= 1
-        sd = float(q * sl_ticks)
-        capped = True
-        sl_at = True
-    if tp_cap is not None and pd > tp_cap + tick_f * 0.5:
-        tp_ticks = max(1, int((D(str(tp_cap)) / q).to_integral_value(rounding=ROUND_CEILING)))
-        while tp_ticks > 1 and float(q * tp_ticks) > tp_cap + 1e-12:
-            tp_ticks -= 1
-        pd = float(q * tp_ticks)
-        capped = True
-        tp_at = True
-    if sd < floor:
-        sd = floor
-    if pd < floor:
-        pd = floor
+    buffer = max(2.0 * tick_f, 2.0 * sp)
+    floor = mn + buffer if (mn + buffer) > 0 else tick_f
+    # Core decision: SL from OHLC adverse move (or broker floor if quieter).
+    raw_sl = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else floor
+    stop_d = max(floor, raw_sl) * t
+    # TP from OHLC κ, limited by what this window actually reaches.
+    raw_tp = float(ohlc_kappa) * stop_d
+    if ohlc_tp is not None and ohlc_tp > 0:
+        profit_d = min(raw_tp, float(ohlc_tp) * t)
+    else:
+        profit_d = raw_tp
+    profit_d = max(floor, profit_d)
+    # Effective κ after reachable-span decision (for tagging / learning).
+    eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
+    # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
+    entry = 1000.0  # levels unused by callers that only need distances
+    snapped = stop_take(
+        entry, 'BUY', tick_f, sp, mn,
+        kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+        range_distance=stop_d)
     return {
-        'stop_distance': float(sd),
-        'profit_distance': float(pd),
-        'capped_to_ohlc': bool(capped),
-        'sl_cap': sl_cap,
-        'tp_cap': tp_cap,
-        'tp_at_ohlc_cap': bool(tp_at or (
-            tp_cap is not None and abs(pd - tp_cap) <= tick_f * 1.01)),
-        'sl_at_ohlc_cap': bool(sl_at or (
-            sl_cap is not None and abs(sd - sl_cap) <= tick_f * 1.01)),
+        'stop_distance': float(snapped['stop_distance']),
+        'profit_distance': float(snapped['profit_distance']),
+        'kappa': float(snapped.get('kappa') or eff_kappa),
+        'sl_scale': 1.0,
+        'ohlc_kappa': float(ohlc_kappa),
+        'ohlc_sl': float(raw_sl),
+        'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
+        'tighten': float(t),
+        'source': 'ohlc_zone',
+        'ready': bool(z.get('ready')),
+        'lookback': z.get('lookback'),
+        'median_up': z.get('median_up'),
+        'median_down': z.get('median_down'),
+        'pull_share': z.get('pull_share'),
+        'favor_share': z.get('favor_share'),
+        'stop_ticks': snapped.get('stop_ticks'),
+        'profit_ticks': snapped.get('profit_ticks'),
+        'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
     }
 
 
 def note_open_bracket_meta(store, meta: dict) -> dict:
-    """Remember whether the last OPEN was already at OHLC TP/SL ceiling."""
+    """Remember the OHLC decision used on the last OPEN (for learn feedback)."""
     clean = {
-        'capped_to_ohlc': bool((meta or {}).get('capped_to_ohlc')),
-        'tp_at_ohlc_cap': bool((meta or {}).get('tp_at_ohlc_cap')),
-        'sl_at_ohlc_cap': bool((meta or {}).get('sl_at_ohlc_cap')),
-        'sl_cap': _finite((meta or {}).get('sl_cap')),
-        'tp_cap': _finite((meta or {}).get('tp_cap')),
+        'source': str((meta or {}).get('source') or 'ohlc_zone'),
+        'ohlc_kappa': _finite((meta or {}).get('ohlc_kappa')),
+        'ohlc_sl': _finite((meta or {}).get('ohlc_sl')),
+        'ohlc_tp': _finite((meta or {}).get('ohlc_tp')),
         'stop_distance': _finite((meta or {}).get('stop_distance')),
         'profit_distance': _finite((meta or {}).get('profit_distance')),
+        'tighten': _finite((meta or {}).get('tighten')),
+        # Kept for older learn path: TP already used full reachable span.
+        'tp_at_ohlc_cap': bool(
+            (meta or {}).get('tp_at_ohlc_cap')
+            or (
+                _finite((meta or {}).get('ohlc_tp')) is not None
+                and _finite((meta or {}).get('profit_distance')) is not None
+                and abs(float(meta['profit_distance']) - float(meta['ohlc_tp']))
+                <= max(1e-9, 0.02 * float(meta['ohlc_tp']))
+            )),
+        'capped_to_ohlc': False,
     }
     if store is not None:
         store.set('bracket_last_open_meta', clean)
@@ -531,41 +530,42 @@ def note_open_bracket_meta(store, meta: dict) -> dict:
 
 def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
-                     candles=None) -> dict:
-    """Zone distances × learned raise/cut multipliers; TP still capped by reach."""
+                     candles=None, tick: float=0.01, spread: float=0.,
+                     min_distance: float=0., tighten: float=1.0) -> dict:
+    """OHLC zone decides κ / SL / TP — learned multipliers do not set width."""
     zone=zone_at_open(candles or []) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
         'range_distance':float(base_sl or 0),'max_tp':max_tp,'ready':bool(ohlc_kappa),
         'lookback':None,
     }
-    if max_tp is None:
-        max_tp=zone.get('max_tp')
-    kappa=float(zone.get('kappa') or DEFAULT_KAPPA)
     if ohlc_kappa and ohlc_kappa>0:
-        kappa=0.5*kappa+0.5*float(ohlc_kappa)
+        # Blend two OHLC κ readings (caller hint + zone) — still candle-driven.
+        zk=_finite(zone.get('kappa')) or DEFAULT_KAPPA
+        zone=dict(zone)
+        zone['kappa']=0.5*float(zk)+0.5*float(ohlc_kappa)
+    if base_sl is not None and _finite(base_sl) and float(base_sl)>0:
+        zone=dict(zone)
+        # Prefer explicit OHLC base when caller already measured range.
+        zone['range_distance']=float(base_sl)
+    if max_tp is not None:
+        zone=dict(zone);zone['max_tp']=max_tp
+    decided=decide_brackets_from_ohlc(
+        zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten)
+    save_params(store,decided['kappa'],1.0,
+                reason=(f"ohlc_zone κ={decided.get('ohlc_kappa')} "
+                        f"sl={decided.get('ohlc_sl')} tp={decided.get('ohlc_tp')}"))
     learned=load_multipliers(store)
-    kappa*=learned['kappa']
-    sl_scale=max(1.0,float(learned['sl_scale']))
-    base=float(base_sl or zone.get('range_distance') or 0)
-    # Learned sl_mult cannot invent SL wider than OHLC adverse range.
-    ohlc_sl=_finite(zone.get('range_distance'))
-    if ohlc_sl is not None and ohlc_sl>0 and base>0:
-        sl_scale=min(float(sl_scale),max(1.0,float(ohlc_sl)/base))
-    if base>0 and max_tp and max_tp>0:
-        room=max_tp/(base*sl_scale)
-        if kappa>room:
-            kappa=max(0.5,room)
-    save_params(store,kappa,sl_scale,
-                reason=(f"ohlc×learn k_mult={learned['kappa']:.3f} "
-                        f"sl_mult={learned['sl_scale']:.3f}"))
     return {
-        'kappa':float(kappa),'sl_scale':float(sl_scale),'explored':False,
-        'max_tp':max_tp,'base_sl':base_sl or zone.get('range_distance'),
-        'ohlc_kappa':ohlc_kappa,'zone_ready':bool(zone.get('ready')),
+        'kappa':float(decided['kappa']),'sl_scale':1.0,'explored':False,
+        'max_tp':decided.get('ohlc_tp'),'base_sl':decided.get('ohlc_sl'),
+        'ohlc_kappa':decided.get('ohlc_kappa'),
+        'zone_ready':bool(zone.get('ready')),
         'median_up':zone.get('median_up'),'median_down':zone.get('median_down'),
         'kappa_mult':learned['kappa'],'sl_mult':learned['sl_scale'],
         'lookback':zone.get('lookback'),
-        'ohlc_sl_cap':float(ohlc_sl) if ohlc_sl is not None else None,
+        'stop_distance':decided['stop_distance'],
+        'profit_distance':decided['profit_distance'],
+        'bracket_source':'ohlc_zone',
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.bracket_learn import (
-    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,clamp_open_brackets,
+    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,decide_brackets_from_ohlc,
     evolve_from_history,load_multipliers,load_params,note_open_bracket_meta,
     propose_for_open,recent_reachable_move,record_outcome,save_multipliers,
     save_params,zone_at_open,
@@ -227,65 +227,49 @@ def test_save_and_load_reject_invalid():
         assert restored['sl_scale']==DEFAULT_SL_SCALE
 
 
-def test_clamp_open_brackets_cuts_fantasy_tp_and_sl_to_ohlc():
-    zone={'range_distance':1.0,'max_tp':1.5,'noise_distance':0.8}
-    # Multipliers invented 3.0 SL / 4.0 TP — must snap to OHLC rails.
-    out=clamp_open_brackets(
-        stop_distance=3.0,profit_distance=4.0,zone=zone,tick=0.01,min_distance=0.2)
-    assert out['capped_to_ohlc'] is True
-    assert out['stop_distance']<=1.0+1e-9
-    assert out['profit_distance']<=1.5+1e-9
-    assert out['tp_at_ohlc_cap'] is True
+def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
+    zone={'kappa':1.5,'range_distance':1.0,'max_tp':1.2,'noise_distance':0.8,
+          'ready':True,'lookback':20,'median_up':1.5,'median_down':1.0}
+    out=decide_brackets_from_ohlc(zone,tick=0.01,spread=0.05,min_distance=0.2)
+    assert out['source']=='ohlc_zone'
+    assert out['sl_scale']==1.0
+    assert out['stop_distance']==pytest.approx(1.0,abs=0.02)
+    # TP follows OHLC κ×SL but not beyond reachable max_tp.
+    assert out['profit_distance']<=1.2+1e-9
+    assert out['ohlc_kappa']==pytest.approx(1.5)
 
 
-def test_win_at_ohlc_cap_does_not_raise_kappa():
+def test_ohlc_decision_ignores_inflated_learned_multipliers_on_open():
+    """Even if Store mults are huge, OPEN width still comes from OHLC zone."""
+    with sandbox() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save_multipliers(store,2.5,2.5,reason='inflated')
+        zone={'kappa':1.2,'range_distance':1.0,'max_tp':1.5,'ready':True}
+        pkg=unified_cycle.compose_open(
+            action='BUY',
+            scores={'BUY':0.55,'SELL':0.25,'HOLD':0.20},
+            evaluation={'action':'BUY','score_edge':0.30},
+            zone=zone,learned=load_multipliers(store),
+            cycle_state=unified_cycle.default_state(),
+            base_sl=1.0,max_tp=1.5)
+        assert pkg['bracket_source']=='ohlc_zone'
+        assert pkg['sl_scale']==1.0
+        assert pkg['kappa']==pytest.approx(1.2) or pkg['kappa']<=1.5+1e-9
+        decided=decide_brackets_from_ohlc(
+            zone,tick=0.01,spread=0.05,min_distance=0.2,
+            tighten=float(pkg.get('tighten') or 1.0))
+        assert decided['stop_distance']<=1.0+0.02
+        assert decided['profit_distance']<=1.5+1e-9
+
+
+def test_win_at_full_ohlc_tp_does_not_raise_unused_mult_for_width():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         note_open_bracket_meta(store,{
-            'capped_to_ohlc':True,'tp_at_ohlc_cap':True,
-            'stop_distance':1.0,'profit_distance':1.5})
+            'source':'ohlc_zone','tp_at_ohlc_cap':True,
+            'ohlc_tp':1.5,'profit_distance':1.5,'stop_distance':1.0})
         before=load_multipliers(store)['kappa']
         out=adapt_after_outcome(
-            store,kappa=2.0,sl_scale=1.0,pnl=0.80,exit_reason='tp')
+            store,kappa=1.2,sl_scale=1.0,pnl=0.80,exit_reason='tp')
         assert out['reason']=='tp_at_ohlc_cap_hold'
         assert load_multipliers(store)['kappa']==pytest.approx(before)
-
-
-def test_win_streak_cannot_inflate_past_ohlc_room():
-    """Fixed OHLC zone: win×N must not grow TP beyond max_tp."""
-    with sandbox() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        base_sl=1.0
-        zone={'kappa':1.2,'range_distance':base_sl,'max_tp':1.5,'noise_distance':1.0}
-        tick,spread,minimum=0.01,0.05,0.2
-        entry=3900.0
-        tps=[]
-        for i in range(10):
-            learned=load_multipliers(store)
-            cycle=unified_cycle.load_state(store)
-            pkg=unified_cycle.compose_open(
-                action='BUY',
-                scores={'BUY':0.55,'SELL':0.25,'HOLD':0.20},
-                evaluation={'action':'BUY','score_edge':0.30},
-                zone=zone,learned=learned,cycle_state=cycle,
-                base_sl=base_sl,max_tp=1.5)
-            br=stop_take(entry,'BUY',tick,spread,minimum,
-                         kappa=pkg['kappa'],sl_scale=pkg['sl_scale'],
-                         range_distance=base_sl)
-            fitted=clamp_open_brackets(
-                stop_distance=br['stop_distance'],
-                profit_distance=br['profit_distance'],
-                zone=zone,tick=tick,min_distance=minimum)
-            note_open_bracket_meta(store,fitted)
-            tps.append(fitted['profit_distance'])
-            assert fitted['stop_distance']<=base_sl+1e-9
-            assert fitted['profit_distance']<=1.5+1e-9
-            record_outcome(
-                store,kappa=pkg['kappa'],sl_scale=pkg['sl_scale'],
-                pnl=1.0,currency='GBP',deal_id=f'w{i}',exit_reason='tp',
-                direction='BUY',entry=entry,
-                exit_level=entry+fitted['profit_distance'],
-                stop_distance=fitted['stop_distance'])
-            unified_cycle.settle(store,pnl=1.0,action='BUY',exit_reason='tp')
-        assert max(tps)<=1.5+1e-9
-        assert tps[-1]<=1.5+1e-9

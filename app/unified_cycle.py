@@ -296,42 +296,38 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'aggression': aggression,
             'min_margin': need,
         }
-    learned = learned if isinstance(learned, dict) else {}
+    # SL/TP width is an OHLC decision (zone κ / range / max_tp) — not learned
+    # multipliers. Aggression may only *tighten* after losses (≤1).
+    del learned  # width ignores raise/cut mults; keep arg for call-site compat
     kappa = _finite(zone.get('kappa')) or 1.0
-    # Blend zone κ with learned multiplier. Aggression may *tighten* after losses
-    # (agg<1) but must not invent wider SL/TP than OHLC on a win streak (agg>1).
-    k_mult = _finite(learned.get('kappa')) or 1.0
-    s_mult = max(1.0, _finite(learned.get('sl_scale')) or 1.0)
-    width_agg = min(1.0, float(aggression))
-    kappa = float(kappa) * float(k_mult) * float(width_agg)
-    # Edge may mildly tighten when weak; never inflate SL past OHLC via edge_scale>1.
-    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
-    sl_scale = max(1.0, float(s_mult) * float(width_agg) * float(edge_scale))
-    # Learned sl_mult cannot push SL past the OHLC adverse range when base is that range.
+    if kappa <= 0:
+        kappa = 1.0
     ohlc_sl = _finite(zone.get('range_distance'))
     tp = tp_hint
     base = float(base_hint)
-    if ohlc_sl is not None and ohlc_sl > 0 and base > 0:
-        # Cap so base * sl_scale ≤ OHLC range (no fantasy SL wider than candles).
-        sl_scale = min(float(sl_scale), max(1.0, float(ohlc_sl) / base))
+    tighten = min(1.0, float(aggression))
+    # Weak edge → slightly tighter fraction of the *same* OHLC plan.
+    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
+    tighten = min(tighten, float(edge_scale))
     if base > 0 and tp is not None and tp > 0:
-        room = float(tp) / (base * sl_scale)
+        room = float(tp) / base
         if kappa > room:
             kappa = max(0.5, room)
     return {
         'action': act if act in ('BUY', 'SELL') else decision['action'],
         'kappa': float(kappa),
-        'sl_scale': float(sl_scale),
+        'sl_scale': 1.0,
         'base_sl': base,
         'max_tp': float(tp) if tp is not None else None,
         'blocked': False,
-        'reason': 'Unified cycle OPEN',
+        'reason': 'Unified cycle OPEN (OHLC zone decides SL/TP)',
         'decision': decision,
         'aggression': aggression,
         'min_margin': need,
         'edge_scale': float(edge_scale),
-        'width_agg': float(width_agg),
-        'ohlc_sl_cap': float(ohlc_sl) if ohlc_sl is not None else None,
+        'tighten': float(tighten),
+        'ohlc_sl': float(ohlc_sl) if ohlc_sl is not None else None,
+        'bracket_source': 'ohlc_zone',
     }
 
 

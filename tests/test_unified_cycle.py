@@ -55,9 +55,9 @@ def test_edge_allows_open_when_margin_clear():
     assert gate['action'] == 'BUY'
 
 
-def test_compose_open_damps_with_aggression():
+def test_compose_open_uses_ohlc_kappa_and_loss_tighten_only():
     zone = {'kappa': 2.0, 'range_distance': 1.0, 'max_tp': 4.0}
-    learned = {'kappa': 1.0, 'sl_scale': 1.5}
+    learned = {'kappa': 2.5, 'sl_scale': 2.5}  # inflated — must NOT set width
     state = uc.default_state()
     state['aggression'] = 0.80
     scores = {'BUY': 0.60, 'SELL': 0.20, 'HOLD': 0.20}
@@ -66,11 +66,12 @@ def test_compose_open_damps_with_aggression():
         zone=zone, learned=learned, cycle_state=state, base_sl=1.0)
     assert pkg['blocked'] is False
     assert pkg['action'] == 'BUY'
-    # κ = zone × learned × aggression = 2 × 1 × 0.8
-    assert pkg['kappa'] == pytest.approx(1.6)
-    # sl_scale = max(1, 1.5 × 0.8 × edge_scale) with edge_scale in [0.85, 1.10]
-    assert pkg['sl_scale'] >= 1.0
-    assert pkg['sl_scale'] < 1.5 * 1.0 * 1.10  # damped vs full learned
+    assert pkg['bracket_source'] == 'ohlc_zone'
+    # Width from OHLC zone κ — learned mult ignored.
+    assert pkg['kappa'] == pytest.approx(2.0)
+    assert pkg['sl_scale'] == pytest.approx(1.0)
+    # Loss cool-down only tightens the OHLC plan (≤ aggression).
+    assert pkg['tighten'] == pytest.approx(0.80)
 
 
 def test_compose_open_hold_when_edge_too_weak():

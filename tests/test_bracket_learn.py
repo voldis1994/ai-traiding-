@@ -264,12 +264,44 @@ def test_zone_at_open_uses_multi_timeframe_consensus():
     assert z['multi_tf'] is True
     assert set(z['horizons_minutes']) >= {1, 5, 15}
     assert '1' in z['timeframes'] and '5' in z['timeframes']
-    # Consensus SL/TP come from combining TFs — not identical to M1 alone.
-    m1_only = zone_at_open(rows, multi_tf=False)
     assert z['range_distance'] > 0 and z['max_tp'] is not None
-    assert z['max_tp'] <= max(
-        float(t['max_tp']) for t in z['timeframes'].values()
-        if t.get('max_tp')) + 1e-9
+    # Coherent pair: consensus TP is not crushed vs SL (old bug: H1 SL + M1 TP
+    # → κ≈0.5 like live 25.05 / 12.53). Effective κ should stay near zone κ.
+    assert z['kappa'] >= 0.75
+    decided = decide_brackets_from_ohlc(z, tick=0.01, spread=0.05, min_distance=0.2)
+    if decided['stop_distance'] > 0:
+        rr = decided['profit_distance'] / decided['stop_distance']
+        assert rr >= 0.75
+
+
+def test_multi_tf_does_not_mix_wide_sl_with_tiny_tp():
+    """Regression: live Gold showed SL~25 / TP~12.5 — broken TF mix."""
+    # Quiet M1 noise + larger packed swings so higher TFs propose wider SL.
+    start = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 3950.0
+    for i in range(120):
+        # Mostly tiny M1 ranges; every 15th bar a bigger impulse.
+        impulse = 8.0 if i % 15 == 0 else 0.15
+        o = px
+        px = px + (0.05 if i % 2 == 0 else -0.04)
+        rows.append({
+            'at': (start + timedelta(minutes=i)).isoformat(),
+            'open': o,
+            'high': max(o, px) + impulse,
+            'low': min(o, px) - impulse * 0.4,
+            'close': px, 'spread': 0.5,
+        })
+    z = zone_at_open(rows, multi_tf=True)
+    assert z['multi_tf'] is True
+    decided = decide_brackets_from_ohlc(
+        z, tick=0.01, spread=0.5, min_distance=0.3)
+    sl = decided['stop_distance']
+    tp = decided['profit_distance']
+    assert sl > 0 and tp > 0
+    # Must not reproduce the live asymmetry (TP ≈ 0.5 × SL).
+    assert tp / sl >= 0.75
+    assert abs(decided['kappa'] - (tp / sl)) < 0.15 or tp <= (z['max_tp'] or tp) + 1e-6
 
 
 def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():

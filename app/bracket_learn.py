@@ -503,11 +503,23 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
             'kappa', 'range_distance', 'max_tp', 'ready', 'lookback')}}
         out['multi_tf'] = False
         return out
+    if len(ready) == 1:
+        # One TF only — keep its native κ/SL/TP (no self-cap via pair median).
+        only = dict(ready[0])
+        only['multi_tf'] = False
+        only['horizons_minutes'] = [int(only.get('tf_minutes') or 1)]
+        only['timeframes'] = {
+            str(m): {
+                'kappa': z.get('kappa'),
+                'range_distance': z.get('range_distance'),
+                'max_tp': z.get('max_tp'),
+                'ready': z.get('ready'),
+                'lookback': z.get('lookback'),
+                'tf_bars': z.get('tf_bars'),
+            } for m, z in per.items()
+        }
+        return only
 
-    ranges = [float(z['range_distance']) for z in ready]
-    kappas = [float(z['kappa']) for z in ready]
-    tps = [float(z['max_tp']) for z in ready
-           if _finite(z.get('max_tp')) and float(z['max_tp']) > 0]
     noises = [float(z['noise_distance']) for z in ready
               if _finite(z.get('noise_distance')) and float(z['noise_distance']) > 0]
     pulls = [float(z['pull_share']) for z in ready if _finite(z.get('pull_share'))]
@@ -522,11 +534,44 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
             structure = float(z['structure'])
             break
 
-    # Consensus across TFs: median SL/κ; TP reach = tightest ready TF
-    # (whole picture must agree the target is reachable on every horizon).
-    sl = float(median(ranges))
-    kappa = float(median(kappas))
-    max_tp = float(min(tps)) if tps else None
+    # Each TF proposes a *coherent* (SL, TP) pair from its own OHLC. Consensus
+    # is the median of those pairs — never mix H1-wide SL with M1-tiny TP
+    # (that looked like "not using OHLC": SL 25 / TP 12.5 with κ≈0.5).
+    pair_sl = []
+    pair_tp = []
+    pair_kappa = []
+    for z in ready:
+        sl_i = float(z['range_distance'])
+        if sl_i <= 0:
+            continue
+        k_i = float(z.get('kappa') or DEFAULT_KAPPA)
+        if k_i <= 0 or not math.isfinite(k_i):
+            k_i = DEFAULT_KAPPA
+        raw_tp = k_i * sl_i
+        tp_cap = _finite(z.get('max_tp'))
+        tp_i = min(raw_tp, float(tp_cap)) if tp_cap is not None and float(tp_cap) > 0 else raw_tp
+        if tp_i <= 0:
+            continue
+        pair_sl.append(sl_i)
+        pair_tp.append(float(tp_i))
+        pair_kappa.append(float(tp_i) / sl_i)
+        z['proposed_sl'] = sl_i
+        z['proposed_tp'] = float(tp_i)
+
+    if not pair_sl:
+        out = _zone_single_tf(rows, n=n, reach_n=reach_n)
+        out['horizons_minutes'] = [1]
+        out['multi_tf'] = False
+        return out
+
+    sl = float(median(pair_sl))
+    max_tp = float(median(pair_tp))
+    kappa = float(median(pair_kappa))
+    if kappa <= 0 or not math.isfinite(kappa):
+        kappa = DEFAULT_KAPPA
+    # Keep reachable bound consistent with the consensus TP plan.
+    if sl > 0 and max_tp > 0 and kappa * sl > max_tp * 1.0001:
+        kappa = max(0.5, max_tp / sl)
     noise = float(median(noises)) if noises else sl
     pull = float(median(pulls)) if pulls else None
     favor = float(median(favors)) if favors else None
@@ -552,6 +597,8 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
                 'kappa': z.get('kappa'),
                 'range_distance': z.get('range_distance'),
                 'max_tp': z.get('max_tp'),
+                'proposed_sl': z.get('proposed_sl'),
+                'proposed_tp': z.get('proposed_tp'),
                 'ready': z.get('ready'),
                 'lookback': z.get('lookback'),
                 'tf_bars': z.get('tf_bars'),

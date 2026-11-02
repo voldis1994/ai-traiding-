@@ -77,6 +77,7 @@ def load_state(store, epic):
     out.update({k: raw[k] for k in out if k in raw})
     out['ready'] = bool(raw.get('ready'))
     out['stage'] = str(raw.get('stage') or 'idle')
+    out['cold_start_open'] = bool(raw.get('cold_start_open'))
     out['data_load_separate_from_train'] = True
     out['chronological_split'] = True
     out['future_leak'] = False

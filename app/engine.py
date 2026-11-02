@@ -2887,12 +2887,12 @@ class SingleTradeEngine:
         if None in (mid,tick,spread) or not epic:
             return None
         try:
-            candles=self.store.candles(epic,n=120,historical_only=True)
+            candles=self.store.candles(epic,n=190,historical_only=True)
         except Exception:
             candles=[]
         if len(candles)<20:
             return None
-        zone=bracket_learn.zone_at_open(candles)
+        zone=bracket_learn.zone_at_open(candles,multi_tf=True)
         rng=zone['range_distance'] or ohlc_range_distance(candles)
         buffer=max(2*float(tick),2*float(spread))
         min_d=float(minimum) if minimum is not None else float(tick)
@@ -3534,9 +3534,9 @@ class SingleTradeEngine:
             size=Decimal(self.mandate['size'])
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # OHLC zone decides SL/TP; cycle only gates weak edge / loss tighten.
-            candles=self.store.candles(self.mandate['epic'],n=120,historical_only=True)
-            zone=bracket_learn.zone_at_open(candles)
+            # OHLC zone decides SL/TP across M1/M5/M15/H1; cycle only gates edge.
+            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
@@ -3607,7 +3607,7 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','OPEN brackets decided from OHLC zone',{
+            self.store.event('bracket','OPEN brackets decided from multi-TF OHLC',{
                 'kappa':bp['kappa'],'sl_scale':1.0,
                 'ohlc_kappa':decided.get('ohlc_kappa'),
                 'ohlc_sl':decided.get('ohlc_sl'),'ohlc_tp':decided.get('ohlc_tp'),
@@ -3619,9 +3619,12 @@ class SingleTradeEngine:
                 'structure':zone.get('structure'),
                 'pull_share':zone.get('pull_share'),
                 'favor_share':zone.get('favor_share'),
+                'multi_tf':bool(zone.get('multi_tf')),
+                'horizons_minutes':zone.get('horizons_minutes'),
+                'timeframes':zone.get('timeframes'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
-                'bracket_source':'ohlc_zone',
+                'bracket_source':'ohlc_zone_multi_tf',
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,

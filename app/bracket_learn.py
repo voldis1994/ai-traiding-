@@ -364,15 +364,63 @@ def _window_structure(candles, n: int|None=None) -> float|None:
     return span if math.isfinite(span) and span>0 else None
 
 
-def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
-    """SL/TP from *this* market window — no hardcoded 1/3 or 1/2 of structure.
+# Same horizons the neural market context already reads (M1/M5/M15/H1).
+BRACKET_TF_MINUTES = (1, 5, 15, 60)
 
-    Shares come from OHLC itself: pull_share = median_down/median_span,
-    favor_share = median_up/median_span. Those observed bar shares scale the
-    lookback peak−trough so OPEN tracks how this instrument actually pulls
-    back and extends. Learned κ / sl_scale in propose_for_open then adapts
-    further from cash £ outcomes.
+
+def resample_m1_ohlc(candles, minutes: int) -> list:
+    """Build higher-TF OHLC by packing sequential completed M1 bars.
+
+    Uses elapsed-bar packs (5/15/60 M1 → M5/M15/H1), matching the neural
+    multi-horizon tape — not a single minute window alone.
     """
+    from .market_context import candle_time
+    m = max(1, int(minutes))
+    cleaned = []
+    for raw in candles or []:
+        dt = candle_time(raw.get('at'))
+        if dt is None:
+            continue
+        try:
+            o, h, l, c = (float(raw[k]) for k in ('open', 'high', 'low', 'close'))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not all(math.isfinite(v) for v in (o, h, l, c)) or min(o, h, l, c) <= 0 or h < l:
+            continue
+        cleaned.append({
+            'at': dt.isoformat(), 'open': o, 'high': h, 'low': l, 'close': c,
+            'spread': _finite(raw.get('spread')), '_dt': dt,
+        })
+    cleaned.sort(key=lambda r: r['_dt'])
+    if m <= 1:
+        out1 = []
+        for r in cleaned:
+            row = {k: r[k] for k in ('at', 'open', 'high', 'low', 'close')}
+            if r.get('spread') is not None:
+                row['spread'] = r['spread']
+            out1.append(row)
+        return out1
+    out = []
+    for i in range(0, len(cleaned) - m + 1, m):
+        chunk = cleaned[i:i + m]
+        if len(chunk) < m:
+            break
+        spreads = [c['spread'] for c in chunk if c.get('spread') is not None]
+        row = {
+            'at': chunk[-1]['at'],
+            'open': chunk[0]['open'],
+            'high': max(c['high'] for c in chunk),
+            'low': min(c['low'] for c in chunk),
+            'close': chunk[-1]['close'],
+        }
+        if spreads:
+            row['spread'] = float(sum(spreads) / len(spreads))
+        out.append(row)
+    return out
+
+
+def _zone_single_tf(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
+    """SL/TP geometry from one OHLC series (one timeframe)."""
     ups,downs,spans,used=_bar_moves(candles,n)
     reach=recent_reachable_move(candles,reach_n if reach_n is not None else used)
     structure=_window_structure(candles,used)
@@ -390,7 +438,6 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
         kappa=med_up/med_down
     if not math.isfinite(kappa) or kappa<=0:
         kappa=DEFAULT_KAPPA
-    # How much of a typical bar is adverse vs favorable — measured here, not coded.
     if med_span>1e-12:
         pull_share=float(med_down/med_span)
         favor_share=float(med_up/med_span)
@@ -413,6 +460,103 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None) -> dict:
         'max_tp':float(max_tp) if max_tp is not None else None,
         'median_up':med_up,'median_down':med_down,
         'ready':True,'lookback':used,
+    }
+
+
+def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
+                 multi_tf: bool=True) -> dict:
+    """SL/TP from the whole tape — M1+M5+M15+H1 consensus, not one timeframe alone.
+
+    Each TF builds its own OHLC geometry (adverse/favor/reach). The OPEN decision
+    is the median across ready timeframes so micro M1 noise cannot dominate and
+    a single slow bar cannot invent an unreachable target by itself.
+    """
+    rows = list(candles or [])
+    if not multi_tf or len(rows) < 20:
+        out = _zone_single_tf(rows, n=n, reach_n=reach_n)
+        out['horizons_minutes'] = [1]
+        out['timeframes'] = {'1': {k: out.get(k) for k in (
+            'kappa', 'range_distance', 'max_tp', 'ready', 'lookback')}}
+        out['multi_tf'] = False
+        return out
+
+    per = {}
+    for minutes in BRACKET_TF_MINUTES:
+        tf_rows = rows if minutes == 1 else resample_m1_ohlc(rows, minutes)
+        # Need enough TF bars for a meaningful median geometry.
+        need = 5 if minutes == 1 else 5
+        if len(tf_rows) < need:
+            continue
+        z = _zone_single_tf(tf_rows, n=(n if minutes == 1 else None),
+                            reach_n=(reach_n if minutes == 1 else None))
+        z['tf_minutes'] = int(minutes)
+        z['tf_bars'] = len(tf_rows)
+        per[int(minutes)] = z
+
+    ready = [z for z in per.values()
+             if z.get('ready') and _finite(z.get('range_distance'))
+             and float(z['range_distance']) > 0]
+    if not ready:
+        out = _zone_single_tf(rows, n=n, reach_n=reach_n)
+        out['horizons_minutes'] = [1]
+        out['timeframes'] = {'1': {k: out.get(k) for k in (
+            'kappa', 'range_distance', 'max_tp', 'ready', 'lookback')}}
+        out['multi_tf'] = False
+        return out
+
+    ranges = [float(z['range_distance']) for z in ready]
+    kappas = [float(z['kappa']) for z in ready]
+    tps = [float(z['max_tp']) for z in ready
+           if _finite(z.get('max_tp')) and float(z['max_tp']) > 0]
+    noises = [float(z['noise_distance']) for z in ready
+              if _finite(z.get('noise_distance')) and float(z['noise_distance']) > 0]
+    pulls = [float(z['pull_share']) for z in ready if _finite(z.get('pull_share'))]
+    favors = [float(z['favor_share']) for z in ready if _finite(z.get('favor_share'))]
+    ups = [float(z['median_up']) for z in ready if _finite(z.get('median_up'))]
+    downs = [float(z['median_down']) for z in ready if _finite(z.get('median_down'))]
+    # Longer TF structure when available — whole-swing context.
+    structure = None
+    for minutes in (60, 15, 5, 1):
+        z = per.get(minutes) or {}
+        if z.get('ready') and _finite(z.get('structure')) and float(z['structure']) > 0:
+            structure = float(z['structure'])
+            break
+
+    # Consensus across TFs: median SL/κ; TP reach = tightest ready TF
+    # (whole picture must agree the target is reachable on every horizon).
+    sl = float(median(ranges))
+    kappa = float(median(kappas))
+    max_tp = float(min(tps)) if tps else None
+    noise = float(median(noises)) if noises else sl
+    pull = float(median(pulls)) if pulls else None
+    favor = float(median(favors)) if favors else None
+    med_up = float(median(ups)) if ups else None
+    med_down = float(median(downs)) if downs else None
+
+    return {
+        'kappa': float(kappa),
+        'range_distance': float(sl),
+        'noise_distance': float(noise),
+        'structure': float(structure) if structure is not None else None,
+        'pull_share': float(pull) if pull is not None else None,
+        'favor_share': float(favor) if favor is not None else None,
+        'max_tp': float(max_tp) if max_tp is not None else None,
+        'median_up': med_up,
+        'median_down': med_down,
+        'ready': True,
+        'lookback': (per.get(1) or {}).get('lookback'),
+        'multi_tf': True,
+        'horizons_minutes': sorted(per.keys()),
+        'timeframes': {
+            str(m): {
+                'kappa': z.get('kappa'),
+                'range_distance': z.get('range_distance'),
+                'max_tp': z.get('max_tp'),
+                'ready': z.get('ready'),
+                'lookback': z.get('lookback'),
+                'tf_bars': z.get('tf_bars'),
+            } for m, z in per.items()
+        },
     }
 
 

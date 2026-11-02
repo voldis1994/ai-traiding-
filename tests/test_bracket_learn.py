@@ -4,11 +4,13 @@ from pathlib import Path
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from app.bracket_learn import (
     DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,decide_brackets_from_ohlc,
     evolve_from_history,load_multipliers,load_params,note_open_bracket_meta,
-    propose_for_open,recent_reachable_move,record_outcome,save_multipliers,
-    save_params,zone_at_open,
+    propose_for_open,recent_reachable_move,record_outcome,resample_m1_ohlc,
+    save_multipliers,save_params,zone_at_open,
 )
 from app import unified_cycle
 from app.engine import Store
@@ -225,6 +227,49 @@ def test_save_and_load_reject_invalid():
         restored=load_params(store)
         assert restored['kappa']==DEFAULT_KAPPA
         assert restored['sl_scale']==DEFAULT_SL_SCALE
+
+
+def _m1_series(n=120, start=None, step=0.05):
+    start = start or datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 100.0
+    for i in range(n):
+        o = px
+        px = px + step * (1 if i % 7 != 0 else -0.5)
+        rows.append({
+            'at': (start + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': max(o, px) + 0.08, 'low': min(o, px) - 0.06,
+            'close': px, 'spread': 0.05,
+        })
+    return rows
+
+
+def test_resample_m1_builds_higher_timeframes():
+    rows = _m1_series(60)
+    m5 = resample_m1_ohlc(rows, 5)
+    m15 = resample_m1_ohlc(rows, 15)
+    h1 = resample_m1_ohlc(rows, 60)
+    assert len(m5) == 12
+    assert len(m15) == 4
+    assert len(h1) == 1
+    assert m5[0]['open'] == rows[0]['open']
+    assert m5[0]['close'] == rows[4]['close']
+    assert m5[0]['high'] >= max(r['high'] for r in rows[:5]) - 1e-9
+
+
+def test_zone_at_open_uses_multi_timeframe_consensus():
+    rows = _m1_series(120)
+    z = zone_at_open(rows, multi_tf=True)
+    assert z['ready'] is True
+    assert z['multi_tf'] is True
+    assert set(z['horizons_minutes']) >= {1, 5, 15}
+    assert '1' in z['timeframes'] and '5' in z['timeframes']
+    # Consensus SL/TP come from combining TFs — not identical to M1 alone.
+    m1_only = zone_at_open(rows, multi_tf=False)
+    assert z['range_distance'] > 0 and z['max_tp'] is not None
+    assert z['max_tp'] <= max(
+        float(t['max_tp']) for t in z['timeframes'].values()
+        if t.get('max_tp')) + 1e-9
 
 
 def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():

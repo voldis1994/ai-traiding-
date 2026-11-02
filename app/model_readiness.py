@@ -427,6 +427,44 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
     return state
 
 
+def grant_cold_start_open(store, brain, *, reason=None) -> dict:
+    """Unblock LIVE OPEN after first manual close when cold prep holdout trapped us.
+
+    Zero-start flow: operator opens one manual trade → it closes → robot must be
+    allowed to OPEN. A failed chronological holdout must not freeze the session
+    forever while online minute labels are still near zero.
+    """
+    epic = getattr(brain, 'epic', None)
+    if not epic:
+        return _empty(None, reason='No instrument for cold-start open grant')
+    state = load_state(store, epic)
+    if state.get('ready'):
+        return state
+    fl = floors(store)
+    labeled = int(getattr(brain, 'labeled', 0) or 0)
+    online_need = int(fl['min_online_labeled'])
+    # If warm path already has enough labels, let trading_readiness promote —
+    # do not override a real holdout failure on a warm brain.
+    if labeled >= online_need:
+        return trading_readiness(store, brain)
+    msg = (reason or
+           'Cold-start OPEN after first manual close — live £ teaches; '
+           'prep holdout no longer hard-blocks this session')
+    state = dict(state)
+    state.update({
+        'ready': True,
+        'stage': 'ready',
+        'cold_start_open': True,
+        'reason': msg,
+    })
+    save_state(store, epic, state)
+    if store is not None:
+        store.event('learning', 'Cold-start prep release — LIVE OPEN permitted',
+                    {'epic': epic, 'online_labeled': labeled,
+                     'online_need': online_need, 'reason': msg})
+    return state
+
+
 def ensure_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0):
     """Idempotent: return current readiness or run prep when needed."""
     status = trading_readiness(store, brain)
@@ -434,12 +472,15 @@ def ensure_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0
         return status
     if not candles or not getattr(brain, 'epic', None):
         return status
-    # Avoid retraining every poll after a failed holdout; retry only when
-    # substantially more chronological history arrives.
+    # Avoid retraining every poll after a failed holdout; retry when a handful
+    # more bars arrive (was +32 — left zero-start sessions stuck too long).
     if status.get('stage') == 'blocked':
+        # Operator already granted cold-start OPEN for this epic — keep it.
+        if status.get('cold_start_open'):
+            return grant_cold_start_open(store, brain, reason=status.get('reason'))
         rows = _sorted_candles(candles)
         prev = int(status.get('candles_loaded') or 0)
-        if len(rows) < prev + 32:
+        if len(rows) < prev + 8:
             return status
     return run_prep_eval(store, brain, candles, tick_size=tick_size,
                          spread_fallback=spread_fallback)

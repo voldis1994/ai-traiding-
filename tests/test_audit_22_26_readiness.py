@@ -123,6 +123,39 @@ def test_live_open_gates_and_submit_helper():
         assert gates2['readiness']['ready'] is True
 
 
+def test_cold_start_first_manual_close_releases_prep_block():
+    """Zero-start + first manual close must not leave LIVE OPEN stuck on holdout fail."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        brain = AdaptiveBrain(store, data_dir=d)
+        engine = SingleTradeEngine(store, brain)
+        brain._activate('GOLD')
+        # Simulate failed prep holdout (same trap as Admin: blocked + not ready).
+        mr.save_state(store, 'GOLD', {
+            **mr._empty('GOLD', reason='Prep/eval holdout failed: samples=22/24'),
+            'stage': 'blocked', 'ready': False,
+            'candles_loaded': 100, 'eval_samples': 22,
+            'minute_direction_accuracy': 0.36,
+            'holdout_net_bps_mean': -0.63,
+        })
+        assert brain.trading_readiness()['ready'] is False
+        engine.mandate = {
+            'epic': 'GOLD', 'size': '0.02',
+            'initial_deal_id': 'm1', 'last_manual_deal_id': 'm1',
+        }
+        engine.last_closed_step = 10  # first manual already closed
+        engine.positions = []
+        released = engine._maybe_release_cold_start_prep()
+        assert released and released['ready'] is True
+        assert released.get('cold_start_open') is True
+        assert brain.trading_readiness()['ready'] is True
+        gates = engine.live_open_gates('BUY')
+        assert gates['allowed'] is True
+        # Flat re-arm path also grants (idempotent).
+        engine._release_execution_after_flat('m1')
+        assert brain.trading_readiness()['ready'] is True
+
+
 def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')

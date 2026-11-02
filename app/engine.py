@@ -1543,6 +1543,12 @@ class SingleTradeEngine:
             self.store.event('reconcile',
                 'Re-armed after broker flat (auto-pause removed)',
                 {'deal_id':deal,'cleared':cleared})
+        # Flat + mandate close: unlock LIVE OPEN if cold prep holdout trapped us.
+        try:
+            self._maybe_release_cold_start_prep()
+        except Exception as exc:
+            self.store.event('warning','Cold-start prep release skipped',
+                             {'type':type(exc).__name__,'deal_id':deal})
         return cleared
 
     async def _position_still_open(self,deal_id):
@@ -2058,6 +2064,9 @@ class SingleTradeEngine:
             if (not self.positions and self.market_context.get('ready') and
                 hasattr(self.brain,'ensure_prep_eval')):
                 try:
+                    # Already flat after first manual close but prep still blocked?
+                    # Unlock cold-start OPEN on poll — do not wait for another trade.
+                    self._maybe_release_cold_start_prep()
                     rd=self.brain.trading_readiness()
                     if not rd.get('ready'):
                         self.brain.ensure_prep_eval(
@@ -2155,6 +2164,25 @@ class SingleTradeEngine:
         on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                    and getattr(self.brain,'fusion_schema',None) is not None)
         return bool(on_fusion and not self.latest_fusion_ready)
+
+    def _maybe_release_cold_start_prep(self):
+        """After first mandate close, do not leave LIVE OPEN trapped on failed holdout.
+
+        Zero-start: manual open → close authorizes size; prep/eval holdout often
+        fails on choppy GOLD and used to block every later robot OPEN forever.
+        """
+        if not self.mandate or self.last_closed_step<0:
+            return None
+        if not hasattr(self.brain,'trading_readiness'):
+            return None
+        rd=self.brain.trading_readiness()
+        if rd.get('ready'):
+            return rd
+        from . import model_readiness
+        return model_readiness.grant_cold_start_open(
+            self.store,self.brain,
+            reason=('Cold-start OPEN after first manual close — '
+                    'prep holdout was blocking new entries'))
 
     def live_open_gates(self,action=None):
         """Shared LIVE OPEN helper for poll/_entry_evaluation/submit (audit #22–#23).

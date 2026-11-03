@@ -7,10 +7,10 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from app.bracket_learn import (
-    DEFAULT_KAPPA,DEFAULT_SL_SCALE,adapt_after_outcome,decide_brackets_from_ohlc,
-    evolve_from_history,load_multipliers,load_params,note_open_bracket_meta,
-    propose_for_open,recent_reachable_move,record_outcome,resample_m1_ohlc,
-    save_multipliers,save_params,zone_at_open,
+    DEFAULT_KAPPA,DEFAULT_SL_SCALE,STRUCTURE_VS_MEDIAN_CAP,adapt_after_outcome,
+    decide_brackets_from_ohlc,evolve_from_history,load_multipliers,load_params,
+    note_open_bracket_meta,propose_for_open,recent_reachable_move,record_outcome,
+    resample_m1_ohlc,save_multipliers,save_params,zone_at_open,_zone_single_tf,
 )
 from app import unified_cycle
 from app.engine import Store
@@ -57,9 +57,14 @@ def test_zone_sl_uses_market_shares_of_structure_not_hardcoded_fractions():
     assert z['ready'] is True
     assert z['structure'] is not None and z['structure']>z['noise_distance']
     assert z['pull_share'] is not None and z['favor_share'] is not None
-    # Structure scaled by *observed* pull/favor shares from this window.
-    assert z['range_distance']>=z['structure']*z['pull_share']-1e-9
-    assert z['max_tp']>=z['structure']*z['favor_share']-1e-9
+    # Structure informs SL/TP but is capped vs median bar (win-streak inflate fix).
+    capped_sl=min(z['structure']*z['pull_share'],
+                  z['noise_distance']*STRUCTURE_VS_MEDIAN_CAP)
+    capped_tp=min(z['structure']*z['favor_share'],
+                  z['noise_distance']*STRUCTURE_VS_MEDIAN_CAP)
+    assert z['range_distance']>=capped_sl-1e-9
+    assert z['max_tp']>=min(capped_tp,z['max_tp'])-1e-9
+    assert z['range_distance']<=z['noise_distance']*STRUCTURE_VS_MEDIAN_CAP+1e-6
 
 
 def test_scratch_on_sl_does_not_raise_risk():
@@ -74,15 +79,21 @@ def test_scratch_on_sl_does_not_raise_risk():
         assert load_multipliers(store)['sl_scale']==before['sl_scale']
 
 
-def test_win_reinforces_kappa_not_sl_width():
+def test_win_does_not_inflate_kappa_or_sl():
+    """Live bug: 3-win streak → fantasy SL/TP via win_reinforce + batch_raise."""
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
+        save_multipliers(store,1.4,1.3,reason='legacy_inflate')
         before=load_multipliers(store)
         out=adapt_after_outcome(
             store,kappa=1.0,sl_scale=1.0,pnl=0.80,exit_reason='tp')
-        assert out['reason'] in ('win_reinforce','tp_reinforce')
-        assert load_multipliers(store)['kappa']>=before['kappa']
-        assert load_multipliers(store)['sl_scale']==before['sl_scale']
+        assert out['reason']=='win_hold_ohlc'
+        after=load_multipliers(store)
+        assert after['kappa']<=before['kappa']+1e-9
+        assert after['sl_scale']<=before['sl_scale']+1e-9
+        # Legacy inflate heals toward 1.
+        assert after['kappa']<=1.4
+        assert after['sl_scale']<=1.3
 
 
 def test_growing_sl_loss_streak_cuts_risk():
@@ -184,19 +195,22 @@ def test_vanish_holds_without_widening_sl():
         assert load_multipliers(store)['sl_scale']==before['sl_scale']
 
 
-def test_tp_win_reinforces():
+def test_tp_win_holds_ohlc_width():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
         before=load_multipliers(store)
         out=adapt_after_outcome(
             store,kappa=1.2,sl_scale=1.0,pnl=0.80,exit_reason='tp')
-        assert out['reason'] in ('win_reinforce','tp_reinforce')
-        assert load_multipliers(store)['kappa']>=before['kappa']
+        assert out['reason']=='win_hold_ohlc'
+        assert load_multipliers(store)['kappa']<=before['kappa']+1e-9
+        assert load_multipliers(store)['sl_scale']==before['sl_scale']
 
 
-def test_record_outcome_learns_and_batch_raise_when_wide_wins():
+def test_batch_never_raises_after_wide_wins():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
+        save_multipliers(store,1.2,1.2,reason='seed')
+        save_params(store,1.0,1.0,reason='ohlc_tag')
         for _ in range(6):
             record_outcome(store,kappa=1.0,sl_scale=1.0,pnl=-0.4,currency='GBP',
                            exit_reason='sl',direction='BUY',entry=100,exit_level=99.5,
@@ -204,9 +218,30 @@ def test_record_outcome_learns_and_batch_raise_when_wide_wins():
         for _ in range(6):
             record_outcome(store,kappa=2.0,sl_scale=1.5,pnl=0.8,currency='GBP',
                            exit_reason='tp')
-        promoted=evolve_from_history(store,min_samples=6)
-        assert promoted is not None
-        assert load_multipliers(store)['kappa']>=1.0
+        before=load_multipliers(store)
+        evolve_from_history(store,min_samples=6)
+        after=load_multipliers(store)
+        # Wide winning must NOT raise κ/SL (old ratchet).
+        assert after['kappa']<=before['kappa']+1e-9
+        assert after['sl_scale']<=before['sl_scale']+1e-9
+        # Multipliers must not overwrite OHLC decision tags.
+        assert load_params(store)=={'kappa':1.0,'sl_scale':1.0}
+
+
+def test_structure_capped_vs_median_bar_after_big_swing():
+    """One huge swing must not set SL ≈ full window peak-trough."""
+    rows=[]
+    for i in range(40):
+        rows.append({'open':100,'high':100.3,'low':99.8,'close':100.1})
+    # One massive impulse like a 3-win streak move inside the lookback.
+    rows.append({'open':100,'high':120,'low':99.5,'close':118})
+    z=_zone_single_tf(rows)
+    assert z['ready'] is True
+    assert z['noise_distance']>0
+    assert z['range_distance']<=z['noise_distance']*STRUCTURE_VS_MEDIAN_CAP+1e-6
+    assert z['max_tp'] is not None
+    assert z['max_tp']<=max(z['noise_distance']*STRUCTURE_VS_MEDIAN_CAP,
+                            z.get('median_up') or 0)+1e-6
 
 
 def test_recent_reachable_move_from_candles():

@@ -42,6 +42,7 @@ from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
 from . import hold_shadow
 from . import learning_generation
+from . import champion_library
 
 DB=DATA/'robot.sqlite3'
 
@@ -3296,6 +3297,24 @@ class SingleTradeEngine:
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'target':label,'weights_updated':False,
                  'learning_generation':learning_generation.current(self.store)})
+        # Multi-champion library: tag broker £ by OPEN context; save if proven.
+        if pnl_source=='broker' and pnl_value is not None:
+            try:
+                ctx=(saved.get('champion_context') if isinstance(saved,dict) else None)
+                if not isinstance(ctx,dict):
+                    ctx=champion_library.context_from(
+                        epic=epic,
+                        trend=(self.market_context or {}).get('trend'),
+                        regime=(self.market_context or {}).get('regime'),
+                        news=self._news_risk())
+                champion_library.append_trade(
+                    self.store,context=ctx,pnl=pnl_value,deal_id=deal_id,
+                    model_version=getattr(self.brain,'model_version',0),
+                    direction=direction)
+                champion_library.consider_save(self.store,self,context=ctx)
+            except Exception as exc:
+                self.store.event('warning','Champion library update skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
         # Shadow vs LIVE promote check right after a real weight update.
         if weights_updated:
             try:self.policy.shadow_self_dev_tick(self)
@@ -3555,6 +3574,19 @@ class SingleTradeEngine:
         if not gates.get('allowed'):
             self.last_entry_reason=gates.get('reason') or 'LIVE OPEN blocked by readiness'
             return
+        # Load profitable version only when current market task matches its context.
+        try:
+            ctx=champion_library.context_from(
+                epic=self.mandate.get('epic'),
+                trend=(self.market_context or {}).get('trend')
+                      or (self.last_signal or {}).get('trend'),
+                regime=(self.market_context or {}).get('regime')
+                       or (self.last_signal or {}).get('regime'),
+                news=self._news_risk())
+            champion_library.maybe_activate(self.store,self,context=ctx)
+        except Exception as exc:
+            self.store.event('warning','Champion activate skipped',
+                             {'type':type(exc).__name__})
         self.pending_order=True
         try:
             await self.sync()
@@ -3667,6 +3699,13 @@ class SingleTradeEngine:
                 'learn_samples':bp.get('nudge_samples')})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
+                open_ctx=champion_library.context_from(
+                    epic=self.mandate['epic'],
+                    trend=(self.market_context or {}).get('trend')
+                          or (self.last_signal or {}).get('trend'),
+                    regime=(self.market_context or {}).get('regime')
+                           or (self.last_signal or {}).get('regime'),
+                    news=self._news_risk())
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -3679,6 +3718,7 @@ class SingleTradeEngine:
                     'cycle_aggression':bp.get('aggression'),
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
+                    'champion_context':open_ctx,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
@@ -3890,6 +3930,7 @@ class SingleTradeEngine:
                     'shadow_active':self.shadow_brain is not None,
                     'shadow_paper':self.shadow_paper.summary(),
                     'hold_shadow':hold_shadow.strategy_evidence(self.store),
+                    'champion_library':champion_library.snapshot(self.store),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),

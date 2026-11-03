@@ -301,9 +301,14 @@ class NeuralCore:
         self.P=np.vstack((self.P,p));self.W=np.pad(self.W,((0,1),(0,1)))
         self.R=np.column_stack((self.R,self.rng.normal(0,.001,3)))
         self.O=np.column_stack((self.O,self.rng.normal(0,.001,3)))
-        # A newborn neuron initially has zero recurrent state and zero reconstruction contribution.
-        self.G=np.column_stack((self.G,np.zeros(self.d)))
-        self.h=np.append(self.h,0.);self.c=np.append(self.c,0.)
+        # Seed G from residual so birth actually cuts reconstruction — zero-G
+        # newborns left error unchanged and re-triggered birth every interval.
+        residual=z-self.G@self.h
+        rnorm=float(np.linalg.norm(residual))+1e-6
+        g_col=residual/rnorm
+        self.G=np.column_stack((self.G,g_col))
+        # Activate the newborn on this residual so h·G starts contributing.
+        self.h=np.append(self.h,rnorm);self.c=np.append(self.c,0.)
         self.tau=np.append(self.tau,10.);self.tau_c=np.append(self.tau_c,25.)
         self.age=np.append(self.age,0);self.utility=np.append(self.utility,0.)
         self.neuron_ids=np.append(self.neuron_ids,self.next_neuron_id)
@@ -322,6 +327,26 @@ class NeuralCore:
         for name in ('h','c','tau','tau_c','age','utility'):
             setattr(self,name,getattr(self,name)[keep])
         self.neuron_ids=self.neuron_ids[keep]
+        self.n=len(keep);self.deaths+=count
+        return count
+
+    def prune_to_cap(self,nmax,min_neurons=8):
+        """Force-trim lowest-utility neurons when over max_neurons (existing fat clients)."""
+        if nmax is None:
+            return 0
+        target=max(int(min_neurons),int(nmax))
+        excess=self.n-target
+        if excess<=0:
+            return 0
+        order=np.argsort(self.utility)
+        remove=set(int(i) for i in order[:excess].tolist())
+        keep=[i for i in range(self.n) if i not in remove]
+        self.P=self.P[keep,:];self.W=self.W[np.ix_(keep,keep)]
+        self.R=self.R[:,keep];self.O=self.O[:,keep];self.G=self.G[:,keep]
+        for name in ('h','c','tau','tau_c','age','utility'):
+            setattr(self,name,getattr(self,name)[keep])
+        self.neuron_ids=self.neuron_ids[keep]
+        count=self.n-len(keep)
         self.n=len(keep);self.deaths+=count
         return count
 

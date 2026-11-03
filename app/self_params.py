@@ -56,13 +56,16 @@ DEFAULTS = {
     'learn_lr': 0.28,
     'learn_win_repeats': 4,
     'learn_loss_repeats': 5,
-    # HOLD opposite-TP teach uses win-strength × this multiplier (floored at 1).
-    'hold_shadow_repeats': 4,
+    # HOLD opposite-TP teach — light auxiliary (not a full trade-PnL cannon).
+    'hold_shadow_repeats': 2,
     'profit_history_rows': 400,
     # Exit intent (logged only — LIVE still SL/TP/trail)
     'exit_need_streak': 2,
-    # Neural growth (engine)
+    # Neural growth (engine) — hard cap so losing clients cannot balloon to 196
+    # while peers stay ~55; birth cooldown stops zero-G re-birth spam.
     'grow_error_threshold': 0.55,
+    'max_neurons': 64,
+    'birth_cooldown_steps': 24,
     'prune_utility_threshold': -0.01,
     'prune_min_age': 80,
     # Shadow/LIVE execution parity (critical #4) — seeds only; evolve from £.
@@ -127,10 +130,12 @@ BOUNDS = {
     'learn_lr': (0.01, 0.50),
     'learn_win_repeats': (1, 8),
     'learn_loss_repeats': (1, 12),
-    'hold_shadow_repeats': (1, 8),
+    'hold_shadow_repeats': (1, 4),
     'profit_history_rows': (50, 2000),
     'exit_need_streak': (1, 8),
     'grow_error_threshold': (0.2, 2.0),
+    'max_neurons': (24, 96),
+    'birth_cooldown_steps': (8, 120),
     'prune_utility_threshold': (-0.2, 0.0),
     'prune_min_age': (20, 500),
     # Soft rails only — operating values live in Store and move via evolve.
@@ -400,8 +405,9 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
             # Scratch / penny closes must not ratchet HOLD repeats —
             # that was the permanent-HOLD trap after a streak of £0 exits.
             if pnl<0 and abs(pnl)>scratch:
-                # Whole 0.01 steps only — never 0.28*1.05=0.294.
-                p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])+LEARN_LR_STEP)
+                # Calm LR after losses — raising it was "learning bigger mistakes"
+                # and diverged clients (one balloons, peers stay compact).
+                p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
                 # Never let loss repeats exceed win repeats (symmetric teacher).
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 cur=int(p['learn_loss_repeats'])
@@ -416,9 +422,10 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['trail_open_gap_frac'])*1.04)
                 p['trail_min_mult']=min(BOUNDS['trail_min_mult'][1],
                     float(p['trail_min_mult'])*1.03)
-                p['grow_error_threshold']=max(BOUNDS['grow_error_threshold'][0],
-                    float(p['grow_error_threshold'])*0.98)
-                notes.append('meaningful loss → raise friction/trail; ease grow threshold')
+                # Harder birth after losses — never ease threshold (runaway n).
+                p['grow_error_threshold']=min(BOUNDS['grow_error_threshold'][1],
+                    float(p['grow_error_threshold'])*1.02)
+                notes.append('meaningful loss → calm LR; raise grow threshold (cap runaway birth)')
             elif pnl<0:
                 # Scratch band itself adapts — repeated pennies widen recognition.
                 p['scratch_pnl_abs']=min(BOUNDS['scratch_pnl_abs'][1],

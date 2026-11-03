@@ -17,6 +17,9 @@ DEFAULT_SL_SCALE=1.0
 # Soft rails on learned multipliers — operating schedule lives in self_params.
 MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
+# Peak-to-trough structure may inform SL, but never dominate after a win streak
+# blew the lookback window (live: 3 wins → fantasy SL/TP from full swing).
+STRUCTURE_VS_MEDIAN_CAP=2.0
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
 MIN_BATCH_SAMPLES=6
 # Exit reasons the adaptation layer understands.
@@ -218,7 +221,8 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     Cash risk must not ratchet up after every scratch/win — lot stays fixed,
     but wider SL was growing £ losses (£0.50→£1.34) while decisions stayed wrong.
 
-      tp / win → reinforce κ only (not SL width)
+      tp / win → NEVER widen SL or κ (OHLC decides width; win-ratchet was the
+                 live bug after 3-win streaks). Decay legacy mults toward 1.
       scratch → never widen SL; cut κ if already wide
       growing SL-loss streak → cut sl_scale back toward 1
       sl + noise + tight shape + NOT growing losses → rare SL room
@@ -242,15 +246,19 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
     if not isinstance(last_open,dict):
         last_open={}
     at_ohlc_tp=bool(last_open.get('tp_at_ohlc_cap') or last_open.get('capped_to_ohlc'))
+
+    def _decay_mults_toward_one():
+        """Heal legacy win-ratchet inflation without inventing wider targets."""
+        nonlocal k_m,s_m
+        if k_m>1.0+1e-9:
+            k_m=max(1.0,k_m*0.98)
+        if s_m>1.0+1e-9:
+            s_m=max(1.0,s_m*0.98)
+
     if reason_x=='tp' or (pnl>band and reason_x in ('trail','unknown','manual')):
-        # Win may reinforce κ only while OHLC still had TP headroom.
-        # If last OPEN was already capped to reachable max_tp, do not invent
-        # a farther fantasy target for the next trade.
-        if at_ohlc_tp:
-            reason='tp_at_ohlc_cap_hold'
-        else:
-            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-            reason='win_reinforce' if pnl>band else 'tp_reinforce'
+        # Wins must not inflate next SL/TP. OHLC zone already sets width.
+        _decay_mults_toward_one()
+        reason=('tp_at_ohlc_cap_hold' if at_ohlc_tp else 'win_hold_ohlc')
     elif reason_x=='trail':
         if pnl<-band and shape>=wide:
             k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_trail_loss_kappa_step']))
@@ -283,16 +291,13 @@ def adapt_after_outcome(store, *, kappa: float, sl_scale: float, pnl: float,
         else:
             reason='loss_insufficient_context_hold'
     elif pnl>band:
-        if at_ohlc_tp:
-            reason='tp_at_ohlc_cap_hold'
-        else:
-            k_m=min(MULT_KAPPA_MAX,k_m*float(sched['bracket_win_kappa_step']))
-            reason='win_reinforce'
+        _decay_mults_toward_one()
+        reason=('tp_at_ohlc_cap_hold' if at_ohlc_tp else 'win_hold_ohlc')
     save_multipliers(store,k_m,s_m,
                      reason=f'learned_{reason} exit={reason_x} pnl={pnl:.4f}')
     if reason not in ('hold','trail_hold','vanish_hold','scratch_hold_sl',
                       'loss_insufficient_context_hold','loss_adverse_hold_sl',
-                      'tp_at_ohlc_cap_hold'):
+                      'tp_at_ohlc_cap_hold','win_hold_ohlc'):
         try:
             from .self_params import evolve_from_feedback
             evolve_from_feedback(store,bracket_reason=reason,commit=False)
@@ -446,9 +451,16 @@ def _zone_single_tf(candles, *, n: int|None=None, reach_n: int|None=None) -> dic
         favor_share=1.0
     if not math.isfinite(pull_share) or pull_share<0:pull_share=1.0
     if not math.isfinite(favor_share) or favor_share<0:favor_share=1.0
+    # Cap structure vs typical bar — full lookback peak-trough after a win
+    # streak was inventing day-range SL/TP (live Gold after 3 wins).
+    struct_cap=float(med_span)*STRUCTURE_VS_MEDIAN_CAP if med_span>1e-12 else 0.0
     struct_sl=(float(structure)*pull_share) if structure and structure>0 else 0.0
     struct_tp=(float(structure)*favor_share) if structure and structure>0 else 0.0
+    if struct_cap>0:
+        struct_sl=min(struct_sl,struct_cap)
+        struct_tp=min(struct_tp,struct_cap)
     sl_distance=max(med_span,med_down,struct_sl)
+    # struct_tp already capped — cannot invent day-range TP alone.
     target_bits=[x for x in (reach,med_up,struct_tp) if x is not None and float(x)>0]
     max_tp=float(max(target_bits)) if target_bits else (float(reach) if reach else None)
     return {
@@ -762,7 +774,12 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
 
 
 def evolve_from_history(store, *, min_samples: int|None=None) -> dict|None:
-    """Batch confirm: if wide brackets earn more £ than tight, raise; else cut TP/SL."""
+    """Batch confirm: only CUT when tight beats wide — never raise SL/κ after wins.
+
+    Width is an OHLC decision. Old batch_raise after winning wide trades was the
+    3-win → fantasy SL/TP ratchet (raised both κ and sl_scale, then saved them
+    into bracket_kappa/sl_scale).
+    """
     sched=_schedule(store)
     need=int(min_samples if min_samples is not None else sched['bracket_min_batch_samples'])
     cut=float(sched['bracket_batch_wide_cut'])
@@ -779,20 +796,25 @@ def evolve_from_history(store, *, min_samples: int|None=None) -> dict|None:
     mw,mt=mean(wide),mean(tight)
     mult=load_multipliers(store)
     k_m,s_m=mult['kappa'],mult['sl_scale']
-    if mw>mt+1e-9:
-        raise_step=float(sched['bracket_batch_raise_step'])
-        k_m=min(MULT_KAPPA_MAX,k_m*raise_step)
-        s_m=min(MULT_SL_MAX,s_m*raise_step)
-        reason=f'batch_raise wide_mean={mw:.4f} tight_mean={mt:.4f}'
-    elif mt>mw+1e-9:
+    if mt>mw+1e-9:
         k_m=max(MULT_KAPPA_MIN,k_m*float(sched['bracket_batch_cut_step']))
-        # Keep SL floor ≥1; cut TP ambition when tight wins.
+        if s_m>1.0+1e-9:
+            s_m=max(MULT_SL_MIN,s_m*float(sched['bracket_batch_cut_step']))
         reason=f'batch_cut_tp wide_mean={mw:.4f} tight_mean={mt:.4f}'
     else:
-        return None
+        # Wide winning or tied → do NOT raise. Heal legacy inflate toward 1.
+        changed=False
+        if k_m>1.0+1e-9:
+            k_m=max(1.0,k_m*0.99);changed=True
+        if s_m>1.0+1e-9:
+            s_m=max(1.0,s_m*0.99);changed=True
+        if not changed:
+            return None
+        reason=f'batch_hold_no_raise wide_mean={mw:.4f} tight_mean={mt:.4f}'
     before=dict(mult)
     save_multipliers(store,k_m,s_m,reason=reason)
     if abs(k_m-before['kappa'])<1e-6 and abs(s_m-before['sl_scale'])<1e-6:
         return None
-    save_params(store,k_m,s_m,reason=reason)
-    return {'kappa':k_m,'sl_scale':s_m,'mean_pnl':mw,'samples':len(wide)+len(tight)}
+    # Do NOT write multipliers into bracket_kappa/sl_scale — those tag OHLC decisions.
+    return {'kappa':k_m,'sl_scale':s_m,'mean_pnl':mw,'samples':len(wide)+len(tight),
+            'reason':reason}

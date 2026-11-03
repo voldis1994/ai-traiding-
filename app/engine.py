@@ -3492,10 +3492,25 @@ class SingleTradeEngine:
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
         bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
                                          base_sl=base_sl,max_tp=zone.get('max_tp'),
-                                         candles=candles)
-        result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
-                         kappa=bp['kappa'],sl_scale=bp['sl_scale'],
-                         range_distance=float(rng) if rng is not None else 0)
+                                         candles=candles,tick=tick,spread=spread,
+                                         min_distance=min_dist)
+        # Use OHLC-decided distances — do not re-scale range via stop_take×sl_mult
+        # (that re-opened the win-ratchet path after 3 wins).
+        decided_sl=_num(bp.get('stop_distance'))
+        decided_tp=_num(bp.get('profit_distance'))
+        if decided_sl and decided_tp and decided_sl>0 and decided_tp>0:
+            sign=1 if p.get('direction')=='BUY' else -1
+            level=float(p['level'] or mid)
+            result={
+                'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
+                'stop_level':level-sign*float(decided_sl),
+                'profit_level':level+sign*float(decided_tp),
+                'kappa':bp.get('kappa'),'sl_scale':1.0,
+            }
+        else:
+            result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
+                             kappa=bp['kappa'],sl_scale=1.0,
+                             range_distance=float(rng) if rng is not None else 0)
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
         if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
             self.store.event('warning','Protection skipped: SL/TP below broker min distance',{

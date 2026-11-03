@@ -390,10 +390,9 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
         p['bracket_loss_wide_kappa_step']=max(BOUNDS['bracket_loss_wide_kappa_step'][0],
             float(p['bracket_loss_wide_kappa_step'])*0.99)
         notes.append('wide loss → lower shape_wide gate + stronger κ cut')
-    elif br in ('win_reinforce','tp_reinforce'):
-        p['bracket_win_kappa_step']=min(BOUNDS['bracket_win_kappa_step'][1],
-            float(p['bracket_win_kappa_step'])*1.005)
-        notes.append('win reinforce → slight win κ step')
+    elif br in ('win_reinforce','tp_reinforce','win_hold_ohlc'):
+        # Wins must not escalate the win-κ step (that compounded 3-win fantasy TP).
+        notes.append('win → hold OHLC width (no win-κ escalate)')
     elif br=='scratch_cut_tp':
         p['bracket_scratch_kappa_step']=max(BOUNDS['bracket_scratch_kappa_step'][0],
             float(p['bracket_scratch_kappa_step'])*0.995)

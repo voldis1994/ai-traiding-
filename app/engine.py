@@ -761,8 +761,11 @@ class AdaptiveBrain:
                                          objective=OBJECTIVE_MINUTE_DIRECTION)
                     if loss is not None and self.feature_schema==self.fusion_schema:
                         self.fusion_labels+=1
-                    if loss is not None:
-                        # Paaudze tracks real weight updates — not policy-file theater.
+                    meta=getattr(self.core,'last_learn_meta',None) or {}
+                    real_dw=(loss is not None and not meta.get('restored')
+                             and float(meta.get('delta_norm') or 0)>1e-9)
+                    if real_dw:
+                        # Paaudze only on real ΔW — restored/no-op learns are theater.
                         if (self.minute_labeled+1)%10==0:
                             from . import learning_generation
                             learning_generation.bump(self.store,'m1_horizon_weight_update')
@@ -790,23 +793,34 @@ class AdaptiveBrain:
                             break
 
         result=self.core.step(x,max(.1,min(float(dt),60)))
-        # Structural growth is separate from learning; avoid allocating a neuron
-        # nearly every quote and overwhelming gradients/CPU/memory.
+        # Structural growth is separate from learning; cap + cooldown stop
+        # losing clients ballooning (196 vs 55) while Paaudze looks busy.
         growth_interval=(self.FAST_GROWTH_INTERVAL if self.core.vbar>2.0
                          else self.GROWTH_INTERVAL)
+        from .self_params import get as sp_get
+        nmax=int(sp_get(self.store,'max_neurons',64))
+        cooldown=int(sp_get(self.store,'birth_cooldown_steps',24))
+        last_birth=int(self.store.get('last_neuron_birth_step') or -10**9)
         if self.core.steps%growth_interval==0:
-            from .self_params import get as sp_get
             z=np.asarray(result['z'])
             grow_th=float(sp_get(self.store,'grow_error_threshold',.55))
-            if self.core.grow_if_needed(z,threshold=grow_th,nmax=None):
-                self.store.event('neural','Neuron automatically added',{'neurons':self.core.n})
-        if self.core.steps%80==0:
-            from .self_params import get as sp_get
+            cooled=(self.core.steps-last_birth)>=cooldown
+            if cooled and self.core.grow_if_needed(z,threshold=grow_th,nmax=nmax):
+                self.store.set('last_neuron_birth_step',self.core.steps)
+                self.store.event('neural','Neuron automatically added',
+                    {'neurons':self.core.n,'nmax':nmax})
+        # Prune ~2× as often as birth attempts; trim excess over hard cap.
+        prune_every=max(16,growth_interval*2)
+        if self.core.steps%prune_every==0:
             deleted=self.core.prune(
                 min_age=int(sp_get(self.store,'prune_min_age',80)),
                 threshold=float(sp_get(self.store,'prune_utility_threshold',-.01)))
-            if deleted:self.store.event('neural','Low utility neurons removed',
-                {'count':deleted,'neurons':self.core.n})
+            trimmed=self.core.prune_to_cap(nmax)
+            removed=int(deleted)+int(trimmed)
+            if removed:
+                self.store.event('neural','Low utility neurons removed',
+                    {'count':removed,'pruned':int(deleted),'trimmed_to_cap':int(trimmed),
+                     'neurons':self.core.n,'nmax':nmax})
         cur=self.store.db.execute('''INSERT INTO signals
             (time,epic,action,scores,price,model_step,label,spread,tick_size,label_version)
             VALUES(?,?,?,?,?,?,NULL,?,?,?)''',
@@ -2982,20 +2996,26 @@ class SingleTradeEngine:
         """Resolve HOLD shadows as soon as a side hits TP/SL; teach opposite immediately."""
         from .self_params import load as load_self_params
         def _learn(label,transition,mode,detail):
-            # Strong opposite teach on the close bar — same lr bus as closed-trade.
+            # Light opposite teach — not full trade-PnL cannon (was overwriting M1).
             sp=load_self_params(self.store)
             lr=float(sp.get('learn_lr',0.28))
-            repeats=max(1,int(sp.get('hold_shadow_repeats',4)))
+            repeats=max(1,min(4,int(sp.get('hold_shadow_repeats',2))))
+            taught=False
             for i in range(repeats):
-                self.brain.learn_from_trade(
-                    transition,int(label),lr=lr,won=True,count_sample=(i==0))
-            learning_generation.bump(self.store,'hold_shadow_opposite_tp')
+                step=self.brain.learn_from_trade(
+                    transition,int(label),lr=lr,won=False,count_sample=(i==0))
+                meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+                if (step is not None and not meta.get('restored')
+                        and float(meta.get('delta_norm') or 0)>1e-9):
+                    taught=True
+            if taught:
+                learning_generation.bump(self.store,'hold_shadow_opposite_tp')
             self.store.event('hold_shadow','Taught opposite after missed TP on HOLD',{
                 'mode':mode,'label':int(label),
                 'opposite':detail.get('opposite'),
                 'opposite_pnl':detail.get('opposite_pnl'),
                 'proposal_pnl':detail.get('proposal_pnl'),
-                'learn_repeats':repeats,
+                'learn_repeats':repeats,'weights_moved':taught,
                 'path_bars':detail.get('path_bars') or
                             (detail.get('opposite_sim') or {}).get('bars_held')})
         outcomes=hold_shadow.resolve_ready(
@@ -3173,13 +3193,17 @@ class SingleTradeEngine:
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
         last_delta=None
+        any_real_dw=False
         for i in range(repeats):
             step_loss=self.brain.learn_from_trade(
                 transition,label,lr=learn_lr,won=pnl_sign>0,count_sample=(i==0))
             if step_loss is not None:losses.append(step_loss)
             meta=getattr(self.brain.core,'last_learn_meta',None) or {}
-            if meta.get('delta_norm') is not None:
-                last_delta=meta.get('delta_norm')
+            dn=meta.get('delta_norm')
+            if dn is not None:
+                last_delta=dn
+                if (not meta.get('restored')) and float(dn or 0)>1e-9:
+                    any_real_dw=True
         # ΔW already updated neural scores (entry quality). Entry floor stays
         # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
         if repeats>0 and label is not None:
@@ -3227,11 +3251,23 @@ class SingleTradeEngine:
             self._note_scratch_close(pnl_value,deal_id)
         if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
-            if self.brain.core.grow_if_needed(np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=None):
+            nmax=int(sp.get('max_neurons',64))
+            cooldown=int(sp.get('birth_cooldown_steps',24))
+            last_birth=int(self.store.get('last_neuron_birth_step') or -10**9)
+            cooled=(self.brain.core.steps-last_birth)>=cooldown
+            if cooled and self.brain.core.grow_if_needed(
+                    np.asarray(self.brain.core.last_z),threshold=grow_th,nmax=nmax):
+                self.store.set('last_neuron_birth_step',self.brain.core.steps)
                 self.store.event('neural','Neuron added after closed-trade learning',
-                                 {'neurons':self.brain.core.n,'deal_id':deal_id})
-        # Real adaptation proof: LIVE weights moved → Paaudze + UI reason.
-        if losses:
+                                 {'neurons':self.brain.core.n,'deal_id':deal_id,
+                                  'nmax':nmax})
+            trimmed=self.brain.core.prune_to_cap(nmax)
+            if trimmed:
+                self.store.event('neural','Trimmed neurons to max_neurons after trade',
+                                 {'trimmed':trimmed,'neurons':self.brain.core.n,'nmax':nmax})
+        # Real adaptation proof: LIVE ΔW (not restored/no-op) → Paaudze.
+        weights_moved=bool(any_real_dw)
+        if weights_moved:
             learning_generation.bump(self.store,'closed_trade_weight_update')
             self.store.set('neural_adapt_reason',
                 f'Closed {direction} £{pnl_value} → LIVE learn×{repeats} mode={mode}')
@@ -3240,7 +3276,7 @@ class SingleTradeEngine:
         # two cannot re-train on restart (lost save ≺ double-train).
         self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.brain.save()
-        weights_updated=bool(repeats>0 and losses)
+        weights_updated=bool(repeats>0 and weights_moved)
         if weights_updated:
             self.store.event('learning','Closed-trade P&L updated LIVE neural weights',
                 {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
@@ -3880,7 +3916,10 @@ class SingleTradeEngine:
         d=self.brain.core.d
         created=False
         if self.shadow_brain is None or self.shadow_brain.d!=d:
+            from .self_params import get as sp_get
+            nmax=int(sp_get(self.store,'max_neurons',64))
             alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
+            alt_n=min(alt_n,nmax)
             # Derive from live init_seed so shadow search is not identical across clients.
             base=int(getattr(self.brain,'init_seed',7) or 7)
             shadow_seed=(base^(0xA5A5+alt_n))%(2**31-1) or (base+alt_n+1)
@@ -3890,6 +3929,7 @@ class SingleTradeEngine:
             try:saved_d=int(saved.get('d') or -1)
             except (TypeError,ValueError):saved_d=-1
             use_n=saved_n if (saved_n>=8 and saved_d==d) else alt_n
+            use_n=min(max(8,use_n),nmax)
             self.shadow_brain=self.brain.core.clone_architecture(
                 n=use_n,seed=shadow_seed,copy_weights=False)
             self.shadow_brain.model_version=0

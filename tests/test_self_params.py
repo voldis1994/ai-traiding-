@@ -52,13 +52,13 @@ def test_learn_lr_only_two_decimal_places():
         store=Store(Path(d)/'db.sqlite3')
         save(store,{**DEFAULTS,'learn_lr':0.12345},reason='poison float')
         assert get(store,'learn_lr') == pytest.approx(0.12)
-        # Meaningful loss bumps exactly one hundredth.
+        # Meaningful loss calms LR by exactly one hundredth (no amplify-mistakes).
         before=get(store,'learn_lr')
         evolve_from_feedback(store,broker_pnl=-1.5)
         after=load(store)['learn_lr']
-        assert after == pytest.approx(round(before+0.01,2))
+        assert after == pytest.approx(round(before-0.01,2))
         assert round(after,2) == after
-        # Win softens by exactly one hundredth.
+        # Win also softens by one hundredth when above floor.
         evolve_from_feedback(store,broker_pnl=1.5)
         soft=load(store)['learn_lr']
         assert soft == pytest.approx(round(after-0.01,2))

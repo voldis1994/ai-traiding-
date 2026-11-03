@@ -89,7 +89,8 @@ def test_trail_and_scratch_knobs_evolve_from_outcomes():
         assert load(store)['trail_open_gap_frac']>=frac0
         grow0=load(store)['grow_error_threshold']
         evolve_from_feedback(store,broker_pnl=-2.0)
-        assert load(store)['grow_error_threshold']<=grow0
+        # Losses harden birth threshold — easing it ballooned losing clients.
+        assert load(store)['grow_error_threshold']>=grow0
 
 
 def test_post_be_trail_gap_reads_store_knobs():

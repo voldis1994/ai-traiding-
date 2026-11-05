@@ -15,6 +15,7 @@ from statistics import mean, median
 DEFAULT_KAPPA=1.0
 DEFAULT_SL_SCALE=1.0
 # Soft rails on learned multipliers — operating schedule lives in self_params.
+# LIVE OPEN width is OHLC-decided (not these rails).
 MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 # Peak-to-trough structure may inform SL, but never dominate after a win streak
@@ -675,7 +676,8 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     else:
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
-    # Effective κ after reachable-span decision (for tagging / learning).
+    # Effective κ from OHLC only — no hardcoded 1:1 reshape / RR floor.
+    # The robot decides width from candles; we do not invent TP/SL ratios.
     eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
     # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
     entry = 1000.0  # levels unused by callers that only need distances

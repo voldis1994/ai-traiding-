@@ -114,15 +114,36 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
         # Cash loss must never reinforce the side that just lost £ (price-unit
         # sim can otherwise re-pick the same side after fees/FX). Choose among
         # HOLD and the opposite path only.
+        #
+        # Live bug: spread≈0 made tiny opposite mid-moves look profitable →
+        # flip_loss_counterfactual_* churn every 2–3 minutes. Require opposite
+        # edge to clear a spread-aware floor; missing/zero spread → HOLD only.
         if sim:
             opposite='SELL' if direction=='BUY' else 'BUY'
             opp_val=float(sim['sell'] if opposite=='SELL' else sim['buy'])
-            hold_val=0.
-            best=opposite if opp_val>hold_val else 'HOLD'
-            prefix='flip_loss_counterfactual_' if flip_after_loss else 'loss_counterfactual_'
-            return {'label':_ACTION_LABEL[best],
-                    'mode':prefix+best.lower(),
-                    'actual_pnl':pnl,'simulated':sim}
+            try:
+                sp=float(spread or 0.)
+            except (TypeError,ValueError):
+                sp=0.
+            if not math.isfinite(sp) or sp<0:
+                sp=0.
+            # Soft approach: missing spread → HOLD teach only (does NOT freeze
+            # LIVE OPEN). Known spread → opposite only if it clears a cost floor;
+            # otherwise HOLD. Keeps early-day trading; stops false flip churn.
+            opp_floor=max(1e-9, 0.25*sp) if sp>0 else None
+            if sp<=0:
+                best='HOLD'
+                mode_tag='loss_hold_missing_spread'
+            elif opp_val>(opp_floor or 0):
+                best=opposite
+                mode_tag=('flip_loss_counterfactual_' if flip_after_loss
+                          else 'loss_counterfactual_')+best.lower()
+            else:
+                best='HOLD'
+                mode_tag=('flip_loss_counterfactual_hold' if flip_after_loss
+                          else 'loss_counterfactual_hold')
+            return {'label':_ACTION_LABEL[best],'mode':mode_tag,
+                    'actual_pnl':pnl,'simulated':sim,'opp_floor':opp_floor}
         return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
                 'simulated':None}
     # Flat / unknown £ — still prefer path evidence over inventing HOLD.

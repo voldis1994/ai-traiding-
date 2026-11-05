@@ -43,6 +43,7 @@ from .model_validation import ModelValidator
 from . import hold_shadow
 from . import learning_generation
 from . import champion_library
+from . import structure_shadow
 
 DB=DATA/'robot.sqlite3'
 
@@ -2258,11 +2259,64 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',reason=edge['reason'],
                             unified_cycle=edge)
             result=dict(result,unified_cycle=edge)
+            # Structure shadow: OHLC frame matches prior SL graves for this side → HOLD.
+            struct=self._structure_shadow_advice(result['action'])
+            result=dict(result,structure_shadow=struct)
+            if struct.get('action')=='HOLD':
+                return dict(result,action='HOLD',reason=struct.get('reason') or
+                            'Structure shadow: same OHLC frame killed this side')
         else:
             result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
                 (self.last_signal or {}).get('scores'),result,
                 unified_cycle.load_state(self.store)))
         return result
+
+    def _structure_shadow_advice(self,proposal):
+        """Frame current candles; ask shadow memory if this side dies here."""
+        if proposal not in ('BUY','SELL') or not self.mandate:
+            return {'action':None,'reason':'no_proposal'}
+        epic=self.mandate.get('epic')
+        try:
+            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        # Chronological: recent path + older pre-window for breakout detect.
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        path=chron[-30:] if len(chron)>30 else chron
+        pre=chron[:-30] if len(chron)>30 else chron[:max(0,len(chron)//2)]
+        return structure_shadow.advise(
+            self.store,epic=epic,proposal=proposal,bars=path,pre_bars=pre)
+
+    def _record_structure_shadow_loss(self,deal_id,saved,*,epic,direction,
+                                      entry,exit_level,exit_reason,broker_pnl,
+                                      spread):
+        """Freeze SL/loss OHLC path so shadow can frame the market event."""
+        bar_time=(saved or {}).get('bar_time')
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        pre=[];path=[]
+        if bar_time:
+            for c in chron:
+                at=c.get('at')
+                if at is None:continue
+                if str(at)<str(bar_time):
+                    pre.append(c)
+                else:
+                    path.append(c)
+        else:
+            mid=max(3,len(chron)//2)
+            pre=chron[:mid]
+            path=chron[mid:]
+        if len(pre)>40:pre=pre[-40:]
+        if len(path)>60:path=path[:60]
+        return structure_shadow.record_loss(
+            self.store,epic=epic,direction=direction,entry=entry,
+            exit_level=exit_level,exit_reason=exit_reason,
+            broker_pnl=broker_pnl,bars=path,pre_bars=pre,
+            deal_id=deal_id,spread=spread)
 
     def _signal_reason(self,action,market_status=None,evaluation=None):
         if not self.last_signal:return 'No neural signal'
@@ -3306,6 +3360,28 @@ class SingleTradeEngine:
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'target':label,'weights_updated':False,
                  'learning_generation':learning_generation.current(self.store)})
+        # Structure shadow: freeze SL/loss OHLC path → frame RANGE/TREND/BREAKOUT.
+        try:
+            exit_reason_tag=self._infer_exit_reason(
+                deal_id,confirmation,entry=entry,direction=direction,
+                exit_level=exit_level,tick=tick)
+            if (str(exit_reason_tag or '').lower()=='sl'
+                    or (pnl_value is not None and pnl_value<0)):
+                rec=self._record_structure_shadow_loss(
+                    deal_id,saved,epic=epic,direction=direction,
+                    entry=entry,exit_level=exit_level,
+                    exit_reason=exit_reason_tag or 'loss',
+                    broker_pnl=pnl_value,spread=spread_cost)
+                if rec:
+                    self.store.event('structure_shadow',
+                        'Recorded loss OHLC frame for shadow memory',{
+                            'deal_id':deal_id,'key':rec.get('key'),
+                            'structure':(rec.get('snapshot') or {}).get('frame',{}).get('structure'),
+                            'direction':direction,'pnl':pnl_value,
+                            'bars':len((rec.get('snapshot') or {}).get('bars') or [])})
+        except Exception as exc:
+            self.store.event('warning','Structure shadow record skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
         # Multi-champion library: tag broker £ by OPEN context; save if proven.
         if pnl_source=='broker' and pnl_value is not None:
             try:
@@ -3955,6 +4031,7 @@ class SingleTradeEngine:
                     'shadow_active':self.shadow_brain is not None,
                     'shadow_paper':self.shadow_paper.summary(),
                     'hold_shadow':hold_shadow.strategy_evidence(self.store),
+                    'structure_shadow':structure_shadow.summary(self.store),
                     'champion_library':champion_library.snapshot(self.store),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),

@@ -678,19 +678,27 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     else:
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
-    # Live bug: tiny max_tp crushed TP≪SL (κ→0.5) → every 50% WR day loses £.
-    # Prefer force RR≥1 when reachable span allows; else mark blocked (no OPEN).
-    blocked = False
-    block_reason = None
+    # Different approach than "HOLD / skip OPEN": keep trading like early days,
+    # but *reshape* to ≥1:1 so TP≪SL crush cannot invent −EV. Shrink SL to the
+    # reachable TP (still ≥ broker floor); never refuse the whole day.
+    reshaped = False
+    reshape_reason = None
     if stop_d > 1e-12 and profit_d + 1e-12 < stop_d * MIN_LIVE_RR:
         reach_cap = float(ohlc_tp) * t if ohlc_tp is not None and ohlc_tp > 0 else None
         if reach_cap is None or reach_cap + 1e-12 >= stop_d * MIN_LIVE_RR:
-            profit_d = stop_d * MIN_LIVE_RR
+            profit_d = max(floor, stop_d * MIN_LIVE_RR)
+            reshape_reason = 'raised_tp_to_1R'
         else:
-            blocked = True
-            block_reason = (
-                f'ohlc_tp {reach_cap:.4f} < SL {stop_d:.4f} — refuse −EV OPEN')
-    # Effective κ after reachable-span decision (for tagging / learning).
+            # Reachable move < wide SL → cut risk to what OHLC can actually pay.
+            stop_d = max(floor, min(stop_d, max(reach_cap, floor)))
+            profit_d = max(floor, stop_d * MIN_LIVE_RR)
+            # If reach still below floor, both sit on broker floor at 1:1.
+            if profit_d + 1e-12 < stop_d:
+                stop_d = max(floor, profit_d)
+                profit_d = stop_d
+            reshape_reason = 'shrunk_sl_to_reachable_1R'
+        reshaped = True
+    # Effective κ after reshape (for tagging / learning).
     eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
     # LIVE floor κ≥1 — never send TP≪SL via stop_take(kappa=0.5).
     live_kappa = max(MIN_LIVE_RR, float(eff_kappa))
@@ -700,25 +708,28 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         entry, 'BUY', tick_f, sp, mn,
         kappa=live_kappa, sl_scale=1.0,
         range_distance=stop_d)
-    # Re-check after tick snap (ceil can still leave RR slightly off).
     sd = float(snapped['stop_distance'])
     pd = float(snapped['profit_distance'])
-    if (not blocked) and sd > 1e-12 and pd + 1e-12 < sd * MIN_LIVE_RR:
-        blocked = True
-        block_reason = f'snapped RR {pd/sd:.3f} < {MIN_LIVE_RR} — refuse −EV OPEN'
+    # After tick snap, nudge TP up to SL if ceil left RR slightly short.
+    if sd > 1e-12 and pd + 1e-12 < sd * MIN_LIVE_RR:
+        pd = sd
+        reshaped = True
+        reshape_reason = (reshape_reason or 'snap') + '+ceil_1R'
     return {
         'stop_distance': sd,
         'profit_distance': pd,
-        'kappa': float(snapped.get('kappa') or live_kappa),
+        'kappa': max(MIN_LIVE_RR, (pd / sd) if sd > 1e-12 else live_kappa),
         'sl_scale': 1.0,
         'ohlc_kappa': float(ohlc_kappa),
         'ohlc_sl': float(raw_sl),
         'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
         'tighten': float(t),
-        'blocked': blocked,
-        'block_reason': block_reason,
+        'blocked': False,
+        'block_reason': None,
+        'reshaped': reshaped,
+        'reshape_reason': reshape_reason,
         'source': 'ohlc_zone',
-        'ready': bool(z.get('ready')) and not blocked,
+        'ready': bool(z.get('ready')),
         'lookback': z.get('lookback'),
         'median_up': z.get('median_up'),
         'median_down': z.get('median_down'),
@@ -793,8 +804,9 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         'lookback':zone.get('lookback'),
         'stop_distance':decided['stop_distance'],
         'profit_distance':decided['profit_distance'],
-        'blocked':bool(decided.get('blocked')),
-        'block_reason':decided.get('block_reason'),
+        'blocked':False,
+        'reshaped':bool(decided.get('reshaped')),
+        'reshape_reason':decided.get('reshape_reason'),
         'bracket_source':'ohlc_zone',
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }

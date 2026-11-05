@@ -127,12 +127,14 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                 sp=0.
             if not math.isfinite(sp) or sp<0:
                 sp=0.
-            # One RT cost proxy; opposite must beat HOLD by more than noise.
-            opp_floor=max(1e-9, 0.25*sp) if sp>0 else float('inf')
+            # Soft approach: missing spread → HOLD teach only (does NOT freeze
+            # LIVE OPEN). Known spread → opposite only if it clears a cost floor;
+            # otherwise HOLD. Keeps early-day trading; stops false flip churn.
+            opp_floor=max(1e-9, 0.25*sp) if sp>0 else None
             if sp<=0:
                 best='HOLD'
                 mode_tag='loss_hold_missing_spread'
-            elif opp_val>opp_floor:
+            elif opp_val>(opp_floor or 0):
                 best=opposite
                 mode_tag=('flip_loss_counterfactual_' if flip_after_loss
                           else 'loss_counterfactual_')+best.lower()
@@ -141,8 +143,7 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                 mode_tag=('flip_loss_counterfactual_hold' if flip_after_loss
                           else 'loss_counterfactual_hold')
             return {'label':_ACTION_LABEL[best],'mode':mode_tag,
-                    'actual_pnl':pnl,'simulated':sim,
-                    'opp_floor':opp_floor if math.isfinite(opp_floor) else None}
+                    'actual_pnl':pnl,'simulated':sim,'opp_floor':opp_floor}
         return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
                 'simulated':None}
     # Flat / unknown £ — still prefer path evidence over inventing HOLD.

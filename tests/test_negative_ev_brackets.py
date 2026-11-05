@@ -1,4 +1,4 @@
-"""Live Gold: κ<1 OPEN + flip_loss with spread≈0 → rapid −£0.10 churn."""
+"""Keep trading like early days — reshape to ≥1:1, do not HOLD-out the session."""
 import tempfile
 from pathlib import Path
 
@@ -17,8 +17,8 @@ def test_live_kappa_floor_is_at_least_one():
     assert MIN_LIVE_RR >= 1.0
 
 
-def test_max_tp_crush_blocks_negative_ev_open():
-    """Tiny reachable TP vs wide SL must refuse OPEN, not send κ=0.5."""
+def test_max_tp_crush_reshapes_not_blocks():
+    """Tiny reachable TP vs wide SL → shrink SL / force 1:1, still tradeable."""
     zone = {
         'kappa': 1.5,
         'range_distance': 2.0,
@@ -28,11 +28,12 @@ def test_max_tp_crush_blocks_negative_ev_open():
     }
     d = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.3, min_distance=0.3, tighten=1.0)
-    assert d['blocked'] is True
-    assert d.get('block_reason')
-    # Must not leave a sendable −EV shape as the only outcome.
-    if d['stop_distance'] > 0 and not d['blocked']:
-        assert d['profit_distance'] / d['stop_distance'] >= MIN_LIVE_RR - 1e-9
+    assert d['blocked'] is False
+    assert d.get('reshaped') is True
+    assert d['stop_distance'] > 0 and d['profit_distance'] > 0
+    assert d['profit_distance'] / d['stop_distance'] >= MIN_LIVE_RR - 1e-9
+    # Risk was cut toward reachable / floor — not left at fantasy 2.0 SL.
+    assert d['stop_distance'] < 2.0
 
 
 def test_reachable_1_to_1_forces_rr_not_half_kappa():
@@ -55,13 +56,11 @@ def test_loss_with_missing_spread_teaches_hold_not_flip():
     d = label_from_profit(
         'SELL', -0.12, flip_after_loss=True,
         entry=3950.0, exit_level=3950.2, spread=0.0)
-    assert d['label'] == 2  # HOLD
+    assert d['label'] == 2  # HOLD teach only — OPEN path unchanged
     assert 'hold' in d['mode']
-    assert 'buy' not in d['mode'] or d['mode'].endswith('hold')
 
 
 def test_loss_opposite_must_clear_spread_floor():
-    # Tiny opposite mid move inside RT spread → HOLD, not flip.
     d = label_from_profit(
         'BUY', -0.15, flip_after_loss=True,
         entry=100.0, exit_level=99.98, spread=0.40)
@@ -73,6 +72,5 @@ def test_multiplier_cuts_cannot_go_below_one():
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(Path(tmp) / 's.db')
         save_multipliers(store, 1.0, 1.0, reason='seed')
-        # Simulate many cut steps via direct save clip.
         save_multipliers(store, 0.4, 1.0, reason='poison')
         assert load_multipliers(store)['kappa'] >= 1.0

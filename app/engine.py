@@ -3648,25 +3648,20 @@ class SingleTradeEngine:
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0))
-            # Refuse −EV brackets (TP≪SL after max_tp crush) — live Gold churn.
-            if decided.get('blocked'):
-                self.last_entry_reason=(decided.get('block_reason')
-                                       or 'OHLC brackets not viable (RR<1)')
-                self.store.event('entry','OPEN skipped — −EV OHLC brackets',{
-                    'reason':self.last_entry_reason,
+            # Keep trading (early-day behaviour): reshape to ≥1:1, do not HOLD-out.
+            if decided.get('reshaped'):
+                self.store.event('bracket','OPEN brackets reshaped to ≥1:1 (keep trading)',{
+                    'reason':decided.get('reshape_reason'),
                     'stop_distance':decided.get('stop_distance'),
                     'profit_distance':decided.get('profit_distance'),
                     'ohlc_tp':decided.get('ohlc_tp'),
                     'ohlc_sl':decided.get('ohlc_sl'),
                     'kappa':decided.get('kappa')})
-                return
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
+            # Safety: if snap still left TP short, lift TP to SL — still OPEN.
             if sd>0 and pd+1e-12<sd:
-                self.last_entry_reason=f'OPEN skipped — RR {pd/sd:.3f}<1'
-                self.store.event('entry','OPEN skipped — TP below SL',{
-                    'stop_distance':sd,'profit_distance':pd})
-                return
+                pd=sd
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
                 'stop_level':float(entry)-sign*sd,
@@ -3675,6 +3670,7 @@ class SingleTradeEngine:
                 'profit_ticks':decided.get('profit_ticks'),
                 'kappa':decided.get('kappa'),'sl_scale':1.0,
                 'raised_to_broker_min':decided.get('raised_to_broker_min'),
+                'reshaped':bool(decided.get('reshaped')),
                 'bracket_source':'ohlc_zone',
             }
             bp={'kappa':decided['kappa'],'sl_scale':1.0,'explored':False,

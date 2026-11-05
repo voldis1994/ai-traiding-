@@ -18,7 +18,8 @@ from .liquidity_feed import (
 )
 from .market_context import FEATURE_NAMES, FEATURE_DIM, candle_time
 
-FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_liquidity_shadow_v6'
+# Bumped with OHLC structure channels (market_context shadow_v5).
+FUSION_SCHEMA = 'closed_m1_m5_m15_h1_intermarket_news_liquidity_shadow_v7'
 EXTERNAL_NAMES = (
     'peer_corr_weighted_return_1m',
     'peer_corr_weighted_return_5m',

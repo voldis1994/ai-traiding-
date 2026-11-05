@@ -2322,39 +2322,21 @@ class SingleTradeEngine:
             deal_id=deal_id,spread=spread)
         if not rec:
             return None
+        # Explain why (audit) — do NOT second-teach opposite/HOLD here.
+        # Understanding comes from structure channels already in entry ``z``;
+        # the single trade-PnL teacher (label_from_profit) updates those weights.
         frame=(rec.get('snapshot') or {}).get('frame') or {}
         teach=structure_shadow.suggest_teach(
             frame=frame,direction=direction,broker_pnl=broker_pnl)
-        taught=False
-        if teach and transition and teach.get('label') in (0,1,2):
-            from .self_params import load as load_self_params
-            sp=load_self_params(self.store)
-            lr=float(sp.get('learn_lr',0.28))
-            # Light structure teach — explain why, don't drown the main CF label.
-            repeats=max(1,min(3,int(sp.get('structure_shadow_repeats',2))))
-            for i in range(repeats):
-                step=self.brain.learn_from_trade(
-                    transition,int(teach['label']),lr=lr,won=False,
-                    count_sample=(i==0))
-                meta=getattr(self.brain.core,'last_learn_meta',None) or {}
-                if (step is not None and not meta.get('restored')
-                        and float(meta.get('delta_norm') or 0)>1e-9):
-                    taught=True
-            if taught:
-                learning_generation.bump(self.store,'structure_shadow_teach')
-                try:
-                    self._shadow_learn(None,int(teach['label']),lr=lr)
-                except Exception:
-                    pass
-            self.store.event('structure_shadow',
-                'Shadow explained SL frame and taught LIVE neurons',{
-                    'deal_id':deal_id,'key':rec.get('key'),
-                    'structure':teach.get('structure'),
-                    'why':teach.get('why'),
-                    'suggest':teach.get('suggest'),
-                    'label':teach.get('label'),
-                    'taught':taught,'learn_repeats':repeats})
-        rec=dict(rec,teach=teach,taught=taught)
+        self.store.event('structure_shadow',
+            'Shadow framed why SL happened (structure already in OPEN features)',{
+                'deal_id':deal_id,'key':rec.get('key'),
+                'structure':(teach or {}).get('structure') or frame.get('structure'),
+                'why':(teach or {}).get('why'),
+                'suggest':(teach or {}).get('suggest'),
+                'taught_weights':False,
+                'reason':'single_teacher_via_structure_features'})
+        rec=dict(rec,teach=teach,taught=False)
         return rec
 
     def _signal_reason(self,action,market_status=None,evaluation=None):

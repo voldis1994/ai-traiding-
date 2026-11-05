@@ -2279,8 +2279,11 @@ class SingleTradeEngine:
         except Exception:
             candles=[]
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
-        path=chron[-30:] if len(chron)>30 else chron
-        pre=chron[:-30] if len(chron)>30 else chron[:max(0,len(chron)//2)]
+        # Evidence lookback only (not a closed-trade path): recent path + prior.
+        n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))
+        n_pre=int(getattr(structure_shadow,'ADVISE_PRE_BARS',40))
+        path=chron[-n_path:] if len(chron)>n_path else chron
+        pre=chron[-(n_path+n_pre):-n_path] if len(chron)>n_path else chron[:max(0,len(chron)//2)]
         return structure_shadow.advise(
             self.store,epic=epic,proposal=proposal,bars=path,pre_bars=pre)
 
@@ -2289,8 +2292,8 @@ class SingleTradeEngine:
                                       spread,transition=None):
         """Freeze SL path, frame why, teach LIVE neurons the shadow suggestion.
 
-        Shadow explains the grave → suggest HOLD/opposite → train LIVE (+shadow)
-        weights. Does not place orders or veto the next OPEN.
+        Path = entry M1 → exit M1 (inclusive). Pre = candles before entry
+        (breakout context only). Does not place orders or veto the next OPEN.
         """
         bar_time=(saved or {}).get('bar_time')
         try:
@@ -2298,21 +2301,20 @@ class SingleTradeEngine:
         except Exception:
             candles=[]
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
-        pre=[];path=[]
+        # Pre-entry context (before decision bar).
+        pre=[]
         if bar_time:
-            for c in chron:
-                at=c.get('at')
-                if at is None:continue
-                if str(at)<str(bar_time):
-                    pre.append(c)
-                else:
-                    path.append(c)
+            pre=[c for c in chron if c.get('at') is not None and str(c.get('at'))<str(bar_time)]
         else:
             mid=max(3,len(chron)//2)
             pre=chron[:mid]
-            path=chron[mid:]
-        if len(pre)>40:pre=pre[-40:]
-        if len(path)>60:path=path[:60]
+        max_pre=int(getattr(structure_shadow,'MAX_PRE_BARS',40))
+        if len(pre)>max_pre:pre=pre[-max_pre:]
+        # In-trade path: entry bar → exit bar (cut post-close; keep SL candle).
+        path=structure_shadow.trim_path_entry_to_exit(
+            chron,direction=direction,entry=entry,exit_level=exit_level,
+            entry_bar_time=bar_time,exit_bar_time=None,
+            limit=int(getattr(structure_shadow,'MAX_BARS_PER_SNAP',60)))
         rec=structure_shadow.record_loss(
             self.store,epic=epic,direction=direction,entry=entry,
             exit_level=exit_level,exit_reason=exit_reason,

@@ -1,30 +1,23 @@
-"""End-result proof: structure shadow improves £ vs blind re-entry.
+"""End-result proof: structure shadow teaches LIVE neurons — no hard veto.
 
-Scenario (Gold-like scratch SL world):
-  - Many TREND_DOWN windows where BUY → SL (−£0.12)
-  - Occasional TREND_UP windows where BUY → TP (+£0.30)
-  - Neural always proposes BUY (worst case: directionally stuck)
-
-Without structure memory: takes every BUY → death by a thousand scratches.
-With structure memory: after MIN_ADVICE_SAMPLES SL graves on TREND_DOWN|BUY,
-further BUY proposals in that frame become HOLD → skips the graves, still
-takes TREND_UP wins.
-
-Asserts: net £, loss count, and max loss-streak all improve with shadow on.
+Operator logic:
+  LIVE executes only neural BUY/SELL/HOLD.
+  Shadow frames why SL happened and teaches a different label into weights.
+  Next votes shift away from the grave side — £ improves without an external gate.
 """
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
 
-from app.engine import Store
+import numpy as np
+
+from app.engine import AdaptiveBrain, Store
 from app import structure_shadow as ss
 
 
 LOSS_GBP = -0.12
 WIN_GBP = 0.30
-N_DOWN = 15   # hostile TREND_DOWN episodes
-N_UP = 4      # favorable TREND_UP episodes interleaved
 
 
 def _trend_down(n=12, start=3950.0, step=0.35):
@@ -51,139 +44,151 @@ def _trend_up(n=12, start=3950.0, step=0.35):
     return rows
 
 
-def _run(*, use_structure_shadow: bool) -> dict:
-    """Replay the same proposal stream; optionally apply structure advice."""
+def _scores(brain, transition):
+    """Softmax BUY/SELL/HOLD from a frozen transition (decision-time h/c)."""
+    core = brain.core
+    z = np.asarray(transition['z'], dtype=float)
+    h = np.asarray(transition['h'], dtype=float)
+    c = np.asarray(transition['c'], dtype=float)
+    _, _, logits = core._forward(z, h, c, float(transition.get('dt') or 1.0))
+    prob = core._softmax(logits)
+    return dict(zip(('BUY', 'SELL', 'HOLD'), map(float, prob)))
+
+
+def test_suggest_teach_explains_hostile_frame():
+    frame = ss.frame_from_ohlc(_trend_down())
+    assert frame['structure'] == 'TREND_DOWN'
+    teach = ss.suggest_teach(frame=frame, direction='BUY', broker_pnl=LOSS_GBP)
+    assert teach is not None
+    assert teach['suggest'] in ('HOLD', 'SELL')
+    assert teach['label'] in (1, 2)
+    assert 'TREND_DOWN' in teach['why']
+
+
+def test_advise_is_evidence_not_required_for_live():
+    """advise() may say HOLD — that is shadow opinion, not a LIVE gate API."""
     with tempfile.TemporaryDirectory() as tmp:
-        store = Store(Path(tmp) / 'db.sqlite3') if use_structure_shadow else None
-        # When shadow off, still need a throwaway store for frame classify only
-        # if we want — but advice is skipped entirely.
-        if store is None:
-            store = Store(Path(tmp) / 'off.sqlite3')
-            shadow_on = False
-        else:
-            shadow_on = True
+        store = Store(Path(tmp) / 'db.sqlite3')
+        bars = _trend_down()
+        for i in range(3):
+            ss.record_loss(
+                store, epic='GOLD', direction='BUY',
+                entry=bars[0]['open'], exit_level=bars[-1]['close'],
+                exit_reason='sl', broker_pnl=LOSS_GBP, bars=bars, deal_id=f'd{i}')
+        advice = ss.advise(store, epic='GOLD', proposal='BUY', bars=bars)
+        assert advice.get('action') == 'HOLD'  # opinion
+        # Contract: callers must not treat this as submit veto — documented.
+        assert 'reason' in advice
 
-        pnls = []
-        actions = []
-        holds = 0
-        deal = 0
-        # Exact mix: 15 hostile DOWN + 4 favorable UP, interleaved (4 DOWN, 1 UP).
-        episodes = []
-        down_left, up_left = N_DOWN, N_UP
-        i = 0
-        while down_left or up_left:
-            # Every 5th slot prefers UP while any remain; else DOWN.
-            take_up = up_left > 0 and (i % 5 == 4 or down_left == 0)
-            if take_up:
-                episodes.append(('UP', _trend_up(start=3950 + i)))
-                up_left -= 1
-            else:
-                episodes.append(('DOWN', _trend_down(start=3950 + i * 0.5)))
-                down_left -= 1
-            i += 1
-        assert sum(1 for e in episodes if e[0] == 'DOWN') == N_DOWN
-        assert sum(1 for e in episodes if e[0] == 'UP') == N_UP
 
-        for kind, bars in episodes:
-            proposal = 'BUY'  # stuck bullish brain
-            frame = ss.frame_from_ohlc(bars)
-            assert frame['ready']
-            if kind == 'DOWN':
-                assert frame['structure'] == 'TREND_DOWN'
-            else:
-                assert frame['structure'] == 'TREND_UP'
-
-            action = proposal
-            if shadow_on:
-                advice = ss.advise(
-                    store, epic='GOLD', proposal=proposal, bars=bars)
-                if advice.get('action') == 'HOLD':
-                    action = 'HOLD'
-                    holds += 1
-                    actions.append('HOLD')
-                    continue  # flat — no £
-
-            # Execute proposal
-            if kind == 'DOWN':
-                pnl = LOSS_GBP
-                exit_reason = 'sl'
-            else:
-                pnl = WIN_GBP
-                exit_reason = 'tp'
-            pnls.append(pnl)
-            actions.append(action)
-            deal += 1
-            if shadow_on and pnl < 0:
-                ss.record_loss(
-                    store, epic='GOLD', direction=proposal,
-                    entry=bars[0]['open'], exit_level=bars[-1]['close'],
-                    exit_reason=exit_reason, broker_pnl=pnl,
-                    bars=bars, deal_id=f'd{deal}', spread=0.35)
-
-        # Loss streak (consecutive negative pnls in executed trades)
-        max_streak = streak = 0
-        for p in pnls:
-            if p < 0:
-                streak += 1
-                max_streak = max(max_streak, streak)
-            else:
-                streak = 0
-
-        return {
-            'shadow': shadow_on,
-            'net': sum(pnls),
-            'trades': len(pnls),
-            'holds': holds,
-            'losses': sum(1 for p in pnls if p < 0),
-            'wins': sum(1 for p in pnls if p > 0),
-            'max_loss_streak': max_streak,
-            'pnls': pnls,
-            'actions': actions,
+def test_structure_teach_shifts_live_neurons_away_from_grave_side():
+    """After SL frames teach HOLD/opposite, BUY score on that state drops."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / 'db.sqlite3')
+        brain = AdaptiveBrain(store, data_dir=tmp)
+        z = np.linspace(-0.2, 0.2, brain.core.d)
+        brain.core.last_z = z.copy()
+        # Capture a decision-time transition (as OPEN would).
+        h0, c0 = brain.core.h.copy(), brain.core.c.copy()
+        brain.core.last_transition = {
+            'z': z.copy(), 'h': h0, 'c': c0, 'dt': 1.0,
+            'neuron_ids': brain.core.neuron_ids.copy(),
         }
+        tr = dict(brain.core.last_transition)
+        before = _scores(brain, tr)
+        bars = _trend_down()
+        frame = ss.frame_from_ohlc(bars)
+        teach = ss.suggest_teach(frame=frame, direction='BUY', broker_pnl=LOSS_GBP)
+        assert teach and teach['label'] in (0, 1, 2)
+        # Simulate shadow → LIVE teach loop (same as engine after SL).
+        for _ in range(8):
+            brain.learn_from_trade(tr, int(teach['label']), lr=0.35, won=False)
+        after = _scores(brain, tr)
+        # Grave side BUY must not gain; HOLD or opposite should rise.
+        assert after['BUY'] <= before['BUY'] + 1e-9
+        if teach['suggest'] == 'HOLD':
+            assert after['HOLD'] >= before['HOLD'] - 1e-9
+            assert after['HOLD'] > before['HOLD'] or after['BUY'] < before['BUY']
+        else:
+            assert after['SELL'] >= before['SELL'] - 1e-9
 
 
-def test_structure_shadow_improves_net_pnl():
-    blind = _run(use_structure_shadow=False)
-    smart = _run(use_structure_shadow=True)
+def test_taught_brain_skips_more_graves_improves_pnl():
+    """£ proof: stuck-BUY brain vs same brain after structure-shadow teach.
 
-    # Blind takes every hostile BUY → many losses.
-    assert blind['losses'] >= N_DOWN - 1
-    assert blind['holds'] == 0
+    Both start BUY-biased (like Gold flip streak). Blind keeps BUY→SL on
+    TREND_DOWN. Teach path: after each SL, shadow frames why and trains HOLD
+    into LIVE neurons — later argmax skips graves. No external HOLD veto.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        z = np.linspace(-0.15, 0.15, 48)  # filled per brain.d below
+        down = _trend_down()
+        up = _trend_up()
+        # Hostile first (streak), then a few UP recoveries.
+        episodes = [('DOWN', down)] * 12 + [('UP', up)] * 4
 
-    # Shadow learns after MIN_ADVICE_SAMPLES and skips further DOWN graves.
-    assert smart['holds'] >= N_DOWN - ss.MIN_ADVICE_SAMPLES
-    assert smart['losses'] < blind['losses']
-    assert smart['net'] > blind['net']
-    assert smart['max_loss_streak'] <= ss.MIN_ADVICE_SAMPLES
-    assert smart['max_loss_streak'] < blind['max_loss_streak']
-    # Still captured the UP wins (shadow does not block TREND_UP|BUY).
-    assert smart['wins'] == blind['wins'] == N_UP
+        def _fresh_buy_biased(tag: str):
+            b = AdaptiveBrain(Store(Path(tmp) / f'{tag}.sqlite3'), data_dir=tmp)
+            zz = np.linspace(-0.15, 0.15, b.core.d)
+            b.core.last_z = zz.copy()
+            h0, c0 = b.core.h.copy(), b.core.c.copy()
+            local_tr = {
+                'z': zz.copy(), 'h': h0, 'c': c0, 'dt': 1.0,
+                'neuron_ids': b.core.neuron_ids.copy(),
+            }
+            b.core.last_transition = dict(local_tr)
+            # Pound BUY into the core — stuck bullish (operator Gold symptom).
+            for _ in range(25):
+                b.learn_from_trade(local_tr, 0, lr=0.45, won=True)
+            sc0 = _scores(b, local_tr)
+            assert sc0['BUY'] == max(sc0.values())
+            return b, local_tr
 
+        def run(use_teach: bool):
+            b, local_tr = _fresh_buy_biased('teach' if use_teach else 'blind')
+            pnls = []
+            holds = 0
+            for kind, bars in episodes:
+                sc = _scores(b, local_tr)
+                action = max(('BUY', 'SELL', 'HOLD'), key=lambda a: sc[a])
+                if action == 'HOLD':
+                    holds += 1
+                    continue
+                if action == 'BUY' and kind == 'DOWN':
+                    pnls.append(LOSS_GBP)
+                    if use_teach:
+                        frame = ss.frame_from_ohlc(bars)
+                        teach = ss.suggest_teach(
+                            frame=frame, direction='BUY', broker_pnl=LOSS_GBP)
+                        # Engine uses ~2 repeats; amplify slightly for unit-test
+                        # horizon so weight move is visible within 12 graves.
+                        for _ in range(4):
+                            b.learn_from_trade(
+                                local_tr, int(teach['label']), lr=0.4, won=False)
+                elif action == 'BUY' and kind == 'UP':
+                    pnls.append(WIN_GBP)
+                elif action == 'SELL' and kind == 'DOWN':
+                    pnls.append(WIN_GBP)
+                elif action == 'SELL' and kind == 'UP':
+                    pnls.append(LOSS_GBP)
+            return {
+                'net': sum(pnls), 'trades': len(pnls), 'holds': holds,
+                'losses': sum(1 for p in pnls if p < 0),
+                'wins': sum(1 for p in pnls if p > 0),
+            }
 
-def test_structure_shadow_improvement_is_material():
-    """£ gap must be more than noise — at least several skipped scratch SL."""
-    blind = _run(use_structure_shadow=False)
-    smart = _run(use_structure_shadow=True)
-    saved = smart['net'] - blind['net']
-    skipped = blind['losses'] - smart['losses']
-    assert skipped >= 5
-    # Each skipped SL saves |LOSS_GBP|; wins identical → gap ≈ skipped * |loss|
-    assert saved >= skipped * abs(LOSS_GBP) - 1e-9
-    assert saved >= 0.60  # ≥ five × £0.12
-
-
-def test_print_comparison_for_operator(capsys):
-    """Human-readable proof line (always asserts improvement)."""
-    blind = _run(use_structure_shadow=False)
-    smart = _run(use_structure_shadow=True)
-    print(
-        f"BLIND  net=£{blind['net']:.2f} trades={blind['trades']} "
-        f"losses={blind['losses']} max_streak={blind['max_loss_streak']}")
-    print(
-        f"SHADOW net=£{smart['net']:.2f} trades={smart['trades']} "
-        f"losses={smart['losses']} holds={smart['holds']} "
-        f"max_streak={smart['max_loss_streak']}")
-    print(
-        f"DELTA  £{smart['net'] - blind['net']:+.2f} "
-        f"(skipped {blind['losses'] - smart['losses']} SL graves)")
-    assert smart['net'] > blind['net']
+        blind = run(False)
+        smart = run(True)
+        print(
+            f"BLIND  net=£{blind['net']:.2f} trades={blind['trades']} "
+            f"losses={blind['losses']} holds={blind['holds']}")
+        print(
+            f"TEACH  net=£{smart['net']:.2f} trades={smart['trades']} "
+            f"losses={smart['losses']} holds={smart['holds']}")
+        print(f"DELTA  £{smart['net'] - blind['net']:+.2f}")
+        assert blind['losses'] >= 10  # stuck BUY eats the DOWN streak
+        assert smart['net'] > blind['net']
+        assert smart['losses'] < blind['losses']
+        # "Do differently" may be HOLD *or* opposite (SELL on TREND_DOWN) —
+        # either path is neural, not an external veto. £ is the proof.
+        assert smart['net'] - blind['net'] >= 1.0

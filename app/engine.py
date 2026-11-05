@@ -2259,12 +2259,10 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',reason=edge['reason'],
                             unified_cycle=edge)
             result=dict(result,unified_cycle=edge)
-            # Structure shadow: OHLC frame matches prior SL graves for this side → HOLD.
-            struct=self._structure_shadow_advice(result['action'])
-            result=dict(result,structure_shadow=struct)
-            if struct.get('action')=='HOLD':
-                return dict(result,action='HOLD',reason=struct.get('reason') or
-                            'Structure shadow: same OHLC frame killed this side')
+            # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
+            # LIVE executes neural vote; shadow teaches weights after SL closes.
+            result=dict(result,structure_shadow=self._structure_shadow_advice(
+                result['action']))
         else:
             result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
                 (self.last_signal or {}).get('scores'),result,
@@ -2272,7 +2270,7 @@ class SingleTradeEngine:
         return result
 
     def _structure_shadow_advice(self,proposal):
-        """Frame current candles; ask shadow memory if this side dies here."""
+        """Evidence/UI: does current OHLC match prior SL graves? Not a LIVE gate."""
         if proposal not in ('BUY','SELL') or not self.mandate:
             return {'action':None,'reason':'no_proposal'}
         epic=self.mandate.get('epic')
@@ -2280,7 +2278,6 @@ class SingleTradeEngine:
             candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
         except Exception:
             candles=[]
-        # Chronological: recent path + older pre-window for breakout detect.
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
         path=chron[-30:] if len(chron)>30 else chron
         pre=chron[:-30] if len(chron)>30 else chron[:max(0,len(chron)//2)]
@@ -2289,8 +2286,12 @@ class SingleTradeEngine:
 
     def _record_structure_shadow_loss(self,deal_id,saved,*,epic,direction,
                                       entry,exit_level,exit_reason,broker_pnl,
-                                      spread):
-        """Freeze SL/loss OHLC path so shadow can frame the market event."""
+                                      spread,transition=None):
+        """Freeze SL path, frame why, teach LIVE neurons the shadow suggestion.
+
+        Shadow explains the grave → suggest HOLD/opposite → train LIVE (+shadow)
+        weights. Does not place orders or veto the next OPEN.
+        """
         bar_time=(saved or {}).get('bar_time')
         try:
             candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
@@ -2312,11 +2313,47 @@ class SingleTradeEngine:
             path=chron[mid:]
         if len(pre)>40:pre=pre[-40:]
         if len(path)>60:path=path[:60]
-        return structure_shadow.record_loss(
+        rec=structure_shadow.record_loss(
             self.store,epic=epic,direction=direction,entry=entry,
             exit_level=exit_level,exit_reason=exit_reason,
             broker_pnl=broker_pnl,bars=path,pre_bars=pre,
             deal_id=deal_id,spread=spread)
+        if not rec:
+            return None
+        frame=(rec.get('snapshot') or {}).get('frame') or {}
+        teach=structure_shadow.suggest_teach(
+            frame=frame,direction=direction,broker_pnl=broker_pnl)
+        taught=False
+        if teach and transition and teach.get('label') in (0,1,2):
+            from .self_params import load as load_self_params
+            sp=load_self_params(self.store)
+            lr=float(sp.get('learn_lr',0.28))
+            # Light structure teach — explain why, don't drown the main CF label.
+            repeats=max(1,min(3,int(sp.get('structure_shadow_repeats',2))))
+            for i in range(repeats):
+                step=self.brain.learn_from_trade(
+                    transition,int(teach['label']),lr=lr,won=False,
+                    count_sample=(i==0))
+                meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+                if (step is not None and not meta.get('restored')
+                        and float(meta.get('delta_norm') or 0)>1e-9):
+                    taught=True
+            if taught:
+                learning_generation.bump(self.store,'structure_shadow_teach')
+                try:
+                    self._shadow_learn(None,int(teach['label']),lr=lr)
+                except Exception:
+                    pass
+            self.store.event('structure_shadow',
+                'Shadow explained SL frame and taught LIVE neurons',{
+                    'deal_id':deal_id,'key':rec.get('key'),
+                    'structure':teach.get('structure'),
+                    'why':teach.get('why'),
+                    'suggest':teach.get('suggest'),
+                    'label':teach.get('label'),
+                    'taught':taught,'learn_repeats':repeats})
+        rec=dict(rec,teach=teach,taught=taught)
+        return rec
 
     def _signal_reason(self,action,market_status=None,evaluation=None):
         if not self.last_signal:return 'No neural signal'
@@ -3371,14 +3408,18 @@ class SingleTradeEngine:
                     deal_id,saved,epic=epic,direction=direction,
                     entry=entry,exit_level=exit_level,
                     exit_reason=exit_reason_tag or 'loss',
-                    broker_pnl=pnl_value,spread=spread_cost)
-                if rec:
+                    broker_pnl=pnl_value,spread=spread_cost,
+                    transition=saved.get('transition') if isinstance(saved,dict) else None)
+                if rec and not rec.get('taught'):
+                    # Snapshot stored even if teach skipped (no transition / no frame).
                     self.store.event('structure_shadow',
                         'Recorded loss OHLC frame for shadow memory',{
                             'deal_id':deal_id,'key':rec.get('key'),
                             'structure':(rec.get('snapshot') or {}).get('frame',{}).get('structure'),
                             'direction':direction,'pnl':pnl_value,
-                            'bars':len((rec.get('snapshot') or {}).get('bars') or [])})
+                            'bars':len((rec.get('snapshot') or {}).get('bars') or []),
+                            'suggest':(rec.get('teach') or {}).get('suggest'),
+                            'why':(rec.get('teach') or {}).get('why')})
         except Exception as exc:
             self.store.event('warning','Structure shadow record skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

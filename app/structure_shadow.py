@@ -1,14 +1,15 @@
-"""Shadow learns market *structure* from bad (SL) trade OHLC paths.
+"""Shadow learns *why* an SL happened from the OHLC path — then teaches LIVE neurons.
 
-Idea (operator): every losing SL trade freezes a snapshot — entry, exit, and
-every candle while the position was open. Shadow frames that path as a market
-event (RANGE / TREND_UP|DOWN / BREAKOUT_UP|DOWN / CHOP) from OHLC geometry
-alone. Later, before LIVE OPEN, shadow matches the *current* candle layout to
-those bad frames and returns precise advice (HOLD / avoid that side) with a
-confidence rooted in how often that structure killed the same direction.
+Operator logic (not a second policy engine):
+  1. LIVE only executes what neurons vote (BUY/SELL/HOLD).
+  2. After a bad SL, shadow freezes entry→exit candles and frames the market
+     event (RANGE / TREND_UP|DOWN / BREAKOUT_UP|DOWN / CHOP).
+  3. Shadow explains *why* that side died in this frame and suggests a teach
+     label (usually HOLD, sometimes opposite when the path clearly favored it).
+  4. That label is trained into LIVE (+ shadow) weights — so next time LIVE
+     *knows* via neurons. Shadow does NOT hard-veto OPEN outside the brain.
 
-No TP/SL hardcode. Structure is read from candles; LIVE still decides size and
-brackets from OHLC zone. This module only remembers *when* a side was wrong.
+No TP/SL hardcode. ``advise()`` is evidence/UI only — never a LIVE gate.
 """
 from __future__ import annotations
 
@@ -304,12 +305,66 @@ def record_loss(store, *, epic, direction, entry, exit_level, exit_reason,
     return {'snapshot': snap, 'bucket': bucket, 'key': key}
 
 
+def suggest_teach(*, frame, direction, broker_pnl=None) -> dict | None:
+    """After an SL path: what label should LIVE neurons learn, and why.
+
+    Shadow's job — explain the grave and recommend a different behaviour.
+    LIVE absorbs it only through ``learn_from_trade`` (weights), never as an
+    external OPEN veto.
+
+    Labels: 0=BUY, 1=SELL, 2=HOLD.
+    """
+    if direction not in ('BUY', 'SELL'):
+        return None
+    if not isinstance(frame, dict) or not frame.get('ready'):
+        return None
+    structure = str(frame.get('structure') or 'CHOP').upper()
+    if structure not in STRUCTURES:
+        structure = 'CHOP'
+    opposite = 'SELL' if direction == 'BUY' else 'BUY'
+    # Path clearly ran the other way → teach opposite (do differently).
+    favors_opposite = (
+        (direction == 'BUY' and structure in ('TREND_DOWN', 'BREAKOUT_DOWN'))
+        or (direction == 'SELL' and structure in ('TREND_UP', 'BREAKOUT_UP'))
+    )
+    # Chop / range / same-way structure → prefer HOLD (don't invent a flip).
+    if favors_opposite:
+        # Strong geometric oppose — still prefer HOLD on tiny scratch losses;
+        # clear opposite only when net moved hard against the side.
+        nor = _finite(frame.get('net_over_range'))
+        hard = nor is not None and (
+            (direction == 'BUY' and nor <= -0.35)
+            or (direction == 'SELL' and nor >= 0.35)
+            or structure.startswith('BREAKOUT_')
+        )
+        if hard:
+            label = 0 if opposite == 'BUY' else 1
+            suggest = opposite
+            why = (f'{structure}: path ran against {direction} '
+                   f'(net/range={nor}) — teach {opposite}')
+        else:
+            label, suggest = 2, 'HOLD'
+            why = (f'{structure}: hostile to {direction} but move not decisive '
+                   f'— teach HOLD (not a blind flip)')
+    else:
+        label, suggest = 2, 'HOLD'
+        why = (f'{structure}: {direction} SL in non-favorable frame — teach HOLD')
+    return {
+        'label': int(label),
+        'suggest': suggest,
+        'structure': structure,
+        'why': why,
+        'direction_lost': direction,
+        'broker_pnl': _finite(broker_pnl),
+    }
+
+
 def advise(store, *, epic, proposal, bars=None, pre_bars=None,
            min_samples=MIN_ADVICE_SAMPLES, sl_rate=ADVICE_SL_RATE) -> dict:
-    """Match current OHLC layout to bad frames; tell LIVE what not to do.
+    """Evidence only: current OHLC matches prior SL graves?
 
-    Returns action advice for the *proposal* side only — never invents a flip
-    OPEN. Strong match → HOLD with structure evidence for the operator / gate.
+    For UI / events / operator. Must NOT gate LIVE OPEN — neurons decide.
+    ``action='HOLD'`` here means “shadow would recommend HOLD teach”, not a veto.
     """
     path = normalise_bars(bars)
     frame = frame_from_ohlc(path, pre_bars=pre_bars)

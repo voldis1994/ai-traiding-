@@ -15,14 +15,12 @@ from statistics import mean, median
 DEFAULT_KAPPA=1.0
 DEFAULT_SL_SCALE=1.0
 # Soft rails on learned multipliers — operating schedule lives in self_params.
-# LIVE must not learn κ<1 — that made TP≪SL after loss streaks (−EV machine).
-MULT_KAPPA_MIN,MULT_KAPPA_MAX=1.0,2.5
+# LIVE OPEN width is OHLC-decided (not these rails).
+MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 # Peak-to-trough structure may inform SL, but never dominate after a win streak
 # blew the lookback window (live: 3 wins → fantasy SL/TP from full swing).
 STRUCTURE_VS_MEDIAN_CAP=2.0
-# OPEN refuses brackets where reachable TP cannot cover SL (κ<1 after crush).
-MIN_LIVE_RR=1.0
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
 MIN_BATCH_SAMPLES=6
 # Exit reasons the adaptation layer understands.
@@ -678,56 +676,24 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     else:
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
-    # Different approach than "HOLD / skip OPEN": keep trading like early days,
-    # but *reshape* to ≥1:1 so TP≪SL crush cannot invent −EV. Shrink SL to the
-    # reachable TP (still ≥ broker floor); never refuse the whole day.
-    reshaped = False
-    reshape_reason = None
-    if stop_d > 1e-12 and profit_d + 1e-12 < stop_d * MIN_LIVE_RR:
-        reach_cap = float(ohlc_tp) * t if ohlc_tp is not None and ohlc_tp > 0 else None
-        if reach_cap is None or reach_cap + 1e-12 >= stop_d * MIN_LIVE_RR:
-            profit_d = max(floor, stop_d * MIN_LIVE_RR)
-            reshape_reason = 'raised_tp_to_1R'
-        else:
-            # Reachable move < wide SL → cut risk to what OHLC can actually pay.
-            stop_d = max(floor, min(stop_d, max(reach_cap, floor)))
-            profit_d = max(floor, stop_d * MIN_LIVE_RR)
-            # If reach still below floor, both sit on broker floor at 1:1.
-            if profit_d + 1e-12 < stop_d:
-                stop_d = max(floor, profit_d)
-                profit_d = stop_d
-            reshape_reason = 'shrunk_sl_to_reachable_1R'
-        reshaped = True
-    # Effective κ after reshape (for tagging / learning).
+    # Effective κ from OHLC only — no hardcoded 1:1 reshape / RR floor.
+    # The robot decides width from candles; we do not invent TP/SL ratios.
     eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
-    # LIVE floor κ≥1 — never send TP≪SL via stop_take(kappa=0.5).
-    live_kappa = max(MIN_LIVE_RR, float(eff_kappa))
     # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
     entry = 1000.0  # levels unused by callers that only need distances
     snapped = stop_take(
         entry, 'BUY', tick_f, sp, mn,
-        kappa=live_kappa, sl_scale=1.0,
+        kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
         range_distance=stop_d)
-    sd = float(snapped['stop_distance'])
-    pd = float(snapped['profit_distance'])
-    # After tick snap, nudge TP up to SL if ceil left RR slightly short.
-    if sd > 1e-12 and pd + 1e-12 < sd * MIN_LIVE_RR:
-        pd = sd
-        reshaped = True
-        reshape_reason = (reshape_reason or 'snap') + '+ceil_1R'
     return {
-        'stop_distance': sd,
-        'profit_distance': pd,
-        'kappa': max(MIN_LIVE_RR, (pd / sd) if sd > 1e-12 else live_kappa),
+        'stop_distance': float(snapped['stop_distance']),
+        'profit_distance': float(snapped['profit_distance']),
+        'kappa': float(snapped.get('kappa') or eff_kappa),
         'sl_scale': 1.0,
         'ohlc_kappa': float(ohlc_kappa),
         'ohlc_sl': float(raw_sl),
         'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
         'tighten': float(t),
-        'blocked': False,
-        'block_reason': None,
-        'reshaped': reshaped,
-        'reshape_reason': reshape_reason,
         'source': 'ohlc_zone',
         'ready': bool(z.get('ready')),
         'lookback': z.get('lookback'),
@@ -804,9 +770,6 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         'lookback':zone.get('lookback'),
         'stop_distance':decided['stop_distance'],
         'profit_distance':decided['profit_distance'],
-        'blocked':False,
-        'reshaped':bool(decided.get('reshaped')),
-        'reshape_reason':decided.get('reshape_reason'),
         'bracket_source':'ohlc_zone',
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }

@@ -168,14 +168,11 @@ def test_adverse_path_beyond_vol_holds_sl():
 def test_wide_loss_teaches_cut_tp():
     with sandbox() as d:
         store=Store(Path(d)/'db.sqlite3')
-        save_multipliers(store,1.5,1.5,reason='seed_wide')
         adapt_after_outcome(
             store,kappa=2.5,sl_scale=1.5,pnl=-0.30,exit_reason='sl',
             direction='BUY',entry=100.0,exit_level=99.5,
             stop_distance=0.5,adverse_path=0.5,volatility=0.4)
-        # Cuts κ but never below LIVE floor 1.0 (−EV trap).
-        assert load_multipliers(store)['kappa']<1.5
-        assert load_multipliers(store)['kappa']>=1.0
+        assert load_multipliers(store)['kappa']<1.0
 
 
 def test_scratch_does_not_raise_sl():

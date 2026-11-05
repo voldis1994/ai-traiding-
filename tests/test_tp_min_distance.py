@@ -27,15 +27,18 @@ def test_kappa_half_raises_tp_to_broker_min():
     assert distances_meet_broker_min(buy['stop_distance'], buy['profit_distance'], '.5')
 
 
-def test_mult_kappa_min_is_at_least_one_to_one():
-    """LIVE floor κ≥1 — old 0.5 floor was the −EV Gold churn machine."""
-    assert MULT_KAPPA_MIN >= 1.0
+def test_mult_kappa_min_cannot_undercut_broker_min():
+    """MULT_KAPPA_MIN=0.5 on a tight instrument must still meet min after snap."""
     minimum = Decimal('0.15')
     tick = Decimal('0.01')
     spread = Decimal('0.01')
+    raw_sl = minimum + max(2 * tick, 2 * spread)
+    assert (MULT_KAPPA_MIN * float(raw_sl)) < float(minimum)
+
     out = stop_take(100, 'BUY', tick, spread, minimum, kappa=MULT_KAPPA_MIN, sl_scale=1)
     assert out['stop_distance'] >= minimum
-    assert out['profit_distance'] >= out['stop_distance']  # RR≥1 at κ=1
+    assert out['profit_distance'] >= minimum
+    assert out['raised_to_broker_min'] is True
     assert distances_meet_broker_min(out['stop_distance'], out['profit_distance'], minimum)
 
 

@@ -140,6 +140,53 @@ def trim_path_entry_to_exit(bars, *, direction=None, entry=None, exit_level=None
     return chron
 
 
+def feature_vector_from_frame(frame) -> list:
+    """Continuous structure channels for the neural input (OPEN-time perception).
+
+    Not a gate and not a hardcode action — just what the brain can *see* so it
+    can learn which layouts kill which side. Values are dimensionless / clipped.
+    """
+    if not isinstance(frame, dict) or not frame.get('ready'):
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+    n = max(1, int(frame.get('bars') or 1) - 1)
+    nor = _finite(frame.get('net_over_range')) or 0.0
+    hh = float(frame.get('hh_hl') or 0) / n
+    lh = float(frame.get('lh_ll') or 0) / n
+    st = str(frame.get('structure') or 'CHOP').upper()
+    if st in ('TREND_UP', 'BREAKOUT_UP'):
+        trend_sign = 1.0
+    elif st in ('TREND_DOWN', 'BREAKOUT_DOWN'):
+        trend_sign = -1.0
+    else:
+        trend_sign = 0.0
+    if frame.get('breakout') and st == 'BREAKOUT_UP':
+        br = 1.0
+    elif frame.get('breakout') and st == 'BREAKOUT_DOWN':
+        br = -1.0
+    else:
+        br = 0.0
+    # Clip to same soft range as other OHLC features.
+    def clip(x, lo=-5.0, hi=5.0):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(v):
+            return 0.0
+        return max(lo, min(hi, v))
+    return [clip(nor), clip(hh, 0, 1), clip(lh, 0, 1), clip(br, -1, 1),
+            clip(trend_sign, -1, 1)]
+
+
+STRUCTURE_FEATURE_NAMES = (
+    'struct_net_over_range',
+    'struct_hh_hl_share',
+    'struct_lh_ll_share',
+    'struct_breakout',
+    'struct_trend_sign',
+)
+
+
 def frame_from_ohlc(bars, *, entry=None, exit_level=None,
                     pre_bars=None) -> dict:
     """Classify market event from OHLC layout — ratios only, no £ / TP / SL rules.

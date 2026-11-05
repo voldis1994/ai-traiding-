@@ -12,11 +12,15 @@ from datetime import datetime, timezone, timedelta
 import math
 import numpy as np
 
-FEATURE_SCHEMA = 'closed_m1_m5_m15_h1_shadow_v4'
+# v5: append live OHLC structure channels so the brain *sees* layout at OPEN
+# (shadow graves alone could not teach understanding — no structure in z).
+FEATURE_SCHEMA = 'closed_m1_m5_m15_h1_shadow_v5'
 FEATURE_NAMES = ('return_1m','return_5m','return_15m','return_60m',
                  'ema_5_15','ema_15_60','volatility_15m',
                  'range_position_60m','candle_body_1m','spread_bps_scaled',
-                 'upper_shadow_1m','lower_shadow_1m','wick_imbalance_5m')
+                 'upper_shadow_1m','lower_shadow_1m','wick_imbalance_5m',
+                 'struct_net_over_range','struct_hh_hl_share','struct_lh_ll_share',
+                 'struct_breakout','struct_trend_sign')
 FEATURE_DIM = len(FEATURE_NAMES)
 MIN_BARS = 61
 
@@ -97,6 +101,17 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, 
             (last[3]-last[0])/max(last[1]-last[2],c*1e-9),
             float(spread)/c*1000.,
             float(up1),float(lo1),wick_imb]
+    # Live structure perception (same OHLC window) — brain must *see* layout at OPEN.
+    from .structure_shadow import frame_from_ohlc, feature_vector_from_frame
+    path_dicts=[{'open':b[0],'high':b[1],'low':b[2],'close':b[3],
+                 'at':(latest-timedelta(minutes=60-i)).isoformat()}
+                for i,b in enumerate(bars)]
+    # Recent path + earlier bars as pre (breakout vs prior range).
+    live_path=path_dicts[-30:]
+    live_pre=path_dicts[:-30]
+    live_frame=frame_from_ohlc(live_path,pre_bars=live_pre)
+    struct_feats=feature_vector_from_frame(live_frame)
+    values.extend(struct_feats)
     if not np.isfinite(values).all():return fail('Non-finite multi-timeframe features')
     # Bound extreme one-minute gaps to avoid poison gradients; scale consistent.
     # Shadows already in [0,1]; wick imbalance in [-1,1] — clip with the rest.
@@ -120,6 +135,8 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, 
             'horizons_minutes':[1,5,15,60],
             'returns_bps':{str(k):round(ret(k)*10,3) for k in (1,5,15,60)},
             'trend':direction,'regime':regime,
+            'structure':live_frame.get('structure'),
+            'structure_frame':live_frame,
             'volatility_bps':round(values[6]*10,3),
             'range_position':round(values[7],4),
             'upper_shadow':round(float(up1),4),'lower_shadow':round(float(lo1),4),

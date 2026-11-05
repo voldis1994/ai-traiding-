@@ -2953,6 +2953,8 @@ class SingleTradeEngine:
         if not brackets:
             return None
         tr=self.brain._json_transition(self.brain.core.last_transition)
+        from .self_params import load as load_self_params
+        slip_bps=float(load_self_params(self.store).get('exec_slip_bps') or 0.)
         row=hold_shadow.enqueue(
             self.store,proposal=proposal,
             reason=evaluation.get('reason') or self.last_entry_reason,
@@ -2962,7 +2964,8 @@ class SingleTradeEngine:
             stop_distance=brackets['stop_distance'],
             profit_distance=brackets['profit_distance'],
             tick=brackets['tick'],min_distance=brackets['min_distance'],
-            transition=tr,scores=(self.last_signal or {}).get('scores'))
+            transition=tr,scores=(self.last_signal or {}).get('scores'),
+            slip_bps=slip_bps)
         if row:
             self.store.event('hold_shadow','Queued opposite-path shadow for HOLD abstention',{
                 'proposal':proposal,'opposite':row.get('opposite'),
@@ -3108,9 +3111,8 @@ class SingleTradeEngine:
             pnl_sign=1 if broker_pnl>0 else (-1 if broker_pnl<0 else 0)
         else:
             pnl_sign=1 if realized_ticks>0.5 else (-1 if realized_ticks<-0.5 else 0)
-        # Profit-centred labels — no entry cooldown. Flip-after-loss → HOLD
-        # (never auto-train opposite churn). Other losses use counterfactual HOLD
-        # preference via profit_learning before optional opposite regret.
+        # Profit-centred labels — no entry cooldown. Losses use label_from_profit
+        # (opposite ∪ HOLD with spread floor). flip_after_loss is audit suffix only.
         prev_out=self.store.get('last_trade_outcome') or {}
         flip_after_loss=bool(
             pnl_sign<0 and isinstance(prev_out,dict) and
@@ -3148,18 +3150,18 @@ class SingleTradeEngine:
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
         else:
-            # Tick path: same rule as £ — wins reinforce side; else counterfactual.
-            from .profit_learning import best_action_from_counterfactual
-            sim=best_action_from_counterfactual(entry,exit_level,spread=spread_cost,**cf)
-            if pnl_sign>0 and direction in ('BUY','SELL'):
-                label=0 if direction=='BUY' else 1;mode='reinforce_win_ticks'
-            elif sim and sim['best'] in ('BUY','SELL','HOLD'):
-                label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
-                prefix=('flip_loss_counterfactual_' if flip_after_loss
-                        else ('loss_counterfactual_' if pnl_sign<0 else 'flat_counterfactual_'))
-                mode=prefix+sim['best'].lower()+'_ticks'
-            else:
-                label,mode=None,'ticks_no_counterfactual'
+            # Tick path must use the SAME loss gate as broker £ (opposite ∪ HOLD
+            # with spread floor). Raw best_action could re-pick the loser / false flip.
+            from .profit_learning import label_from_profit
+            tick_pnl=(1.0 if pnl_sign>0 else (-1.0 if pnl_sign<0 else 0.0))
+            decision=label_from_profit(
+                direction,tick_pnl,flip_after_loss=flip_after_loss,
+                entry=entry,exit_level=exit_level,spread=spread_cost,**cf)
+            label=decision.get('label')
+            if label is not None:label=int(label)
+            mode=str(decision.get('mode') or 'ticks_no_counterfactual')
+            if mode and not mode.endswith('_ticks'):
+                mode=mode+'_ticks'
             self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,
                 exit_level=exit_level,broker_pnl=None,
@@ -4338,31 +4340,62 @@ class SingleTradeEngine:
             slip_bps=slip_bps,fill_delay_bars=fill_delay_bars,
             shadow_transition=shadow_tr)
         if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
+            # CRITICAL: shadow paper must use the SAME loss teacher as LIVE
+            # (label_from_profit). Old path called best_action_from_counterfactual
+            # raw → false flip labels with missing/tiny spread, then promote
+            # copied those poisoned weights into LIVE (Gold flip_loss churn).
             pnl=closed.get('paper_pnl')
             if pnl is None:pnl=closed.get('price_pnl')
             label=None
+            teach_mode=None
             if pnl is not None:
                 try:
                     cash=float(pnl)
                     direction=closed.get('direction')
-                    if cash>0:
-                        label={'BUY':0,'SELL':1}.get(direction)
-                    elif cash<0:
-                        # Same teacher as LIVE losses — counterfactual, not hardcode HOLD.
-                        from .profit_learning import best_action_from_counterfactual
-                        entry=_num(closed.get('entry'))
-                        exit_px=_num(closed.get('exit') or closed.get('exit_px'))
-                        sim=best_action_from_counterfactual(
-                            entry,exit_px,spread=float(spread or 0),
-                            slip_bps=slip_bps) if entry is not None and exit_px is not None else None
-                        if sim and sim.get('best') in ('BUY','SELL','HOLD'):
-                            label={'BUY':0,'SELL':1,'HOLD':2}[sim['best']]
-                        else:
-                            label=2
+                    entry=_num(closed.get('entry'))
+                    exit_px=_num(closed.get('exit') or closed.get('exit_px'))
+                    # Prefer the trade's own spread (stored at close), not bar mid.
+                    try:
+                        trade_spread=float(closed.get('spread')
+                                           if closed.get('spread') is not None
+                                           else (spread or 0))
+                    except (TypeError,ValueError):
+                        trade_spread=float(spread or 0)
+                    if not math.isfinite(trade_spread) or trade_spread<0:
+                        trade_spread=0.
+                    # flip_after_loss audit: prior *paper* loss + direction change.
+                    hist=list(self.shadow_paper.history or [])
+                    prev=hist[-2] if len(hist)>=2 else None
+                    flip_after_loss=False
+                    if (cash<0 and isinstance(prev,dict)
+                            and prev.get('direction') in ('BUY','SELL')
+                            and prev.get('direction')!=direction):
+                        prev_pnl=prev.get('paper_pnl')
+                        if prev_pnl is None:prev_pnl=prev.get('price_pnl')
+                        try:
+                            flip_after_loss=float(prev_pnl)<0
+                        except (TypeError,ValueError):
+                            flip_after_loss=False
+                    from .profit_learning import label_from_profit
+                    decision=label_from_profit(
+                        direction,cash,flip_after_loss=flip_after_loss,
+                        entry=entry,exit_level=exit_px,
+                        spread=trade_spread,slip_bps=slip_bps)
+                    label=decision.get('label')
+                    teach_mode=decision.get('mode')
+                    if label is not None:label=int(label)
                 except (TypeError,ValueError):
-                    label=None
+                    label=None;teach_mode=None
             if label is not None:
                 self._shadow_learn(closed.get('shadow_transition'),label)
+                try:
+                    self.store.event('shadow_paper','Shadow paper taught from close',{
+                        'direction':closed.get('direction'),
+                        'paper_pnl':pnl,'label':label,'mode':teach_mode,
+                        'spread':closed.get('spread'),
+                        'exit_reason':closed.get('exit_reason')})
+                except Exception:
+                    pass
         return closed
 
     def restore_neural_weights(self, version_meta_or_path):

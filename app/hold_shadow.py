@@ -106,19 +106,23 @@ def save_pending(store, rows: list) -> list:
 
 def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
                    profit_distance=None, tick=None, min_distance=None,
-                   trail=True):
-    """Replay proposal + opposite under identical bracket/cost rules."""
+                   trail=True, slip_bps=0.):
+    """Replay proposal + opposite under identical bracket/cost rules.
+
+    ``slip_bps`` must match LIVE/shadow_paper friction — zero-slip sims were
+    optimistic and taught opposite into LIVE on paths that would not clear costs.
+    """
     opp = opposite_of(proposal)
     if opp is None or not bars:
         return None
     prop_sim = simulate_action_on_path(
         proposal, bars, spread=spread, stop_distance=stop_distance,
         profit_distance=profit_distance, tick=tick, min_distance=min_distance,
-        trail=trail)
+        slip_bps=slip_bps, trail=trail)
     opp_sim = simulate_action_on_path(
         opp, bars, spread=spread, stop_distance=stop_distance,
         profit_distance=profit_distance, tick=tick, min_distance=min_distance,
-        trail=trail)
+        slip_bps=slip_bps, trail=trail)
     if not prop_sim or not opp_sim:
         return None
     prop_pnl = _finite(prop_sim.get('pnl'))
@@ -143,7 +147,7 @@ def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
 
 def enqueue(store, *, proposal, reason, bar_time, epic, entry, spread,
             stop_distance, profit_distance, tick, min_distance, transition,
-            scores=None, trail=True):
+            scores=None, trail=True, slip_bps=0.):
     """Queue a HOLD abstention for later opposite-path shadow."""
     if proposal not in ('BUY', 'SELL'):
         return None
@@ -155,6 +159,9 @@ def enqueue(store, *, proposal, reason, bar_time, epic, entry, spread,
     pending = load_pending(store)
     # One pending per bar_time — replace if re-evaluated.
     pending = [p for p in pending if str(p.get('bar_time')) != str(bar_time)]
+    slip = _finite(slip_bps)
+    if slip is None or slip < 0:
+        slip = 0.
     row = {
         'id': f'hs-{len(pending)+1}-{str(bar_time or "")[-12:]}',
         'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -170,6 +177,7 @@ def enqueue(store, *, proposal, reason, bar_time, epic, entry, spread,
         'tick': _finite(tick),
         'min_distance': _finite(min_distance),
         'trail': bool(trail),
+        'slip_bps': float(slip),
         'transition': transition,
         'scores': scores if isinstance(scores, dict) else None,
         'bars_seen': 0,
@@ -217,7 +225,8 @@ def resolve_one(case: dict, bars: list) -> dict | None:
         profit_distance=case.get('profit_distance'),
         tick=case.get('tick'),
         min_distance=case.get('min_distance'),
-        trail=case.get('trail', True))
+        trail=case.get('trail', True),
+        slip_bps=case.get('slip_bps') or 0.)
 
 
 def _path_decisive(detail: dict) -> bool:

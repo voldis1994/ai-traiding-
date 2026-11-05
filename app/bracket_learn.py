@@ -15,11 +15,14 @@ from statistics import mean, median
 DEFAULT_KAPPA=1.0
 DEFAULT_SL_SCALE=1.0
 # Soft rails on learned multipliers — operating schedule lives in self_params.
-MULT_KAPPA_MIN,MULT_KAPPA_MAX=0.5,2.5
+# LIVE must not learn κ<1 — that made TP≪SL after loss streaks (−EV machine).
+MULT_KAPPA_MIN,MULT_KAPPA_MAX=1.0,2.5
 MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 # Peak-to-trough structure may inform SL, but never dominate after a win streak
 # blew the lookback window (live: 3 wins → fantasy SL/TP from full swing).
 STRUCTURE_VS_MEDIAN_CAP=2.0
+# OPEN refuses brackets where reachable TP cannot cover SL (κ<1 after crush).
+MIN_LIVE_RR=1.0
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
 MIN_BATCH_SAMPLES=6
 # Exit reasons the adaptation layer understands.
@@ -675,25 +678,47 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     else:
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
+    # Live bug: tiny max_tp crushed TP≪SL (κ→0.5) → every 50% WR day loses £.
+    # Prefer force RR≥1 when reachable span allows; else mark blocked (no OPEN).
+    blocked = False
+    block_reason = None
+    if stop_d > 1e-12 and profit_d + 1e-12 < stop_d * MIN_LIVE_RR:
+        reach_cap = float(ohlc_tp) * t if ohlc_tp is not None and ohlc_tp > 0 else None
+        if reach_cap is None or reach_cap + 1e-12 >= stop_d * MIN_LIVE_RR:
+            profit_d = stop_d * MIN_LIVE_RR
+        else:
+            blocked = True
+            block_reason = (
+                f'ohlc_tp {reach_cap:.4f} < SL {stop_d:.4f} — refuse −EV OPEN')
     # Effective κ after reachable-span decision (for tagging / learning).
     eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
+    # LIVE floor κ≥1 — never send TP≪SL via stop_take(kappa=0.5).
+    live_kappa = max(MIN_LIVE_RR, float(eff_kappa))
     # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
     entry = 1000.0  # levels unused by callers that only need distances
     snapped = stop_take(
         entry, 'BUY', tick_f, sp, mn,
-        kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+        kappa=live_kappa, sl_scale=1.0,
         range_distance=stop_d)
+    # Re-check after tick snap (ceil can still leave RR slightly off).
+    sd = float(snapped['stop_distance'])
+    pd = float(snapped['profit_distance'])
+    if (not blocked) and sd > 1e-12 and pd + 1e-12 < sd * MIN_LIVE_RR:
+        blocked = True
+        block_reason = f'snapped RR {pd/sd:.3f} < {MIN_LIVE_RR} — refuse −EV OPEN'
     return {
-        'stop_distance': float(snapped['stop_distance']),
-        'profit_distance': float(snapped['profit_distance']),
-        'kappa': float(snapped.get('kappa') or eff_kappa),
+        'stop_distance': sd,
+        'profit_distance': pd,
+        'kappa': float(snapped.get('kappa') or live_kappa),
         'sl_scale': 1.0,
         'ohlc_kappa': float(ohlc_kappa),
         'ohlc_sl': float(raw_sl),
         'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
         'tighten': float(t),
+        'blocked': blocked,
+        'block_reason': block_reason,
         'source': 'ohlc_zone',
-        'ready': bool(z.get('ready')),
+        'ready': bool(z.get('ready')) and not blocked,
         'lookback': z.get('lookback'),
         'median_up': z.get('median_up'),
         'median_down': z.get('median_down'),
@@ -768,6 +793,8 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         'lookback':zone.get('lookback'),
         'stop_distance':decided['stop_distance'],
         'profit_distance':decided['profit_distance'],
+        'blocked':bool(decided.get('blocked')),
+        'block_reason':decided.get('block_reason'),
         'bracket_source':'ohlc_zone',
         'nudge_samples':len(store.get('bracket_outcome_history',[]) or []),
     }

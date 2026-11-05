@@ -3117,7 +3117,14 @@ class SingleTradeEngine:
             int(prev_out.get('pnl_sign') or 0)<0 and
             prev_out.get('direction') in ('BUY','SELL') and
             prev_out.get('direction')!=direction)
-        spread_cost=_num(saved.get('entry_spread')) or 0.
+        # Missing entry spread → live market spread (never 0: that taught false flips).
+        spread_cost=_num(saved.get('entry_spread'))
+        if spread_cost is None or spread_cost<=0:
+            live_sp=_num((self.market or {}).get('spread'))
+            if live_sp is not None and live_sp>0:
+                spread_cost=live_sp
+            else:
+                spread_cost=0.
         shadow_action=None
         if self.shadow_brain is not None and saved.get('shadow_scores'):
             sc=saved['shadow_scores']
@@ -3641,8 +3648,25 @@ class SingleTradeEngine:
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0))
+            # Refuse −EV brackets (TP≪SL after max_tp crush) — live Gold churn.
+            if decided.get('blocked'):
+                self.last_entry_reason=(decided.get('block_reason')
+                                       or 'OHLC brackets not viable (RR<1)')
+                self.store.event('entry','OPEN skipped — −EV OHLC brackets',{
+                    'reason':self.last_entry_reason,
+                    'stop_distance':decided.get('stop_distance'),
+                    'profit_distance':decided.get('profit_distance'),
+                    'ohlc_tp':decided.get('ohlc_tp'),
+                    'ohlc_sl':decided.get('ohlc_sl'),
+                    'kappa':decided.get('kappa')})
+                return
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
+            if sd>0 and pd+1e-12<sd:
+                self.last_entry_reason=f'OPEN skipped — RR {pd/sd:.3f}<1'
+                self.store.event('entry','OPEN skipped — TP below SL',{
+                    'stop_distance':sd,'profit_distance':pd})
+                return
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
                 'stop_level':float(entry)-sign*sd,

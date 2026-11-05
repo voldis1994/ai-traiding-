@@ -22,11 +22,17 @@ LAST_ADVICE_KEY = 'structure_shadow_last_advice_v1'
 
 MAX_LIBRARY = 48          # keyed buckets
 MAX_SNAPSHOTS = 120       # raw loss paths kept for audit / re-frame
+# In-trade OHLC path for framing (entry bar → exit bar, inclusive).
 MAX_BARS_PER_SNAP = 60
+# Candles *before* entry — only for breakout-vs-prior-range detection.
+MAX_PRE_BARS = 40
 MIN_BARS = 3
 MIN_ADVICE_SAMPLES = 3
 # Soft: only warn/hold when same structure+side has mostly been SL losses.
 ADVICE_SL_RATE = 0.67
+# Live advise() lookback (current market layout, not a closed trade).
+ADVISE_PATH_BARS = 30
+ADVISE_PRE_BARS = 40
 
 STRUCTURES = frozenset({
     'TREND_UP', 'TREND_DOWN', 'RANGE',
@@ -85,12 +91,61 @@ def normalise_bars(rows, *, limit=MAX_BARS_PER_SNAP) -> list:
     return out
 
 
+def trim_path_entry_to_exit(bars, *, direction=None, entry=None, exit_level=None,
+                            entry_bar_time=None, exit_bar_time=None,
+                            limit=MAX_BARS_PER_SNAP) -> list:
+    """Keep only candles of the open trade: entry bar → exit bar (inclusive).
+
+    Correct window for “why did this SL happen”:
+      • start = decision/entry M1 (``entry_bar_time``) when known
+      • end   = exit M1 (``exit_bar_time``) or first bar that tags ``exit_level``
+      • never candles *after* the exit (post-close noise must not reframe the grave)
+
+    If the trade path is longer than ``limit``, keep the **entry bar + last
+    (limit-1) bars ending at exit** so the SL candle is never dropped.
+    """
+    chron = []
+    for raw in bars or []:
+        if not isinstance(raw, dict):
+            continue
+        b = _bar_ohlc(raw)
+        if b is None:
+            continue
+        b = dict(b)
+        b['at'] = raw.get('at')
+        chron.append(b)
+    if not chron:
+        return []
+    chron = sorted(chron, key=lambda r: str(r.get('at') or ''))
+    if entry_bar_time is not None:
+        chron = [b for b in chron if str(b.get('at') or '') >= str(entry_bar_time)]
+    if exit_bar_time is not None:
+        chron = [b for b in chron if str(b.get('at') or '') <= str(exit_bar_time)]
+    # No exit stamp → cut at first bar whose range tags the exit fill.
+    exit_px = _finite(exit_level)
+    if exit_bar_time is None and exit_px is not None and direction in ('BUY', 'SELL'):
+        cut = None
+        for i, b in enumerate(chron):
+            if direction == 'BUY' and b['low'] <= exit_px + 1e-12:
+                cut = i
+                break
+            if direction == 'SELL' and b['high'] >= exit_px - 1e-12:
+                cut = i
+                break
+        if cut is not None:
+            chron = chron[: cut + 1]
+    lim = int(limit or MAX_BARS_PER_SNAP)
+    if lim > 0 and len(chron) > lim:
+        chron = [chron[0]] + chron[-(lim - 1):]
+    return chron
+
+
 def frame_from_ohlc(bars, *, entry=None, exit_level=None,
                     pre_bars=None) -> dict:
     """Classify market event from OHLC layout — ratios only, no £ / TP / SL rules.
 
-    Uses the in-trade path first. Optional ``pre_bars`` (candles before entry)
-    detect breakouts beyond the prior range.
+    ``bars`` must be the *in-trade* path (entry candle → exit candle). Optional
+    ``pre_bars`` (before entry) detect breakouts beyond the prior range only.
     """
     path = normalise_bars(bars)
     if len(path) < MIN_BARS:
@@ -121,7 +176,7 @@ def frame_from_ohlc(bars, *, entry=None, exit_level=None,
         elif highs[i] <= highs[i - 1] and lows[i] <= lows[i - 1]:
             lh_ll += 1
     # Prior range (pre-entry) → breakout if exit pierces it.
-    pre = normalise_bars(pre_bars or [], limit=40)
+    pre = normalise_bars(pre_bars or [], limit=MAX_PRE_BARS)
     breakout = False
     breakout_side = None
     exit_px = _finite(exit_level) or closes[-1]
@@ -240,7 +295,7 @@ def build_snapshot(*, epic, direction, entry, exit_level, exit_reason,
         'broker_pnl': _finite(broker_pnl),
         'spread': _finite(spread),
         'bars': path,
-        'pre_bars': normalise_bars(pre_bars or [], limit=40),
+        'pre_bars': normalise_bars(pre_bars or [], limit=MAX_PRE_BARS),
         'frame': frame,
         'key': frame_key(
             epic=epic, structure=frame.get('structure'), direction=direction),

@@ -76,6 +76,69 @@ def normalize_exit_reason(reason) -> str:
     return r if r in EXIT_REASONS else 'unknown'
 
 
+def infer_exit_reason_from_path(*, direction=None, entry=None, exit_level=None,
+                                bars=None, stop_distance=None,
+                                profit_distance=None, tick=None,
+                                trail_active=False) -> str:
+    """Classify sl/tp/trail from the OHLC path when the broker omits a reason.
+
+    Walks entry→exit candles; whichever of stop/profit was tagged first wins.
+    No RR hardcode — uses the deal's own stop/profit distances.
+    """
+    entry_n=_finite(entry);exit_n=_finite(exit_level)
+    stop=_finite(stop_distance);profit=_finite(profit_distance)
+    tick_n=_finite(tick) or 0.
+    if direction not in ('BUY','SELL') or entry_n is None:
+        return 'unknown'
+    tol=max(float(tick_n)*1.5,1e-9)
+    stop_lvl=profit_lvl=None
+    if stop is not None and stop>0:
+        stop_lvl=(entry_n-stop) if direction=='BUY' else (entry_n+stop)
+    if profit is not None and profit>0:
+        profit_lvl=(entry_n+profit) if direction=='BUY' else (entry_n-profit)
+    first=None
+    for raw in bars or []:
+        if not isinstance(raw,dict):
+            continue
+        hi=_finite(raw.get('high'));lo=_finite(raw.get('low'))
+        mid=_finite(raw.get('mid')) or _finite(raw.get('close'))
+        if hi is None:hi=mid
+        if lo is None:lo=mid
+        if hi is None or lo is None:
+            continue
+        hit_sl=hit_tp=False
+        if stop_lvl is not None:
+            if direction=='BUY' and lo<=stop_lvl+tol:hit_sl=True
+            if direction=='SELL' and hi>=stop_lvl-tol:hit_sl=True
+        if profit_lvl is not None:
+            if direction=='BUY' and hi>=profit_lvl-tol:hit_tp=True
+            if direction=='SELL' and lo<=profit_lvl+tol:hit_tp=True
+        if hit_sl and hit_tp:
+            # Same bar: adverse first for classification conservatism.
+            first='sl'
+            break
+        if hit_sl:
+            first='sl'
+            break
+        if hit_tp:
+            first='tp'
+            break
+    if first=='sl':
+        return 'trail' if trail_active else 'sl'
+    if first=='tp':
+        return 'tp'
+    # Fallback: exit proximity to planned levels.
+    if entry_n is not None and exit_n is not None:
+        move=(exit_n-entry_n) if direction=='BUY' else (entry_n-exit_n)
+        if stop is not None and move<=-(float(stop)-tol):
+            return 'trail' if trail_active else 'sl'
+        if profit is not None and move>=(float(profit)-tol):
+            return 'tp'
+        if trail_active and move<0:
+            return 'trail'
+    return 'unknown'
+
+
 def analyze_trade_path(*, direction=None, entry=None, exit_level=None,
                        stop_distance=None, adverse_path=None, volatility=None,
                        costs=None, pnl=None, store=None, scratch_cash_band=None) -> dict:

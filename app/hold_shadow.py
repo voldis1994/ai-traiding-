@@ -29,7 +29,8 @@ HISTORY_KEY = 'hold_shadow_history_v1'
 # a decisive exit appears — not after a fixed 45-minute delay.
 HORIZON_BARS = 15
 MIN_RESOLVE_BARS = 1
-MAX_PENDING = 12
+# Live had 186 queued / 12 taught — tiny pending cap dropped evidence.
+MAX_PENDING = 48
 MAX_HISTORY = 200
 # When opposite TP rate is high, expose a strategy hint (evolve / UI).
 STRATEGY_HINT_MIN = 5
@@ -63,6 +64,8 @@ def default_stats():
         'proposal_hit_tp': 0,
         'both_lost': 0,
         'taught_opposite': 0,
+        'taught_proposal': 0,
+        'taught_hold': 0,
         'skipped': 0,
         'strategy_hint': None,
         'opposite_tp_rate': None,
@@ -82,7 +85,8 @@ def save_stats(store, stats: dict) -> dict:
     if isinstance(stats, dict):
         clean.update({k: stats.get(k, clean[k]) for k in clean})
     for k in ('enqueued', 'resolved', 'opposite_hit_tp', 'proposal_hit_tp',
-              'both_lost', 'taught_opposite', 'skipped'):
+              'both_lost', 'taught_opposite', 'taught_proposal', 'taught_hold',
+              'skipped'):
         try:
             clean[k] = max(0, int(clean[k] or 0))
         except (TypeError, ValueError):
@@ -129,19 +133,26 @@ def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
     opp_pnl = _finite(opp_sim.get('pnl'))
     if prop_pnl is None or opp_pnl is None:
         return None
+    prop_tp = prop_sim.get('reason') == 'tp'
+    opp_tp = opp_sim.get('reason') == 'tp'
+    both_lost = (not prop_tp and not opp_tp
+                 and float(prop_pnl) <= 0 and float(opp_pnl) <= 0)
     return {
         'proposal': proposal,
         'opposite': opp,
         'proposal_sim': prop_sim,
         'opposite_sim': opp_sim,
-        'proposal_hit_tp': prop_sim.get('reason') == 'tp',
-        'opposite_hit_tp': opp_sim.get('reason') == 'tp',
+        'proposal_hit_tp': prop_tp,
+        'opposite_hit_tp': opp_tp,
         'proposal_pnl': float(prop_pnl),
         'opposite_pnl': float(opp_pnl),
-        # Teach opposite only when it clearly won the path (TP) and proposal
-        # did not — avoids reinforcing noise / both-side wins.
-        'teach_opposite': bool(
-            opp_sim.get('reason') == 'tp' and prop_sim.get('reason') != 'tp'),
+        'both_lost': both_lost,
+        # Opposite clearly won the path (TP) and proposal did not.
+        'teach_opposite': bool(opp_tp and not prop_tp),
+        # Proposal clearly won — HOLD abstention missed a real move.
+        'teach_proposal': bool(prop_tp and not opp_tp),
+        # Neither side paid — abstention was the right call on this path.
+        'teach_hold': bool(both_lost),
     }
 
 
@@ -282,21 +293,33 @@ def resolve_ready(store, *, candles_after, learn_callback=None,
             stats['opposite_hit_tp'] = int(stats.get('opposite_hit_tp') or 0) + 1
         if detail['proposal_hit_tp']:
             stats['proposal_hit_tp'] = int(stats.get('proposal_hit_tp') or 0) + 1
-        if (not detail['opposite_hit_tp'] and not detail['proposal_hit_tp']
-                and detail['opposite_pnl'] <= 0 and detail['proposal_pnl'] <= 0):
+        if detail.get('both_lost'):
             stats['both_lost'] = int(stats.get('both_lost') or 0) + 1
         taught = False
         mode = 'hold_shadow_observe'
+        label = None
         if detail['teach_opposite']:
             mode = f"hold_missed_opposite_tp_{detail['opposite'].lower()}"
-            if learn_callback is not None and case.get('transition'):
-                label = _ACTION_LABEL[detail['opposite']]
-                try:
-                    learn_callback(label, case['transition'], mode, detail)
-                    taught = True
-                    stats['taught_opposite'] = int(stats.get('taught_opposite') or 0) + 1
-                except Exception:
-                    taught = False
+            label = _ACTION_LABEL[detail['opposite']]
+            stat_key = 'taught_opposite'
+        elif detail.get('teach_proposal'):
+            mode = f"hold_missed_proposal_tp_{detail['proposal'].lower()}"
+            label = _ACTION_LABEL[detail['proposal']]
+            stat_key = 'taught_proposal'
+        elif detail.get('teach_hold'):
+            mode = 'hold_both_lost_hold'
+            label = _ACTION_LABEL['HOLD']
+            stat_key = 'taught_hold'
+        else:
+            stat_key = None
+        if label is not None and learn_callback is not None and case.get('transition'):
+            try:
+                learn_callback(label, case['transition'], mode, detail)
+                taught = True
+                if stat_key:
+                    stats[stat_key] = int(stats.get(stat_key) or 0) + 1
+            except Exception:
+                taught = False
         out = {
             'case_id': case.get('id'),
             'bar_time': case.get('bar_time'),
@@ -304,8 +327,10 @@ def resolve_ready(store, *, candles_after, learn_callback=None,
             'opposite': detail['opposite'],
             'mode': mode,
             'taught': taught,
+            'label': label,
             'opposite_hit_tp': detail['opposite_hit_tp'],
             'proposal_hit_tp': detail['proposal_hit_tp'],
+            'both_lost': bool(detail.get('both_lost')),
             'opposite_pnl': detail['opposite_pnl'],
             'proposal_pnl': detail['proposal_pnl'],
             'path_bars': len(path),

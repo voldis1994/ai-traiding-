@@ -2324,7 +2324,8 @@ class SingleTradeEngine:
             return None
         # Explain why (audit) — do NOT second-teach opposite/HOLD here.
         # Understanding comes from structure channels already in entry ``z``;
-        # the single trade-PnL teacher (label_from_profit) updates those weights.
+        # the single trade-PnL teacher (label_from_profit) updates those weights
+        # and now also listens to library_prefers_hold + path MFE.
         frame=(rec.get('snapshot') or {}).get('frame') or {}
         teach=structure_shadow.suggest_teach(
             frame=frame,direction=direction,broker_pnl=broker_pnl)
@@ -2338,6 +2339,34 @@ class SingleTradeEngine:
                 'reason':'single_teacher_via_structure_features'})
         rec=dict(rec,teach=teach,taught=False)
         return rec
+
+    def _record_structure_shadow_win(self,deal_id,saved,*,epic,direction,
+                                     entry,exit_level,exit_reason,broker_pnl,
+                                     spread):
+        """Bank a winning OHLC frame so structure memory knows what pays."""
+        bar_time=(saved or {}).get('bar_time')
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        pre=[]
+        if bar_time:
+            pre=[c for c in chron if c.get('at') is not None and str(c.get('at'))<str(bar_time)]
+        else:
+            mid=max(3,len(chron)//2)
+            pre=chron[:mid]
+        max_pre=int(getattr(structure_shadow,'MAX_PRE_BARS',40))
+        if len(pre)>max_pre:pre=pre[-max_pre:]
+        path=structure_shadow.trim_path_entry_to_exit(
+            chron,direction=direction,entry=entry,exit_level=exit_level,
+            entry_bar_time=bar_time,exit_bar_time=None,
+            limit=int(getattr(structure_shadow,'MAX_BARS_PER_SNAP',60)))
+        return structure_shadow.record_win(
+            self.store,epic=epic,direction=direction,entry=entry,
+            exit_level=exit_level,exit_reason=exit_reason,
+            broker_pnl=broker_pnl,bars=path,pre_bars=pre,
+            deal_id=deal_id,spread=spread)
 
     def _signal_reason(self,action,market_status=None,evaluation=None):
         if not self.last_signal:return 'No neural signal'
@@ -2458,8 +2487,12 @@ class SingleTradeEngine:
         return _num(bal) if not isinstance(bal,dict) else None
 
     def _infer_exit_reason(self,deal_id,confirmation,*,entry=None,direction=None,
-                           exit_level=None,tick=None):
-        """Classify SL / TP / trail / vanish / manual for bracket learning (audit #19)."""
+                           exit_level=None,tick=None,bars=None):
+        """Classify SL / TP / trail / vanish / manual for bracket learning (audit #19).
+
+        Live bug: broker often omits closeReason → everything logged ``unknown``
+        (sl_count stayed 0). Fall back to OHLC path vs the deal's own stop/TP.
+        """
         conf=confirmation or {}
         raw=(conf.get('exit_reason') or conf.get('reason') or conf.get('closeReason')
              or conf.get('actionType') or conf.get('activityType'))
@@ -2468,30 +2501,76 @@ class SingleTradeEngine:
             if got!='unknown':return got
         src=str(conf.get('source') or '')
         if src=='position_disappeared':
-            # Try level proximity before falling back to vanish.
+            # Try level proximity / path before falling back to vanish.
             pass
         elif src in ('manual','user'):
             return 'manual'
         meta=self.store.get('adaptive_protection:'+str(deal_id)) or {}
+        saved=self.store.get('entry_brain:'+str(deal_id)) or {}
         entry_n=_num(entry);exit_n=_num(exit_level);tick_n=_num(tick)
-        stop_dist=_num(meta.get('original_risk')) or _num(
-            (self.store.get('entry_brain:'+str(deal_id)) or {}).get('stop_distance'))
+        stop_dist=_num(meta.get('original_risk')) or _num(saved.get('stop_distance'))
+        profit_dist=_num(saved.get('profit_distance')) or _num(meta.get('original_profit'))
+        trail_active=bool(meta.get('owner')=='AUTO' and meta.get('trail_extreme') is not None)
         sign={'BUY':1,'SELL':-1}.get(direction)
         if entry_n is not None and exit_n is not None and sign is not None:
             move=sign*(exit_n-entry_n)
             tol=max(float(tick_n or 0)*1.5,abs(float(stop_dist or 0))*0.15,1e-9)
-            profit_dist=_num((self.store.get('entry_brain:'+str(deal_id)) or {}).get('profit_distance'))
             if stop_dist and move<=-(float(stop_dist)-tol):
-                if meta.get('owner')=='AUTO' and meta.get('trail_extreme') is not None:
-                    return 'trail'
-                return 'sl'
+                return 'trail' if trail_active else 'sl'
             if profit_dist and move>=(float(profit_dist)-tol):
                 return 'tp'
-            if meta.get('owner')=='AUTO' and meta.get('trail_extreme') is not None and move<0:
+            if trail_active and move<0:
                 return 'trail'
+        # OHLC path: which planned level was tagged first (fixes unknown graves).
+        path_bars=bars
+        if not path_bars:
+            epic=saved.get('epic') or (self.mandate or {}).get('epic')
+            try:
+                path_bars=self._trade_path_bars(
+                    deal_id,saved,epic=epic,entry=entry_n,exit_level=exit_n,
+                    direction=direction)
+            except Exception:
+                path_bars=None
+        from_path=bracket_learn.infer_exit_reason_from_path(
+            direction=direction,entry=entry_n,exit_level=exit_n,bars=path_bars,
+            stop_distance=stop_dist,profit_distance=profit_dist,tick=tick_n,
+            trail_active=trail_active)
+        if from_path!='unknown':
+            return from_path
         if src=='position_disappeared':
             return 'vanish'
         return 'unknown'
+
+    def _trade_path_bars(self,deal_id,saved,*,epic,entry,exit_level,direction=None):
+        """Entry→exit inclusive OHLC for CF / structure / exit inference.
+
+        Cuts post-close candles so opposite CF cannot invent flips from noise
+        after the broker fill.
+        """
+        bar_time=(saved or {}).get('bar_time')
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        # Prefer structure trim (keeps SL candle; drops post-exit).
+        path=structure_shadow.trim_path_entry_to_exit(
+            chron,direction=direction or (saved or {}).get('direction'),
+            entry=entry,exit_level=exit_level,entry_bar_time=bar_time,
+            exit_bar_time=None,
+            limit=max(int(getattr(structure_shadow,'MAX_BARS_PER_SNAP',60)),120))
+        out=[]
+        for c in path:
+            mid=_num(c.get('close'));hi=_num(c.get('high'));lo=_num(c.get('low'))
+            if mid is None:continue
+            out.append({
+                'open':_num(c.get('open')),'mid':mid,
+                'high':hi if hi is not None else mid,
+                'low':lo if lo is not None else mid,
+                'close':mid,'at':c.get('at'),
+                'spread':_num(c.get('spread')),
+            })
+        return out
 
     def _bracket_path_context(self,deal_id,confirmation,saved):
         """Build exit/path/vol/cost context for post-trade SL/TP adaptation."""
@@ -2506,11 +2585,18 @@ class SingleTradeEngine:
         meta=self.store.get('adaptive_protection:'+str(deal_id)) or {}
         if stop_distance is None:
             stop_distance=_num(meta.get('original_risk'))
+        epic=saved.get('epic') or (self.mandate or {}).get('epic')
+        path_bars=None
+        try:
+            path_bars=self._trade_path_bars(
+                deal_id,saved,epic=epic,entry=entry,exit_level=exit_level,
+                direction=direction)
+        except Exception:
+            path_bars=None
         exit_reason=self._infer_exit_reason(
             deal_id,confirmation,entry=entry,direction=direction,
-            exit_level=exit_level,tick=tick)
+            exit_level=exit_level,tick=tick,bars=path_bars)
         # Recent M1 median range as vol context at close.
-        epic=saved.get('epic') or (self.mandate or {}).get('epic')
         vol=None
         if epic:
             candles=self.store.candles(epic,n=60,historical_only=True)
@@ -2522,6 +2608,12 @@ class SingleTradeEngine:
             sign=1 if direction=='BUY' else -1
             signed=sign*(exit_level-entry)
             adverse=abs(signed) if signed<0 else 0.0
+            # Prefer true MAE from path when available.
+            if path_bars:
+                from .profit_learning import path_excursion
+                mae=path_excursion(path_bars,direction,entry).get('mae')
+                if mae is not None:
+                    adverse=float(mae)
         return {
             'exit_reason':exit_reason,'direction':direction,'entry':entry,
             'exit_level':exit_level,'stop_distance':stop_distance,
@@ -2893,7 +2985,11 @@ class SingleTradeEngine:
             self.last_closed_step=max(self.last_closed_step,self.brain.core.steps)
 
     def _counterfactual_context(self,deal_id,saved,*,epic,entry,exit_level,tick,spread):
-        """Bars + SL/TP for path counterfactual (audit #15); empty → endpoint CF."""
+        """Bars + SL/TP for path counterfactual (audit #15); empty → endpoint CF.
+
+        Bars are trimmed entry→exit (inclusive). Post-close candles used to invent
+        false opposite wins after the fill.
+        """
         stop_d=_num((saved or {}).get('stop_distance'))
         profit_d=_num((saved or {}).get('profit_distance'))
         prot=self.store.get('adaptive_protection:'+str(deal_id)) or {}
@@ -2914,34 +3010,15 @@ class SingleTradeEngine:
             except Exception:
                 pass
         min_d=_num((self.market or {}).get('min_distance'))
-        bars=[]
-        bar_time=(saved or {}).get('bar_time')
-        try:
-            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
-        except Exception:
-            candles=[]
-        if candles:
-            started=False
-            for c in candles:
-                at=c.get('at')
-                if bar_time and not started:
-                    if at is None or str(at)<str(bar_time):continue
-                    started=True
-                elif not bar_time and not started:
-                    tr=self.store.db.execute(
-                        'SELECT opened FROM trades WHERE deal_id=?',(deal_id,)).fetchone()
-                    opened=(tr[0] if tr else None)
-                    if opened and at and str(at)<str(opened)[:19]:
-                        continue
-                    started=True
-                if not started:continue
-                mid=_num(c.get('close'));hi=_num(c.get('high'));lo=_num(c.get('low'))
-                if mid is None:continue
-                bars.append({'mid':mid,'high':hi if hi is not None else mid,
-                             'low':lo if lo is not None else mid,
-                             'spread':_num(c.get('spread')) if _num(c.get('spread')) is not None else spread,
-                             'at':at})
-            if len(bars)>120:bars=bars[:120]
+        direction=(saved or {}).get('direction')
+        bars=self._trade_path_bars(
+            deal_id,saved,epic=epic,entry=entry,exit_level=exit_level,
+            direction=direction)
+        # Attach spread fallback for cost-aware path sim.
+        if bars and spread is not None:
+            for b in bars:
+                if b.get('spread') is None:
+                    b['spread']=spread
         # No invented 2-point path — without OHLC, profit_learning falls back to
         # endpoint mid delta (still using shared one-RT cost rules).
         return {
@@ -2951,6 +3028,39 @@ class SingleTradeEngine:
             'tick':tick,
             'min_distance':min_d,
             'trail':True,
+        }
+
+    def _structure_teacher_context(self,deal_id,saved,*,epic,direction,entry,
+                                   exit_level,bars=None):
+        """Structure memory + path MFE for the single trade-PnL teacher."""
+        path=bars or []
+        pre=[]
+        bar_time=(saved or {}).get('bar_time')
+        try:
+            candles=self.store.candles(epic,n=190,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        if bar_time:
+            pre=[c for c in chron if c.get('at') is not None and str(c.get('at'))<str(bar_time)]
+        max_pre=int(getattr(structure_shadow,'MAX_PRE_BARS',40))
+        if len(pre)>max_pre:pre=pre[-max_pre:]
+        frame=structure_shadow.frame_from_ohlc(
+            path,entry=entry,exit_level=exit_level,pre_bars=pre)
+        prefer=structure_shadow.library_prefers_hold(
+            self.store,epic=epic,structure=frame.get('structure'),
+            direction=direction)
+        from .profit_learning import path_excursion
+        exc=path_excursion(path,direction,entry)
+        return {
+            'frame':frame,
+            'structure_prefer_hold':bool(prefer.get('prefer_hold')),
+            'structure_key':prefer.get('key'),
+            'structure_reason':prefer.get('reason'),
+            'path_mfe':exc.get('mfe'),
+            'path_mae':exc.get('mae'),
+            'gave_then_lost':bool(exc.get('gave_then_lost')),
+            'pre_bars':pre,
         }
 
     def _settle_unified_cycle(self,*,pnl,action=None,exit_reason=None,deal_id=None):
@@ -3072,10 +3182,10 @@ class SingleTradeEngine:
         return bars
 
     def _resolve_hold_shadows(self):
-        """Resolve HOLD shadows as soon as a side hits TP/SL; teach opposite immediately."""
+        """Resolve HOLD shadows ASAP: opposite TP, proposal TP, or both-lost→HOLD."""
         from .self_params import load as load_self_params
         def _learn(label,transition,mode,detail):
-            # Light opposite teach — not full trade-PnL cannon (was overwriting M1).
+            # Light teach — not full trade-PnL cannon (was overwriting M1).
             sp=load_self_params(self.store)
             lr=float(sp.get('learn_lr',0.28))
             repeats=max(1,min(4,int(sp.get('hold_shadow_repeats',2))))
@@ -3088,15 +3198,24 @@ class SingleTradeEngine:
                         and float(meta.get('delta_norm') or 0)>1e-9):
                     taught=True
             if taught:
-                learning_generation.bump(self.store,'hold_shadow_opposite_tp')
-            self.store.event('hold_shadow','Taught opposite after missed TP on HOLD',{
+                if 'opposite_tp' in str(mode):
+                    learning_generation.bump(self.store,'hold_shadow_opposite_tp')
+                elif 'proposal_tp' in str(mode):
+                    learning_generation.bump(self.store,'hold_shadow_proposal_tp')
+                else:
+                    learning_generation.bump(self.store,'hold_shadow_hold')
+            msg=('Taught opposite after missed TP on HOLD' if 'opposite_tp' in str(mode)
+                 else ('Taught proposal after missed TP on HOLD' if 'proposal_tp' in str(mode)
+                       else 'Taught HOLD after both sides lost on abstention'))
+            self.store.event('hold_shadow',msg,{
                 'mode':mode,'label':int(label),
                 'opposite':detail.get('opposite'),
+                'proposal':detail.get('proposal'),
                 'opposite_pnl':detail.get('opposite_pnl'),
                 'proposal_pnl':detail.get('proposal_pnl'),
                 'learn_repeats':repeats,'weights_moved':taught,
                 'path_bars':detail.get('path_bars') or
-                            (detail.get('opposite_sim') or {}).get('bars_held')})
+                (detail.get('opposite_sim') or {}).get('bars_held')})
         outcomes=hold_shadow.resolve_ready(
             self.store,candles_after=self._hold_shadow_candles_after,
             learn_callback=_learn,horizon=hold_shadow.HORIZON_BARS)
@@ -3210,9 +3329,18 @@ class SingleTradeEngine:
             except (TypeError,ValueError):
                 shadow_action=None
         # Audit #15: path CF with same SL/TP/trail/costs (not entry→exit delta alone).
+        # Bars trimmed entry→exit so post-close noise cannot invent flips.
         cf=self._counterfactual_context(deal_id,saved,epic=epic,entry=entry,
                                         exit_level=exit_level,tick=tick,
                                         spread=spread_cost)
+        # Single teacher listens to structure memory + path MFE (no second teach).
+        struct_ctx=self._structure_teacher_context(
+            deal_id,saved,epic=epic,direction=direction,entry=entry,
+            exit_level=exit_level,bars=cf.get('bars'))
+        teach_extra=dict(
+            structure_prefer_hold=struct_ctx.get('structure_prefer_hold'),
+            path_mfe=struct_ctx.get('path_mfe'),
+            path_mae=struct_ctx.get('path_mae'))
         # Profit ledger: ONLY broker-confirmed £ — never ±1 tick fakes.
         if pnl_source=='broker' and pnl_value is not None:
             decision=self.profit_learning.record_closed(
@@ -3221,7 +3349,8 @@ class SingleTradeEngine:
                 currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True,**cf)
+                shadow_action=shadow_action,require_broker_pnl=True,
+                **cf,**teach_extra)
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
         else:
@@ -3231,7 +3360,8 @@ class SingleTradeEngine:
             tick_pnl=(1.0 if pnl_sign>0 else (-1.0 if pnl_sign<0 else 0.0))
             decision=label_from_profit(
                 direction,tick_pnl,flip_after_loss=flip_after_loss,
-                entry=entry,exit_level=exit_level,spread=spread_cost,**cf)
+                entry=entry,exit_level=exit_level,spread=spread_cost,
+                **cf,**teach_extra)
             label=decision.get('label')
             if label is not None:label=int(label)
             mode=str(decision.get('mode') or 'ticks_no_counterfactual')
@@ -3243,7 +3373,8 @@ class SingleTradeEngine:
                 currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True,**cf)
+                shadow_action=shadow_action,require_broker_pnl=True,
+                **cf,**teach_extra)
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
         if label is None:
@@ -3381,11 +3512,12 @@ class SingleTradeEngine:
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'target':label,'weights_updated':False,
                  'learning_generation':learning_generation.current(self.store)})
-        # Structure shadow: freeze SL/loss OHLC path → frame RANGE/TREND/BREAKOUT.
+        # Structure shadow: bank loss AND win OHLC frames (memory of what works).
+        # Teach label itself comes from label_from_profit (listens to library/MFE).
         try:
             exit_reason_tag=self._infer_exit_reason(
                 deal_id,confirmation,entry=entry,direction=direction,
-                exit_level=exit_level,tick=tick)
+                exit_level=exit_level,tick=tick,bars=cf.get('bars'))
             if (str(exit_reason_tag or '').lower()=='sl'
                     or (pnl_value is not None and pnl_value<0)):
                 rec=self._record_structure_shadow_loss(
@@ -3395,15 +3527,32 @@ class SingleTradeEngine:
                     broker_pnl=pnl_value,spread=spread_cost,
                     transition=saved.get('transition') if isinstance(saved,dict) else None)
                 if rec and not rec.get('taught'):
-                    # Snapshot stored even if teach skipped (no transition / no frame).
                     self.store.event('structure_shadow',
                         'Recorded loss OHLC frame for shadow memory',{
                             'deal_id':deal_id,'key':rec.get('key'),
                             'structure':(rec.get('snapshot') or {}).get('frame',{}).get('structure'),
                             'direction':direction,'pnl':pnl_value,
                             'bars':len((rec.get('snapshot') or {}).get('bars') or []),
+                            'exit_reason':exit_reason_tag,
+                            'teacher_mode':mode,
+                            'structure_prefer_hold':struct_ctx.get('structure_prefer_hold'),
+                            'path_mfe':struct_ctx.get('path_mfe'),
                             'suggest':(rec.get('teach') or {}).get('suggest'),
                             'why':(rec.get('teach') or {}).get('why')})
+            elif pnl_value is not None and pnl_value>0:
+                win_rec=self._record_structure_shadow_win(
+                    deal_id,saved,epic=epic,direction=direction,
+                    entry=entry,exit_level=exit_level,
+                    exit_reason=exit_reason_tag or 'tp',
+                    broker_pnl=pnl_value,spread=spread_cost)
+                if win_rec:
+                    self.store.event('structure_shadow',
+                        'Recorded win OHLC frame for shadow memory',{
+                            'deal_id':deal_id,'key':win_rec.get('key'),
+                            'structure':(win_rec.get('snapshot') or {}).get('frame',{}).get('structure'),
+                            'direction':direction,'pnl':pnl_value,
+                            'exit_reason':exit_reason_tag,
+                            'bars':len((win_rec.get('snapshot') or {}).get('bars') or [])})
         except Exception as exc:
             self.store.event('warning','Structure shadow record skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

@@ -12,6 +12,10 @@ Loss labels are NOT hardcoded to HOLD. After a loss the supervised target is
 whichever of BUY/SELL/HOLD the post-cost **path** actually rewarded — the brain
 must discover abstain vs reverse from outcomes, not from a fixed rule.
 
+When structure memory already shows the same frame killed this side, or the
+path went favourable then reversed (gave-then-lost), the teacher prefers HOLD
+over a false flip — still from evidence, not a TP/SL/RR hardcode.
+
 Audit #15: counterfactual replays the full subsequent OHLC path with the same
 SL/TP/trailing/cost rules as shadow paper — not a single entry→exit mid delta.
 """
@@ -33,6 +37,38 @@ def _finite(x):
         return v if math.isfinite(v) else None
     except (TypeError,ValueError):
         return None
+
+
+def path_excursion(bars, direction, entry):
+    """Favourable / adverse excursion (price units) along an OHLC path.
+
+    MFE > 0 means the trade was right-direction for a while before the close.
+    Used so loss teaching does not flip sides on “gave then lost” graves.
+    """
+    entry_n=_finite(entry)
+    if entry_n is None or direction not in ('BUY','SELL') or not bars:
+        return {'mfe':None,'mae':None,'gave_then_lost':False}
+    highs=[];lows=[]
+    for raw in bars:
+        if not isinstance(raw,dict):
+            continue
+        h=_finite(raw.get('high'));l=_finite(raw.get('low'))
+        mid=_finite(raw.get('mid')) or _finite(raw.get('close'))
+        if h is None:h=mid
+        if l is None:l=mid
+        if h is None or l is None:
+            continue
+        highs.append(float(h));lows.append(float(l))
+    if not highs:
+        return {'mfe':None,'mae':None,'gave_then_lost':False}
+    if direction=='BUY':
+        mfe=max(highs)-entry_n
+        mae=entry_n-min(lows)
+    else:
+        mfe=entry_n-min(lows)
+        mae=max(highs)-entry_n
+    mfe=max(0.,float(mfe));mae=max(0.,float(mae))
+    return {'mfe':mfe,'mae':mae,'gave_then_lost':bool(mfe>0)}
 
 
 def hypothetical_pnl(direction, entry, exit_level, *, spread=0., slip_bps=0.,
@@ -92,12 +128,19 @@ def best_action_from_counterfactual(entry, exit_level, *, spread=0., slip_bps=0.
 def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                       entry=None, exit_level=None, spread=0., slip_bps=0.,
                       bars=None, stop_distance=None, profit_distance=None,
-                      tick=None, min_distance=None, trail=True, spread_exit=None):
+                      tick=None, min_distance=None, trail=True, spread_exit=None,
+                      structure_prefer_hold=False, path_mfe=None, path_mae=None):
     """Map £ outcome → BUY/SELL/HOLD from the path itself — no forced HOLD-on-loss.
 
     Wins reinforce the taken side. Losses / flats use post-cost counterfactual
     (BUY vs SELL vs HOLD≈0). flip_after_loss is audit-only (mode suffix), never
-    overrides the target to HOLD.
+    overrides the target to HOLD by itself.
+
+    Optional evidence (still not TP/SL/RR hardcode):
+      • ``structure_prefer_hold`` — structure library already shows this frame
+        killed the taken side → teach HOLD instead of flip churn.
+      • ``path_mfe`` — favourable excursion before the loss (“gave then lost”);
+        flip only if opposite CF clears a stronger evidence floor.
 
     Labels: 0=BUY, 1=SELL, 2=HOLD — same as NeuralCore.
     label=None when there is nothing honest to supervise.
@@ -142,8 +185,32 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                 best='HOLD'
                 mode_tag=('flip_loss_counterfactual_hold' if flip_after_loss
                           else 'loss_counterfactual_hold')
+            # Structure memory: same layout already lethal for this side → HOLD.
+            # Evidence from prior graves, not a hardcoded OPEN veto.
+            if best==opposite and structure_prefer_hold:
+                best='HOLD'
+                mode_tag=('flip_loss_structure_hold' if flip_after_loss
+                          else 'loss_structure_hold')
+            # Gave-then-lost: path was favourable first. Flip only if opposite
+            # CF clearly beats a floor tied to that favourable excursion.
+            mfe=_finite(path_mfe)
+            if mfe is None and bars:
+                mfe=path_excursion(bars,direction,entry).get('mfe')
+            stop_n=_finite(stop_distance)
+            meaningful=None
+            if mfe is not None:
+                meaningful=max(float(sp or 0),float(stop_n or 0)*0.25,1e-9)
+            if (best==opposite and mfe is not None and meaningful is not None
+                    and mfe>meaningful):
+                gave_floor=max(float(opp_floor or 0),0.35*float(mfe))
+                if opp_val<=gave_floor:
+                    best='HOLD'
+                    mode_tag=('flip_loss_gave_then_hold' if flip_after_loss
+                              else 'loss_gave_then_hold')
             return {'label':_ACTION_LABEL[best],'mode':mode_tag,
-                    'actual_pnl':pnl,'simulated':sim,'opp_floor':opp_floor}
+                    'actual_pnl':pnl,'simulated':sim,'opp_floor':opp_floor,
+                    'path_mfe':mfe,'path_mae':_finite(path_mae),
+                    'structure_prefer_hold':bool(structure_prefer_hold)}
         return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
                 'simulated':None}
     # Flat / unknown £ — still prefer path evidence over inventing HOLD.
@@ -169,12 +236,15 @@ class ProfitLearning:
                       flip_after_loss=False, model_version=None, feature_schema=None,
                       shadow_action=None, require_broker_pnl=True,
                       bars=None, stop_distance=None, profit_distance=None,
-                      tick=None, min_distance=None, trail=True, spread_exit=None):
+                      tick=None, min_distance=None, trail=True, spread_exit=None,
+                      structure_prefer_hold=False, path_mfe=None, path_mae=None):
         """Record a closed trade. Fake ±1 cash is refused when require_broker_pnl."""
         cf_kw=dict(spread=spread,slip_bps=slip_bps,bars=bars,
                    stop_distance=stop_distance,profit_distance=profit_distance,
                    tick=tick,min_distance=min_distance,trail=trail,
                    spread_exit=spread_exit)
+        teach_kw=dict(structure_prefer_hold=structure_prefer_hold,
+                      path_mfe=path_mfe,path_mae=path_mae)
         actual=_finite(broker_pnl)
         if require_broker_pnl and actual is None:
             # Do not invent cash for the profit ledger — caller may still train ticks.
@@ -182,7 +252,8 @@ class ProfitLearning:
                     'simulated':best_action_from_counterfactual(
                         entry,exit_level,**cf_kw)}
         decision=label_from_profit(direction,actual,flip_after_loss=flip_after_loss,
-                                   entry=entry,exit_level=exit_level,**cf_kw)
+                                   entry=entry,exit_level=exit_level,
+                                   **cf_kw,**teach_kw)
         sim=best_action_from_counterfactual(entry,exit_level,**cf_kw)
         row={
             'at':datetime.now(timezone.utc).isoformat(),
@@ -198,7 +269,11 @@ class ProfitLearning:
             'cf_method':(sim or {}).get('method'),
             'stop_distance':_finite(stop_distance),
             'profit_distance':_finite(profit_distance),
-            'path_bars':len(bars) if bars else 0}
+            'path_bars':len(bars) if bars else 0,
+            'structure_prefer_hold':bool(structure_prefer_hold),
+            'path_mfe':_finite(decision.get('path_mfe') if isinstance(decision,dict)
+                               else path_mfe),
+            'path_mae':_finite(path_mae)}
         self.history.append(row)
         self._save()
         return decision

@@ -302,10 +302,12 @@ def save_library(store, library: dict) -> dict:
     buckets = library.get('buckets') if isinstance(library, dict) else {}
     if not isinstance(buckets, dict):
         buckets = {}
-    # Cap by weakest evidence (fewest SL samples) when oversized.
+    # Cap by weakest evidence (fewest samples) when oversized.
     items = sorted(
         buckets.items(),
-        key=lambda kv: int((kv[1] or {}).get('sl_count') or 0),
+        key=lambda kv: (
+            int((kv[1] or {}).get('samples') or 0),
+            int((kv[1] or {}).get('sl_count') or 0)),
         reverse=True,
     )
     trimmed = {k: dict(v) for k, v in items[:MAX_LIBRARY] if isinstance(v, dict)}
@@ -349,13 +351,33 @@ def build_snapshot(*, epic, direction, entry, exit_level, exit_reason,
     }
 
 
+def _empty_bucket(*, key, epic, structure, direction) -> dict:
+    return {
+        'key': key, 'epic': str(epic or ''), 'structure': structure,
+        'direction': direction, 'sl_count': 0, 'loss_count': 0,
+        'win_count': 0, 'tp_count': 0,
+        'total_pnl': 0.0, 'last_at': None, 'last_deal': None,
+        'avg_net_over_range': None, 'samples': 0,
+    }
+
+
+def _update_bucket_avg_nor(bucket: dict, nor) -> None:
+    if nor is None:
+        return
+    prev = _finite(bucket.get('avg_net_over_range'))
+    n = int(bucket.get('samples') or 0)
+    if n <= 0:
+        return
+    if prev is None:
+        bucket['avg_net_over_range'] = float(nor)
+    else:
+        bucket['avg_net_over_range'] = (prev * (n - 1) + float(nor)) / n
+
+
 def record_loss(store, *, epic, direction, entry, exit_level, exit_reason,
                 broker_pnl=None, bars=None, pre_bars=None, deal_id=None,
                 spread=None) -> dict | None:
-    """On SL (or cash-losing) close: snapshot path, frame structure, update library.
-
-    Shadow memory grows only from bad outcomes — wins are not required here.
-    """
+    """On SL (or cash-losing) close: snapshot path, frame structure, update library."""
     if direction not in ('BUY', 'SELL'):
         return None
     reason = str(exit_reason or '').lower()
@@ -377,34 +399,110 @@ def record_loss(store, *, epic, direction, entry, exit_level, exit_reason,
             'exit_reason', 'broker_pnl', 'spread', 'frame', 'key')
     } | {'bar_count': len(snap['bars']),
          # Keep a compact OHLC trail for later re-frame / audit.
-         'ohlc': snap['bars'][-MAX_BARS_PER_SNAP:]})
+         'ohlc': snap['bars'][-MAX_BARS_PER_SNAP:],
+         'outcome': 'loss'})
     lib = load_library(store)
     key = snap['key']
-    bucket = dict(lib['buckets'].get(key) or {
-        'key': key, 'epic': str(epic or ''), 'structure': snap['frame']['structure'],
-        'direction': direction, 'sl_count': 0, 'loss_count': 0,
-        'total_pnl': 0.0, 'last_at': None, 'last_deal': None,
-        'avg_net_over_range': None, 'samples': 0,
-    })
+    bucket = dict(lib['buckets'].get(key) or _empty_bucket(
+        key=key, epic=epic, structure=snap['frame']['structure'],
+        direction=direction))
     bucket['sl_count'] = int(bucket.get('sl_count') or 0) + (1 if is_sl else 0)
     bucket['loss_count'] = int(bucket.get('loss_count') or 0) + 1
     bucket['samples'] = int(bucket.get('samples') or 0) + 1
     if pnl is not None:
         bucket['total_pnl'] = float(bucket.get('total_pnl') or 0) + float(pnl)
-    nor = snap['frame'].get('net_over_range')
-    if nor is not None:
-        prev = _finite(bucket.get('avg_net_over_range'))
-        n = int(bucket['samples'])
-        if prev is None:
-            bucket['avg_net_over_range'] = float(nor)
-        else:
-            bucket['avg_net_over_range'] = (prev * (n - 1) + float(nor)) / n
+    _update_bucket_avg_nor(bucket, snap['frame'].get('net_over_range'))
     bucket['last_at'] = snap['at']
     bucket['last_deal'] = deal_id
     bucket['structure'] = snap['frame']['structure']
     lib['buckets'][key] = bucket
     save_library(store, lib)
     return {'snapshot': snap, 'bucket': bucket, 'key': key}
+
+
+def record_win(store, *, epic, direction, entry, exit_level, exit_reason,
+               broker_pnl=None, bars=None, pre_bars=None, deal_id=None,
+               spread=None) -> dict | None:
+    """Bank a winning structure frame so memory learns what works — not only graves.
+
+    Same key space as losses (epic|structure|side). Wins dilute hostile rates so
+    advise()/library_prefers_hold stay honest when a layout starts paying.
+    """
+    if direction not in ('BUY', 'SELL'):
+        return None
+    pnl = _finite(broker_pnl)
+    if pnl is None or pnl <= 0:
+        return None
+    reason = str(exit_reason or '').lower()
+    is_tp = reason == 'tp'
+    snap = build_snapshot(
+        epic=epic, direction=direction, entry=entry, exit_level=exit_level,
+        exit_reason=exit_reason, broker_pnl=broker_pnl, bars=bars,
+        pre_bars=pre_bars, deal_id=deal_id, spread=spread)
+    if not snap['frame'].get('ready') and len(snap['bars']) < MIN_BARS:
+        return None
+    _append_snapshot(store, {
+        k: snap[k] for k in (
+            'at', 'deal_id', 'epic', 'direction', 'entry', 'exit',
+            'exit_reason', 'broker_pnl', 'spread', 'frame', 'key')
+    } | {'bar_count': len(snap['bars']),
+         'ohlc': snap['bars'][-MAX_BARS_PER_SNAP:],
+         'outcome': 'win'})
+    lib = load_library(store)
+    key = snap['key']
+    bucket = dict(lib['buckets'].get(key) or _empty_bucket(
+        key=key, epic=epic, structure=snap['frame']['structure'],
+        direction=direction))
+    bucket['win_count'] = int(bucket.get('win_count') or 0) + 1
+    bucket['tp_count'] = int(bucket.get('tp_count') or 0) + (1 if is_tp else 0)
+    bucket['samples'] = int(bucket.get('samples') or 0) + 1
+    bucket['total_pnl'] = float(bucket.get('total_pnl') or 0) + float(pnl)
+    _update_bucket_avg_nor(bucket, snap['frame'].get('net_over_range'))
+    bucket['last_at'] = snap['at']
+    bucket['last_deal'] = deal_id
+    bucket['structure'] = snap['frame']['structure']
+    lib['buckets'][key] = bucket
+    save_library(store, lib)
+    return {'snapshot': snap, 'bucket': bucket, 'key': key}
+
+
+def library_prefers_hold(store, *, epic, structure, direction,
+                         min_samples=MIN_ADVICE_SAMPLES,
+                         sl_rate=ADVICE_SL_RATE) -> dict:
+    """True when structure memory already shows this frame kills ``direction``.
+
+    Used by the single trade-PnL teacher — not as a LIVE OPEN veto.
+    """
+    key = frame_key(epic=epic, structure=structure, direction=direction)
+    lib = load_library(store)
+    bucket = lib['buckets'].get(key)
+    out = {
+        'prefer_hold': False, 'key': key, 'bucket': bucket,
+        'reason': 'no_loss_memory_for_frame', 'confidence': 0.0,
+    }
+    if not isinstance(bucket, dict):
+        return out
+    samples = int(bucket.get('samples') or 0)
+    sl_count = int(bucket.get('sl_count') or 0)
+    loss_count = int(bucket.get('loss_count') or 0)
+    if samples < int(min_samples):
+        out['reason'] = f'need_{min_samples}_samples_have_{samples}'
+        out['confidence'] = samples / max(1, int(min_samples))
+        return out
+    rate = sl_count / samples if samples else 0.0
+    loss_rate = loss_count / samples if samples else 0.0
+    hostile = max(rate, loss_rate)
+    out['confidence'] = float(hostile)
+    if hostile >= float(sl_rate):
+        out['prefer_hold'] = True
+        out['reason'] = (
+            f'structure_memory: {structure} killed {direction} '
+            f'{loss_count}/{samples} (sl={sl_count}) — prefer HOLD teach')
+    else:
+        out['reason'] = (
+            f'structure_memory_weak: {structure}/{direction} '
+            f'loss_rate={hostile:.0%} below gate')
+    return out
 
 
 def suggest_teach(*, frame, direction, broker_pnl=None) -> dict | None:

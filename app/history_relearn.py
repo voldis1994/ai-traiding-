@@ -5,6 +5,9 @@ Uses closed deals, OHLC paths and structure memory to rebuild:
   2. profit_learning history modes (structure HOLD / gave-then-lost)
   3. LIVE neural weights via trade-PnL only on flat entry transitions
 
+Also merges many ``NEURAL_AI_LEARNING_BACKUP_*`` / client sqlite dumps into one
+corpus (dedupe trades + candles) so ~1000 historical closes become one school.
+
 Entry transitions are rebuilt with ``h=c=0`` (flat OPEN) and z from OHLC
 features at the entry bar. Missing fusion/external channels are zero-filled
 and recorded in the report — better than replaying poisoned mid-trade M1.
@@ -12,13 +15,19 @@ and recorded in the report — better than replaying poisoned mid-trade M1.
 from __future__ import annotations
 
 import math
+import re
 import shutil
-from datetime import timedelta
+import sqlite3
 from pathlib import Path
 
 from . import structure_shadow as ss
 from .market_context import FEATURE_DIM, candle_time, market_features
 from .profit_learning import label_from_profit, path_excursion, ProfitLearning
+
+BACKUP_DIR_RE = re.compile(r'^NEURAL_AI_LEARNING_BACKUP_', re.I)
+CLIENT_DIR_RE = re.compile(r'^client_\d+$')
+# Multi-week merges need far more than a live 120-bar window window.
+CANDLE_LOAD_N = 200_000
 
 
 def _finite(x):
@@ -37,7 +46,7 @@ def _iso(ts):
 def load_trades(store):
     rows = store.db.execute(
         'SELECT deal_id,epic,direction,opened,closed,entry,exit,pnl,pnl_currency,pnl_source '
-        'FROM trades ORDER BY opened').fetchall()
+        'FROM trades WHERE closed IS NOT NULL ORDER BY opened').fetchall()
     cols = ['deal_id', 'epic', 'direction', 'opened', 'closed', 'entry', 'exit',
             'pnl', 'pnl_currency', 'pnl_source']
     out = []
@@ -53,9 +62,199 @@ def load_trades(store):
     return out
 
 
-def load_candles(store, epic, *, n=20000):
+def _trade_merge_key(row: dict) -> tuple | None:
+    """Stable identity across backups: deal_id, else epic+path fingerprint."""
+    did = str(row.get('deal_id') or '').strip()
+    if did:
+        return ('id', did)
+    epic = str(row.get('epic') or '').strip()
+    opened = str(row.get('opened') or '').strip()
+    closed = str(row.get('closed') or '').strip()
+    direction = str(row.get('direction') or '').strip()
+    if not (epic and opened and closed and direction):
+        return None
+    return ('ep', epic, opened, closed, direction)
+
+
+def load_candles(store, epic, *, n=CANDLE_LOAD_N):
     """All saved minutes — live dumps use MINUTE/QUOTE, not only HISTORICAL."""
     return list(store.candles(epic, n=n, historical_only=False) or [])
+
+
+def discover_sqlite_dumps(root: Path, *, extra: list | None = None) -> list:
+    """Find robot.sqlite3 under LEARNING_BACKUP_* and data/accounts/client_*.
+
+    ``extra`` paths are always included (explicit operator dumps).
+    """
+    root = Path(root).expanduser().resolve()
+    found = []
+    seen = set()
+
+    def _add(p: Path):
+        try:
+            rp = p.expanduser().resolve()
+        except OSError:
+            return
+        if not rp.is_file():
+            return
+        key = str(rp)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(rp)
+
+    for p in extra or []:
+        _add(Path(p))
+    if not root.is_dir():
+        return found
+    # Timestamped learning wipes beside the project root / data parent.
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and BACKUP_DIR_RE.match(child.name):
+            for hit in child.rglob('robot.sqlite3'):
+                _add(hit)
+    # Live client journals.
+    data = root / 'data' if (root / 'data').is_dir() else root
+    accounts = data / 'accounts'
+    if accounts.is_dir():
+        for folder in sorted(accounts.iterdir()):
+            if folder.is_dir() and CLIENT_DIR_RE.match(folder.name):
+                _add(folder / 'robot.sqlite3')
+    # Legacy single-tenant layout.
+    _add(data / 'robot.sqlite3')
+    return found
+
+
+def _trade_quality(row: dict) -> tuple:
+    """Higher is better when the same deal_id appears in several backups."""
+    src = str(row.get('pnl_source') or '')
+    broker = 2 if src == 'broker' else (1 if row.get('pnl') is not None else 0)
+    closed = 1 if row.get('closed') else 0
+    spread_ok = 1 if _finite(row.get('entry')) is not None else 0
+    return (broker, closed, spread_ok, str(row.get('closed') or ''))
+
+
+def _read_src_trades(db_path: Path) -> list:
+    con = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in con.execute('PRAGMA table_info(trades)')}
+        if 'deal_id' not in cols:
+            return []
+        want = ['deal_id', 'epic', 'size', 'direction', 'opened', 'closed',
+                'entry', 'exit', 'pnl']
+        optional = []
+        if 'pnl_currency' in cols:
+            optional.append('pnl_currency')
+        if 'pnl_source' in cols:
+            optional.append('pnl_source')
+        sel = want + optional
+        rows = con.execute(
+            f"SELECT {','.join(sel)} FROM trades").fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(sel, r))
+            if d.get('direction') not in ('BUY', 'SELL'):
+                continue
+            if _finite(d.get('entry')) is None or _finite(d.get('exit')) is None:
+                continue
+            if _finite(d.get('pnl')) is None:
+                continue
+            if not d.get('closed'):
+                continue
+            out.append(d)
+        return out
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def _read_src_candles(db_path: Path) -> list:
+    con = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in con.execute('PRAGMA table_info(candles)')}
+        need = {'epic', 'at', 'open', 'high', 'low', 'close'}
+        if not need.issubset(cols):
+            return []
+        has_src = 'source' in cols
+        has_sp = 'spread' in cols
+        q = 'SELECT epic,at,open,high,low,close'
+        q += ',source' if has_src else ",'MINUTE' AS source"
+        q += ',spread' if has_sp else ',NULL AS spread'
+        q += ' FROM candles'
+        return [dict(zip(
+            ('epic', 'at', 'open', 'high', 'low', 'close', 'source', 'spread'), r))
+            for r in con.execute(q)]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def merge_sqlite_dumps(dest_store, sources: list) -> dict:
+    """Union trades + candles from many dumps into ``dest_store`` (deduped).
+
+    Same ``deal_id`` keeps the highest-quality row (broker PnL preferred).
+    Candles keyed by ``(epic, at)``. Does not copy poisoned neural state.
+    """
+    sources = [Path(p) for p in sources]
+    by_key = {}
+    candle_n = 0
+    per_src = []
+    for src in sources:
+        trades = _read_src_trades(src)
+        kept = 0
+        for t in trades:
+            key = _trade_merge_key(t)
+            if key is None:
+                continue
+            prev = by_key.get(key)
+            if prev is None or _trade_quality(t) >= _trade_quality(prev):
+                t = dict(t)
+                t['_src'] = str(src)
+                # Synthetic deal_id for path-only rows so PRIMARY KEY insert works.
+                if not str(t.get('deal_id') or '').strip():
+                    t['deal_id'] = 'path:' + '|'.join(str(x) for x in key[1:])
+                by_key[key] = t
+                kept += 1
+        candles = _read_src_candles(src)
+        inserted = 0
+        for c in candles:
+            try:
+                cur = dest_store.db.execute(
+                    'INSERT OR IGNORE INTO candles(epic,at,open,high,low,close,source,spread) '
+                    'VALUES(?,?,?,?,?,?,?,?)',
+                    (c.get('epic'), c.get('at'), c.get('open'), c.get('high'),
+                     c.get('low'), c.get('close'), c.get('source') or 'MINUTE',
+                     c.get('spread')))
+                if int(cur.rowcount or 0) > 0:
+                    inserted += 1
+            except sqlite3.Error:
+                continue
+        dest_store.db.commit()
+        candle_n += inserted
+        per_src.append({
+            'path': str(src), 'trades_read': len(trades),
+            'trades_kept_prefer': kept, 'candles_read': len(candles),
+            'candles_inserted': inserted,
+        })
+    # Rewrite trades table from merged map.
+    dest_store.db.execute('DELETE FROM trades')
+    for t in by_key.values():
+        dest_store.db.execute(
+            'INSERT OR REPLACE INTO trades('
+            'deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
+            'pnl_currency,pnl_source) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            (t.get('deal_id'), t.get('epic'), str(t.get('size') or ''),
+             t.get('direction'), t.get('opened'), t.get('closed'),
+             t.get('entry'), t.get('exit'), t.get('pnl'),
+             t.get('pnl_currency'), t.get('pnl_source')))
+    dest_store.db.commit()
+    return {
+        'sources': len(sources),
+        'unique_trades': len(by_key),
+        'candles_inserted_total': candle_n,
+        'per_source': per_src,
+    }
 
 
 def path_between(candles, opened, closed):
@@ -273,3 +472,25 @@ def prepare_workdir(src_db: Path, src_brain: Path, work: Path) -> dict:
     shutil.copy2(src_db, db_dst)
     shutil.copy2(src_brain, brain_dst)
     return {'db': db_dst, 'brain': brain_dst, 'work': work}
+
+
+def prepare_merged_workdir(*, brain: Path, work: Path, sources: list,
+                           seed_db: Path | None = None) -> dict:
+    """Build an empty/seed sqlite, merge all sources, copy brain for relearn."""
+    from .engine import Store
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    db_dst = work / 'robot.sqlite3'
+    brain_dst = work / 'brain.npz'
+    if seed_db is not None and Path(seed_db).is_file():
+        shutil.copy2(seed_db, db_dst)
+    elif db_dst.exists():
+        db_dst.unlink()
+    store = Store(db_dst)
+    # Drop seed trades/candles only when we intentionally start empty; if seed
+    # was copied, merge_sqlite_dumps still dedupes on top.
+    merge = merge_sqlite_dumps(store, sources)
+    shutil.copy2(brain, brain_dst)
+    store.set('history_merge_last_v1', merge)
+    return {'db': db_dst, 'brain': brain_dst, 'work': work, 'merge': merge,
+            'store': store}

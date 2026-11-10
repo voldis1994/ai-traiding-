@@ -133,8 +133,17 @@ def _trade_quality(row: dict) -> tuple:
     return (broker, closed, spread_ok, str(row.get('closed') or ''))
 
 
+def _open_src_db(db_path: Path):
+    """Open backup sqlite read-only; ``immutable=1`` salvages torn WAL copies."""
+    uri = f"file:{Path(db_path).resolve()}?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
+
 def _read_src_trades(db_path: Path) -> list:
-    con = sqlite3.connect(str(db_path))
+    try:
+        con = _open_src_db(db_path)
+    except sqlite3.Error:
+        return []
     try:
         cols = {r[1] for r in con.execute('PRAGMA table_info(trades)')}
         if 'deal_id' not in cols:
@@ -147,8 +156,11 @@ def _read_src_trades(db_path: Path) -> list:
         if 'pnl_source' in cols:
             optional.append('pnl_source')
         sel = want + optional
-        rows = con.execute(
-            f"SELECT {','.join(sel)} FROM trades").fetchall()
+        try:
+            rows = con.execute(
+                f"SELECT {','.join(sel)} FROM trades").fetchall()
+        except sqlite3.Error:
+            return []
         out = []
         for r in rows:
             d = dict(zip(sel, r))
@@ -169,7 +181,10 @@ def _read_src_trades(db_path: Path) -> list:
 
 
 def _read_src_candles(db_path: Path) -> list:
-    con = sqlite3.connect(str(db_path))
+    try:
+        con = _open_src_db(db_path)
+    except sqlite3.Error:
+        return []
     try:
         cols = {r[1] for r in con.execute('PRAGMA table_info(candles)')}
         need = {'epic', 'at', 'open', 'high', 'low', 'close'}
@@ -180,10 +195,23 @@ def _read_src_candles(db_path: Path) -> list:
         q = 'SELECT epic,at,open,high,low,close'
         q += ',source' if has_src else ",'MINUTE' AS source"
         q += ',spread' if has_sp else ',NULL AS spread'
-        q += ' FROM candles'
-        return [dict(zip(
-            ('epic', 'at', 'open', 'high', 'low', 'close', 'source', 'spread'), r))
-            for r in con.execute(q)]
+        q += ' FROM candles ORDER BY rowid'
+        out = []
+        try:
+            cur = con.execute(q)
+            while True:
+                try:
+                    row = cur.fetchone()
+                except sqlite3.Error:
+                    break
+                if row is None:
+                    break
+                out.append(dict(zip(
+                    ('epic', 'at', 'open', 'high', 'low', 'close', 'source', 'spread'),
+                    row)))
+        except sqlite3.Error:
+            pass
+        return out
     except sqlite3.Error:
         return []
     finally:

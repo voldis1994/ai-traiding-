@@ -17,13 +17,23 @@ echo and relearns LIVE weights with corrected teachers.
 echo.
 echo STOP the robot first (run_windows.bat window).
 echo This does NOT place broker orders.
-echo PRESERVED until you choose install: live client files stay intact.
 echo Output: data\relearn_from_backups\brain.npz + relearn_report.json
 echo.
-echo Optional: pass --install to copy the new brain into the seed client
+echo Examples:
+echo   extract_learning_windows.bat
 echo   extract_learning_windows.bat --install
-echo   extract_learning_windows.bat --install --client client_3
+echo   extract_learning_windows.bat --install-only --client client_1
 echo.
+
+REM Refuse while the live UI/API port is still listening — install would be
+REM overwritten by the running process save() of the old in-memory brain.
+netstat -ano 2>nul | findstr ":8765" | findstr "LISTENING" >nul
+if not errorlevel 1 (
+  echo [ERROR] Port 8765 is LISTENING — robot is still running.
+  echo [ERROR] Click Stop, close run_windows.bat, then retry.
+  set "RESULT=1"
+  goto end
+)
 
 set "PY="
 if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
@@ -45,8 +55,8 @@ if not "%RESULT%"=="0" goto failed
 echo [OK] Done. New brain: data\relearn_from_backups\brain.npz
 echo [OK] Report:     data\relearn_from_backups\relearn_report.json
 echo.
-echo To install into the same client as the seed brain:
-echo   extract_learning_windows.bat --install
+echo If you did NOT pass --install yet:
+echo   extract_learning_windows.bat --install-only --client client_1
 echo Then start the robot with run_windows.bat
 goto end
 

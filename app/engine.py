@@ -2043,14 +2043,33 @@ class SingleTradeEngine:
                         feature_schema=self.brain.feature_schema,
                         market_bar=self.market_context.get('bar_time'),
                         trend=self.market_context.get('trend'),
-                        regime=self.market_context.get('regime'))
-                    self.last_signal=next_signal
-                    self.last_decision_bar=self.market_context['bar_time']
-                    new_closed_bar=True
-                    # Audit #32: never run neural growth / feature search before
-                    # open-position protection. Flat books may self-dev now;
-                    # open books defer until after trail/protect below.
-                    if not self.positions:
+                        regime=self.market_context.get('regime'),
+                        entry_train=bool(next_signal.get('entry_train',not in_pos)),
+                        in_position=bool(in_pos))
+                    # In-trade: perceive + protect only. Do NOT replace the OPEN
+                    # entry signal in the UI / exit-intent path — mid-bar BUY/SELL
+                    # churn looked like the entry policy was still mixing votes.
+                    if in_pos:
+                        if isinstance(self.last_signal,dict):
+                            frozen=dict(self.last_signal)
+                            frozen['in_position']=True
+                            frozen['entry_train']=False
+                            frozen['perceive_bar']=self.market_context.get('bar_time')
+                            # Keep live perceive scores under a side key for audit.
+                            frozen['perceive_scores']=next_signal.get('scores')
+                            frozen['perceive_action']=next_signal.get('action')
+                            self.last_signal=frozen
+                        else:
+                            # Manual adopt / missing OPEN snapshot — show perceive once.
+                            self.last_signal=next_signal
+                        new_closed_bar=True
+                    else:
+                        self.last_signal=next_signal
+                        self.last_decision_bar=self.market_context['bar_time']
+                        new_closed_bar=True
+                        # Audit #32: never run neural growth / feature search before
+                        # open-position protection. Flat books may self-dev now;
+                        # open books defer until after trail/protect below.
                         self._run_self_development_cycle(candles,spread=ask-bid)
                 elif on_fusion and fused is None and not self.positions:
                     # Flat + fusion gap: stale signal must not authorize entry.
@@ -2162,11 +2181,8 @@ class SingleTradeEngine:
                              'streak':streak,'returns_bps':self.market_context.get('returns_bps'),
                              'neural_market_exit':False})
                 await self.adapt_protection(p)
-                # Protection finished first — heavy self-dev only if resources allow
-                # and never instead of trail/protect (audit #32).
-                if new_closed_bar:
-                    self._run_self_development_cycle(candles,spread=ask-bid,
-                                                     defer_if_busy=True)
+                # No self-dev / feature search while a LIVE deal is open — that
+                # mutates entry-policy architecture under an active manage MDP.
             elif (len(self.positions)==0 and self.last_signal and
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):

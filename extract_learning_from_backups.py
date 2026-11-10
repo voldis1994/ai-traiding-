@@ -60,6 +60,61 @@ def _pick_install_client(root: Path, client: str | None,
     return None
 
 
+def _install_into_client(*, root: Path, work: Path, client_dir: Path,
+                         merged_store=None) -> dict:
+    """Copy relearn brain + structure/profit memory into a live client folder."""
+    src_brain = Path(work) / 'brain.npz'
+    if not src_brain.is_file():
+        return {'ok': False, 'reason': 'missing_relearn_brain', 'path': str(src_brain)}
+    dst_brain = client_dir / 'brain.npz'
+    if dst_brain.is_file():
+        bak = client_dir / 'brain.before_backup_relearn.npz'
+        shutil.copy2(dst_brain, bak)
+    shutil.copy2(src_brain, dst_brain)
+
+    store = merged_store
+    close_store = False
+    if store is None:
+        merged_db = Path(work) / 'robot.sqlite3'
+        if not merged_db.is_file():
+            return {
+                'ok': True, 'brain': str(dst_brain), 'client': str(client_dir),
+                'rollback_brain': str(client_dir / 'brain.before_backup_relearn.npz'),
+                'structure_warning': 'no_merged_sqlite',
+            }
+        store = Store(merged_db)
+        close_store = True
+
+    live = Store(client_dir / 'robot.sqlite3')
+    try:
+        from app import structure_shadow as ss
+        from app.profit_learning import ProfitLearning
+        for key in (ss.STORE_KEY, ss.SNAPSHOT_KEY, ss.LAST_ADVICE_KEY,
+                    'history_merge_last_v1'):
+            val = store.get(key)
+            if val is not None:
+                live.set(key, val)
+        pl_src = ProfitLearning(store)
+        pl_dst = ProfitLearning(live)
+        pl_dst.history = list(pl_src.history or [])
+        pl_dst._save()
+        installed = {
+            'ok': True, 'brain': str(dst_brain),
+            'client': str(client_dir),
+            'rollback_brain': str(client_dir / 'brain.before_backup_relearn.npz'),
+        }
+    except Exception as exc:
+        installed = {
+            'ok': True, 'brain': str(dst_brain),
+            'client': str(client_dir),
+            'structure_warning': str(exc),
+        }
+    live.close()
+    if close_store:
+        store.close()
+    return installed
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', type=Path, default=ROOT,
@@ -76,6 +131,8 @@ def main(argv=None):
                    help='Do not pick loose robot(1).sqlite3-style copies')
     p.add_argument('--install', action='store_true',
                    help='After OK relearn, copy brain.npz into the live client folder')
+    p.add_argument('--install-only', action='store_true',
+                   help='Only copy existing relearn_from_backups brain into client')
     p.add_argument('--client', type=str, default=None,
                    help='Install target client folder (default: same as seed brain)')
     p.add_argument('--lr', type=float, default=0.28)
@@ -85,6 +142,28 @@ def main(argv=None):
 
     root = args.root.expanduser().resolve()
     out = (args.out or (root / 'data' / 'relearn_from_backups')).expanduser().resolve()
+
+    if args.install_only:
+        brain_path = discover_seed_brain(
+            root, scan_parent=bool(args.scan_parent), prefer=args.brain)
+        client_dir = _pick_install_client(
+            root, args.client, seed_brain=brain_path)
+        if client_dir is None:
+            print(json.dumps({'ok': False, 'reason': 'no_client_folder'}, indent=2))
+            return 1
+        installed = _install_into_client(
+            root=root, work=out, client_dir=client_dir, merged_store=None)
+        print(json.dumps({
+            'ok': bool(installed.get('ok')),
+            'install_only': True,
+            'install': installed,
+            'out': str(out),
+        }, indent=2, default=str))
+        if installed.get('ok'):
+            print(f'[OK] Installed into {installed.get("client")}')
+            print('[OK] Now start run_windows.bat (robot must have been STOPPED).')
+            return 0
+        return 1
 
     sources = discover_sqlite_dumps(
         root,
@@ -148,43 +227,9 @@ def main(argv=None):
         if client_dir is None:
             installed = {'ok': False, 'reason': 'no_client_folder'}
         else:
-            src_brain = Path(paths['work']) / 'brain.npz'
-            dst_brain = client_dir / 'brain.npz'
-            # Keep previous live brain as rollback beside the client.
-            if dst_brain.is_file():
-                bak = client_dir / 'brain.before_backup_relearn.npz'
-                shutil.copy2(dst_brain, bak)
-            shutil.copy2(src_brain, dst_brain)
-            # Structure library lives in robot.sqlite3 state — copy merged store
-            # keys the operator needs without wiping live candle stream: merge
-            # report already rebuilt structure inside out/robot.sqlite3; copy
-            # that file only when client has no open need — safer: copy state
-            # via Store.get keys.
-            live = Store(client_dir / 'robot.sqlite3')
-            try:
-                from app import structure_shadow as ss
-                from app.profit_learning import ProfitLearning
-                for key in (ss.STORE_KEY, ss.SNAPSHOT_KEY, ss.LAST_ADVICE_KEY,
-                            'history_merge_last_v1'):
-                    val = store.get(key)
-                    if val is not None:
-                        live.set(key, val)
-                pl_src = ProfitLearning(store)
-                pl_dst = ProfitLearning(live)
-                pl_dst.history = list(pl_src.history or [])
-                pl_dst._save()
-                installed = {
-                    'ok': True, 'brain': str(dst_brain),
-                    'client': str(client_dir),
-                    'rollback_brain': str(client_dir / 'brain.before_backup_relearn.npz'),
-                }
-            except Exception as exc:
-                installed = {
-                    'ok': True, 'brain': str(dst_brain),
-                    'client': str(client_dir),
-                    'structure_warning': str(exc),
-                }
-            live.close()
+            installed = _install_into_client(
+                root=root, work=paths['work'], client_dir=client_dir,
+                merged_store=store)
 
     summary = {
         'ok': report.get('ok'),

@@ -947,6 +947,9 @@ class SingleTradeEngine:
         self.store=store;self.brain=brain;self.broker=None
         self.armed=False;self.execution_enabled=False;self.mandate=None
         self.positions=[];self.account={};self.market={};self.last_signal=None;self.last_error=None
+        # OPEN-time BUY/HOLD/SELL locked for UI while a LIVE deal is managed.
+        self._locked_entry_signal=None
+        self._last_in_trade_protect_bar=None
         self.position_age=0;self.last_position_id=None;self.last_closed_step=-1
         self.last_entry_signal_step=-1;self.last_order_ref=None
         self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
@@ -1218,6 +1221,7 @@ class SingleTradeEngine:
                 self._switch_instrument_learning(previous,None)
             self.mandate=None;self.store.set('mandate',None)
             self.last_signal=None;self.last_closed_step=-1
+            self._locked_entry_signal=None;self._last_in_trade_protect_bar=None
             self.last_entry_signal_step=-1;self.last_entry_audit_key=None
             self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
             self.last_position_id=None;self._seen_initial=False
@@ -1594,6 +1598,8 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Flat recurrent reset skipped',
                             {'type':type(exc).__name__,'deal_id':deal})
+        self._locked_entry_signal=None
+        self._last_in_trade_protect_bar=None
         # Flat + mandate close: unlock LIVE OPEN if cold prep holdout trapped us.
         try:
             self._maybe_release_cold_start_prep()
@@ -1749,6 +1755,7 @@ class SingleTradeEngine:
                 self._seen_initial=True;self.last_closed_step=-1
                 self.last_entry_signal_step=-1
                 self.last_signal=None;self.last_decision_bar=None
+                self._locked_entry_signal=None;self._last_in_trade_protect_bar=None
                 self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
                 self.last_entry_audit_key=None
                 if not old or old['epic']!=p['epic']:
@@ -2026,51 +2033,43 @@ class SingleTradeEngine:
                 # position protection continues below regardless of fusion.
                 # Pre-fusion OHLC models may still tick on local features alone.
                 in_pos=bool(self.positions)
-                if fused is not None:
+                bar_t=self.market_context.get('bar_time')
+                if in_pos:
+                    # HARD freeze: do not run entry-policy tick at all while a
+                    # LIVE deal is open — no new softmax, no signals-table rows,
+                    # no mid-trade BUY/HOLD/SELL churn in Admin/UI.
+                    self._lock_entry_signal_for_open()
+                    if bar_t is not None and bar_t!=self._last_in_trade_protect_bar:
+                        self._last_in_trade_protect_bar=bar_t
+                        new_closed_bar=True
+                    next_signal=None
+                elif fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
-                        bar_time=self.market_context['bar_time'],external_features=True,
-                        in_position=in_pos)
+                        bar_time=bar_t,external_features=True,
+                        in_position=False)
                 elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=self.market_context['features'],
-                        bar_time=self.market_context['bar_time'],in_position=in_pos)
+                        bar_time=bar_t,in_position=False)
                 else:
                     next_signal=None
-                if next_signal is not None:
+                if next_signal is not None and not in_pos:
                     next_signal=dict(next_signal,
                         model_version=self.brain.model_version,
                         feature_schema=self.brain.feature_schema,
-                        market_bar=self.market_context.get('bar_time'),
+                        market_bar=bar_t,
                         trend=self.market_context.get('trend'),
                         regime=self.market_context.get('regime'),
-                        entry_train=bool(next_signal.get('entry_train',not in_pos)),
-                        in_position=bool(in_pos))
-                    # In-trade: perceive + protect only. Do NOT replace the OPEN
-                    # entry signal in the UI / exit-intent path — mid-bar BUY/SELL
-                    # churn looked like the entry policy was still mixing votes.
-                    if in_pos:
-                        if isinstance(self.last_signal,dict):
-                            frozen=dict(self.last_signal)
-                            frozen['in_position']=True
-                            frozen['entry_train']=False
-                            frozen['perceive_bar']=self.market_context.get('bar_time')
-                            # Keep live perceive scores under a side key for audit.
-                            frozen['perceive_scores']=next_signal.get('scores')
-                            frozen['perceive_action']=next_signal.get('action')
-                            self.last_signal=frozen
-                        else:
-                            # Manual adopt / missing OPEN snapshot — show perceive once.
-                            self.last_signal=next_signal
-                        new_closed_bar=True
-                    else:
-                        self.last_signal=next_signal
-                        self.last_decision_bar=self.market_context['bar_time']
-                        new_closed_bar=True
-                        # Audit #32: never run neural growth / feature search before
-                        # open-position protection. Flat books may self-dev now;
-                        # open books defer until after trail/protect below.
-                        self._run_self_development_cycle(candles,spread=ask-bid)
+                        entry_train=True,
+                        in_position=False)
+                    self.last_signal=next_signal
+                    self.last_decision_bar=bar_t
+                    new_closed_bar=True
+                    # Audit #32: never run neural growth / feature search before
+                    # open-position protection. Flat books may self-dev now;
+                    # open books defer until after trail/protect below.
+                    self._run_self_development_cycle(candles,spread=ask-bid)
                 elif on_fusion and fused is None and not self.positions:
                     # Flat + fusion gap: stale signal must not authorize entry.
                     # Keep last_signal for UI audit only when a position is open.
@@ -2084,6 +2083,8 @@ class SingleTradeEngine:
                 # protection still runs from broker levels, not this signal.
                 if not self.positions:
                     self.last_signal=None
+                elif self.positions:
+                    self._lock_entry_signal_for_open()
             # Bind the decision-time neural state (captured in submit) to the deal.
             # Fallback: only if we never captured at entry (e.g. manual adopt).
             if len(self.positions)==1:
@@ -4052,6 +4053,8 @@ class SingleTradeEngine:
                 'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance']),
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
             self.last_entry_signal_step=self.brain.core.steps
+            # Freeze UI scores at the OPEN decision before manage ticks start.
+            self._lock_entry_signal_for_open()
             try:
                 receipt=await self.broker.open_position(self.mandate['epic'],action,size,
                     stop_distance=brackets['stop_distance'],profit_distance=brackets['profit_distance'])
@@ -4074,6 +4077,19 @@ class SingleTradeEngine:
                     {'type':type(exc).__name__})
                 self._ensure_live_unless_operator_paused()
         finally:self.pending_order=False
+    def _lock_entry_signal_for_open(self):
+        """Pin Admin/UI BUY/HOLD/SELL to the OPEN vote for the whole deal."""
+        import copy
+        if self._locked_entry_signal is None and isinstance(self.last_signal,dict):
+            locked=copy.deepcopy(self.last_signal)
+            locked['in_position']=True
+            locked['entry_train']=False
+            locked['scores_frozen']=True
+            self._locked_entry_signal=locked
+        if self._locked_entry_signal is not None:
+            # Always re-publish the locked OPEN scores — never mid-trade perceive.
+            self.last_signal=copy.deepcopy(self._locked_entry_signal)
+
     def _existing_open_block_reason(self):
         """Name the live deal + UPL; explain 0% scores while waiting for first vote."""
         if not self.positions:return 'Existing open position'
@@ -4170,9 +4186,13 @@ class SingleTradeEngine:
         decision=(raw_exit_intent if self.positions else
                   (evaluation['action'] if evaluation else 'HOLD'))
         gates=self.live_open_gates(evaluation['action'] if evaluation else None)
+        # Snapshot must never leak mid-trade perceive scores into Admin/UI.
+        if self.positions:
+            self._lock_entry_signal_for_open()
+        ui_signal=self._locked_entry_signal if (self.positions and self._locked_entry_signal) else self.last_signal
         return {'connected':bool(self.broker),'armed':self.armed,'execution_enabled':self.execution_enabled,
                 'mandate':self.mandate,'data_dir':str(self.store.path.parent),
-                'positions':self.positions,'market':self.market,'signal':self.last_signal,
+                'positions':self.positions,'market':self.market,'signal':ui_signal,
                 'neural':dict(self.brain.core.snapshot(),feature_schema=getattr(self.brain,'feature_schema',None),
                     input_dimension=self.brain.core.d,
                     external_features_learned=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)

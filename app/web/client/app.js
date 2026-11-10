@@ -2,6 +2,8 @@
 const $=id=>document.getElementById(id);
 let lang=localStorage.getItem('nta_client_lang')||'lv';
 let socket=null;let pollTimer=null;let currentClient=null;
+// Freeze BUY/HOLD/SELL bars while a LIVE deal is open.
+let frozenScores=null;
 
 function t(key){return (window.NTA_I18N[lang]||window.NTA_I18N.lv)[key]||key}
 function applyI18n(){
@@ -29,7 +31,16 @@ function renderGuide(phase){
 }
 function renderRobot(view){
   $('guide').classList.add('hidden');$('robot').classList.remove('hidden');
-  const scores=view.scores||{};
+  const pos=view.position;
+  let scores=view.scores||{};
+  if(pos){
+    if(!frozenScores && (scores.BUY||scores.HOLD||scores.SELL)){
+      frozenScores={BUY:scores.BUY,HOLD:scores.HOLD,SELL:scores.SELL};
+    }
+    if(frozenScores)scores=frozenScores;
+  }else{
+    frozenScores=null;
+  }
   const b=pct(scores.BUY),h=pct(scores.HOLD),s=pct(scores.SELL);
   $('scoreBuy').textContent=b+'%';$('scoreHold').textContent=h+'%';$('scoreSell').textContent=s+'%';
   $('barBuy').style.width=b+'%';$('barHold').style.width=h+'%';$('barSell').style.width=s+'%';
@@ -41,7 +52,6 @@ function renderRobot(view){
   $('evoSamples').textContent=String(evo.labeled_samples??0);
   $('marketEpic').textContent=view.mandate?.epic||'—';
   $('marketSize').textContent=view.mandate?.size||'—';
-  const pos=view.position;
   $('positionLine').textContent=pos?`${pos.direction||''} ${pos.size||''}`.trim():t('none');
   const paused=!!view.operator_paused || !view.execution_enabled;
   $('livePill').textContent=paused?t('paused'):t('live');

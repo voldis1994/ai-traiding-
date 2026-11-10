@@ -35,9 +35,14 @@ class AccountRuntime:
         snap=self.engine.snapshot()
         signal=snap.get('signal') or {}
         scores=signal.get('scores') or {}
+        neural=snap.get('neural') or {}
+        mandate=snap.get('mandate')
+        positions=snap.get('positions') or []
         # After restart last_signal is empty until the first completed M1+fusion
         # vote — surface the latest journaled scores so admin is not stuck at 0%.
-        if not signal.get('action') and not any(scores.values()):
+        # Never do this while a LIVE deal is open: journal rows may be mid-trade
+        # perceive noise and would make BUY/HOLD/SELL dance in the UI.
+        if (not positions and not signal.get('action') and not any(scores.values())):
             try:
                 rows=self.store.signals(1)
                 if rows:
@@ -52,9 +57,6 @@ class AccountRuntime:
                                 'from_journal':True}
             except Exception:
                 pass
-        neural=snap.get('neural') or {}
-        mandate=snap.get('mandate')
-        positions=snap.get('positions') or []
         code=self.engine.policy.info() if self.engine.policy else {}
         phase='guide' if not mandate else 'robot'
         return {

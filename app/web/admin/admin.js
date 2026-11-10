@@ -1,6 +1,9 @@
 'use strict';
 const $=id=>document.getElementById(id);
 let pollTimer=null;
+// While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
+// lagging backend cannot make the Admin card dance mid-trade.
+const frozenScoresByClient=new Map();
 
 async function api(path,method='GET',payload){
   const opts={method,credentials:'same-origin',headers:{'Content-Type':'application/json'}};
@@ -51,8 +54,19 @@ function renderSummary(s){
 }
 
 function renderCard(c){
-  const e=c.evolution||{},a=c.activity||{},r=c.results||{},sc=c.scores||{};
+  const e=c.evolution||{},a=c.activity||{},r=c.results||{};
   const running=!!c.robot_running;
+  const cid=String(c.id);
+  let sc=c.scores||{};
+  if(a.position){
+    if(!frozenScoresByClient.has(cid) && (sc.BUY||sc.HOLD||sc.SELL)){
+      frozenScoresByClient.set(cid,{BUY:sc.BUY,HOLD:sc.HOLD,SELL:sc.SELL,action:c.action});
+    }
+    const fr=frozenScoresByClient.get(cid);
+    if(fr){sc=fr;c={...c,action:fr.action||c.action};}
+  }else{
+    frozenScoresByClient.delete(cid);
+  }
   const paused=!!c.operator_paused;
   const pill=running?(paused?'pause':'on'):'off';
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';

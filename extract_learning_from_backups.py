@@ -18,18 +18,39 @@ if str(ROOT) not in sys.path:
 
 from app.engine import AdaptiveBrain, Store
 from app.history_relearn import (
-    discover_seed_brain, discover_sqlite_dumps, prepare_merged_workdir, relearn,
+    CLIENT_DIR_RE, discover_seed_brain, discover_sqlite_dumps,
+    prepare_merged_workdir, relearn,
 )
 
 
-def _pick_install_client(root: Path, client: str | None) -> Path | None:
+def _client_dir_from_brain(brain_path: Path | None) -> Path | None:
+    """If seed brain lives in data/accounts/client_N/, return that folder."""
+    if brain_path is None:
+        return None
+    try:
+        p = Path(brain_path).resolve()
+    except OSError:
+        return None
+    if p.name.lower() != 'brain.npz':
+        return None
+    parent = p.parent
+    if CLIENT_DIR_RE.match(parent.name) and parent.parent.name == 'accounts':
+        return parent
+    return None
+
+
+def _pick_install_client(root: Path, client: str | None,
+                         *, seed_brain: Path | None = None) -> Path | None:
     accounts = root / 'data' / 'accounts'
     if not accounts.is_dir():
         return None
     if client:
         folder = accounts / client
         return folder if folder.is_dir() else None
-    # Prefer client_1, else first client_* with brain.npz / robot.sqlite3.
+    # Default: same client as the seed brain (not always client_1).
+    from_seed = _client_dir_from_brain(seed_brain)
+    if from_seed is not None and from_seed.is_dir():
+        return from_seed
     preferred = accounts / 'client_1'
     if preferred.is_dir():
         return preferred
@@ -56,7 +77,7 @@ def main(argv=None):
     p.add_argument('--install', action='store_true',
                    help='After OK relearn, copy brain.npz into the live client folder')
     p.add_argument('--client', type=str, default=None,
-                   help='Install target client folder name (default: client_1)')
+                   help='Install target client folder (default: same as seed brain)')
     p.add_argument('--lr', type=float, default=0.28)
     p.add_argument('--loss-repeats', type=int, default=3)
     p.add_argument('--win-repeats', type=int, default=2)
@@ -122,7 +143,8 @@ def main(argv=None):
 
     installed = None
     if report.get('ok') and args.install:
-        client_dir = _pick_install_client(root, args.client)
+        client_dir = _pick_install_client(
+            root, args.client, seed_brain=brain_path)
         if client_dir is None:
             installed = {'ok': False, 'reason': 'no_client_folder'}
         else:

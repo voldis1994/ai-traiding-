@@ -22,7 +22,8 @@ echo.
 echo Examples:
 echo   extract_learning_windows.bat
 echo   extract_learning_windows.bat --install
-echo   extract_learning_windows.bat --install-only --client client_1
+echo   extract_learning_windows.bat --install-only
+echo   (--install / --install-only copies brain into ALL client_* folders)
 echo.
 
 REM Refuse while the live UI/API port is still listening — install would be
@@ -55,8 +56,8 @@ if not "%RESULT%"=="0" goto failed
 echo [OK] Done. New brain: data\relearn_from_backups\brain.npz
 echo [OK] Report:     data\relearn_from_backups\relearn_report.json
 echo.
-echo If you did NOT pass --install yet:
-echo   extract_learning_windows.bat --install-only --client client_1
+echo If you did NOT pass --install yet (installs ALL clients):
+echo   extract_learning_windows.bat --install-only
 echo Then start the robot with run_windows.bat
 goto end
 

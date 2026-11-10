@@ -39,25 +39,41 @@ def _client_dir_from_brain(brain_path: Path | None) -> Path | None:
     return None
 
 
-def _pick_install_client(root: Path, client: str | None,
-                         *, seed_brain: Path | None = None) -> Path | None:
+def _list_client_dirs(root: Path) -> list:
     accounts = root / 'data' / 'accounts'
     if not accounts.is_dir():
-        return None
+        return []
+    out = []
+    try:
+        for folder in sorted(accounts.iterdir()):
+            if folder.is_dir() and CLIENT_DIR_RE.match(folder.name):
+                out.append(folder)
+    except OSError:
+        return []
+    return out
+
+
+def _pick_install_clients(root: Path, client: str | None, *,
+                          all_clients: bool = True,
+                          seed_brain: Path | None = None) -> list:
+    """Default: every data/accounts/client_N. ``--client`` selects one."""
+    accounts = root / 'data' / 'accounts'
+    if not accounts.is_dir():
+        return []
     if client:
         folder = accounts / client
-        return folder if folder.is_dir() else None
-    # Default: same client as the seed brain (not always client_1).
+        return [folder] if folder.is_dir() else []
+    if all_clients:
+        return _list_client_dirs(root)
+    # Legacy single-target fallback: seed client, else client_1, else first.
     from_seed = _client_dir_from_brain(seed_brain)
     if from_seed is not None and from_seed.is_dir():
-        return from_seed
+        return [from_seed]
     preferred = accounts / 'client_1'
     if preferred.is_dir():
-        return preferred
-    for folder in sorted(accounts.iterdir()):
-        if folder.is_dir() and folder.name.startswith('client_'):
-            return folder
-    return None
+        return [preferred]
+    listed = _list_client_dirs(root)
+    return listed[:1] if listed else []
 
 
 def _install_into_client(*, root: Path, work: Path, client_dir: Path,
@@ -130,11 +146,11 @@ def main(argv=None):
     p.add_argument('--no-loose', action='store_true',
                    help='Do not pick loose robot(1).sqlite3-style copies')
     p.add_argument('--install', action='store_true',
-                   help='After OK relearn, copy brain.npz into the live client folder')
+                   help='After OK relearn, copy brain into all client_* (or --client)')
     p.add_argument('--install-only', action='store_true',
-                   help='Only copy existing relearn_from_backups brain into client')
+                   help='Only copy existing relearn_from_backups brain into clients')
     p.add_argument('--client', type=str, default=None,
-                   help='Install target client folder (default: same as seed brain)')
+                   help='Install only this client_N (default: ALL client_*)')
     p.add_argument('--lr', type=float, default=0.28)
     p.add_argument('--loss-repeats', type=int, default=3)
     p.add_argument('--win-repeats', type=int, default=2)
@@ -146,21 +162,26 @@ def main(argv=None):
     if args.install_only:
         brain_path = discover_seed_brain(
             root, scan_parent=bool(args.scan_parent), prefer=args.brain)
-        client_dir = _pick_install_client(
-            root, args.client, seed_brain=brain_path)
-        if client_dir is None:
+        clients = _pick_install_clients(
+            root, args.client, all_clients=True, seed_brain=brain_path)
+        if not clients:
             print(json.dumps({'ok': False, 'reason': 'no_client_folder'}, indent=2))
             return 1
-        installed = _install_into_client(
-            root=root, work=out, client_dir=client_dir, merged_store=None)
+        results = []
+        for client_dir in clients:
+            results.append(_install_into_client(
+                root=root, work=out, client_dir=client_dir, merged_store=None))
+        ok = all(r.get('ok') for r in results)
         print(json.dumps({
-            'ok': bool(installed.get('ok')),
+            'ok': ok,
             'install_only': True,
-            'install': installed,
+            'install': results,
+            'clients': [str(c) for c in clients],
             'out': str(out),
         }, indent=2, default=str))
-        if installed.get('ok'):
-            print(f'[OK] Installed into {installed.get("client")}')
+        if ok:
+            for r in results:
+                print(f'[OK] Installed into {r.get("client")}')
             print('[OK] Now start run_windows.bat (robot must have been STOPPED).')
             return 0
         return 1
@@ -222,14 +243,17 @@ def main(argv=None):
 
     installed = None
     if report.get('ok') and args.install:
-        client_dir = _pick_install_client(
-            root, args.client, seed_brain=brain_path)
-        if client_dir is None:
-            installed = {'ok': False, 'reason': 'no_client_folder'}
+        clients = _pick_install_clients(
+            root, args.client, all_clients=True, seed_brain=brain_path)
+        if not clients:
+            installed = [{'ok': False, 'reason': 'no_client_folder'}]
         else:
-            installed = _install_into_client(
-                root=root, work=paths['work'], client_dir=client_dir,
-                merged_store=store)
+            installed = [
+                _install_into_client(
+                    root=root, work=paths['work'], client_dir=client_dir,
+                    merged_store=store)
+                for client_dir in clients
+            ]
 
     summary = {
         'ok': report.get('ok'),
@@ -253,9 +277,13 @@ def main(argv=None):
     if report.get('ok'):
         print('[OK] Relearn finished. Deploy brain:')
         print(f'     {Path(paths["work"]) / "brain.npz"}')
-        if installed and installed.get('ok'):
-            print(f'[OK] Installed into {installed.get("client")}')
-        elif args.install and not (installed and installed.get('ok')):
+        if isinstance(installed, list) and installed:
+            if all(r.get('ok') for r in installed):
+                for r in installed:
+                    print(f'[OK] Installed into {r.get("client")}')
+            else:
+                print('[WARN] Install skipped/failed for some clients — see JSON.')
+        elif args.install:
             print('[WARN] Install skipped/failed — copy brain manually if needed.')
         return 0
     return 1

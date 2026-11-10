@@ -38,6 +38,8 @@ def main(argv=None):
                    help='Project root containing NEURAL_AI_LEARNING_BACKUP_* + data/')
     p.add_argument('--extra-db', action='append', default=[],
                    help='Additional robot.sqlite3 paths (repeatable)')
+    p.add_argument('--scan-parent', action='store_true',
+                   help='Also scan parent folder for NEURAL_AI_LEARNING_BACKUP_*')
     p.add_argument('--lr', type=float, default=0.28)
     p.add_argument('--loss-repeats', type=int, default=3)
     p.add_argument('--win-repeats', type=int, default=2)
@@ -47,7 +49,9 @@ def main(argv=None):
     if args.backups_root or args.extra_db:
         sources = discover_sqlite_dumps(
             args.backups_root or Path('.'),
-            extra=list(args.extra_db) + ([args.db] if args.db else []))
+            extra=list(args.extra_db) + ([args.db] if args.db else []),
+            scan_parent=bool(args.scan_parent),
+            loose=True)
         if not sources:
             print(json.dumps({'ok': False, 'reason': 'no_sqlite_sources'}))
             return 1

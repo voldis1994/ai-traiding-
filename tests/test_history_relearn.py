@@ -94,6 +94,49 @@ def test_relearn_teaches_hold_on_repeated_down_buy_losses():
             r.get('structure_prefer_hold') for r in report['rows'])
 
 
+def test_discover_finds_loose_robot_copies_and_seed_brain():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        root = tmp / 'proj'
+        parent = tmp
+        root.mkdir()
+        (root / 'data' / 'accounts' / 'client_1').mkdir(parents=True)
+        live_db = root / 'data' / 'accounts' / 'client_1' / 'robot.sqlite3'
+        live_brain = root / 'data' / 'accounts' / 'client_1' / 'brain.npz'
+        _fill_db(live_db, candles=_bars(4000.0, 5), trades=[{
+            'deal_id': 'live1', 'direction': 'BUY',
+            'opened': '2026-01-05T10:00:00+00:00',
+            'closed': '2026-01-05T10:05:00+00:00',
+            'entry': 4000.0, 'exit': 3999.0, 'pnl': -0.1,
+        }])
+        # Minimal npz seed.
+        np.savez(live_brain, x=np.array([1.0]))
+        loose = root / 'robot(1).sqlite3'
+        _fill_db(loose, candles=_bars(4010.0, 5), trades=[{
+            'deal_id': 'loose1', 'direction': 'SELL',
+            'opened': '2026-01-05T11:00:00+00:00',
+            'closed': '2026-01-05T11:05:00+00:00',
+            'entry': 4010.0, 'exit': 4008.0, 'pnl': 0.2,
+        }])
+        backup = parent / 'NEURAL_AI_LEARNING_BACKUP_20261029_090000'
+        backup.mkdir()
+        _fill_db(backup / 'robot.sqlite3', candles=_bars(4020.0, 5), trades=[{
+            'deal_id': 'bak1', 'direction': 'BUY',
+            'opened': '2026-01-05T12:00:00+00:00',
+            'closed': '2026-01-05T12:05:00+00:00',
+            'entry': 4020.0, 'exit': 4015.0, 'pnl': -0.3,
+        }])
+
+        found = hr.discover_sqlite_dumps(root, scan_parent=True, loose=True)
+        names = {p.name for p in found}
+        assert 'robot.sqlite3' in names or any('client_1' in str(p) for p in found)
+        assert any(p.name == 'robot(1).sqlite3' for p in found)
+        assert any('NEURAL_AI_LEARNING_BACKUP_' in str(p) for p in found)
+        brain = hr.discover_seed_brain(root, scan_parent=True)
+        assert brain is not None
+        assert brain.name == 'brain.npz'
+
+
 def test_merge_backups_dedupes_deal_id_and_unions_candles():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

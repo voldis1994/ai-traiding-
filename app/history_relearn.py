@@ -26,6 +26,13 @@ from .profit_learning import label_from_profit, path_excursion, ProfitLearning
 
 BACKUP_DIR_RE = re.compile(r'^NEURAL_AI_LEARNING_BACKUP_', re.I)
 CLIENT_DIR_RE = re.compile(r'^client_\d+$')
+# robot.sqlite3 or Windows copy names robot(1).sqlite3 — not -wal/-shm.
+ROBOT_SQLITE_RE = re.compile(r'^robot(\(\d+\))?\.sqlite3$', re.I)
+BRAIN_NPZ_RE = re.compile(r'^brain.*\.npz$', re.I)
+SKIP_DIR_NAMES = {
+    '.git', '.venv', 'venv', 'node_modules', '__pycache__',
+    'relearn_from_backups', 'relearn_merged', 'relearn_out',
+}
 # Multi-week merges need far more than a live 120-bar window window.
 CANDLE_LOAD_N = 200_000
 
@@ -81,10 +88,30 @@ def load_candles(store, epic, *, n=CANDLE_LOAD_N):
     return list(store.candles(epic, n=n, historical_only=False) or [])
 
 
-def discover_sqlite_dumps(root: Path, *, extra: list | None = None) -> list:
-    """Find robot.sqlite3 under LEARNING_BACKUP_* and data/accounts/client_*.
+def _iter_scan_dirs(root: Path, *, scan_parent: bool = False):
+    root = Path(root).expanduser().resolve()
+    yield root
+    if scan_parent and root.parent != root:
+        yield root.parent
+
+
+def _should_skip_dir(path: Path) -> bool:
+    name = path.name
+    if name in SKIP_DIR_NAMES:
+        return True
+    if name.startswith('relearn_'):
+        return True
+    return False
+
+
+def discover_sqlite_dumps(root: Path, *, extra: list | None = None,
+                          scan_parent: bool = False,
+                          loose: bool = True) -> list:
+    """Find learning journals under backups, clients, and loose robot*.sqlite3.
 
     ``extra`` paths are always included (explicit operator dumps).
+    With ``loose=True`` also picks ``robot(1).sqlite3``-style copies dropped
+    next to the project (common after manual ZIP/extract).
     """
     root = Path(root).expanduser().resolve()
     found = []
@@ -97,6 +124,10 @@ def discover_sqlite_dumps(root: Path, *, extra: list | None = None) -> list:
             return
         if not rp.is_file():
             return
+        if rp.suffix.lower() != '.sqlite3':
+            return
+        if not ROBOT_SQLITE_RE.match(rp.name):
+            return
         key = str(rp)
         if key in seen:
             return
@@ -105,23 +136,101 @@ def discover_sqlite_dumps(root: Path, *, extra: list | None = None) -> list:
 
     for p in extra or []:
         _add(Path(p))
-    if not root.is_dir():
-        return found
-    # Timestamped learning wipes beside the project root / data parent.
-    for child in sorted(root.iterdir()):
-        if child.is_dir() and BACKUP_DIR_RE.match(child.name):
-            for hit in child.rglob('robot.sqlite3'):
-                _add(hit)
-    # Live client journals.
-    data = root / 'data' if (root / 'data').is_dir() else root
-    accounts = data / 'accounts'
-    if accounts.is_dir():
-        for folder in sorted(accounts.iterdir()):
-            if folder.is_dir() and CLIENT_DIR_RE.match(folder.name):
-                _add(folder / 'robot.sqlite3')
-    # Legacy single-tenant layout.
-    _add(data / 'robot.sqlite3')
+
+    root = root.resolve()
+    for base in _iter_scan_dirs(root, scan_parent=scan_parent):
+        if not base.is_dir():
+            continue
+        is_project = base == root
+        # Timestamped learning wipes beside the project / data parent.
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and BACKUP_DIR_RE.match(child.name):
+                try:
+                    for hit in child.rglob('robot*.sqlite3'):
+                        _add(hit)
+                except OSError:
+                    continue
+        # Live client journals — only inside the project tree.
+        if is_project:
+            data = base / 'data' if (base / 'data').is_dir() else base
+            accounts = data / 'accounts'
+            if accounts.is_dir():
+                try:
+                    for folder in sorted(accounts.iterdir()):
+                        if folder.is_dir() and CLIENT_DIR_RE.match(folder.name):
+                            _add(folder / 'robot.sqlite3')
+                except OSError:
+                    pass
+            _add(data / 'robot.sqlite3')
+        # Loose dumps:
+        # - project: files here + one level of subfolders
+        # - parent (scan_parent): only robot*.sqlite3 sitting next to the project
+        if loose:
+            for child in children:
+                if child.is_file():
+                    _add(child)
+                elif (is_project and child.is_dir() and not _should_skip_dir(child)
+                      and not BACKUP_DIR_RE.match(child.name)):
+                    try:
+                        for hit in child.iterdir():
+                            if hit.is_file():
+                                _add(hit)
+                    except OSError:
+                        continue
     return found
+
+
+def discover_seed_brain(root: Path, *, scan_parent: bool = False,
+                        prefer: Path | None = None) -> Path | None:
+    """Pick a seed brain.npz — live client first, then newest/largest backup copy."""
+    if prefer is not None:
+        p = Path(prefer).expanduser()
+        if p.is_file():
+            return p.resolve()
+    candidates = []
+    for base in _iter_scan_dirs(root, scan_parent=scan_parent):
+        if not base.is_dir():
+            continue
+        data = base / 'data' if (base / 'data').is_dir() else base
+        accounts = data / 'accounts'
+        if accounts.is_dir():
+            try:
+                for folder in sorted(accounts.iterdir()):
+                    if folder.is_dir() and CLIENT_DIR_RE.match(folder.name):
+                        hit = folder / 'brain.npz'
+                        if hit.is_file():
+                            candidates.append((0, hit.stat().st_mtime, hit.stat().st_size, hit))
+            except OSError:
+                pass
+        # Backups + loose brain*.npz next to project.
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if child.is_file() and BRAIN_NPZ_RE.match(child.name):
+                # Live-shaped name ranks above brain(1).npz curios.
+                rank = 1 if child.name.lower() == 'brain.npz' else 2
+                candidates.append((rank, child.stat().st_mtime, child.stat().st_size, child))
+            elif child.is_dir() and BACKUP_DIR_RE.match(child.name):
+                try:
+                    for hit in child.rglob('brain*.npz'):
+                        if hit.is_file() and BRAIN_NPZ_RE.match(hit.name):
+                            candidates.append((3, hit.stat().st_mtime, hit.stat().st_size, hit))
+                except OSError:
+                    continue
+        legacy = data / 'brain.npz'
+        if legacy.is_file():
+            candidates.append((0, legacy.stat().st_mtime, legacy.stat().st_size, legacy))
+    if not candidates:
+        return None
+    # Prefer live client (rank 0), then newest, then largest.
+    candidates.sort(key=lambda t: (t[0], -t[1], -t[2]))
+    return candidates[0][3].resolve()
 
 
 def _trade_quality(row: dict) -> tuple:

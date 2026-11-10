@@ -712,11 +712,22 @@ class AdaptiveBrain:
         cost=max(from_spread,to_spread)
         return 0 if delta>cost else (1 if delta < -cost else 2)
 
-    def tick(self,mid,spread,tick_size,epic,dt=1.,features=None,bar_time=None,external_features=None):
+    def tick(self,mid,spread,tick_size,epic,dt=1.,features=None,bar_time=None,
+             external_features=None,in_position=False):
+        """One M1 step. ``in_position`` freezes entry-policy teachers.
+
+        While a LIVE deal is open the brain may still *perceive* (step + audit
+        signals), but must NOT:
+          • train minute-direction into LIVE entry weights
+          • enqueue pending that later backfills M1 learns after close
+          • grow/prune the entry network mid-trade
+        That is a different MDP (manage vs open) — off-policy contamination.
+        """
         if (not isinstance(epic,str) or not epic or
             not all(map(math.isfinite,(mid,spread,tick_size))) or
             mid<=0 or tick_size<=0 or spread<0):return None
         self._activate(epic)
+        train_entry=not bool(in_position)
         if features is not None:
             if (bar_time is None or not isinstance(features,(list,tuple,np.ndarray))
                 or not np.isfinite(features).all()):return None
@@ -750,12 +761,13 @@ class AdaptiveBrain:
         # Label an older observation, never the latest one and never another EPIC.
         # Do this before step/growth, so gradients always have a safe state mapping.
         # Audit #17: minute-direction objective (weight 0.2) — not trade-PnL.
+        # In-trade: audit-label only — never ΔW on the entry policy.
         if len(self.pending)>=self.HORIZON:
             past=self.pending.popleft()
             if past['epic']==epic:
                 label=self._label(float(past['mid']),mid,float(past['spread']),spread)
                 transition=past.get('transition')
-                if transition is not None:
+                if train_entry and transition is not None:
                     self.core.update_utility(past['h'],past['c'],label,
                         neuron_ids=past.get('neuron_ids'))
                     from .core import OBJECTIVE_MINUTE_DIRECTION
@@ -779,11 +791,12 @@ class AdaptiveBrain:
                                  'objective':'minute_direction',
                                  'objective_weight':self.MINUTE_OBJECTIVE_WEIGHT,
                                  'proven_improvement':False})
-                self.minute_labeled+=1
-                hit=int(past['action']==('BUY','SELL','HOLD')[label])
-                self.minute_correct+=hit
-                self.labeled=self.minute_labeled
-                self.correct=self.minute_correct
+                if train_entry:
+                    self.minute_labeled+=1
+                    hit=int(past['action']==('BUY','SELL','HOLD')[label])
+                    self.minute_correct+=hit
+                    self.labeled=self.minute_labeled
+                    self.correct=self.minute_correct
                 self.store.db.execute('UPDATE signals SET label=?,label_version=? WHERE id=? AND epic=?',
                     (str(label),self.LABEL_VERSION,past['signal_id'],epic))
                 self.store.db.commit()
@@ -797,13 +810,15 @@ class AdaptiveBrain:
         result=self.core.step(x,max(.1,min(float(dt),60)))
         # Structural growth is separate from learning; cap + cooldown stop
         # losing clients ballooning (196 vs 55) while Paaudze looks busy.
+        # Freeze grow/prune while in-trade — architecture must not move under
+        # an open deal (entry_brain z/neuron_ids would misalign at close).
         growth_interval=(self.FAST_GROWTH_INTERVAL if self.core.vbar>2.0
                          else self.GROWTH_INTERVAL)
         from .self_params import get as sp_get
         nmax=int(sp_get(self.store,'max_neurons',64))
         cooldown=int(sp_get(self.store,'birth_cooldown_steps',24))
         last_birth=int(self.store.get('last_neuron_birth_step') or -10**9)
-        if self.core.steps%growth_interval==0:
+        if train_entry and self.core.steps%growth_interval==0:
             z=np.asarray(result['z'])
             grow_th=float(sp_get(self.store,'grow_error_threshold',.55))
             cooled=(self.core.steps-last_birth)>=cooldown
@@ -813,7 +828,7 @@ class AdaptiveBrain:
                     {'neurons':self.core.n,'nmax':nmax})
         # Prune ~2× as often as birth attempts; trim excess over hard cap.
         prune_every=max(16,growth_interval*2)
-        if self.core.steps%prune_every==0:
+        if train_entry and self.core.steps%prune_every==0:
             deleted=self.core.prune(
                 min_age=int(sp_get(self.store,'prune_min_age',80)),
                 threshold=float(sp_get(self.store,'prune_utility_threshold',-.01)))
@@ -830,14 +845,16 @@ class AdaptiveBrain:
              spread,tick_size,self.LABEL_VERSION))
         self.store.db.commit()
         tr=self._json_transition(self.core.last_transition)
-        self.pending.append({'epic':epic,'mid':mid,'spread':spread,'tick_size':tick_size,
-            'change':change,'bar_time':bar_time,'transition':tr,'h':self.core.h.tolist(),
-            'c':self.core.c.tolist(),'neuron_ids':self.core.neuron_ids.tolist(),
-            'action':result['action'],'signal_id':cur.lastrowid})
-        self.prior_record=self.pending[-1]
+        # Only flat bars enter the entry-policy pending queue.
+        if train_entry:
+            self.pending.append({'epic':epic,'mid':mid,'spread':spread,'tick_size':tick_size,
+                'change':change,'bar_time':bar_time,'transition':tr,'h':self.core.h.tolist(),
+                'c':self.core.c.tolist(),'neuron_ids':self.core.neuron_ids.tolist(),
+                'action':result['action'],'signal_id':cur.lastrowid})
+            self.prior_record=self.pending[-1]
         self.history.append({'signal_id':cur.lastrowid,'price':mid,'scores':result['scores'],
             'action':result['action'],'label':None,'time':bar_time if features is not None else now(),
-            'spread_bps':10000*spread/mid})
+            'spread_bps':10000*spread/mid,'in_position':bool(in_position)})
         self.last_regime=('HIGH VOLATILITY' if abs(change)>10 else
             'RANGING' if abs(change)<spread/tick_size else 'TRENDING')
         self.last_mid=mid;self.last_change=change
@@ -852,7 +869,18 @@ class AdaptiveBrain:
         # Minute-direction label hit-rate — NOT closed-trade win rate (audit #24).
         result['minute_direction_accuracy']=self.correct/self.labeled if self.labeled else None
         result['accuracy_proxy']=result['minute_direction_accuracy']
+        result['entry_train']=bool(train_entry)
         return result
+
+    def reset_flat_state(self,*,reason='broker_flat'):
+        """After close: drop in-trade RNN memory so next OPEN starts flat."""
+        self.core.reset_recurrent_flat()
+        self.pending.clear()
+        self.last_mid=None
+        self.last_change=0.
+        self.store.event('learning','Recurrent state reset for flat OPEN',
+            {'epic':self.epic,'reason':reason,'neurons':self.core.n})
+        self.save()
 
     def trading_readiness(self):
         """Prep/eval readiness for LIVE OPEN (audit #22)."""
@@ -1559,6 +1587,13 @@ class SingleTradeEngine:
             self.store.event('reconcile',
                 'Re-armed after broker flat (auto-pause removed)',
                 {'deal_id':deal,'cleared':cleared})
+        # Drop in-trade RNN memory before the next flat OPEN vote.
+        try:
+            if self.brain is not None:
+                self.brain.reset_flat_state(reason='broker_flat')
+        except Exception as exc:
+            self.store.event('warning','Flat recurrent reset skipped',
+                            {'type':type(exc).__name__,'deal_id':deal})
         # Flat + mandate close: unlock LIVE OPEN if cold prep holdout trapped us.
         try:
             self._maybe_release_cold_start_prep()
@@ -1990,14 +2025,16 @@ class SingleTradeEngine:
                 # must NOT drive a NEW entry from a stale prior signal. Open
                 # position protection continues below regardless of fusion.
                 # Pre-fusion OHLC models may still tick on local features alone.
+                in_pos=bool(self.positions)
                 if fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=fused,
-                        bar_time=self.market_context['bar_time'],external_features=True)
+                        bar_time=self.market_context['bar_time'],external_features=True,
+                        in_position=in_pos)
                 elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=60,features=self.market_context['features'],
-                        bar_time=self.market_context['bar_time'])
+                        bar_time=self.market_context['bar_time'],in_position=in_pos)
                 else:
                     next_signal=None
                 if next_signal is not None:
@@ -2039,15 +2076,12 @@ class SingleTradeEngine:
                                            'tick_size':pending.get('tick_size') or tick,
                                            'entry_spread':pending.get('entry_spread') if pending.get('entry_spread') is not None else ask-bid})
                         self._pending_entry_brain=None
-                elif self.store.get(key) is None and self.brain.core.last_transition:
-                    tr=self.brain.core.last_transition
-                    if len(tr['h'])==self.brain.core.n:
-                        self.store.set(key,{'epic':p['epic'],'direction':p['direction'],
-                            'entry':p['level'],'tick_size':tick,'entry_spread':ask-bid,
-                            'transition':self.brain._json_transition(tr),
-                            'scores':(self.last_signal or {}).get('scores'),
-                            'shadow_scores':self._shadow_scores_now(),
-                            'captured':'poll_fallback'})
+                elif self.store.get(key) is None:
+                    # Never bind mid-trade h/c as entry_brain — that poisons the
+                    # closed-trade teacher with manage-state memory.
+                    self.store.event('warning',
+                        'entry_brain missing; refused poll_fallback mid-trade bind',
+                        {'deal_id':p.get('dealId'),'epic':p.get('epic')})
                 else:
                     # Fill missing tick/spread on manual-adopt snapshots so close can learn.
                     saved=self.store.get(key)
@@ -2091,8 +2125,9 @@ class SingleTradeEngine:
                     self.store.event('warning','Prep/eval stage failed',
                                     {'type':type(exc).__name__})
             if not self.armed or not self.execution_enabled:return
-            # Resolve HOLD→opposite shadows on every new M1 bar (even when in trade).
-            if new_closed_bar:
+            # HOLD-shadow teach is an entry-policy teacher — only when flat.
+            # In-trade resolves would ΔW the same LIVE weights mid-manage.
+            if new_closed_bar and not self.positions:
                 try:self._resolve_hold_shadows()
                 except Exception as exc:
                     self.store.event('warning','hold_shadow resolve skipped',
@@ -3385,10 +3420,8 @@ class SingleTradeEngine:
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
-        # Penny-loss closes must not spam any class into the core (HOLD trap).
-        # Exact £0 / flat broker rows still use the light counterfactual path —
-        # Capital often snapshots UPL=0 at close while ticks still moved.
-        # Band is Store-owned (self_params.scratch_pnl_abs) — not a frozen constant.
+        # Penny losses used to skip entirely (repeats=0) while still claiming the
+        # deal — same bad entry repeated with no ΔW. Teach light HOLD instead.
         scratch_band=float(sp['scratch_pnl_abs'])
         scratch_hold=False
         if pnl_value is not None:
@@ -3398,14 +3431,17 @@ class SingleTradeEngine:
             except (TypeError,ValueError):
                 scratch_hold=False
         if scratch_hold:
-            repeats=0
-            mode=str(mode)+'_scratch_skip'
+            label=2  # HOLD — do not invent flip on pennies
+            repeats=1
+            mode=str(mode)+'_scratch_hold'
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
-        # Critical #5: claim BEFORE any weight mutation so a crash between
-        # train/save/mark cannot double-apply the same deal on restart.
-        self._claim_trade_learned(deal_id)
+        # Critical #5: claim BEFORE weight mutation. Only claim when we will
+        # actually train — null/zero-repeat must not burn once-only learn.
+        claimed_neural=False
+        if repeats>0 and label is not None:
+            claimed_neural=bool(self._claim_trade_learned(deal_id))
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
         last_delta=None

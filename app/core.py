@@ -456,6 +456,17 @@ class NeuralCore:
         if copy_weights:clone.copy_weights_from(self)
         return clone
 
+    def reset_recurrent_flat(self):
+        """Clear recurrent memory when the book goes flat.
+
+        After a multi-bar trade, ``h``/``c`` still encode the in-trade path.
+        The next OPEN must vote from a flat state — not leftover management
+        memory. Does not touch P/W/R/O (learned weights stay).
+        """
+        self.h[:]=0.
+        self.c[:]=0.
+        self.last_transition=None
+
     def snapshot(self):
         return {'neurons':self.n,'steps':self.steps,'smoothed_error':self.vbar,
                 'mean_activation':float(np.mean(np.abs(self.h))),

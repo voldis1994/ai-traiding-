@@ -93,6 +93,32 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
         assert 'USD' not in (stats.get('pnl_by_currency') or {})
 
 
+def test_admin_trade_stats_sums_beyond_200_and_legacy_blank_source():
+    """P&L must include full history + blank pnl_source cash (not only last 200)."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        total=0.0
+        for i in range(250):
+            pnl=-0.04
+            total+=pnl
+            store.upsert_trade({'dealId':f'old{i}','epic':'GOLD','size':'0.1',
+                                'direction':'SELL','level':2000})
+            # Half legacy blank source, half broker — both are account cash.
+            src='broker' if i%2==0 else None
+            store.close_trade(f'old{i}',1999,pnl,currency='GBP',source=src)
+            if src is None:
+                store.db.execute(
+                    "UPDATE trades SET pnl_source=NULL WHERE deal_id=?",(f'old{i}',))
+                store.db.commit()
+        hub=RuntimeHub.__new__(RuntimeHub)
+        stats=hub._trade_stats(store,'GBP',open_upl=-0.57)
+        assert stats['cash_trades']==250
+        assert stats['realized_pnl']==pytest.approx(total)
+        assert stats['open_upl']==pytest.approx(-0.57)
+        assert stats['equity_pnl']==pytest.approx(total-0.57)
+        assert stats['losses']==250 and stats['wins']==0
+
+
 def test_shadow_rollback_restores_when_recent_pound_worse():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)

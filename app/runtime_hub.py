@@ -125,51 +125,67 @@ class RuntimeHub:
     def all_runtimes(self) -> list[AccountRuntime]:
         return list(self._runtimes.values())
 
-    def _trade_stats(self,store: Store, account_currency: str|None=None) -> dict:
+    @staticmethod
+    def _cash_pnl_source(src) -> str:
+        """Classify journal source: cash | pending | proxy."""
+        s=(src or '').strip().lower()
+        if s in ('ticks_only','price_size','position_disappeared'):
+            return 'proxy'
+        if s in ('pending_close_sync','pending_broker_pnl'):
+            return 'pending'
+        # Explicit broker, or legacy blank source with a settled pnl figure.
+        if s in ('broker','') or not s:
+            return 'cash'
+        return 'other'
+
+    def _trade_stats(self,store: Store, account_currency: str|None=None,
+                     open_upl: float|None=None) -> dict:
         acct=(account_currency or '').strip().upper() or None
         # Fix historical GOLD→USD tags so admin P&L matches Capital account cash.
         if acct:
             try:store.repair_broker_pnl_currency(acct)
             except Exception:pass
-        trades=store.trades(200)
-        closed=[t for t in trades if t.get('closed')]
-        open_rows=[t for t in trades if not t.get('closed')]
-        # Only sum broker cash rows. price_size / ticks_only are not account money.
+        # Full history — Admin P&L must NOT silently drop older closes past a
+        # trades(200) window (that made −13 look like −3).
+        cols=('deal_id','epic','size','direction','opened','closed','entry','exit',
+              'pnl','pnl_currency','pnl_source')
+        closed_rows=[dict(zip(cols,r)) for r in store.db.execute(
+            'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
+            'pnl_currency,pnl_source FROM trades WHERE closed IS NOT NULL '
+            'ORDER BY closed DESC')]
+        open_n=int(store.db.execute(
+            'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
         signed=[]
         recent=[]
-        for t in closed:
-            src=(t.get('pnl_source') or '').strip().lower()
-            # Non-cash proxies never enter £ totals. pending_* rows may still be
-            # listed (null pnl) so Admin is not frozen on an old green strip while
-            # Capital already shows newer closes awaiting cash bind.
-            proxy=src in ('ticks_only','price_size','position_disappeared')
-            pending=src in ('pending_close_sync','pending_broker_pnl')
-            if proxy:continue
+        cash_n=0
+        for t in closed_rows:
+            kind=self._cash_pnl_source(t.get('pnl_source'))
+            if kind=='proxy':
+                continue
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
             val=None
             if t.get('pnl') is not None:
                 try:val=float(t['pnl'])
                 except (TypeError,ValueError):val=None
-            # Broker-settled cash is always account currency — remapping display
-            # when Capital tagged the instrument quote (GOLD=USD) on cash rows.
-            if src=='broker' and acct:
+            # Broker / legacy cash → account currency when known.
+            if kind=='cash' and acct:
                 ccy=acct
             else:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
-            if val is not None and src=='broker':
+            if val is not None and kind=='cash':
+                cash_n+=1
                 by_ccy.setdefault(ccy,[]).append(val)
-                # W/L next to account P&L must not mix other currency buckets.
                 if not acct or ccy==acct:
                     signed.append(val)
-                recent.append(row)
-            elif pending or (val is not None and not proxy):
-                # Surface closes that Capital already booked but cash bind lags.
-                recent.append(row)
+                if len(recent)<12:
+                    recent.append(row)
+            elif kind=='pending' or (val is not None and kind=='other'):
+                if len(recent)<12:
+                    recent.append(row)
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
-        # Prefer a single currency total; if mixed, keep map and avoid one fake sum.
         primary=None
         if len(by_ccy)==1:
             ccy,vals=next(iter(by_ccy.items()))
@@ -177,10 +193,23 @@ class RuntimeHub:
         elif acct and acct in by_ccy:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
+        realized=primary['realized_pnl'] if primary else 0.0
+        upl=None
+        if open_upl is not None:
+            try:
+                u=float(open_upl)
+                if __import__('math').isfinite(u):
+                    upl=round(u,4)
+            except (TypeError,ValueError):
+                upl=None
+        equity=round(realized+(upl or 0.0),4) if upl is not None else realized
         return {
-            'closed_trades':len(closed),
-            'open_trades_recorded':len(open_rows),
-            'realized_pnl':primary['realized_pnl'] if primary else 0.0,
+            'closed_trades':len(closed_rows),
+            'open_trades_recorded':open_n,
+            'cash_trades':cash_n,
+            'realized_pnl':realized,
+            'open_upl':upl,
+            'equity_pnl':equity,
             'pnl_currency':primary['currency'] if primary else acct,
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
@@ -306,7 +335,14 @@ class RuntimeHub:
                 try:store=Store(db)
                 except Exception:store=None
         if store is not None:
-            try:card['results']=self._trade_stats(store,card.get('account_currency'))
+            try:
+                upl=None
+                pos=card.get('activity',{}).get('position') or {}
+                if isinstance(pos,dict) and pos.get('upl') is not None:
+                    try:upl=float(pos['upl'])
+                    except (TypeError,ValueError):upl=None
+                card['results']=self._trade_stats(
+                    store,card.get('account_currency'),open_upl=upl)
             except Exception:pass
             try:
                 from . import hard_risk

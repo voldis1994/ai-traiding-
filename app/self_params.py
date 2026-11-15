@@ -77,6 +77,12 @@ DEFAULTS = {
     'trail_min_mult': 2.0,
     'trail_open_gap_frac': 0.35,
     'trail_fallback_frac': 0.5,
+    # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
+    'structure_edge_min_samples': 5,
+    'structure_edge_nudge': 0.08,
+    # Trail self-arm: MFE fraction of opening risk before enabling trail
+    'trail_arm_mfe_frac': 0.55,
+    'trail_arm_min_ev': 0.0,
     # Bracket teacher schedule (seeds) — thresholds/steps evolve; mults already Store.
     'bracket_vs_vol_noise': 1.15,
     'bracket_vs_stop_noise': 1.05,
@@ -145,6 +151,10 @@ BOUNDS = {
     'trail_min_mult': (1.0, 4.0),
     'trail_open_gap_frac': (0.15, 0.7),
     'trail_fallback_frac': (0.25, 0.8),
+    'structure_edge_min_samples': (3, 30),
+    'structure_edge_nudge': (0.02, 0.25),
+    'trail_arm_mfe_frac': (0.25, 1.0),
+    'trail_arm_min_ev': (-1.0, 2.0),
     'bracket_vs_vol_noise': (0.8, 2.0),
     'bracket_vs_stop_noise': (0.8, 1.5),
     'bracket_shape_wide': (1.1, 2.5),
@@ -222,7 +232,8 @@ def _clip(key, value):
                'profit_history_rows','exit_need_streak','prune_min_age',
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
-               'min_online_labeled','policy_evolve_enabled','policy_live_execute'):
+               'min_online_labeled','policy_evolve_enabled','policy_live_execute',
+               'structure_edge_min_samples'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

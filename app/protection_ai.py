@@ -116,12 +116,14 @@ def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
 
 
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
-                         zone_range=None,store=None):
+                         zone_range=None,store=None,arm_decision=None):
     """Trail SL behind broker extreme — past break-even, not stuck at BE.
 
-    Before BE: gap = full opening risk (avoids tip±min £0 scratches; first
-    ratchet ≈ BE+). After BE: gap = recent M1 median range (OHLC zone), with a
-    Store-owned floor above raw minStop so SL does not fire “early” vs the chart.
+    Before BE: gap = opening risk (avoids tip±min £0 scratches). When
+    ``arm_decision`` says the robot may arm early (MFE / structure EV), the first
+    ratchet may lock near BE once tip covers the adaptive fraction of R — not a
+    frozen human “always wait 1R” law. After BE: gap = recent M1 median range
+    (OHLC zone), with a Store-owned floor above raw minStop.
 
     CRITICAL: always re-send live profitLevel on trail PUTs. Omitting TP on
     Capital update_position turns Take Profit Off — price can touch the old
@@ -148,10 +150,13 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):
         return None
     if tp is not None and sign*(tp-stop)<=0:return None
-    if gap is None or gap<=0:gap=minimum
+    # Refuse tip±minStop glue when opening risk is missing/corrupt.
+    if gap is None or gap<=0:
+        return None
     open_gap=max(gap,minimum)
     # Stop already on the profit side of entry → BE (or better) is banked.
     be_locked=sign*(stop-entry)>=-1e-12
+    early_arm=bool(isinstance(arm_decision,dict) and arm_decision.get('arm'))
     if be_locked:
         # Prefer zone_range from caller; fall back to value stored on open meta.
         zr=zone_range if zone_range is not None else initial.get('zone_range')
@@ -165,8 +170,24 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         tip=bid if sign==1 else ask
     favorable=sign*(exit_quote-entry)
     tip_fav=sign*(tip-entry)
-    # First move still needs a full opening-risk excursion; later moves use trail_gap.
-    need=open_gap if not be_locked else trail_gap
+    # Adaptive first arm: once MFE/structure evidence says arm, allow a BE-lock
+    # ratchet when tip_fav < full open_gap (gap shrinks to tip_fav).
+    if not be_locked and early_arm and tip_fav>0:
+        try:
+            from .self_params import load as _sp_load
+            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.55))
+        except Exception:
+            arm_frac=0.55
+        arm_frac=max(0.25,min(1.0,arm_frac))
+        # Structure EV may arm at ~0.35R; MFE path uses trail_arm_mfe_frac.
+        floor_need=min(arm_frac,0.35)*open_gap
+        if tip_fav<floor_need:
+            return None
+        # Shrink gap to tip_fav so the first ratchet can lock near BE.
+        trail_gap=min(open_gap,max(minimum,tip_fav))
+        need=floor_need
+    else:
+        need=open_gap if not be_locked else trail_gap
     if tip_fav<need:return None
     if sign==1:
         tip=max(tip,bid)
@@ -174,8 +195,13 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         desired=tip-trail_gap
         # Never place tighter than broker min from live bid.
         desired=min(desired,bid-minimum)
+        # Early-arm BE lock must not invent a loss-side SL (→ £≈0 scratches).
+        if early_arm and not be_locked:
+            desired=max(desired,entry)
         new_stop=_quantize(desired,tick,up=False)
         new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
+        if early_arm and not be_locked and new_stop<entry-1e-12:
+            return None
         if new_stop<=stop or new_stop>=tip:return None
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop<stop+tick-1e-12:return None
@@ -184,17 +210,25 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         if tip>=entry:return None
         desired=tip+trail_gap
         desired=max(desired,ask+minimum)
+        if early_arm and not be_locked:
+            desired=min(desired,entry)
         new_stop=_quantize(desired,tick,up=True)
         new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
+        if early_arm and not be_locked and new_stop>entry+1e-12:
+            return None
         if new_stop>=stop or new_stop<=tip:return None
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None
+    reason=('trail past BE (OHLC zone gap)' if be_locked
+            else ('adaptive early arm → BE lock'
+                  if early_arm and trail_gap<open_gap-1e-12
+                  else 'broker extreme ± opening stop distance (≥ minStop)'))
     return {'stop_level':new_stop,'profit_level':tp,
-            'reason':('trail past BE (OHLC zone gap)' if be_locked
-                      else 'broker extreme ± opening stop distance (≥ minStop)'),
+            'reason':reason,
             'extreme':tip,'trail_gap':trail_gap,'open_gap':open_gap,
             'zone_range':_finite(zone_range if zone_range is not None else initial.get('zone_range')),
-            'be_locked':be_locked,'min_distance':minimum,'tick':tick,
+            'be_locked':be_locked,'early_arm':early_arm,
+            'min_distance':minimum,'tick':tick,
             'observed_profit_distance':round(favorable,5),
             'bar_time':mark_time,'preserve_tp':tp is not None}
 

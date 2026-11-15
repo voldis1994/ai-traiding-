@@ -105,6 +105,17 @@ def test_settle_cools_aggression_on_losses_and_warms_on_wins():
         assert s3['aggression'] > s2['aggression']
 
 
+def test_settle_scratch_does_not_bump_loss_streak():
+    """Penny closes must not tighten next brackets like a real loss."""
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        base = uc.load_state(store)
+        s = uc.settle(store, pnl=-0.02, action='BUY', scratch_band=0.05)
+        assert s['loss_streak'] == int(base.get('loss_streak') or 0)
+        assert s.get('last_scratch') is True
+        assert s['aggression'] >= uc.AGGRESSION_MIN
+
+
 def test_note_open_increments_counter():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')

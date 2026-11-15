@@ -79,6 +79,7 @@ def default_state():
         'win_streak': 0,
         'last_pnl': None,
         'last_action': None,
+        'last_scratch': False,
         'opens': 0,
         'settlements': 0,
         'version': 2,
@@ -102,6 +103,7 @@ def load_state(store) -> dict:
         out['settlements'] = _safe_int(out.get('settlements'), 0)
         out['version'] = _safe_int(out.get('version'), 2) or 2
         out['last_pnl'] = _finite(out.get('last_pnl'))
+        out['last_scratch'] = bool(out.get('last_scratch'))
         if out.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
             out['last_action'] = None
     return out
@@ -121,6 +123,7 @@ def save_state(store, state: dict) -> dict:
     clean['settlements'] = _safe_int(clean.get('settlements'), 0)
     clean['version'] = _safe_int(clean.get('version'), 2) or 2
     clean['last_pnl'] = _finite(clean.get('last_pnl'))
+    clean['last_scratch'] = bool(clean.get('last_scratch'))
     if clean.get('last_action') not in ('BUY', 'SELL', 'HOLD', None):
         clean['last_action'] = None
     if store is not None:
@@ -331,11 +334,14 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     }
 
 
-def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
+def settle(store, *, pnl, action=None, exit_reason=None, scratch_band=None) -> dict:
     """Fold broker £ into aggression / streaks for exit width — not entry floor.
 
     Calibrated entry_edge_floor is preserved (clipped to rails). Aggression
     still shapes κ/sl on the next OPEN so exits improve from £ feedback.
+
+    Scratch pennies (|£| ≤ scratch_band) must NOT bump loss_streak or tighten
+    brackets like a real loss — that cascade manufactured more £≈0 scratches.
     """
     state = load_state(store)
     p = _finite(pnl)
@@ -348,6 +354,14 @@ def settle(store, *, pnl, action=None, exit_reason=None) -> dict:
     agg = _finite(state.get('aggression')) or 1.0
     if p is None:
         return save_state(store, state)
+    band = _finite(scratch_band)
+    is_scratch = band is not None and band >= 0 and abs(p) <= band
+    if is_scratch:
+        # Penny close: tiny cool-off only — do not inflate loss_streak.
+        state['aggression'] = _clip(agg * 0.998, AGGRESSION_MIN, AGGRESSION_MAX)
+        state['last_scratch'] = True
+        return save_state(store, state)
+    state['last_scratch'] = False
     if p < 0:
         state['loss_streak'] = _safe_int(state.get('loss_streak'), 0) + 1
         state['win_streak'] = 0

@@ -86,6 +86,7 @@ def test_flat_sync_retries_pending_and_binds():
 
 
 def test_pending_upl_fallback_after_retries():
+    """UPL shown for Admin, but deal stays pending for real broker cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -106,8 +107,54 @@ def test_pending_upl_fallback_after_retries():
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.19)
+            assert row['pnl_source']=='upl_estimate'
+            pending=store.get('pending_broker_pnl_deals') or []
+            assert any(str(x.get('deal_id'))=='upl1' and x.get('upl_shown') for x in pending)
+            assert not e._trade_already_learned('upl1')
+    asyncio.run(scenario())
+
+
+def test_upl_estimate_then_broker_overwrites_without_double_learn():
+    """Full UPL→broker path: estimate → real £ → overwrite, learn at most once."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            store.upsert_trade({'dealId':'upl2','epic':'GOLD','size':'.02','direction':'BUY','level':100})
+            store.set('entry_brain:upl2',{
+                'epic':'GOLD','direction':'BUY','entry':100,'tick_size':.01,
+                'transition':brain._json_transition(brain.core.last_transition)})
+            store.set('last_upl:upl2',{'upl':-0.25,'currency':'GBP'})
+            store.set('pending_broker_pnl_deals',
+                      [{'deal_id':'upl2','exit_level':99.7,'attempts':5,
+                        'queued_at':'2026-10-29T10:00:00+00:00'}])
+            # 1) No broker cash yet → Admin UPL estimate; stay pending; no teach.
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.25)
+            assert row['pnl_source']=='upl_estimate'
+            assert not e._trade_already_learned('upl2')
+            labeled_before=brain.labeled
+            pending=store.get('pending_broker_pnl_deals') or []
+            assert any(str(x.get('deal_id'))=='upl2' and x.get('upl_shown') for x in pending)
+            # 2) Real Capital cash arrives → overwrite estimate and learn once.
+            broker.tx=[{'reference':'upl2','pnl':-0.18,'currency':'GBP'}]
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.18)
             assert row['pnl_source']=='broker'
             assert not (store.get('pending_broker_pnl_deals') or [])
+            assert e._trade_already_learned('upl2')
+            labeled_after=brain.labeled
+            assert labeled_after >= labeled_before
+            # 3) Another late refine must not double-train.
+            e._learn_closed_trade('upl2',{'level':99.7,'profit':-0.50,'pnl_currency':'GBP'})
+            assert brain.labeled == labeled_after
     asyncio.run(scenario())
 
 

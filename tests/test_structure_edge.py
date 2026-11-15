@@ -110,6 +110,18 @@ def test_teach_after_loss_no_flip_without_cost_floor():
     assert 'no_floor' in mode
 
 
+def test_teach_after_loss_cf_best_opposite_blocked_without_floor():
+    """cf_best='SELL' after BUY loss must not teach SELL when opp_floor unknown."""
+    taught, mode = se.teach_after_loss(
+        direction='BUY', cf_best='SELL',
+        frame_advice={'advice': 'SELL', 'buy': {'mean_pnl': -1.0},
+                      'sell': {'mean_pnl': 2.0}},
+        opp_val=None, opp_floor=None)
+    assert taught == 'HOLD'
+    assert taught != 'SELL'
+    assert 'no_floor' in mode or 'no_cf_floor' in mode
+
+
 def test_teach_after_loss_grave_tries_opposite_when_cf_clears():
     taught, mode = se.teach_after_loss(
         direction='BUY', cf_best='HOLD', structure_prefer_hold=True,

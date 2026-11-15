@@ -30,15 +30,25 @@ ATTEMPT_KEY = 'feature_validation_attempts_v1'
 
 # Feature series starts after this many completed bars (same window compute_candidate uses).
 FEATURE_SERIES_WARMUP = 60
-# Capital.com /prices max — never request more than the broker accepts.
+# Capital.com /prices max — broker hard cap, not an AI policy knob.
 BROKER_PRICE_HISTORY_MAX = 1000
-# Comfortable LIVE window once train/OOS math is satisfiable (defaults need ≥260).
-LIVE_HISTORY_BARS_FLOOR = 400
+# confirm_feature_oos requires this many non-overlapping OOS round-trips.
+CONFIRM_MIN_OOS_TRADES = 10
+# Thin-split also keeps at least this many feature-points on the OOS side.
+MIN_OOS_FEATURE_POINTS = 15
 
 
 def _cfg(store=None):
     from .self_params import load
     return load(store)
+
+
+def _oos_frac(store=None, oos_frac=None):
+    cfg=_cfg(store)
+    frac=float(cfg['val_oos_frac'] if oos_frac is None else oos_frac)
+    if frac<0:return 0.
+    if frac>=1:return 0.99
+    return frac
 
 
 def train_end_floor(store=None):
@@ -47,38 +57,51 @@ def train_end_floor(store=None):
     return max(20, int(cfg['val_min_bars']) - FEATURE_SERIES_WARMUP)
 
 
-def min_bars_for_train_oos_split(store=None, oos_frac=None):
-    """Smallest completed-bar count that can pass the train/OOS thin-split gate.
+def _n_feat_for_gates(store=None, oos_frac=None):
+    """Smallest feature-series length that satisfies train + OOS confirm gates.
 
-    Feature values exist only after FEATURE_SERIES_WARMUP bars, then
-    train_end = ⌊n_feat × (1 − val_oos_frac)⌋ must be ≥ train_end_floor and
-    the OOS slice at least 15 points. With defaults (oos=0.7, min_bars=120)
-    this is 260 — so a LIVE poll of 190 bars can never approve a feature.
+    Derived only from the robot's self_params (val_min_bars, val_oos_frac,
+    val_horizon_bars) — no human-chosen LIVE window size.
     """
     cfg=_cfg(store)
-    frac=float(cfg['val_oos_frac'] if oos_frac is None else oos_frac)
-    if frac<0:frac=0.
-    if frac>=1:frac=0.99
+    frac=_oos_frac(store,oos_frac)
     train_frac=1.0-frac
     floor=train_end_floor(store)
-    # int(n_feat * train_frac) >= floor  →  need n_feat large enough after truncation
+    horizon=max(1,int(cfg['val_horizon_bars']))
+    # Non-overlapping OOS trades need roughly trades×horizon feature steps.
+    oos_points=max(MIN_OOS_FEATURE_POINTS, CONFIRM_MIN_OOS_TRADES*horizon)
     n_feat=0
     while True:
         n_feat+=1
         train_end=int(n_feat*train_frac)
-        if train_end>=floor and (n_feat-train_end)>=15:
-            break
+        oos_len=n_feat-train_end
+        if train_end>=floor and oos_len>=oos_points:
+            return n_feat
         if n_feat>BROKER_PRICE_HISTORY_MAX*2:
-            break
-    need_bars=FEATURE_SERIES_WARMUP+n_feat
-    # Also honour the explicit val_min_bars early gate.
+            return n_feat
+
+
+def min_bars_for_train_oos_split(store=None, oos_frac=None):
+    """Smallest completed-bar count that can pass train/OOS validation gates.
+
+    Feature values exist only after FEATURE_SERIES_WARMUP bars. With defaults
+    (oos=0.7, min_bars=120, horizon=8) this is computed — not hard-coded —
+    and exceeds the legacy 190 LIVE poll, which could never approve a feature.
+    """
+    cfg=_cfg(store)
+    need_bars=FEATURE_SERIES_WARMUP+_n_feat_for_gates(store,oos_frac=oos_frac)
     return max(int(cfg['val_min_bars']), need_bars)
 
 
 def recommended_live_history_bars(store=None):
-    """Bars to fetch/read LIVE so feature validation is not mathematically blocked."""
+    """Bars the robot should fetch/read — computed from its own val_* knobs.
+
+    Only external clamp is BROKER_PRICE_HISTORY_MAX (Capital.com). When the
+    operator/self_params change val_oos_frac / val_min_bars / val_horizon_bars,
+    this number moves with them.
+    """
     need=min_bars_for_train_oos_split(store)
-    return int(min(BROKER_PRICE_HISTORY_MAX, max(need+80, LIVE_HISTORY_BARS_FLOOR)))
+    return int(min(BROKER_PRICE_HISTORY_MAX, need))
 
 
 def _series_for_feature(feature_id, bars, spreads, times):
@@ -247,7 +270,7 @@ def confirm_feature_oos(feature_values, closes, spreads, *, train_end, end,
     horizon=int(cfg['val_horizon_bars'])
     oos=net_pnl_curve(feature_values,closes,spreads,start=train_end,end=end,
                       horizon=horizon)
-    if oos is None or oos['n']<10:
+    if oos is None or oos['n']<CONFIRM_MIN_OOS_TRADES:
         return {'confirmed':False,'reason':'OOS too thin for net PnL','oos':oos}
     if oos['net']<=float(cfg['val_min_net_pnl']):
         return {'confirmed':False,
@@ -303,7 +326,7 @@ def validate_feature(feature_id, bars, *, spreads=None, times=None,
     n=len(feat)
     train_end,end,oos_frac=train_oos_bounds(n,store=store)
     floor=train_end_floor(store)
-    if train_end<floor or end-train_end<15:
+    if train_end<floor or end-train_end<MIN_OOS_FEATURE_POINTS:
         return {'approved':False,'reason':'train/OOS chronological split too thin',
                 'train_end':train_end,'n':n,'oos_frac':oos_frac,
                 'need_bars':need_bars,'train_end_floor':floor}

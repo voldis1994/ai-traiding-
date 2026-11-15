@@ -336,6 +336,11 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
             p['val_max_corr']=max(BOUNDS['val_max_corr'][0],
                 float(p['val_max_corr'])-0.01)
             notes.append('stricter uniqueness via lower corr cap move')
+        elif ('train/OOS' in why or 'chronological split too thin' in why
+              or 'OOS too thin' in why):
+            # History depth is requested from these knobs LIVE — do not invent a
+            # fixed candle count; leave val_* so recommended_live_history_bars grows.
+            notes.append('thin history reject — LIVE window follows val_* math')
         elif 'net PnL' in why or 'unstable' in why:
             p['val_horizon_bars']=min(BOUNDS['val_horizon_bars'][1],
                 int(p['val_horizon_bars'])+1)

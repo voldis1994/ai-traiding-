@@ -142,9 +142,20 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
         hi=max(hi,mid);lo=min(lo,mid)
         sp_bar=float(sp_i if sp_i is not None else sp)
         if trail:
+            # Mirror LIVE adaptive arm: BE lock once MFE covers trail_arm fraction.
+            arm=None
+            try:
+                from . import structure_edge as _se
+                mfe=sign*(float(hi if action=='BUY' else lo)-float(entry))
+                arm=_se.trail_arm_decision(
+                    None,epic=None,structure='CHOP',direction=action,
+                    mfe=mfe,original_risk=original_risk,be_locked=sign*(stop-entry)>=-1e-12)
+            except Exception:
+                arm=None
             new_stop=paper_trail_stop(
                 action,entry,stop,profit,high=hi,low=lo,mid=mid,spread=sp_bar,
-                original_risk=original_risk,tick=tick_v,min_distance=min_d)
+                original_risk=original_risk,tick=tick_v,min_distance=min_d,
+                arm_decision=arm)
             if new_stop is not None:
                 stop=float(new_stop);trailed=True
         hit=hit_sl_tp(action,high=hi,low=lo,stop=stop,profit=profit,
@@ -167,11 +178,12 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
 
 
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
-                     original_risk, tick, min_distance, store=None):
+                     original_risk, tick, min_distance, store=None,
+                     arm_decision=None):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
 
-    Same BE / post-BE gap idea as `propose_broker_trail` — never flips on signal.
-    Returns new stop or None when no improvement.
+    Same BE / post-BE / early-arm gap idea as `propose_broker_trail` — never
+    flips on signal. Returns new stop or None when no improvement.
     """
     direction=direction if direction in ('BUY','SELL') else None
     if direction is None:return None
@@ -181,7 +193,9 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     sp=_finite(spread) or 0.
     if None in (entry,stop,tick,high,low,mid) or tick<=0:return None
     if minimum is None or minimum<0:minimum=tick
-    if gap is None or gap<=0:gap=max(minimum,abs(entry-stop))
+    # Match LIVE: refuse tip±min glue when opening risk is missing.
+    if gap is None or gap<=0:
+        return None
     open_gap=max(float(gap),float(minimum))
     half=half_spread(sp)
     bid=mid-half;ask=mid+half
@@ -192,20 +206,38 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     else:
         tip=tip+half
     be_locked=sign*(stop-entry)>=-1e-12
+    early_arm=bool(isinstance(arm_decision,dict) and arm_decision.get('arm'))
     if be_locked:
         from .protection_ai import _post_be_trail_gap
         trail_gap=_post_be_trail_gap(open_gap,minimum,None,store=store)
     else:
         trail_gap=open_gap
-    need=open_gap if not be_locked else trail_gap
     tip_fav=sign*(tip-entry)
+    if not be_locked and early_arm and tip_fav>0:
+        try:
+            from .self_params import load as _sp_load
+            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.55))
+        except Exception:
+            arm_frac=0.55
+        arm_frac=max(0.25,min(1.0,arm_frac))
+        floor_need=min(arm_frac,0.35)*open_gap
+        if tip_fav<floor_need:
+            return None
+        trail_gap=min(open_gap,max(minimum,tip_fav))
+        need=floor_need
+    else:
+        need=open_gap if not be_locked else trail_gap
     if tip_fav<need:return None
     profit=_finite(profit)
     if direction=='BUY':
         tip=max(tip,bid)
         if tip<=entry:return None
         desired=min(tip-trail_gap,bid-minimum)
+        if early_arm and not be_locked:
+            desired=max(desired,entry)
         new_stop=math.floor(desired/tick+1e-12)*tick
+        if early_arm and not be_locked and new_stop<entry-1e-12:
+            return None
         if new_stop<=stop or new_stop>=tip:return None
         if profit is not None and profit<=new_stop:return None
         if new_stop<stop+tick-1e-12:return None
@@ -213,7 +245,11 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     tip=min(tip,ask)
     if tip>=entry:return None
     desired=max(tip+trail_gap,ask+minimum)
+    if early_arm and not be_locked:
+        desired=min(desired,entry)
     new_stop=math.ceil(desired/tick-1e-12)*tick
+    if early_arm and not be_locked and new_stop>entry+1e-12:
+        return None
     if new_stop>=stop or new_stop<=tip:return None
     if profit is not None and profit>=new_stop:return None
     if new_stop>stop-tick+1e-12:return None
@@ -359,13 +395,28 @@ class ShadowPaperJournal:
         pos=self.position
         if pos is not None:
             direction=pos.get('direction')
+            sign=1 if direction=='BUY' else -1
+            entry_p=_finite(pos.get('entry'));stop_p=_finite(pos.get('stop'))
+            tip=hi if direction=='BUY' else lo
+            mfe=(sign*(float(tip)-float(entry_p))
+                 if entry_p is not None and tip is not None else None)
+            be_locked=(entry_p is not None and stop_p is not None
+                       and sign*(float(stop_p)-float(entry_p))>=-1e-12)
+            try:
+                from . import structure_edge as _se
+                arm=_se.trail_arm_decision(
+                    self.store,epic=None,structure='CHOP',direction=direction,
+                    mfe=mfe,original_risk=pos.get('original_risk'),
+                    be_locked=be_locked)
+            except Exception:
+                arm=None
             new_stop=paper_trail_stop(
                 direction,pos.get('entry'),pos.get('stop'),pos.get('profit'),
                 high=hi,low=lo,mid=mid,spread=sp,
                 original_risk=pos.get('original_risk'),
                 tick=pos.get('tick') or tick,
                 min_distance=pos.get('min_distance') or min_distance,
-                store=self.store)
+                store=self.store,arm_decision=arm)
             if new_stop is not None:
                 pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
                 self.position=pos

@@ -178,8 +178,22 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
             # otherwise HOLD. Keeps early-day trading; stops false flip churn.
             opp_floor=max(1e-9, 0.25*sp) if sp>0 else None
             if sp<=0:
-                best='HOLD'
-                mode_tag='loss_hold_missing_spread'
+                # Prefer tick×2 floor over blind HOLD when spread unknown —
+                # adopt/vanish paths often lack entry spread.
+                tick_v=_finite(tick)
+                if tick_v is not None and tick_v>0:
+                    opp_floor=max(1e-9,2.0*float(tick_v))
+                    if opp_val>opp_floor:
+                        best=opposite
+                        mode_tag=('flip_loss_counterfactual_' if flip_after_loss
+                                  else 'loss_counterfactual_')+best.lower()+'_tick_floor'
+                    else:
+                        best='HOLD'
+                        mode_tag=('flip_loss_hold_tick_floor' if flip_after_loss
+                                  else 'loss_hold_tick_floor')
+                else:
+                    best='HOLD'
+                    mode_tag='loss_hold_missing_spread'
             elif opp_val>(opp_floor or 0):
                 best=opposite
                 mode_tag=('flip_loss_counterfactual_' if flip_after_loss
@@ -222,10 +236,28 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                     'structure_teach':teach_mode}
         return {'label':None,'mode':'loss_no_counterfactual','actual_pnl':pnl,
                 'simulated':None}
-    # Flat / unknown £ — still prefer path evidence over inventing HOLD.
+    # Flat / unknown £ — path evidence, but same spread/cost floor as losses
+    # so tip±min £0 scratches do not teach free flips.
     if sim and sim['best'] in _ACTION_LABEL:
-        return {'label':_ACTION_LABEL[sim['best']],
-                'mode':'flat_counterfactual_'+sim['best'].lower(),
+        best=sim['best']
+        try:
+            sp=float(spread or 0.)
+        except (TypeError,ValueError):
+            sp=0.
+        if not math.isfinite(sp) or sp<0:
+            sp=0.
+        if best in ('BUY','SELL'):
+            opp_val=float(sim['buy'] if best=='BUY' else sim['sell'])
+            tick_v=_finite(tick)
+            floor=(max(1e-9,0.25*sp) if sp>0
+                   else (max(1e-9,2.0*float(tick_v)) if tick_v and tick_v>0 else None))
+            if floor is None or opp_val<=floor:
+                best='HOLD'
+                return {'label':_ACTION_LABEL[best],
+                        'mode':'flat_counterfactual_hold_cost_floor',
+                        'actual_pnl':pnl,'simulated':sim,'opp_floor':floor}
+        return {'label':_ACTION_LABEL[best],
+                'mode':'flat_counterfactual_'+best.lower(),
                 'actual_pnl':pnl,'simulated':sim}
     return {'label':None,'mode':'flat_no_signal','actual_pnl':pnl,'simulated':None}
 

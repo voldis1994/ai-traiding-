@@ -150,7 +150,9 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if position.get('epic')!=market.get('epic') or position.get('dealId')!=initial.get('deal_id'):
         return None
     if tp is not None and sign*(tp-stop)<=0:return None
-    if gap is None or gap<=0:gap=minimum
+    # Refuse tip±minStop glue when opening risk is missing/corrupt.
+    if gap is None or gap<=0:
+        return None
     open_gap=max(gap,minimum)
     # Stop already on the profit side of entry → BE (or better) is banked.
     be_locked=sign*(stop-entry)>=-1e-12
@@ -193,8 +195,13 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         desired=tip-trail_gap
         # Never place tighter than broker min from live bid.
         desired=min(desired,bid-minimum)
+        # Early-arm BE lock must not invent a loss-side SL (→ £≈0 scratches).
+        if early_arm and not be_locked:
+            desired=max(desired,entry)
         new_stop=_quantize(desired,tick,up=False)
         new_stop=_away_from_market(new_stop,'BUY',bid,ask,minimum,tick)
+        if early_arm and not be_locked and new_stop<entry-1e-12:
+            return None
         if new_stop<=stop or new_stop>=tip:return None
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop<stop+tick-1e-12:return None
@@ -203,8 +210,12 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         if tip>=entry:return None
         desired=tip+trail_gap
         desired=max(desired,ask+minimum)
+        if early_arm and not be_locked:
+            desired=min(desired,entry)
         new_stop=_quantize(desired,tick,up=True)
         new_stop=_away_from_market(new_stop,'SELL',bid,ask,minimum,tick)
+        if early_arm and not be_locked and new_stop>entry+1e-12:
+            return None
         if new_stop>=stop or new_stop<=tip:return None
         if tp is not None and sign*(tp-new_stop)<=0:return None
         if new_stop>stop-tick+1e-12:return None

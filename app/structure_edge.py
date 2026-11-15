@@ -180,7 +180,20 @@ def teach_after_loss(*, direction, cf_best, structure_prefer_hold=False,
     sell_m = ((adv.get('sell') or {}).get('mean_pnl'))
 
     if advice == opposite:
-        return opposite, 'loss_structure_edge_opposite'
+        # Never bypass the spread/cost floor — structure EV is a hint, not a free flip.
+        if opp_val is not None and opp_floor is not None:
+            if float(opp_val) > float(opp_floor):
+                return opposite, 'loss_structure_edge_opposite'
+            if cf_best in ('BUY', 'SELL', 'HOLD'):
+                return cf_best, 'loss_structure_edge_opp_below_floor'
+            return 'HOLD', 'loss_structure_edge_opp_below_floor'
+        # No CF cost evidence: only flip if opposite mean £ is clearly positive.
+        opp_mean = sell_m if opposite == 'SELL' else buy_m
+        if opp_mean is not None and float(opp_mean) > 0:
+            return opposite, 'loss_structure_edge_opposite_ev'
+        if cf_best in ('BUY', 'SELL', 'HOLD'):
+            return cf_best, 'loss_structure_edge_keeps_cf'
+        return 'HOLD', 'loss_structure_edge_no_cf_floor'
     if advice == 'HOLD':
         return 'HOLD', 'loss_structure_edge_both_negative'
     # Structure says this layout pays the taken side? Unusual on a loss — keep CF.

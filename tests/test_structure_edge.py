@@ -73,6 +73,16 @@ def test_teach_after_loss_prefers_opposite_when_edge_says_so():
     assert 'opposite' in mode
 
 
+def test_teach_after_loss_respects_spread_floor():
+    taught, mode = se.teach_after_loss(
+        direction='BUY', cf_best='HOLD',
+        frame_advice={'advice': 'SELL', 'buy': {'mean_pnl': -1.0},
+                      'sell': {'mean_pnl': 0.8}},
+        opp_val=0.05, opp_floor=0.1)
+    assert taught == 'HOLD'
+    assert 'below_floor' in mode
+
+
 def test_teach_after_loss_grave_tries_opposite_when_cf_clears():
     taught, mode = se.teach_after_loss(
         direction='BUY', cf_best='HOLD', structure_prefer_hold=True,
@@ -89,14 +99,16 @@ def test_label_from_profit_uses_structure_frame_advice():
         _seed_side(s, direction='BUY', total_pnl=-5.0, samples=10)
         advice = se.compare_frame(s, epic='GOLD', structure='TREND')
         assert advice['advice'] == 'SELL'
-        # Loss on BUY with path that would HOLD without advice — edge teaches SELL.
+        # BUY loss; path must show opposite SELL clearing the spread floor so
+        # structure advice may teach SELL (never bypass cost floor).
         out = label_from_profit(
             'BUY', -1.2, entry=100., exit_level=99.0, spread=0.2,
             structure_prefer_hold=True,
             structure_frame_advice=advice,
             bars=[
-                {'open': 100., 'high': 100.1, 'low': 99.9, 'close': 100., 'spread': 0.2},
-                {'open': 100., 'high': 100.05, 'low': 98.9, 'close': 99.0, 'spread': 0.2},
+                {'open': 100., 'high': 100.2, 'low': 99.8, 'close': 100., 'spread': 0.2},
+                # Strong adverse for BUY / favorable for SELL CF
+                {'open': 100., 'high': 100.1, 'low': 97.5, 'close': 97.8, 'spread': 0.2},
             ],
             stop_distance=1.0, profit_distance=1.5, tick=0.01, min_distance=0.3)
         assert out['label'] == 1  # SELL
@@ -148,6 +160,25 @@ def test_propose_early_arm_locks_near_be():
         out = propose_broker_trail(
             pos, market, meta, extreme=100.5, store=s, arm_decision=arm)
         assert out is not None
-        assert out['stop_level'] >= 99.2
+        assert out['stop_level'] >= 100.0 - 1e-9  # BE lock — never loss-side of entry
         assert out['profit_level'] == 101.6  # TP preserved
         assert out.get('early_arm') is True
+
+
+def test_propose_early_arm_skips_when_be_violates_min_distance():
+    """If BE stop would sit inside broker min of market, skip — do not glue loss-side."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
+               'stopLevel': 99.2, 'profitLevel': 102.0, 'size': '.25'}
+        # bid barely above entry; minStop large → bid-min below entry
+        market = {'epic': 'GOLD', 'bid': 100.2, 'ask': 100.3, 'spread': 0.1,
+                  'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE'}
+        meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
+                'original_profit': 2.0}
+        arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.5}
+        out = propose_broker_trail(
+            pos, market, meta, extreme=100.5, store=s, arm_decision=arm)
+        # Either None (skipped) or stop >= entry — never below entry.
+        if out is not None:
+            assert out['stop_level'] >= 100.0 - 1e-9

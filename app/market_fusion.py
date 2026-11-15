@@ -34,18 +34,28 @@ FUSION_NAMES = FEATURE_NAMES + EXTERNAL_NAMES
 FUSION_DIM = len(FUSION_NAMES)  # default empty-registry size; runtime may grow
 
 
-def peer_features(state, bar_time):
-    """Six comparable aggregates, built exclusively from completed aligned bars."""
+def peer_features(state, bar_time, *, max_lag_seconds=90):
+    """Six comparable aggregates, built exclusively from completed aligned bars.
+
+    Peers may lag the primary M1 by up to ``max_lag_seconds`` — exact timestamp
+    match used to clear ``last_signal`` every bar and freeze OPEN.
+    """
     if not isinstance(state, dict) or state.get('status') != 'READY':
         return None
     timestamp = candle_time(bar_time)
     if timestamp is None:
         return None
+    lag = max(0, int(max_lag_seconds))
     ready = []
     for p in state.get('peers', []):
         if not isinstance(p, dict) or not p.get('ready'):
             continue
-        if candle_time(p.get('last_completed_bar')) != timestamp:
+        peer_t = candle_time(p.get('last_completed_bar'))
+        if peer_t is None:
+            continue
+        # Prefer exact match; allow small lag so one slow peer does not veto fusion.
+        delta = abs((peer_t - timestamp).total_seconds())
+        if delta > lag:
             continue
         try:
             data = [float(p[k]) for k in ('correlation', 'holdout_correlation',
@@ -54,9 +64,12 @@ def peer_features(state, bar_time):
         except (ValueError, TypeError, KeyError):
             continue
         if all(math.isfinite(x) for x in data):
-            ready.append((p, data))
+            ready.append((p, data, delta))
     if not ready:
         return None
+    # Prefer the tightest-aligned peers when several qualify.
+    ready.sort(key=lambda x: x[2])
+    ready = [(p, data) for p, data, _ in ready]
     trusted = [(p, v) for p,v in ready if p.get('stable') and v[0]*v[1]>0]
     # Correlation sign has been fitted and validated using earlier observations.
     weighted = []
@@ -110,16 +123,29 @@ def _liquidity_vector_ok(values):
     return all(math.isfinite(float(x)) for x in values)
 
 
+def _peer_vector_ok(values):
+    if not isinstance(values, (list, tuple)) or len(values) != 6:
+        return False
+    return all(math.isfinite(float(x)) for x in values)
+
+
+def _news_vector_ok(values):
+    if not isinstance(values, (list, tuple)) or len(values) != 2:
+        return False
+    return all(math.isfinite(float(x)) and 0 <= float(x) <= 1 for x in values)
+
+
 def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now=None,
                       expected_ohlc_dim=None, liquidity_path=None,
-                      liquidity_fallback=None):
+                      liquidity_fallback=None, peers_fallback=None,
+                      news_fallback=None):
     """Which EXTERNAL source blocks a fused decision after fusion transition.
 
     Returns None when fusion can be built; otherwise a short operator-facing
     reason naming the blocking feed (peers / news / liquidity / OHLC dim).
 
-    `liquidity_fallback`: last known good liquidity vector — when the live
-    minute has no volume observation, OPEN must not wait out the move.
+    Fallbacks (last good vectors) keep OPEN from freezing on a one-bar peer lag
+    or calendar refresh — values are carried, never invented from zeros.
     """
     if not isinstance(base, dict) or not base.get('ready'):
         return 'ohlc: market context not ready'
@@ -128,12 +154,12 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
     if len(ohlc) != need:
         return f'ohlc: feature dim {len(ohlc)} != expected {need}'
     peers = peer_features(intermarket, base.get('bar_time'))
-    if peers is None:
+    if peers is None and not _peer_vector_ok(peers_fallback):
         status = (intermarket or {}).get('status') if isinstance(intermarket, dict) else None
         detail = (intermarket or {}).get('reason') if isinstance(intermarket, dict) else None
         return 'peers: ' + (detail or status or 'aligned peer features unavailable')
     news = news_features(epic, calendar_path, currencies, now=now)
-    if news is None:
+    if news is None and not _news_vector_ok(news_fallback):
         return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW'
     if liquidity_path is None and not _liquidity_vector_ok(liquidity_fallback):
         return 'liquidity: path not configured'
@@ -150,7 +176,7 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
 
 def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=None,
                     expected_ohlc_dim=None, fusion_schema=None, liquidity_path=None,
-                    liquidity_fallback=None):
+                    liquidity_fallback=None, peers_fallback=None, news_fallback=None):
     """Return complete fusion vector or None.
 
     Layout (must match NeuralCore columns): [BASE_OHLC | DYNAMIC | EXTERNAL].
@@ -160,14 +186,17 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     `expected_ohlc_dim`: when registry has dynamic features, base['features'] must
     match that length. Default = FEATURE_DIM (static base only).
 
-    When the live minute has no fresh volume/DOM, `liquidity_fallback` (last
-    good vector) is used so OPEN is not frozen waiting for a late public feed.
-    Peers/news/OHLC are never invented.
+    When the live minute has no fresh volume/DOM/peers/news, last-good fallbacks
+    are used so OPEN is not frozen waiting for a late feed. OHLC is never invented.
     """
     if not isinstance(base,dict) or not base.get('ready'):
         return None
     peers = peer_features(intermarket, base.get('bar_time'))
+    if peers is None and _peer_vector_ok(peers_fallback):
+        peers = [float(x) for x in peers_fallback]
     news = news_features(epic,calendar_path,currencies,now=now)
+    if news is None and _news_vector_ok(news_fallback):
+        news = [float(x) for x in news_fallback]
     if peers is None or news is None:
         return None
     liq = None
@@ -202,6 +231,32 @@ def fusion_liquidity_tail(fused, *, ohlc_dim=None):
         return None
     tail = list(fused[start:end])
     return tail if _liquidity_vector_ok(tail) else None
+
+
+def fusion_peers_tail(fused, *, ohlc_dim=None):
+    """Extract peer EXTERNAL block (6 dims) for carry-forward."""
+    if not isinstance(fused, (list, tuple)):
+        return None
+    need = FEATURE_DIM if ohlc_dim is None else int(ohlc_dim)
+    start = need
+    end = start + 6
+    if len(fused) < end:
+        return None
+    tail = list(fused[start:end])
+    return tail if _peer_vector_ok(tail) else None
+
+
+def fusion_news_tail(fused, *, ohlc_dim=None):
+    """Extract news EXTERNAL block (2 dims) for carry-forward."""
+    if not isinstance(fused, (list, tuple)):
+        return None
+    need = FEATURE_DIM if ohlc_dim is None else int(ohlc_dim)
+    start = need + 6
+    end = start + 2
+    if len(fused) < end:
+        return None
+    tail = list(fused[start:end])
+    return tail if _news_vector_ok(tail) else None
 
 
 def fusion_dim_for(ohlc_dim):

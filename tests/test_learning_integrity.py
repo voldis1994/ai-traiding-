@@ -194,7 +194,10 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
 
 
 def test_scratch_loss_does_not_spam_hold_into_core():
-    """Penny-loss closes must not train any class into the core (HOLD trap)."""
+    """Penny-loss closes must not train any class into the core (HOLD trap).
+
+    Also must NOT burn the once-only learn slot — later CF/broker retry can teach.
+    """
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
         brain.tick(100,.05,.01,'GOLD')
@@ -212,9 +215,11 @@ def test_scratch_loss_does_not_spam_hold_into_core():
         assert detail['learn_repeats']==0
         assert detail['scratch_hold_skip'] is True
         assert detail['weights_updated'] is False
-        assert detail['mode'].endswith('_scratch_skip')
+        assert detail['mode'].endswith('_scratch_no_neural')
         assert np.array_equal(before,brain.core.P)
         assert store.get('entry_brain:scratch1') is None
+        # Once-only slot not burned — deal can still be taught later.
+        assert not store.get('learned_trade:scratch1')
 
 
 def test_mismatched_broker_trade_outcome_never_trains():

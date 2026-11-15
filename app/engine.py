@@ -33,7 +33,7 @@ from .storage import DATA
 from .market_context import market_features, candle_bucket, candle_time, FEATURE_SCHEMA, FEATURE_DIM
 from .market_fusion import (
     FUSION_SCHEMA, FUSION_DIM, fusion_features, fusion_dim_for, EXTERNAL_NAMES,
-    fusion_gap_reason, fusion_liquidity_tail,
+    fusion_gap_reason, fusion_liquidity_tail, fusion_peers_tail, fusion_news_tail,
 )
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
@@ -966,9 +966,11 @@ class SingleTradeEngine:
         self.market_context={'ready':False,'reason':'Waiting for complete multi-timeframe candles'}
         self.latest_fusion_ready=False
         self.fusion_block_reason=None  # which EXTERNAL source blocks new fused entry
-        # Last good liquidity EXTERNAL tail — carry forward when public volume/DOM
-        # lags the completed M1 so OPEN does not miss the move waiting on the feed.
+        # Last good EXTERNAL tails — carry forward when public volume/DOM/peers/news
+        # lag the completed M1 so OPEN does not miss the move waiting on the feed.
         self._last_good_liquidity=None
+        self._last_good_peers=None
+        self._last_good_news=None
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
         self.last_entry_audit_key=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
@@ -1132,6 +1134,8 @@ class SingleTradeEngine:
         self.latest_fusion_ready=False
         self.fusion_block_reason=None
         self._last_good_liquidity=None
+        self._last_good_peers=None
+        self._last_good_news=None
         self.last_calendar_refresh=0.;self.calendar_feed_error=None
         self.last_liquidity_refresh=0.;self.liquidity_feed_error=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
@@ -2064,7 +2068,9 @@ class SingleTradeEngine:
                     now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                     fusion_schema=self.brain.fusion_schema,
                     liquidity_path=self.liquidity_path,
-                    liquidity_fallback=self._last_good_liquidity)
+                    liquidity_fallback=self._last_good_liquidity,
+                    peers_fallback=self._last_good_peers,
+                    news_fallback=self._last_good_news)
                 # After restart with an open position, peers/calendar/liquidity stay
                 # background-only — fusion never becomes ready and admin shows BUY/
                 # HOLD/SELL 0% forever. One blocking warm-up restores the first vote.
@@ -2084,15 +2090,24 @@ class SingleTradeEngine:
                         now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                         fusion_schema=self.brain.fusion_schema,
                         liquidity_path=self.liquidity_path,
-                        liquidity_fallback=self._last_good_liquidity)
+                        liquidity_fallback=self._last_good_liquidity,
+                        peers_fallback=self._last_good_peers,
+                        news_fallback=self._last_good_news)
                 self.latest_fusion_ready=fused is not None
                 if fused is not None:
                     self.fusion_block_reason=None
-                    # Remember live (or carried) liquidity so a lagging public feed
+                    # Remember live (or carried) EXTERNAL so a lagging feed
                     # cannot freeze the next M1 OPEN while the move finishes.
-                    tail=fusion_liquidity_tail(fused,ohlc_dim=self.brain.ohlc_dim)
+                    odim=self.brain.ohlc_dim
+                    tail=fusion_liquidity_tail(fused,ohlc_dim=odim)
                     if tail is not None:
                         self._last_good_liquidity=tail
+                    peers=fusion_peers_tail(fused,ohlc_dim=odim)
+                    if peers is not None:
+                        self._last_good_peers=peers
+                    news=fusion_news_tail(fused,ohlc_dim=odim)
+                    if news is not None:
+                        self._last_good_news=news
                 else:
                     # Name the EXTERNAL source that blocks a new fused decision.
                     self.fusion_block_reason=fusion_gap_reason(
@@ -2101,7 +2116,9 @@ class SingleTradeEngine:
                         self.instrument_profile['currencies'],
                         now=clock(),expected_ohlc_dim=self.brain.ohlc_dim,
                         liquidity_path=self.liquidity_path,
-                        liquidity_fallback=self._last_good_liquidity)
+                        liquidity_fallback=self._last_good_liquidity,
+                        peers_fallback=self._last_good_peers,
+                        news_fallback=self._last_good_news)
                 # Prefer fusion when ready. After fusion-model transition, a gap
                 # must NOT drive a NEW entry from a stale prior signal. Open
                 # position protection continues below regardless of fusion.
@@ -2363,10 +2380,22 @@ class SingleTradeEngine:
         history=list(self.brain.history)
         # Adaptive structure edge: soft-nudge scores from learned EV by frame×side.
         # Never a hard veto — neurons still vote; £ teacher corrects after closes.
-        raw_scores=dict(self.last_signal['scores'] or {})
+        # Always nudge from scores_raw (neural) — never re-nudge already-nudged
+        # scores (Admin/poll re-entry used to compound HOLD tilt → false HOLD).
+        base_scores=dict(
+            (self.last_signal.get('scores_raw')
+             if isinstance(self.last_signal.get('scores_raw'),dict)
+             else None)
+            or self.last_signal.get('scores')
+            or {})
+        if not self.last_signal.get('scores_raw'):
+            self.last_signal=dict(self.last_signal,scores_raw=dict(base_scores))
         edge_advice=self._structure_edge_advice()
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
-            raw_scores,edge_advice,store=self.store)
+            base_scores,edge_advice,store=self.store)
+        self.last_signal=dict(
+            self.last_signal,scores=dict(nudged_scores),
+            structure_edge=edge_advice,structure_nudge=nudge_meta)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -3082,16 +3111,21 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','Fuzzy pending P&L failed',
                                      {'deal_id':deal,'type':type(exc).__name__})
-            # Exhausted history: bind last live UPL so Admin is not stuck forever.
-            # First resolve still never freezes UPL (audit #1); only after retries.
+            # Exhausted history: bind last live UPL for Admin display ONLY —
+            # never teach from UPL (≠ realized £ → wrong labels / settle).
             if not found and attempts>=6:
                 snap=self.store.get('last_upl:'+deal) or {}
                 upl=_num(snap.get('upl'))
                 if upl is not None and math.isfinite(upl):
-                    found=(float(upl),self._cash_currency(snap.get('currency')))
+                    ccy_upl=self._cash_currency(snap.get('currency'))
+                    self.store.close_trade(
+                        deal,exit_level,float(upl),currency=ccy_upl,
+                        source='upl_estimate',overwrite=True)
                     self.store.event('trade',
-                        'Pending cash bound from last live UPL after history retries',
+                        'Pending cash shown from last UPL (no neural teach)',
                         {'deal_id':deal,'upl':float(upl),'attempts':attempts})
+                    self.store.set('last_upl:'+deal,None)
+                    continue
             if not found:
                 nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
                 remaining.append(nxt)
@@ -3222,13 +3256,25 @@ class SingleTradeEngine:
             'pre_bars':pre,
         }
 
-    def _settle_unified_cycle(self,*,pnl,action=None,exit_reason=None,deal_id=None):
+    def _scratch_band(self):
+        from .self_params import load as load_self_params, DEFAULTS as SP_DEFAULTS
+        try:
+            return float(load_self_params(self.store).get(
+                'scratch_pnl_abs',SP_DEFAULTS['scratch_pnl_abs']))
+        except (TypeError,ValueError):
+            return float(SP_DEFAULTS['scratch_pnl_abs'])
+
+    def _settle_unified_cycle(self,*,pnl,action=None,exit_reason=None,deal_id=None,
+                              scratch_band=None):
         """Fold broker £ into the single LIVE cycle bus (aggression / streaks)."""
+        if scratch_band is None:
+            scratch_band=self._scratch_band()
         cycle=unified_cycle.settle(
-            self.store,pnl=pnl,action=action,exit_reason=exit_reason)
+            self.store,pnl=pnl,action=action,exit_reason=exit_reason,
+            scratch_band=scratch_band)
         self.store.event('cycle','Unified cycle settled from broker £',{
             'deal_id':deal_id,'pnl':pnl,'action':action,
-            'exit_reason':exit_reason,
+            'exit_reason':exit_reason,'scratch':bool(cycle.get('last_scratch')),
             'aggression':cycle.get('aggression'),
             'loss_streak':cycle.get('loss_streak'),
             'win_streak':cycle.get('win_streak')})
@@ -3246,7 +3292,8 @@ class SingleTradeEngine:
         if None in (mid,tick,spread) or not epic:
             return None
         try:
-            candles=self.store.candles(epic,n=190,historical_only=True)
+            hist_n=recommended_live_history_bars(self.store)
+            candles=self.store.candles(epic,n=hist_n,historical_only=True)
         except Exception:
             candles=[]
         if len(candles)<20:
@@ -3556,9 +3603,11 @@ class SingleTradeEngine:
             except (TypeError,ValueError):
                 scratch_hold=False
         if scratch_hold:
-            label=2  # HOLD — do not invent flip on pennies
-            repeats=1
-            mode=str(mode)+'_scratch_hold'
+            # Penny closes: do NOT teach HOLD into the core (HOLD-trap) and do
+            # NOT burn the once-only learn slot — brackets/cycle still settle.
+            label=None
+            repeats=0
+            mode=str(mode)+'_scratch_no_neural'
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
@@ -3567,6 +3616,9 @@ class SingleTradeEngine:
         claimed_neural=False
         if repeats>0 and label is not None:
             claimed_neural=bool(self._claim_trade_learned(deal_id))
+            if not claimed_neural:
+                # Already claimed/learned elsewhere — skip weight mutation.
+                repeats=0
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
         last_delta=None
@@ -3583,11 +3635,11 @@ class SingleTradeEngine:
                     any_real_dw=True
         # ΔW already updated neural scores (entry quality). Entry floor stays
         # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
-        if repeats>0 and label is not None:
+        if repeats>0 and label is not None and claimed_neural:
             unified_cycle.note_weight_update(
                 self.store,won=pnl_sign>0,delta_norm=last_delta)
         # Independent shadow core trains on same label using *its* decision-time h/c.
-        if repeats>0:
+        if repeats>0 and label is not None and claimed_neural:
             self._shadow_learn(None,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
             # Queue evidence only — commit when long-horizon £ proves improvement.
@@ -3615,9 +3667,11 @@ class SingleTradeEngine:
             # Audit #21: operator daily loss / drawdown halt from realized cash.
             hard_risk.record_realized_pnl(self.store,pnl_value)
             # One feedback bus: £ → cycle aggression / streak for next OPEN.
+            # Pass scratch band so pennies do not tighten brackets like real losses.
             self._settle_unified_cycle(
                 pnl=pnl_value,action=direction,
-                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id)
+                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id,
+                scratch_band=float(sp.get('scratch_pnl_abs') or 0.05))
             equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
@@ -3649,11 +3703,16 @@ class SingleTradeEngine:
             self.store.set('neural_adapt_reason',
                 f'Closed {direction} £{pnl_value} → LIVE learn×{repeats} mode={mode}')
             self.brain.model_version=int(getattr(self.brain,'model_version',0) or 0)+1
-        # Critical #5: mark learned BEFORE brain.save() so a crash between the
-        # two cannot re-train on restart (lost save ≺ double-train).
-        self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
+        # Critical #5: mark learned ONLY when we claimed + trained (or claimed
+        # with no ΔW). Never burn the once-only slot on label=None / scratch skip
+        # — that blocked later CF retry and left the same bad entry untaught.
+        if claimed_neural and (repeats>0 or any_real_dw):
+            self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
+        elif claimed_neural:
+            # Claimed but no train steps — still finalize so crash cannot double-claim.
+            self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.brain.save()
-        weights_updated=bool(repeats>0 and weights_moved)
+        weights_updated=bool(repeats>0 and weights_moved and claimed_neural)
         if weights_updated:
             self.store.event('learning','Closed-trade P&L updated LIVE neural weights',
                 {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
@@ -3838,7 +3897,20 @@ class SingleTradeEngine:
         if not meta or meta.get('owner')!='AUTO':
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
             return
-        if self.store.unresolved() or self.pending_order or self.pending_close:return
+        if self.pending_order or self.pending_close:return
+        # Stale PENDING PROTECT for *this* deal must not freeze trail forever —
+        # supersede leftovers and continue. Other unresolved kinds still wait.
+        deal_s=str(p.get('dealId'))
+        blocking=[]
+        for item in (self.store.unresolved() or []):
+            kind=item.get('kind')
+            if kind=='PROTECT' and str(item.get('deal_id'))==deal_s:
+                self.store.order_update(item['id'],'SUPERSEDED')
+                self.store.event('reconcile','Stale PROTECT superseded so trail can continue',{
+                    'deal_id':deal_s,'order_id':item.get('id')})
+            else:
+                blocking.append(item)
+        if blocking:return
         if self.market.get('status')!='TRADEABLE':return
         if self.market.get('tick') is None or self.market.get('min_distance') is None:return
         opened=candle_time(meta.get('opened')) if meta.get('opened') else None
@@ -3946,7 +4018,15 @@ class SingleTradeEngine:
         if self.pending_order or self.pending_close:return
         if p.get('stopLevel') is not None and p.get('profitLevel') is not None:
             self.protected.add(p['dealId']);return
-        if self.store.unresolved():return
+        # Same stale-PROTECT policy as adapt_protection — do not freeze forever.
+        deal_s=str(p.get('dealId'))
+        blocking=[]
+        for item in (self.store.unresolved() or []):
+            if item.get('kind')=='PROTECT' and str(item.get('deal_id'))==deal_s:
+                self.store.order_update(item['id'],'SUPERSEDED')
+            else:
+                blocking.append(item)
+        if blocking:return
         min_dist=self.market.get('min_distance');tick=self.market.get('tick');mid=self.market.get('mid')
         if min_dist is None or not tick or not mid:
             # Skip this tick — do NOT disable execution (that froze OPEN after every close).
@@ -4087,7 +4167,9 @@ class SingleTradeEngine:
             if size<=0:return
             entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
             # OHLC zone decides SL/TP across M1/M5/M15/H1; cycle only gates edge.
-            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            # Use the same history need as feature validation (≥260), not a frozen 190.
+            hist_n=recommended_live_history_bars(self.store)
+            candles=self.store.candles(self.mandate['epic'],n=hist_n,historical_only=True)
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))

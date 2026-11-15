@@ -47,6 +47,7 @@ from . import hold_shadow
 from . import learning_generation
 from . import champion_library
 from . import structure_shadow
+from . import structure_edge
 
 DB=DATA/'robot.sqlite3'
 
@@ -2360,14 +2361,22 @@ class SingleTradeEngine:
         ctx=self.market_context or {}
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else None
         history=list(self.brain.history)
+        # Adaptive structure edge: soft-nudge scores from learned EV by frame×side.
+        # Never a hard veto — neurons still vote; £ teacher corrects after closes.
+        raw_scores=dict(self.last_signal['scores'] or {})
+        edge_advice=self._structure_edge_advice()
+        nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
+            raw_scores,edge_advice,store=self.store)
         result=self.policy.evaluate_neural_entry(
-            self.last_signal['scores'],
+            nudged_scores,
             returns_bps=ctx.get('returns_bps'),
             trend=ctx.get('trend'),
             regime=ctx.get('regime'),
             history=history,
             readiness=readiness,
             spread_bps=self._spread_bps())
+        result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
+                    scores=nudged_scores)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -2378,7 +2387,7 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
             # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
             edge=unified_cycle.edge_allows_open(
-                self.last_signal['scores'],result,
+                nudged_scores,result,
                 unified_cycle.load_state(self.store))
             if not edge['allowed']:
                 return dict(result,action='HOLD',reason=edge['reason'],
@@ -2390,9 +2399,30 @@ class SingleTradeEngine:
                 result['action']))
         else:
             result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
-                (self.last_signal or {}).get('scores'),result,
+                nudged_scores,result,
                 unified_cycle.load_state(self.store)))
         return result
+
+    def _structure_edge_advice(self):
+        """BUY vs SELL EV in the live OHLC frame — soft evidence, not a gate."""
+        if not self.mandate:
+            return {'advice':None,'reason':'no_mandate'}
+        epic=self.mandate.get('epic')
+        try:
+            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))
+        n_pre=int(getattr(structure_shadow,'ADVISE_PRE_BARS',40))
+        path=chron[-n_path:] if len(chron)>n_path else chron
+        pre=chron[-(n_path+n_pre):-n_path] if len(chron)>n_path else chron[:max(0,len(chron)//2)]
+        mid=_num(self.market.get('mid'))
+        frame=structure_shadow.frame_from_ohlc(path,entry=mid,exit_level=None,pre_bars=pre)
+        structure=(frame or {}).get('structure') or 'CHOP'
+        advice=structure_edge.compare_frame(self.store,epic=epic,structure=structure)
+        structure_edge.persist_advice(self.store,advice)
+        return advice
 
     def _structure_shadow_advice(self,proposal):
         """Evidence/UI: does current OHLC match prior SL graves? Not a LIVE gate."""
@@ -3177,11 +3207,15 @@ class SingleTradeEngine:
             direction=direction)
         from .profit_learning import path_excursion
         exc=path_excursion(path,direction,entry)
+        # Adaptive BUY/SELL/HOLD from structure×£ EV (opposite when it pays).
+        frame_advice=structure_edge.compare_frame(
+            self.store,epic=epic,structure=frame.get('structure') or 'CHOP')
         return {
             'frame':frame,
             'structure_prefer_hold':bool(prefer.get('prefer_hold')),
             'structure_key':prefer.get('key'),
             'structure_reason':prefer.get('reason'),
+            'structure_frame_advice':frame_advice,
             'path_mfe':exc.get('mfe'),
             'path_mae':exc.get('mae'),
             'gave_then_lost':bool(exc.get('gave_then_lost')),
@@ -3465,7 +3499,8 @@ class SingleTradeEngine:
         teach_extra=dict(
             structure_prefer_hold=struct_ctx.get('structure_prefer_hold'),
             path_mfe=struct_ctx.get('path_mfe'),
-            path_mae=struct_ctx.get('path_mae'))
+            path_mae=struct_ctx.get('path_mae'),
+            structure_frame_advice=struct_ctx.get('structure_frame_advice'))
         # Profit ledger: ONLY broker-confirmed £ — never ±1 tick fakes.
         if pnl_source=='broker' and pnl_value is not None:
             decision=self.profit_learning.record_closed(
@@ -3729,6 +3764,23 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set(key,None)
 
+    def _trail_structure_label(self,p,candles=None):
+        """OHLC structure tag for adaptive trail arm (TREND/BREAKOUT/…)."""
+        epic=p.get('epic')
+        entry=_num(p.get('level'))
+        try:
+            rows=candles if candles is not None else (
+                self.store.candles(epic,n=90,historical_only=True) if epic else [])
+        except Exception:
+            rows=[]
+        chron=sorted(rows or [],key=lambda r:r.get('at') or '')
+        n_path=30;n_pre=40
+        path=chron[-n_path:] if len(chron)>n_path else chron
+        pre=chron[-(n_path+n_pre):-n_path] if len(chron)>n_path else chron[:max(0,len(chron)//2)]
+        frame=structure_shadow.frame_from_ohlc(
+            path,entry=entry,exit_level=None,pre_bars=pre)
+        return (frame or {}).get('structure') or 'CHOP'
+
     def _enroll_adaptive_protection(self,p,*,force=False):
         """Register robot deal for broker trail. Needs entry+SL; TP optional.
 
@@ -3747,6 +3799,10 @@ class SingleTradeEngine:
                 if sign*(tp-entry)>0:
                     meta=dict(existing);meta['original_profit']=abs(tp-entry)
                     self.store.set(key,meta)
+            if not existing.get('structure'):
+                meta=dict(existing)
+                meta['structure']=self._trail_structure_label(p)
+                self.store.set(key,meta)
             return True
         if not self.store.get('robot_open:'+str(deal_id)):
             return False
@@ -3758,11 +3814,13 @@ class SingleTradeEngine:
             'owner':'AUTO','deal_id':deal_id,'epic':p.get('epic'),
             'original_risk':abs(entry-stop),
             'original_profit':(abs(tp-entry) if tp is not None and sign*(tp-entry)>0 else None),
+            'structure':self._trail_structure_label(p),
             'opened':(existing or {}).get('opened') or now()}
         self.store.set(key,meta)
         self.store.event('protection','Robot-opened position enrolled in adaptive SL/TP',
             {'deal_id':deal_id,'initial_risk':meta['original_risk'],
-             'initial_profit':meta['original_profit'],'tp_optional':tp is None})
+             'initial_profit':meta['original_profit'],'tp_optional':tp is None,
+             'structure':meta.get('structure')})
         return True
 
     async def adapt_protection(self,p):
@@ -3770,6 +3828,7 @@ class SingleTradeEngine:
 
         Pre-BE gap = original_risk; after BE gap = recent M1 median range from
         OHLC (same zone data), not a hardcoded fraction of R.
+        Trail self-arms from MFE / structure EV (not a fixed human 1R law).
         """
         key='adaptive_protection:'+str(p['dealId'])
         # Late enroll if OPEN lacked TP / meta was never written.
@@ -3792,12 +3851,35 @@ class SingleTradeEngine:
             meta=dict(meta);meta['trail_extreme']=extreme
             if zone_range is not None:meta['zone_range']=float(zone_range)
             self.store.set(key,meta)
+        # Adaptive trail arm: MFE / structure EV / BE lock — not a frozen 1R rule.
+        entry=_num(p.get('level'));sign={'BUY':1,'SELL':-1}.get(p.get('direction'))
+        mfe=None
+        if entry is not None and sign is not None and extreme is not None:
+            mfe=sign*(float(extreme)-float(entry))
+        elif entry is not None and sign is not None:
+            quote=self.market.get('bid') if sign==1 else self.market.get('ask')
+            if quote is not None:
+                mfe=sign*(float(quote)-float(entry))
+        stop_now=_num(p.get('stopLevel'))
+        be_locked=(entry is not None and stop_now is not None and sign is not None
+                   and sign*(float(stop_now)-float(entry))>=-1e-12)
+        structure=meta.get('structure') or self._trail_structure_label(p,candles)
+        arm=structure_edge.trail_arm_decision(
+            self.store,epic=p.get('epic'),structure=structure,
+            direction=p.get('direction'),mfe=mfe,
+            original_risk=meta.get('original_risk'),be_locked=be_locked)
+        if not arm.get('arm'):
+            self.protection_brief={
+                'status':'Trail waiting for adaptive arm evidence',
+                'deal_id':p['dealId'],'extreme':extreme,'trail_arm':arm}
+            return
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
                                       zone_range=float(zone_range) if zone_range is not None else None,
-                                      store=self.store)
+                                      store=self.store,arm_decision=arm)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
-                               'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal}
+                               'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal,
+                               'trail_arm':arm}
         if not proposal:return
         runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{}) or {}
         now_mono=time.monotonic()
@@ -3809,21 +3891,23 @@ class SingleTradeEngine:
         # turns Take Profit Off — TP mark can be touched with no fill left.
         tp=proposal.get('profit_level')
         if tp is None:tp=_num(p.get('profitLevel'))
-        # Audit #9: skip trail PUT when SL/TP would violate broker min distance.
-        if not levels_meet_broker_min(p.get('direction'),stop,tp,
+        # Trail moves STOP only. TP near market must not freeze SL protection —
+        # validate stop vs bid/ask; still re-send TP so Capital keeps it on.
+        if not levels_meet_broker_min(p.get('direction'),stop,None,
                                       self.market.get('bid'),self.market.get('ask'),
                                       self.market.get('min_distance')):
-            self.store.event('warning','Trail skipped: SL/TP below broker min distance',{
+            self.store.event('warning','Trail skipped: SL below broker min distance',{
                 'deal_id':p.get('dealId'),'stop':stop,'profit':tp,
                 'min_distance':self.market.get('min_distance'),
                 'tick':self.market.get('tick'),'bid':self.market.get('bid'),
-                'ask':self.market.get('ask')})
-            self.protection_brief={'status':'Trail skipped: SL/TP below broker min',
+                'ask':self.market.get('ask'),'stop_only_check':True})
+            self.protection_brief={'status':'Trail skipped: SL below broker min',
                                    'deal_id':p['dealId'],'proposal':proposal}
             return
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
             'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
-            'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None})
+            'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None,
+            'trail_arm':arm.get('reason')})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=tp)
             if await self._confirm_reconcile(receipt,oid,'PROTECT',p['dealId']):

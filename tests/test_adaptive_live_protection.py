@@ -193,15 +193,25 @@ def test_trail_put_never_clears_existing_take_profit():
 
 
 def test_stale_broker_levels_are_not_false_confirmed():
+    """Stale broker echo must not mark trail CONFIRMED — and must not pause LIVE.
+
+    Trail validates stop-only vs minStop (TP near market must not block SL).
+    When Capital keeps the old stop, reconcile fails → SUPERSEDED, levels kept,
+    robot stays armed (trail glitch must not freeze OPEN).
+    """
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             e,b,s=engine_fixture(d);b.return_old=True
             await e.sync()
             await e.adapt_protection(e.positions[0])
             assert len(b.requests)==1
-            assert not e.execution_enabled and not e.armed
-            assert len(s.unresolved())==1
-            assert e.protection_brief['status'].startswith('Uncertain')
+            assert e.armed and e.execution_enabled
+            assert not s.unresolved()  # SUPERSEDED, not left hanging
+            assert b.open[0]['position']['stopLevel']==99.2  # old level kept
+            status=(e.protection_brief or {}).get('status','')
+            assert 'uncertain' in status.lower() or 'kept' in status.lower()
+            runtime=s.get('adaptive_runtime:auto1') or {}
+            assert runtime.get('status')!='CONFIRMED'
     asyncio.run(scenario())
 
 
@@ -296,12 +306,15 @@ def test_confirmed_sell_open_registers_persistent_adaptive_rights():
 
 
 class OpenWithoutTakeProfitBroker(BrokerSimulation):
-    """Capital often confirms OPEN with SL set and Take Profit Off."""
+    """Capital often confirms OPEN with SL set and Take Profit Off.
+
+    dealId must match BrokerSimulation.confirm (``b2``) so OPEN reconciles.
+    """
     async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None):
         self.requests.append(('OPEN',epic,direction,size,stop_distance,profit_distance))
         sign=1 if direction=='BUY' else -1
         entry=self.price
-        self.open=[{'position':{'dealId':'ntp1','size':str(size),'direction':direction,
+        self.open=[{'position':{'dealId':'b2','size':str(size),'direction':direction,
             'level':entry,'stopLevel':entry-sign*float(stop_distance),
             'profitLevel':None},'market':{'epic':epic}}]
         return {'dealReference':'open-no-tp'}
@@ -318,17 +331,18 @@ def test_open_without_tp_still_enrolls_trail():
                       'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
             e.market_context={'ready':True}
             await e.submit('BUY')
-            meta=s.get('adaptive_protection:ntp1')
+            meta=s.get('adaptive_protection:b2')
             assert meta and meta['owner']=='AUTO'
             assert meta['original_risk']>0
             assert meta.get('original_profit') in (None,0) or meta['original_profit'] is None
             # Trail must still propose with TP Off once price runs.
-            e.positions=[{'dealId':'ntp1','epic':'SIM','direction':'BUY','level':100.,
+            e.positions=[{'dealId':'b2','epic':'SIM','direction':'BUY','level':100.,
                           'stopLevel':99.2,'profitLevel':None,'size':'1'}]
             e.market={'epic':'SIM','mid':101.4,'bid':101.35,'ask':101.45,'spread':.1,
                       'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
             prop=propose_broker_trail(e.positions[0],e.market,meta,extreme=101.35)
             assert prop and prop['stop_level']>99.2
+            assert prop['profit_level'] is None
     asyncio.run(scenario())
 
 

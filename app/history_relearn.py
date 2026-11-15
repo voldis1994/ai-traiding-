@@ -530,13 +530,17 @@ def relearn(*, store, brain, lr=0.28, loss_repeats=3, win_repeats=2,
         prefer = ss.library_prefers_hold(
             store, epic=epic, structure=frame.get('structure'),
             direction=direction)
+        from . import structure_edge as se
+        frame_advice = se.compare_frame(
+            store, epic=epic, structure=frame.get('structure') or 'CHOP')
         exc = path_excursion(path, direction, entry)
         decision = label_from_profit(
             direction, pnl, entry=entry, exit_level=exit_level, spread=spread,
             bars=path or None, stop_distance=stop_d, profit_distance=profit_d,
             tick=tick, trail=False,
             structure_prefer_hold=bool(prefer.get('prefer_hold')),
-            path_mfe=exc.get('mfe'), path_mae=exc.get('mae'))
+            path_mfe=exc.get('mfe'), path_mae=exc.get('mae'),
+            structure_frame_advice=frame_advice)
         # Persist corrected ledger row.
         pl.record_closed(
             deal_id=tr['deal_id'], epic=epic, direction=direction, entry=entry,
@@ -545,6 +549,7 @@ def relearn(*, store, brain, lr=0.28, loss_repeats=3, win_repeats=2,
             profit_distance=profit_d, tick=tick, trail=False,
             structure_prefer_hold=bool(prefer.get('prefer_hold')),
             path_mfe=exc.get('mfe'), path_mae=exc.get('mae'),
+            structure_frame_advice=frame_advice,
             require_broker_pnl=True)
         mode = decision.get('mode') or 'none'
         mode_counts[mode] = mode_counts.get(mode, 0) + 1

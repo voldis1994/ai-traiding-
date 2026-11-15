@@ -37,7 +37,9 @@ from .market_fusion import (
 )
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
-from .feature_validation import FeatureValidator
+from .feature_validation import (
+    FeatureValidator, recommended_live_history_bars, min_bars_for_train_oos_split,
+)
 from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
 from . import hold_shadow
@@ -1890,7 +1892,10 @@ class SingleTradeEngine:
             self.last_candle_tick=self.tick_count
             if not hasattr(self.broker,'prices'):return
             try:
-                source=await self.broker.prices(self.mandate['epic'],resolution='MINUTE',maximum=180)
+                # Must cover train/OOS feature validation (≥260 with defaults; 400 floor).
+                hist_n=recommended_live_history_bars(self.store)
+                source=await self.broker.prices(
+                    self.mandate['epic'],resolution='MINUTE',maximum=hist_n)
                 for p in source.get('prices',[]):
                     def midprice(name):
                         item=p.get(name) or {};b=_num(item.get('bid'));a=_num(item.get('ask'))
@@ -1961,7 +1966,10 @@ class SingleTradeEngine:
             await self._account_and_candles()
             # Only BROKER-REPORTED complete MINUTE OHLC bars may feed the AI.
             # The forming quote candle is explicitly excluded by market_features.
-            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            # Window must be large enough for feature train/OOS confirm (not 190).
+            hist_n=recommended_live_history_bars(self.store)
+            candles=self.store.candles(
+                self.mandate['epic'],n=hist_n,historical_only=True)
             self.feature_registry.load()
             if hasattr(self.brain,'apply_registry'):
                 try:
@@ -4526,7 +4534,9 @@ class SingleTradeEngine:
             return
         self._last_self_dev_bar=bar
         bars,spreads,times=self._bars_and_spreads_from_candles(candles)
-        if len(bars)<120:return
+        # Do not propose/validate until history can pass train/OOS thin-split.
+        need=min_bars_for_train_oos_split(self.store)
+        if len(bars)<need:return
         window=bars[-61:]
         # Discovery uses the latest known per-bar spread when present.
         last_sp=next((s for s in reversed(spreads) if s is not None),None)

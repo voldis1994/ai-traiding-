@@ -2034,12 +2034,14 @@ class SingleTradeEngine:
                  'spread':ask-bid}
             self.store.candle(self.mandate['epic'],bar)
             await self._account_and_candles()
-            # Only BROKER-REPORTED complete MINUTE OHLC bars may feed the AI.
-            # The forming quote candle is explicitly excluded by market_features.
-            # Window size is robot-computed from val_* — not a fixed 190/400.
+            # LIVE context: include closed QUOTE minutes too. PK(epic,at) means a
+            # minute written as QUOTE during the forming bar is excluded forever by
+            # historical_only=True until Capital rewrite — that punched holes in the
+            # last 60m and froze BUY/HOLD/SELL at 0%. Forming minute still excluded
+            # by market_features cutoff. Window size from val_* (not fixed 190/400).
             hist_n=recommended_live_history_bars(self.store)
             candles=self.store.candles(
-                self.mandate['epic'],n=hist_n,historical_only=True)
+                self.mandate['epic'],n=hist_n,historical_only=False)
             self.feature_registry.load()
             if hasattr(self.brain,'apply_registry'):
                 try:
@@ -3297,7 +3299,7 @@ class SingleTradeEngine:
             return None
         try:
             hist_n=recommended_live_history_bars(self.store)
-            candles=self.store.candles(epic,n=hist_n,historical_only=True)
+            candles=self.store.candles(epic,n=hist_n,historical_only=False)
         except Exception:
             candles=[]
         if len(candles)<20:
@@ -4173,7 +4175,7 @@ class SingleTradeEngine:
             # OHLC zone decides SL/TP across M1/M5/M15/H1; cycle only gates edge.
             # Use the same history need as feature validation (≥260), not a frozen 190.
             hist_n=recommended_live_history_bars(self.store)
-            candles=self.store.candles(self.mandate['epic'],n=hist_n,historical_only=True)
+            candles=self.store.candles(self.mandate['epic'],n=hist_n,historical_only=False)
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))

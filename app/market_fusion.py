@@ -34,11 +34,14 @@ FUSION_NAMES = FEATURE_NAMES + EXTERNAL_NAMES
 FUSION_DIM = len(FUSION_NAMES)  # default empty-registry size; runtime may grow
 
 
-def peer_features(state, bar_time, *, max_lag_seconds=90):
+def peer_features(state, bar_time, *, max_lag_seconds=0):
     """Six comparable aggregates, built exclusively from completed aligned bars.
 
-    Peers may lag the primary M1 by up to ``max_lag_seconds`` — exact timestamp
-    match used to clear ``last_signal`` every bar and freeze OPEN.
+    Default is exact bar match — ``abs()`` lag windows allowed future peer bars
+    (lookahead in research) and conflicted with fusion tests that reject a
+    60s-stale peer. LIVE one-bar peer gaps use ``peers_fallback`` carry-forward
+    instead of inventing alignment. ``max_lag_seconds`` only accepts *past*
+    peers (peer_t ≤ bar_time), never future.
     """
     if not isinstance(state, dict) or state.get('status') != 'READY':
         return None
@@ -53,9 +56,11 @@ def peer_features(state, bar_time, *, max_lag_seconds=90):
         peer_t = candle_time(p.get('last_completed_bar'))
         if peer_t is None:
             continue
-        # Prefer exact match; allow small lag so one slow peer does not veto fusion.
-        delta = abs((peer_t - timestamp).total_seconds())
-        if delta > lag:
+        # Past-only: reject future peers (lookahead). Exact match when lag=0.
+        age = (timestamp - peer_t).total_seconds()
+        if age < -1e-9:
+            continue
+        if age > lag + 1e-9:
             continue
         try:
             data = [float(p[k]) for k in ('correlation', 'holdout_correlation',
@@ -64,7 +69,7 @@ def peer_features(state, bar_time, *, max_lag_seconds=90):
         except (ValueError, TypeError, KeyError):
             continue
         if all(math.isfinite(x) for x in data):
-            ready.append((p, data, delta))
+            ready.append((p, data, age))
     if not ready:
         return None
     # Prefer the tightest-aligned peers when several qualify.

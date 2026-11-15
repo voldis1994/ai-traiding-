@@ -134,6 +134,9 @@ def soft_nudge_scores(scores, advice, *, store=None):
     """Gently tilt softmax-ish scores toward adaptive advice — never a hard veto.
 
     Returns (new_scores, meta). If advice is None/weak, scores unchanged.
+
+    After tilt, scores are clipped to [0, 1] and renormalized to sum exactly 1
+    so ``autonomy._safe_scores`` (sum≈1) does not reject → false HOLD.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -157,9 +160,17 @@ def soft_nudge_scores(scores, advice, *, store=None):
         out['HOLD'] = out.get('HOLD', 0) + delta
         out['BUY'] = out.get('BUY', 0) - 0.35 * delta
         out['SELL'] = out.get('SELL', 0) - 0.35 * delta
+    # Clip negatives from dampening, then renormalize to a valid simplex.
+    for k in out:
+        out[k] = max(0.0, float(out[k]))
+    total = sum(out.values())
+    if total <= 1e-12:
+        return dict(scores), {'nudged': False, 'reason': 'degenerate_after_nudge'}
+    out = {k: v / total for k, v in out.items()}
     return out, {
         'nudged': True, 'delta': delta, 'target': target,
         'reason': advice.get('reason'), 'confidence': conf,
+        'renormalized': True, 'sum': sum(out.values()),
     }
 
 
@@ -176,23 +187,19 @@ def teach_after_loss(*, direction, cf_best, structure_prefer_hold=False,
     opposite = 'SELL' if direction == 'BUY' else 'BUY'
     adv = frame_advice if isinstance(frame_advice, dict) else {}
     advice = adv.get('advice')
-    buy_m = ((adv.get('buy') or {}).get('mean_pnl'))
-    sell_m = ((adv.get('sell') or {}).get('mean_pnl'))
 
     if advice == opposite:
         # Never bypass the spread/cost floor — structure EV is a hint, not a free flip.
+        # Without opp_val + opp_floor, do NOT flip on historical mean £ alone
+        # (missing spread/tick would teach SELL after BUY without cost proof).
         if opp_val is not None and opp_floor is not None:
             if float(opp_val) > float(opp_floor):
                 return opposite, 'loss_structure_edge_opposite'
             if cf_best in ('BUY', 'SELL', 'HOLD'):
                 return cf_best, 'loss_structure_edge_opp_below_floor'
             return 'HOLD', 'loss_structure_edge_opp_below_floor'
-        # No CF cost evidence: only flip if opposite mean £ is clearly positive.
-        opp_mean = sell_m if opposite == 'SELL' else buy_m
-        if opp_mean is not None and float(opp_mean) > 0:
-            return opposite, 'loss_structure_edge_opposite_ev'
         if cf_best in ('BUY', 'SELL', 'HOLD'):
-            return cf_best, 'loss_structure_edge_keeps_cf'
+            return cf_best, 'loss_structure_edge_keeps_cf_no_floor'
         return 'HOLD', 'loss_structure_edge_no_cf_floor'
     if advice == 'HOLD':
         return 'HOLD', 'loss_structure_edge_both_negative'

@@ -31,11 +31,11 @@ def test_nudge_does_not_compound_across_reeval():
         from app import structure_shadow as ss
         lib = ss.load_library(store)
         for side, pnl in (('BUY', 5.0), ('SELL', -4.0)):
-            key = ss.frame_key(epic='GOLD', structure='TREND', direction=side)
+            key = ss.frame_key(epic='GOLD', structure='TREND_UP', direction=side)
             lib.setdefault('buckets', {})[key] = {
                 'samples': 10, 'total_pnl': pnl, 'win_count': 7, 'loss_count': 3}
         store.set(ss.STORE_KEY, lib)
-        advice = se.compare_frame(store, epic='GOLD', structure='TREND')
+        advice = se.compare_frame(store, epic='GOLD', structure='TREND_UP')
         assert advice['advice'] == 'BUY'
         raw = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         # Simulate engine: first nudge from raw, second also from scores_raw.

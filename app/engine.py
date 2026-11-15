@@ -37,7 +37,10 @@ from .market_fusion import (
 )
 from .feature_registry import FeatureRegistry
 from .feature_discovery import FeatureDiscovery
-from .feature_validation import FeatureValidator
+from .feature_validation import (
+    FeatureValidator, recommended_live_history_bars, min_bars_for_train_oos_split,
+    BROKER_PRICE_HISTORY_MAX,
+)
 from .profit_learning import ProfitLearning
 from .model_validation import ModelValidator
 from . import hold_shadow
@@ -1878,6 +1881,87 @@ class SingleTradeEngine:
         tick=_num(inst.get('onePipMeans'))
         if tick and tick>0:return tick
         return None
+    def _historical_candle_count(self,epic):
+        row=self.store.db.execute(
+            "SELECT COUNT(*) FROM candles WHERE epic=? AND source='HISTORICAL'",
+            (epic,)).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def _oldest_historical_at(self,epic):
+        row=self.store.db.execute(
+            "SELECT at FROM candles WHERE epic=? AND source='HISTORICAL' "
+            "ORDER BY at ASC LIMIT 1",(epic,)).fetchone()
+        return row[0] if row else None
+
+    def _ingest_broker_price_rows(self,epic,prices):
+        """Persist completed broker M1 bars as HISTORICAL (never the forming bucket)."""
+        current_bucket=candle_bucket(now())
+        n=0
+        for p in prices or []:
+            def midprice(name,row=p):
+                item=row.get(name) or {};b=_num(item.get('bid'));a=_num(item.get('ask'))
+                return (a+b)/2 if a is not None and b is not None else None
+            at=candle_bucket(p.get('snapshotTimeUTC') or p.get('snapshotTime'))
+            if at is None or (current_bucket and at>=current_bucket):continue
+            close_item=p.get('closePrice') or {}
+            cb=_num(close_item.get('bid'));ca=_num(close_item.get('ask'))
+            bar_spread=(ca-cb) if ca is not None and cb is not None and ca>=cb else None
+            bar={'at':at,'open':midprice('openPrice'),'high':midprice('highPrice'),
+                 'low':midprice('lowPrice'),'close':midprice('closePrice'),
+                 'spread':bar_spread}
+            if bar['at'] and all(v is not None for k,v in bar.items() if k not in ('at','spread')):
+                self.store.candle(epic,bar,source='HISTORICAL');n+=1
+        return n
+
+    async def _bootstrap_historical_candles(self,epic,*,need=None):
+        """Pull broker history in one shot (page older if needed) — no live wait.
+
+        Capital.com returns up to 1000 M1 bars per request. We ask for the
+        robot-computed need immediately, then keep appending live closed bars.
+        """
+        if not epic or not hasattr(self.broker,'prices'):return 0
+        need=int(need if need is not None else recommended_live_history_bars(self.store))
+        need=max(1,min(need,BROKER_PRICE_HISTORY_MAX))
+        before=self._historical_candle_count(epic)
+        try:
+            source=await self.broker.prices(epic,resolution='MINUTE',maximum=need)
+            self._ingest_broker_price_rows(epic,source.get('prices'))
+        except Exception as exc:
+            self.store.event('warning','Candle bootstrap unsuccessful',
+                             {'type':type(exc).__name__,'epic':epic})
+            return 0
+        # Page older windows while still short (from/to), up to a few hops.
+        pages=0
+        while self._historical_candle_count(epic)<need and pages<4:
+            oldest=self._oldest_historical_at(epic)
+            if not oldest:break
+            try:
+                end=datetime.fromisoformat(str(oldest).replace('Z','+00:00'))
+            except ValueError:
+                break
+            if end.tzinfo is None:end=end.replace(tzinfo=timezone.utc)
+            to_dt=end-timedelta(minutes=1)
+            from_dt=to_dt-timedelta(minutes=need)
+            to_s=to_dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            from_s=from_dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            try:
+                older=await self.broker.prices(
+                    epic,resolution='MINUTE',maximum=need,
+                    from_time=from_s,to_time=to_s)
+                added=self._ingest_broker_price_rows(epic,older.get('prices'))
+            except Exception as exc:
+                self.store.event('warning','Candle history page unsuccessful',
+                                 {'type':type(exc).__name__,'epic':epic,'page':pages})
+                break
+            pages+=1
+            if added<=0:break
+        after=self._historical_candle_count(epic)
+        self.store.event('history',
+            'Historical M1 bootstrap from broker' if after>=need
+            else 'Historical M1 bootstrap partial — continuing with live bars',
+            {'epic':epic,'need':need,'have':after,'gained':after-before,'pages':pages+1})
+        return after
+
     async def _account_and_candles(self):
         if self.tick_count-self.last_account_tick>=10:
             self.last_account_tick=self.tick_count
@@ -1886,28 +1970,14 @@ class SingleTradeEngine:
                 # Once account currency is known, fix GOLD→USD cash mislabels.
                 self.repair_broker_pnl_currencies()
             except Exception as exc:self.store.event('warning','Account refresh unsuccessful',{'type':type(exc).__name__})
-        if self.tick_count-self.last_candle_tick>=20 and self.mandate:
-            self.last_candle_tick=self.tick_count
-            if not hasattr(self.broker,'prices'):return
-            try:
-                source=await self.broker.prices(self.mandate['epic'],resolution='MINUTE',maximum=180)
-                for p in source.get('prices',[]):
-                    def midprice(name):
-                        item=p.get(name) or {};b=_num(item.get('bid'));a=_num(item.get('ask'))
-                        return (a+b)/2 if a is not None and b is not None else None
-                    at=candle_bucket(p.get('snapshotTimeUTC') or p.get('snapshotTime'))
-                    current_bucket=candle_bucket(now())
-                    if at is None or at>=current_bucket:continue
-                    close_item=p.get('closePrice') or {}
-                    cb=_num(close_item.get('bid'));ca=_num(close_item.get('ask'))
-                    bar_spread=(ca-cb) if ca is not None and cb is not None and ca>=cb else None
-                    bar={'at':at,
-                         'open':midprice('openPrice'),'high':midprice('highPrice'),
-                         'low':midprice('lowPrice'),'close':midprice('closePrice'),
-                         'spread':bar_spread}
-                    if bar['at'] and all(v is not None for k,v in bar.items() if k not in ('at','spread')):
-                        self.store.candle(self.mandate['epic'],bar,source='HISTORICAL')
-            except Exception as exc:self.store.event('warning','Candle refresh unsuccessful',{'type':type(exc).__name__})
+        if not self.mandate or not hasattr(self.broker,'prices'):return
+        need=recommended_live_history_bars(self.store)
+        have=self._historical_candle_count(self.mandate['epic'])
+        # Eager: if history is thin, pull broker archive now — do not wait for M1 clock.
+        due=(self.tick_count-self.last_candle_tick>=20) or (have<need)
+        if not due:return
+        self.last_candle_tick=self.tick_count
+        await self._bootstrap_historical_candles(self.mandate['epic'],need=need)
     async def poll(self):
         async with self.lock:
             await self.sync()
@@ -1961,7 +2031,10 @@ class SingleTradeEngine:
             await self._account_and_candles()
             # Only BROKER-REPORTED complete MINUTE OHLC bars may feed the AI.
             # The forming quote candle is explicitly excluded by market_features.
-            candles=self.store.candles(self.mandate['epic'],n=190,historical_only=True)
+            # Window size is robot-computed from val_* — not a fixed 190/400.
+            hist_n=recommended_live_history_bars(self.store)
+            candles=self.store.candles(
+                self.mandate['epic'],n=hist_n,historical_only=True)
             self.feature_registry.load()
             if hasattr(self.brain,'apply_registry'):
                 try:
@@ -4526,7 +4599,9 @@ class SingleTradeEngine:
             return
         self._last_self_dev_bar=bar
         bars,spreads,times=self._bars_and_spreads_from_candles(candles)
-        if len(bars)<120:return
+        # Do not propose/validate until history can pass train/OOS thin-split.
+        need=min_bars_for_train_oos_split(self.store)
+        if len(bars)<need:return
         window=bars[-61:]
         # Discovery uses the latest known per-bar spread when present.
         last_sp=next((s for s in reversed(spreads) if s is not None),None)

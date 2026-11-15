@@ -28,19 +28,90 @@ from .feature_discovery import CANDIDATE_LIBRARY, compute_candidate, _build_libr
 STORE_KEY = 'feature_validation_log_v1'
 ATTEMPT_KEY = 'feature_validation_attempts_v1'
 
+# Feature series starts after this many completed bars (same window compute_candidate uses).
+FEATURE_SERIES_WARMUP = 60
+# Capital.com /prices max — broker hard cap, not an AI policy knob.
+BROKER_PRICE_HISTORY_MAX = 1000
+# confirm_feature_oos requires this many non-overlapping OOS round-trips.
+CONFIRM_MIN_OOS_TRADES = 10
+# Thin-split also keeps at least this many feature-points on the OOS side.
+MIN_OOS_FEATURE_POINTS = 15
+
 
 def _cfg(store=None):
     from .self_params import load
     return load(store)
 
 
+def _oos_frac(store=None, oos_frac=None):
+    cfg=_cfg(store)
+    frac=float(cfg['val_oos_frac'] if oos_frac is None else oos_frac)
+    if frac<0:return 0.
+    if frac>=1:return 0.99
+    return frac
+
+
+def train_end_floor(store=None):
+    """Minimum train feature-points before OOS confirm is allowed."""
+    cfg=_cfg(store)
+    return max(20, int(cfg['val_min_bars']) - FEATURE_SERIES_WARMUP)
+
+
+def _n_feat_for_gates(store=None, oos_frac=None):
+    """Smallest feature-series length that satisfies train + OOS confirm gates.
+
+    Derived only from the robot's self_params (val_min_bars, val_oos_frac,
+    val_horizon_bars) — no human-chosen LIVE window size.
+    """
+    cfg=_cfg(store)
+    frac=_oos_frac(store,oos_frac)
+    train_frac=1.0-frac
+    floor=train_end_floor(store)
+    horizon=max(1,int(cfg['val_horizon_bars']))
+    # Non-overlapping OOS trades need roughly trades×horizon feature steps.
+    oos_points=max(MIN_OOS_FEATURE_POINTS, CONFIRM_MIN_OOS_TRADES*horizon)
+    n_feat=0
+    while True:
+        n_feat+=1
+        train_end=int(n_feat*train_frac)
+        oos_len=n_feat-train_end
+        if train_end>=floor and oos_len>=oos_points:
+            return n_feat
+        if n_feat>BROKER_PRICE_HISTORY_MAX*2:
+            return n_feat
+
+
+def min_bars_for_train_oos_split(store=None, oos_frac=None):
+    """Smallest completed-bar count that can pass train/OOS validation gates.
+
+    Feature values exist only after FEATURE_SERIES_WARMUP bars. With defaults
+    (oos=0.7, min_bars=120, horizon=8) this is computed — not hard-coded —
+    and exceeds the legacy 190 LIVE poll, which could never approve a feature.
+    """
+    cfg=_cfg(store)
+    need_bars=FEATURE_SERIES_WARMUP+_n_feat_for_gates(store,oos_frac=oos_frac)
+    return max(int(cfg['val_min_bars']), need_bars)
+
+
+def recommended_live_history_bars(store=None):
+    """Bars the robot should fetch/read — computed from its own val_* knobs.
+
+    Only external clamp is BROKER_PRICE_HISTORY_MAX (Capital.com). When the
+    operator/self_params change val_oos_frac / val_min_bars / val_horizon_bars,
+    this number moves with them.
+    """
+    need=min_bars_for_train_oos_split(store)
+    return int(min(BROKER_PRICE_HISTORY_MAX, need))
+
+
 def _series_for_feature(feature_id, bars, spreads, times):
     _build_library()
     if feature_id not in CANDIDATE_LIBRARY:return None
     values=[]
-    for i in range(60,len(bars)):
-        use=bars[max(0,i+1-61):i+1]
-        if len(use)<61:values.append(np.nan);continue
+    warm=FEATURE_SERIES_WARMUP
+    for i in range(warm,len(bars)):
+        use=bars[max(0,i+1-(warm+1)):i+1]
+        if len(use)<warm+1:values.append(np.nan);continue
         sp=spreads[i]
         if sp is None or not math.isfinite(float(sp)):
             values.append(np.nan);continue
@@ -99,7 +170,7 @@ def net_pnl_curve(feature_values, closes, spreads, *, start, end, horizon=8,
     end=int(end)
     horizon=max(1,int(horizon))
     while local<end:
-        bar_i=60+local
+        bar_i=FEATURE_SERIES_WARMUP+local
         if bar_i+horizon>=len(closes):break
         x=feature_values[local]
         if not math.isfinite(float(x)) or float(x)==0:
@@ -128,7 +199,7 @@ def walk_forward_net_pnl(feature_values, closes, spreads, *, folds=None, store=N
     start=max(0,int(start))
     end=n if end is None else max(start,min(n,int(end)))
     span=end-start
-    if span<min_bars-60 or folds<2:return None
+    if span<min_bars-FEATURE_SERIES_WARMUP or folds<2:return None
     fold_nets=[];boundaries=np.linspace(start,end,folds+1,dtype=int)
     for f in range(folds):
         a,b=int(boundaries[f]),int(boundaries[f+1])
@@ -199,7 +270,7 @@ def confirm_feature_oos(feature_values, closes, spreads, *, train_end, end,
     horizon=int(cfg['val_horizon_bars'])
     oos=net_pnl_curve(feature_values,closes,spreads,start=train_end,end=end,
                       horizon=horizon)
-    if oos is None or oos['n']<10:
+    if oos is None or oos['n']<CONFIRM_MIN_OOS_TRADES:
         return {'confirmed':False,'reason':'OOS too thin for net PnL','oos':oos}
     if oos['net']<=float(cfg['val_min_net_pnl']):
         return {'confirmed':False,
@@ -222,6 +293,7 @@ def validate_feature(feature_id, bars, *, spreads=None, times=None,
     min_bars=int(cfg['val_min_bars'])
     if not bars or len(bars)<min_bars:
         return {'approved':False,'reason':f'need ≥{min_bars} completed bars'}
+    need_bars=min_bars_for_train_oos_split(store)
     spreads_n,err=_normalize_spreads(spreads,len(bars),store=store)
     if spreads_n is None:
         return {'approved':False,'reason':err}
@@ -253,9 +325,11 @@ def validate_feature(feature_id, bars, *, spreads=None, times=None,
                                 'corr':c,'peer':nm}
     n=len(feat)
     train_end,end,oos_frac=train_oos_bounds(n,store=store)
-    if train_end<max(20,int(cfg['val_min_bars'])-60) or end-train_end<15:
+    floor=train_end_floor(store)
+    if train_end<floor or end-train_end<MIN_OOS_FEATURE_POINTS:
         return {'approved':False,'reason':'train/OOS chronological split too thin',
-                'train_end':train_end,'n':n,'oos_frac':oos_frac}
+                'train_end':train_end,'n':n,'oos_frac':oos_frac,
+                'need_bars':need_bars,'train_end_floor':floor}
     # Phase 1: select on train only.
     selection=select_feature_candidate(feature_id,feat,closes,spreads_n,
                                        train_end=train_end,store=store)

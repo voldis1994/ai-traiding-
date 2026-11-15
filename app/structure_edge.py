@@ -134,6 +134,9 @@ def soft_nudge_scores(scores, advice, *, store=None):
     """Gently tilt softmax-ish scores toward adaptive advice — never a hard veto.
 
     Returns (new_scores, meta). If advice is None/weak, scores unchanged.
+
+    After tilt, scores are clipped to [0, 1] and renormalized to sum exactly 1
+    so ``autonomy._safe_scores`` (sum≈1) does not reject → false HOLD.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -157,9 +160,17 @@ def soft_nudge_scores(scores, advice, *, store=None):
         out['HOLD'] = out.get('HOLD', 0) + delta
         out['BUY'] = out.get('BUY', 0) - 0.35 * delta
         out['SELL'] = out.get('SELL', 0) - 0.35 * delta
+    # Clip negatives from dampening, then renormalize to a valid simplex.
+    for k in out:
+        out[k] = max(0.0, float(out[k]))
+    total = sum(out.values())
+    if total <= 1e-12:
+        return dict(scores), {'nudged': False, 'reason': 'degenerate_after_nudge'}
+    out = {k: v / total for k, v in out.items()}
     return out, {
         'nudged': True, 'delta': delta, 'target': target,
         'reason': advice.get('reason'), 'confidence': conf,
+        'renormalized': True, 'sum': sum(out.values()),
     }
 
 
@@ -172,49 +183,56 @@ def teach_after_loss(*, direction, cf_best, structure_prefer_hold=False,
       2) If structure EV says both ≤0 → HOLD
       3) Else keep counterfactual choice (cf_best), even when old
          ``structure_prefer_hold`` would have forced HOLD
+
+    Invariant: never return the opposite side unless both ``opp_val`` and
+    ``opp_floor`` are known and ``opp_val > opp_floor``. Keeping ``cf_best``
+    when it already *is* opposite without a cost floor is also forbidden.
     """
     opposite = 'SELL' if direction == 'BUY' else 'BUY'
     adv = frame_advice if isinstance(frame_advice, dict) else {}
     advice = adv.get('advice')
-    buy_m = ((adv.get('buy') or {}).get('mean_pnl'))
-    sell_m = ((adv.get('sell') or {}).get('mean_pnl'))
+    floor_ok = (
+        opp_val is not None and opp_floor is not None
+        and float(opp_val) > float(opp_floor)
+    )
+
+    def _keep_cf(reason_cf, reason_block_opp):
+        """Keep cf_best, but never opposite without verified cost floor."""
+        if cf_best == opposite:
+            if floor_ok:
+                return opposite, reason_cf
+            return 'HOLD', reason_block_opp
+        if cf_best in ('BUY', 'SELL', 'HOLD'):
+            return cf_best, reason_cf
+        return 'HOLD', reason_block_opp
 
     if advice == opposite:
-        # Never bypass the spread/cost floor — structure EV is a hint, not a free flip.
+        if floor_ok:
+            return opposite, 'loss_structure_edge_opposite'
         if opp_val is not None and opp_floor is not None:
-            if float(opp_val) > float(opp_floor):
-                return opposite, 'loss_structure_edge_opposite'
-            if cf_best in ('BUY', 'SELL', 'HOLD'):
-                return cf_best, 'loss_structure_edge_opp_below_floor'
-            return 'HOLD', 'loss_structure_edge_opp_below_floor'
-        # No CF cost evidence: only flip if opposite mean £ is clearly positive.
-        opp_mean = sell_m if opposite == 'SELL' else buy_m
-        if opp_mean is not None and float(opp_mean) > 0:
-            return opposite, 'loss_structure_edge_opposite_ev'
-        if cf_best in ('BUY', 'SELL', 'HOLD'):
-            return cf_best, 'loss_structure_edge_keeps_cf'
-        return 'HOLD', 'loss_structure_edge_no_cf_floor'
+            return _keep_cf(
+                'loss_structure_edge_opp_below_floor',
+                'loss_structure_edge_opp_below_floor')
+        # Missing floor: refuse opposite even when cf_best already is opposite.
+        return _keep_cf(
+            'loss_structure_edge_keeps_cf_no_floor',
+            'loss_structure_edge_no_cf_floor')
     if advice == 'HOLD':
         return 'HOLD', 'loss_structure_edge_both_negative'
     # Structure says this layout pays the taken side? Unusual on a loss — keep CF.
     if advice == direction:
-        if cf_best in ('BUY', 'SELL', 'HOLD'):
-            return cf_best, 'loss_structure_edge_keeps_cf'
-        return 'HOLD', 'loss_structure_edge_same_side_hold'
+        return _keep_cf(
+            'loss_structure_edge_keeps_cf',
+            'loss_structure_edge_same_side_hold')
 
     # No clear frame advice. Old prefer_hold meant “this side is a grave”.
     # Re-interpret: if opposite CF clears floor → opposite; else HOLD.
-    # Never force HOLD solely because prefer_hold when opposite CF is strong.
+    # Never invent floor=0 when opp_floor is missing.
     if structure_prefer_hold:
-        floor = opp_floor
-        if floor is None:
-            floor = 0.0
-        if opp_val is not None and float(opp_val) > float(floor):
+        if floor_ok:
             return opposite, 'loss_structure_grave_try_opposite'
         return 'HOLD', 'loss_structure_grave_hold'
-    if cf_best in ('BUY', 'SELL', 'HOLD'):
-        return cf_best, 'loss_cf_unchanged'
-    return 'HOLD', 'loss_default_hold'
+    return _keep_cf('loss_cf_unchanged', 'loss_default_hold')
 
 
 def trail_arm_decision(store, *, epic, structure, direction, mfe=None,

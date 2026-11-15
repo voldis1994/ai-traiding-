@@ -14,7 +14,7 @@ def _store(tmp):
     return Store(Path(tmp) / 't.sqlite3')
 
 
-def _seed_side(store, *, epic='GOLD', structure='TREND', direction='BUY',
+def _seed_side(store, *, epic='GOLD', structure='TREND_UP', direction='BUY',
                samples=8, total_pnl=4.0, wins=6, losses=2):
     lib = ss.load_library(store)
     key = ss.frame_key(epic=epic, structure=structure, direction=direction)
@@ -30,9 +30,9 @@ def _seed_side(store, *, epic='GOLD', structure='TREND', direction='BUY',
 def test_compare_frame_prefers_positive_side_not_auto_hold():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        _seed_side(s, direction='BUY', total_pnl=5.0, samples=10)
-        _seed_side(s, direction='SELL', total_pnl=-3.0, samples=10)
-        out = se.compare_frame(s, epic='GOLD', structure='TREND')
+        _seed_side(s, structure='TREND_UP', direction='BUY', total_pnl=5.0, samples=10)
+        _seed_side(s, structure='TREND_UP', direction='SELL', total_pnl=-3.0, samples=10)
+        out = se.compare_frame(s, epic='GOLD', structure='TREND_UP')
         assert out['advice'] == 'BUY'
         assert out['confidence'] > 0.4
         assert '−EV' in out['reason'] or '-EV' in out['reason'] or 'BUY' in out['reason']
@@ -41,9 +41,9 @@ def test_compare_frame_prefers_positive_side_not_auto_hold():
 def test_compare_frame_hold_only_when_both_sides_negative():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        _seed_side(s, direction='BUY', total_pnl=-4.0, samples=8)
-        _seed_side(s, direction='SELL', total_pnl=-2.0, samples=8)
-        out = se.compare_frame(s, epic='GOLD', structure='BREAKOUT')
+        _seed_side(s, structure='BREAKOUT_UP', direction='BUY', total_pnl=-4.0, samples=8)
+        _seed_side(s, structure='BREAKOUT_UP', direction='SELL', total_pnl=-2.0, samples=8)
+        out = se.compare_frame(s, epic='GOLD', structure='BREAKOUT_UP')
         assert out['advice'] == 'HOLD'
 
 
@@ -61,6 +61,22 @@ def test_soft_nudge_tilts_scores_without_veto():
         assert nudged['BUY'] < scores['BUY']
         # Still a soft tilt — no action flip forced here.
         assert set(nudged) == {'BUY', 'SELL', 'HOLD'}
+        # Critical: renormalize so autonomy._safe_scores does not reject → HOLD.
+        assert abs(sum(nudged.values()) - 1.0) < 1e-9
+        assert all(0 <= nudged[k] <= 1 for k in nudged)
+        assert meta.get('renormalized') is True
+
+
+def test_soft_nudge_keeps_safe_scores_for_autonomy():
+    """Regression: raw tilt sum>1 used to force neural HOLD via _safe_scores."""
+    from app.autonomy import AutoEvolution
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        advice = {'advice': 'SELL', 'confidence': 0.8, 'reason': 'test'}
+        scores = {'BUY': 0.45, 'SELL': 0.40, 'HOLD': 0.15}
+        nudged, meta = se.soft_nudge_scores(scores, advice, store=s)
+        assert meta['nudged']
+        assert AutoEvolution._safe_scores(nudged)
 
 
 def test_teach_after_loss_prefers_opposite_when_edge_says_so():
@@ -83,6 +99,29 @@ def test_teach_after_loss_respects_spread_floor():
     assert 'below_floor' in mode
 
 
+def test_teach_after_loss_no_flip_without_cost_floor():
+    """Missing opp_val/opp_floor must not flip on historical mean £ alone."""
+    taught, mode = se.teach_after_loss(
+        direction='BUY', cf_best='HOLD',
+        frame_advice={'advice': 'SELL', 'buy': {'mean_pnl': -1.0},
+                      'sell': {'mean_pnl': 2.0}},
+        opp_val=None, opp_floor=None)
+    assert taught == 'HOLD'
+    assert 'no_floor' in mode
+
+
+def test_teach_after_loss_cf_best_opposite_blocked_without_floor():
+    """cf_best='SELL' after BUY loss must not teach SELL when opp_floor unknown."""
+    taught, mode = se.teach_after_loss(
+        direction='BUY', cf_best='SELL',
+        frame_advice={'advice': 'SELL', 'buy': {'mean_pnl': -1.0},
+                      'sell': {'mean_pnl': 2.0}},
+        opp_val=None, opp_floor=None)
+    assert taught == 'HOLD'
+    assert taught != 'SELL'
+    assert 'no_floor' in mode or 'no_cf_floor' in mode
+
+
 def test_teach_after_loss_grave_tries_opposite_when_cf_clears():
     taught, mode = se.teach_after_loss(
         direction='BUY', cf_best='HOLD', structure_prefer_hold=True,
@@ -95,9 +134,9 @@ def test_teach_after_loss_grave_tries_opposite_when_cf_clears():
 def test_label_from_profit_uses_structure_frame_advice():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        _seed_side(s, direction='SELL', total_pnl=6.0, samples=10)
-        _seed_side(s, direction='BUY', total_pnl=-5.0, samples=10)
-        advice = se.compare_frame(s, epic='GOLD', structure='TREND')
+        _seed_side(s, structure='TREND_UP', direction='SELL', total_pnl=6.0, samples=10)
+        _seed_side(s, structure='TREND_UP', direction='BUY', total_pnl=-5.0, samples=10)
+        advice = se.compare_frame(s, epic='GOLD', structure='TREND_UP')
         assert advice['advice'] == 'SELL'
         # BUY loss; path must show opposite SELL clearing the spread floor so
         # structure advice may teach SELL (never bypass cost floor).
@@ -119,7 +158,7 @@ def test_trail_arm_on_mfe_fraction():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         arm = se.trail_arm_decision(
-            s, epic='GOLD', structure='TREND', direction='BUY',
+            s, epic='GOLD', structure='TREND_UP', direction='BUY',
             mfe=0.5, original_risk=0.8, be_locked=False)
         assert arm['arm'] is True
         assert 'mfe' in arm['reason']

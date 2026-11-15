@@ -3112,8 +3112,9 @@ class SingleTradeEngine:
                     self.store.event('warning','Fuzzy pending P&L failed',
                                      {'deal_id':deal,'type':type(exc).__name__})
             # Exhausted history: bind last live UPL for Admin display ONLY —
-            # never teach from UPL (≠ realized £ → wrong labels / settle).
-            if not found and attempts>=6:
+            # never teach from UPL. Keep the deal in pending so a later real
+            # broker cash row can overwrite the estimate (do not drop forever).
+            if not found and attempts>=6 and not base.get('upl_shown'):
                 snap=self.store.get('last_upl:'+deal) or {}
                 upl=_num(snap.get('upl'))
                 if upl is not None and math.isfinite(upl):
@@ -3122,9 +3123,11 @@ class SingleTradeEngine:
                         deal,exit_level,float(upl),currency=ccy_upl,
                         source='upl_estimate',overwrite=True)
                     self.store.event('trade',
-                        'Pending cash shown from last UPL (no neural teach)',
+                        'Pending cash shown from last UPL; still waiting for broker',
                         {'deal_id':deal,'upl':float(upl),'attempts':attempts})
-                    self.store.set('last_upl:'+deal,None)
+                    nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                    nxt['upl_shown']=True
+                    remaining.append(nxt)
                     continue
             if not found:
                 nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
@@ -3133,6 +3136,7 @@ class SingleTradeEngine:
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
             already=self._trade_already_learned(deal)
+            # Real broker cash always overwrites a prior upl_estimate display.
             self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
             if already:
                 self.store.event('trade','Late broker P&L refined record without re-learning',

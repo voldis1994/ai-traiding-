@@ -60,6 +60,9 @@ def test_fused_input_has_crossmarket_and_news_with_no_future_candle(tmp_path):
     # Missing peer bar is NOT converted into fake neutral data.
     stale=market_state(bar=BASE-timedelta(minutes=1))
     assert peer_features(stale,BASE.isoformat()) is None
+    # Future peer bars must never pass (lookahead) — even with a lag window.
+    future=market_state(bar=BASE+timedelta(minutes=1))
+    assert peer_features(future,BASE.isoformat(),max_lag_seconds=120) is None
     assert peer_features({'status':'UNAVAILABLE','peers':[]},BASE.isoformat()) is None
     assert fusion_features({'ready':True,'bar_time':BASE.isoformat(),
         'features':[0.]*FEATURE_DIM},stale,'EURUSD',file,['EUR','USD'],now=BASE,

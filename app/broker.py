@@ -46,8 +46,12 @@ class CapitalBroker:
     async def market(self,epic):return await self._request('GET','/api/v1/markets/'+quote(epic,safe=''))
     async def search_markets(self,search_term):
         return await self._request('GET','/api/v1/markets',params={'searchTerm':search_term})
-    async def prices(self,epic,resolution='MINUTE',maximum=80):
-        return await self._request('GET','/api/v1/prices/'+quote(epic,safe=''),params={'resolution':resolution,'max':maximum})
+    async def prices(self,epic,resolution='MINUTE',maximum=80,from_time=None,to_time=None):
+        """Historical OHLC. ``max`` ≤ 1000. Optional ``from``/``to`` page older bars."""
+        params={'resolution':resolution,'max':int(maximum)}
+        if from_time:params['from']=str(from_time)
+        if to_time:params['to']=str(to_time)
+        return await self._request('GET','/api/v1/prices/'+quote(epic,safe=''),params=params)
     async def confirm(self,deal_reference):
         return await self._request('GET','/api/v1/confirms/'+quote(deal_reference,safe=''))
     async def transactions(self,*,last_period=600,from_time=None,to_time=None,tx_type='TRADE'):

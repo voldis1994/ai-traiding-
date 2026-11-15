@@ -52,12 +52,36 @@ def test_current_green_candle_cannot_reverse_broad_downtrend():
 def test_short_gap_old_history_and_bad_price_rejected():
     history=bars(91,start=BASE-timedelta(minutes=90))
     assert not market_features(history[:30],now_utc=BASE+timedelta(minutes=1))['ready']
+    # Single missing M1 is carry-filled (Capital/ingest blip) — context stays ready.
     gapped=[x for x in history if x['at']!=(BASE-timedelta(minutes=2)).isoformat()]
-    assert not market_features(gapped,now_utc=BASE+timedelta(minutes=1))['ready']
+    filled=market_features(gapped,now_utc=BASE+timedelta(minutes=1),spread=.03)
+    assert filled['ready']
+    # Three consecutive missing minutes still fail-closed.
+    hole={ (BASE-timedelta(minutes=i)).isoformat() for i in (2,3,4) }
+    big_gap=[x for x in history if x['at'] not in hole]
+    assert not market_features(big_gap,now_utc=BASE+timedelta(minutes=1),spread=.03)['ready']
     assert 'stale' in market_features(history,now_utc=BASE+timedelta(hours=2))['reason'].lower()
     broken=history.copy();broken[-1]=dict(broken[-1],close=-5)
     assert not market_features(broken,now_utc=BASE+timedelta(minutes=1))['ready']
     assert candle_bucket('2026-10-13T17:00:10Z')==BASE.isoformat()
+
+
+def test_closed_quote_minutes_count_toward_context():
+    """LIVE poll stores forming bars as QUOTE; after the minute closes they must
+    still feed market_features (historical_only=False path)."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        history=bars(70,start=BASE-timedelta(minutes=69))
+        for i,bar in enumerate(history):
+            src='HISTORICAL' if i%3 else 'QUOTE'
+            store.candle('GOLD',bar,source=src)
+        rows=store.candles('GOLD',n=80,historical_only=False)
+        snap=market_features(rows,now_utc=BASE+timedelta(minutes=1),spread=.03,epic='GOLD')
+        assert snap['ready'], snap.get('reason')
+        only_hist=store.candles('GOLD',n=80,historical_only=True)
+        # Pure HISTORICAL subset is gappier — may fail; that is why LIVE must not
+        # filter QUOTE closed minutes out.
+        assert len(only_hist)<len(rows)
 
 
 def test_different_price_units_same_return_vector():
@@ -132,14 +156,26 @@ def test_market_context_for_real_broker_candles_and_minute_learning(monkeypatch)
             s=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
             e=SingleTradeEngine(s,brain);e.policy=AutoEvolution(s,Path(d)/'policy.py')
             broker=HistoricalBroker();e.attach(broker)
+            # Adopt mandate from the simulated open, then flatten — hard-freeze
+            # skips entry tick while a LIVE deal is open.
+            await e.sync()
+            broker.open=[]
+            await e.sync()
+            # Learn M1 ticks without auto-OPEN (hard-freeze would stop further ticks).
+            e.operator_paused=True
+            e.execution_enabled=False
+            e.last_candle_tick=-20
             await e.poll()
-            assert e.market_context['ready'] and brain.core.steps==1
+            assert e.market_context['ready'], e.market_context.get('reason')
+            assert brain.core.steps==1
             assert e.last_signal and brain.core.d==FEATURE_DIM
             await e.poll()
             assert brain.core.steps==1  # same completed candle cannot generate repeated learning
             for step in range(1,10):
                 clock[0]=BASE+timedelta(minutes=1+step)
                 e.last_candle_tick=-20  # request new minute history in deterministic test
+                e.operator_paused=True
+                e.execution_enabled=False
                 await e.poll()
             assert brain.core.steps==10
             assert brain.labeled==9  # HORIZON=1: ten M1 steps → nine next-bar labels

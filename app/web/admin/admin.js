@@ -59,11 +59,18 @@ function renderCard(c){
   const cid=String(c.id);
   let sc=c.scores||{};
   if(a.position){
-    if(!frozenScoresByClient.has(cid) && (sc.BUY||sc.HOLD||sc.SELL)){
+    const hasLive=!!(Number(sc.BUY)||Number(sc.HOLD)||Number(sc.SELL));
+    const fr0=frozenScoresByClient.get(cid);
+    const frEmpty=!fr0||!(Number(fr0.BUY)||Number(fr0.HOLD)||Number(fr0.SELL));
+    // Seed / upgrade freeze once non-zero scores arrive (adopt/restart often
+    // starts at 0% until first manage vote — do not stay stuck forever).
+    if(hasLive && (!frozenScoresByClient.has(cid) || frEmpty)){
       frozenScoresByClient.set(cid,{BUY:sc.BUY,HOLD:sc.HOLD,SELL:sc.SELL,action:c.action});
     }
     const fr=frozenScoresByClient.get(cid);
-    if(fr){sc=fr;c={...c,action:fr.action||c.action};}
+    if(fr && (Number(fr.BUY)||Number(fr.HOLD)||Number(fr.SELL))){
+      sc=fr;c={...c,action:fr.action||c.action};
+    }
   }else{
     frozenScoresByClient.delete(cid);
   }

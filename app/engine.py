@@ -3254,8 +3254,8 @@ class SingleTradeEngine:
             exit_level=base.get('exit_level')
             # Pass queued_at so history lookback is not stuck on last 30 minutes.
             found=await self._pnl_from_broker_history(deal,queued_at=queued)
-            # After a few misses, try epic/size single-row fuzzy (not on force-close path).
-            if not found and attempts>=2:
+            # Fuzzy epic/size match early — Capital often uses short tx references.
+            if not found and attempts>=1:
                 try:
                     found=await self._pnl_fuzzy_instrument_cash(deal,queued_at=queued)
                 except Exception as exc:
@@ -3264,7 +3264,8 @@ class SingleTradeEngine:
             # Exhausted history: bind last live UPL for Admin display ONLY —
             # never teach from UPL. Keep the deal in pending so a later real
             # broker cash row can overwrite the estimate (do not drop forever).
-            if not found and attempts>=6 and not base.get('upl_shown'):
+            # Faster UPL display (attempt≥3) so Admin is not stuck at £0 for hours.
+            if not found and attempts>=3 and not base.get('upl_shown'):
                 snap=self.store.get('last_upl:'+deal) or {}
                 upl=_num(snap.get('upl'))
                 if upl is not None and math.isfinite(upl):
@@ -3805,6 +3806,13 @@ class SingleTradeEngine:
                 neuron_ids=transition.get('neuron_ids'))
         self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                source=pnl_source,overwrite=overwrite)
+        # ticks_only / missing cash must still hunt Capital history — else Admin
+        # shows 13 closes with £0 forever while Capital already paid.
+        if pnl_source!='broker' or pnl_value is None:
+            self._queue_pending_pnl(deal_id,exit_level=exit_level)
+            if pnl_source in ('ticks_only',None,''):
+                self.store.close_trade(deal_id,exit_level,source='pending_broker_pnl',
+                                       overwrite=True)
         self.store.set('last_trade_outcome',{
             'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
             'pnl':pnl_value,'mode':mode})

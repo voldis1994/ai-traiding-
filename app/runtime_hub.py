@@ -148,12 +148,15 @@ class RuntimeHub:
 
     @staticmethod
     def _cash_pnl_source(src) -> str:
-        """Classify journal source: cash | pending | proxy."""
+        """Classify journal source: cash | pending | estimate | proxy."""
         s=(src or '').strip().lower()
         if s in ('ticks_only','price_size','position_disappeared'):
             return 'proxy'
         if s in ('pending_close_sync','pending_broker_pnl'):
             return 'pending'
+        # Last UPL shown while waiting for Capital cash — display only, not broker £.
+        if s in ('upl_estimate',):
+            return 'estimate'
         # Explicit broker, or legacy blank source with a settled pnl figure.
         if s in ('broker','') or not s:
             return 'cash'
@@ -180,9 +183,18 @@ class RuntimeHub:
         signed=[]
         recent=[]
         cash_n=0
+        pending_n=0
+        proxy_n=0
+        estimate_n=0
+        estimate_sum=0.0
+        blank_n=0
         for t in closed_rows:
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
+                proxy_n+=1
+                if len(recent)<12:
+                    recent.append({**t,'pnl_currency':(
+                        (t.get('pnl_currency') or '').strip().upper() or acct or '?')})
                 continue
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
             val=None
@@ -202,7 +214,18 @@ class RuntimeHub:
                     signed.append(val)
                 if len(recent)<12:
                     recent.append(row)
-            elif kind=='pending' or (val is not None and kind=='other'):
+            elif kind=='pending':
+                pending_n+=1
+                if val is None:blank_n+=1
+                if len(recent)<12:
+                    recent.append(row)
+            elif kind=='estimate' and val is not None:
+                estimate_n+=1
+                estimate_sum+=float(val)
+                if len(recent)<12:
+                    recent.append(row)
+            elif kind=='other' or (kind=='cash' and val is None):
+                if kind=='cash' and val is None:blank_n+=1
                 if len(recent)<12:
                     recent.append(row)
         wins=sum(1 for p in signed if p>0)
@@ -215,6 +238,16 @@ class RuntimeHub:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
         realized=primary['realized_pnl'] if primary else 0.0
+        closed_n=len(closed_rows)
+        # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
+        if closed_n>0 and cash_n==0:
+            pnl_status='closed_without_broker_cash'
+        elif pending_n>0 or blank_n>0:
+            pnl_status='broker_cash_pending'
+        elif cash_n>0:
+            pnl_status='broker_cash_ok'
+        else:
+            pnl_status='no_closes'
         upl=None
         if open_upl is not None:
             try:
@@ -225,9 +258,15 @@ class RuntimeHub:
                 upl=None
         equity=round(realized+(upl or 0.0),4) if upl is not None else realized
         return {
-            'closed_trades':len(closed_rows),
+            'closed_trades':closed_n,
             'open_trades_recorded':open_n,
             'cash_trades':cash_n,
+            'pending_cash_trades':pending_n,
+            'proxy_trades':proxy_n,
+            'estimate_trades':estimate_n,
+            'estimate_pnl':round(estimate_sum,4) if estimate_n else None,
+            'blank_pnl_trades':blank_n,
+            'pnl_status':pnl_status,
             'realized_pnl':realized,
             'open_upl':upl,
             'equity_pnl':equity,
@@ -419,6 +458,10 @@ class RuntimeHub:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]
         running=sum(1 for c in clients if c.get('robot_running'))
         total_closed=sum(int((c.get('results') or {}).get('closed_trades') or 0) for c in clients)
+        total_cash=sum(int((c.get('results') or {}).get('cash_trades') or 0) for c in clients)
+        total_pending=sum(int((c.get('results') or {}).get('pending_cash_trades') or 0)
+                          for c in clients)
+        total_proxy=sum(int((c.get('results') or {}).get('proxy_trades') or 0) for c in clients)
         # Never add GBP + USD into one number.
         by_ccy: dict[str,float]={}
         for c in clients:
@@ -432,14 +475,27 @@ class RuntimeHub:
         if len(by_ccy)==1:
             ccy,val=next(iter(by_ccy.items()))
             primary={'currency':ccy,'realized_pnl':val}
+        if total_closed>0 and total_cash==0:
+            pnl_status='closed_without_broker_cash'
+        elif total_pending>0:
+            pnl_status='broker_cash_pending'
+        elif total_cash>0:
+            pnl_status='broker_cash_ok'
+        else:
+            pnl_status='no_closes'
         return {
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
-                'realized_pnl_all':primary['realized_pnl'] if primary else None,
+                'realized_pnl_all':primary['realized_pnl'] if primary else (
+                    0.0 if total_closed else None),
                 'pnl_currency':primary['currency'] if primary else None,
                 'pnl_by_currency':by_ccy,
                 'closed_trades_all':total_closed,
+                'cash_trades_all':total_cash,
+                'pending_cash_trades_all':total_pending,
+                'proxy_trades_all':total_proxy,
+                'pnl_status':pnl_status,
             },
             'clients':clients,
         }

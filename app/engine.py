@@ -3122,12 +3122,27 @@ class SingleTradeEngine:
     @staticmethod
     def _row_cash_pnl(row,details=None):
         details=details if isinstance(details,dict) else {}
-        for key in ('profit','pnl','guaranteedStopProfit','realizedPnl','cash'):
+        # Capital TRADE rows expose pnl/cash as strings; activity uses details.profit.
+        for key in ('profit','pnl','profitAndLoss','profitLoss','pl',
+                    'guaranteedStopProfit','realizedPnl','cash'):
             val=_num(details.get(key))
             if val is None:val=_num(row.get(key))
             if val is not None and math.isfinite(val):
                 return float(val)
         return None
+
+    @staticmethod
+    def _parse_broker_ts(raw):
+        if raw in (None,''):
+            return None
+        try:
+            text=str(raw).replace('Z','+00:00')
+            dt=datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt=dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).timestamp()
+        except Exception:
+            return None
 
     def _transaction_matches_deal(self,row,deal,*,exact=False):
         """Capital tx.reference is often a short id, not the UUID dealId."""
@@ -3175,12 +3190,18 @@ class SingleTradeEngine:
                     payload=await self.broker.activity(
                         detailed=True,deal_id=deal,last_period=86400)
                     rows=list(payload.get('activities') or [])
+                # Still empty: Capital sometimes ignores dealId filter — scan window.
+                if not rows:
+                    wide=dict(detailed=True,last_period=86400)
+                    payload=await self.broker.activity(**wide)
+                    rows=list(payload.get('activities') or [])
                 for row in rows:
                     if not self._activity_matches_deal(row,deal,exact=exact_deal):continue
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
                     val=self._row_cash_pnl(row,details)
                     if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
+                        return float(val),self._cash_currency(
+                            row.get('currency') or details.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
@@ -3206,6 +3227,26 @@ class SingleTradeEngine:
                 self.store.event('warning','Transaction history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
         return None
+
+    def _requeue_unsettled_cash_closes(self):
+        """Pull journal rows stuck on upl_estimate/pending back into the harvest queue."""
+        try:
+            rows=self.store.db.execute(
+                "SELECT deal_id,exit,opened,closed,pnl_source FROM trades "
+                "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
+                "('pending_broker_pnl','pending_close_sync','upl_estimate',"
+                "'ticks_only','price_size','position_disappeared')) "
+                "ORDER BY closed DESC LIMIT 80").fetchall()
+        except Exception:
+            return 0
+        n=0
+        for deal_id,exit_lvl,_opened,_closed,src in rows:
+            deal=str(deal_id)
+            if self.store.get('broker_cash_banked:'+deal):
+                continue
+            self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
+            n+=1
+        return n
 
     @staticmethod
     def _tx_fingerprint(tx):
@@ -3242,21 +3283,24 @@ class SingleTradeEngine:
             self.store.set('fuzzy_pnl_tx_for:'+str(deal_id),fp)
 
     async def _pnl_fuzzy_instrument_cash(self,deal_id,*,queued_at=None):
-        """When dealId refs miss, bind the single unused closing TRADE for epic/size.
+        """When dealId refs miss, bind one unused closing TRADE for this deal.
 
-        Never reuses a TRADE already bound to another deal. Never banks £0 open
-        fills (those poison broker_cash_banked and freeze day_book).
+        Capital often omits instrumentName and uses signed size. With many GOLD
+        closes, ``len(hits)==1`` never fires — pick the closest unused TRADE by
+        close time / openLevel instead of staying on upl_estimate forever.
         """
         if not self.broker or not hasattr(self.broker,'transactions'):return None
         deal=str(deal_id)
         try:
             row=self.store.db.execute(
-                'SELECT epic,size,direction,opened FROM trades WHERE deal_id=?',
-                (deal,)).fetchone()
+                'SELECT epic,size,direction,opened,closed,entry,exit FROM trades '
+                'WHERE deal_id=?',(deal,)).fetchone()
         except Exception:
             row=None
         if not row or not row[0]:return None
-        epic,size,direction,opened=row[0],str(row[1] or ''),str(row[2] or ''),row[3]
+        epic,size,direction,opened,closed,entry,exit_lvl=(
+            row[0],str(row[1] or ''),str(row[2] or ''),row[3],row[4],
+            _num(row[5]),_num(row[6]))
         look=self._history_lookback(deal,queued_at=queued_at or opened)
         try:
             kwargs=dict(tx_type='TRADE')
@@ -3265,6 +3309,10 @@ class SingleTradeEngine:
             else:
                 kwargs['last_period']=look['last_period'] or 86400
             payload=await self.broker.transactions(**kwargs)
+            # Widen once — Capital from_time windows often miss the close cash.
+            if not (payload.get('transactions') or []) and look['from_time']:
+                payload=await self.broker.transactions(
+                    last_period=86400,tx_type='TRADE')
         except Exception as exc:
             self.store.event('warning','Fuzzy transaction P&L lookup failed',
                              {'type':type(exc).__name__,'deal_id':deal})
@@ -3273,9 +3321,11 @@ class SingleTradeEngine:
         epic_u=epic.upper()
         consumed=self._fuzzy_tx_consumed()
         already=self.store.get('fuzzy_pnl_tx_for:'+deal)
+        target_ts=(self._parse_broker_ts(closed) or self._parse_broker_ts(queued_at)
+                   or self._parse_broker_ts(opened))
         for tx in payload.get('transactions') or []:
             if self._transaction_matches_deal(tx,deal):
-                # Prefer exact/fuzzy deal match path — caller already tried that.
+                # Prefer exact deal match path — caller already tried that.
                 continue
             fp=self._tx_fingerprint(tx)
             if fp and fp in consumed and fp!=already:
@@ -3287,26 +3337,65 @@ class SingleTradeEngine:
                 continue
             blob=' '.join(str(tx.get(k) or '') for k in
                           ('instrumentName','marketName','epic','description','note')).upper()
+            has_instrument=bool(blob.strip())
             # GOLD often shows as "Gold" / "Gold Spot"; keep XAU as alias.
-            if epic_u not in blob and not (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)):
+            # Capital TRADE schema often OMIT instrumentName — then size/time decide.
+            instrument_ok=(not has_instrument) or (
+                epic_u in blob or (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)))
+            if not instrument_ok:
                 continue
-            # Size: Decimal compare; missing size on either side = wildcard.
+            # Size: Capital uses signed lots — compare absolute values.
             tx_size_raw=tx.get('size') if tx.get('size') not in (None,'') else tx.get('quantity')
+            size_ok=True
             if tx_size_raw not in (None,'') and size not in (None,''):
                 try:
-                    if Decimal(str(tx_size_raw))!=Decimal(str(size)):
-                        continue
+                    size_ok=(abs(Decimal(str(tx_size_raw)))==abs(Decimal(str(size))))
                 except (ValueError,TypeError,ArithmeticError):
-                    continue
-            # Closing TRADE rows are often the *opposite* of open direction —
-            # never require tx.direction == open direction. Missing dir = wildcard.
-            hits.append((float(val),self._cash_currency(tx.get('currency')),fp))
-        if len(hits)==1:
-            pnl,ccy,fp=hits[0]
-            if fp:
-                self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
-            return pnl,ccy
-        return None
+                    size_ok=False
+            if not size_ok:
+                continue
+            tx_ts=(self._parse_broker_ts(tx.get('dateUtc'))
+                   or self._parse_broker_ts(tx.get('dateUTC'))
+                   or self._parse_broker_ts(tx.get('date')))
+            open_lvl=_num(tx.get('openLevel') or tx.get('open_level'))
+            close_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+            # Score: lower is better. Prefer openLevel≈entry, then time, then name.
+            score=0.0
+            if has_instrument:
+                score-=10.0
+            if entry is not None and open_lvl is not None:
+                diff=abs(float(entry)-float(open_lvl))
+                if diff<=1e-6:
+                    score-=1000.0  # exact open level → this deal's close cash
+                else:
+                    score+=min(200.0,diff*20.0)
+            elif entry is not None and open_lvl is None:
+                score+=25.0
+            if exit_lvl is not None and close_lvl is not None:
+                cdiff=abs(float(exit_lvl)-float(close_lvl))
+                if cdiff<=1e-6:
+                    score-=50.0
+                else:
+                    score+=min(40.0,cdiff*5.0)
+            if target_ts is not None and tx_ts is not None:
+                score+=abs(tx_ts-target_ts)/60.0  # minutes apart
+            elif target_ts is not None and tx_ts is None:
+                score+=500.0
+            hits.append((score,float(val),self._cash_currency(tx.get('currency')),fp,tx_ts))
+        if not hits:
+            return None
+        hits.sort(key=lambda h:h[0])
+        best=hits[0]
+        # Require a clear winner when several unused GOLD rows exist.
+        if len(hits)>1 and (hits[1][0]-best[0])<0.5:
+            self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
+                             {'deal_id':deal,'candidates':len(hits),
+                              'best_score':best[0],'second_score':hits[1][0]})
+            return None
+        _score,pnl,ccy,fp,_ts=best
+        if fp:
+            self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
+        return pnl,ccy
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
         """Confirm.profit → history/activity only.
@@ -3513,8 +3602,15 @@ class SingleTradeEngine:
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
+        if not self.broker:return
+        # Live Admin stuck on [upl_estimate]: re-arm journal rows every poll.
+        try:
+            self._requeue_unsettled_cash_closes()
+        except Exception as exc:
+            self.store.event('warning','Unsettled cash requeue failed',
+                             {'type':type(exc).__name__})
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
-        if not pending or not self.broker:return
+        if not pending:return
         remaining=[]
         for item in pending:
             base=item if isinstance(item,dict) else {'deal_id':item}

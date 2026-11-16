@@ -449,3 +449,68 @@ def test_stop_ticks_by_deal_shrinks_add_size():
             positions=e.positions,stop_ticks_by_deal=None,market=market)
         assert with_map.get('committed_risk',0)>0
         assert float(with_map['size'])<=float(bare['size'])
+
+
+def test_fuzzy_binds_signed_size_and_open_level():
+    """Capital uses signed size and often omits instrumentName — still bind cash."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            store.upsert_trade({'dealId':'uuid-a','epic':'GOLD','size':'0.02',
+                                'direction':'BUY','level':2650.0})
+            store.close_trade('uuid-a',2648.0,source='upl_estimate',overwrite=True)
+            store.upsert_trade({'dealId':'uuid-b','epic':'GOLD','size':'0.02',
+                                'direction':'BUY','level':2660.0})
+            store.close_trade('uuid-b',2655.0,source='upl_estimate',overwrite=True)
+            # Two Capital TRADE rows, no instrumentName, signed sizes.
+            broker.tx=[
+                {'reference':'T1','size':'-0.02','openLevel':'2650','closeLevel':'2648',
+                 'pnl':'-0.10','currency':'GBP','dateUtc':'2026-11-16T10:00:00Z'},
+                {'reference':'T2','size':'-0.02','openLevel':'2660','closeLevel':'2655',
+                 'pnl':'0.11','currency':'GBP','dateUtc':'2026-11-16T11:00:00Z'},
+            ]
+            found_a=await e._pnl_fuzzy_instrument_cash('uuid-a')
+            found_b=await e._pnl_fuzzy_instrument_cash('uuid-b')
+            assert found_a is not None and found_a[0]==pytest.approx(-0.10)
+            assert found_b is not None and found_b[0]==pytest.approx(0.11)
+    asyncio.run(scenario())
+
+
+def test_requeue_upl_estimate_then_bind_broker_cash():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            store.upsert_trade({'dealId':'est1','epic':'GOLD','size':'0.02',
+                                'direction':'SELL','level':2651})
+            store.close_trade('est1',2650, -0.39, currency='GBP',
+                              source='upl_estimate', overwrite=True)
+            store.set('entry_brain:est1',{
+                'epic':'GOLD','direction':'SELL','entry':2651,'tick_size':.1,
+                'transition':brain._json_transition(brain.core.last_transition)})
+            # Pending queue empty — Admin stuck until requeue.
+            store.set('pending_broker_pnl_deals',[])
+            broker.tx=[{'reference':'est1','pnl':-0.41,'currency':'GBP',
+                        'size':'0.02','openLevel':'2651'}]
+            n=e._requeue_unsettled_cash_closes()
+            assert n>=1
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl_source']=='broker'
+            assert row['pnl']==pytest.approx(-0.41)
+            daily=db.load_daily(store,equity=10_000.0)
+            assert float(daily.get('realized_pnl') or 0)==pytest.approx(-0.41)
+    asyncio.run(scenario())

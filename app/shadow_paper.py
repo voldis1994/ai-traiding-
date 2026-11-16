@@ -213,6 +213,7 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     else:
         trail_gap=open_gap
     tip_fav=sign*(tip-entry)
+    phase='trail' if be_locked else 'watch'
     if not be_locked and early_arm and tip_fav>0:
         try:
             from .self_params import load as _sp_load
@@ -225,6 +226,7 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
             return None
         trail_gap=min(open_gap,max(minimum,tip_fav))
         need=floor_need
+        phase='armed'
     else:
         need=open_gap if not be_locked else trail_gap
     if tip_fav<need:return None
@@ -232,24 +234,34 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     if direction=='BUY':
         tip=max(tip,bid)
         if tip<=entry:return None
-        desired=min(tip-trail_gap,bid-minimum)
+        legal_cap=bid-minimum
+        desired=min(tip-trail_gap,legal_cap)
         if early_arm and not be_locked:
-            desired=max(desired,entry)
+            if entry<=legal_cap+1e-12:
+                desired=max(desired,entry);phase='be_lock'
+            else:
+                desired=min(desired,legal_cap);phase='ratchet'
         new_stop=math.floor(desired/tick+1e-12)*tick
-        if early_arm and not be_locked and new_stop<entry-1e-12:
-            return None
+        if phase=='be_lock' and new_stop<entry-1e-12:
+            new_stop=math.floor(legal_cap/tick+1e-12)*tick
+            phase='ratchet'
         if new_stop<=stop or new_stop>=tip:return None
         if profit is not None and profit<=new_stop:return None
         if new_stop<stop+tick-1e-12:return None
         return float(new_stop)
     tip=min(tip,ask)
     if tip>=entry:return None
-    desired=max(tip+trail_gap,ask+minimum)
+    legal_floor=ask+minimum
+    desired=max(tip+trail_gap,legal_floor)
     if early_arm and not be_locked:
-        desired=min(desired,entry)
+        if entry>=legal_floor-1e-12:
+            desired=min(desired,entry);phase='be_lock'
+        else:
+            desired=max(desired,legal_floor);phase='ratchet'
     new_stop=math.ceil(desired/tick-1e-12)*tick
-    if early_arm and not be_locked and new_stop>entry+1e-12:
-        return None
+    if phase=='be_lock' and new_stop>entry+1e-12:
+        new_stop=math.ceil(legal_floor/tick-1e-12)*tick
+        phase='ratchet'
     if new_stop>=stop or new_stop<=tip:return None
     if profit is not None and profit>=new_stop:return None
     if new_stop>stop-tick+1e-12:return None

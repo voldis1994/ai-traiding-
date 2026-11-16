@@ -60,7 +60,7 @@ def test_scratch_settle_preserves_aggression():
         assert after['aggression'] >= before * 0.99
 
 
-def test_early_arm_never_loss_side_of_entry():
+def test_early_arm_locks_be_when_min_allows():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 't.sqlite3')
         pos = _position(stop=99.2, profit=102.0)
@@ -69,8 +69,9 @@ def test_early_arm_never_loss_side_of_entry():
         arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.5}
         out = propose_broker_trail(
             pos, market, meta, extreme=100.5, store=store, arm_decision=arm)
-        if out is not None:
-            assert out['stop_level'] >= 100.0 - 1e-9
+        assert out is not None
+        assert out['stop_level'] >= 100.0 - 1e-9
+        assert out.get('phase') == 'be_lock'
 
 
 def test_teach_never_bypasses_cost_floor():

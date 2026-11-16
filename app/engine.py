@@ -2399,14 +2399,9 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','Prep/eval stage failed',
                                     {'type':type(exc).__name__})
-            if not self.armed or not self.execution_enabled:return
-            # HOLD-shadow teach is an entry-policy teacher — only when flat.
-            # In-trade resolves would ΔW the same LIVE weights mid-manage.
-            if new_closed_bar and not self.positions:
-                try:self._resolve_hold_shadows()
-                except Exception as exc:
-                    self.store.event('warning','hold_shadow resolve skipped',
-                                    {'type':type(exc).__name__})
+            if not self.armed:return
+            # Open-risk path: protect + trail even when NEW entry execution is
+            # paused. Trailing must not die because opens are frozen.
             if self.positions:
                 # Manage every open deal (multi-pos day book) — reverse CLOSE + trail.
                 manage_bar=(self._manage_signal or {}).get('bar_time')
@@ -2416,7 +2411,7 @@ class SingleTradeEngine:
                         else None) or (
                     (self.last_signal or {}).get('scores')
                     if isinstance(self.last_signal,dict) else None)
-                if (new_closed_bar and scores and exit_bar and
+                if (self.execution_enabled and new_closed_bar and scores and exit_bar and
                     self.last_exit_processed_bar!=exit_bar):
                     self.last_exit_processed_bar=exit_bar
                     vote=self.policy.neural_decision(scores)
@@ -2450,6 +2445,14 @@ class SingleTradeEngine:
                         continue
                     await self.adapt_protection(p)
                 # Fall through: day book may ADD another position on a new bar.
+            if not self.execution_enabled:return
+            # HOLD-shadow teach is an entry-policy teacher — only when flat.
+            # In-trade resolves would ΔW the same LIVE weights mid-manage.
+            if new_closed_bar and not self.positions:
+                try:self._resolve_hold_shadows()
+                except Exception as exc:
+                    self.store.event('warning','hold_shadow resolve skipped',
+                                    {'type':type(exc).__name__})
             # Multi-pos ADD edge from manage scores — frozen OPEN often HOLD-tilted.
             _poll_scores,_poll_src=self._entry_vote_scores()
             _poll_edge=(self.policy.score_edge(_poll_scores)
@@ -4466,13 +4469,15 @@ class SingleTradeEngine:
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
             return
         if self.pending_order or self.pending_close:return
-        # Stale PENDING PROTECT for *this* deal must not freeze trail forever —
-        # supersede leftovers and continue. Other unresolved kinds still wait.
+        # Deal-scoped unresolved only. Sibling OPEN UNCERTAIN / other-deal
+        # leftovers must not freeze THIS deal's trail forever.
         deal_s=str(p.get('dealId'))
         blocking=[]
         for item in (self.store.unresolved() or []):
+            if str(item.get('deal_id') or '')!=deal_s:
+                continue
             kind=item.get('kind')
-            if kind=='PROTECT' and str(item.get('deal_id'))==deal_s:
+            if kind=='PROTECT':
                 self.store.order_update(item['id'],'SUPERSEDED')
                 self.store.event('reconcile','Stale PROTECT superseded so trail can continue',{
                     'deal_id':deal_s,'order_id':item.get('id')})
@@ -4511,7 +4516,8 @@ class SingleTradeEngine:
         if not arm.get('arm'):
             self.protection_brief={
                 'status':'Trail waiting for adaptive arm evidence',
-                'deal_id':p['dealId'],'extreme':extreme,'trail_arm':arm}
+                'deal_id':p['dealId'],'extreme':extreme,'trail_arm':arm,
+                'phase':'watch'}
             return
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
@@ -4519,7 +4525,8 @@ class SingleTradeEngine:
                                       store=self.store,arm_decision=arm)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal,
-                               'trail_arm':arm}
+                               'trail_arm':arm,
+                               'phase':(proposal or {}).get('phase') or ('armed' if arm.get('arm') else 'watch')}
         if not proposal:return
         runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{}) or {}
         now_mono=time.monotonic()
@@ -4547,16 +4554,17 @@ class SingleTradeEngine:
         oid=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':tp,
             'tick':self.market['tick'],'reason':'BROKER_TRAIL','extreme':extreme,
             'min_distance':self.market.get('min_distance'),'preserve_tp':tp is not None,
-            'trail_arm':arm.get('reason')})
+            'trail_arm':arm.get('reason'),'phase':proposal.get('phase')})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=tp)
             if await self._confirm_reconcile(receipt,oid,'PROTECT',p['dealId']):
                 self.store.set('adaptive_runtime:'+str(p['dealId']),{
                     'mono':now_mono,'stop':stop,'profit':tp,'extreme':extreme,'status':'CONFIRMED',
-                    'mark':mark})
+                    'mark':mark,'phase':proposal.get('phase')})
                 self.protection_brief['status']='Broker-confirmed trail update'
                 self.store.event('protection','Trail SL verified by broker',{
                     'deal_id':p['dealId'],'new_stop':stop,'profit_level':tp,'extreme':extreme,
+                    'phase':proposal.get('phase'),
                     'min_distance':self.market.get('min_distance'),'tick':self.market.get('tick')})
             else:
                 self.protection_brief['status']='Broker rejected trail; old levels retained'
@@ -4586,11 +4594,13 @@ class SingleTradeEngine:
         if self.pending_order or self.pending_close:return
         if p.get('stopLevel') is not None and p.get('profitLevel') is not None:
             self.protected.add(p['dealId']);return
-        # Same stale-PROTECT policy as adapt_protection — do not freeze forever.
+        # Deal-scoped unresolved — same policy as adapt_protection.
         deal_s=str(p.get('dealId'))
         blocking=[]
         for item in (self.store.unresolved() or []):
-            if item.get('kind')=='PROTECT' and str(item.get('deal_id'))==deal_s:
+            if str(item.get('deal_id') or '')!=deal_s:
+                continue
+            if item.get('kind')=='PROTECT':
                 self.store.order_update(item['id'],'SUPERSEDED')
             else:
                 blocking.append(item)

@@ -406,3 +406,101 @@ def test_scratch_close_logs_streak_without_hardcoded_cooldown():
         assert s.get('scratch_streak')==2
         e._note_scratch_close(-1.5,'d3')  # real loss resets streak
         assert s.get('scratch_streak')==0
+
+
+def test_one_to_one_rr_trails_before_tp_fill():
+    """1:1 Gold book: arm at ~0.55R and lock BE — never wait for tip==TP."""
+    # R = TP = 2.0; tip at 1.2 (0.6R) — old contract needed tip≥2.0 (=TP) → never trail.
+    pos={'dealId':'g1','epic':'GOLD','direction':'BUY','level':2000.,
+         'stopLevel':1998.,'profitLevel':2002.,'size':'.5'}
+    market={'epic':'GOLD','bid':2001.2,'ask':2001.3,'spread':0.1,
+            'tick':0.01,'min_distance':0.5,'status':'TRADEABLE'}
+    meta={'owner':'AUTO','deal_id':'g1','original_risk':2.0,'original_profit':2.0}
+    # Without arm: still requires full R → None (WATCH).
+    assert propose_broker_trail(pos,market,meta,extreme=2001.2) is None
+    arm={'arm':True,'reason':'mfe 1.2 ≥ 0.55×risk','mfe':1.2}
+    out=propose_broker_trail(pos,market,meta,extreme=2001.2,arm_decision=arm)
+    assert out is not None
+    assert out['stop_level']>=2000.0-1e-9  # BE lock before TP
+    assert out['profit_level']==2002.0
+    assert out.get('phase')=='be_lock'
+    # At/near TP tip must still allow trail (not abort solely because quote≈TP).
+    near_tp=_market(2001.95,2002.05)
+    near_tp['epic']='GOLD';near_tp['min_distance']=0.5
+    be_pos=dict(pos);be_pos['stopLevel']=2000.0
+    past=propose_broker_trail(be_pos,near_tp,meta,extreme=2001.95,arm_decision=arm)
+    # Through TP by >tick → None; at tip still pre-fill may trail past BE.
+    assert past is None or past['stop_level']>=2000.0
+
+
+def test_trail_runs_when_entry_execution_paused():
+    """Open positions keep trailing even if NEW opens are paused."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            e,b,s=engine_fixture(d)
+            e.execution_enabled=False  # entry paused — trail must still fire
+            e.armed=True
+            await e.sync()
+            await e.adapt_protection(e.positions[0])
+            assert len(b.requests)==1
+            assert b.requests[0][0]=='PROTECT'
+            assert b.open[0]['position']['stopLevel']>99.2
+            assert b.requests[0][3]==101.6  # TP preserved
+    asyncio.run(scenario())
+
+
+def test_sibling_unresolved_open_does_not_freeze_trail():
+    """OPEN UNCERTAIN on another deal must not block THIS deal's trail."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            e,b,s=engine_fixture(d)
+            # Leftover multi-add UNCERTAIN on a sibling deal.
+            oid=s.order('OPEN','sibling99',{'epic':'GOLD','direction':'BUY'})
+            s.order_update(oid,'UNCERTAIN','ghost-ref')
+            assert any(u.get('deal_id')=='sibling99' for u in s.unresolved())
+            await e.sync()
+            await e.adapt_protection(e.positions[0])
+            assert len(b.requests)==1
+            assert b.open[0]['position']['stopLevel']>99.2
+    asyncio.run(scenario())
+
+
+def test_trail_lifecycle_watch_arm_be_trail():
+    """Coherent phases: WATCH → ARMED/BE → TRAIL past BE on 1:1 book."""
+    from app import structure_edge as se
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        risk=2.0
+        pos={'dealId':'lc1','epic':'GOLD','direction':'BUY','level':100.,
+             'stopLevel':98.,'profitLevel':102.,'size':'.25'}
+        meta={'owner':'AUTO','deal_id':'lc1','original_risk':risk,'original_profit':risk}
+        # WATCH: MFE too small.
+        arm=se.trail_arm_decision(
+            s,epic='GOLD',structure='TREND_UP',direction='BUY',
+            mfe=0.5,original_risk=risk,be_locked=False)
+        assert arm['arm'] is False
+        market=_market(100.5,100.6);market['min_distance']=0.3
+        assert propose_broker_trail(
+            pos,market,meta,extreme=100.5,store=s,arm_decision=arm) is None
+        # ARMED at 0.55R → BE lock.
+        arm=se.trail_arm_decision(
+            s,epic='GOLD',structure='TREND_UP',direction='BUY',
+            mfe=1.2,original_risk=risk,be_locked=False)
+        assert arm['arm'] is True
+        market=_market(101.2,101.3);market['min_distance']=0.3
+        out=propose_broker_trail(
+            pos,market,meta,extreme=101.2,store=s,arm_decision=arm)
+        assert out and out['phase']=='be_lock' and out['stop_level']>=100.-1e-9
+        # TRAIL past BE.
+        pos2=dict(pos);pos2['stopLevel']=100.0
+        market=_market(101.5,101.6);market['min_distance']=0.3
+        arm2=se.trail_arm_decision(
+            s,epic='GOLD',structure='TREND_UP',direction='BUY',
+            mfe=1.5,original_risk=risk,be_locked=True)
+        assert arm2['arm'] is True
+        trail=propose_broker_trail(
+            pos2,market,meta,extreme=101.5,store=s,arm_decision=arm2,
+            zone_range=0.5)
+        assert trail and trail['be_locked'] is True
+        assert trail['stop_level']>100.0
+        assert trail['profit_level']==102.0

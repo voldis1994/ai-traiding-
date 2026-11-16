@@ -237,7 +237,13 @@ class RuntimeHub:
         elif acct and acct in by_ccy:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
-        realized=primary['realized_pnl'] if primary else 0.0
+        # Never invent 0.00 when multi-currency cash cannot be summed.
+        if primary:
+            realized=primary['realized_pnl']
+        elif by_ccy:
+            realized=None
+        else:
+            realized=0.0
         closed_n=len(closed_rows)
         # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
         if closed_n>0 and cash_n==0:
@@ -256,7 +262,14 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
-        equity=round(realized+(upl or 0.0),4) if upl is not None else realized
+        if realized is not None and upl is not None:
+            equity=round(float(realized)+float(upl),4)
+        elif realized is not None:
+            equity=realized
+        elif upl is not None:
+            equity=upl
+        else:
+            equity=None
         return {
             'closed_trades':closed_n,
             'open_trades_recorded':open_n,

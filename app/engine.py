@@ -1651,7 +1651,7 @@ class SingleTradeEngine:
         return any(str(p.get('dealId'))==deal for p in live)
 
     async def _settle_deal_from_history_cash(self,deal,*,source='history_settle'):
-        """Clear open book + bind Capital cash when history already shows the close."""
+        """Bind Capital cash for one deal — never wipe sibling multi-pos rows."""
         deal=str(deal)
         # Exact dealId only — fuzzy tx refs must not wipe a live open.
         found=await self._pnl_from_broker_history(deal,exact_deal=True)
@@ -1662,9 +1662,18 @@ class SingleTradeEngine:
         if exit_guess is None:
             snap=self.store.get('last_upl:'+deal) or {}
             exit_guess=_num(snap.get('exit_hint'))
-        self.positions=[]
-        self.position_age=0
-        self.last_position_id=None
+        # Multi-pos safe: drop only this dealId from the local book.
+        self.positions=[p for p in (self.positions or [])
+                        if str(p.get('dealId'))!=deal]
+        self._open_deal_ids={str(p['dealId']) for p in self.positions
+                             if p.get('dealId') is not None}
+        if not self.positions:
+            self.position_age=0
+            self.last_position_id=None
+        else:
+            head=self.positions[0].get('dealId')
+            self.last_position_id=str(head) if head is not None else None
+            self.position_age=0
         self.last_closed_step=self.brain.core.steps
         self.latest_close_id=deal
         conf={'level':exit_guess,'profit':float(pnl),'pnl_currency':self._cash_currency(ccy),
@@ -1672,7 +1681,8 @@ class SingleTradeEngine:
         self._learn_closed_trade(deal,conf)
         self.store.event('reconcile',
             'Open deal settled from Capital history cash',
-            {'deal_id':deal,'pnl':float(pnl),'source':source})
+            {'deal_id':deal,'pnl':float(pnl),'source':source,
+             'remaining_open':len(self.positions)})
         self._release_execution_after_flat(deal)
         return True
 
@@ -1688,26 +1698,42 @@ class SingleTradeEngine:
             return False
 
     async def _recover_ghost_open_after_positions_error(self,exc):
-        """positions() REST failed — Capital may already be flat on last_position_id.
+        """positions() REST failed — Capital may already be flat on open dealIds.
 
         Leaving self.positions unchanged freezes Admin on 'Existing open position',
         blocks orphan £ reconcile, and clears neural scores while ON.
+        Multi-pos: try every known open dealId (not only positions[0]).
         """
-        deal=self.last_position_id
-        if deal is None and self.positions:
-            deal=self.positions[0].get('dealId')
-        if deal is None:
+        candidates=[]
+        seen=set()
+        def _add(d):
+            if d is None:return
+            s=str(d)
+            if s in seen:return
+            seen.add(s);candidates.append(s)
+        _add(self.last_position_id)
+        for d in (getattr(self,'_open_deal_ids',None) or set()):
+            _add(d)
+        for p in (self.positions or []):
+            _add(p.get('dealId'))
+        if not candidates:
             return False
-        deal=str(deal)
-        ok=await self._settle_deal_from_history_cash(
-            deal,source='ghost_positions_error_recover')
-        if not ok:
+        settled=[]
+        for deal in candidates:
+            ok=await self._settle_deal_from_history_cash(
+                deal,source='ghost_positions_error_recover')
+            if ok:
+                settled.append(deal)
+        if not settled:
             self.store.event('warning','Positions sync failed; ghost open not confirmed closed',
-                {'deal_id':deal,'type':type(exc).__name__})
+                {'deal_ids':candidates,'type':type(exc).__name__})
             return False
         self.store.event('reconcile',
             'Cleared ghost open after positions API error; Capital history has cash close',
-            {'deal_id':deal,'error':type(exc).__name__})
+            {'deal_ids':settled,'remaining_open':len(self.positions or []),
+             'error':type(exc).__name__})
+        # Any settled deal means we made progress — do not re-raise the positions()
+        # error (sibling opens stay until the next successful broker refresh).
         return True
 
     async def sync(self):
@@ -4624,14 +4650,28 @@ class SingleTradeEngine:
                 if self.positions and self._pending_entry_brain:
                     after={str(p['dealId']):p for p in self.positions if p.get('dealId')}
                     new_ids=[d for d in after if d not in before_ids]
-                    deal_id=(new_ids[0] if new_ids else
-                             (self.positions[0].get('dealId') if self.positions else None))
-                    key='entry_brain:'+str(deal_id)
-                    pos=after.get(str(deal_id)) or (self.positions[0] if self.positions else {})
-                    if deal_id and self.store.get(key) is None:
+                    # Multi-pos safe: never fall back to positions[0] (wrong deal).
+                    # Prefer sole newcomer, else latest_robot_deal_id from confirm.
+                    deal_id=None
+                    if len(new_ids)==1:
+                        deal_id=new_ids[0]
+                    else:
+                        latest=self.store.get('latest_robot_deal_id')
+                        if latest is not None and str(latest) in after:
+                            deal_id=str(latest)
+                        elif len(after)==1:
+                            deal_id=next(iter(after))
+                    key='entry_brain:'+str(deal_id) if deal_id else None
+                    pos=after.get(str(deal_id)) if deal_id else {}
+                    if deal_id and key and self.store.get(key) is None:
                         pending=self._pending_entry_brain
                         self.store.set(key,{**pending,
-                            'entry':pos.get('level') if pos.get('level') is not None else pending.get('entry')})
+                            'entry':(pos.get('level') if pos and pos.get('level') is not None
+                                     else pending.get('entry'))})
+                    elif self._pending_entry_brain and not deal_id:
+                        self.store.event('warning',
+                            'OPEN entry_brain not bound — ambiguous multi-pos dealId',
+                            {'new_ids':new_ids,'open':list(after.keys())})
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
                     day_book.record_open(self.store,equity=equity)
@@ -4700,11 +4740,18 @@ class SingleTradeEngine:
             self.last_signal=copy.deepcopy(self._locked_entry_signal)
 
     def _existing_open_block_reason(self):
-        """Name the live deal + UPL; explain manage reverse watch vs waiting."""
+        """Name the live deal(s) + UPL; explain manage reverse watch vs waiting."""
         if not self.positions:return 'Existing open position'
+        n=len(self.positions)
         p=self.positions[0]
         deal=p.get('dealId')
         upl=_num(p.get('upl'))
+        if n>1:
+            try:
+                upl=sum(float(x) for x in (_num(q.get('upl')) for q in self.positions)
+                        if x is not None and math.isfinite(x))
+            except (TypeError,ValueError):
+                pass
         manage=self._manage_signal if isinstance(self._manage_signal,dict) else None
         if self.last_signal is None and not (manage and manage.get('scores')):
             fusion_cold=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
@@ -4718,8 +4765,15 @@ class SingleTradeEngine:
                 manage.get('action')))
         else:
             head='Existing open position'
+        if n>1:
+            head=head.replace('Existing open position',
+                              'Existing open positions ({0})'.format(n),1)
         bits=[head]
-        if deal is not None:bits.append('deal '+str(deal))
+        if n==1 and deal is not None:
+            bits.append('deal '+str(deal))
+        elif n>1:
+            ids=[str(q.get('dealId')) for q in self.positions if q.get('dealId')]
+            bits.append('deals '+','.join(ids[:4])+(('…') if len(ids)>4 else ''))
         if upl is not None and math.isfinite(upl):
             bits.append('UPL {0:.2f}'.format(float(upl)))
         return ' — '.join(bits)
@@ -4824,9 +4878,14 @@ class SingleTradeEngine:
                       if isinstance(self._manage_signal,dict) else None)
             s_scores=(self.last_signal or {}).get('scores') if isinstance(self.last_signal,dict) else None
             use=m_scores or s_scores
-            if use:
+            dirs={p.get('direction') for p in self.positions
+                  if p.get('direction') in ('BUY','SELL')}
+            # Multi-pos mixed directions → no single exit intent label.
+            if use and len(dirs)==1:
                 raw_exit_intent=self.policy.neural_decision(
-                    use,self.positions[0]['direction'])
+                    use,next(iter(dirs)))
+            elif use and len(dirs)>1:
+                raw_exit_intent=self.policy.neural_decision(use)
         decision=(raw_exit_intent if self.positions else
                   (evaluation['action'] if evaluation else 'HOLD'))
         gates=self.live_open_gates(evaluation['action'] if evaluation else None)

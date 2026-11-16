@@ -234,3 +234,97 @@ def test_snapshot_passes_score_edge_when_open():
             epic='GOLD',mandate_epic='GOLD',score_edge=None)
         assert denied['allowed'] is False
         assert denied['reason']=='add_needs_stronger_edge'
+
+
+def test_settle_history_cash_keeps_sibling_multi_pos():
+    """Settling one deal from history must NOT wipe other open positions."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            e.positions=[
+                {'dealId':'keep','epic':'GOLD','direction':'BUY','size':'0.02','level':2650},
+                {'dealId':'gone','epic':'GOLD','direction':'BUY','size':'0.02','level':2651},
+            ]
+            for p in e.positions:
+                store.upsert_trade(p)
+            e._open_deal_ids={'keep','gone'}
+            broker.tx=[{'reference':'gone','pnl':0.11,'currency':'GBP'}]
+            ok=await e._settle_deal_from_history_cash('gone',source='audit_multi')
+            assert ok is True
+            assert len(e.positions)==1
+            assert e.positions[0]['dealId']=='keep'
+            assert 'keep' in e._open_deal_ids
+            assert 'gone' not in e._open_deal_ids
+            row=next(t for t in store.trades(5) if t['deal_id']=='gone')
+            assert row['pnl']==pytest.approx(0.11)
+            assert row['pnl_source']=='broker'
+    asyncio.run(scenario())
+
+
+def test_ghost_recover_tries_all_open_deals():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            e.positions=[
+                {'dealId':'a','epic':'GOLD','direction':'SELL','size':'0.01','level':1},
+                {'dealId':'b','epic':'GOLD','direction':'SELL','size':'0.01','level':2},
+            ]
+            for p in e.positions:
+                store.upsert_trade(p)
+            e._open_deal_ids={'a','b'}
+            e.last_position_id=None
+            broker.tx=[
+                {'reference':'a','pnl':-0.02,'currency':'GBP'},
+                {'reference':'b','pnl':0.03,'currency':'GBP'},
+            ]
+            ok=await e._recover_ghost_open_after_positions_error(RuntimeError('boom'))
+            assert ok is True
+            assert e.positions==[]
+    asyncio.run(scenario())
+
+
+def test_trade_stats_multi_ccy_realized_none_not_zero():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        store.upsert_trade({'dealId':'g1','epic':'GOLD','size':'0.1',
+                            'direction':'BUY','level':2000})
+        store.close_trade('g1',2001,1.5,currency='GBP',source='broker',overwrite=True)
+        store.upsert_trade({'dealId':'u1','epic':'US100','size':'1',
+                            'direction':'BUY','level':100})
+        store.close_trade('u1',101,2.0,currency='USD',source='broker',overwrite=True)
+        hub=RuntimeHub.__new__(RuntimeHub)
+        # No account currency → cannot pick a primary; must not invent 0.00.
+        stats=hub._trade_stats(store,None)
+        assert stats['cash_trades']==2
+        assert stats['realized_pnl'] is None
+        assert set(stats['pnl_by_currency'])=={'GBP','USD'}
+
+
+def test_admin_card_status_closed_without_cash_not_ok():
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        for i in range(13):
+            store.upsert_trade({
+                'dealId':f'x{i}','epic':'GOLD','size':'0.1',
+                'direction':'BUY','level':2000,
+            })
+            store.close_trade(f'x{i}',1999,source='pending_broker_pnl',overwrite=True)
+        hub=RuntimeHub.__new__(RuntimeHub)
+        stats=hub._trade_stats(store,'GBP')
+        assert stats['closed_trades']==13
+        assert stats['cash_trades']==0
+        assert stats['pnl_status']=='closed_without_broker_cash'
+        assert stats['realized_pnl']==0.0

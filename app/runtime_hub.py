@@ -548,6 +548,24 @@ class RuntimeHub:
                 card['hard_risk']=hard_risk.snapshot(store)
             except Exception:
                 card['hard_risk']=None
+            # Day book is the live risk book the robot already uses — surface it
+            # even when the worker is stopped so Admin Riski is never blank.
+            if not (card.get('activity') or {}).get('day_book'):
+                try:
+                    from . import day_book
+                    equity=None
+                    bal=((card.get('activity') or {}).get('balance') or {})
+                    for key in ('balance','available','deposit','equity'):
+                        if bal.get(key) is not None:
+                            try:equity=float(bal[key]);break
+                            except (TypeError,ValueError):pass
+                    positions=((card.get('activity') or {}).get('positions')
+                               or ([card['activity']['position']]
+                                   if (card.get('activity') or {}).get('position') else []))
+                    card['activity']['day_book']=day_book.snapshot(
+                        store,equity=equity,positions=positions)
+                except Exception:
+                    pass
         else:
             card['hard_risk']=None
         return card

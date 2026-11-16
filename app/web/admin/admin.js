@@ -403,19 +403,31 @@ function renderTopClients(clients){
     </div>`).join('');
 }
 
+function dayBookOf(c){
+  const a=c&&c.activity||{};
+  return a.day_book&&typeof a.day_book==='object'?a.day_book:{};
+}
+
+function phaseClass(phase){
+  const p=String(phase||'').toUpperCase();
+  if(p==='DEFEND')return 'pause';
+  if(p==='DONE'||p==='PROTECT')return 'on';
+  if(p==='HUNT')return 'on';
+  return 'off';
+}
+
 function collectRiskAlerts(clients){
   const alerts=[];
   (clients||[]).forEach(c=>{
     const name=c.display_name||c.username||('#'+c.id);
-    const hr=c.hard_risk||{};
-    const dd=hr.equity_drawdown_pct??hr.drawdown_pct??hr.current_drawdown_pct;
-    if(dd!=null && Number(dd)>=5){
-      alerts.push({title:`${name} — augsts drawdown`,detail:'Equity drawdown',metric:Number(dd).toFixed(1)+'%'});
-    }
-    if(hr.trading_halted){
-      alerts.push({title:`${name} — tirdzniecība apturēta`,detail:hr.halt_reason||'Hard risk halt',metric:'HALT'});
-    }
     const a=c.activity||{};
+    const db=dayBookOf(c);
+    const phase=String(db.phase||(db.daily&&db.daily.phase)||'').toUpperCase();
+    if(phase==='DEFEND'){
+      alerts.push({title:`${name} — dienas zaud. budžets`,detail:'Day book DEFEND — jauni OPEN aizliegti',metric:'DEFEND'});
+    }else if(phase==='DONE'){
+      alerts.push({title:`${name} — dienas mērķis sasniegts`,detail:'Day book DONE — plus/BE, gaida nākamo dienu',metric:'DONE'});
+    }
     if(a.entry_block_reason){
       alerts.push({title:`${name} — ieeja bloķēta`,detail:String(a.entry_block_reason),metric:'BLOCK'});
     }
@@ -425,7 +437,6 @@ function collectRiskAlerts(clients){
     (a.positions||(a.position?[a.position]:[])).forEach(p=>{
       if(!p)return;
       const epic=String(p.epic||'');
-      // Heuristic volatility flag when UPL swings hard vs size
       const upl=Math.abs(Number(p.upl)||0);
       if(upl>50){
         alerts.push({title:`${epic||'INSTR'} — paaugstināta kustība`,detail:name,metric:(upl>=0?'+':'')+upl.toFixed(0)});
@@ -455,19 +466,46 @@ function renderRiskBoard(clients){
     return;
   }
   board.innerHTML=clients.map(c=>{
-    const hr=c.hard_risk||{};
+    const a=c.activity||{};
+    const r=c.results||{};
+    const ccy=r.pnl_currency||c.account_currency||a.currency||'';
     const name=c.display_name||c.username||('#'+c.id);
-    const halted=!!hr.trading_halted;
+    const db=dayBookOf(c);
+    const budgets=db.budgets||{};
+    const daily=db.daily||{};
+    const params=db.params||{};
+    const phase=db.phase||daily.phase||'—';
+    const realized=daily.realized_pnl;
+    const mark=db.day_mark_pnl;
+    const target=budgets.profit_target;
+    const loss=budgets.loss_budget;
+    const rpt=budgets.risk_per_trade;
+    const targetFrac=params.profit_target_frac;
+    const lossFrac=params.loss_budget_frac;
+    const riskFrac=params.risk_per_trade_frac;
+    const progress=Number.isFinite(Number(target))&&Number(target)>0&&Number.isFinite(Number(realized))
+      ? Math.round((Number(realized)/Number(target))*100)
+      : null;
     return `<article class="card risk-card">
       <div class="card-head">
         <h2>${icon('shield')} ${esc(name)}</h2>
-        <span class="state-pill ${halted?'pause':(c.robot_running?'on':'off')}">${halted?'HALT':(c.robot_running?'ON':'OFF')}</span>
+        <span class="state-pill ${phaseClass(phase)}">${esc(String(phase).toUpperCase())}</span>
       </div>
-      <div class="kv"><span>Max risks / treids</span><b>${esc(hr.max_risk_per_trade??'—')}</b></div>
-      <div class="kv"><span>Dienas zaud. limits</span><b>${esc(hr.daily_loss_limit??'—')}</b></div>
-      <div class="kv"><span>Drawdown limits</span><b>${esc(hr.equity_drawdown_limit??'—')}</b></div>
-      <div class="kv"><span>Halt iemesls</span><b>${esc(hr.halt_reason||'—')}</b></div>
-      <div class="kv"><span>Entry block</span><b>${esc((c.activity||{}).entry_block_reason||'—')}</b></div>
+      <div class="kv"><span>Dienas peļņas mērķis</span><b class="pnl-pos">${
+        target==null?'—':esc(money(target,ccy))
+      }${targetFrac!=null?` <small>(${(Number(targetFrac)*100).toFixed(2)}%)</small>`:''}</b></div>
+      <div class="kv"><span>Dienas zaud. budžets</span><b class="pnl-neg">${
+        loss==null?'—':esc('-'+num(loss,2)+(ccy?' '+ccy:''))
+      }${lossFrac!=null?` <small>(${(Number(lossFrac)*100).toFixed(2)}%)</small>`:''}</b></div>
+      <div class="kv"><span>Risks / treids</span><b>${
+        rpt==null?'—':esc(money(rpt,ccy).replace(/^\+/,''))
+      }${riskFrac!=null?` <small>(${(Number(riskFrac)*100).toFixed(2)}%)</small>`:''}</b></div>
+      <div class="kv"><span>Šodien realizēts</span><b class="${pnlClass(realized)}">${esc(money(realized,ccy))}</b></div>
+      <div class="kv"><span>Dienas mark (inkl. UPL)</span><b class="${pnlClass(mark)}">${esc(money(mark,ccy))}</b></div>
+      <div class="kv"><span>Progress pret mērķi</span><b>${progress==null?'—':esc(progress+'%')}</b></div>
+      <div class="kv"><span>Atvērtās poz.</span><b>${esc(db.open_count??(a.positions||[]).length??0)}</b></div>
+      <div class="kv"><span>Entry block</span><b>${esc(a.entry_block_reason||'—')}</b></div>
+      <p class="muted risk-goal">${esc(db.goal||'Dienas mērķis: plusā vai 0 (BE).')}</p>
     </article>`;
   }).join('');
 }

@@ -554,10 +554,15 @@ class AdaptiveBrain:
                     raise ValueError('Backup OHLC dim disagrees with feature registry')
                 if fs in (reg_fs,FUSION_SCHEMA) and int(meta['d'])!=int(reg_fus):
                     raise ValueError('Backup fusion dim disagrees with feature registry')
+                # legacy_quote_v2 is a real pre-OHLC schema — allow restore when
+                # the live core is still on that layout (or None→legacy).
+                live_fs=self.feature_schema or 'legacy_quote_v2'
                 if fs not in (None,reg_os,reg_fs,FEATURE_SCHEMA,FUSION_SCHEMA,
-                              meta.get('ohlc_schema'),meta.get('fusion_schema')):
+                              'legacy_quote_v2',
+                              meta.get('ohlc_schema'),meta.get('fusion_schema'),
+                              live_fs):
                     # Allow exact match to schemas stored in the file itself.
-                    if fs not in (meta.get('ohlc_schema'),meta.get('fusion_schema')):
+                    if fs not in (meta.get('ohlc_schema'),meta.get('fusion_schema'),live_fs):
                         raise ValueError('Backup feature_schema not recognized for registry')
             self._apply_weight_payload(arrays,meta)
             # Persist restored weights as the active brain file only after validation.
@@ -963,6 +968,8 @@ class SingleTradeEngine:
         self.last_decision_bar=None;self.last_entry_processed_bar=None;self.last_exit_processed_bar=None
         self.pending_order=False;self.pending_close=False;self.lock=asyncio.Lock()
         self._pending_entry_brain=None  # neural state at the decision that opened the trade
+        # Adopt without a transition yet → bind once on first in-session perception.
+        self._adopt_entry_brain_pending=set()
         self.last_time=None;self.last_account_tick=0;self.last_candle_tick=-20
         # Prefer explicit path; AutoEvolution also defaults next to store journal.
         self.policy=AutoEvolution(store,policy_path)
@@ -1152,6 +1159,7 @@ class SingleTradeEngine:
         self.protection_brief={'status':'Waiting for robot-opened position'}
         self.last_protection_bar=None
         self._unresolved_at_login=bool(self.store.unresolved())
+        self._adopt_entry_brain_pending=set()
         # Session start MUST NOT reuse a cached adoptive size from SQLite.
         # Size/EPIC authorization is valid only after a live broker position is
         # adopted in THIS login. Stale mandate rows caused restarts to keep
@@ -1168,10 +1176,11 @@ class SingleTradeEngine:
         self._seen_initial=False
         self.last_closed_step=-1
         if self._unresolved_at_login:
-            # Never auto-pause — clear stale journal noise; operator Pause is the only freeze.
+            # Never auto-pause. Keep reconcilable PENDING/UNCERTAIN (with refs)
+            # for reconcile_outstanding — do not blind-SUPERSEDE on login.
+            # submit() already refuses new OPEN while unresolved rows remain.
             self.store.event('warning',
-                'Previous order outcome unresolved at login; clearing without pause')
-            self.clear_unresolved_on_operator_resume()
+                'Previous order outcome unresolved at login; staying live (no auto-pause)')
             self._ensure_live_unless_operator_paused()
     def _ensure_live_unless_operator_paused(self):
         """Only explicit operator Pause may freeze OPEN. Auto-pause paths are banned."""
@@ -1816,6 +1825,7 @@ class SingleTradeEngine:
                 # can train LIVE weights — without it, closes only log £ and skip learn.
                 key='entry_brain:'+str(deal_id)
                 tr=getattr(self.brain.core,'last_transition',None)
+                saved_brain=False
                 if self.store.get(key) is None and isinstance(tr,dict) and tr.get('h') is not None:
                     try:
                         hlen=len(np.asarray(tr.get('h')))
@@ -1831,6 +1841,12 @@ class SingleTradeEngine:
                             'scores':(self.last_signal or {}).get('scores'),
                             'shadow_scores':self._shadow_scores_now(),
                             'captured':'manual_adopt'})
+                        saved_brain=True
+                if not saved_brain and self.store.get(key) is None:
+                    # Bind once on first in-session perception (after schema ready).
+                    self._adopt_entry_brain_pending.add(str(deal_id))
+                else:
+                    self._adopt_entry_brain_pending.discard(str(deal_id))
                 if fresh_session and open_in_flight:
                     self._supersede_stale_open_orders(deal_id)
                 self.store.event('adoption','Live broker position adopted for this session',
@@ -2245,22 +2261,43 @@ class SingleTradeEngine:
                     self._lock_entry_signal_for_open()
             # Bind the decision-time neural state (captured in submit) to the deal.
             # Fallback: only if we never captured at entry (e.g. manual adopt).
-            if len(self.positions)==1:
-                p=self.positions[0];key='entry_brain:'+str(p['dealId'])
-                if self.store.get(key) is None and self._pending_entry_brain:
+            if self.positions:
+                for p in list(self.positions):
+                  deal_s=str(p.get('dealId')) if p.get('dealId') is not None else None
+                  if not deal_s:continue
+                  key='entry_brain:'+deal_s
+                  if self.store.get(key) is None and self._pending_entry_brain:
                     pending=self._pending_entry_brain
                     if pending.get('direction')==p.get('direction') and pending.get('epic')==p.get('epic'):
                         self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry'),
                                            'tick_size':pending.get('tick_size') or tick,
                                            'entry_spread':pending.get('entry_spread') if pending.get('entry_spread') is not None else ask-bid})
                         self._pending_entry_brain=None
-                elif self.store.get(key) is None:
+                        self._adopt_entry_brain_pending.discard(deal_s)
+                  elif self.store.get(key) is None and deal_s in self._adopt_entry_brain_pending:
+                    # One-shot bind on first perception after adopt (not mid-trade churn).
+                    tr=getattr(self.brain.core,'last_transition',None)
+                    if isinstance(tr,dict) and tr.get('h') is not None:
+                        try:hlen=len(np.asarray(tr.get('h')))
+                        except Exception:hlen=-1
+                        if hlen==getattr(self.brain.core,'n',None):
+                            self.store.set(key,{
+                                'epic':p.get('epic'),'direction':p.get('direction'),
+                                'entry':p.get('level'),'tick_size':tick,
+                                'entry_spread':ask-bid,
+                                'transition':self.brain._json_transition(tr),
+                                'scores':((self._manage_signal or {}).get('scores')
+                                          or (self.last_signal or {}).get('scores')),
+                                'shadow_scores':self._shadow_scores_now(),
+                                'captured':'manual_adopt_first_perception'})
+                            self._adopt_entry_brain_pending.discard(deal_s)
+                  elif self.store.get(key) is None:
                     # Never bind mid-trade h/c as entry_brain — that poisons the
                     # closed-trade teacher with manage-state memory.
                     self.store.event('warning',
                         'entry_brain missing; refused poll_fallback mid-trade bind',
                         {'deal_id':p.get('dealId'),'epic':p.get('epic')})
-                else:
+                  else:
                     # Fill missing tick/spread on manual-adopt snapshots so close can learn.
                     saved=self.store.get(key)
                     if isinstance(saved,dict) and (
@@ -2734,19 +2771,20 @@ class SingleTradeEngine:
         if kind=='CLOSE':
             # Confirm often omits profit on CLOSE; fill from history before learn.
             # Never promote last UPL to realized cash (audit #1).
+            # Still teach from exit level / entry_brain when cash is pending —
+            # late broker £ refines the journal without a second ΔW.
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
             if pnl is not None and src=='broker':
                 if _num(confirmation.get('profit')) is None and _num(confirmation.get('pnl')) is None:
                     confirmation={**confirmation,'profit':pnl}
                 if _ccy and not confirmation.get('pnl_currency'):
                     confirmation={**confirmation,'pnl_currency':_ccy}
-                self._learn_closed_trade(deal_id,confirmation)
             else:
                 exit_lvl=_num(confirmation.get('level'))
-                self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
                 self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
                 self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
                                  {'deal_id':deal_id,'reference':ref,'pnl_source':src})
+            self._learn_closed_trade(deal_id,confirmation)
             # Confirmed close must leave the robot armed for the next OPEN.
             self._release_execution_after_flat(deal_id)
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})

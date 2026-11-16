@@ -92,7 +92,8 @@ def test_stale_unresolved_open_no_longer_blocks_fresh_gold_adoption():
             eng=SingleTradeEngine(store,brain)
             eng.policy=AutoEvolution(store,Path(d)/'policy.py')
             eng.attach(broker)
-            assert eng.execution_enabled is False  # unresolved-at-login pause
+            # No auto-pause on stale unresolved — stay live; adopt clears journal.
+            assert eng.execution_enabled is True
             assert eng.mandate is None
             await eng.sync()
             assert eng.mandate is not None

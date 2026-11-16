@@ -130,7 +130,14 @@ class BrokerSimulation:
             'minSizeIncrement':{'unit':'AMOUNT','value':'.01'}}}
     async def accounts(self):return {'accounts':[{'preferred':True,'accountId':'SIM','currency':'USD','balance':{'balance':1000}}]}
     async def prices(self,epic,resolution='MINUTE',maximum=80):return {'prices':[]}
-    async def confirm(self,ref):return {'dealStatus':'ACCEPTED','dealId':'b2'}
+    async def confirm(self,ref):
+        # Prefer the live open dealId so login reconcile can match epic/dir/size
+        # to the book (audit #31) instead of a hard-coded b2 vs m1 mismatch.
+        if self.open:
+            pos=self.open[0].get('position') or self.open[0]
+            deal=pos.get('dealId') or 'b2'
+            return {'dealStatus':'ACCEPTED','dealId':deal}
+        return {'dealStatus':'ACCEPTED','dealId':'b2'}
     async def update_position(self,deal_id,stop_level=None,profit_level=None):
         self.requests.append(('PROTECT',deal_id,stop_level,profit_level))
         if stop_level is not None:self.open[0]['position']['stopLevel']=float(stop_level)
@@ -258,7 +265,10 @@ def test_login_reconciles_prior_confirmed_request_without_retry():
             s.order_update(oid,'PENDING','known-ref')
             e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));e.policy=AutoEvolution(s,Path(d)/'policy.py')
             e.attach(b)
-            assert not e.execution_enabled
+            # No auto-pause on unresolved-at-login; reconcilable PENDING stays
+            # until confirm, and submit() refuses new OPEN while it remains.
+            assert e.execution_enabled
+            assert s.unresolved()
             assert await e.reconcile_outstanding()
             assert not s.unresolved()
             assert e.execution_enabled
@@ -328,7 +338,10 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
             assert brain.core.last_loss is not None
-            assert any('P&L self-evaluation' in e['message'] for e in s.recent())
+            assert any(
+                ('Closed-trade P&L updated LIVE neural weights' in ev['message']
+                 or 'P&L self-evaluation' in ev['message'])
+                for ev in s.recent())
     async_run(scenario())
 
 

@@ -16,6 +16,14 @@ function show(login){$('login').classList.toggle('hidden',!login);$('dash').clas
 function pct(v){return Math.round((Number(v)||0)*100)+'%'}
 function num(v,d=2){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'—'}
 function pnlClass(v){const n=Number(v);if(!Number.isFinite(n)||n===0)return '';return n>0?'pnl-pos':'pnl-neg'}
+function money(v,ccy){
+  if(v==null||v===''||!Number.isFinite(Number(v)))return '—';
+  return num(v,2)+(ccy?' '+ccy:'');
+}
+function esc(s){
+  return String(s??'').replace(/[&<>"']/g,c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 async function loadBrokers(){
   const data=await api('/api/admin/brokers');
@@ -28,10 +36,6 @@ async function loadBrokers(){
   });
 }
 
-function money(v,ccy){
-  if(v==null||v===''||!Number.isFinite(Number(v)))return '—';
-  return num(v,2)+(ccy?' '+ccy:'');
-}
 function renderSummary(s){
   s=s||{};
   let pnlLabel;
@@ -52,20 +56,67 @@ function renderSummary(s){
   }else{
     pnlLabel='—';
   }
-  // 13 closes with £0 is NOT ok — surface missing Capital cash explicitly.
   let pnlNote='';
   if(closed>0 && cash===0){
-    pnlNote=` · ${closed} slēgti bez broker £`+(pending?` (${pending} pending)`:'')+(proxy?` · ${proxy} ticks_only`:'');
+    pnlNote=` · ${closed} bez £`+(pending?` (${pending} pend)`:'')+(proxy?` · ${proxy} ticks`:'');
   }else if(pending>0){
-    pnlNote=` · ${pending} vēl gaida broker £`;
+    pnlNote=` · ${pending} pending £`;
   }else if(cash>0 && cash<closed){
-    pnlNote=` · broker £ ${cash}/${closed}`;
+    pnlNote=` · £ ${cash}/${closed}`;
   }
   $('summary').innerHTML=`
-    <div class="stat"><span>Klienti</span><b>${s.clients||0}</b></div>
-    <div class="stat"><span>Roboti ON</span><b>${s.running_robots||0}</b></div>
-    <div class="stat"><span>Slēgtie treidi</span><b>${closed}</b></div>
-    <div class="stat"><span>Realizētais P&amp;L (konta valūta)</span><b class="${pnlClass(s.realized_pnl_all)}">${pnlLabel}${pnlNote}</b></div>`;
+    <div class="fleet-cell"><span>Klienti</span><b>${s.clients||0}</b></div>
+    <div class="fleet-cell"><span>Roboti ON</span><b>${s.running_robots||0}</b></div>
+    <div class="fleet-cell"><span>Slēgtie</span><b>${closed}</b></div>
+    <div class="fleet-cell"><span>Realizētais P&amp;L</span><b class="${pnlClass(s.realized_pnl_all)}">${esc(pnlLabel)}${esc(pnlNote)}</b></div>`;
+}
+
+function trailFlag(phase){
+  const p=String(phase||'flat').toLowerCase();
+  const labels={
+    flat:'TRAIL —',
+    unknown:'TRAIL ?',
+    manual:'TRAIL manual',
+    watch:'TRAIL watch',
+    armed:'TRAIL armed',
+    ratchet:'TRAIL ratchet',
+    be_lock:'TRAIL BE',
+    trail:'TRAILING',
+  };
+  const label=labels[p]||(`TRAIL ${p}`);
+  const on=['armed','ratchet','be_lock','trail'].includes(p);
+  return `<span class="flag trail-${esc(p)}${on?'':''}">${esc(label)}</span>`;
+}
+
+function renderDeal(p,ccy){
+  if(!p){
+    return `<div class="deal flat">Nav atvērta pozīcija — robots gaida OPEN</div>`;
+  }
+  const dir=String(p.direction||'').toUpperCase();
+  const sideCls=dir==='BUY'?'buy':(dir==='SELL'?'sell':'');
+  const lot=p.size!=null?String(p.size):'—';
+  const tp=p.has_tp || p.profitLevel!=null;
+  const sl=p.has_sl || p.stopLevel!=null;
+  const phase=p.trail_phase||(p.enrolled?'armed':'flat');
+  const uplCcy=p.currency&&p.currency!==ccy?p.currency:ccy;
+  return `<div class="deal">
+    <div class="side ${sideCls}">${esc(dir||'—')}</div>
+    <div>
+      <div class="lot"><em>LOT</em>${esc(lot)}</div>
+      <div class="deal-meta">
+        <span>Epic <strong>${esc(p.epic||'—')}</strong></span>
+        <span>Entry <strong>${esc(num(p.level,2))}</strong></span>
+        <span>SL <strong>${p.stopLevel==null?'—':esc(num(p.stopLevel,2))}</strong></span>
+        <span>TP <strong>${p.profitLevel==null?'OFF':esc(num(p.profitLevel,2))}</strong></span>
+        <span>UPL <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
+      </div>
+    </div>
+    <div class="flags">
+      <span class="flag ${sl?'on':'off'}">SL ${sl?'ON':'OFF'}</span>
+      <span class="flag ${tp?'on':'off'}">TP ${tp?'ON':'OFF'}</span>
+      ${trailFlag(phase)}
+    </div>
+  </div>`;
 }
 
 function renderCard(c){
@@ -73,12 +124,14 @@ function renderCard(c){
   const running=!!c.robot_running;
   const cid=String(c.id);
   let sc=c.scores||{};
-  if(a.position){
+  const positions=Array.isArray(a.positions)&&a.positions.length
+    ?a.positions
+    :(a.position?[a.position]:[]);
+  const inTrade=positions.length>0;
+  if(inTrade){
     const hasLive=!!(Number(sc.BUY)||Number(sc.HOLD)||Number(sc.SELL));
     const fr0=frozenScoresByClient.get(cid);
     const frEmpty=!fr0||!(Number(fr0.BUY)||Number(fr0.HOLD)||Number(fr0.SELL));
-    // Seed / upgrade freeze once non-zero scores arrive (adopt/restart often
-    // starts at 0% until first manage vote — do not stay stuck forever).
     if(hasLive && (!frozenScoresByClient.has(cid) || frEmpty)){
       frozenScoresByClient.set(cid,{BUY:sc.BUY,HOLD:sc.HOLD,SELL:sc.SELL,action:c.action});
     }
@@ -94,64 +147,77 @@ function renderCard(c){
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';
   const broker=c.broker?`${c.broker.display_name}`:'nav brokera';
   const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+  const day=a.day_book||{};
+  const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
+  const mandateSize=(a.mandate&&a.mandate.size)||'—';
   const trades=(r.recent_trades||[]).slice(0,6).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
     const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
-    return `<div><span>${t.direction||'?'} ${t.epic||''}${src}</span><span class="${cls}">${p==null?'—':money(p,tCcy)}</span></div>`;
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${p==null?'—':esc(money(p,tCcy))}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
+
+  const dealsHtml=inTrade
+    ?positions.map(p=>renderDeal(p,ccy)).join('')
+    :renderDeal(null,ccy);
+
+  const trailNote=(()=>{
+    const live=positions.find(p=>p.trail_status)||positions[0];
+    const st=live&&live.trail_status;
+    const prot=(a.protection&&a.protection.status)||st;
+    if(!inTrade)return '';
+    const active=['armed','ratchet','be_lock','trail'].includes(String((live&&live.trail_phase)||'').toLowerCase());
+    return `<div class="trail-line ${active?'active':''}">${esc(prot||'Trail status nav ziņots')}</div>`;
+  })();
+
+  const cashLine=
+    r.pnl_status==='closed_without_broker_cash'?'⛔ bez broker £':
+    r.pnl_status==='broker_cash_pending'?`⏳ pending ${r.pending_cash_trades||0}`:
+    r.pnl_status==='broker_cash_ok'?'✓ broker £':
+    (r.pnl_status||'—');
+
   const el=document.createElement('article');
-  el.className='card';
+  el.className='strip'+(inTrade?' live':'');
   el.innerHTML=`
     <div class="head">
       <div>
-        <h3>#${c.id} ${c.display_name||c.username}</h3>
-        <div class="muted small">@${c.username} · ${c.language||''} · ${broker}${ccy?' · '+ccy:''}</div>
+        <h3>#${esc(c.id)} ${esc(c.display_name||c.username)}</h3>
+        <div class="who">@${esc(c.username)} · ${esc(c.language||'')} · ${esc(broker)}${ccy?' · '+esc(ccy):''}</div>
       </div>
-      <span class="pill ${pill}">${pillText}</span>
+      <span class="state-pill ${pill}">${pillText}</span>
     </div>
-    <div class="scores">
-      <div class="score buy"><em>BUY</em><b>${pct(sc.BUY)}</b></div>
-      <div class="score"><em>HOLD</em><b>${pct(sc.HOLD)}</b></div>
-      <div class="score sell"><em>SELL</em><b>${pct(sc.SELL)}</b></div>
+    <div class="deals">${dealsHtml}</div>
+    ${trailNote}
+    <div class="nerve">
+      <div class="buy"><em>BUY</em><b>${pct(sc.BUY)}</b></div>
+      <div><em>HOLD</em><b>${pct(sc.HOLD)}</b></div>
+      <div class="sell"><em>SELL</em><b>${pct(sc.SELL)}</b></div>
     </div>
-    <div class="meta">
-      <div><span>Fāze</span><br><strong>${c.phase||'—'}</strong></div>
-      <div><span>Signāls</span><br><strong>${c.action||'—'}</strong></div>
-      <div><span>Neironi</span><br><strong>${e.neurons??'—'}</strong></div>
-      <div><span>Soļi</span><br><strong>${e.steps??0}</strong></div>
-      <div><span>Paaudze (neironi)</span><br><strong>${e.learning_generation??e.generation??0}</strong></div>
-      <div><span>Modeļa versija</span><br><strong>${e.model_version??0}</strong></div>
-      <div><span>Mācību paraugi</span><br><strong>${e.labeled_samples??0}</strong></div>
-      <div><span>M1 virziena precizitāte</span><br><strong>${pct(e.minute_direction_accuracy??e.accuracy_proxy)}</strong></div>
-      <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
-      <div><span>Tirgus</span><br><strong>${a.market||'—'}</strong></div>
-      <div><span>Ticki</span><br><strong>${a.tick_count??0}</strong></div>
-      <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${
+    <div class="facts">
+      <div><span>Signāls</span><strong>${esc(c.action||'—')}</strong></div>
+      <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
+      <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>
+      <div><span>Tirgus</span><strong>${esc(a.market||'—')}</strong></div>
+      <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
+      <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
+      <div><span>P&amp;L realizēts</span><strong class="${pnlClass(r.realized_pnl)}">${
         (r.closed_trades>0 && (r.cash_trades||0)===0)
-          ? ('— · bez broker £'+(r.pending_cash_trades?` (${r.pending_cash_trades} pending)`:''))
-          : (money(r.realized_pnl,ccy)+(r.cash_trades!=null?` · broker ${r.cash_trades||0}/${r.closed_trades||0}`:''))
+          ? ('— · bez £'+(r.pending_cash_trades?` (${r.pending_cash_trades})`:''))
+          : esc(money(r.realized_pnl,ccy))
       }</strong></div>
-      <div><span>P&amp;L + UPL</span><br><strong class="${pnlClass(r.equity_pnl??r.realized_pnl)}">${
-        (r.closed_trades>0 && (r.cash_trades||0)===0 && r.open_upl==null)
-          ? '—'
-          : (money(r.equity_pnl??r.realized_pnl,ccy)+(r.open_upl!=null?` (UPL ${money(r.open_upl,ccy)})`:''))
-      }</strong></div>
-      <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
-      <div><span>Broker £ statuss</span><br><strong>${
-        r.pnl_status==='closed_without_broker_cash'?'⛔ slēgti bez broker £':
-        r.pnl_status==='broker_cash_pending'?`⏳ pending ${r.pending_cash_trades||0}`:
-        r.pnl_status==='broker_cash_ok'?'✓ broker £':
-        (r.pnl_status||'—')
-      }${r.estimate_pnl!=null?` · UPL est. ${money(r.estimate_pnl,ccy)}`:''}</strong></div>
+      <div><span>Broker £</span><strong>${esc(cashLine)}</strong></div>
     </div>
-    <div class="muted small">${e.neural_adapt_reason||e.last_reason||''}${(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)?(' · '+(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)):''}</div>
+    <div class="muted" style="padding:8px 14px;font-size:11px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
+      (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)
+        ?(' · '+esc(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error))
+        :''
+    }</div>
     <div class="trades">${trades}</div>
     <div class="actions">
       <button type="button" class="btn tiny" data-act="start" data-id="${c.id}">Start</button>
-      <button type="button" class="btn tiny" data-act="stop" data-id="${c.id}">Stop</button>
-      <button type="button" class="btn tiny" data-act="resume" data-id="${c.id}">Resume</button>
-      <button type="button" class="btn tiny" data-act="wipe" data-id="${c.id}">Mācīties no jauna</button>
+      <button type="button" class="btn tiny ghost" data-act="stop" data-id="${c.id}">Stop</button>
+      <button type="button" class="btn tiny ghost" data-act="resume" data-id="${c.id}">Resume</button>
+      <button type="button" class="btn tiny ghost" data-act="wipe" data-id="${c.id}">Mācīties no jauna</button>
     </div>`;
   el.querySelectorAll('[data-act]').forEach(btn=>{
     btn.onclick=async()=>{
@@ -186,7 +252,7 @@ async function loadOverview(){
     opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);
   });
   if(prev)pick.value=prev;
-  $('clock').textContent=new Date().toLocaleTimeString('lv-LV');
+  $('clock').textContent=new Date().toLocaleTimeString('lv-LV',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 
 async function enterDash(){

@@ -3,52 +3,64 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Neural Trading · Admin Control</title>
+  <title>NEURAL · Signal Deck</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/admin/static/admin.css">
 </head>
 <body>
-  <div id="login" class="wrap">
-    <form id="loginForm" class="box">
-      <h1>Admin Control</h1>
-      <p class="muted">Galvenais panelis — klienti, neironi, aktivitāte, rezultāti. Brokeru API tikai šeit.</p>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <div class="scan" aria-hidden="true"></div>
+
+  <div id="login" class="gate">
+    <form id="loginForm" class="gate-panel">
+      <p class="brand-mark">NEURAL</p>
+      <h1>Signal Deck</h1>
+      <p class="lede">Operator access — live lot, side, TP, trail. Not a classic panel.</p>
       <label>Lietotājvārds<input name="username" required autocomplete="username"></label>
       <label>Parole<input name="password" type="password" required autocomplete="current-password"></label>
-      <button class="btn" type="submit">Ienākt</button>
+      <button class="btn pulse" type="submit">Enter deck</button>
       <p id="loginError" class="error"></p>
-      <p class="muted small">Portāls: <a href="/">/</a> · Klients: <a href="/app">/app</a></p>
+      <p class="links">Portāls <a href="/">/</a> · Klients <a href="/app">/app</a></p>
     </form>
   </div>
 
-  <div id="dash" class="wrap wide hidden">
-    <header class="bar">
-      <div>
-        <strong>Admin · Main Control Panel</strong>
-        <span class="muted">Visi klienti · neironi · aktivitāte · P&amp;L</span>
+  <div id="dash" class="deck hidden">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="brand-mark">NEURAL</p>
+        <h1>Signal Deck</h1>
+        <p class="lede">Live client truth — lot · side · TP · trail</p>
+        <div class="hero-actions">
+          <button type="button" id="refreshBtn" class="btn">Atsvaidzināt</button>
+          <button type="button" id="resetLearningBtn" class="btn ghost">Mācīties no jauna</button>
+          <a class="btn ghost" href="/app" target="_blank" rel="noopener">Klienta /app</a>
+          <button type="button" id="logoutBtn" class="btn ghost">Iziet</button>
+        </div>
       </div>
-      <div class="bar-actions">
-        <span id="clock" class="muted small"></span>
-        <button type="button" id="refreshBtn" class="btn ghost">Atsvaidzināt</button>
-        <button type="button" id="resetLearningBtn" class="btn ghost" title="Izdzēš neironu vēsturi; klienti paliek">Mācīties no jauna</button>
-        <a class="btn ghost" href="/app" target="_blank">Klienta /app</a>
-        <button type="button" id="logoutBtn" class="btn">Iziet</button>
+      <div class="hero-pulse" aria-hidden="true">
+        <span class="ring"></span>
+        <span class="ring delay"></span>
+        <span id="clock" class="clock"></span>
       </div>
     </header>
 
-    <section id="summary" class="summary"></section>
+    <section id="summary" class="fleet-rail" aria-label="Fleet summary"></section>
 
-    <section class="panel">
-      <div class="row">
-        <h2>Kontroles telpa</h2>
-        <span class="muted small">Automātiski ik 5 s</span>
+    <section class="stage">
+      <div class="stage-head">
+        <h2>Live clients</h2>
+        <span class="muted">Automātiski ik 5 s · deal strip = notikums</span>
       </div>
-      <div id="controlRoom" class="cards"></div>
+      <div id="controlRoom" class="strips"></div>
     </section>
 
-    <details class="panel setup">
-      <summary><strong>Reģistrācija · jauns klients / brokeris</strong></summary>
-      <div class="grid">
+    <details class="ops">
+      <summary>Reģistrācija · jauns klients / brokeris</summary>
+      <div class="ops-grid">
         <article>
-          <h2>Jauns klients</h2>
+          <h3>Jauns klients</h3>
           <form id="createForm">
             <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
             <label>Parole<input name="password" required minlength="4" maxlength="256" placeholder="••••••••"></label>
@@ -60,12 +72,12 @@
                 <option value="ru">Русский</option>
               </select>
             </label>
-            <button class="btn primary" type="submit">Izveidot klientu</button>
+            <button class="btn" type="submit">Izveidot klientu</button>
             <p id="createMsg" class="muted"></p>
           </form>
         </article>
         <article>
-          <h2>Pieslēgt brokeri klientam</h2>
+          <h3>Pieslēgt brokeri</h3>
           <form id="brokerForm">
             <label>Klients
               <select name="client_id" id="brokerClient" required></select>
@@ -77,7 +89,7 @@
             <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
             <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
             <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
-            <button class="btn primary" type="submit">Saglabāt un palaist robotu</button>
+            <button class="btn" type="submit">Saglabāt un palaist</button>
             <p id="brokerMsg" class="muted"></p>
           </form>
         </article>

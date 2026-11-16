@@ -31,6 +31,82 @@ class AccountRuntime:
     last_start_error: Optional[str]=None
     started: bool=False
 
+    @staticmethod
+    def _deal_protection_truth(engine, position, brief=None) -> dict:
+        """Admin-facing SL/TP/trail truth for one live deal."""
+        p=position if isinstance(position,dict) else {}
+        deal=str(p.get('dealId') or '')
+        brief=brief if isinstance(brief,dict) else (getattr(engine,'protection_brief',None) or {})
+        store=getattr(engine,'store',None)
+        robot=bool(store and deal and store.get('robot_open:'+deal))
+        meta=(store.get('adaptive_protection:'+deal) if store and deal else None) or {}
+        runtime=(store.get('adaptive_runtime:'+deal) if store and deal else None) or {}
+        has_sl=p.get('stopLevel') is not None
+        has_tp=p.get('profitLevel') is not None
+        enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
+        phase='flat'
+        if not deal:
+            phase='unknown'
+        elif not robot:
+            phase='manual'
+        elif not enrolled:
+            phase='watch'
+        else:
+            prop=brief.get('proposal') if isinstance(brief.get('proposal'),dict) else {}
+            cand=(runtime.get('phase') or prop.get('phase')
+                  or brief.get('phase') or '')
+            status=str(brief.get('status') or '').lower()
+            if cand in ('watch','armed','ratchet','be_lock','trail'):
+                phase=cand
+            elif 'waiting for adaptive arm' in status:
+                phase='watch'
+            elif 'confirmed trail' in status or runtime.get('status')=='CONFIRMED':
+                phase='trail'
+            elif 'be' in status and 'lock' in status:
+                phase='be_lock'
+            elif 'ratchet' in status:
+                phase='ratchet'
+            elif enrolled:
+                phase='armed'
+            else:
+                phase='watch'
+        # Only attach brief text when it belongs to this deal (or sole open).
+        brief_deal=str(brief.get('deal_id') or '')
+        sole=len(getattr(engine,'positions',None) or [])==1
+        status_txt=None
+        if brief_deal==deal or (sole and brief.get('status')):
+            status_txt=brief.get('status')
+        return {
+            'has_sl':has_sl,
+            'has_tp':has_tp,
+            'robot_open':robot,
+            'enrolled':enrolled,
+            'trail_phase':phase,
+            'trail_status':status_txt,
+            'original_risk':meta.get('original_risk') if isinstance(meta,dict) else None,
+            'last_trail_stop':runtime.get('stop') if isinstance(runtime,dict) else None,
+        }
+
+    def _enrich_positions(self,engine,positions,brief=None) -> list:
+        out=[]
+        for p in positions or []:
+            if not isinstance(p,dict):
+                continue
+            truth=self._deal_protection_truth(engine,p,brief=brief)
+            out.append({
+                'dealId':p.get('dealId'),
+                'epic':p.get('epic'),
+                'direction':p.get('direction'),
+                'size':p.get('size'),
+                'level':p.get('level'),
+                'stopLevel':p.get('stopLevel'),
+                'profitLevel':p.get('profitLevel'),
+                'upl':p.get('upl'),
+                'currency':p.get('currency'),
+                **truth,
+            })
+        return out
+
     def client_view(self) -> dict:
         snap=self.engine.snapshot()
         signal=snap.get('signal') or {}
@@ -39,6 +115,8 @@ class AccountRuntime:
         mandate=snap.get('mandate')
         positions=snap.get('positions') or []
         manage=snap.get('manage_signal') if isinstance(snap.get('manage_signal'),dict) else None
+        brief=snap.get('adaptive_protection') if isinstance(snap.get('adaptive_protection'),dict) else None
+        enriched=self._enrich_positions(self.engine,positions,brief=brief)
         # After restart last_signal is empty until the first completed M1+fusion
         # vote — surface the latest journaled scores so admin is not stuck at 0%.
         # Never do this while a LIVE deal is open: journal rows may be mid-trade
@@ -79,6 +157,7 @@ class AccountRuntime:
             adapt_reason=('Reverse watch {0} (manage)'.format(manage.get('action')))
         else:
             adapt_reason=(snap.get('neural_adapt_reason') or code.get('last_reason'))
+        day_book=snap.get('day_book') if isinstance(snap.get('day_book'),dict) else None
         return {
             'phase':phase,
             'connected':bool(self.engine.broker),
@@ -86,7 +165,10 @@ class AccountRuntime:
             'armed':bool(snap.get('armed')),
             'operator_paused':bool(getattr(self.engine,'operator_paused',False)),
             'mandate':mandate,
-            'position':positions[0] if positions else None,
+            'position':enriched[0] if enriched else None,
+            'positions':enriched,
+            'protection':brief,
+            'day_book':day_book,
             'scores':{
                 'BUY':float(scores.get('BUY') or 0),
                 'HOLD':float(scores.get('HOLD') or 0),
@@ -318,6 +400,7 @@ class RuntimeHub:
             },
             'activity':{
                 'tick_count':0,'market':None,'mandate':None,'position':None,
+                'positions':[],'protection':None,'day_book':None,
                 'entry_block_reason':None,'error':None,'last_start_error':None,
             },
             'last_start_error':self._start_errors.get(cid),
@@ -386,6 +469,10 @@ class RuntimeHub:
                     'market_status':(snap.get('market') or {}).get('status'),
                     'mandate':view.get('mandate'),
                     'position':view.get('position'),
+                    'positions':view.get('positions') or (
+                        [view['position']] if view.get('position') else []),
+                    'protection':view.get('protection') or snap.get('adaptive_protection'),
+                    'day_book':view.get('day_book') or snap.get('day_book'),
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')
                                                or snap.get('entry_can_submit_now')),

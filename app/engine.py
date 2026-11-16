@@ -2450,8 +2450,8 @@ class SingleTradeEngine:
                         continue
                     await self.adapt_protection(p)
                 # Fall through: day book may ADD another position on a new bar.
-            _poll_scores=((self.last_signal or {}).get('scores')
-                          if isinstance(self.last_signal,dict) else None)
+            # Multi-pos ADD edge from manage scores — frozen OPEN often HOLD-tilted.
+            _poll_scores,_poll_src=self._entry_vote_scores()
             _poll_edge=(self.policy.score_edge(_poll_scores)
                         if _poll_scores and hasattr(self.policy,'score_edge') else None)
             book_allows=day_book.allows_new_open(
@@ -2460,7 +2460,7 @@ class SingleTradeEngine:
                 epic=(self.mandate or {}).get('epic'),
                 mandate_epic=(self.mandate or {}).get('epic'),
                 score_edge=_poll_edge).get('allowed')
-            if (book_allows and self.last_signal and
+            if (book_allows and (_poll_scores or self.last_signal) and
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
                 # After fusion transition, refuse new entries while EXTERNAL data
@@ -2549,6 +2549,27 @@ class SingleTradeEngine:
         return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
                 'readiness':readiness,'economic_utility':None,'hard_risk':hr}
 
+    def _entry_vote_scores(self):
+        """Scores for flat OPEN or multi-pos ADD.
+
+        While a deal is live, Admin keeps the frozen OPEN vote — but ADD must
+        use the fresh manage perceive scores. Frozen HOLD-tilt OPEN votes were
+        blocking every multi-pos add (add_needs_stronger_edge forever).
+        """
+        if self.positions and isinstance(getattr(self,'_manage_signal',None),dict):
+            ms=self._manage_signal.get('scores')
+            if isinstance(ms,dict) and self.policy and self.policy._safe_scores(ms):
+                return dict(ms),'manage'
+        if isinstance(self.last_signal,dict):
+            raw=(self.last_signal.get('scores_raw')
+                 if isinstance(self.last_signal.get('scores_raw'),dict) else None)
+            if raw and self.policy and self.policy._safe_scores(raw):
+                return dict(raw),'entry_raw'
+            sc=self.last_signal.get('scores')
+            if isinstance(sc,dict) and self.policy and self.policy._safe_scores(sc):
+                return dict(sc),'entry'
+        return {},'none'
+
     def _entry_evaluation(self):
         if not self.market_context.get('ready',False):
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
@@ -2559,7 +2580,11 @@ class SingleTradeEngine:
                     'reason':'External fusion gap blocks new entry: '+(
                         self.fusion_block_reason or 'aligned external neural inputs unavailable'),
                     'evidence':None,'fusion_gap':True,'fusion_block':self.fusion_block_reason}
-        if not self.last_signal or not self.mandate or self.brain.epic!=self.mandate['epic']:
+        if not self.mandate or self.brain.epic!=self.mandate['epic']:
+            return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
+                    'reason':'Waiting for same-instrument neural signal','evidence':None}
+        base_scores,vote_src=self._entry_vote_scores()
+        if not base_scores:
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
                     'reason':'Waiting for same-instrument neural signal','evidence':None}
         ctx=self.market_context or {}
@@ -2567,15 +2592,9 @@ class SingleTradeEngine:
         history=list(self.brain.history)
         # Adaptive structure edge: soft-nudge scores from learned EV by frame×side.
         # Never a hard veto — neurons still vote; £ teacher corrects after closes.
-        # Always nudge from scores_raw (neural) — never re-nudge already-nudged
-        # scores (Admin/poll re-entry used to compound HOLD tilt → false HOLD).
-        base_scores=dict(
-            (self.last_signal.get('scores_raw')
-             if isinstance(self.last_signal.get('scores_raw'),dict)
-             else None)
-            or self.last_signal.get('scores')
-            or {})
-        if not self.last_signal.get('scores_raw'):
+        # Always nudge from raw vote scores — never re-nudge already-nudged copies.
+        if (isinstance(self.last_signal,dict) and not self.positions
+                and not self.last_signal.get('scores_raw')):
             self.last_signal=dict(self.last_signal,scores_raw=dict(base_scores))
         edge_advice=self._structure_edge_advice()
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
@@ -2589,10 +2608,12 @@ class SingleTradeEngine:
             nudged_scores,phase=phase,store=self.store)
         nudged_scores,phase_meta=day_book.soft_nudge_day_phase(
             nudged_scores,phase=phase,store=self.store)
-        self.last_signal=dict(
-            self.last_signal,scores=dict(nudged_scores),
-            structure_edge=edge_advice,structure_nudge=nudge_meta,
-            day_book=db_snap,day_conviction=conv_meta,day_phase_nudge=phase_meta)
+        # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.
+        if isinstance(self.last_signal,dict) and not self.positions:
+            self.last_signal=dict(
+                self.last_signal,scores=dict(nudged_scores),
+                structure_edge=edge_advice,structure_nudge=nudge_meta,
+                day_book=db_snap,day_conviction=conv_meta,day_phase_nudge=phase_meta)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -2603,7 +2624,8 @@ class SingleTradeEngine:
             spread_bps=self._spread_bps())
         result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
                     day_book=db_snap,day_conviction=conv_meta,
-                    day_phase_nudge=phase_meta,scores=nudged_scores)
+                    day_phase_nudge=phase_meta,scores=nudged_scores,
+                    vote_source=vote_src)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -4723,9 +4745,11 @@ class SingleTradeEngine:
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             learned=bracket_learn.load_multipliers(self.store)
             cycle_state=unified_cycle.load_state(self.store)
-            scores=(self.last_signal or {}).get('scores')
+            scores,_vote_src=self._entry_vote_scores()
+            if not scores and isinstance(self.last_signal,dict):
+                scores=self.last_signal.get('scores')
             score_edge=(self.policy.score_edge(scores) if scores else None)
-            evaluation={'action':action,'score_edge':score_edge}
+            evaluation={'action':action,'score_edge':score_edge,'vote_source':_vote_src}
             pkg=unified_cycle.compose_open(
                 action=action,scores=scores,evaluation=evaluation,zone=zone,
                 learned=learned,cycle_state=cycle_state,base_sl=base_sl,
@@ -4779,6 +4803,23 @@ class SingleTradeEngine:
             size_grid=dealing_size_grid(market,mandate_size=self.mandate['size'])
             # Day book: equity risk → adaptive lot; multi-pos when capacity remains.
             equity=self._account_equity()
+            # When Capital omits valueOfOnePip, lot stayed glued to mandate forever.
+            # Calibrate tick_value so mandate size ≈ day risk_per_trade at this stop.
+            tick_val_src='capital'
+            if tick_val is None and brackets.get('stop_ticks') and equity:
+                try:
+                    params=day_book.load_params(self.store)
+                    bmap=day_book.budgets(
+                        equity=equity,params=params,
+                        daily=day_book.load_daily(self.store,equity=equity))
+                    rpt=_num(bmap.get('risk_per_trade'))
+                    msize=float(Decimal(str(self.mandate['size'])))
+                    st=float(brackets['stop_ticks'])
+                    if rpt and rpt>0 and msize>0 and st>0:
+                        tick_val=rpt/(msize*st)
+                        tick_val_src='mandate_risk_calibrated'
+                except Exception:
+                    tick_val=None
             plan=day_book.plan_open(
                 store=self.store,equity=equity,mandate_size=self.mandate['size'],
                 stop_ticks=brackets.get('stop_ticks'),tick_value=tick_val,
@@ -4847,6 +4888,7 @@ class SingleTradeEngine:
                     'source':size_grid.get('source')},
                 'stop_ticks':int(brackets['stop_ticks']),
                 'tick_value':float(tick_val) if tick_val is not None else None,
+                'tick_value_source':tick_val_src,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'phase':plan.get('phase'),'day_budgets':plan.get('budgets'),
                 'open_gated':False})
@@ -5058,8 +5100,7 @@ class SingleTradeEngine:
             if self.store.unresolved():
                 return 'Unresolved broker operation'
         if self.positions:
-            _scores=((self.last_signal or {}).get('scores')
-                     if isinstance(self.last_signal,dict) else None)
+            _scores,_=self._entry_vote_scores()
             _edge=(self.policy.score_edge(_scores)
                    if _scores and hasattr(self.policy,'score_edge') else None)
             book=day_book.allows_new_open(
@@ -5101,8 +5142,7 @@ class SingleTradeEngine:
     def snapshot(self):
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or a.get('accountId')==self.account.get('currentAccountId')),account[0] if account else {})
-        _snap_scores=((self.last_signal or {}).get('scores')
-                      if isinstance(self.last_signal,dict) else None)
+        _snap_scores,_=self._entry_vote_scores()
         _snap_edge=(self.policy.score_edge(_snap_scores)
                     if _snap_scores and hasattr(self.policy,'score_edge') else None)
         book_open=day_book.allows_new_open(

@@ -3323,9 +3323,11 @@ class SingleTradeEngine:
             'at':now(),'pnl':val,'currency':currency,'action':action})
         hard_risk.record_realized_pnl(self.store,val)
         equity=self._account_equity()
+        # Phase DONE vs PROTECT: count siblings still open — never this deal.
+        open_n=len([p for p in (self.positions or [])
+                    if str(p.get('dealId'))!=deal])
         day_book.record_close(
-            self.store,pnl=val,equity=equity,
-            open_count=len(self.positions or []))
+            self.store,pnl=val,equity=equity,open_count=open_n)
         self._settle_unified_cycle(
             pnl=val,action=action,exit_reason=exit_reason,deal_id=deal,
             scratch_band=scratch_band)

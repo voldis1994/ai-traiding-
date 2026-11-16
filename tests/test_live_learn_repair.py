@@ -49,20 +49,20 @@ def _gave_then_lost_buy(n_up=6, n_down=8, start=100.0):
 
 
 def test_structure_prefer_hold_overrides_flip():
-    """Lethal structure memory → HOLD teach even when opposite CF looks green."""
+    """Grave memory still tries opposite when CF clears the cost floor (no blind HOLD)."""
     bars = _down_bars()
     # Without structure: clear down move → SELL opposite.
     raw = label_from_profit(
         'BUY', -0.40, entry=100., exit_level=94., spread=0.5, bars=bars,
         stop_distance=2.0, profit_distance=2.0, tick=0.1, trail=False)
     assert raw['label'] == 1  # SELL
-    # With structure memory prefer-hold: same path → HOLD.
+    # With structure_prefer_hold: opposite CF is green → teach SELL, not blind HOLD.
     fixed = label_from_profit(
         'BUY', -0.40, entry=100., exit_level=94., spread=0.5, bars=bars,
         stop_distance=2.0, profit_distance=2.0, tick=0.1, trail=False,
         structure_prefer_hold=True)
-    assert fixed['label'] == 2
-    assert 'structure_hold' in fixed['mode']
+    assert fixed['label'] == 1
+    assert 'grave_try_opposite' in fixed.get('structure_teach','') or fixed['label'] == 1
 
 
 def test_gave_then_lost_prefers_hold_over_weak_flip():

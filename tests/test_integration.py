@@ -123,10 +123,21 @@ class BrokerSimulation:
         'decimalPlacesFactor':2},
         # valueOfOnePip required so hard-risk cash_risk can be computed for OPEN.
         'instrument':{'onePipMeans':.01,'valueOfOnePip':1.0},
-        'dealingRules':{'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'}}}
+        'dealingRules':{
+            'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'},
+            'minDealSize':{'unit':'AMOUNT','value':'.01'},
+            'maxDealSize':{'unit':'AMOUNT','value':'100'},
+            'minSizeIncrement':{'unit':'AMOUNT','value':'.01'}}}
     async def accounts(self):return {'accounts':[{'preferred':True,'accountId':'SIM','currency':'USD','balance':{'balance':1000}}]}
     async def prices(self,epic,resolution='MINUTE',maximum=80):return {'prices':[]}
-    async def confirm(self,ref):return {'dealStatus':'ACCEPTED','dealId':'b2'}
+    async def confirm(self,ref):
+        # Prefer the live open dealId so login reconcile can match epic/dir/size
+        # to the book (audit #31) instead of a hard-coded b2 vs m1 mismatch.
+        if self.open:
+            pos=self.open[0].get('position') or self.open[0]
+            deal=pos.get('dealId') or 'b2'
+            return {'dealStatus':'ACCEPTED','dealId':deal}
+        return {'dealStatus':'ACCEPTED','dealId':'b2'}
     async def update_position(self,deal_id,stop_level=None,profit_level=None):
         self.requests.append(('PROTECT',deal_id,stop_level,profit_level))
         if stop_level is not None:self.open[0]['position']['stopLevel']=float(stop_level)
@@ -189,13 +200,35 @@ def test_uncertain_order_does_not_retry():
     async_run(scenario())
 
 
-def test_multi_position_detected_pauses_execution():
+def test_multi_position_same_epic_stays_live_for_day_book():
+    """Same-instrument multi-pos is allowed by day_book — do not disarm."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
             b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'SIM'}})
             e.attach(b);await e.sync()
-            assert not e.armed and not e.execution_enabled
+            assert len(e.positions)==2
+            assert e._paused_for_multi is False
+            assert e.armed and e.execution_enabled
+    async_run(scenario())
+
+
+def test_multi_position_foreign_epic_blocks_day_book_add():
+    """Foreign epic in the book blocks new OPEN (mandate stays one market)."""
+    from app import day_book
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
+            e.attach(b);await e.sync()  # adopt SIM m1
+            b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'OTHER'}})
+            await e.sync()
+            gate=day_book.allows_new_open(
+                store=s,equity=10_000.0,positions=e.positions,
+                epic='SIM',mandate_epic='SIM',score_edge=0.2)
+            assert gate['allowed'] is False
+            assert gate['reason']=='foreign_epic_open'
+            # Robot stays live — day book blocks adds, no auto-pause.
+            assert e.armed and e.execution_enabled
     async_run(scenario())
 
 
@@ -232,7 +265,10 @@ def test_login_reconciles_prior_confirmed_request_without_retry():
             s.order_update(oid,'PENDING','known-ref')
             e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));e.policy=AutoEvolution(s,Path(d)/'policy.py')
             e.attach(b)
-            assert not e.execution_enabled
+            # No auto-pause on unresolved-at-login; reconcilable PENDING stays
+            # until confirm, and submit() refuses new OPEN while it remains.
+            assert e.execution_enabled
+            assert s.unresolved()
             assert await e.reconcile_outstanding()
             assert not s.unresolved()
             assert e.execution_enabled
@@ -302,7 +338,10 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
             assert brain.core.last_loss is not None
-            assert any('P&L self-evaluation' in e['message'] for e in s.recent())
+            assert any(
+                ('Closed-trade P&L updated LIVE neural weights' in ev['message']
+                 or 'P&L self-evaluation' in ev['message'])
+                for ev in s.recent())
     async_run(scenario())
 
 

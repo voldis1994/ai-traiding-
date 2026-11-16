@@ -1,12 +1,155 @@
 """Dimensional stop/take helpers.
 
-Adopted lot size + instrument are the operator risk frame. SL distance uses the
-broker minimum (+ spread buffer) scaled by a *learned* sl_scale — not a frozen
-20-tick invent. TP = kappa * SL with learned kappa.
+Instrument is the operator mandate. Lot size is robot-sized by ``day_book`` from
+equity risk, then **snapped to Capital.com dealingRules** (minDealSize /
+minSizeIncrement / maxDealSize) — never invented fractions like 0.1009.
+SL/TP distances snap to the broker price tick grid.
 """
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 D = lambda value: Decimal(str(value))
+
+
+def broker_wire_number(value):
+    """JSON-safe number with no binary float dust (Capital rejects dirty sizes)."""
+    x = D(value)
+    if not x.is_finite():
+        raise ValueError('non-finite broker number')
+    # Fixed-point string → float round-trips cleanly for Capital payloads.
+    text = format(x.normalize(), 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    if text in ('', '-'):
+        text = '0'
+    return float(text) if '.' in text else int(text)
+
+
+def _rule_value(rules, *names):
+    """Read Capital dealingRules.{name}.value → Decimal, or None."""
+    rules = rules or {}
+    for name in names:
+        raw = rules.get(name)
+        if not isinstance(raw, dict):
+            continue
+        try:
+            v = D(raw.get('value'))
+        except Exception:
+            continue
+        if v.is_finite() and v > 0:
+            return v
+    return None
+
+
+def dealing_size_grid(market=None, *, mandate_size=None):
+    """Capital.com lot grid from GET /markets/{epic} dealingRules.
+
+    Fields (Capital): minDealSize, maxDealSize, minSizeIncrement.
+    If Capital omits the grid, fall back to the adopted mandate size as the
+    only legal step/min — never invent a fractional lot.
+    """
+    market = market or {}
+    rules = market.get('dealingRules') if isinstance(market, dict) else None
+    if rules is None and isinstance(market, dict):
+        rules = market  # allow passing dealingRules directly
+    rules = rules or {}
+    min_size = _rule_value(rules, 'minDealSize')
+    max_size = _rule_value(rules, 'maxDealSize')
+    step = _rule_value(rules, 'minSizeIncrement', 'dealSizeStep', 'minDealSize')
+    seed = None
+    if mandate_size is not None:
+        try:
+            seed = D(mandate_size)
+            if not seed.is_finite() or seed <= 0:
+                seed = None
+        except Exception:
+            seed = None
+    source = 'capital_dealing_rules'
+    if step is None and seed is not None:
+        step = seed
+        source = 'mandate_fallback'
+    if min_size is None and seed is not None:
+        min_size = seed
+    if min_size is None and step is not None:
+        min_size = step
+    if step is None and min_size is not None:
+        step = min_size
+    if max_size is not None and min_size is not None and max_size < min_size:
+        max_size = min_size
+    return {
+        'min': min_size,
+        'max': max_size,
+        'step': step,
+        'source': source,
+        'ok': bool(min_size is not None and step is not None and step > 0),
+    }
+
+
+def snap_deal_size(raw, *, min_size, step, max_size=None):
+    """Floor raw lot onto Capital size grid. Returns Decimal or None if illegal."""
+    try:
+        q = D(raw); mn = D(min_size); st = D(step)
+    except Exception:
+        return None
+    if not q.is_finite() or not mn.is_finite() or not st.is_finite():
+        return None
+    if st <= 0 or mn <= 0 or q <= 0:
+        return None
+    mx = None
+    if max_size is not None:
+        try:
+            mx = D(max_size)
+            if not mx.is_finite() or mx < mn:
+                mx = None
+        except Exception:
+            mx = None
+    capped = q if mx is None else min(q, mx)
+    # Exact grid: n * step, never 0.1009 dust.
+    n = (capped / st).to_integral_value(rounding=ROUND_FLOOR)
+    sized = n * st
+    if sized < mn:
+        # Jump to min if min itself sits on the step grid; else next step ≥ min.
+        if (mn / st) == (mn / st).to_integral_value():
+            sized = mn
+        else:
+            sized = (mn / st).to_integral_value(rounding=ROUND_CEILING) * st
+    if mx is not None and sized > mx:
+        sized = (mx / st).to_integral_value(rounding=ROUND_FLOOR) * st
+    if sized < mn or sized <= 0:
+        return None
+    # Normalize (1.0 → 1, 0.10 → 0.1) so wire form matches Capital.
+    return sized.normalize() if sized == sized.to_integral_value() else sized
+
+
+def on_deal_size_grid(size, *, min_size, step, max_size=None):
+    """True only when size is an exact Capital grid point."""
+    snapped = snap_deal_size(size, min_size=min_size, step=step, max_size=max_size)
+    if snapped is None:
+        return False
+    try:
+        return D(size) == D(snapped)
+    except Exception:
+        return False
+
+
+def snap_distance(raw, tick, *, minimum=None, round_up=True):
+    """Snap SL/TP distance to the broker price tick grid (Capital POINTS)."""
+    try:
+        q = D(raw); t = D(tick)
+    except Exception:
+        return None
+    if not q.is_finite() or not t.is_finite() or t <= 0 or q <= 0:
+        return None
+    n = (q / t).to_integral_value(
+        rounding=ROUND_CEILING if round_up else ROUND_FLOOR)
+    out = n * t
+    if minimum is not None:
+        try:
+            mn = D(minimum)
+            if mn.is_finite() and mn > 0 and out < mn:
+                out = (mn / t).to_integral_value(rounding=ROUND_CEILING) * t
+        except Exception:
+            pass
+    return out.normalize() if out == out.to_integral_value() else out
 
 
 def _bar_spans(candles):

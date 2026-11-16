@@ -7,19 +7,19 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=90">
 </head>
 <body>
   <div id="login" class="gate">
     <form id="loginForm" class="gate-panel">
       <p class="brand-mark">NEURAL</p>
       <h1>Ops Board</h1>
-      <p class="lede">Pilnekrāna operators — lot, side, TP, trail, P&amp;L.</p>
+      <p class="lede">Klienta kartiņas · lot · TP · trail · P&amp;L · W/L</p>
       <label>Lietotājvārds<input name="username" required autocomplete="username"></label>
       <label>Parole<input name="password" type="password" required autocomplete="current-password"></label>
       <button class="btn" type="submit">Ienākt</button>
       <p id="loginError" class="error"></p>
-      <p class="links">Portāls <a href="/">/</a> · Klients <a href="/app">/app</a></p>
+      <p class="links"><a href="/">/</a> · <a href="/app">/app</a></p>
     </form>
   </div>
 
@@ -27,7 +27,7 @@
     <header class="topbar">
       <div class="topbar-brand">
         <span class="brand-mark">NEURAL</span>
-        <span class="topbar-sub">Ops Board · fullscreen</span>
+        <span class="topbar-sub">Ops Board · kartiņas</span>
       </div>
       <div class="topbar-actions">
         <span id="clock" class="clock"></span>
@@ -38,8 +38,8 @@
       </div>
     </header>
 
-    <section id="summary" class="fleet" aria-label="Fleet"></section>
-    <section id="controlRoom" class="clients" aria-label="Clients"></section>
+    <section id="summary" class="fleet"></section>
+    <section id="controlRoom" class="cards"></section>
 
     <details class="ops">
       <summary>Reģistrācija · jauns klients / brokeris</summary>
@@ -47,7 +47,7 @@
         <article>
           <h3>Jauns klients</h3>
           <form id="createForm">
-            <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
+            <label>Login<input name="username" required maxlength="64"></label>
             <label>Parole<input name="password" required minlength="4" maxlength="256"></label>
             <label>Vārds<input name="display_name" maxlength="120"></label>
             <label>Valoda
@@ -77,6 +77,6 @@
       </div>
     </details>
   </div>
-  <script src="/admin/static/admin.js"></script>
+  <script src="/admin/static/admin.js?v=90"></script>
 </body>
 </html>

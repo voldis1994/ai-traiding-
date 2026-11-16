@@ -82,3 +82,7 @@ def test_working_pnl_and_wl_from_mixed_estimates():
         assert stats['display_losses'] == 2
         assert stats['wins'] == 0  # broker cash W/L still honest zero
         assert stats['wl_source'] == 'upl_estimate'
+        ledger = stats['pnl_ledger']
+        assert len(ledger) == 4
+        assert all(row['source'] == 'upl_estimate' for row in ledger)
+        assert sum(row['pnl'] for row in ledger) == pytest.approx(-0.28)

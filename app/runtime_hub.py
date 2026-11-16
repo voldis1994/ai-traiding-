@@ -407,6 +407,12 @@ class RuntimeHub:
             'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
             'recent_trades':recent[:12],
+            # Compact ledger for Admin cards — every closed row with a number.
+            'pnl_ledger':[
+                {'pnl':float(v),'source':'broker'} for v in signed
+            ]+[
+                {'pnl':float(v),'source':'upl_estimate'} for v in estimate_signed
+            ],
         }
 
     def admin_client_card(self,client: dict) -> dict:

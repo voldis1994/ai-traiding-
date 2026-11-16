@@ -321,8 +321,12 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
 
 
 def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
-                    score_edge=None, now=None):
-    """May the robot add/open another deal on the mandated instrument?"""
+                    score_edge=None, now=None, trend_aligned=False):
+    """May the robot add/open another deal on the mandated instrument?
+
+    ``trend_aligned``: live tape matches the open book side (e.g. TREND_UP with
+    BUY open) — then do not demand a huge softmax edge to ADD on the rebound.
+    """
     params = load_params(store)
     daily = load_daily(store, now=now, equity=equity)
     b = budgets(equity=equity, params=params, daily=daily)
@@ -364,20 +368,24 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
             'allowed': False, 'reason': 'day_protect_bank_target',
             'phase': phase, 'daily': daily, 'budgets': b, 'open_count': open_n,
         }
-    # Adding onto an existing book needs a clearer edge than a flat open.
+    # Adding onto an existing book needs a clearer edge than a flat open —
+    # unless the live tape already agrees with the book (clear rebound ADD).
     if open_n > 0:
         need = float(params.get('add_min_edge') or 0.08)
+        if trend_aligned:
+            need = min(need, 0.02)
         edge = _finite(score_edge)
         if edge is None or edge < need:
             return {
                 'allowed': False, 'reason': 'add_needs_stronger_edge',
                 'phase': phase, 'daily': daily, 'budgets': b,
                 'open_count': open_n, 'need_edge': need, 'score_edge': edge,
+                'trend_aligned': bool(trend_aligned),
             }
     return {
         'allowed': True, 'reason': 'day_book_hunt', 'phase': phase,
         'daily': daily, 'budgets': b, 'open_count': open_n,
-        'max_positions': max_pos,
+        'max_positions': max_pos, 'trend_aligned': bool(trend_aligned),
     }
 
 

@@ -2649,6 +2649,41 @@ class SingleTradeEngine:
                 return dict(sc),'entry'
         return {},'none'
 
+    def _day_book_add_edge(self):
+        """Score edge for ADD gates — apply clear-trend anti-HOLD first.
+
+        Admin used to compute edge on raw HOLD-dominated manage votes, so
+        ``add_needs_stronger_edge`` stuck forever during visible TREND_UP.
+        """
+        scores,src=self._entry_vote_scores()
+        ctx=self.market_context or {}
+        structure=(ctx.get('structure')
+                   or (self._live_ohlc_structure()[0] if self.mandate else None))
+        phase=None
+        try:
+            snap=day_book.snapshot(self.store,equity=self._account_equity(),
+                                   positions=self.positions)
+            phase=snap.get('phase')
+        except Exception:
+            phase=day_book.PHASE_HUNT
+        nudged,meta=day_book.soft_nudge_conviction(
+            scores or {'BUY':0.,'SELL':0.,'HOLD':1.},
+            phase=phase or day_book.PHASE_HUNT,store=self.store,
+            live_trend=ctx.get('trend'),structure=structure,
+            returns_bps=ctx.get('returns_bps'))
+        clear=day_book._clear_trend_side(
+            live_trend=ctx.get('trend'),structure=structure,
+            returns_bps=ctx.get('returns_bps'))
+        aligned=bool(
+            self.positions and clear and all(
+                str(p.get('direction') or '').upper()==clear
+                for p in self.positions if p.get('direction')))
+        edge=None
+        if self.policy and hasattr(self.policy,'score_edge') and nudged:
+            try:edge=self.policy.score_edge(nudged)
+            except Exception:edge=None
+        return nudged,edge,aligned
+
     def _entry_evaluation(self):
         if not self.market_context.get('ready',False):
             return {'action':'HOLD','proposal':'HOLD','threshold':self._adaptive_threshold(),
@@ -2728,11 +2763,18 @@ class SingleTradeEngine:
             score_edge=result.get('score_edge')
             if score_edge is None and hasattr(self.policy,'score_edge'):
                 score_edge=self.policy.score_edge(nudged_scores)
+            _clear=day_book._clear_trend_side(
+                live_trend=ctx.get('trend'),structure=live_structure,
+                returns_bps=ctx.get('returns_bps'))
+            _aligned=bool(
+                self.positions and _clear and all(
+                    str(p.get('direction') or '').upper()==_clear
+                    for p in self.positions if p.get('direction')))
             book=day_book.allows_new_open(
                 store=self.store,equity=equity,positions=self.positions,
                 epic=self.mandate.get('epic'),mandate_epic=self.mandate.get('epic'),
-                score_edge=score_edge)
-            result=dict(result,day_book_gate=book)
+                score_edge=score_edge,trend_aligned=_aligned)
+            result=dict(result,day_book_gate=book,trend_aligned=_aligned)
             if not book.get('allowed'):
                 return dict(result,action='HOLD',reason=book.get('reason') or 'day_book_blocked')
             # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
@@ -5244,22 +5286,21 @@ class SingleTradeEngine:
         if self.operator_paused:
             return 'Paused by operator'
         if self.store.unresolved():
-            # Flat leftovers must not freeze Admin forever.
-            if not self.positions:
-                self.clear_unresolved_on_operator_resume()
-                self._ensure_live_unless_operator_paused()
+            # Flat leftovers must not freeze Admin forever. Also heal stale
+            # PROTECT/OPEN journal rows while a live deal is already on broker —
+            # otherwise "Unresolved broker operation" blocks the whole rebound.
+            self.clear_unresolved_on_operator_resume()
+            self._ensure_live_unless_operator_paused()
             if self.store.unresolved():
                 return 'Unresolved broker operation'
         if self.positions:
-            _scores,_=self._entry_vote_scores()
-            _edge=(self.policy.score_edge(_scores)
-                   if _scores and hasattr(self.policy,'score_edge') else None)
+            _scores,_edge,_aligned=self._day_book_add_edge()
             book=day_book.allows_new_open(
                 store=self.store,equity=self._account_equity(),
                 positions=self.positions,
                 epic=(self.mandate or {}).get('epic'),
                 mandate_epic=(self.mandate or {}).get('epic'),
-                score_edge=_edge)
+                score_edge=_edge,trend_aligned=_aligned)
             if not book.get('allowed'):
                 return (self._existing_open_block_reason()
                         + ' · day book: ' + str(book.get('reason') or book.get('phase')))

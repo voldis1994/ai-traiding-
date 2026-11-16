@@ -61,6 +61,13 @@ def test_allows_multi_when_edge_strong():
         assert denied['allowed'] is False
         assert denied['reason'] == 'add_needs_stronger_edge'
 
+        # Clear TREND_UP with BUY book — low edge is enough to ADD on rebound.
+        aligned = db.allows_new_open(
+            store=s, equity=10_000.0, positions=positions,
+            epic='GOLD', mandate_epic='GOLD', score_edge=0.025,
+            trend_aligned=True)
+        assert aligned['allowed'] is True
+
         ok = db.allows_new_open(
             store=s, equity=10_000.0, positions=positions,
             epic='GOLD', mandate_epic='GOLD', score_edge=0.12)

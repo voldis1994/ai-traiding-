@@ -2139,18 +2139,22 @@ class SingleTradeEngine:
                         self._last_in_trade_protect_bar=bar_t
                         new_closed_bar=True
                         manage=None
+                        # Prefer fused features; if EXTERNAL lags, still perceive on
+                        # OHLC so reverse CLOSE is not frozen by a peer/news gap.
                         if fused is not None:
                             manage=self.brain.tick(
                                 self.market_context['close'],ask-bid,tick,
                                 self.mandate['epic'],dt=60,features=fused,
                                 bar_time=bar_t,external_features=True,
                                 in_position=True)
-                        elif not on_fusion:
-                            manage=self.brain.tick(
-                                self.market_context['close'],ask-bid,tick,
-                                self.mandate['epic'],dt=60,
-                                features=self.market_context['features'],
-                                bar_time=bar_t,in_position=True)
+                        elif self.market_context.get('features') is not None:
+                            # OHLC manage path — works even when brain is on fusion
+                            # schema for flat OPEN (tick returns None on fusion+ohlc
+                            # mismatch). Use a one-shot OHLC forward if needed.
+                            manage=self._manage_perceive_ohlc(
+                                mid=self.market_context['close'],spread=ask-bid,
+                                tick=tick,epic=self.mandate['epic'],bar_t=bar_t,
+                                features=self.market_context['features'])
                         if manage is not None:
                             self._manage_signal={
                                 'scores':dict(manage.get('scores') or {}),
@@ -2159,6 +2163,18 @@ class SingleTradeEngine:
                                 'entry_train':False,'in_position':True,
                                 'trend':self.market_context.get('trend'),
                                 'regime':self.market_context.get('regime')}
+                            # Adopt / restart often clears last_signal — seed the
+                            # Admin freeze lock from first manage vote so UI is
+                            # not stuck at 0% / "waiting for first M1 neural vote".
+                            if (self._locked_entry_signal is None
+                                    and isinstance(self._manage_signal.get('scores'),dict)
+                                    and any(self._manage_signal['scores'].values())):
+                                import copy
+                                seeded=copy.deepcopy(self._manage_signal)
+                                seeded['scores_frozen']=True
+                                seeded['seeded_from_manage']=True
+                                self._locked_entry_signal=seeded
+                                self.last_signal=copy.deepcopy(seeded)
                     next_signal=None
                 elif fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
@@ -4362,6 +4378,48 @@ class SingleTradeEngine:
                     {'type':type(exc).__name__})
                 self._ensure_live_unless_operator_paused()
         finally:self.pending_order=False
+    def _manage_perceive_ohlc(self,*,mid,spread,tick,epic,bar_t,features):
+        """Forward-only manage scores when fusion EXTERNAL is gapped.
+
+        Never fabricates EXTERNAL for a flat OPEN — only while in_position so a
+        peer/news lag cannot freeze reverse CLOSE. Pads last-good tails when
+        present; otherwise zeros the EXTERNAL block (manage exit only).
+        """
+        brain=self.brain
+        if brain is None or features is None:
+            return None
+        try:
+            feats=[float(x) for x in features]
+        except (TypeError,ValueError):
+            return None
+        if brain.feature_schema!=brain.fusion_schema:
+            return brain.tick(mid,spread,tick,epic,dt=60,features=feats,
+                              bar_time=bar_t,in_position=True)
+        from .market_fusion import EXTERNAL_NAMES
+        need=int(brain.ohlc_dim)
+        if len(feats)!=need:
+            return None
+        ext=[0.]*len(EXTERNAL_NAMES)
+        peers=self._last_good_peers
+        news=self._last_good_news
+        liq=self._last_good_liquidity
+        if isinstance(peers,(list,tuple)) and len(peers)>=6:
+            ext[0:6]=[float(x) for x in peers[:6]]
+        if isinstance(news,(list,tuple)) and len(news)>=2:
+            ext[6:8]=[float(x) for x in news[:2]]
+        if isinstance(liq,(list,tuple)) and liq:
+            n=min(len(liq),len(ext)-8)
+            if n>0:
+                ext[-n:]=[float(x) for x in liq[-n:]]
+        fused_vec=feats+ext
+        fdim=int(brain.fusion_dim)
+        if len(fused_vec)<fdim:
+            fused_vec=fused_vec+[0.]*(fdim-len(fused_vec))
+        elif len(fused_vec)>fdim:
+            fused_vec=fused_vec[:fdim]
+        return brain.tick(mid,spread,tick,epic,dt=60,features=fused_vec,
+                          bar_time=bar_t,external_features=True,in_position=True)
+
     def _lock_entry_signal_for_open(self):
         """Pin Admin/UI BUY/HOLD/SELL to the OPEN vote for the whole deal."""
         import copy
@@ -4376,18 +4434,22 @@ class SingleTradeEngine:
             self.last_signal=copy.deepcopy(self._locked_entry_signal)
 
     def _existing_open_block_reason(self):
-        """Name the live deal + UPL; explain 0% scores while waiting for first vote."""
+        """Name the live deal + UPL; explain manage reverse watch vs waiting."""
         if not self.positions:return 'Existing open position'
         p=self.positions[0]
         deal=p.get('dealId')
         upl=_num(p.get('upl'))
-        if self.last_signal is None:
+        manage=self._manage_signal if isinstance(self._manage_signal,dict) else None
+        if self.last_signal is None and not (manage and manage.get('scores')):
             fusion_cold=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                          and getattr(self.brain,'fusion_schema',None) is not None
                          and not self.latest_fusion_ready)
             head=('Existing open position · waiting for neural fusion vote'
                   if fusion_cold else
                   'Existing open position · waiting for first M1 neural vote')
+        elif manage and manage.get('action'):
+            head=('Existing open position · reverse watch ({0})'.format(
+                manage.get('action')))
         else:
             head='Existing open position'
         bits=[head]
@@ -4463,15 +4525,21 @@ class SingleTradeEngine:
             pass
         trade_n=trade_wins+trade_losses
         trade_win_rate=(trade_wins/trade_n) if trade_n else None
-        # In a position neural_decision may report CLOSE — diagnostic only (audit #25).
+        # Exit intent from manage scores when present (frozen OPEN is fallback).
         raw_exit_intent=None
-        if self.positions and self.last_signal:
-            raw_exit_intent=self.policy.neural_decision(
-                self.last_signal['scores'],self.positions[0]['direction'])
+        if self.positions:
+            m_scores=((self._manage_signal or {}).get('scores')
+                      if isinstance(self._manage_signal,dict) else None)
+            s_scores=(self.last_signal or {}).get('scores') if isinstance(self.last_signal,dict) else None
+            use=m_scores or s_scores
+            if use:
+                raw_exit_intent=self.policy.neural_decision(
+                    use,self.positions[0]['direction'])
         decision=(raw_exit_intent if self.positions else
                   (evaluation['action'] if evaluation else 'HOLD'))
         gates=self.live_open_gates(evaluation['action'] if evaluation else None)
-        # Snapshot must never leak mid-trade perceive scores into Admin/UI.
+        # Snapshot publishes locked OPEN (or manage-seeded) scores — not every
+        # mid-trade manage flicker (Admin freezes client-side too).
         if self.positions:
             self._lock_entry_signal_for_open()
         ui_signal=self._locked_entry_signal if (self.positions and self._locked_entry_signal) else self.last_signal

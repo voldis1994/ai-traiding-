@@ -38,6 +38,7 @@ class AccountRuntime:
         neural=snap.get('neural') or {}
         mandate=snap.get('mandate')
         positions=snap.get('positions') or []
+        manage=snap.get('manage_signal') if isinstance(snap.get('manage_signal'),dict) else None
         # After restart last_signal is empty until the first completed M1+fusion
         # vote — surface the latest journaled scores so admin is not stuck at 0%.
         # Never do this while a LIVE deal is open: journal rows may be mid-trade
@@ -57,8 +58,27 @@ class AccountRuntime:
                                 'from_journal':True}
             except Exception:
                 pass
+        # Open deal with cleared last_signal (adopt/restart): show locked OPEN or
+        # first manage vote so Admin is not stuck at 0% forever.
+        if positions and not any(float(scores.get(k) or 0) for k in ('BUY','HOLD','SELL')):
+            for src in (signal, manage):
+                if not isinstance(src,dict):
+                    continue
+                raw=src.get('scores')
+                if isinstance(raw,dict) and any(float(raw.get(k) or 0) for k in ('BUY','HOLD','SELL')):
+                    scores=raw
+                    if not signal.get('action') and src.get('action'):
+                        signal={**signal,'action':src.get('action'),
+                                'from_manage':src is manage}
+                    break
         code=self.engine.policy.info() if self.engine.policy else {}
         phase='guide' if not mandate else 'robot'
+        # Mid-trade: prefer reverse-watch status over a stale "M1 label updated…"
+        # reason that still sits in the store from before the deal opened.
+        if positions and manage and manage.get('action'):
+            adapt_reason=('Reverse watch {0} (manage)'.format(manage.get('action')))
+        else:
+            adapt_reason=(snap.get('neural_adapt_reason') or code.get('last_reason'))
         return {
             'phase':phase,
             'connected':bool(self.engine.broker),
@@ -72,7 +92,7 @@ class AccountRuntime:
                 'HOLD':float(scores.get('HOLD') or 0),
                 'SELL':float(scores.get('SELL') or 0),
             },
-            'action':signal.get('action'),
+            'action':signal.get('action') or (manage or {}).get('action'),
             # Uncalibrated model score — not calibrated profit probability (audit #24).
             'confidence':signal.get('confidence'),
             'model_score':signal.get('model_score',signal.get('confidence')),
@@ -85,8 +105,8 @@ class AccountRuntime:
                 'policy_generation':int(snap.get('policy_generation') or code.get('generation') or 0),
                 'strategy':code.get('strategy'),
                 'attempts':int(code.get('attempts') or 0),
-                'last_reason':(snap.get('neural_adapt_reason') or code.get('last_reason')),
-                'neural_adapt_reason':snap.get('neural_adapt_reason'),
+                'last_reason':adapt_reason,
+                'neural_adapt_reason':adapt_reason,
                 'model_version':neural.get('model_version') or snap.get('neural',{}).get('model_version'),
                 'labeled_samples':int(snap.get('labeled_samples') or 0),
                 'neurons':neural.get('neurons'),
@@ -102,9 +122,10 @@ class AccountRuntime:
             'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
             'model_readiness':snap.get('model_readiness') or snap.get('prep_eval'),
             'hard_risk':snap.get('hard_risk'),
-            'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',True)),
-            'neural_close_executable':False,
+            'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',False)),
+            'neural_close_executable':bool(snap.get('neural_close_executable',True)),
             'neural_exit_intent':snap.get('neural_exit_intent'),
+            'manage_signal':manage,
             'neural_seed':int(getattr(self.brain,'init_seed',0) or 0),
             'error':self.last_error or snap.get('error'),
             'tick_count':snap.get('tick_count') or 0,

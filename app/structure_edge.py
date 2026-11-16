@@ -130,13 +130,16 @@ def compare_frame(store, *, epic, structure):
     return out
 
 
-def soft_nudge_scores(scores, advice, *, store=None):
+def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
     """Gently tilt softmax-ish scores toward adaptive advice — never a hard veto.
 
     Returns (new_scores, meta). If advice is None/weak, scores unchanged.
 
     After tilt, scores are clipped to [0, 1] and renormalized to sum exactly 1
     so ``autonomy._safe_scores`` (sum≈1) does not reject → false HOLD.
+
+    When live multi-TF ``trend`` fights historical frame advice (e.g. advice=BUY
+    but trend=DOWN), skip the nudge — do not keep the robot glued to the old side.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -147,9 +150,17 @@ def soft_nudge_scores(scores, advice, *, store=None):
     conf = float(advice.get('confidence') or 0)
     if conf < 0.35 or strength <= 0:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence'}
+    target = advice['advice']
+    # Live regime flip: historical EV must not fight the current move.
+    trend = (live_trend or '').upper() if isinstance(live_trend, str) else None
+    if target in ('BUY', 'SELL') and trend in ('UP', 'DOWN'):
+        if (target == 'BUY' and trend == 'DOWN') or (target == 'SELL' and trend == 'UP'):
+            return dict(scores), {
+                'nudged': False, 'reason': 'live_trend_disagrees',
+                'target': target, 'live_trend': trend,
+            }
     delta = strength * conf
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
-    target = advice['advice']
     if target in ('BUY', 'SELL'):
         out[target] = out.get(target, 0) + delta
         # Slightly damp the weaker directional side only — HOLD untouched unless

@@ -202,16 +202,26 @@ def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                 best='HOLD'
                 mode_tag=('flip_loss_counterfactual_hold' if flip_after_loss
                           else 'loss_counterfactual_hold')
-            # Gave-then-lost / MFE still soft-gate blind flips.
+            # Gave-then-lost / MFE soft-gates blind flips in chop — but a real
+            # reverse (structure prefers opposite, or MAE ≥ MFE) must teach the
+            # opposite side, not HOLD forever against the new move.
             mfe=_finite(path_mfe)
             if mfe is None and bars:
                 mfe=path_excursion(bars,direction,entry).get('mfe')
+            mae=_finite(path_mae)
+            if mae is None and bars:
+                mae=path_excursion(bars,direction,entry).get('mae')
             stop_n=_finite(stop_distance)
             meaningful=None
             if mfe is not None:
                 meaningful=max(float(sp or 0),float(stop_n or 0)*0.25,1e-9)
+            frame_says_opp=(
+                isinstance(structure_frame_advice,dict)
+                and structure_frame_advice.get('advice')==opposite)
+            reverse_loss=(
+                mae is not None and mfe is not None and float(mae)>=float(mfe))
             if (best==opposite and mfe is not None and meaningful is not None
-                    and mfe>meaningful):
+                    and mfe>meaningful and not frame_says_opp and not reverse_loss):
                 gave_floor=max(float(opp_floor or 0),0.35*float(mfe))
                 if opp_val<=gave_floor:
                     best='HOLD'

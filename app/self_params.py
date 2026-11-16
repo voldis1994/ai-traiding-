@@ -92,6 +92,10 @@ DEFAULTS = {
     'day_lot_vs_mandate_max_mult': 2.0,
     'day_lot_vs_mandate_min_mult': 0.25,
     'day_add_min_edge': 0.08,
+    # Situation memory: scene×action £ with time decay → soft OPEN influence
+    'situation_memory_min_samples': 3,
+    'situation_memory_nudge': 0.12,
+    'situation_memory_half_life_days': 14.0,
     # Trail self-arm: MFE fraction of opening risk before enabling trail
     'trail_arm_mfe_frac': 0.55,
     'trail_arm_min_ev': 0.0,
@@ -174,6 +178,9 @@ BOUNDS = {
     'day_lot_vs_mandate_max_mult': (1.0, 5.0),
     'day_lot_vs_mandate_min_mult': (0.05, 1.0),
     'day_add_min_edge': (0.02, 0.25),
+    'situation_memory_min_samples': (2, 30),
+    'situation_memory_nudge': (0.02, 0.30),
+    'situation_memory_half_life_days': (1.0, 90.0),
     'trail_arm_mfe_frac': (0.25, 1.0),
     'trail_arm_min_ev': (-1.0, 2.0),
     'bracket_vs_vol_noise': (0.8, 2.0),
@@ -255,6 +262,7 @@ def _clip(key, value):
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
                'structure_edge_min_samples',
+               'situation_memory_min_samples',
                'day_max_positions'):
         n=int(round(n))
     if bounds:

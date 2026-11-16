@@ -48,6 +48,7 @@ from . import learning_generation
 from . import champion_library
 from . import structure_shadow
 from . import structure_edge
+from . import situation_memory
 
 DB=DATA/'robot.sqlite3'
 
@@ -2451,9 +2452,14 @@ class SingleTradeEngine:
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
             base_scores,edge_advice,store=self.store,
             live_trend=ctx.get('trend'))
+        # Situation memory: scene×£ soft tilt after structure edge (one ready loop).
+        sit_advice=self._situation_memory_advice(structure=(edge_advice or {}).get('structure'))
+        nudged_scores,sit_nudge=situation_memory.soft_nudge_scores(
+            nudged_scores,sit_advice,store=self.store)
         self.last_signal=dict(
             self.last_signal,scores=dict(nudged_scores),
-            structure_edge=edge_advice,structure_nudge=nudge_meta)
+            structure_edge=edge_advice,structure_nudge=nudge_meta,
+            situation_memory=sit_advice,situation_nudge=sit_nudge)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -2463,6 +2469,7 @@ class SingleTradeEngine:
             readiness=readiness,
             spread_bps=self._spread_bps())
         result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
+                    situation_memory=sit_advice,situation_nudge=sit_nudge,
                     scores=nudged_scores)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
@@ -2490,10 +2497,10 @@ class SingleTradeEngine:
                 unified_cycle.load_state(self.store)))
         return result
 
-    def _structure_edge_advice(self):
-        """BUY vs SELL EV in the live OHLC frame — soft evidence, not a gate."""
+    def _live_ohlc_structure(self):
+        """Current OHLC layout label (TREND_UP/…/CHOP) for edge + situation memory."""
         if not self.mandate:
-            return {'advice':None,'reason':'no_mandate'}
+            return 'CHOP', None
         epic=self.mandate.get('epic')
         try:
             candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
@@ -2507,9 +2514,41 @@ class SingleTradeEngine:
         mid=_num(self.market.get('mid'))
         frame=structure_shadow.frame_from_ohlc(path,entry=mid,exit_level=None,pre_bars=pre)
         structure=(frame or {}).get('structure') or 'CHOP'
+        return structure, frame
+
+    def _structure_edge_advice(self):
+        """BUY vs SELL EV in the live OHLC frame — soft evidence, not a gate."""
+        if not self.mandate:
+            return {'advice':None,'reason':'no_mandate'}
+        epic=self.mandate.get('epic')
+        structure,_frame=self._live_ohlc_structure()
         advice=structure_edge.compare_frame(self.store,epic=epic,structure=structure)
         structure_edge.persist_advice(self.store,advice)
         return advice
+
+    def _situation_memory_advice(self, *, structure=None):
+        """Scene×£ advice for the live situation — soft evidence, not a ban."""
+        if not self.mandate:
+            return {'advice':None,'reason':'no_mandate'}
+        ctx=self.market_context or {}
+        epic=self.mandate.get('epic')
+        if not structure:
+            structure,_=self._live_ohlc_structure()
+        sit=situation_memory.fingerprint(
+            epic=epic,market_context=ctx,structure=structure,
+            returns_bps=ctx.get('returns_bps'),trend=ctx.get('trend'))
+        advice=situation_memory.compare_situation(self.store,situation=sit)
+        situation_memory.persist_advice(self.store,advice)
+        return advice
+
+    def _situation_fingerprint_now(self, *, structure=None):
+        ctx=self.market_context or {}
+        epic=(self.mandate or {}).get('epic')
+        if not structure:
+            structure,_=self._live_ohlc_structure()
+        return situation_memory.fingerprint(
+            epic=epic,market_context=ctx,structure=structure,
+            returns_bps=ctx.get('returns_bps'),trend=ctx.get('trend'))
 
     def _structure_shadow_advice(self,proposal):
         """Evidence/UI: does current OHLC match prior SL graves? Not a LIVE gate."""
@@ -3728,6 +3767,18 @@ class SingleTradeEngine:
                 currency=currency,deal_id=deal_id,**path_ctx)
             # Audit #21: operator daily loss / drawdown halt from realized cash.
             hard_risk.record_realized_pnl(self.store,pnl_value)
+            # Situation memory: bank £ into the OPEN-time scene×action bucket.
+            sit=saved.get('situation')
+            if not sit:
+                fr=(struct_ctx.get('frame') or {}).get('structure') or saved.get('structure')
+                sit=situation_memory.fingerprint(
+                    epic=epic,structure=fr,trend=saved.get('trend'),
+                    returns_bps=saved.get('returns_bps'),
+                    market_context={'trend':saved.get('trend'),
+                                    'returns_bps':saved.get('returns_bps')})
+            situation_memory.record_outcome(
+                self.store,situation=sit,action=direction,pnl=pnl_value,
+                epic=epic,deal_id=deal_id)
             # One feedback bus: £ → cycle aggression / streak for next OPEN.
             # Pass scratch band so pennies do not tighten brackets like real losses.
             self._settle_unified_cycle(
@@ -4335,6 +4386,8 @@ class SingleTradeEngine:
                     regime=(self.market_context or {}).get('regime')
                            or (self.last_signal or {}).get('regime'),
                     news=self._news_risk())
+                sit_struct=((self.last_signal or {}).get('structure_edge') or {}).get('structure')
+                sit_fp=self._situation_fingerprint_now(structure=sit_struct)
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -4348,6 +4401,11 @@ class SingleTradeEngine:
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
                     'champion_context':open_ctx,
+                    # Situation at OPEN — £ banks into this scene on close.
+                    'situation':sit_fp,
+                    'trend':(self.market_context or {}).get('trend'),
+                    'returns_bps':(self.market_context or {}).get('returns_bps'),
+                    'structure':sit_struct,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
@@ -4632,6 +4690,7 @@ class SingleTradeEngine:
                     'shadow_paper':self.shadow_paper.summary(),
                     'hold_shadow':hold_shadow.strategy_evidence(self.store),
                     'structure_shadow':structure_shadow.summary(self.store),
+                    'situation_memory':situation_memory.snapshot(self.store),
                     'champion_library':champion_library.snapshot(self.store),
                     'self_params':__import__('app.self_params',fromlist=['snapshot']).snapshot(self.store)},
                 'bracket':bracket_learn.load_params(self.store),

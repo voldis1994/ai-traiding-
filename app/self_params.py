@@ -95,7 +95,7 @@ DEFAULTS = {
     'day_conviction_nudge': 0.12,
     'day_lot_vs_mandate_max_mult': 2.0,
     'day_lot_vs_mandate_min_mult': 0.25,
-    'day_add_min_edge': 0.08,
+    'day_add_min_edge': 0.04,
     # Situation memory: scene×action £ with time decay → soft OPEN influence
     'situation_memory_min_samples': 3,
     'situation_memory_nudge': 0.12,

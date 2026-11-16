@@ -4582,10 +4582,10 @@ class SingleTradeEngine:
         return True
 
     async def adapt_protection(self,p):
-        """Trail SL behind broker extreme — ROBOT only; continues past BE.
+        """Trail SL behind 1m OHLC structure — ROBOT only; continues past BE.
 
-        Pre-BE gap = original_risk; after BE gap = recent M1 median range from
-        OHLC (same zone data), not a hardcoded fraction of R.
+        Pre-BE gap = original_risk; after BE stop follows recent completed 1m
+        swing lows/highs (fallback: median M1 range), not a huge % of R.
         Trail self-arms from MFE / structure EV (not a fixed human 1R law).
         """
         key='adaptive_protection:'+str(p['dealId'])
@@ -4650,7 +4650,7 @@ class SingleTradeEngine:
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
                                       zone_range=float(zone_range) if zone_range is not None else None,
-                                      store=self.store,arm_decision=arm)
+                                      store=self.store,arm_decision=arm,candles=candles)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal,
                                'trail_arm':arm,

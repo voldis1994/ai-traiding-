@@ -99,10 +99,9 @@ def test_post_be_trail_gap_reads_store_knobs():
         store=Store(Path(d)/'s.db')
         save(store,{**DEFAULTS,'trail_min_mult':3.0,'trail_open_gap_frac':0.5,
                     'trail_fallback_frac':0.6},reason='test')
-        # open_gap=1.0, minimum=0.1 → floor = max(0.1, min(1.0, max(0.3, 0.5))) = 0.5
-        # No zone → max(floor, fallback*open_gap) = max(0.5, 0.6) = 0.6
+        # No zone → Store soft floor (max of mult/frac/fallback) = 0.6
         g=_post_be_trail_gap(1.0,0.1,None,store=store)
         assert g==pytest.approx(0.6)
-        # Zone below floor → still floor 0.5
+        # Zone present → prefer real 1m range (0.2), only floored by minStop
         g2=_post_be_trail_gap(1.0,0.1,0.2,store=store)
-        assert g2==pytest.approx(0.5)
+        assert g2==pytest.approx(0.2)

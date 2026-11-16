@@ -228,8 +228,14 @@ table.data tr:last-child td{border-bottom:0}
 .alert b{display:block;font-size:13px}.alert span{color:var(--muted);font-size:12px}
 .alert .metric{font-family:var(--display);font-weight:800;color:var(--warn);font-size:1.05rem}
 
+.stat b .stat-sub{display:block;font-family:var(--body);font-size:11px;font-weight:600;
+  color:var(--muted);letter-spacing:0;margin-top:4px}
+
 /* Clients */
-.client-list{display:flex;flex-direction:column;gap:14px}
+.client-list{
+  display:grid;grid-template-columns:repeat(var(--cols,1),minmax(0,1fr));gap:14px}
+.client-list[data-dense="1"] .strip .facts{grid-template-columns:repeat(2,minmax(0,1fr))}
+.client-list[data-dense="1"] .trades{max-height:64px}
 .strip{
   border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);
   overflow:hidden;animation:fadeUp .45s ease both}

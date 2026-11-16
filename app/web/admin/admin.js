@@ -30,6 +30,79 @@ function esc(s){
 }
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
+function sourceLabel(src){
+  if(src==='broker')return 'broker £';
+  if(src==='upl_estimate')return 'UPL estimate';
+  if(src==='working')return 'working';
+  if(src==='none'||src==='empty')return 'nav skaitļu';
+  return src||'—';
+}
+
+/** Prefer working/estimate P&L + W/L — never show a lying 0 when estimates exist (from main #89). */
+function scoreboard(r){
+  r=r||{};
+  const ccy=r.pnl_currency||'';
+  const ledger=Array.isArray(r.pnl_ledger)?r.pnl_ledger:[];
+  const recent=Array.isArray(r.recent_trades)?r.recent_trades:[];
+  let pnl=null,src='none',wins=0,losses=0;
+
+  if(r.working_pnl!=null && Number.isFinite(Number(r.working_pnl))){
+    pnl=Number(r.working_pnl);src=r.working_pnl_source||'working';
+  }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
+    pnl=Number(r.realized_pnl);src='broker';
+  }else if(r.estimate_pnl!=null && Number.isFinite(Number(r.estimate_pnl))){
+    pnl=Number(r.estimate_pnl);src='upl_estimate';
+  }
+
+  if(r.display_wins!=null || r.display_losses!=null){
+    wins=Number(r.display_wins)||0;losses=Number(r.display_losses)||0;
+    if(r.wl_source)src=src==='none'?r.wl_source:src;
+  }else if(r.estimate_wins!=null || r.estimate_losses!=null){
+    wins=Number(r.estimate_wins)||0;losses=Number(r.estimate_losses)||0;
+    if(wins+losses>0 && src==='none')src='upl_estimate';
+  }else if((r.cash_trades||0)>0){
+    wins=Number(r.wins)||0;losses=Number(r.losses)||0;
+  }
+
+  if((pnl==null || wins+losses===0) && ledger.length){
+    let sum=0,w=0,l=0;
+    for(const row of ledger){
+      const v=Number(row.pnl);
+      if(!Number.isFinite(v))continue;
+      sum+=v;if(v>0)w++;else if(v<0)l++;
+    }
+    if(pnl==null && ledger.length){
+      pnl=sum;
+      src=ledger.some(x=>x.source==='broker')&&(r.cash_trades||0)>0?'broker':'upl_estimate';
+    }
+    if(wins+losses===0){wins=w;losses=l}
+  }
+
+  if((pnl==null || wins+losses===0) && recent.length){
+    let sum=0,n=0,w=0,l=0;
+    for(const t of recent){
+      const v=Number(t.pnl);
+      if(!Number.isFinite(v))continue;
+      const s=String(t.pnl_source||'').toLowerCase();
+      if(s==='ticks_only'||s==='price_size'||s==='position_disappeared')continue;
+      sum+=v;n++;if(v>0)w++;else if(v<0)l++;
+    }
+    if(pnl==null && n){pnl=sum;src='upl_estimate'}
+    if(wins+losses===0 && n){wins=w;losses=l;if(src==='none')src='upl_estimate'}
+  }
+
+  return {pnl,src,wins,losses,ccy,closed:Number(r.closed_trades)||0,
+    cash:Number(r.cash_trades)||0,estimate:Number(r.estimate_trades)||0};
+}
+
+function layoutCols(n){
+  if(n<=1)return 1;
+  if(n===2||n===3)return n;
+  if(n===4)return 2;
+  if(n<=6)return 3;
+  return Math.min(4,Math.ceil(Math.sqrt(n)));
+}
+
 function setView(name){
   document.querySelectorAll('.nav-item').forEach(b=>{
     b.classList.toggle('active',b.dataset.view===name);
@@ -109,37 +182,42 @@ function ringSvg(pctVal){
     </svg><strong>${p}%</strong></div>`;
 }
 
-function summarizePnl(s){
+function fleetPnl(s,clients){
   s=s||{};
-  const by=s.pnl_by_currency||{};
+  let total=s.working_pnl_all;
+  let src=s.working_pnl_source||'none';
+  let wins=s.display_wins_all;
+  let losses=s.display_losses_all;
+  const ccy=s.pnl_currency||'';
+  if(total==null || wins==null || losses==null){
+    let sum=0,n=0,w=0,l=0,anyEst=false;
+    for(const c of clients||[]){
+      const sb=scoreboard(c.results||{});
+      if(sb.pnl!=null){sum+=sb.pnl;n++}
+      w+=sb.wins;l+=sb.losses;
+      if(sb.src==='upl_estimate')anyEst=true;
+    }
+    if(total==null && n){total=sum;src=anyEst?'upl_estimate':src}
+    if(wins==null)wins=w;
+    if(losses==null)losses=l;
+  }
+  // Multi-currency: never invent one number from mixed books.
+  const by=s.working_pnl_by_currency||s.pnl_by_currency||{};
   const keys=Object.keys(by);
-  const closed=Number(s.closed_trades_all)||0;
-  const cash=Number(s.cash_trades_all)||0;
-  const pending=Number(s.pending_cash_trades_all)||0;
-  const proxy=Number(s.proxy_trades_all)||0;
-  let pnlLabel,pnlNum=null,ccy='';
-  if(keys.length>1){
+  let pnlLabel,pnlNum=total;
+  if(keys.length>1 && total==null){
     pnlLabel=keys.map(k=>`${num(by[k],2)} ${k}`).join(' · ');
-  }else if(s.realized_pnl_all!=null && s.pnl_currency){
-    pnlNum=Number(s.realized_pnl_all);ccy=s.pnl_currency;
+    pnlNum=null;
+  }else if(pnlNum!=null){
     pnlLabel=money(pnlNum,ccy);
-  }else if(keys.length===1){
-    pnlNum=Number(by[keys[0]]);ccy=keys[0];
-    pnlLabel=money(pnlNum,ccy);
-  }else if(closed>0 && cash===0){
-    pnlLabel='— · bez broker £';
   }else{
     pnlLabel='—';
   }
-  let pnlNote='';
-  if(closed>0 && cash===0){
-    pnlNote=` · ${closed} bez £`+(pending?` (${pending} pend)`:'')+(proxy?` · ${proxy} ticks`:'');
-  }else if(pending>0){
-    pnlNote=` · ${pending} pending £`;
-  }else if(cash>0 && cash<closed){
-    pnlNote=` · £ ${cash}/${closed}`;
-  }
-  return {pnlLabel,pnlNote,pnlNum,ccy,closed};
+  const cash=Number(s.cash_trades_all)||0;
+  const closed=Number(s.closed_trades_all)||0;
+  const est=Number(s.estimate_trades_all)||0;
+  const srcNote=` · ${sourceLabel(src)}`+(cash||est?` · £ ${cash}/${closed}`+(est?` · est ${est}`:''):'');
+  return {pnlLabel,pnlNote:srcNote,pnlNum,ccy,closed,wins:wins||0,losses:losses||0,src};
 }
 
 function renderSummary(data){
@@ -149,7 +227,7 @@ function renderSummary(data){
   const running=Number(s.running_robots)||0;
   const total=Number(s.clients)||clients.length||0;
   const robotPct=total?Math.round((running/total)*100):0;
-  const {pnlLabel,pnlNote,pnlNum}=summarizePnl(s);
+  const {pnlLabel,pnlNote,pnlNum,wins,losses}=fleetPnl(s,clients);
   const uplSum=open.reduce((acc,r)=>acc+(Number.isFinite(Number(r.upl))?Number(r.upl):0),0);
   const delta=Number.isFinite(pnlNum)&&Math.abs(pnlNum)>0.01
     ? ((uplSum/(Math.abs(pnlNum)+Math.abs(uplSum)||1))*100)
@@ -160,7 +238,7 @@ function renderSummary(data){
       <span class="label">Klienti</span>
       <b>${total}</b>
       <div class="stat-icon">${icon('users')}</div>
-      ${total?`<span class="delta-pill">flote</span>`:''}
+      ${total?`<span class="delta-pill">W/L ${wins}/${losses}</span>`:''}
     </article>
     <article class="stat">
       <span class="label">Aktīvie roboti</span>
@@ -174,13 +252,13 @@ function renderSummary(data){
     </article>
     <article class="stat">
       <span class="label">Kopējais P&amp;L</span>
-      <b class="${pnlClass(pnlNum)}">${esc(pnlLabel)}${esc(pnlNote)}</b>
+      <b class="${pnlClass(pnlNum)}">${esc(pnlLabel)}<small class="stat-sub">${esc(pnlNote)}</small></b>
       <div class="stat-icon">${icon('layers')}</div>
       ${delta!=null?`<span class="delta-pill ${delta<0?'neg':''}">${delta>=0?'+':''}${delta.toFixed(2)}%</span>`:''}
     </article>`;
 
-  // Performance header uses balance-like sum of realized when single ccy, else label.
-  const {ccy}=summarizePnl(s);
+  // Performance header prefers live balances, else honest working P&L.
+  const {ccy}=fleetPnl(s,clients);
   let bal=null;
   clients.forEach(c=>{
     const balObj=((c.activity||{}).balance)||{};
@@ -297,14 +375,17 @@ function drawPerfChart(clients){
 function renderTopClients(clients){
   const ranked=[...(clients||[])].map(c=>{
     const r=c.results||{};
-    const pnl=Number(r.realized_pnl);
-    const ccy=r.pnl_currency||c.account_currency||'';
-    const wr=Number(r.win_rate);
+    const sb=scoreboard(r);
+    const total=sb.wins+sb.losses;
+    const wr=total?sb.wins/total:(Number.isFinite(Number(r.win_rate))?Number(r.win_rate):null);
     return {
       name:c.display_name||c.username||('#'+c.id),
       user:c.username||'',
-      pnl:Number.isFinite(pnl)?pnl:0,
-      ccy,wr:Number.isFinite(wr)?wr:null,
+      pnl:sb.pnl==null?0:sb.pnl,
+      ccy:sb.ccy||r.pnl_currency||c.account_currency||'',
+      wr,
+      src:sb.src,
+      wl:`${sb.wins}/${sb.losses}`,
     };
   }).sort((a,b)=>b.pnl-a.pnl).slice(0,3);
 
@@ -315,7 +396,7 @@ function renderTopClients(clients){
   $('topClients').innerHTML=ranked.map((c,i)=>`
     <div class="rank">
       <span class="medal m${i+1}">${i+1}</span>
-      <div class="who">${esc(c.name)}<small>@${esc(c.user)}</small></div>
+      <div class="who">${esc(c.name)}<small>@${esc(c.user)} · ${esc(sourceLabel(c.src))} · W/L ${esc(c.wl)}</small></div>
       <div class="earn ${pnlClass(c.pnl)}">${esc(money(c.pnl,c.ccy))}
         <small>${c.wr==null?'—':((c.wr<=1?c.wr*100:c.wr).toFixed(1)+'% WR')}</small>
       </div>
@@ -486,7 +567,8 @@ function renderCard(c){
   const day=a.day_book||{};
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
   const mandateSize=(a.mandate&&a.mandate.size)||'—';
-  const trades=(r.recent_trades||[]).slice(0,6).map(t=>{
+  const sb=scoreboard(r);
+  const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
     const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
@@ -505,12 +587,6 @@ function renderCard(c){
     const active=['armed','ratchet','be_lock','trail'].includes(String((live&&live.trail_phase)||'').toLowerCase());
     return `<div class="trail-line ${active?'active':''}">${esc(prot||'Trail status nav ziņots')}</div>`;
   })();
-
-  const cashLine=
-    r.pnl_status==='closed_without_broker_cash'?'⛔ bez broker £':
-    r.pnl_status==='broker_cash_pending'?`⏳ pending ${r.pending_cash_trades||0}`:
-    r.pnl_status==='broker_cash_ok'?'✓ broker £':
-    (r.pnl_status||'—');
 
   const el=document.createElement('article');
   el.className='strip'+(inTrade?' live':'');
@@ -536,12 +612,10 @@ function renderCard(c){
       <div><span>Tirgus</span><strong>${esc(a.market||'—')}</strong></div>
       <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
       <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
-      <div><span>P&amp;L realizēts</span><strong class="${pnlClass(r.realized_pnl)}">${
-        (r.closed_trades>0 && (r.cash_trades||0)===0)
-          ? ('— · bez £'+(r.pending_cash_trades?` (${r.pending_cash_trades})`:''))
-          : esc(money(r.realized_pnl,ccy))
+      <div><span>Kopējais P&amp;L</span><strong class="${pnlClass(sb.pnl)}">${
+        sb.pnl==null?'—':esc(money(sb.pnl,sb.ccy||ccy))
       }</strong></div>
-      <div><span>Broker £</span><strong>${esc(cashLine)}</strong></div>
+      <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
     </div>
     <div class="muted" style="padding:8px 14px;font-size:12px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)
@@ -618,8 +692,13 @@ async function loadOverview(){
   drawPerfChart(data.clients);
 
   const room=$('controlRoom');room.innerHTML='';
+  const clients=data.clients||[];
+  const n=clients.length;
+  room.dataset.count=String(n);
+  room.dataset.dense=n>=4?'1':'0';
+  room.style.setProperty('--cols',String(layoutCols(n)));
   const pick=$('brokerClient');const prev=pick.value;pick.innerHTML='';
-  (data.clients||[]).forEach(c=>{
+  clients.forEach(c=>{
     room.appendChild(renderCard(c));
     const opt=document.createElement('option');opt.value=c.id;
     opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);

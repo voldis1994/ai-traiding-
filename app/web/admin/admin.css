@@ -302,8 +302,10 @@ table.data tr:last-child td{border-bottom:0}
 .actions{display:flex;flex-wrap:wrap;gap:6px;padding:12px 14px;border-top:1px solid var(--line-soft)}
 
 .risk-board{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
-.risk-card .kv{display:flex;justify-content:space-between;gap:10px;margin:10px 0;font-size:13px;color:var(--muted)}
-.risk-card .kv b{color:var(--text)}
+.risk-card .kv{display:flex;justify-content:space-between;gap:10px;margin:10px 0;font-size:13px;color:var(--muted);align-items:baseline}
+.risk-card .kv b{color:var(--text);text-align:right}
+.risk-card .kv b small{color:var(--muted);font-weight:600;margin-left:4px}
+.risk-card .risk-goal{margin:12px 0 0;font-size:12px}
 .settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
 .settings-grid .card:last-child{grid-column:1/-1}
 .form-stack .btn{margin-top:16px}

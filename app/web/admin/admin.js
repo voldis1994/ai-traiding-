@@ -276,7 +276,7 @@ function patchClient(el,c){
   const day=a.day_book||{};
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
   const sb=scoreboard(r);
-  const trades=(r.recent_trades||[]).slice(0,10).map(t=>{
+  const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
     const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
@@ -310,11 +310,23 @@ function patchClient(el,c){
   setText(el.querySelector('[data-k="note"]'),note||'');
 }
 
+function layoutCols(n){
+  if(n<=1)return 1;
+  if(n===2||n===3)return n;
+  if(n===4)return 2;
+  if(n<=6)return 3;
+  return Math.min(4,Math.ceil(Math.sqrt(n)));
+}
+
 async function loadOverview(){
   const data=await api('/api/admin/overview');
   const clients=data.clients||[];
   renderSummary(data.summary,clients);
   const room=$('controlRoom');
+  const n=clients.length;
+  room.dataset.count=String(n);
+  room.dataset.dense=n>=4?'1':'0';
+  room.style.setProperty('--cols',String(layoutCols(n)));
   const seen=new Set();
   const pick=$('brokerClient');const prev=pick.value;
   const opts=[];

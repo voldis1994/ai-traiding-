@@ -2,6 +2,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.engine import Store
 from app.runtime_hub import RuntimeHub
 
@@ -55,3 +57,28 @@ def test_upl_estimate_not_counted_as_broker_cash():
         assert stats['estimate_pnl'] == -0.09
         assert stats['realized_pnl'] is None
         assert stats['pnl_status'] == 'closed_without_broker_cash'
+        # Admin must show estimate truth — not a lying 0 W/L / blank.
+        assert stats['working_pnl'] == -0.09
+        assert stats['working_pnl_source'] == 'upl_estimate'
+        assert stats['display_wins'] == 0
+        assert stats['display_losses'] == 1
+        assert stats['wl_source'] == 'upl_estimate'
+
+
+def test_working_pnl_and_wl_from_mixed_estimates():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        for i, pnl in enumerate([0.28, -0.57, 0.33, -0.32]):
+            store.upsert_trade({
+                'dealId': f'e{i}', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 2000,
+            })
+            store.close_trade(f'e{i}', 2001, pnl, currency='GBP', source='upl_estimate')
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        assert stats['cash_trades'] == 0
+        assert stats['working_pnl'] == pytest.approx(-0.28)
+        assert stats['display_wins'] == 2
+        assert stats['display_losses'] == 2
+        assert stats['wins'] == 0  # broker cash W/L still honest zero
+        assert stats['wl_source'] == 'upl_estimate'

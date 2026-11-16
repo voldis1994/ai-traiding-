@@ -504,3 +504,40 @@ def test_trail_lifecycle_watch_arm_be_trail():
         assert trail and trail['be_locked'] is True
         assert trail['stop_level']>100.0
         assert trail['profit_level']==102.0
+
+
+def test_claim_robot_open_enrolls_trail_on_uncertain_fill():
+    """UNCERTAIN OPEN + live adopt must enroll adaptive trail (not manual-only)."""
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        e=SingleTradeEngine(s,Brain())
+        p={'dealId':'fill1','epic':'GOLD','direction':'SELL','level':3870.26,
+           'stopLevel':3874.71,'profitLevel':3865.73,'size':'0.1'}
+        e.positions=[p]
+        e._pending_entry_brain={
+            'epic':'GOLD','direction':'SELL','entry':3870.26,'captured':'submit',
+            'situation':'GOLD|TREND_DOWN|FLOW_DOWN|TREND_DOWN'}
+        # Journal OPEN left UNCERTAIN — same pattern as live GOLD history.
+        oid=s.order('OPEN',None,{'epic':'GOLD','direction':'SELL','size':'0.1'})
+        s.order_update(oid,'UNCERTAIN','ghost-ref')
+        assert s.unresolved()
+        e._supersede_stale_open_orders('fill1')
+        assert s.get('robot_open:fill1') is True
+        meta=s.get('adaptive_protection:fill1')
+        assert meta and meta['owner']=='AUTO'
+        assert meta['original_risk']==pytest.approx(4.45)
+        assert s.get('entry_brain:fill1')['captured'] in ('submit','claim_robot_open')
+        assert not any(u.get('kind')=='OPEN' for u in (s.unresolved() or []))
+
+
+def test_claim_robot_open_on_adopt_after_pending_brain():
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        e=SingleTradeEngine(s,Brain())
+        p={'dealId':'ad1','epic':'GOLD','direction':'BUY','level':100.,
+           'stopLevel':99.2,'profitLevel':101.6,'size':'.12'}
+        e._pending_entry_brain={
+            'epic':'GOLD','direction':'BUY','entry':100.,'captured':'submit'}
+        assert e._claim_robot_open(p,reason='adopt_robot_fill')
+        assert s.get('robot_open:ad1')
+        assert s.get('adaptive_protection:ad1')['owner']=='AUTO'

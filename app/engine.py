@@ -1330,12 +1330,49 @@ class SingleTradeEngine:
                 'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
         return out
 
+    def _claim_robot_open(self,p,*,reason='reconcile'):
+        """Mark live deal as robot-owned and enroll adaptive trail.
+
+        Capital often accepts OPEN without a usable confirm reference → journal
+        OPEN stays UNCERTAIN, sync *adopts* the fill as if it were manual, and
+        trail never enrolls (no robot_open / adaptive_protection). Any live
+        fill that came from our OPEN path must claim trail rights here.
+        """
+        if not isinstance(p,dict):return False
+        deal_id=p.get('dealId')
+        if not deal_id:return False
+        deal_s=str(deal_id)
+        already=bool(self.store.get('robot_open:'+deal_s))
+        self.store.set('robot_open:'+deal_s,True)
+        self.store.set('latest_robot_deal_id',deal_id)
+        # Bind pending submit snapshot if OPEN confirm never matched dealId.
+        key='entry_brain:'+deal_s
+        if self.store.get(key) is None and self._pending_entry_brain:
+            pending=self._pending_entry_brain
+            if (pending.get('epic') in (None,p.get('epic')) and
+                pending.get('direction') in (None,p.get('direction'))):
+                self.store.set(key,{**pending,
+                    'entry':(p.get('level') if p.get('level') is not None
+                             else pending.get('entry')),
+                    'captured':pending.get('captured') or 'claim_robot_open'})
+                self._pending_entry_brain=None
+        enrolled=self._enroll_adaptive_protection(p,force=True)
+        if not already:
+            self.store.event('protection',
+                'Robot OPEN fill claimed for adaptive trail',
+                {'deal_id':deal_s,'reason':reason,'enrolled':bool(enrolled),
+                 'epic':p.get('epic'),'direction':p.get('direction')})
+        return True
+
     def _supersede_stale_open_orders(self,live_deal_id):
         """Drop journal OPEN rows once the broker already shows a live deal.
 
         Stale PENDING/UNCERTAIN OPEN (often without a usable confirm reference)
         otherwise keep execution_enabled=False and used to block mandate adoption,
         leaving the UI on WAITING FOR MOBILE TRADE while UPL already showed the trade.
+
+        When we supersede our own OPEN against a live fill, claim robot_open +
+        enroll trail — adopt must not leave protection as manual-only forever.
         """
         cleared=0
         for op in list(self.store.unresolved()):
@@ -1350,6 +1387,12 @@ class SingleTradeEngine:
             if (not self._unresolved_at_login and not self.operator_paused and
                 not self._paused_for_multi and not self._paused_for_read):
                 self.armed=True;self.execution_enabled=True
+            # Live fill that cleared our OPEN journal → robot trail rights.
+            if live_deal_id is not None:
+                p=next((x for x in (self.positions or [])
+                        if str(x.get('dealId'))==str(live_deal_id)),None)
+                if p is not None:
+                    self._claim_robot_open(p,reason='stale_open_superseded')
         return cleared
     @staticmethod
     def _protection_matches(live,payload):
@@ -1906,13 +1949,29 @@ class SingleTradeEngine:
                     self._adopt_entry_brain_pending.discard(str(deal_id))
                 if fresh_session and open_in_flight:
                     self._supersede_stale_open_orders(deal_id)
+                # Robot OPEN often lands as adopt (UNCERTAIN confirm). Claim trail
+                # when this fill matches our submit / pending brain / entry_brain.
+                pending=self._pending_entry_brain if isinstance(self._pending_entry_brain,dict) else None
+                brain=self.store.get(key) if isinstance(self.store.get(key),dict) else {}
+                robot_fill=(
+                    bool(pending and pending.get('epic') in (None,p.get('epic'))
+                         and pending.get('direction') in (None,p.get('direction')))
+                    or (brain.get('captured') in (
+                        'submit','claim_robot_open','manual_adopt_first_perception')
+                        and brain.get('direction')==p.get('direction'))
+                    or bool(self.store.get('robot_open:'+str(deal_id)))
+                    or str(self.store.get('latest_robot_deal_id') or '')==str(deal_id)
+                )
+                if robot_fill:
+                    self._claim_robot_open(p,reason='adopt_robot_fill')
                 self.store.event('adoption','Live broker position adopted for this session',
                     {'deal_id':deal_id,'epic':p['epic'],'size':str(p['size']),
                      'direction':p.get('direction'),
                      'previous_epic':old['epic'] if old else None,
                      'fresh_session':fresh_session,
                      'cleared_stale_open':bool(fresh_session and open_in_flight),
-                     'entry_brain_saved':bool(self.store.get(key))})
+                     'entry_brain_saved':bool(self.store.get(key)),
+                     'robot_open_claimed':bool(self.store.get('robot_open:'+str(deal_id)))})
             elif self.mandate is None and latest:
                 # Surface why WAITING FOR MOBILE TRADE persists despite an open deal.
                 self.store.event('warning','Open broker position not adopted yet',
@@ -1921,6 +1980,22 @@ class SingleTradeEngine:
                      'direction':p.get('direction'),'size':p.get('size'),
                      'valid':valid,'own_order_marker':own_order,
                      'open_in_flight':open_in_flight})
+        # Mid-session: robot OPEN UNCERTAIN blocks adopt, but Capital already
+        # shows the fill — claim robot_open + trail without waiting for Resume.
+        if latest and (self._pending_entry_brain or any(
+                op.get('kind')=='OPEN' for op in (self.store.unresolved() or []))):
+            pending=self._pending_entry_brain if isinstance(self._pending_entry_brain,dict) else {}
+            for p in latest:
+                did=p.get('dealId')
+                if not did or self.store.get('robot_open:'+str(did)):
+                    continue
+                if pending:
+                    if pending.get('epic') not in (None,p.get('epic')):continue
+                    if pending.get('direction') not in (None,p.get('direction')):continue
+                elif not any(op.get('kind')=='OPEN' for op in (self.store.unresolved() or [])):
+                    continue
+                self._claim_robot_open(p,reason='sync_open_in_flight_fill')
+                self._supersede_stale_open_orders(did)
         # The mandate's size is a cached sizing reference, not evidence of the
         # currently open position. On every broker sync (including restart),
         # refresh it from the actual single open position of the authorized
@@ -2896,12 +2971,8 @@ class SingleTradeEngine:
                 if len(newcomers)==1:
                     p=newcomers[0]
             if p is not None:
-                # Persist origin so a later reconnect does not mistake a robot
-                # deal for a NEW manual mandate.
-                self.store.set('robot_open:'+str(p['dealId']),True)
-                self.store.set('latest_robot_deal_id',p['dealId'])
-                # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
-                self._enroll_adaptive_protection(p,force=True)
+                # Persist origin + enroll trail (shared with adopt/supersede path).
+                self._claim_robot_open(p,reason='open_confirmed')
         if kind=='PROTECT' and self.positions:
             p=next((x for x in self.positions if x.get('dealId')==deal_id),None)
             if p is not None and self.store.get('robot_open:'+str(deal_id)):
@@ -5059,12 +5130,14 @@ class SingleTradeEngine:
                     day_book.record_open(self.store,equity=equity)
             except Exception as exc:
                 # Keep UNCERTAIN so a second OPEN cannot fire; operator Resume clears.
+                # Keep _pending_entry_brain — Capital often filled while confirm failed;
+                # next sync adopt/supersede must claim robot_open + trail + brain.
                 self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
-                self._pending_entry_brain=None
                 self.execution_enabled=False
                 self.store.event('error',
                     'Entry outcome uncertain; no automatic retry until Resume',
-                    {'type':type(exc).__name__})
+                    {'type':type(exc).__name__,
+                     'pending_entry_brain_kept':bool(self._pending_entry_brain)})
         finally:self.pending_order=False
     def _manage_perceive_ohlc(self,*,mid,spread,tick,epic,bar_t,features):
         """Forward-only manage scores when fusion EXTERNAL is gapped.

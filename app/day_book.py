@@ -411,10 +411,42 @@ def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
     return out
 
 
-def soft_nudge_conviction(scores, *, phase, store=None):
+def _clear_trend_side(*, live_trend=None, structure=None, returns_bps=None):
+    """Map visible market path → BUY/SELL. None when the tape is mixed/chop."""
+    st = str(structure or '').upper()
+    tr = str(live_trend or '').upper() if live_trend is not None else ''
+    if st in ('TREND_UP', 'BREAKOUT_UP') or tr == 'UP':
+        return 'BUY'
+    if st in ('TREND_DOWN', 'BREAKOUT_DOWN') or tr == 'DOWN':
+        return 'SELL'
+    # Sharp short-horizon continuation (V-rebound) while 15/60 may still be MIXED.
+    if isinstance(returns_bps, dict):
+        def _bp(key):
+            v = returns_bps.get(key)
+            if v is None:
+                v = returns_bps.get(str(key))
+            try:
+                n = float(v)
+                return n if math.isfinite(n) else None
+            except (TypeError, ValueError):
+                return None
+        r1, r5 = _bp(1), _bp(5)
+        if r1 is not None and r5 is not None:
+            if r1 > 0 and r5 > 0:
+                return 'BUY'
+            if r1 < 0 and r5 < 0:
+                return 'SELL'
+    return None
+
+
+def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
+                          structure=None, returns_bps=None):
     """Tilt away from stupid HOLD when direction is clear and day needs work.
 
     Never a veto — renormalize so autonomy._safe_scores stays valid.
+    When live structure/trend is clear but HOLD still dominates the softmax
+    (classic missed TREND_UP), transfer HOLD mass to the tape side so argmax
+    can OPEN instead of forever-abstaining.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -424,14 +456,57 @@ def soft_nudge_conviction(scores, *, phase, store=None):
     strength = float(cfg.get('conviction_nudge') or 0.12)
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     buy, sell, hold = out['BUY'], out['SELL'], out['HOLD']
+    clear = _clear_trend_side(
+        live_trend=live_trend, structure=structure, returns_bps=returns_bps)
     best = 'BUY' if buy >= sell else 'SELL'
     best_v = out[best]
     other = sell if best == 'BUY' else buy
+
+    # --- Clear tape path: break HOLD dominance (the missed GOLD rebound case) ---
+    if clear is not None:
+        side_v = out[clear]
+        opp = 'SELL' if clear == 'BUY' else 'BUY'
+        opp_v = out[opp]
+        # Do not fight a strongly opposite neural vote.
+        if opp_v >= 0.45 and opp_v > side_v + 0.10:
+            pass  # fall through to ordinary conviction path
+        elif hold >= side_v or (side_v - hold) < 0.05:
+            # Need side to lead HOLD by a small margin after transfer.
+            lead = 0.06
+            need = max(0.0, (hold - side_v) + lead)
+            transfer = min(hold * 0.70, max(need, strength * 1.5))
+            if transfer > 1e-6:
+                out[clear] = side_v + transfer
+                out['HOLD'] = max(0.0, hold - transfer)
+                # Nibble the opposite side only if it is not already tiny.
+                if opp_v > 0.08:
+                    trim = min(opp_v * 0.35, 0.25 * transfer)
+                    out[opp] = max(0.0, opp_v - trim)
+                    out[clear] = out[clear] + trim
+                total = sum(out.values())
+                if total <= 1e-12:
+                    return dict(scores), {'nudged': False, 'reason': 'degenerate'}
+                out = {k: v / total for k, v in out.items()}
+                return out, {
+                    'nudged': True, 'target': clear, 'delta': transfer,
+                    'reason': 'clear_trend_anti_hold',
+                    'phase': phase or PHASE_HUNT,
+                    'structure': structure, 'live_trend': live_trend,
+                    'renormalized': True, 'sum': sum(out.values()),
+                }
+
     # Convincing = clear winner over HOLD and over the opposite side.
-    if best_v < 0.34 or (best_v - hold) < 0.06 or (best_v - other) < 0.04:
-        return dict(scores), {'nudged': False, 'reason': 'not_convincing'}
+    # With a matching clear tape, accept a slightly weaker neural lead.
+    min_best = 0.28 if clear == best else 0.34
+    min_vs_hold = 0.03 if clear == best else 0.06
+    min_vs_other = 0.03 if clear == best else 0.04
+    if best_v < min_best or (best_v - hold) < min_vs_hold or (best_v - other) < min_vs_other:
+        return dict(scores), {'nudged': False, 'reason': 'not_convincing',
+                              'clear_side': clear}
     # Day still hunting → shrink HOLD mass toward the clear side.
-    delta = strength * min(1.0, (best_v - hold) * 2.0)
+    delta = strength * min(1.0, max(0.25, (best_v - hold) * 2.0))
+    if clear == best:
+        delta = max(delta, strength * 1.25)
     out[best] = best_v + delta
     out['HOLD'] = max(0.0, hold - 0.7 * delta)
     out['BUY' if best == 'SELL' else 'SELL'] = max(0.0, other - 0.3 * delta)
@@ -442,7 +517,7 @@ def soft_nudge_conviction(scores, *, phase, store=None):
     return out, {
         'nudged': True, 'target': best, 'delta': delta,
         'reason': 'conviction_anti_hold', 'phase': phase or PHASE_HUNT,
-        'renormalized': True, 'sum': sum(out.values()),
+        'clear_side': clear, 'renormalized': True, 'sum': sum(out.values()),
     }
 
 

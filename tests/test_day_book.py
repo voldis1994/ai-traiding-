@@ -95,6 +95,35 @@ def test_soft_nudge_conviction_renormalizes():
         assert AutoEvolution._safe_scores(nudged)
 
 
+def test_clear_trend_breaks_hold_dominance():
+    """GOLD rebound case: HOLD 56% > BUY 25% but TREND_UP → anti-HOLD flip."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        scores = {'BUY': 0.247, 'SELL': 0.191, 'HOLD': 0.562}
+        nudged, meta = db.soft_nudge_conviction(
+            scores, phase=db.PHASE_HUNT, store=s,
+            structure='TREND_UP', live_trend='MIXED',
+            returns_bps={'1': 12.0, '5': 8.0})
+        assert meta['nudged'] is True
+        assert meta['reason'] == 'clear_trend_anti_hold'
+        assert meta['target'] == 'BUY'
+        assert nudged['BUY'] > nudged['HOLD']
+        assert AutoEvolution._safe_scores(nudged)
+        # Argmax side after nudge — no more HOLD-dominates forever.
+        assert nudged['BUY'] >= nudged['SELL']
+        assert nudged['BUY'] > nudged['HOLD']
+
+
+def test_clear_trend_does_not_fight_strong_opposite():
+    scores = {'BUY': 0.10, 'SELL': 0.55, 'HOLD': 0.35}
+    nudged, meta = db.soft_nudge_conviction(
+        scores, phase=db.PHASE_HUNT, store=None,
+        structure='TREND_UP')
+    # Strong SELL vote — do not force BUY from TREND_UP alone.
+    assert meta.get('target') != 'BUY' or meta.get('reason') != 'clear_trend_anti_hold'
+    assert nudged['SELL'] >= nudged['BUY']
+
+
 def test_day_phase_protect_tilts_hold():
     scores = {'BUY': 0.45, 'SELL': 0.35, 'HOLD': 0.20}
     nudged, meta = db.soft_nudge_day_phase(scores, phase=db.PHASE_PROTECT)

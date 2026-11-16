@@ -127,8 +127,16 @@ function renderCard(c){
       <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
       <div><span>Tirgus</span><br><strong>${a.market||'—'}</strong></div>
       <div><span>Ticki</span><br><strong>${a.tick_count??0}</strong></div>
-      <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}${(r.cash_trades!=null)?` · broker ${r.cash_trades||0}/${r.closed_trades||0}`:''}</strong></div>
-      <div><span>P&amp;L + UPL</span><br><strong class="${pnlClass(r.equity_pnl??r.realized_pnl)}">${money(r.equity_pnl??r.realized_pnl,ccy)}${r.open_upl!=null?` (UPL ${money(r.open_upl,ccy)})`:''}</strong></div>
+      <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${
+        (r.closed_trades>0 && (r.cash_trades||0)===0)
+          ? ('— · bez broker £'+(r.pending_cash_trades?` (${r.pending_cash_trades} pending)`:''))
+          : (money(r.realized_pnl,ccy)+(r.cash_trades!=null?` · broker ${r.cash_trades||0}/${r.closed_trades||0}`:''))
+      }</strong></div>
+      <div><span>P&amp;L + UPL</span><br><strong class="${pnlClass(r.equity_pnl??r.realized_pnl)}">${
+        (r.closed_trades>0 && (r.cash_trades||0)===0 && r.open_upl==null)
+          ? '—'
+          : (money(r.equity_pnl??r.realized_pnl,ccy)+(r.open_upl!=null?` (UPL ${money(r.open_upl,ccy)})`:''))
+      }</strong></div>
       <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
       <div><span>Broker £ statuss</span><br><strong>${
         r.pnl_status==='closed_without_broker_cash'?'⛔ slēgti bez broker £':

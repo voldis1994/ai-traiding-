@@ -31,7 +31,7 @@ LAST_PLAN_KEY = 'day_book_last_plan_v1'
 PHASE_HUNT = 'HUNT'          # day behind target — trade / add when edge
 PHASE_PROTECT = 'PROTECT'    # day at/above target — bank, prefer no new risk
 PHASE_DEFEND = 'DEFEND'      # day at loss budget — no new opens
-PHASE_DONE = 'DONE'          # flat and day +/BE — idle until next day
+PHASE_DONE = 'DONE'          # flat and day profit target hit — idle until next day
 
 
 def _now():
@@ -155,23 +155,22 @@ def budgets(*, equity, params, daily):
 
 
 def phase_for(*, daily, budgets_map, open_count=0):
-    """Which book mode the robot is in — data-driven from £ vs equity fracs."""
+    """Which book mode the robot is in — data-driven from £ vs equity fracs.
+
+    DEFEND on loss budget. PROTECT/DONE only when profit target is hit.
+    Mere BE-band after a scratch/small close must NOT flip DONE/PROTECT
+    (that forced HOLD after pennies).
+    """
     b = budgets_map or {}
     realized = float((daily or {}).get('realized_pnl') or 0.0)
     target = _finite(b.get('profit_target'))
     loss_cap = _finite(b.get('loss_budget'))
-    be = _finite(b.get('be_band')) or 0.0
     if loss_cap is not None and realized <= -abs(loss_cap):
         return PHASE_DEFEND
     if target is not None and realized >= abs(target):
         if int(open_count or 0) <= 0:
             return PHASE_DONE
         return PHASE_PROTECT
-    if be > 0 and abs(realized) <= be and int((daily or {}).get('closes') or 0) > 0:
-        # Already near BE after trades — protect if open, else done.
-        if int(open_count or 0) > 0:
-            return PHASE_PROTECT
-        return PHASE_DONE
     return PHASE_HUNT
 
 

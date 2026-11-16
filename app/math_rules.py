@@ -1,8 +1,9 @@
 """Dimensional stop/take helpers.
 
-Adopted lot size + instrument are the operator risk frame. SL distance uses the
-broker minimum (+ spread buffer) scaled by a *learned* sl_scale — not a frozen
-20-tick invent. TP = kappa * SL with learned kappa.
+Instrument is the operator mandate. Lot size is robot-sized by ``day_book`` from
+equity risk (mandate size is the seed/step grid). SL distance uses the broker
+minimum (+ spread buffer) scaled by a *learned* sl_scale — not a frozen 20-tick
+invent. TP = kappa * SL with learned kappa.
 """
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 

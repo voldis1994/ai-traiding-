@@ -82,6 +82,16 @@ DEFAULTS = {
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
+    # Day book — robot equity risk / day +/BE / multi-pos / adaptive lot
+    'day_profit_target_frac': 0.01,
+    'day_loss_budget_frac': 0.02,
+    'day_risk_per_trade_frac': 0.005,
+    'day_be_band_frac': 0.001,
+    'day_max_positions': 3,
+    'day_conviction_nudge': 0.12,
+    'day_lot_vs_mandate_max_mult': 2.0,
+    'day_lot_vs_mandate_min_mult': 0.25,
+    'day_add_min_edge': 0.08,
     # Trail self-arm: MFE fraction of opening risk before enabling trail
     'trail_arm_mfe_frac': 0.55,
     'trail_arm_min_ev': 0.0,
@@ -155,6 +165,15 @@ BOUNDS = {
     'trail_fallback_frac': (0.25, 0.8),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
+    'day_profit_target_frac': (0.001, 0.05),
+    'day_loss_budget_frac': (0.002, 0.10),
+    'day_risk_per_trade_frac': (0.0005, 0.03),
+    'day_be_band_frac': (0.0001, 0.01),
+    'day_max_positions': (1, 8),
+    'day_conviction_nudge': (0.02, 0.30),
+    'day_lot_vs_mandate_max_mult': (1.0, 5.0),
+    'day_lot_vs_mandate_min_mult': (0.05, 1.0),
+    'day_add_min_edge': (0.02, 0.25),
     'trail_arm_mfe_frac': (0.25, 1.0),
     'trail_arm_min_ev': (-1.0, 2.0),
     'bracket_vs_vol_noise': (0.8, 2.0),
@@ -235,7 +254,8 @@ def _clip(key, value):
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
-               'structure_edge_min_samples'):
+               'structure_edge_min_samples',
+               'day_max_positions'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

@@ -189,13 +189,35 @@ def test_uncertain_order_does_not_retry():
     async_run(scenario())
 
 
-def test_multi_position_detected_pauses_execution():
+def test_multi_position_same_epic_stays_live_for_day_book():
+    """Same-instrument multi-pos is allowed by day_book — do not disarm."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
             b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'SIM'}})
             e.attach(b);await e.sync()
-            assert not e.armed and not e.execution_enabled
+            assert len(e.positions)==2
+            assert e._paused_for_multi is False
+            assert e.armed and e.execution_enabled
+    async_run(scenario())
+
+
+def test_multi_position_foreign_epic_blocks_day_book_add():
+    """Foreign epic in the book blocks new OPEN (mandate stays one market)."""
+    from app import day_book
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
+            e.attach(b);await e.sync()  # adopt SIM m1
+            b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'OTHER'}})
+            await e.sync()
+            gate=day_book.allows_new_open(
+                store=s,equity=10_000.0,positions=e.positions,
+                epic='SIM',mandate_epic='SIM',score_edge=0.2)
+            assert gate['allowed'] is False
+            assert gate['reason']=='foreign_epic_open'
+            # Robot stays live — day book blocks adds, no auto-pause.
+            assert e.armed and e.execution_enabled
     async_run(scenario())
 
 

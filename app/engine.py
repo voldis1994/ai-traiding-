@@ -2688,8 +2688,12 @@ class SingleTradeEngine:
         equity=self._account_equity()
         db_snap=day_book.snapshot(self.store,equity=equity,positions=self.positions)
         phase=db_snap.get('phase') or day_book.PHASE_HUNT
+        live_structure=(ctx.get('structure')
+                        or (self._live_ohlc_structure()[0] if self.mandate else None))
         nudged_scores,conv_meta=day_book.soft_nudge_conviction(
-            nudged_scores,phase=phase,store=self.store)
+            nudged_scores,phase=phase,store=self.store,
+            live_trend=ctx.get('trend'),structure=live_structure,
+            returns_bps=ctx.get('returns_bps'))
         nudged_scores,phase_meta=day_book.soft_nudge_day_phase(
             nudged_scores,phase=phase,store=self.store)
         # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.

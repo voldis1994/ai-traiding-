@@ -1789,6 +1789,29 @@ class SingleTradeEngine:
             if len(latest)==1 and current and self.position_age>=2 and await self._force_close_if_history_settled(current):
                 latest=[];current=None
                 self.positions=[];self.position_age=0;self._open_deal_ids=set()
+            elif len(latest)>1:
+                # Multi-pos: age+settle each ghost deal independently.
+                settled_ids=[]
+                for p in list(latest):
+                    deal=p.get('dealId')
+                    if deal is None:
+                        continue
+                    deal_s=str(deal)
+                    age_key='ghost_sync_age:'+deal_s
+                    age=int(self.store.get(age_key) or 0)+1
+                    self.store.set(age_key,age)
+                    # age≥3 ≈ two re-syncs after first sight (same as single position_age≥2).
+                    if age>=3 and await self._force_close_if_history_settled(deal_s):
+                        settled_ids.append(deal_s)
+                        self.store.set(age_key,None)
+                if settled_ids:
+                    latest=list(self.positions or [])
+                    new_ids={str(p['dealId']) for p in latest if p.get('dealId') is not None}
+                    self._open_deal_ids=set(new_ids)
+                    current=(str(latest[0]['dealId'])
+                             if latest and latest[0].get('dealId') is not None else None)
+                for deal_s in list(prev_ids-new_ids):
+                    self.store.set('ghost_sync_age:'+deal_s,None)
         else:
             self.position_age=0
             self._open_deal_ids=set()
@@ -2301,6 +2324,10 @@ class SingleTradeEngine:
                   key='entry_brain:'+deal_s
                   if self.store.get(key) is None and self._pending_entry_brain:
                     pending=self._pending_entry_brain
+                    # Multi-pos: only bind to the deal we just opened — never an older sibling.
+                    latest_open=self.store.get('latest_robot_deal_id')
+                    if latest_open is not None and str(latest_open)!=deal_s:
+                        continue
                     if pending.get('direction')==p.get('direction') and pending.get('epic')==p.get('epic'):
                         self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry'),
                                            'tick_size':pending.get('tick_size') or tick,
@@ -3180,8 +3207,46 @@ class SingleTradeEngine:
                                  {'type':type(exc).__name__,'deal_id':deal})
         return None
 
+    @staticmethod
+    def _tx_fingerprint(tx):
+        """Stable id for a Capital TRADE row — used to consume fuzzy binds once."""
+        if not isinstance(tx,dict):
+            return None
+        for key in ('reference','transactionId','dealId','dealReference','id'):
+            ref=tx.get(key)
+            if ref not in (None,''):
+                return str(key)+':'+str(ref)
+        # Last resort: cash+instrument+size so blank-ref opens cannot collide forever.
+        val=SingleTradeEngine._row_cash_pnl(tx)
+        blob='|'.join(str(tx.get(k) or '') for k in
+                      ('instrumentName','marketName','epic','size','quantity','date','dateUtc'))
+        if val is None and not blob.strip('|'):
+            return None
+        return 'fallback:'+str(val)+':'+blob
+
+    def _fuzzy_tx_consumed(self):
+        raw=self.store.get('fuzzy_pnl_tx_consumed') or []
+        return set(str(x) for x in raw) if isinstance(raw,list) else set()
+
+    def _mark_fuzzy_tx_consumed(self,fingerprint,*,deal_id=None):
+        fp=str(fingerprint or '')
+        if not fp:
+            return
+        used=list(self.store.get('fuzzy_pnl_tx_consumed') or [])
+        if fp not in used:
+            used.append(fp)
+        if len(used)>2000:
+            used=used[-2000:]
+        self.store.set('fuzzy_pnl_tx_consumed',used)
+        if deal_id is not None:
+            self.store.set('fuzzy_pnl_tx_for:'+str(deal_id),fp)
+
     async def _pnl_fuzzy_instrument_cash(self,deal_id,*,queued_at=None):
-        """When dealId refs miss, bind the single TRADE cash row for this epic/size."""
+        """When dealId refs miss, bind the single unused closing TRADE for epic/size.
+
+        Never reuses a TRADE already bound to another deal. Never banks £0 open
+        fills (those poison broker_cash_banked and freeze day_book).
+        """
         if not self.broker or not hasattr(self.broker,'transactions'):return None
         deal=str(deal_id)
         try:
@@ -3206,12 +3271,20 @@ class SingleTradeEngine:
             return None
         hits=[]
         epic_u=epic.upper()
+        consumed=self._fuzzy_tx_consumed()
+        already=self.store.get('fuzzy_pnl_tx_for:'+deal)
         for tx in payload.get('transactions') or []:
             if self._transaction_matches_deal(tx,deal):
                 # Prefer exact/fuzzy deal match path — caller already tried that.
                 continue
+            fp=self._tx_fingerprint(tx)
+            if fp and fp in consumed and fp!=already:
+                continue  # another deal already owns this TRADE row
             val=self._row_cash_pnl(tx)
             if val is None:continue
+            # Opening TRADE / flat fill is not closing cash — never bank £0 fuzzy.
+            if abs(float(val))<1e-12:
+                continue
             blob=' '.join(str(tx.get(k) or '') for k in
                           ('instrumentName','marketName','epic','description','note')).upper()
             # GOLD often shows as "Gold" / "Gold Spot"; keep XAU as alias.
@@ -3227,9 +3300,12 @@ class SingleTradeEngine:
                     continue
             # Closing TRADE rows are often the *opposite* of open direction —
             # never require tx.direction == open direction. Missing dir = wildcard.
-            hits.append((float(val),self._cash_currency(tx.get('currency'))))
+            hits.append((float(val),self._cash_currency(tx.get('currency')),fp))
         if len(hits)==1:
-            return hits[0]
+            pnl,ccy,fp=hits[0]
+            if fp:
+                self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
+            return pnl,ccy
         return None
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
@@ -3288,15 +3364,24 @@ class SingleTradeEngine:
             'mode':mode,'pnl':pnl,'source':source})
 
     def _queue_pending_pnl(self,deal_id,*,exit_level=None):
-        """Queue Capital £ harvest. Cap 500 — keep oldest first (never drop unresolved)."""
+        """Queue Capital £ harvest. Cap 500 — never drop unresolved new closes."""
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
         deal=str(deal_id)
         ids=[str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]
         if deal not in ids:
             pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
-        # Raise old [-40:] truncate that dropped unresolved; keep oldest 500.
         if len(pending)>500:
-            pending=pending[:500]
+            def _done(item):
+                d=str(item.get('deal_id') if isinstance(item,dict) else item)
+                return bool(self.store.get('broker_cash_banked:'+d))
+            open_q=[x for x in pending if not _done(x)]
+            done_q=[x for x in pending if _done(x)]
+            # Prefer keeping unresolved; drop already-banked first, then oldest open.
+            if len(open_q)<=500:
+                pending=open_q
+            else:
+                pending=open_q[-500:]
+            del done_q  # discarded when over cap
         self.store.set('pending_broker_pnl_deals',pending)
 
     def _bank_broker_cash_side_effects(self,deal_id,pnl,*,currency=None,action=None,
@@ -3305,7 +3390,7 @@ class SingleTradeEngine:
 
         Must run even when neural already learned (late Capital cash). Keyed by
         ``broker_cash_banked:{deal}`` so ticks-then-£ and retry paths cannot
-        double-count the same deal.
+        double-count the same deal. A prior £0 poison bind may be corrected.
         """
         if pnl is None or deal_id is None:
             return False
@@ -3317,10 +3402,13 @@ class SingleTradeEngine:
             return False
         deal=str(deal_id)
         key='broker_cash_banked:'+deal
-        if self.store.get(key):
-            return False
-        self.store.set(key,{
-            'at':now(),'pnl':val,'currency':currency,'action':action})
+        prev=self.store.get(key)
+        if isinstance(prev,dict):
+            prev_pnl=_num(prev.get('pnl'))
+            # Allow one correction when a £0 open TRADE poisoned the bank key.
+            if not (prev_pnl is not None and abs(prev_pnl)<1e-12 and abs(val)>=1e-12):
+                return False
+        # Side effects first — marker only after success so a crash can retry.
         hard_risk.record_realized_pnl(self.store,val)
         equity=self._account_equity()
         # Phase DONE vs PROTECT: count siblings still open — never this deal.
@@ -3332,6 +3420,8 @@ class SingleTradeEngine:
             pnl=val,action=action,exit_reason=exit_reason,deal_id=deal,
             scratch_band=scratch_band)
         self._note_scratch_close(val,deal)
+        self.store.set(key,{
+            'at':now(),'pnl':val,'currency':currency,'action':action})
         return True
 
     def _trade_direction(self,deal_id):
@@ -3344,6 +3434,82 @@ class SingleTradeEngine:
         except Exception:
             pass
         return None
+
+    def _stop_ticks_by_deal(self,tick):
+        """Per-deal stop distance in ticks for day-book committed risk."""
+        out={}
+        tick_f=_num(tick)
+        if tick_f is None or tick_f<=0:
+            return out
+        for p in (self.positions or []):
+            deal=p.get('dealId')
+            if deal is None:
+                continue
+            meta=self.store.get('adaptive_protection:'+str(deal)) or {}
+            risk=_num(meta.get('original_risk'))
+            if risk is None:
+                entry=_num(p.get('level'));stop=_num(p.get('stopLevel'))
+                if entry is not None and stop is not None:
+                    risk=abs(entry-stop)
+            if risk is None or risk<=0:
+                continue
+            out[str(deal)]=float(risk)/float(tick_f)
+        return out
+
+    def _late_broker_teacher_update(self,deal_id,saved,*,broker_pnl,currency,
+                                    exit_level=None,action=None):
+        """Feed profit_learning + bracket_learn when Capital £ arrives after ticks."""
+        if broker_pnl is None or not math.isfinite(float(broker_pnl)):
+            return False
+        saved=saved if isinstance(saved,dict) else self.store.get('entry_brain:'+str(deal_id))
+        direction=(action or (saved or {}).get('direction')
+                   or self._trade_direction(deal_id))
+        epic=(saved or {}).get('epic') or (self.mandate or {}).get('epic')
+        entry=_num((saved or {}).get('entry'))
+        try:
+            row=self.store.db.execute(
+                'SELECT epic,entry,direction FROM trades WHERE deal_id=?',
+                (str(deal_id),)).fetchone()
+        except Exception:
+            row=None
+        if row:
+            if not epic and row[0]:
+                epic=row[0]
+            if entry is None:
+                entry=_num(row[1])
+            if direction not in ('BUY','SELL') and row[2] in ('BUY','SELL'):
+                direction=row[2]
+        exit_lvl=_num(exit_level)
+        spread=_num((saved or {}).get('entry_spread')) or 0.
+        if direction in ('BUY','SELL') and epic and entry is not None:
+            try:
+                self.profit_learning.record_closed(
+                    deal_id=deal_id,epic=epic,direction=direction,entry=entry,
+                    exit_level=exit_lvl if exit_lvl is not None else entry,
+                    broker_pnl=float(broker_pnl),currency=currency,spread=spread,
+                    require_broker_pnl=True)
+            except Exception as exc:
+                self.store.event('warning','Late profit_learning skipped',
+                                 {'deal_id':deal_id,'type':type(exc).__name__})
+        try:
+            from . import bracket_learn
+            bk=(saved or {}).get('bracket_kappa')
+            bs=(saved or {}).get('bracket_sl_scale')
+            if bk is None or bs is None:
+                cur=bracket_learn.load_params(self.store);bk,bs=cur['kappa'],cur['sl_scale']
+            bracket_learn.record_outcome(
+                self.store,kappa=bk,sl_scale=bs,pnl=float(broker_pnl),
+                currency=currency,deal_id=deal_id)
+        except Exception as exc:
+            self.store.event('warning','Late bracket_learn skipped',
+                             {'deal_id':deal_id,'type':type(exc).__name__})
+        try:
+            from .self_params import evolve_from_feedback, maybe_commit_long_horizon
+            evolve_from_feedback(self.store,broker_pnl=float(broker_pnl),commit=False)
+            maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
+        except Exception:
+            pass
+        return True
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
@@ -3390,18 +3556,10 @@ class SingleTradeEngine:
                 continue
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
-            already=self._trade_already_learned(deal)
-            # Real broker cash always overwrites a prior upl_estimate display.
-            self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
-            if already:
-                # Neural already taught from ticks — still bank £ once (day book).
-                self._bank_broker_cash_side_effects(
-                    deal,pnl,currency=ccy,action=self._trade_direction(deal))
-                self.store.event('trade','Late broker P&L refined record without re-learning',
-                                 {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
-            else:
-                conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,'source':'pending_pnl_retry'}
-                self._learn_closed_trade(deal,conf)
+            # Always through learn path — already_learned banks £ + late teachers once.
+            conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,
+                  'source':'pending_pnl_retry'}
+            self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
         # Flat book: also harvest Capital cash for open SQLite rows whose deal vanished
@@ -3710,17 +3868,25 @@ class SingleTradeEngine:
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         already_learned=self._trade_already_learned(deal_id)
         # Late broker cash may refine the journal without repeating training.
-        # Still bank £ once — neural-once-only must not skip day_book / hard_risk.
+        # Still bank £ once — neural-once-only must not skip day_book / hard_risk /
+        # profit_learning / bracket_learn teachers.
         if already_learned:
             if broker_pnl is not None:
-                currency=hint_ccy or self._account_currency()
+                currency=self._cash_currency(hint_ccy) or self._account_currency()
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker',overwrite=True)
-                self._bank_broker_cash_side_effects(
-                    deal_id,broker_pnl,currency=currency,
-                    action=self._trade_direction(deal_id))
+                action=self._trade_direction(deal_id) or (
+                    saved.get('direction') if isinstance(saved,dict) else None)
+                banked=self._bank_broker_cash_side_effects(
+                    deal_id,broker_pnl,currency=currency,action=action)
+                teacher_key='late_cash_teachers:'+str(deal_id)
+                if banked and not self.store.get(teacher_key):
+                    self._late_broker_teacher_update(
+                        deal_id,saved,broker_pnl=broker_pnl,currency=currency,
+                        exit_level=exit_level,action=action)
+                    self.store.set(teacher_key,{'at':now(),'pnl':broker_pnl})
                 self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
-                                 {'deal_id':deal_id,'pnl':broker_pnl})
+                                 {'deal_id':deal_id,'pnl':broker_pnl,'banked':banked})
             return
         # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
@@ -4520,7 +4686,9 @@ class SingleTradeEngine:
             plan=day_book.plan_open(
                 store=self.store,equity=equity,mandate_size=self.mandate['size'],
                 stop_ticks=brackets.get('stop_ticks'),tick_value=tick_val,
-                positions=self.positions,score_edge=score_edge,
+                positions=self.positions,
+                stop_ticks_by_deal=self._stop_ticks_by_deal(tick),
+                score_edge=score_edge,
                 epic=self.mandate.get('epic'),mandate_epic=self.mandate.get('epic'),
                 market=market)
             if not plan.get('allowed') or plan.get('size') is None:

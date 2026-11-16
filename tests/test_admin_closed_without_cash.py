@@ -21,7 +21,7 @@ def test_trade_stats_flags_closed_without_broker_cash():
         assert stats['closed_trades'] == 13
         assert stats['cash_trades'] == 0
         assert stats['pending_cash_trades'] == 13
-        assert stats['realized_pnl'] == 0.0
+        assert stats['realized_pnl'] is None
         assert stats['pnl_status'] == 'closed_without_broker_cash'
 
 
@@ -53,5 +53,5 @@ def test_upl_estimate_not_counted_as_broker_cash():
         assert stats['cash_trades'] == 0
         assert stats['estimate_trades'] == 1
         assert stats['estimate_pnl'] == -0.09
-        assert stats['realized_pnl'] == 0.0
+        assert stats['realized_pnl'] is None
         assert stats['pnl_status'] == 'closed_without_broker_cash'

@@ -243,6 +243,7 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         positions, stop_ticks_by_deal=stop_ticks_by_deal, tick_value=tick_value)
     # Soft robot cap still on Capital grid (never below broker min / above max).
     hi_mult = max(1.0, float(p.get('lot_max_mult') or 2.0))
+    lo_mult = max(0.0, float(p.get('lot_min_mult') or 0.25))
     minimum = grid['min']
     step = grid['step']
     robot_cap = seed * Decimal(str(hi_mult))
@@ -252,6 +253,10 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         maximum = robot_cap
     maximum = snap_deal_size(
         maximum, min_size=minimum, step=step, max_size=grid.get('max')) or seed
+    # Mandate-relative floor (still snapped to Capital grid).
+    robot_floor = snap_deal_size(
+        seed * Decimal(str(lo_mult)), min_size=minimum, step=step,
+        max_size=maximum)
     edge = _finite(score_edge) or 0.0
     risk_cap = float(rpt) * (1.0 + min(0.5, max(0.0, edge)))
     try:
@@ -282,6 +287,20 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
                 'size': None, 'reason': 'cannot_snap_to_capital_grid',
                 'allowed': False, 'size_grid': grid,
             }
+    if robot_floor is not None and size is not None and size < robot_floor:
+        # Risk room may still forbid the floor — then refuse rather than undersize.
+        floor_risk = None
+        try:
+            floor_risk = float(cash_risk(robot_floor, stop_ticks, tick_value))
+        except Exception:
+            floor_risk = None
+        if floor_risk is not None and floor_risk > risk_cap - committed + 1e-12:
+            return {
+                'size': None, 'reason': 'mandate_floor_exceeds_risk_room',
+                'allowed': False, 'budgets': b, 'committed_risk': committed,
+                'size_grid': grid, 'lot_min_mult': lo_mult,
+            }
+        size = robot_floor
     scale = float(size / seed) if seed > 0 else 1.0
     return {
         'size': size,
@@ -292,6 +311,7 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         'estimated_risk': float(sized.get('estimated_risk') or 0),
         'scale': scale,
         'raw': float(sized.get('raw') or 0),
+        'lot_min_mult': lo_mult,
         'size_grid': {
             'min': str(grid['min']), 'step': str(grid['step']),
             'max': str(grid['max']) if grid.get('max') is not None else None,

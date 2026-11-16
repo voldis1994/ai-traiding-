@@ -48,7 +48,7 @@ function renderSummary(s){
   }else if(keys.length===1){
     pnlLabel=money(by[keys[0]],keys[0]);
   }else if(closed>0 && cash===0){
-    pnlLabel='0.00 · bez broker £';
+    pnlLabel='— · bez broker £';
   }else{
     pnlLabel='—';
   }

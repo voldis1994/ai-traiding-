@@ -238,13 +238,16 @@ class RuntimeHub:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
         # Never invent 0.00 when multi-currency cash cannot be summed.
+        closed_n=len(closed_rows)
         if primary:
             realized=primary['realized_pnl']
         elif by_ccy:
             realized=None
+        elif closed_n>0 and cash_n==0:
+            # Never invent a fake 0.00 when closes lack broker cash.
+            realized=None
         else:
             realized=0.0
-        closed_n=len(closed_rows)
         # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
         if closed_n>0 and cash_n==0:
             pnl_status='closed_without_broker_cash'

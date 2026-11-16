@@ -327,4 +327,125 @@ def test_admin_card_status_closed_without_cash_not_ok():
         assert stats['closed_trades']==13
         assert stats['cash_trades']==0
         assert stats['pnl_status']=='closed_without_broker_cash'
-        assert stats['realized_pnl']==0.0
+        assert stats['realized_pnl'] is None
+
+
+def test_fuzzy_cash_not_double_bound_across_pending():
+    """One Capital TRADE must not bank onto two pending deals."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            for deal in ('a1','b1'):
+                store.upsert_trade({'dealId':deal,'epic':'GOLD','size':'0.02',
+                                    'direction':'BUY','level':2650})
+                store.close_trade(deal,2649,source='pending_broker_pnl',overwrite=True)
+                e._mark_trade_learned(deal,mode='ticks',pnl=None,source='ticks_only')
+            store.set('pending_broker_pnl_deals',[
+                {'deal_id':'a1','exit_level':2649,'attempts':1},
+                {'deal_id':'b1','exit_level':2649,'attempts':1},
+            ])
+            # Single TRADE row — only one pending may consume it.
+            broker.tx=[{'reference':'ZZ99','instrumentName':'Gold Spot',
+                        'size':'0.02','direction':'SELL','pnl':0.40,'currency':'GBP'}]
+            await e._retry_pending_broker_pnl()
+            rows={t['deal_id']:t for t in store.trades(10)}
+            cashed=[r for r in rows.values() if r.get('pnl_source')=='broker']
+            assert len(cashed)==1
+            assert cashed[0]['pnl']==pytest.approx(0.40)
+            daily=db.load_daily(store,equity=10_000.0)
+            assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.40)
+    asyncio.run(scenario())
+
+
+def test_fuzzy_rejects_zero_open_trade_poison():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            broker=HistoryBroker()
+            e.attach(broker)
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            store.upsert_trade({'dealId':'z1','epic':'GOLD','size':'0.02',
+                                'direction':'BUY','level':2650})
+            store.close_trade('z1',2649,source='pending_broker_pnl',overwrite=True)
+            e._mark_trade_learned('z1',mode='ticks',pnl=None,source='ticks_only')
+            store.set('pending_broker_pnl_deals',
+                      [{'deal_id':'z1','exit_level':2649,'attempts':2}])
+            broker.tx=[{'reference':'OPEN0','instrumentName':'Gold Spot',
+                        'size':'0.02','pnl':0.0,'currency':'GBP'}]
+            await e._retry_pending_broker_pnl()
+            assert store.get('broker_cash_banked:z1') in (None,False,{})
+            daily=db.load_daily(store,equity=10_000.0)
+            assert float(daily.get('realized_pnl') or 0)==0.0
+            # Later real close cash must still bank.
+            broker.tx=[{'reference':'CLOSE1','instrumentName':'Gold Spot',
+                        'size':'0.02','pnl':-0.22,'currency':'GBP'}]
+            store.set('pending_broker_pnl_deals',
+                      [{'deal_id':'z1','exit_level':2649,'attempts':3}])
+            await e._retry_pending_broker_pnl()
+            daily2=db.load_daily(store,equity=10_000.0)
+            assert float(daily2.get('realized_pnl') or 0)==pytest.approx(-0.22)
+    asyncio.run(scenario())
+
+
+def test_late_cash_feeds_profit_learning():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store,brain=new_brain(d)
+            brain.tick(100,.05,.01,'GOLD')
+            e=SingleTradeEngine(store,brain)
+            e.policy=AutoEvolution(store,Path(d)/'policy.py')
+            e.attach(HistoryBroker())
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
+            store.upsert_trade({'dealId':'pl1','epic':'GOLD','size':'.02',
+                                'direction':'SELL','level':2650})
+            store.set('entry_brain:pl1',{
+                'epic':'GOLD','direction':'SELL','entry':2650,'tick_size':.1,
+                'transition':brain._json_transition(brain.core.last_transition),
+                'entry_spread':.3,'bracket_kappa':1.0,'bracket_sl_scale':1.0})
+            e._learn_closed_trade('pl1',{'level':2649})
+            assert e._trade_already_learned('pl1')
+            assert list(e.profit_learning.broker_pnls())==[]
+            e._learn_closed_trade('pl1',{
+                'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+            assert float(db.load_daily(store,equity=10_000.0).get('realized_pnl') or 0)==pytest.approx(0.18)
+            assert e.profit_learning.broker_pnls()[-1]==pytest.approx(0.18)
+    asyncio.run(scenario())
+
+
+def test_stop_ticks_by_deal_shrinks_add_size():
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        e.mandate={'epic':'GOLD','size':'1.0'}
+        e.positions=[{
+            'dealId':'live1','epic':'GOLD','direction':'BUY','size':'1.0',
+            'level':2000,'stopLevel':1990}]
+        store.set('adaptive_protection:live1',{
+            'owner':'AUTO','original_risk':10.0})
+        ticks=e._stop_ticks_by_deal(1.0)
+        assert ticks['live1']==pytest.approx(10.0)
+        market={'dealingRules':{
+            'minDealSize':{'value':'0.1'},'minSizeIncrement':{'value':'0.1'},
+            'maxDealSize':{'value':'50'}}}
+        with_map=db.propose_size(
+            mandate_size='1.0',equity=10_000.0,daily={'realized_pnl':0},
+            params=db.load_params(None),stop_ticks=10,tick_value=1.0,
+            positions=e.positions,stop_ticks_by_deal=ticks,market=market)
+        bare=db.propose_size(
+            mandate_size='1.0',equity=10_000.0,daily={'realized_pnl':0},
+            params=db.load_params(None),stop_ticks=10,tick_value=1.0,
+            positions=e.positions,stop_ticks_by_deal=None,market=market)
+        assert with_map.get('committed_risk',0)>0
+        assert float(with_map['size'])<=float(bare['size'])

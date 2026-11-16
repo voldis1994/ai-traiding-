@@ -24,7 +24,9 @@ from .core import NeuralCore
 from .autonomy import AutoEvolution
 from .math_rules import (stop_take, ohlc_range_distance,
                          distances_meet_broker_min, levels_meet_broker_min,
-                         cash_risk, tick_value_from_instrument)
+                         cash_risk, tick_value_from_instrument,
+                         dealing_size_grid, snap_deal_size, snap_distance,
+                         on_deal_size_grid, broker_wire_number)
 from . import bracket_learn
 from . import hard_risk
 from . import unified_cycle
@@ -4347,22 +4349,58 @@ class SingleTradeEngine:
                     'raised_to_broker_min':brackets.get('raised_to_broker_min')})
                 return
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
+            # Capital dealingRules size grid — never invent 0.1009-style lots.
+            size_grid=dealing_size_grid(market,mandate_size=self.mandate['size'])
             # Day book: equity risk → adaptive lot; multi-pos when capacity remains.
             equity=self._account_equity()
             plan=day_book.plan_open(
                 store=self.store,equity=equity,mandate_size=self.mandate['size'],
                 stop_ticks=brackets.get('stop_ticks'),tick_value=tick_val,
                 positions=self.positions,score_edge=score_edge,
-                epic=self.mandate.get('epic'),mandate_epic=self.mandate.get('epic'))
+                epic=self.mandate.get('epic'),mandate_epic=self.mandate.get('epic'),
+                market=market)
             if not plan.get('allowed') or plan.get('size') is None:
                 self.last_entry_reason=plan.get('reason') or 'day_book_blocked'
                 self.store.event('entry','OPEN skipped — day book',{
                     'reason':self.last_entry_reason,'phase':plan.get('phase'),
                     'open_count':plan.get('open_count'),
-                    'budgets':plan.get('budgets')})
+                    'budgets':plan.get('budgets'),'size_grid':plan.get('size_grid')})
                 return
-            size=Decimal(str(plan['size']))
-            if size<=0:return
+            size=snap_deal_size(
+                plan['size'],min_size=size_grid['min'],step=size_grid['step'],
+                max_size=size_grid.get('max')) if size_grid.get('ok') else None
+            if size is None:
+                self.last_entry_reason='size_off_capital_grid'
+                self.store.event('entry','OPEN skipped — size not on Capital grid',{
+                    'raw':str(plan.get('size')),'size_grid':{
+                        'min':str(size_grid.get('min')),'step':str(size_grid.get('step')),
+                        'max':str(size_grid.get('max')) if size_grid.get('max') is not None else None,
+                        'source':size_grid.get('source')}})
+                return
+            if not on_deal_size_grid(
+                    size,min_size=size_grid['min'],step=size_grid['step'],
+                    max_size=size_grid.get('max')):
+                self.last_entry_reason='size_grid_check_failed'
+                return
+            # SL/TP distances on the price tick grid (Capital POINTS).
+            sd=snap_distance(brackets['stop_distance'],tick,minimum=minimum,round_up=True)
+            pd=snap_distance(brackets['profit_distance'],tick,minimum=minimum,round_up=True)
+            if sd is None or pd is None:
+                self.store.event('warning','OPEN skipped: SL/TP could not snap to tick grid',{
+                    'stop_distance':brackets['stop_distance'],
+                    'profit_distance':brackets['profit_distance'],'tick':tick})
+                return
+            tick_d=Decimal(str(tick))
+            brackets=dict(brackets,stop_distance=float(sd),profit_distance=float(pd),
+                          stop_ticks=int((Decimal(str(sd))/tick_d).to_integral_value()),
+                          profit_ticks=int((Decimal(str(pd))/tick_d).to_integral_value()))
+            if not distances_meet_broker_min(brackets['stop_distance'],
+                                             brackets['profit_distance'],minimum):
+                self.store.event('warning','OPEN skipped: snapped SL/TP below broker min',{
+                    'stop_distance':brackets['stop_distance'],
+                    'profit_distance':brackets['profit_distance'],
+                    'min_distance':float(minimum)})
+                return
             proposed=None
             if tick_val is not None:
                 try:
@@ -4370,10 +4408,15 @@ class SingleTradeEngine:
                 except (ValueError,TypeError,ArithmeticError):
                     proposed=None
             gate=self._hard_risk_gate(proposed_risk=proposed)
-            self.store.event('risk','Day-book OPEN cash-risk (robot sized)',{
+            self.store.event('risk','Day-book OPEN cash-risk (Capital-grid sized)',{
                 'proposed_risk':proposed,'size':str(size),
+                'size_wire':broker_wire_number(size),
                 'mandate_size':str(self.mandate['size']),
                 'size_scale':plan.get('scale'),
+                'size_grid':plan.get('size_grid') or {
+                    'min':str(size_grid.get('min')),'step':str(size_grid.get('step')),
+                    'max':str(size_grid.get('max')) if size_grid.get('max') is not None else None,
+                    'source':size_grid.get('source')},
                 'stop_ticks':int(brackets['stop_ticks']),
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
@@ -4401,7 +4444,8 @@ class SingleTradeEngine:
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'learn_samples':bp.get('nudge_samples'),
-                'day_phase':plan.get('phase'),'size_scale':plan.get('scale')})
+                'day_phase':plan.get('phase'),'size_scale':plan.get('scale'),
+                'size':str(size)})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 open_ctx=champion_library.context_from(

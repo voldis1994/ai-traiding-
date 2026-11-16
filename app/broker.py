@@ -72,21 +72,34 @@ class CapitalBroker:
         if deal_id:params['dealId']=str(deal_id)
         return await self._request('GET','/api/v1/history/activity',params=params)
     async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None,limit_distance=None):
-        if direction not in ('BUY','SELL') or Decimal(str(size))<=0:raise ValueError('Invalid trade')
-        payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False}
-        if stop_distance is not None:payload['stopDistance']=float(stop_distance)
+        from .math_rules import broker_wire_number
+        if direction not in ('BUY','SELL'):raise ValueError('Invalid trade')
+        try:
+            q=Decimal(str(size))
+        except Exception as exc:
+            raise ValueError('Invalid trade size') from exc
+        if q<=0:raise ValueError('Invalid trade')
+        # Wire only clean Capital-grid numbers — never float dust like 0.1009.
+        payload={'epic':epic,'direction':direction,
+                 'size':broker_wire_number(q),'guaranteedStop':False}
+        if stop_distance is not None:
+            payload['stopDistance']=broker_wire_number(stop_distance)
         distance=profit_distance if profit_distance is not None else limit_distance
-        if distance is not None:payload['profitDistance']=float(distance)
+        if distance is not None:
+            payload['profitDistance']=broker_wire_number(distance)
         return await self._request('POST','/api/v1/positions',json=payload)
     async def close_position(self,deal_id):
         return await self._request('DELETE','/api/v1/positions/'+quote(str(deal_id),safe=''))
     async def update_position(self,deal_id,stop_level=None,profit_level=None,limit_level=None):
+        from .math_rules import broker_wire_number
         payload={}
         # Capital rejects stopLevel/profitLevel that are not on the price grid
-        # (e.g. 4006.075). Pass through floats already snapped by protection_ai.
-        if stop_level is not None:payload['stopLevel']=float(stop_level)
+        # (e.g. 4006.075). Pass through floats already snapped by protection_ai,
+        # then strip binary dust on the wire.
+        if stop_level is not None:payload['stopLevel']=broker_wire_number(stop_level)
         if profit_level is not None or limit_level is not None:
-            payload['profitLevel']=float(profit_level if profit_level is not None else limit_level)
+            payload['profitLevel']=broker_wire_number(
+                profit_level if profit_level is not None else limit_level)
         if not payload:raise ValueError('No changes supplied')
         return await self._request('PUT','/api/v1/positions/'+quote(str(deal_id),safe=''),json=payload)
     async def close(self, *, end_session: bool=True):

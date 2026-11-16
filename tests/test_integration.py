@@ -123,7 +123,11 @@ class BrokerSimulation:
         'decimalPlacesFactor':2},
         # valueOfOnePip required so hard-risk cash_risk can be computed for OPEN.
         'instrument':{'onePipMeans':.01,'valueOfOnePip':1.0},
-        'dealingRules':{'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'}}}
+        'dealingRules':{
+            'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'},
+            'minDealSize':{'unit':'AMOUNT','value':'.01'},
+            'maxDealSize':{'unit':'AMOUNT','value':'100'},
+            'minSizeIncrement':{'unit':'AMOUNT','value':'.01'}}}
     async def accounts(self):return {'accounts':[{'preferred':True,'accountId':'SIM','currency':'USD','balance':{'balance':1000}}]}
     async def prices(self,epic,resolution='MINUTE',maximum=80):return {'prices':[]}
     async def confirm(self,ref):return {'dealStatus':'ACCEPTED','dealId':'b2'}

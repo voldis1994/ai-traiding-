@@ -18,7 +18,10 @@ import math
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 
-from .math_rules import position_size as risk_position_size, cash_risk
+from .math_rules import (
+    position_size as risk_position_size, cash_risk, dealing_size_grid,
+    snap_deal_size,
+)
 
 STORE_KEY = 'day_book_v1'
 DAILY_KEY = 'day_book_daily_v1'
@@ -201,29 +204,55 @@ def committed_risk(positions, *, stop_ticks_by_deal=None, tick_value=None):
 
 
 def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
-                 positions=None, stop_ticks_by_deal=None, score_edge=None):
-    """Adaptive lot from equity risk budget; mandate size is the seed/step grid."""
+                 positions=None, stop_ticks_by_deal=None, score_edge=None,
+                 market=None, size_grid=None):
+    """Adaptive lot from equity risk — always snapped to Capital size grid.
+
+    Never invents fractions (0.1009). Legal sizes are only
+    minDealSize + n×minSizeIncrement (≤ maxDealSize).
+    """
     seed = _dec(mandate_size)
     if seed is None or seed <= 0:
         return {'size': None, 'reason': 'no_mandate_size', 'allowed': False}
+    grid = size_grid if isinstance(size_grid, dict) else dealing_size_grid(
+        market, mandate_size=seed)
+    if not grid.get('ok'):
+        # No Capital grid and no mandate step → refuse (do not invent a lot).
+        return {
+            'size': None, 'reason': 'no_capital_size_grid', 'allowed': False,
+            'size_grid': grid,
+        }
+    # Snap mandate itself onto the grid — Capital is source of truth.
+    seed_on_grid = snap_deal_size(
+        seed, min_size=grid['min'], step=grid['step'], max_size=grid.get('max'))
+    if seed_on_grid is None:
+        return {
+            'size': None, 'reason': 'mandate_off_capital_grid', 'allowed': False,
+            'size_grid': grid,
+        }
+    seed = seed_on_grid
     p = params or load_params(None)
     b = budgets(equity=equity, params=p, daily=daily)
     rpt = _finite(b.get('risk_per_trade'))
     if rpt is None or rpt <= 0 or stop_ticks is None or tick_value is None:
-        # Fallback: mandate size (robot still decides phase/adds elsewhere).
         return {
-            'size': seed, 'reason': 'mandate_fallback', 'allowed': True,
+            'size': seed, 'reason': 'mandate_on_capital_grid', 'allowed': True,
             'budgets': b, 'estimated_risk': None, 'scale': 1.0,
+            'size_grid': grid,
         }
     committed = committed_risk(
         positions, stop_ticks_by_deal=stop_ticks_by_deal, tick_value=tick_value)
-    # Max size relative to mandate seed.
-    lo_mult = max(0.05, float(p.get('lot_min_mult') or 0.25))
-    hi_mult = max(lo_mult, float(p.get('lot_max_mult') or 2.0))
-    minimum = seed * Decimal(str(lo_mult))
-    maximum = seed * Decimal(str(hi_mult))
-    step = seed  # scale in mandate increments (0.5, 1.0, 1.5 … of seed)
-    # Conviction can use a bit more of the per-trade risk (still capped).
+    # Soft robot cap still on Capital grid (never below broker min / above max).
+    hi_mult = max(1.0, float(p.get('lot_max_mult') or 2.0))
+    minimum = grid['min']
+    step = grid['step']
+    robot_cap = seed * Decimal(str(hi_mult))
+    if grid.get('max') is not None:
+        maximum = min(grid['max'], robot_cap)
+    else:
+        maximum = robot_cap
+    maximum = snap_deal_size(
+        maximum, min_size=minimum, step=step, max_size=grid.get('max')) or seed
     edge = _finite(score_edge) or 0.0
     risk_cap = float(rpt) * (1.0 + min(0.5, max(0.0, edge)))
     try:
@@ -231,29 +260,44 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
             risk_cap, committed, stop_ticks, tick_value, step, minimum, maximum)
     except (ValueError, ArithmeticError):
         return {
-            'size': seed, 'reason': 'risk_size_error_mandate', 'allowed': True,
+            'size': seed, 'reason': 'risk_size_error_mandate_grid', 'allowed': True,
             'budgets': b, 'estimated_risk': None, 'scale': 1.0,
+            'size_grid': grid,
         }
-    size = sized.get('size')
+    raw = sized.get('size')
+    size = snap_deal_size(
+        raw if raw is not None else 0, min_size=minimum, step=step,
+        max_size=maximum)
     if size is None or size <= 0:
-        # Floor to minimum mandate unit if any risk room left.
         room = max(0.0, risk_cap - committed)
         if room <= 0:
             return {
                 'size': None, 'reason': 'no_risk_room', 'allowed': False,
                 'budgets': b, 'committed_risk': committed, 'scale': 0.0,
+                'size_grid': grid,
             }
-        size = minimum if minimum > 0 else seed
+        size = snap_deal_size(
+            minimum, min_size=minimum, step=step, max_size=maximum)
+        if size is None:
+            return {
+                'size': None, 'reason': 'cannot_snap_to_capital_grid',
+                'allowed': False, 'size_grid': grid,
+            }
     scale = float(size / seed) if seed > 0 else 1.0
     return {
         'size': size,
-        'reason': 'equity_risk_sized',
+        'reason': 'equity_risk_on_capital_grid',
         'allowed': True,
         'budgets': b,
         'committed_risk': committed,
         'estimated_risk': float(sized.get('estimated_risk') or 0),
         'scale': scale,
         'raw': float(sized.get('raw') or 0),
+        'size_grid': {
+            'min': str(grid['min']), 'step': str(grid['step']),
+            'max': str(grid['max']) if grid.get('max') is not None else None,
+            'source': grid.get('source'),
+        },
     }
 
 
@@ -320,8 +364,8 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
 
 def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
               positions=None, stop_ticks_by_deal=None, score_edge=None,
-              epic=None, mandate_epic=None, now=None):
-    """Full OPEN plan: allow? + size. Persist last plan for Admin."""
+              epic=None, mandate_epic=None, now=None, market=None):
+    """Full OPEN plan: allow? + Capital-grid size. Persist last plan for Admin."""
     gate = allows_new_open(
         store=store, equity=equity, positions=positions, epic=epic,
         mandate_epic=mandate_epic, score_edge=score_edge, now=now)
@@ -335,7 +379,7 @@ def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
         mandate_size=mandate_size, equity=equity, daily=gate.get('daily'),
         params=load_params(store), stop_ticks=stop_ticks, tick_value=tick_value,
         positions=positions, stop_ticks_by_deal=stop_ticks_by_deal,
-        score_edge=score_edge)
+        score_edge=score_edge, market=market)
     out.update(sized)
     if not sized.get('allowed') or sized.get('size') is None:
         out['allowed'] = False

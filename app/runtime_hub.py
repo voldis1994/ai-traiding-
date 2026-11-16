@@ -263,6 +263,7 @@ class RuntimeHub:
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
         signed=[]
+        estimate_signed=[]
         recent=[]
         cash_n=0
         pending_n=0
@@ -304,6 +305,7 @@ class RuntimeHub:
             elif kind=='estimate' and val is not None:
                 estimate_n+=1
                 estimate_sum+=float(val)
+                estimate_signed.append(float(val))
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='other' or (kind=='cash' and val is None):
@@ -312,6 +314,8 @@ class RuntimeHub:
                     recent.append(row)
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
+        est_wins=sum(1 for p in estimate_signed if p>0)
+        est_losses=sum(1 for p in estimate_signed if p<0)
         primary=None
         if len(by_ccy)==1:
             ccy,vals=next(iter(by_ccy.items()))
@@ -339,6 +343,24 @@ class RuntimeHub:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
+        # Operator display: prefer broker £; else UPL-estimate sum so Admin is
+        # not stuck on lying 0 / empty while Capital history is pending.
+        if realized is not None and cash_n>0:
+            working_pnl=realized
+            working_pnl_source='broker'
+        elif estimate_n>0:
+            working_pnl=round(estimate_sum,4)
+            working_pnl_source='upl_estimate'
+        else:
+            working_pnl=realized
+            working_pnl_source=('broker' if realized is not None and cash_n>0
+                                else ('none' if closed_n else 'empty'))
+        if cash_n>0:
+            display_wins,display_losses,wl_source=wins,losses,'broker'
+        elif estimate_n>0:
+            display_wins,display_losses,wl_source=est_wins,est_losses,'upl_estimate'
+        else:
+            display_wins,display_losses,wl_source=0,0,'none'
         upl=None
         if open_upl is not None:
             try:
@@ -347,10 +369,11 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
-        if realized is not None and upl is not None:
-            equity=round(float(realized)+float(upl),4)
-        elif realized is not None:
-            equity=realized
+        base_for_equity=working_pnl if working_pnl is not None else realized
+        if base_for_equity is not None and upl is not None:
+            equity=round(float(base_for_equity)+float(upl),4)
+        elif base_for_equity is not None:
+            equity=base_for_equity
         elif upl is not None:
             equity=upl
         else:
@@ -363,18 +386,25 @@ class RuntimeHub:
             'proxy_trades':proxy_n,
             'estimate_trades':estimate_n,
             'estimate_pnl':round(estimate_sum,4) if estimate_n else None,
+            'estimate_wins':est_wins,
+            'estimate_losses':est_losses,
             'blank_pnl_trades':blank_n,
             'pnl_status':pnl_status,
             'realized_pnl':realized,
+            'working_pnl':working_pnl,
+            'working_pnl_source':working_pnl_source,
             'open_upl':upl,
             'equity_pnl':equity,
             'pnl_currency':primary['currency'] if primary else acct,
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
+            'display_wins':display_wins,
+            'display_losses':display_losses,
+            'wl_source':wl_source,
             # Closed-trade win rate — NOT minute-direction accuracy (audit #24).
-            'win_rate':round(wins/max(1,wins+losses),3),
-            'trade_win_rate':round(wins/max(1,wins+losses),3),
+            'win_rate':round(display_wins/max(1,display_wins+display_losses),3),
+            'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
             'recent_trades':recent[:12],
         }
@@ -565,8 +595,12 @@ class RuntimeHub:
         total_pending=sum(int((c.get('results') or {}).get('pending_cash_trades') or 0)
                           for c in clients)
         total_proxy=sum(int((c.get('results') or {}).get('proxy_trades') or 0) for c in clients)
+        total_estimate=sum(int((c.get('results') or {}).get('estimate_trades') or 0) for c in clients)
         # Never add GBP + USD into one number.
         by_ccy: dict[str,float]={}
+        working_by_ccy: dict[str,float]={}
+        display_wins=0
+        display_losses=0
         for c in clients:
             res=c.get('results') or {}
             for ccy,val in (res.get('pnl_by_currency') or {}).items():
@@ -574,10 +608,20 @@ class RuntimeHub:
             if not res.get('pnl_by_currency') and res.get('pnl_currency') and res.get('realized_pnl') is not None:
                 ccy=res['pnl_currency']
                 by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(res.get('realized_pnl') or 0),4)
+            wp=res.get('working_pnl')
+            wccy=(res.get('pnl_currency') or '').strip().upper() or None
+            if wp is not None and wccy:
+                working_by_ccy[wccy]=round(working_by_ccy.get(wccy,0.0)+float(wp),4)
+            display_wins+=int(res.get('display_wins') or 0)
+            display_losses+=int(res.get('display_losses') or 0)
         primary=None
         if len(by_ccy)==1:
             ccy,val=next(iter(by_ccy.items()))
             primary={'currency':ccy,'realized_pnl':val}
+        working_primary=None
+        if len(working_by_ccy)==1:
+            ccy,val=next(iter(working_by_ccy.items()))
+            working_primary={'currency':ccy,'working_pnl':val}
         if total_closed>0 and total_cash==0:
             pnl_status='closed_without_broker_cash'
         elif total_pending>0:
@@ -586,18 +630,29 @@ class RuntimeHub:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
+        wl_source=('broker' if total_cash>0 else
+                   ('upl_estimate' if total_estimate>0 else 'none'))
         return {
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
                 # Multi-currency: never sum GBP+USD into one number (or fake 0.0).
                 'realized_pnl_all':primary['realized_pnl'] if primary else None,
-                'pnl_currency':primary['currency'] if primary else None,
+                'working_pnl_all':(working_primary['working_pnl'] if working_primary else None),
+                'working_pnl_source':('broker' if total_cash>0 else
+                                     ('upl_estimate' if total_estimate>0 else 'none')),
+                'pnl_currency':(working_primary['currency'] if working_primary
+                                else (primary['currency'] if primary else None)),
                 'pnl_by_currency':by_ccy,
+                'working_pnl_by_currency':working_by_ccy,
                 'closed_trades_all':total_closed,
                 'cash_trades_all':total_cash,
                 'pending_cash_trades_all':total_pending,
                 'proxy_trades_all':total_proxy,
+                'estimate_trades_all':total_estimate,
+                'display_wins_all':display_wins,
+                'display_losses_all':display_losses,
+                'wl_source':wl_source,
                 'pnl_status':pnl_status,
             },
             'clients':clients,

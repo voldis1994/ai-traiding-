@@ -973,6 +973,8 @@ class SingleTradeEngine:
         self._last_good_news=None
         self.last_policy_decision='HOLD';self.last_entry_reason='Awaiting a fresh signal'
         self.last_entry_audit_key=None
+        # In-trade perception only (no entry ΔW) — used for reverse CLOSE.
+        self._manage_signal=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
         self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
         self.protection_brief={'status':'Awaiting first robot-opened position'}
@@ -1608,6 +1610,7 @@ class SingleTradeEngine:
                             {'type':type(exc).__name__,'deal_id':deal})
         self._locked_entry_signal=None
         self._last_in_trade_protect_bar=None
+        self._manage_signal=None
         # Flat + mandate close: unlock LIVE OPEN if cold prep holdout trapped us.
         try:
             self._maybe_release_cold_start_prep()
@@ -2128,13 +2131,34 @@ class SingleTradeEngine:
                 in_pos=bool(self.positions)
                 bar_t=self.market_context.get('bar_time')
                 if in_pos:
-                    # HARD freeze: do not run entry-policy tick at all while a
-                    # LIVE deal is open — no new softmax, no signals-table rows,
-                    # no mid-trade BUY/HOLD/SELL churn in Admin/UI.
+                    # Admin/UI stays pinned to the OPEN vote (no mid-trade churn).
+                    # Separately *perceive* each new M1 with in_position=True so a
+                    # market reverse can trigger CLOSE — without entry ΔW / pending.
                     self._lock_entry_signal_for_open()
                     if bar_t is not None and bar_t!=self._last_in_trade_protect_bar:
                         self._last_in_trade_protect_bar=bar_t
                         new_closed_bar=True
+                        manage=None
+                        if fused is not None:
+                            manage=self.brain.tick(
+                                self.market_context['close'],ask-bid,tick,
+                                self.mandate['epic'],dt=60,features=fused,
+                                bar_time=bar_t,external_features=True,
+                                in_position=True)
+                        elif not on_fusion:
+                            manage=self.brain.tick(
+                                self.market_context['close'],ask-bid,tick,
+                                self.mandate['epic'],dt=60,
+                                features=self.market_context['features'],
+                                bar_time=bar_t,in_position=True)
+                        if manage is not None:
+                            self._manage_signal={
+                                'scores':dict(manage.get('scores') or {}),
+                                'action':manage.get('action'),
+                                'bar_time':bar_t,
+                                'entry_train':False,'in_position':True,
+                                'trend':self.market_context.get('trend'),
+                                'regime':self.market_context.get('regime')}
                     next_signal=None
                 elif fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
@@ -2251,13 +2275,23 @@ class SingleTradeEngine:
                 # TP (Capital TP Off after trail is intentional for SL ratchet).
                 if p.get('stopLevel') is None:
                     await self.protect_position(p);return
-                # Live exit = broker SL / TP / trail only. Neural market-delete
-                # was matching M1 noise; the network still learns from cash P&L
-                # when those broker exits confirm. Intent is logged, never sent.
-                if (new_closed_bar and self.last_signal and
-                    self.last_exit_processed_bar!=self.last_decision_bar):
-                    self.last_exit_processed_bar=self.last_decision_bar
-                    scores=self.last_signal['scores']
+                # Reverse exit: evaluate each new M1 from *manage* scores (fresh
+                # perception), not the frozen OPEN vote. Confirmed opposite +
+                # aligned 5/15m returns → market CLOSE so we stop fighting the
+                # move and can learn / re-enter the other side next flat bar.
+                # Broker SL/TP/trail still run via adapt_protection below.
+                manage_bar=(self._manage_signal or {}).get('bar_time')
+                exit_bar=manage_bar or self.market_context.get('bar_time')
+                # Prefer fresh manage scores; frozen OPEN last_signal is fallback.
+                # Adopt/sync can clear last_signal — reverse exit must still run.
+                scores=((self._manage_signal or {}).get('scores')
+                        if isinstance((self._manage_signal or {}).get('scores'),dict)
+                        else None) or (
+                    (self.last_signal or {}).get('scores')
+                    if isinstance(self.last_signal,dict) else None)
+                if (new_closed_bar and scores and exit_bar and
+                    self.last_exit_processed_bar!=exit_bar):
+                    self.last_exit_processed_bar=exit_bar
                     vote=self.policy.neural_decision(scores)
                     streak_key='exit_opposite_streak:'+str(p['dealId'])
                     if vote in ('BUY','SELL') and vote!=p['direction']:
@@ -2270,10 +2304,15 @@ class SingleTradeEngine:
                         returns_bps=self.market_context.get('returns_bps'),
                         opposite_streak=streak,store=self.store)
                     if intent=='CLOSE':
-                        self.store.event('exit','Neural CLOSE intent ignored — SL/TP/trail only',
-                            {'deal_id':p['dealId'],'direction':p['direction'],'vote':vote,
-                             'streak':streak,'returns_bps':self.market_context.get('returns_bps'),
-                             'neural_market_exit':False})
+                        self.store.event('exit',
+                            'Neural CLOSE on confirmed reverse — market exit',
+                            {'deal_id':p['dealId'],'direction':p['direction'],
+                             'vote':vote,'streak':streak,
+                             'returns_bps':self.market_context.get('returns_bps'),
+                             'manage_bar':manage_bar,
+                             'neural_market_exit':True})
+                        await self.exit_position(p['dealId'])
+                        return
                 await self.adapt_protection(p)
                 # No self-dev / feature search while a LIVE deal is open — that
                 # mutates entry-policy architecture under an active manage MDP.
@@ -2394,7 +2433,8 @@ class SingleTradeEngine:
             self.last_signal=dict(self.last_signal,scores_raw=dict(base_scores))
         edge_advice=self._structure_edge_advice()
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
-            base_scores,edge_advice,store=self.store)
+            base_scores,edge_advice,store=self.store,
+            live_trend=ctx.get('trend'))
         self.last_signal=dict(
             self.last_signal,scores=dict(nudged_scores),
             structure_edge=edge_advice,structure_nudge=nudge_meta)
@@ -4490,12 +4530,13 @@ class SingleTradeEngine:
                 'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
                 'neural_entry_rule':'neural argmax proposes; evolved policy.py confirms or HOLDs when policy_live_execute=1; readiness+utility separate',
-                # Audit #25: neural CLOSE is diagnostic; live exit = broker SL/TP/trail.
-                'neural_market_exit':False,
-                'neural_close_diagnostic_only':True,
-                'neural_close_executable':False,
+                # Confirmed reverse (fresh manage scores + streak + 5/15m) may market-exit.
+                'neural_market_exit':True,
+                'neural_close_diagnostic_only':False,
+                'neural_close_executable':True,
                 'neural_exit_intent':raw_exit_intent,
-                'neural_exit_rule':'diagnostic CLOSE intent only — broker SL/TP/trail executes closes; neural market-delete is not a strategy',
+                'neural_exit_rule':'confirmed opposite manage vote + aligned 5/15m → market CLOSE; else broker SL/TP/trail',
+                'manage_signal':self._manage_signal,
                 'hard_risk':hr_snap,
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),

@@ -315,9 +315,9 @@ class AutoEvolution:
     @staticmethod
     def evaluate_neural_exit(scores,current_direction,*,returns_bps=None,opposite_streak=0,
                              need_streak=None,store=None):
-        """Score a CLOSE *intent* from full OHLC zone + multi-bar confirmation.
+        """Score a CLOSE intent from manage scores + multi-bar confirmation.
 
-        Live engine does NOT market-delete on this signal (SL/TP/trail only).
+        Live engine market-closes when this returns CLOSE (confirmed reverse).
         need_streak comes from self_params (robot-owned), not a frozen default.
         """
         if need_streak is None:

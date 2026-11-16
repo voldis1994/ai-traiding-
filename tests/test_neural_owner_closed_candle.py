@@ -177,8 +177,8 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_position_exit_never_market_deletes_neural_intent(monkeypatch):
-    """Zone+streak may score CLOSE intent, but live exit is SL/TP/trail only."""
+def test_position_exit_market_closes_on_confirmed_reverse(monkeypatch):
+    """Confirmed opposite manage vote + streak + 5/15m → market CLOSE."""
     from app import engine as module
     clock=[datetime(2026,10,14,17,10,tzinfo=timezone.utc)]
     def context(rows,*,spread=0.,epic=None,**_kw):
@@ -196,18 +196,27 @@ def test_position_exit_never_market_deletes_neural_intent(monkeypatch):
             e.attach(broker)
             e._schedule_calendar_in_background=lambda:None
             exits=[]
-            async def fake_exit(deal_id):exits.append(deal_id)
+            async def fake_exit(deal_id):
+                exits.append(deal_id);broker.open=[];e.positions=[]
             e.exit_position=fake_exit
             await e.poll()
             exits.clear()
-            brain.core.b=np.array([-4.,8.,-4.])  # SELL opposes manual BUY
+            # Force manage SELL each bar (frozen OPEN scores stay BUY).
+            def sell_tick(*_a,**kw):
+                assert kw.get('in_position') is True
+                return {'scores':{'BUY':0.1,'SELL':0.85,'HOLD':0.05},'action':'SELL','z':[0.]}
+            brain.tick=sell_tick
+            e.last_signal={'scores':{'BUY':0.7,'SELL':0.2,'HOLD':0.1},
+                           'scores_raw':{'BUY':0.7,'SELL':0.2,'HOLD':0.1},'action':'BUY'}
+            e._locked_entry_signal=dict(e.last_signal,scores_frozen=True)
             for _ in range(5):
                 clock[0]+=timedelta(minutes=1)
                 await e.poll()
-            assert exits==[]  # never market-delete; broker SL/TP must close
+                if exits:break
+            assert exits  # confirmed reverse must leave the wrong side
             snap=e.snapshot()
-            assert snap.get('neural_market_exit') is False
+            assert snap.get('neural_market_exit') is True
             events=store.recent(50)
-            assert any(ev.get('kind')=='exit' and 'SL/TP' in str(ev.get('message',''))
+            assert any(ev.get('kind')=='exit' and 'confirmed reverse' in str(ev.get('message','')).lower()
                        for ev in events)
     asyncio.run(scenario())

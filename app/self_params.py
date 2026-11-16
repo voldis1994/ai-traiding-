@@ -60,6 +60,8 @@ DEFAULTS = {
     'hold_shadow_repeats': 2,
     'profit_history_rows': 400,
     # Exit intent (logged only — LIVE still SL/TP/trail)
+    # 2 confirmed opposite M1 bars + aligned 5/15m — fast enough to leave a
+    # wrong-side hold without one-bar noise churn.
     'exit_need_streak': 2,
     # Neural growth (engine) — hard cap so losing clients cannot balloon to 196
     # while peers stay ~55; birth cooldown stops zero-G re-birth spam.

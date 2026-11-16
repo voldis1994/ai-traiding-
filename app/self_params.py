@@ -76,9 +76,13 @@ DEFAULTS = {
     # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
     'scratch_pnl_abs': 0.05,
     # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
+    # After BE, LIVE prefers 1m OHLC swing structure; these are no-zone fallback.
     'trail_min_mult': 2.0,
     'trail_open_gap_frac': 0.35,
     'trail_fallback_frac': 0.5,
+    # 1m structure trail: last N completed bars + pad as frac of median range.
+    'trail_ohlc_bars': 5,
+    'trail_ohlc_buffer_frac': 0.15,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
@@ -167,6 +171,8 @@ BOUNDS = {
     'trail_min_mult': (1.0, 4.0),
     'trail_open_gap_frac': (0.15, 0.7),
     'trail_fallback_frac': (0.25, 0.8),
+    'trail_ohlc_bars': (2, 15),
+    'trail_ohlc_buffer_frac': (0.0, 0.5),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
     'day_profit_target_frac': (0.001, 0.05),
@@ -263,7 +269,7 @@ def _clip(key, value):
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
-               'day_max_positions'):
+               'day_max_positions','trail_ohlc_bars'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

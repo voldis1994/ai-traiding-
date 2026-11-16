@@ -152,10 +152,18 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
                     mfe=mfe,original_risk=original_risk,be_locked=sign*(stop-entry)>=-1e-12)
             except Exception:
                 arm=None
+            path_bars=bars[:i+1]
+            zr=None
+            try:
+                from .math_rules import ohlc_range_distance
+                zr=ohlc_range_distance(path_bars)
+                zr=float(zr) if zr is not None else None
+            except Exception:
+                zr=None
             new_stop=paper_trail_stop(
                 action,entry,stop,profit,high=hi,low=lo,mid=mid,spread=sp_bar,
                 original_risk=original_risk,tick=tick_v,min_distance=min_d,
-                arm_decision=arm)
+                arm_decision=arm,zone_range=zr,candles=path_bars)
             if new_stop is not None:
                 stop=float(new_stop);trailed=True
         hit=hit_sl_tp(action,high=hi,low=lo,stop=stop,profit=profit,
@@ -179,11 +187,11 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
 
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
                      original_risk, tick, min_distance, store=None,
-                     arm_decision=None):
+                     arm_decision=None,zone_range=None,candles=None,opened_at=None):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
 
-    Same BE / post-BE / early-arm gap idea as `propose_broker_trail` — never
-    flips on signal. Returns new stop or None when no improvement.
+    After BE: prefer recent 1m OHLC swing structure (same as propose_broker_trail),
+    else median-range gap — never flips on signal. Returns new stop or None.
     """
     direction=direction if direction in ('BUY','SELL') else None
     if direction is None:return None
@@ -207,9 +215,25 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
         tip=tip+half
     be_locked=sign*(stop-entry)>=-1e-12
     early_arm=bool(isinstance(arm_decision,dict) and arm_decision.get('arm'))
+    from .protection_ai import _post_be_trail_gap,_trail_knobs,ohlc_1m_structure_stop
+    structure_stop=None
     if be_locked:
-        from .protection_ai import _post_be_trail_gap
-        trail_gap=_post_be_trail_gap(open_gap,minimum,None,store=store)
+        zr=_finite(zone_range)
+        trail_gap=_post_be_trail_gap(open_gap,minimum,zr,store=store)
+        knobs=_trail_knobs(store)
+        buf=0.0
+        if zr is not None and zr>0:
+            buf=max(0.0,float(knobs['ohlc_buffer_frac'])*zr)
+        opened_ts=None
+        if opened_at is not None:
+            try:
+                from .market_context import candle_time as _ct
+                opened_ts=_ct(opened_at) if not hasattr(opened_at,'year') else opened_at
+            except Exception:
+                opened_ts=None
+        structure_stop=ohlc_1m_structure_stop(
+            direction,candles,opened_at=opened_ts,
+            lookback=knobs['ohlc_bars'],buffer=buf)
     else:
         trail_gap=open_gap
     tip_fav=sign*(tip-entry)
@@ -228,19 +252,27 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
         need=floor_need
         phase='armed'
     else:
-        need=open_gap if not be_locked else trail_gap
+        if be_locked and structure_stop is not None:
+            need=minimum
+        else:
+            need=open_gap if not be_locked else trail_gap
     if tip_fav<need:return None
     profit=_finite(profit)
     if direction=='BUY':
         tip=max(tip,bid)
         if tip<=entry:return None
         legal_cap=bid-minimum
-        desired=min(tip-trail_gap,legal_cap)
+        if be_locked and structure_stop is not None:
+            desired=min(float(structure_stop),legal_cap,tip-tick)
+        else:
+            desired=min(tip-trail_gap,legal_cap)
         if early_arm and not be_locked:
             if entry<=legal_cap+1e-12:
                 desired=max(desired,entry);phase='be_lock'
             else:
                 desired=min(desired,legal_cap);phase='ratchet'
+        if be_locked:
+            desired=max(desired,entry)
         new_stop=math.floor(desired/tick+1e-12)*tick
         if phase=='be_lock' and new_stop<entry-1e-12:
             new_stop=math.floor(legal_cap/tick+1e-12)*tick
@@ -252,12 +284,17 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     tip=min(tip,ask)
     if tip>=entry:return None
     legal_floor=ask+minimum
-    desired=max(tip+trail_gap,legal_floor)
+    if be_locked and structure_stop is not None:
+        desired=max(float(structure_stop),legal_floor,tip+tick)
+    else:
+        desired=max(tip+trail_gap,legal_floor)
     if early_arm and not be_locked:
         if entry>=legal_floor-1e-12:
             desired=min(desired,entry);phase='be_lock'
         else:
             desired=max(desired,legal_floor);phase='ratchet'
+    if be_locked:
+        desired=min(desired,entry)
     new_stop=math.ceil(desired/tick-1e-12)*tick
     if phase=='be_lock' and new_stop>entry+1e-12:
         new_stop=math.ceil(legal_floor/tick-1e-12)*tick
@@ -301,6 +338,7 @@ class ShadowPaperJournal:
         self.last_bar=st.get('last_bar')
         self.cash_scale=st.get('cash_scale')
         self.bars_seen=int(st.get('bars_seen') or 0)
+        self.recent_ohlc=list(st.get('recent_ohlc') or [])[-120:]
 
     def _persist(self):
         from .self_params import get as sp_get
@@ -309,7 +347,8 @@ class ShadowPaperJournal:
         self.store.set(STATE_KEY,{
             'position':self.position,'pending':self.pending,
             'last_bar':self.last_bar,'cash_scale':self.cash_scale,
-            'bars_seen':self.bars_seen})
+            'bars_seen':self.bars_seen,
+            'recent_ohlc':list(self.recent_ohlc or [])[-120:]})
 
     def update_cash_scale(self, live_rows, *, min_samples=5):
         """Refresh £/price-unit from LIVE broker history when possible."""
@@ -388,6 +427,11 @@ class ShadowPaperJournal:
         if bar_time and bar_time==self.last_bar:return None
         self.last_bar=bar_time
         self.bars_seen=int(self.bars_seen or 0)+1
+        self.recent_ohlc=list(getattr(self,'recent_ohlc',None) or [])
+        self.recent_ohlc.append({
+            'at':bar_time,'open':mid,'high':high if high is not None else mid,
+            'low':low if low is not None else mid,'close':mid,'spread':sp})
+        self.recent_ohlc=self.recent_ohlc[-120:]
         if cash_scale is not None:
             cs=_finite(cash_scale)
             if cs is not None:self.cash_scale=cs
@@ -422,13 +466,22 @@ class ShadowPaperJournal:
                     be_locked=be_locked)
             except Exception:
                 arm=None
+            zr=None
+            try:
+                from .math_rules import ohlc_range_distance
+                zr=ohlc_range_distance(self.recent_ohlc)
+                zr=float(zr) if zr is not None else None
+            except Exception:
+                zr=None
+            opened=pos.get('opened_at') or pos.get('bar_time')
             new_stop=paper_trail_stop(
                 direction,pos.get('entry'),pos.get('stop'),pos.get('profit'),
                 high=hi,low=lo,mid=mid,spread=sp,
                 original_risk=pos.get('original_risk'),
                 tick=pos.get('tick') or tick,
                 min_distance=pos.get('min_distance') or min_distance,
-                store=self.store,arm_decision=arm)
+                store=self.store,arm_decision=arm,zone_range=zr,
+                candles=self.recent_ohlc,opened_at=opened)
             if new_stop is not None:
                 pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
                 self.position=pos

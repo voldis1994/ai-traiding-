@@ -1,21 +1,48 @@
-:root{color-scheme:dark;font-family:"Segoe UI",system-ui,sans-serif}
+:root{
+  color-scheme:dark;
+  --bg:#070a0c;
+  --panel:rgba(16,22,26,.86);
+  --line:rgba(57,255,136,.16);
+  --text:#eef6f1;
+  --muted:#8a9a92;
+  --accent:#39ff88;
+  --display:"Sora",ui-sans-serif,sans-serif;
+  --body:"Manrope",ui-sans-serif,sans-serif;
+}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;color:#e8eef8;background:#0a0d16;
-  background-image:radial-gradient(ellipse 80% 55% at 50% -15%,#1c2740,transparent)}
+body{
+  margin:0;min-height:100vh;color:var(--text);font-family:var(--body);
+  background:
+    radial-gradient(ellipse 70% 45% at 12% 100%,rgba(57,255,136,.12),transparent 55%),
+    radial-gradient(ellipse 50% 40% at 90% 0%,rgba(57,255,136,.06),transparent 50%),
+    linear-gradient(165deg,#06090b,#0a1012 55%,#070a0c);
+}
+.icon-sprite{position:absolute;width:0;height:0;overflow:hidden}
+.ico{width:1.15em;height:1.15em;display:inline-block;vertical-align:-.18em}
 .shell{max-width:860px;margin:0 auto;padding:48px 20px 40px}
 .brand{text-align:center;margin-bottom:36px}
-.mark{font-size:48px;color:#3ecf8e;margin-bottom:10px}
-.brand h1{margin:0;font-size:28px;letter-spacing:.06em}
-.brand p{margin:10px 0 0;color:#8b97b0}
-.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
-.card{display:block;text-decoration:none;color:inherit;background:#121826;border:1px solid #2a3348;
-  border-radius:14px;padding:18px;min-height:150px;transition:border-color .15s,transform .15s}
-.card:hover{border-color:#3ecf8e;transform:translateY(-2px)}
-.eyebrow{display:block;color:#8b97b0;font-size:11px;font-weight:800;letter-spacing:.08em;margin-bottom:10px}
-.card strong{display:block;font-size:22px;margin-bottom:10px;color:#3ecf8e}
-.card em{display:block;font-style:normal;color:#b7c0d4;line-height:1.45;font-size:13px}
-.warn{background:#1a1510;border:1px solid #8a6a2a;border-radius:12px;padding:14px 16px;margin:0 0 18px;
-  color:#e8d9b0;font-size:13px;line-height:1.45}
+.brand-icon{
+  width:56px;height:56px;margin:0 auto 14px;border-radius:16px;display:grid;place-items:center;
+  background:rgba(57,255,136,.12);border:1px solid var(--line);color:var(--accent)}
+.brand-icon .ico{width:30px;height:30px}
+.brand h1{margin:0;font-family:var(--display);font-size:clamp(1.6rem,4vw,2rem);letter-spacing:.02em;font-weight:800}
+.brand p{margin:10px 0 0;color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.card{
+  display:block;text-decoration:none;color:inherit;background:var(--panel);
+  border:1px solid var(--line);border-radius:16px;padding:20px;min-height:160px;
+  transition:border-color .15s,transform .15s,box-shadow .15s;
+  backdrop-filter:blur(10px)}
+.card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 12px 40px rgba(57,255,136,.12)}
+.card-ico{
+  width:40px;height:40px;border-radius:12px;display:grid;place-items:center;margin-bottom:12px;
+  background:rgba(57,255,136,.1);color:var(--accent);border:1px solid var(--line)}
+.card-ico .ico{width:22px;height:22px}
+.eyebrow{display:block;color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.08em;margin-bottom:8px}
+.card strong{display:block;font-family:var(--display);font-size:22px;margin-bottom:10px;color:var(--accent)}
+.card em{display:block;font-style:normal;color:#b7c8be;line-height:1.45;font-size:13px}
+.warn{background:rgba(245,185,66,.08);border:1px solid rgba(245,185,66,.3);border-radius:12px;
+  padding:14px 16px;margin:0 0 18px;color:#e8d9b0;font-size:13px;line-height:1.45}
 .warn strong{display:block;margin-bottom:6px;color:#f0c96a}
 .warn code{color:#9fe3c0}
 .hidden{display:none!important}

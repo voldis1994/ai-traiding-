@@ -3,80 +3,337 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NEURAL · Ops Board</title>
+  <title>NEURAL Trading AI · Komandcentrs</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=91">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=92">
 </head>
 <body>
+  <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <!-- Unified monoline icon set: 1.75 stroke, round caps/joins, 24 viewBox -->
+      <symbol id="i-logo" viewBox="0 0 24 24" fill="none">
+        <path d="M3 16c3-8 5-8 8 0s5 8 8 0" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 12h2M18 12h2" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24" fill="none">
+        <rect x="3.5" y="3.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="13.5" y="3.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="3.5" y="13.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="13.5" y="13.5" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.75"/>
+      </symbol>
+      <symbol id="i-users" viewBox="0 0 24 24" fill="none">
+        <circle cx="9" cy="8" r="3.25" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M3.5 19.5c.6-3.2 2.7-5 5.5-5s4.9 1.8 5.5 5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <circle cx="17" cy="9" r="2.5" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M15.2 14.2c1.7.3 3.1 1.5 3.8 3.8" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-user" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="8" r="3.5" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M5 19.5c1-3.6 3.4-5.5 7-5.5s6 1.9 7 5.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-candles" viewBox="0 0 24 24" fill="none">
+        <path d="M7 3v3M7 18v3M12 5v2M12 17v2M17 4v2M17 16v4" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <rect x="5" y="6" width="4" height="12" rx="1" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="10" y="7" width="4" height="10" rx="1" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="15" y="6" width="4" height="10" rx="1" stroke="currentColor" stroke-width="1.75"/>
+      </symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24" fill="none">
+        <path d="M12 3.5l7.5 3v5.2c0 4.6-3.1 7.8-7.5 9.3-4.4-1.5-7.5-4.7-7.5-9.3V6.5L12 3.5z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+        <path d="M9.2 12.2l1.9 1.9 3.7-3.8" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="3.25" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M12 3.5v2.2M12 18.3V20.5M20.5 12h-2.2M5.7 12H3.5M17.9 6.1l-1.6 1.6M7.7 16.3l-1.6 1.6M17.9 17.9l-1.6-1.6M7.7 7.7 6.1 6.1" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-sync" viewBox="0 0 24 24" fill="none">
+        <path d="M19.5 12a7.5 7.5 0 1 1-1.6-4.6" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <path d="M19.5 4.5V9H15" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-play" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="8.25" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M10 8.8v6.4l5.4-3.2L10 8.8z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-robot" viewBox="0 0 24 24" fill="none">
+        <rect x="5" y="8" width="14" height="11" rx="3" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M12 4.5V8M9 13h.01M15 13h.01M9.5 16.5h5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <circle cx="9.2" cy="13" r=".8" fill="currentColor"/>
+        <circle cx="15.2" cy="13" r=".8" fill="currentColor"/>
+      </symbol>
+      <symbol id="i-arrows" viewBox="0 0 24 24" fill="none">
+        <path d="M8 19V5M8 5l-3 3M8 5l3 3" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M16 5v14M16 19l-3-3M16 19l3-3" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24" fill="none">
+        <path d="M12 3.5 20 8l-8 4.5L4 8l8-4.5z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+        <path d="M4 12.2 12 16.7l8-4.5M4 16.4 12 20.9l8-4.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-warn" viewBox="0 0 24 24" fill="none">
+        <path d="M12 4.5 21 19.5H3L12 4.5z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+        <path d="M12 10v4.5M12 17.2h.01" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-up" viewBox="0 0 24 24" fill="none">
+        <path d="M12 19V5M6.5 10.5 12 5l5.5 5.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-down" viewBox="0 0 24 24" fill="none">
+        <path d="M12 5v14M6.5 13.5 12 19l5.5-5.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-logout" viewBox="0 0 24 24" fill="none">
+        <path d="M10 6H7a3 3 0 0 0-3 3v6a3 3 0 0 0 3 3h3" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <path d="M14 8l4 4-4 4M18 12H10" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24" fill="none">
+        <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-link" viewBox="0 0 24 24" fill="none">
+        <path d="M9.5 14.5 14.5 9.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        <path d="M11 7.5l1.2-1.2a4 4 0 1 1 5.7 5.7L16.5 13M13 16.5l-1.2 1.2a4 4 0 1 1-5.7-5.7L7.5 11" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24" fill="none">
+        <rect x="6.5" y="6.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.75"/>
+      </symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24" fill="none">
+        <rect x="7" y="6" width="3.5" height="12" rx="1" stroke="currentColor" stroke-width="1.75"/>
+        <rect x="13.5" y="6" width="3.5" height="12" rx="1" stroke="currentColor" stroke-width="1.75"/>
+      </symbol>
+      <symbol id="i-gold" viewBox="0 0 24 24" fill="none">
+        <path d="M4 16.5 7 7.5h10l3 9H4z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/>
+        <path d="M7.5 12.5h9" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-fx" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="8.25" stroke="currentColor" stroke-width="1.75"/>
+        <path d="M4.5 12h15M12 4c2.2 2.4 3.3 4.9 3.3 8S14.2 17.6 12 20c-2.2-2.4-3.3-4.9-3.3-8S9.8 6.4 12 4z" stroke="currentColor" stroke-width="1.75"/>
+      </symbol>
+      <symbol id="i-index" viewBox="0 0 24 24" fill="none">
+        <path d="M4 17.5 9 11l3.5 3.5L20 6.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M15 6.5h5v5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+    </defs>
+  </svg>
+
   <div id="login" class="gate">
+    <div class="gate-glow" aria-hidden="true"></div>
     <form id="loginForm" class="gate-panel">
-      <p class="brand-mark">NEURAL</p>
-      <h1>Ops Board</h1>
-      <p class="lede">Visa flote vienā ekrānā · lot · TP · trail · P&amp;L · W/L</p>
+      <div class="brand-row">
+        <span class="brand-icon"><svg class="ico"><use href="#i-logo"></use></svg></span>
+        <div>
+          <strong>NEURAL</strong>
+          <span>Trading AI</span>
+        </div>
+      </div>
+      <h1>Operatora ieeja</h1>
+      <p class="lede">Komandcentrs — flote, treidi, riski vienā skatā.</p>
       <label>Lietotājvārds<input name="username" required autocomplete="username"></label>
       <label>Parole<input name="password" type="password" required autocomplete="current-password"></label>
-      <button class="btn" type="submit">Ienākt</button>
-      <p id="loginError" class="error"></p>
-      <p class="links"><a href="/">/</a> · <a href="/app">/app</a></p>
+      <button class="btn btn-primary full" type="submit">
+        <svg class="ico"><use href="#i-play"></use></svg>
+        Ienākt
+      </button>
+      <p id="loginError" class="error" role="alert"></p>
+      <p class="links">Portāls <a href="/">/</a> · Klients <a href="/app">/app</a></p>
     </form>
   </div>
 
-  <div id="dash" class="board hidden">
-    <header class="topbar">
-      <div class="topbar-brand">
-        <span class="brand-mark">NEURAL</span>
-        <span class="topbar-sub">Ops Board · viena lapa</span>
+  <div id="dash" class="shell hidden">
+    <aside class="sidebar" aria-label="Navigācija">
+      <div class="sidebar-brand">
+        <span class="brand-icon"><svg class="ico"><use href="#i-logo"></use></svg></span>
+        <div>
+          <strong>NEURAL</strong>
+          <span>Trading AI</span>
+        </div>
       </div>
-      <div class="topbar-actions">
-        <span id="clock" class="clock"></span>
-        <button type="button" id="refreshBtn" class="btn">Atsvaidzināt</button>
-        <button type="button" id="resetLearningBtn" class="btn ghost">Mācīties no jauna</button>
-        <a class="btn ghost" href="/app" target="_blank" rel="noopener">/app</a>
-        <button type="button" id="logoutBtn" class="btn ghost">Iziet</button>
-      </div>
-    </header>
+      <nav class="side-nav">
+        <button type="button" class="nav-item active" data-view="overview">
+          <svg class="ico"><use href="#i-grid"></use></svg><span>Pārskats</span>
+        </button>
+        <button type="button" class="nav-item" data-view="clients">
+          <svg class="ico"><use href="#i-user"></use></svg><span>Klienti</span>
+        </button>
+        <button type="button" class="nav-item" data-view="trades">
+          <svg class="ico"><use href="#i-candles"></use></svg><span>Treidi</span>
+        </button>
+        <button type="button" class="nav-item" data-view="risks">
+          <svg class="ico"><use href="#i-shield"></use></svg><span>Riski</span>
+        </button>
+        <button type="button" class="nav-item" data-view="settings">
+          <svg class="ico"><use href="#i-settings"></use></svg><span>Iestatījumi</span>
+        </button>
+      </nav>
+      <div class="sidebar-wave" aria-hidden="true"></div>
+    </aside>
 
-    <section id="summary" class="fleet"></section>
-    <section id="controlRoom" class="cards"></section>
+    <div class="main">
+      <header class="topbar">
+        <div class="status-pill" id="systemStatus">
+          <span class="dot"></span>
+          <span>Sistēma aktīva</span>
+        </div>
+        <div class="top-actions">
+          <button type="button" id="refreshBtn" class="btn btn-ghost">
+            <svg class="ico"><use href="#i-sync"></use></svg>
+            Sinhronizēt
+          </button>
+          <button type="button" id="startAllBtn" class="btn btn-primary">
+            <svg class="ico"><use href="#i-play"></use></svg>
+            Palaist robotus
+          </button>
+          <button type="button" id="logoutBtn" class="btn btn-ghost icon-only" title="Iziet" aria-label="Iziet">
+            <svg class="ico"><use href="#i-logout"></use></svg>
+          </button>
+        </div>
+      </header>
 
-    <details class="ops">
-      <summary>Reģistrācija · jauns klients / brokeris</summary>
-      <div class="ops-grid">
-        <article>
-          <h3>Jauns klients</h3>
-          <form id="createForm">
-            <label>Login<input name="username" required maxlength="64"></label>
-            <label>Parole<input name="password" required minlength="4" maxlength="256"></label>
-            <label>Vārds<input name="display_name" maxlength="120"></label>
-            <label>Valoda
-              <select name="language">
-                <option value="lv">Latviešu</option>
-                <option value="en">English</option>
-                <option value="ru">Русский</option>
-              </select>
-            </label>
-            <button class="btn" type="submit">Izveidot</button>
-            <p id="createMsg" class="muted"></p>
-          </form>
+      <section class="view active" data-view="overview">
+        <div class="page-head">
+          <h1>Komandcentrs</h1>
+          <p>Visa flote vienā skatā</p>
+        </div>
+
+        <div id="summary" class="stat-grid" aria-label="Kopsavilkums"></div>
+
+        <div class="overview-grid">
+          <div class="overview-main">
+            <article class="card chart-card">
+              <div class="card-head">
+                <div>
+                  <h2>Kopējā veiktspēja</h2>
+                  <div class="perf-row">
+                    <strong id="perfValue">—</strong>
+                    <span id="perfDelta" class="trend-pill">—</span>
+                  </div>
+                </div>
+                <div class="range-tabs" role="tablist" aria-label="Laika periods">
+                  <button type="button" class="range-tab" data-range="1D">1D</button>
+                  <button type="button" class="range-tab active" data-range="1W">1N</button>
+                  <button type="button" class="range-tab" data-range="1M">1M</button>
+                  <button type="button" class="range-tab" data-range="ALL">Visi</button>
+                </div>
+              </div>
+              <canvas id="perfChart" width="800" height="220" aria-label="Veiktspējas grafiks"></canvas>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <h2>Atvērtie treidi</h2>
+                <button type="button" class="text-link" data-jump="trades">Skatīt visus →</button>
+              </div>
+              <div id="openTradesPreview" class="table-wrap"></div>
+            </article>
+          </div>
+
+          <aside class="overview-side">
+            <article class="card">
+              <div class="card-head"><h2>Top klienti</h2></div>
+              <div id="topClients" class="rank-list"></div>
+            </article>
+            <article class="card">
+              <div class="card-head">
+                <h2>Riska brīdinājumi</h2>
+                <svg class="ico warn"><use href="#i-warn"></use></svg>
+              </div>
+              <div id="riskAlerts" class="alert-list"></div>
+            </article>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" data-view="clients">
+        <div class="page-head">
+          <h1>Klienti</h1>
+          <p>Live flote — lot · side · TP · trail</p>
+        </div>
+        <div id="controlRoom" class="client-list"></div>
+      </section>
+
+      <section class="view" data-view="trades">
+        <div class="page-head">
+          <h1>Treidi</h1>
+          <p>Visas atvērtās pozīcijas flotē</p>
+        </div>
+        <article class="card">
+          <div id="openTradesFull" class="table-wrap"></div>
         </article>
-        <article>
-          <h3>Brokeris</h3>
-          <form id="brokerForm">
-            <label>Klients<select name="client_id" id="brokerClient" required></select></label>
-            <label>Tips<select name="broker_type" id="brokerType" required></select></label>
-            <label>Nosaukums<input name="display_name" maxlength="120"></label>
-            <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
-            <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
-            <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
-            <button class="btn" type="submit">Saglabāt + palaist</button>
-            <p id="brokerMsg" class="muted"></p>
-          </form>
+        <article class="card" style="margin-top:16px">
+          <div class="card-head"><h2>Nesen slēgtie</h2></div>
+          <div id="recentClosed" class="table-wrap"></div>
         </article>
-      </div>
-    </details>
+      </section>
+
+      <section class="view" data-view="risks">
+        <div class="page-head">
+          <h1>Riski</h1>
+          <p>Hard-risk limitu un brīdinājumu pārskats</p>
+        </div>
+        <div id="riskBoard" class="risk-board"></div>
+      </section>
+
+      <section class="view" data-view="settings">
+        <div class="page-head">
+          <h1>Iestatījumi</h1>
+          <p>Reģistrācija, brokeris, mācīšanās</p>
+        </div>
+        <div class="settings-grid">
+          <article class="card">
+            <div class="card-head">
+              <h2><svg class="ico accent"><use href="#i-plus"></use></svg> Jauns klients</h2>
+            </div>
+            <form id="createForm" class="form-stack">
+              <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
+              <label>Parole<input name="password" required minlength="4" maxlength="256" placeholder="••••••••"></label>
+              <label>Vārds / nosaukums<input name="display_name" maxlength="120" placeholder="Jānis"></label>
+              <label>Valoda
+                <select name="language">
+                  <option value="lv">Latviešu</option>
+                  <option value="en">English</option>
+                  <option value="ru">Русский</option>
+                </select>
+              </label>
+              <button class="btn btn-primary" type="submit">
+                <svg class="ico"><use href="#i-plus"></use></svg>
+                Izveidot klientu
+              </button>
+              <p id="createMsg" class="muted"></p>
+            </form>
+          </article>
+          <article class="card">
+            <div class="card-head">
+              <h2><svg class="ico accent"><use href="#i-link"></use></svg> Pieslēgt brokeri</h2>
+            </div>
+            <form id="brokerForm" class="form-stack">
+              <label>Klients
+                <select name="client_id" id="brokerClient" required></select>
+              </label>
+              <label>Brokeris
+                <select name="broker_type" id="brokerType" required></select>
+              </label>
+              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
+              <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
+              <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
+              <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
+              <button class="btn btn-primary" type="submit">
+                <svg class="ico"><use href="#i-play"></use></svg>
+                Saglabāt un palaist
+              </button>
+              <p id="brokerMsg" class="muted"></p>
+            </form>
+          </article>
+          <article class="card">
+            <div class="card-head">
+              <h2><svg class="ico accent"><use href="#i-sync"></use></svg> Mācīšanās</h2>
+            </div>
+            <p class="muted">Izdzēš neironu/treidu/signālu vēsturi. Klienti un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.</p>
+            <button type="button" id="resetLearningBtn" class="btn btn-ghost">
+              <svg class="ico"><use href="#i-sync"></use></svg>
+              Mācīties no jauna (viss)
+            </button>
+            <p class="muted" style="margin-top:12px">Klienta portāls: <a href="/app" target="_blank" rel="noopener">/app</a></p>
+          </article>
+        </div>
+      </section>
+    </div>
   </div>
-  <script src="/admin/static/admin.js?v=91"></script>
+  <script src="/admin/static/admin.js"></script>
 </body>
 </html>

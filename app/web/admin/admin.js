@@ -37,20 +37,35 @@ function renderSummary(s){
   let pnlLabel;
   const by=s.pnl_by_currency||{};
   const keys=Object.keys(by);
+  const closed=Number(s.closed_trades_all)||0;
+  const cash=Number(s.cash_trades_all)||0;
+  const pending=Number(s.pending_cash_trades_all)||0;
+  const proxy=Number(s.proxy_trades_all)||0;
   if(keys.length>1){
     pnlLabel=keys.map(k=>`${num(by[k],2)} ${k}`).join(' · ');
   }else if(s.realized_pnl_all!=null && s.pnl_currency){
     pnlLabel=money(s.realized_pnl_all,s.pnl_currency);
   }else if(keys.length===1){
     pnlLabel=money(by[keys[0]],keys[0]);
+  }else if(closed>0 && cash===0){
+    pnlLabel='0.00 · bez broker £';
   }else{
     pnlLabel='—';
+  }
+  // 13 closes with £0 is NOT ok — surface missing Capital cash explicitly.
+  let pnlNote='';
+  if(closed>0 && cash===0){
+    pnlNote=` · ${closed} slēgti bez broker £`+(pending?` (${pending} pending)`:'')+(proxy?` · ${proxy} ticks_only`:'');
+  }else if(pending>0){
+    pnlNote=` · ${pending} vēl gaida broker £`;
+  }else if(cash>0 && cash<closed){
+    pnlNote=` · broker £ ${cash}/${closed}`;
   }
   $('summary').innerHTML=`
     <div class="stat"><span>Klienti</span><b>${s.clients||0}</b></div>
     <div class="stat"><span>Roboti ON</span><b>${s.running_robots||0}</b></div>
-    <div class="stat"><span>Slēgtie treidi</span><b>${s.closed_trades_all||0}</b></div>
-    <div class="stat"><span>Realizētais P&amp;L (konta valūta)</span><b class="${pnlClass(s.realized_pnl_all)}">${pnlLabel}</b></div>`;
+    <div class="stat"><span>Slēgtie treidi</span><b>${closed}</b></div>
+    <div class="stat"><span>Realizētais P&amp;L (konta valūta)</span><b class="${pnlClass(s.realized_pnl_all)}">${pnlLabel}${pnlNote}</b></div>`;
 }
 
 function renderCard(c){
@@ -112,9 +127,15 @@ function renderCard(c){
       <div><span>Dzimšanas / prune</span><br><strong>${e.births??0} / ${e.pruned??0}</strong></div>
       <div><span>Tirgus</span><br><strong>${a.market||'—'}</strong></div>
       <div><span>Ticki</span><br><strong>${a.tick_count??0}</strong></div>
-      <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
+      <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}${(r.cash_trades!=null)?` · broker ${r.cash_trades||0}/${r.closed_trades||0}`:''}</strong></div>
       <div><span>P&amp;L + UPL</span><br><strong class="${pnlClass(r.equity_pnl??r.realized_pnl)}">${money(r.equity_pnl??r.realized_pnl,ccy)}${r.open_upl!=null?` (UPL ${money(r.open_upl,ccy)})`:''}</strong></div>
       <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
+      <div><span>Broker £ statuss</span><br><strong>${
+        r.pnl_status==='closed_without_broker_cash'?'⛔ slēgti bez broker £':
+        r.pnl_status==='broker_cash_pending'?`⏳ pending ${r.pending_cash_trades||0}`:
+        r.pnl_status==='broker_cash_ok'?'✓ broker £':
+        (r.pnl_status||'—')
+      }${r.estimate_pnl!=null?` · UPL est. ${money(r.estimate_pnl,ccy)}`:''}</strong></div>
     </div>
     <div class="muted small">${e.neural_adapt_reason||e.last_reason||''}${(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)?(' · '+(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)):''}</div>
     <div class="trades">${trades}</div>

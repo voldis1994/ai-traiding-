@@ -41,6 +41,13 @@ def test_phase_hunt_protect_defend_done():
     b = db.budgets(equity=10_000.0, params=params, daily=daily)
     assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_DEFEND
 
+    # BE-band after a scratch must stay HUNT (no auto DONE/PROTECT).
+    daily = {'realized_pnl': 0.05, 'closes': 1}
+    b = db.budgets(equity=10_000.0, params=params, daily=daily)
+    assert abs(daily['realized_pnl']) <= float(b['be_band'] or 0)
+    assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_HUNT
+    assert db.phase_for(daily=daily, budgets_map=b, open_count=1) == db.PHASE_HUNT
+
 
 def test_allows_multi_when_edge_strong():
     with tempfile.TemporaryDirectory() as d:

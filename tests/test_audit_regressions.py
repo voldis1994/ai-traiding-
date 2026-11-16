@@ -5,12 +5,15 @@ max DD with start equity, and stubs that fail until later items land.
 """
 import asyncio
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
-from app.liquidity_feed import LiquidityFeed
+from app.liquidity_feed import (
+    MAX_OBSERVATION_AGE_SEC, _observation_age_ok, build_liquidity_observation,
+)
 from app.model_validation import _equity_curve
 from app.shadow_paper import STATE_KEY as SHADOW_STATE_KEY
 from tests.test_broker_pnl_resolve import HistoryBroker
@@ -58,18 +61,16 @@ def test_shadow_state_persists_hc_and_steps():
 
 def test_stale_observation_rejected_even_if_snapshot_fresh():
     """Audit #10: observation time — not download time — gates volume freshness."""
-    with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'s.db')
-        feed=LiquidityFeed(store)
-        # Prefer public helpers if present.
-        obs_age=getattr(feed,'observation_too_old',None) or getattr(feed,'_observation_too_old',None)
-        if callable(obs_age):
-            # Very old observation must be rejected.
-            assert obs_age(age_sec=3600*24) is True or obs_age(3600*24) is True
-        else:
-            # Fall back: snapshot builder should mark unavailable when obs stale.
-            build=getattr(feed,'build_snapshot',None) or getattr(feed,'snapshot',None)
-            assert build is not None, 'LiquidityFeed missing observation helpers'
+    now=datetime(2026,10,29,12,0,tzinfo=timezone.utc)
+    stale=now-timedelta(seconds=3600*24)
+    assert _observation_age_ok(stale.timestamp(),now,kind='yahoo_futures') is False
+    fresh=now-timedelta(seconds=30)
+    assert _observation_age_ok(fresh.timestamp(),now,kind='yahoo_futures') is True
+    # Kind must be known — missing kind rejects.
+    assert _observation_age_ok(fresh.timestamp(),now,kind=None) is False
+    assert 'yahoo_futures' in MAX_OBSERVATION_AGE_SEC
+    # Module builder still imported for collection smoke.
+    assert callable(build_liquidity_observation)
 
 
 def test_promote_fingerprint_blocks_repeat():

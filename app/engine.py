@@ -1371,31 +1371,38 @@ class SingleTradeEngine:
     def _order_fully_matched(self, kind, req, deal_id, confirmation=None, ref=None):
         """Full broker reconcile check — epic alone is never enough (audit #31).
 
-        OPEN: epic + direction + size, and when the confirm carries a dealId it
-        must identify the live position. CLOSE: deal gone. PROTECT: dealId + levels.
+        OPEN: epic + direction + size among *all* positions, bound to confirm
+        dealId (multi-pos safe). CLOSE: deal gone. PROTECT: dealId + levels
+        among all positions (not only positions[0] with len==1).
         """
         if kind=='CLOSE':
             return not any(p.get('dealId')==deal_id for p in self.positions)
         if kind=='PROTECT':
-            return (len(self.positions)==1 and self.positions[0].get('dealId')==deal_id and
-                    self._protection_matches(self.positions[0],req or {}))
+            live=next((p for p in (self.positions or [])
+                       if p.get('dealId')==deal_id),None)
+            return live is not None and self._protection_matches(live,req or {})
         if kind!='OPEN' or not req or not self.mandate:
             return False
-        if len(self.positions)!=1:return False
-        p=self.positions[0]
-        try:
-            size_ok=Decimal(str(p.get('size')))==Decimal(str(req.get('size')))
-        except (ValueError,TypeError,ArithmeticError):
-            size_ok=False
-        epic_ok=(p.get('epic')==self.mandate.get('epic') and
-                 (req.get('epic') is None or p.get('epic')==req.get('epic')))
-        dir_ok=p.get('direction')==req.get('direction')
-        if not (epic_ok and dir_ok and size_ok):
-            return False
-        # Critical #3: OPEN must bind broker-confirmed dealId to the live position.
         conf=confirmation or {}
         conf_deal=conf.get('dealId') or conf.get('dealID')
-        if conf_deal is None or str(p.get('dealId'))!=str(conf_deal):
+        # Critical #3: OPEN must bind broker-confirmed dealId to a live position.
+        if conf_deal is None:
+            return False
+        matched=None
+        for p in (self.positions or []):
+            if str(p.get('dealId'))!=str(conf_deal):
+                continue
+            try:
+                size_ok=Decimal(str(p.get('size')))==Decimal(str(req.get('size')))
+            except (ValueError,TypeError,ArithmeticError):
+                size_ok=False
+            epic_ok=(p.get('epic')==self.mandate.get('epic') and
+                     (req.get('epic') is None or p.get('epic')==req.get('epic')))
+            dir_ok=p.get('direction')==req.get('direction')
+            if epic_ok and dir_ok and size_ok:
+                matched=p
+                break
+        if matched is None:
             return False
         # dealReference already authenticated the accept; require it when provided.
         if ref and conf.get('dealReference') not in (None,ref):
@@ -2732,6 +2739,10 @@ class SingleTradeEngine:
                 return True
             return False
         if status!='ACCEPTED':raise RuntimeError('Broker confirmation not final')
+        # Capture pre-sync deal ids so OPEN enroll binds the *new* deal, not
+        # an older multi-pos row at positions[0].
+        before_ids={str(p.get('dealId')) for p in (self.positions or [])
+                    if p.get('dealId') is not None}
         await self.sync()
         req=None
         if kind in ('OPEN','PROTECT'):
@@ -2756,16 +2767,26 @@ class SingleTradeEngine:
             raise RuntimeError('Accepted request not reconciled with broker positions')
         self.store.order_update(order_id,'CONFIRMED',ref)
         if kind=='OPEN' and self.positions:
-            p=self.positions[0]
-            # Persist origin so a later reconnect does not mistake a robot
-            # deal for a NEW manual mandate.
-            self.store.set('robot_open:'+str(p['dealId']),True)
-            self.store.set('latest_robot_deal_id',p['dealId'])
-            # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
-            self._enroll_adaptive_protection(p,force=True)
+            conf_deal=confirmation.get('dealId') or confirmation.get('dealID')
+            p=None
+            if conf_deal is not None:
+                p=next((x for x in self.positions
+                        if str(x.get('dealId'))==str(conf_deal)),None)
+            if p is None:
+                newcomers=[x for x in self.positions
+                           if str(x.get('dealId')) not in before_ids]
+                if len(newcomers)==1:
+                    p=newcomers[0]
+            if p is not None:
+                # Persist origin so a later reconnect does not mistake a robot
+                # deal for a NEW manual mandate.
+                self.store.set('robot_open:'+str(p['dealId']),True)
+                self.store.set('latest_robot_deal_id',p['dealId'])
+                # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
+                self._enroll_adaptive_protection(p,force=True)
         if kind=='PROTECT' and self.positions:
-            p=self.positions[0]
-            if p.get('dealId')==deal_id and self.store.get('robot_open:'+str(deal_id)):
+            p=next((x for x in self.positions if x.get('dealId')==deal_id),None)
+            if p is not None and self.store.get('robot_open:'+str(deal_id)):
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
@@ -3170,10 +3191,16 @@ class SingleTradeEngine:
             # GOLD often shows as "Gold" / "Gold Spot"; keep XAU as alias.
             if epic_u not in blob and not (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)):
                 continue
-            tx_size=str(tx.get('size') or tx.get('quantity') or '')
-            if tx_size and size and tx_size!=size:continue
-            tx_dir=str(tx.get('direction') or '').upper()
-            if tx_dir and direction and tx_dir!=direction.upper():continue
+            # Size: Decimal compare; missing size on either side = wildcard.
+            tx_size_raw=tx.get('size') if tx.get('size') not in (None,'') else tx.get('quantity')
+            if tx_size_raw not in (None,'') and size not in (None,''):
+                try:
+                    if Decimal(str(tx_size_raw))!=Decimal(str(size)):
+                        continue
+                except (ValueError,TypeError,ArithmeticError):
+                    continue
+            # Closing TRADE rows are often the *opposite* of open direction —
+            # never require tx.direction == open direction. Missing dir = wildcard.
             hits.append((float(val),self._cash_currency(tx.get('currency'))))
         if len(hits)==1:
             return hits[0]
@@ -3235,11 +3262,60 @@ class SingleTradeEngine:
             'mode':mode,'pnl':pnl,'source':source})
 
     def _queue_pending_pnl(self,deal_id,*,exit_level=None):
+        """Queue Capital £ harvest. Cap 500 — keep oldest first (never drop unresolved)."""
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
         deal=str(deal_id)
-        if deal not in [str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]:
+        ids=[str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]
+        if deal not in ids:
             pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
-            self.store.set('pending_broker_pnl_deals',pending[-40:])
+        # Raise old [-40:] truncate that dropped unresolved; keep oldest 500.
+        if len(pending)>500:
+            pending=pending[:500]
+        self.store.set('pending_broker_pnl_deals',pending)
+
+    def _bank_broker_cash_side_effects(self,deal_id,pnl,*,currency=None,action=None,
+                                       exit_reason=None,scratch_band=None):
+        """Once-only day-book / hard-risk / cycle / scratch bank from broker £.
+
+        Must run even when neural already learned (late Capital cash). Keyed by
+        ``broker_cash_banked:{deal}`` so ticks-then-£ and retry paths cannot
+        double-count the same deal.
+        """
+        if pnl is None or deal_id is None:
+            return False
+        try:
+            val=float(pnl)
+        except (TypeError,ValueError):
+            return False
+        if not math.isfinite(val):
+            return False
+        deal=str(deal_id)
+        key='broker_cash_banked:'+deal
+        if self.store.get(key):
+            return False
+        self.store.set(key,{
+            'at':now(),'pnl':val,'currency':currency,'action':action})
+        hard_risk.record_realized_pnl(self.store,val)
+        equity=self._account_equity()
+        day_book.record_close(
+            self.store,pnl=val,equity=equity,
+            open_count=len(self.positions or []))
+        self._settle_unified_cycle(
+            pnl=val,action=action,exit_reason=exit_reason,deal_id=deal,
+            scratch_band=scratch_band)
+        self._note_scratch_close(val,deal)
+        return True
+
+    def _trade_direction(self,deal_id):
+        try:
+            row=self.store.db.execute(
+                'SELECT direction FROM trades WHERE deal_id=?',
+                (str(deal_id),)).fetchone()
+            if row and row[0] in ('BUY','SELL'):
+                return row[0]
+        except Exception:
+            pass
+        return None
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
@@ -3290,6 +3366,9 @@ class SingleTradeEngine:
             # Real broker cash always overwrites a prior upl_estimate display.
             self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
             if already:
+                # Neural already taught from ticks — still bank £ once (day book).
+                self._bank_broker_cash_side_effects(
+                    deal,pnl,currency=ccy,action=self._trade_direction(deal))
                 self.store.event('trade','Late broker P&L refined record without re-learning',
                                  {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
             else:
@@ -3322,6 +3401,8 @@ class SingleTradeEngine:
             if self._trade_already_learned(deal):
                 self.store.close_trade(deal,_num(exit_lvl),pnl,currency=ccy,
                                       source='broker',overwrite=True)
+                self._bank_broker_cash_side_effects(
+                    deal,pnl,currency=ccy,action=self._trade_direction(deal))
             else:
                 self._learn_closed_trade(deal,conf)
             self.store.event('reconcile','Orphan open trade closed from Capital history',
@@ -3601,11 +3682,15 @@ class SingleTradeEngine:
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         already_learned=self._trade_already_learned(deal_id)
         # Late broker cash may refine the journal without repeating training.
+        # Still bank £ once — neural-once-only must not skip day_book / hard_risk.
         if already_learned:
             if broker_pnl is not None:
                 currency=hint_ccy or self._account_currency()
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker',overwrite=True)
+                self._bank_broker_cash_side_effects(
+                    deal_id,broker_pnl,currency=currency,
+                    action=self._trade_direction(deal_id))
                 self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
                                  {'deal_id':deal_id,'pnl':broker_pnl})
             return
@@ -3618,17 +3703,26 @@ class SingleTradeEngine:
                     deal_id,row[0],exit_level,row[1],broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':
-                    self._settle_unified_cycle(pnl=pnl_value,action=row[1],deal_id=deal_id)
-                    self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker' and pnl_value is not None:
+                    self._bank_broker_cash_side_effects(
+                        deal_id,pnl_value,currency=currency,action=row[1])
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
+                    self.store.close_trade(deal_id,exit_level,source='pending_broker_pnl',
+                                           overwrite=True)
             elif exit_level is not None or broker_pnl is not None:
                 currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
                 if broker_pnl is not None:
-                    self._settle_unified_cycle(pnl=broker_pnl,deal_id=deal_id)
-                    self._note_scratch_close(broker_pnl,deal_id)
+                    self._bank_broker_cash_side_effects(
+                        deal_id,broker_pnl,currency=currency,
+                        action=self._trade_direction(deal_id))
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
+                    self.store.close_trade(deal_id,exit_level,source='pending_broker_pnl',
+                                           overwrite=True)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -3650,9 +3744,13 @@ class SingleTradeEngine:
                     deal_id,entry,exit_level or entry,direction,broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':
-                    self._settle_unified_cycle(pnl=pnl_value,action=direction,deal_id=deal_id)
-                    self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker' and pnl_value is not None:
+                    self._bank_broker_cash_side_effects(
+                        deal_id,pnl_value,currency=currency,action=direction)
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
+                    self.store.close_trade(deal_id,exit_level,source='pending_broker_pnl',
+                                           overwrite=True)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
@@ -3826,26 +3924,18 @@ class SingleTradeEngine:
             bracket_learn.record_outcome(
                 self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
                 currency=currency,deal_id=deal_id,**path_ctx)
-            # Audit #21: operator daily loss / drawdown halt from realized cash.
-            hard_risk.record_realized_pnl(self.store,pnl_value)
-            equity=self._account_equity()
-            # Day book: bank £ → refresh phase (enough profit / enough loss).
-            day_book.record_close(
-                self.store,pnl=pnl_value,equity=equity,
-                open_count=len(self.positions or []))
-            # One feedback bus: £ → cycle aggression / streak for next OPEN.
-            # Pass scratch band so pennies do not tighten brackets like real losses.
-            self._settle_unified_cycle(
-                pnl=pnl_value,action=direction,
-                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id,
+            # Audit #21 + day book + cycle: once-only bank (also used on late £).
+            self._bank_broker_cash_side_effects(
+                deal_id,pnl_value,currency=currency,action=direction,
+                exit_reason=path_ctx.get('exit_reason'),
                 scratch_band=float(sp.get('scratch_pnl_abs') or 0.05))
+            equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
             promoted=bracket_learn.evolve_from_history(self.store)
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
                 learning_generation.bump(self.store,'bracket_shape_promoted')
-            self._note_scratch_close(pnl_value,deal_id)
         if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
             nmax=int(sp.get('max_neurons',64))
@@ -4648,11 +4738,16 @@ class SingleTradeEngine:
             if self.store.unresolved():
                 return 'Unresolved broker operation'
         if self.positions:
+            _scores=((self.last_signal or {}).get('scores')
+                     if isinstance(self.last_signal,dict) else None)
+            _edge=(self.policy.score_edge(_scores)
+                   if _scores and hasattr(self.policy,'score_edge') else None)
             book=day_book.allows_new_open(
                 store=self.store,equity=self._account_equity(),
                 positions=self.positions,
                 epic=(self.mandate or {}).get('epic'),
-                mandate_epic=(self.mandate or {}).get('epic'))
+                mandate_epic=(self.mandate or {}).get('epic'),
+                score_edge=_edge)
             if not book.get('allowed'):
                 return (self._existing_open_block_reason()
                         + ' · day book: ' + str(book.get('reason') or book.get('phase')))
@@ -4686,11 +4781,16 @@ class SingleTradeEngine:
     def snapshot(self):
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or a.get('accountId')==self.account.get('currentAccountId')),account[0] if account else {})
+        _snap_scores=((self.last_signal or {}).get('scores')
+                      if isinstance(self.last_signal,dict) else None)
+        _snap_edge=(self.policy.score_edge(_snap_scores)
+                    if _snap_scores and hasattr(self.policy,'score_edge') else None)
         book_open=day_book.allows_new_open(
             store=self.store,equity=self._account_equity(),
             positions=self.positions,
             epic=(self.mandate or {}).get('epic'),
-            mandate_epic=(self.mandate or {}).get('epic'))
+            mandate_epic=(self.mandate or {}).get('epic'),
+            score_edge=_snap_edge)
         evaluation=(self._entry_evaluation()
                     if book_open.get('allowed') else None)
         news=self._news_risk()

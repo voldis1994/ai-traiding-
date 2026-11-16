@@ -487,8 +487,8 @@ class RuntimeHub:
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
-                'realized_pnl_all':primary['realized_pnl'] if primary else (
-                    0.0 if total_closed else None),
+                # Multi-currency: never sum GBP+USD into one number (or fake 0.0).
+                'realized_pnl_all':primary['realized_pnl'] if primary else None,
                 'pnl_currency':primary['currency'] if primary else None,
                 'pnl_by_currency':by_ccy,
                 'closed_trades_all':total_closed,

@@ -2996,17 +2996,18 @@ class SingleTradeEngine:
         from_time=None
         if raw:
             try:
-                from_time=str(raw).replace(' ','T')
-                if from_time.endswith('+00:00'):from_time=from_time[:-6]+'Z'
+                from .broker import capital_api_time
                 # If only queue time is known, back up 6h so close cash is inside window.
                 if not opened and queued_at:
                     try:
                         dt=datetime.fromisoformat(str(queued_at).replace('Z','+00:00'))
-                        from_time=(dt.astimezone(timezone.utc).replace(microsecond=0)
-                                   -timedelta(hours=6)
-                                   ).strftime('%Y-%m-%dT%H:%M:%SZ')
+                        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+                        from_time=capital_api_time(dt.astimezone(timezone.utc)-timedelta(hours=6))
                     except Exception:
-                        from_time=None
+                        from_time=capital_api_time(raw)
+                else:
+                    # Capital docs: YYYY-MM-DDTHH:MM:SS — never append Z.
+                    from_time=capital_api_time(raw)
             except Exception:
                 from_time=None
         # 24h window covers overnight SL/TP after restart when timestamps missing.

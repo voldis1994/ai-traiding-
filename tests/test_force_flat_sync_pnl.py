@@ -55,6 +55,16 @@ def test_lookback_prefers_opened_not_queued_at():
         look=e._history_lookback('lb1',queued_at='2099-01-01T00:00:00+00:00')
         assert look['from_time'] is not None
         assert not look['from_time'].startswith('2099')
+        # Capital docs: no Z / offset on from=
+        assert 'Z' not in look['from_time']
+        assert '+00:00' not in look['from_time']
+
+
+def test_capital_api_time_strips_z():
+    from app.broker import capital_api_time
+    assert capital_api_time('2026-11-17T10:00:00Z')=='2026-11-17T10:00:00'
+    assert capital_api_time('2026-11-17T10:00:00+00:00')=='2026-11-17T10:00:00'
+    assert capital_api_time('2026-11-17T10:00:00')=='2026-11-17T10:00:00'
 
 
 def test_flat_sync_retries_pending_and_binds():

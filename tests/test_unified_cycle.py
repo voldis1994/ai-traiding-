@@ -56,7 +56,7 @@ def test_edge_allows_open_when_margin_clear():
 
 
 def test_compose_open_uses_ohlc_kappa_and_loss_tighten_only():
-    zone = {'kappa': 2.0, 'range_distance': 1.0, 'max_tp': 4.0}
+    zone = {'kappa': 1.1, 'range_distance': 1.0, 'max_tp': 4.0}
     learned = {'kappa': 2.5, 'sl_scale': 2.5}  # inflated — must NOT set width
     state = uc.default_state()
     state['aggression'] = 0.80
@@ -67,7 +67,7 @@ def test_compose_open_uses_ohlc_kappa_and_loss_tighten_only():
     assert pkg['blocked'] is False
     assert pkg['action'] == 'BUY'
     assert pkg['bracket_source'] == 'ohlc_zone'
-    # Width from OHLC zone κ — learned mult ignored.
+    # Hard 1:2 RR — learned mult and zone κ ignored for width.
     assert pkg['kappa'] == pytest.approx(2.0)
     assert pkg['sl_scale'] == pytest.approx(1.0)
     # Loss cool-down only tightens the OHLC plan (≤ aggression).

@@ -12,7 +12,7 @@ import math
 from statistics import mean, median
 
 
-DEFAULT_KAPPA=1.0
+DEFAULT_KAPPA=2.0  # TP = 2×SL (SL half of TP)
 DEFAULT_SL_SCALE=1.0
 # Soft rails on learned multipliers — operating schedule lives in self_params.
 # LIVE OPEN width is OHLC-decided (not these rails).
@@ -683,17 +683,21 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
     }
 
 
+# Hard LIVE rule: stop is always half the take-profit distance (1:2 RR).
+# Helps when OPEN fights the tape — small risk, room for the rebound.
+FIXED_TP_SL_RATIO = 2.0
+
+
 def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                               tighten=1.0) -> dict:
-    """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
+    """System decides SL from OHLC; TP is always 2×SL (SL half of TP).
 
-    Decision from candles:
+    Decision:
       SL = observed adverse range (``range_distance``), floored by broker min
-      κ  = observed favor/adverse ratio (``zone.kappa``)
-      TP = κ×SL, but not beyond reachable favor span (``max_tp``)
+      TP = 2×SL always — not OHLC κ, not max_tp crush toward 1:1
 
     ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
-    *same* OHLC decision, never an invented wider target.
+    *same* OHLC SL, with TP locked at 2×.
     """
     from .math_rules import stop_take
 
@@ -732,32 +736,38 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     # Core decision: SL from OHLC adverse move (or broker floor if quieter).
     raw_sl = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else floor
     stop_d = max(floor, raw_sl) * t
-    # TP from OHLC κ, limited by what this window actually reaches.
-    raw_tp = float(ohlc_kappa) * stop_d
-    if ohlc_tp is not None and ohlc_tp > 0:
-        profit_d = min(raw_tp, float(ohlc_tp) * t)
-    else:
-        profit_d = raw_tp
-    profit_d = max(floor, profit_d)
-    # Effective κ from OHLC only — no hardcoded 1:1 reshape / RR floor.
-    # The robot decides width from candles; we do not invent TP/SL ratios.
-    eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
+    # Hard rule: TP is always 2×SL (SL half of TP) — helps counter-trend opens.
+    # Do NOT crush TP to max_tp (that recreated SL≈TP or TP<SL).
+    eff_kappa = float(FIXED_TP_SL_RATIO)
     # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
     entry = 1000.0  # levels unused by callers that only need distances
     snapped = stop_take(
         entry, 'BUY', tick_f, sp, mn,
-        kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+        kappa=eff_kappa, sl_scale=1.0,
         range_distance=stop_d)
+    stop_out = float(snapped['stop_distance'])
+    profit_out = float(snapped['profit_distance'])
+    # After tick snap / broker-min raise, re-lock TP = 2×SL on the tick grid.
+    if stop_out > 1e-12 and tick_f > 0:
+        target_tp = stop_out * FIXED_TP_SL_RATIO
+        tp_ticks = max(1, int(round(target_tp / tick_f + 1e-12)))
+        # Never leave TP below broker min ticks.
+        floor_ticks = int(round((mn / tick_f) + 1e-12)) if mn > 0 else 1
+        if tp_ticks < max(1, floor_ticks):
+            tp_ticks = max(1, floor_ticks)
+        profit_out = float(tp_ticks) * tick_f
     return {
-        'stop_distance': float(snapped['stop_distance']),
-        'profit_distance': float(snapped['profit_distance']),
-        'kappa': float(snapped.get('kappa') or eff_kappa),
+        'stop_distance': stop_out,
+        'profit_distance': profit_out,
+        'kappa': float(FIXED_TP_SL_RATIO),
         'sl_scale': 1.0,
         'ohlc_kappa': float(ohlc_kappa),
         'ohlc_sl': float(raw_sl),
         'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
         'tighten': float(t),
         'source': 'ohlc_zone',
+        'rr_locked': True,
+        'rr': float(FIXED_TP_SL_RATIO),
         'ready': bool(z.get('ready')),
         'lookback': z.get('lookback'),
         'median_up': z.get('median_up'),
@@ -765,7 +775,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         'pull_share': z.get('pull_share'),
         'favor_share': z.get('favor_share'),
         'stop_ticks': snapped.get('stop_ticks'),
-        'profit_ticks': snapped.get('profit_ticks'),
+        'profit_ticks': int(round(profit_out / tick_f)) if tick_f > 0 else snapped.get('profit_ticks'),
         'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
     }
 

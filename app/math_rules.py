@@ -293,11 +293,11 @@ def levels_meet_broker_min(direction, stop_level, profit_level, bid, ask, min_di
     return b - tp + tol >= mn
 
 
-def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=1, sl_scale=1,
+def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_scale=1,
               range_distance=0):
     """Broker-min + optional broker OHLC range, × learned sl_scale; TP = kappa × SL.
 
-    Default κ=1 (1:1), not a frozen 1:2. Learned/explored κ comes from cash P&L.
+    Default κ=2 (TP = 2×SL — SL always half of TP). LIVE OPEN locks this ratio.
     Hard floor: dealing min + spread/tick buffer. Soft floor from broker M1 ranges.
 
     Audit #9: after κ and tick snap, both SL and TP distances are raised to at

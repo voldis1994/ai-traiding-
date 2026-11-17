@@ -675,11 +675,34 @@ def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
                     'renormalized': True, 'sum': sum(out.values()),
                 }
 
+    # Even a modest lean vs the opposite side → drain loud HOLD (HUNT only).
+    # Stupid HOLD trap: HOLD 50%+ while BUY already beats SELL (or reverse).
+    if (best_v - other) >= 0.03 and hold + 1e-12 >= best_v:
+        lead = 0.05
+        need = max(0.0, (hold - best_v) + lead)
+        transfer = min(hold * 0.80, max(need, strength * 1.25))
+        if transfer > 1e-6:
+            out[best] = best_v + transfer
+            out['HOLD'] = max(0.0, hold - transfer)
+            if other > 0.08:
+                trim = min(other * 0.25, 0.20 * transfer)
+                out['BUY' if best == 'SELL' else 'SELL'] = max(0.0, other - trim)
+                out[best] = out[best] + trim
+            total = sum(out.values())
+            if total <= 1e-12:
+                return dict(scores), {'nudged': False, 'reason': 'degenerate'}
+            out = {k: v / total for k, v in out.items()}
+            return out, {
+                'nudged': True, 'target': best, 'delta': transfer,
+                'reason': 'lean_anti_hold', 'phase': phase or PHASE_HUNT,
+                'clear_side': clear, 'renormalized': True, 'sum': sum(out.values()),
+            }
+
     # Convincing = clear winner over HOLD and over the opposite side.
     # With a matching clear tape, accept a slightly weaker neural lead.
-    min_best = 0.28 if clear == best else 0.34
-    min_vs_hold = 0.03 if clear == best else 0.06
-    min_vs_other = 0.03 if clear == best else 0.04
+    min_best = 0.24 if clear == best else 0.28
+    min_vs_hold = 0.02 if clear == best else 0.04
+    min_vs_other = 0.02 if clear == best else 0.03
     if best_v < min_best or (best_v - hold) < min_vs_hold or (best_v - other) < min_vs_other:
         return dict(scores), {'nudged': False, 'reason': 'not_convincing',
                               'clear_side': clear}

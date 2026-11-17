@@ -407,6 +407,20 @@ class AutoEvolution:
             'calibration_method':(calibration or {}).get('method'),
         }
         if pol in ('HOLD','CLOSE'):
+            # HOLD mass in softmax is not a reason to veto a clear side lean.
+            opp='SELL' if direction=='BUY' else 'BUY'
+            try:
+                side_vs_opp=float(scores[direction])-float(scores[opp])
+            except (TypeError,ValueError,KeyError):
+                side_vs_opp=None
+            floor=float(edge_floor) if edge_floor is not None else 0.06
+            if side_vs_opp is not None and math.isfinite(side_vs_opp) and side_vs_opp>=floor:
+                evidence['evolved_policy']['hold_override']=True
+                evidence['evolved_policy']['side_vs_opposite']=side_vs_opp
+                return direction,(
+                    f'Neural {direction} overrides evolved {pol} '
+                    f'(side−opp={side_vs_opp:.3f} ≥ edge_floor={floor:.3f}; '
+                    f'HOLD abstention not required)'),evidence
             return 'HOLD',(
                 f'Evolved policy {pol} vetoes neural {direction} '
                 f'(edge_floor={edge_floor:.3f}, '
@@ -420,14 +434,57 @@ class AutoEvolution:
             f'(edge_floor={edge_floor:.3f}, '
             f'gen={evidence["evolved_policy"]["generation"]})'),evidence
 
+    @staticmethod
+    def hold_necessary(buy,sell,hold,*,returns_bps=None,trend=None,structure=None):
+        """True only when abstention is required — not when HOLD is merely loud.
+
+        Stupid HOLD trap: softmax HOLD 50%+ while BUY/SELL already disagree.
+        Keep HOLD when sides are tied/ambiguous or HOLD utterly dominates with
+        no directional lean; never when the tape agrees with the better side.
+        """
+        try:
+            buy=float(buy);sell=float(sell);hold=float(hold)
+        except (TypeError,ValueError):
+            return True
+        if not all(math.isfinite(x) for x in (buy,sell,hold)):
+            return True
+        direction='BUY' if buy>=sell else 'SELL'
+        strength=buy if direction=='BUY' else sell
+        other=sell if direction=='BUY' else buy
+        side_gap=abs(buy-sell)
+        clear=None
+        try:
+            from .day_book import _clear_trend_side
+            clear=_clear_trend_side(
+                live_trend=trend,structure=structure,returns_bps=returns_bps)
+        except Exception:
+            clear=None
+        # Tape already picks a side — do not abstain just because HOLD is loud.
+        if clear==direction:
+            return False
+        # Directional lean vs opposite exists — HOLD mass alone is not enough.
+        if (strength-other)>=0.04:
+            return False
+        # Necessary: no real lean between BUY and SELL, HOLD on top.
+        if side_gap<0.05 and hold+1e-12>=strength:
+            return True
+        # Necessary: HOLD utterly on top with almost no directional lean.
+        if hold>=strength+0.12 and side_gap<0.06:
+            return True
+        # Residual: HOLD still louder than the better side with weak lean.
+        return hold>strength
+
     def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
-                              history=None,readiness=None,spread_bps=0.0):
+                              history=None,readiness=None,spread_bps=0.0,
+                              structure=None):
         """LIVE: neural argmax proposes; evolved policy may confirm or HOLD.
 
-        Argmax chooses BUY/SELL/HOLD — zone/SHIFT/trend are evidence only, never
-        entry bans. When ``policy_live_execute`` is on (default), promoted
-        ``active_policy.py`` / ``policy.py`` decide() gates OPEN. Readiness +
-        economic utility remain separate (audit #22–#23).
+        Argmax chooses BUY/SELL — HOLD only when abstention is necessary.
+        Zone/SHIFT/trend are evidence only, never entry bans. When
+        ``policy_live_execute`` is on (default), promoted policy may still
+        confirm; a HOLD veto is ignored when side−opposite already clears the
+        edge floor (HOLD mass is not a trading reason). Readiness + economic
+        utility remain separate (audit #22–#23).
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -439,16 +496,20 @@ class AutoEvolution:
         strength=buy if direction=='BUY' else sell
         score_edge=self.score_edge(scores)
         evidence={'returns_bps':returns_bps,'trend':trend,'regime':regime,
+                  'structure':structure,
                   'scores':{'BUY':buy,'SELL':sell,'HOLD':hold},
                   'score_edge':score_edge,
                   'score_edge_is_not_trading_advantage':True}
         base={'proposal':direction,'threshold':None,'calibration':None,
               'score_edge':score_edge,'readiness':readiness,'economic_utility':None,
               'evidence':evidence}
-        if hold>strength:
+        if self.hold_necessary(
+                buy,sell,hold,returns_bps=returns_bps,trend=trend,
+                structure=structure):
             return {**base,'action':'HOLD',
-                    'reason':(f'Neural HOLD dominates {direction} '
-                              f'({hold:.1%} > {strength:.1%})')}
+                    'reason':(f'Neural HOLD necessary vs {direction} '
+                              f'(HOLD {hold:.1%} / {direction} {strength:.1%}; '
+                              f'sides tied or no lean)')}
         # --- Separate gate: model prep/eval readiness (audit #22) ---
         # Cold-start OPEN is LIVE permission without claiming historical prep passed.
         from .model_readiness import allows_live_open as _allows_live

@@ -36,9 +36,10 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         assert result['evidence'] is not None
         assert p.neural_decision({'BUY':.34,'SELL':.33,'HOLD':.33})=='BUY'
         assert p.neural_decision({'BUY':.25,'SELL':.35,'HOLD':.40})=='HOLD'
-        blocked=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40},
+        # HOLD louder than SELL but tape+lean agree DOWN → OPEN SELL (no stupid HOLD).
+        opened=p.evaluate_neural_entry({'BUY':.25,'SELL':.35,'HOLD':.40},
             returns_bps={'5':-1,'15':-2,'60':-3},trend='DOWN')
-        assert blocked['action']=='HOLD' and blocked['proposal']=='SELL'
+        assert opened['action']=='SELL' and opened['proposal']=='SELL'
         assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='BUY'
         up={'5':2,'15':3,'60':4}
         # Tiny edge 0.01 < default MIN_EDGE 0.06 → evolved policy HOLDs (proposal still BUY).

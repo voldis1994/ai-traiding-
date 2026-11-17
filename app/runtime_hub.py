@@ -183,6 +183,16 @@ class RuntimeHub:
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='pending' or (val is not None and kind=='other'):
+                if kind=='pending':
+                    # Attach last live UPL as a display hint only — not cash £.
+                    snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
+                    try:
+                        hint=float(snap.get('upl')) if snap.get('upl') is not None else None
+                    except (TypeError,ValueError):
+                        hint=None
+                    if hint is not None and __import__('math').isfinite(hint):
+                        row['upl_hint']=round(hint,4)
+                    row['pending_cash']=True
                 if len(recent)<12:
                     recent.append(row)
         wins=sum(1 for p in signed if p>0)
@@ -204,10 +214,19 @@ class RuntimeHub:
             except (TypeError,ValueError):
                 upl=None
         equity=round(realized+(upl or 0.0),4) if upl is not None else realized
+        pending_q=0
+        try:
+            pending_q=len(store.get('pending_broker_pnl_deals') or [])
+        except Exception:
+            pending_q=0
+        pending_rows=sum(1 for t in closed_rows
+                         if self._cash_pnl_source(t.get('pnl_source'))=='pending')
         return {
             'closed_trades':len(closed_rows),
             'open_trades_recorded':open_n,
             'cash_trades':cash_n,
+            'pending_broker_pnl':pending_q,
+            'pending_trades':pending_rows,
             'realized_pnl':realized,
             'open_upl':upl,
             'equity_pnl':equity,

@@ -147,6 +147,72 @@ def test_full_balance_uses_account_and_splits_multi_lot():
         assert sum(slices) == Decimal('2.00')
 
 
+def test_full_balance_no_tick_value_deploys_min_pack_not_mandate():
+    """Missing Capital pip value + full_balance must not glue size to mandate."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        market = {
+            'dealingRules': {
+                'minDealSize': {'value': '0.01'},
+                'minSizeIncrement': {'value': '0.01'},
+                'maxDealSize': {'value': '50'},
+            },
+        }
+        params = db.load_params(s)
+        assert int(params.get('size_full_balance') or 0) == 1
+        out = db.propose_size(
+            mandate_size='0.1', equity=15.0, daily={}, params=params,
+            stop_ticks=500, tick_value=None, positions=[], score_edge=0.0,
+            market=market)
+        assert out['allowed'] is True
+        assert out['reason'] == 'full_balance_no_tick_value_min_pack'
+        # open_slices(5)×min(0.01) — not mandate 0.1 glue / not one tiny seed.
+        assert float(out['size']) == pytest.approx(0.05)
+        slices = db.split_planned_sizes(
+            out['size'], store=s, positions=[], size_grid={
+                'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
+                'max': Decimal('50')},
+            action='BUY')
+        assert len(slices) == 5
+        assert all(s == Decimal('0.01') for s in slices)
+
+
+def test_gold_like_full_balance_splits_three_min_lots():
+    """£15 + wide GOLD stop → ~0.03 total must fire 3×0.01, not one 0.03."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        market = {
+            'dealingRules': {
+                'minDealSize': {'value': '0.01'},
+                'minSizeIncrement': {'value': '0.01'},
+                'maxDealSize': {'value': '50'},
+            },
+        }
+        params = db.load_params(s)
+        # stop_ticks=500, tick_value=1 → size = 15/500 = 0.03
+        out = db.propose_size(
+            mandate_size='0.1', equity=15.0, daily={}, params=params,
+            stop_ticks=500, tick_value=1.0, positions=[], market=market)
+        assert float(out['size']) == pytest.approx(0.03)
+        grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
+                'max': Decimal('50')}
+        slices = db.split_planned_sizes(
+            out['size'], store=s, positions=[], size_grid=grid, action='BUY')
+        assert slices == [Decimal('0.01'), Decimal('0.01'), Decimal('0.01')]
+        # Ghost sibling in positions must not collapse when force_flat (submit).
+        forced = db.split_planned_sizes(
+            out['size'], store=s,
+            positions=[{'dealId': 'ghost', 'epic': 'GOLD', 'size': '0.01'}],
+            size_grid=grid, action='BUY', force_flat=True)
+        assert forced == [Decimal('0.01'), Decimal('0.01'), Decimal('0.01')]
+        # Without force_flat, ADD stays one ticket.
+        add = db.split_planned_sizes(
+            out['size'], store=s,
+            positions=[{'dealId': 'live', 'epic': 'GOLD', 'size': '0.01'}],
+            size_grid=grid, action='BUY')
+        assert add == [Decimal('0.03')]
+
+
 def test_soft_nudge_conviction_renormalizes():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
@@ -346,12 +412,15 @@ def test_split_planned_sizes_into_five_when_advantageous():
         s = _store(d)
         grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
                 'max': Decimal('50')}
-        # Flat + BUY → 5 slices summing ≈ 0.10 (signal-first, not 0.06 freeze)
+        # Flat + BUY → 5 tickets preferring N×minDealSize + remainder bumps
         slices = db.split_planned_sizes(
             Decimal('0.10'), store=s, positions=[], size_grid=grid,
             score_edge=0.02, action='BUY', structure='TREND_UP')
         assert len(slices) == 5
         assert sum(slices) == Decimal('0.10')
+        assert all(s >= Decimal('0.01') for s in slices)
+        # Prefer min-lot base: every ticket starts at min before remainder.
+        assert min(slices) == Decimal('0.01') or min(slices) == Decimal('0.02')
         # Already open → single ADD slice
         one = db.split_planned_sizes(
             Decimal('0.10'), store=s,

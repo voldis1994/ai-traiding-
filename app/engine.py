@@ -5158,27 +5158,40 @@ class SingleTradeEngine:
             size_grid=dealing_size_grid(market,mandate_size=self.mandate['size'])
             # Day book: full account balance → lot pack; multi-pos when capacity remains.
             equity=self._account_equity()
-            # When Capital omits valueOfOnePip, calibrate so mandate ≈ fractional
-            # risk_per_trade. Skip when size_full_balance — that glue would keep
-            # size at mandate even though risk_cap = whole £ balance.
+            # When Capital omits valueOfOnePip:
+            #  • fractional mode — calibrate so mandate ≈ risk_per_trade
+            #  • full_balance — calibrate so open_slices×minDealSize ≈ equity
+            #    cash-risk (never leave tick_val None → mandate glue / one chunk)
             tick_val_src='capital'
             if tick_val is None and brackets.get('stop_ticks') and equity:
                 try:
                     params=day_book.load_params(self.store)
                     full_bal=int(params.get('size_full_balance') or 0)==1
-                    if not full_bal:
+                    st=float(brackets['stop_ticks'])
+                    if full_bal and size_grid.get('ok') and st>0:
+                        want=max(3,int(params.get('open_slices') or 5))
+                        mn=float(Decimal(str(size_grid['min'])))
+                        target=max(mn,mn*want)
+                        if target>0 and equity>0:
+                            tick_val=float(equity)/(target*st)
+                            tick_val_src='full_balance_min_pack_calibrated'
+                    elif not full_bal:
                         bmap=day_book.budgets(
                             equity=equity,params=params,
                             daily=day_book.load_daily(self.store,equity=equity))
                         rpt=_num(bmap.get('risk_per_trade'))
                         msize=float(Decimal(str(self.mandate['size'])))
-                        st=float(brackets['stop_ticks'])
                         if rpt and rpt>0 and msize>0 and st>0:
                             tick_val=rpt/(msize*st)
                             tick_val_src='mandate_risk_calibrated'
                 except Exception:
                     tick_val=None
             _scores_for_align,_edge_for_align,_aligned=self._day_book_add_edge()
+            # Flat = broker book empty after the submit sync. before_ids alone can
+            # lie (stale local []); post-sync empty is the real flat pack signal.
+            # force_flat still protects the split if a mid-burst sibling appears
+            # later — plan_open must see the true book for ADD gating.
+            flat_at_submit=len(self.positions or [])==0
             plan=day_book.plan_open(
                 store=self.store,equity=equity,mandate_size=self.mandate['size'],
                 stop_ticks=brackets.get('stop_ticks'),tick_value=tick_val,
@@ -5211,7 +5224,9 @@ class SingleTradeEngine:
                 self.last_entry_reason='size_grid_check_failed'
                 return
             # Split one planned lot into simultaneous Capital-grid slices when
-            # flat + advantageous (e.g. 5× BUY/SELL). ADD path stays 1 slice.
+            # flat + advantageous (e.g. 5× BUY/SELL). Prefer N×minDealSize.
+            # ADD path stays 1 slice. force_flat when we started flat so a
+            # post-sync ghost cannot collapse 0.03 → one ticket.
             sit_struct=((self.last_signal or {}).get('structure_edge') or {}).get('structure')
             if not sit_struct:
                 sit_struct=zone.get('structure')
@@ -5223,7 +5238,7 @@ class SingleTradeEngine:
                 size,store=self.store,positions=self.positions,size_grid=size_grid,
                 score_edge=score_edge if score_edge is not None else _edge_for_align,
                 action=action,live_trend=live_trend,structure=sit_struct,
-                returns_bps=returns_bps)
+                returns_bps=returns_bps,force_flat=flat_at_submit)
             if not slice_sizes:
                 self.last_entry_reason='size_slice_empty'
                 return
@@ -5343,7 +5358,7 @@ class SingleTradeEngine:
             # Flat AI OPEN → fire the *whole* planned multi-lot pack in this
             # submit (all lot sizes now). Do not abort after slice 0 because a
             # sibling OPEN confirm is still settling / unresolved.
-            flat_burst=len(before_ids)==0 and len(slice_sizes)>1
+            flat_burst=bool(flat_at_submit) and len(slice_sizes)>1
             burst_oids=set()
             try:
                 for slice_i,size in enumerate(slice_sizes):
@@ -5413,7 +5428,15 @@ class SingleTradeEngine:
                         stop_distance=brackets['stop_distance'],
                         profit_distance=brackets['profit_distance'])
                     self.last_order_ref=receipt.get('dealReference')
-                    await self._confirm_reconcile(receipt,oid,'OPEN')
+                    confirmed=await self._confirm_reconcile(receipt,oid,'OPEN')
+                    if confirmed is False:
+                        # Broker REJECTED this slice (margin / filters). Do not
+                        # count it as filled; stop the pack to avoid hammering.
+                        self.store.event('entry',
+                            'Multi-lot OPEN slice rejected — stopping pack',
+                            {'slice_index':slice_i,'size':str(size),
+                             'opened_slices':opened_slices})
+                        break
                     opened_slices+=1
                     if self.positions and pending_brain:
                         after={str(p['dealId']):p for p in self.positions

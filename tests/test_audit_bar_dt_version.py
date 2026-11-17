@@ -86,7 +86,7 @@ def test_replay_trade_cash_prefers_pound_not_label_accuracy():
 
 
 def test_replay_trade_cash_does_not_credit_opposite_with_buy_pnl():
-    """SELL candidate must not inherit a BUY trade's +£10."""
+    """SELL candidate must not inherit a BUY trade's +£10 or raw price units."""
     def always_sell(scores, threshold=None):
         return 'SELL'
 
@@ -94,26 +94,38 @@ def test_replay_trade_cash_does_not_credit_opposite_with_buy_pnl():
     bare = [{
         'scores': {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1},
         'direction': 'BUY', 'actual_pnl': 10.0,
+        'epic': 'GOLD', 'currency': 'GBP',
     }] * 6
     mean, n = AutoEvolution._replay_trade_cash(always_sell, bare, min_trades=6)
     assert n == 0
     assert mean == float('-inf')
-    # With path counterfactual — use simulated SELL £, not BUY's +10.
+    # Price-unit sim without entry/exit scale → skip (never sum -3 pts into £).
     with_sim = [{
         'scores': {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1},
         'direction': 'BUY', 'actual_pnl': 10.0,
         'simulated': {'buy': 10.0, 'sell': -3.0, 'hold': 0.0, 'method': 'path'},
     }] * 6
     mean2, n2 = AutoEvolution._replay_trade_cash(always_sell, with_sim, min_trades=6)
-    assert n2 == 6
-    assert mean2 == pytest.approx(-3.0)
+    assert n2 == 0
+    assert mean2 == float('-inf')
+    # Explicit account-£ counterfactual is allowed.
+    with_cash = [{
+        'scores': {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1},
+        'direction': 'BUY', 'actual_pnl': 10.0,
+        'simulated_cash': {'BUY': 10.0, 'SELL': -7.5, 'HOLD': 0.0},
+    }] * 6
+    mean3, n3 = AutoEvolution._replay_trade_cash(always_sell, with_cash, min_trades=6)
+    assert n3 == 6
+    assert mean3 == pytest.approx(-7.5)
 
 
 def test_policy_cash_rows_join_requires_scores_on_profit():
     profit = [
-        {'direction': 'BUY', 'actual_pnl': 1.2, 'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}},
-        {'direction': 'SELL', 'actual_pnl': -0.4},  # no scores → dropped
-        {'direction': 'BUY', 'actual_pnl': 0.8, 'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25}},
+        {'direction': 'BUY', 'actual_pnl': 1.2, 'epic': 'GOLD', 'currency': 'GBP',
+         'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}},
+        {'direction': 'SELL', 'actual_pnl': -0.4, 'epic': 'GOLD', 'currency': 'GBP'},  # no scores
+        {'direction': 'BUY', 'actual_pnl': 0.8, 'epic': 'GOLD', 'currency': 'GBP',
+         'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25}},
     ]
     joined = AutoEvolution.policy_cash_rows(profit, signal_history=[])
     assert len(joined) == 2

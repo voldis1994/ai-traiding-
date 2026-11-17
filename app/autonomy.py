@@ -797,14 +797,33 @@ class AutoEvolution:
         return sum(present)/len(present),n
 
     @staticmethod
-    def policy_cash_rows(profit_rows, signal_history=None):
+    def policy_cash_rows(profit_rows, signal_history=None, *, epic=None,
+                         currency=None):
         """Join profit_learning £ rows with entry scores for cash_gate.
 
         Prefer scores already stored on the profit row (from entry_brain).
-        ``signal_history`` alone cannot fill deal-scoped scores reliably —
-        callers must pass scores into ``record_closed``.
+        Isolates one epic + account currency — GOLD £ must not mix with other
+        instruments or FX accounts.
         """
         _ = signal_history  # reserved; deal_id join not available on M1 history
+        want_epic=(str(epic).upper() if epic else None)
+        want_ccy=(str(currency).upper() if currency else None)
+        # When caller omits filters, lock to the modal (epic, currency) bucket
+        # so a mixed history never sums GOLD price units with e.g. FX £.
+        if want_epic is None or want_ccy is None:
+            buckets={}
+            for row in profit_rows or []:
+                if not isinstance(row,dict):continue
+                if not isinstance(row.get('scores'),dict):continue
+                if row.get('actual_pnl') is None:continue
+                e=str(row.get('epic') or '').upper() or None
+                c=str(row.get('currency') or '').upper() or None
+                if not e:continue
+                buckets[(e,c)]=buckets.get((e,c),0)+1
+            if buckets:
+                (dom_e,dom_c),_=max(buckets.items(),key=lambda kv:kv[1])
+                if want_epic is None:want_epic=dom_e
+                if want_ccy is None:want_ccy=dom_c
         out=[]
         for row in profit_rows or []:
             if not isinstance(row,dict):continue
@@ -812,31 +831,79 @@ class AutoEvolution:
             if not isinstance(scores,dict):continue
             direction=str(row.get('direction') or '').upper()
             if direction not in ('BUY','SELL'):continue
+            row_epic=str(row.get('epic') or '').upper() or None
+            row_ccy=str(row.get('currency') or '').upper() or None
+            if want_epic and row_epic!=want_epic:continue
+            if want_ccy and row_ccy!=want_ccy:continue
             try:
                 pnl=float(row.get('actual_pnl'))
             except (TypeError,ValueError):
                 continue
             if not math.isfinite(pnl):continue
+            entry=exit_px=None
+            try:
+                if row.get('entry') is not None:entry=float(row['entry'])
+            except (TypeError,ValueError):
+                entry=None
+            try:
+                if row.get('exit') is not None:exit_px=float(row['exit'])
+            except (TypeError,ValueError):
+                exit_px=None
             out.append({
                 'scores':scores,
                 'direction':direction,
                 'actual_pnl':pnl,
                 'simulated':row.get('simulated') if isinstance(row.get('simulated'),dict) else None,
+                'simulated_cash':(row.get('simulated_cash')
+                                  if isinstance(row.get('simulated_cash'),dict) else None),
                 'deal_id':row.get('deal_id'),
-                'epic':row.get('epic'),
+                'epic':row_epic,
+                'currency':row_ccy,
+                'entry':entry,
+                'exit':exit_px,
                 'at':row.get('at'),
             })
         return out
 
     @staticmethod
+    def _opposite_cash_pnl(item, signal, *, scale=None):
+        """Account-currency £ for an opposite-side candidate, or None.
+
+        ``simulated[buy|sell]`` are price units (GOLD points), NOT £.
+        Prefer ``simulated_cash`` when present; else scale price units by
+        ``cash_per_price_unit``. Never add raw price units into a £ sum.
+        """
+        if signal not in ('BUY','SELL'):
+            return None
+        cash_map=item.get('simulated_cash') if isinstance(item.get('simulated_cash'),dict) else {}
+        key_cash=signal  # BUY/SELL
+        try:
+            if cash_map.get(key_cash) is not None:
+                v=float(cash_map[key_cash])
+                if math.isfinite(v):
+                    return v
+        except (TypeError,ValueError):
+            pass
+        if scale is None or not math.isfinite(float(scale)) or float(scale)==0:
+            return None
+        sim=item.get('simulated') if isinstance(item.get('simulated'),dict) else {}
+        key='buy' if signal=='BUY' else 'sell'
+        try:
+            alt=float(sim.get(key)) if sim.get(key) is not None else None
+        except (TypeError,ValueError):
+            alt=None
+        if alt is None or not math.isfinite(alt):
+            return None
+        return float(alt)*float(scale)
+
+    @staticmethod
     def _replay_trade_cash(f,trades,margin_override=None,*,min_trades=6):
         """Score a policy on closed-trade £ — direction-matched, not any BUY/SELL.
 
-        Same direction as the historical deal → credit ``actual_pnl``.
+        Same direction as the historical deal → credit ``actual_pnl`` (account £).
         HOLD → 0 £ (abstain).
-        Opposite → use path/endpoint counterfactual ``simulated[buy|sell]`` when
-        present (GOLD is not a mirror); otherwise skip the row (never invent
-        −actual_pnl).
+        Opposite → account-£ counterfactual only (``simulated_cash`` or price-unit
+        sim × ``cash_per_price_unit``). Never sum GOLD price points into £.
         """
         rows=[]
         for item in trades or []:
@@ -853,6 +920,11 @@ class AutoEvolution:
             rows.append(item)
         if len(rows)<int(min_trades):
             return float('-inf'),0
+        try:
+            from .shadow_paper import cash_per_price_unit
+            scale=cash_per_price_unit(rows,min_samples=5)
+        except Exception:
+            scale=None
         total=0.0;n=0
         for item in rows:
             scores=item['scores']
@@ -870,15 +942,9 @@ class AutoEvolution:
             if signal==direction:
                 total+=float(item['actual_pnl']);n+=1
                 continue
-            # Opposite side — need a counterfactual, not the other side's £.
-            sim=item.get('simulated') if isinstance(item.get('simulated'),dict) else {}
-            key='buy' if signal=='BUY' else 'sell'
-            try:
-                alt=float(sim.get(key)) if sim.get(key) is not None else None
-            except (TypeError,ValueError):
-                alt=None
-            if alt is None or not math.isfinite(alt):
-                continue  # skip — do not invent mirror PnL
+            alt=AutoEvolution._opposite_cash_pnl(item,signal,scale=scale)
+            if alt is None:
+                continue  # skip — do not invent £ or mix price units
             total+=alt;n+=1
         if n<int(min_trades):
             return float('-inf'),0
@@ -974,7 +1040,11 @@ class AutoEvolution:
         cash_cut=int(len(cash_rows)*.7)
         cash_train=cash_rows[:cash_cut]
         cash_val=cash_rows[cash_cut:]
+        # Need ≥6 train + ≥6 val → ≥20 rows after 70/30 (ceil(0.3*n)≥6 ⇒ n≥20).
         use_cash=len(cash_val)>=6 and len(cash_train)>=6
+        self.last_cash_gate=bool(use_cash)
+        self.store.set('evolution_cash_gate',bool(use_cash))
+        self.store.set('evolution_cash_rows',len(cash_rows))
         old_cash_val,_=self._replay_trade_cash(
             incumbent,cash_val,
             margin_override=self.adaptive_threshold(

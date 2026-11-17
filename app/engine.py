@@ -2752,7 +2752,8 @@ class SingleTradeEngine:
             regime=ctx.get('regime'),
             history=history,
             readiness=readiness,
-            spread_bps=self._spread_bps())
+            spread_bps=self._spread_bps(),
+            structure=live_structure)
         result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
                     situation_memory=sit_advice,situation_nudge=sit_nudge,
                     day_book=db_snap,day_conviction=conv_meta,

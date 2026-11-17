@@ -176,10 +176,12 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             engine.market_context={'ready':True}  # exercise router, not market readiness
             brain.mark_prep_ready('test fixture')
             await engine.submit('SELL')
-            assert broker.requests[-1][0]=='OPEN'
-            assert broker.requests[-1][3]==Decimal('.25')
-            assert broker.requests[-1][4]>0 and broker.requests[-1][5]>0
-            assert len(engine.positions)==1
+            opens=[r for r in broker.requests if r[0]=='OPEN']
+            assert opens
+            # Flat BUY/SELL may multi-lot into day_open_slices (sum stays mandate).
+            assert sum((Decimal(str(r[3])) for r in opens), Decimal('0'))==Decimal('.25')
+            assert opens[-1][4]>0 and opens[-1][5]>0
+            assert len(engine.positions)>=1
             assert not store.unresolved()
             assert store.trades()[0]['epic']=='SIM'
     async_run(scenario())

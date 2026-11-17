@@ -2259,7 +2259,10 @@ class SingleTradeEngine:
                     if int(sp_get(self.store,'policy_evolve_enabled',1)):
                         cash=self.policy.policy_cash_rows(
                             getattr(self.profit_learning,'history',[]) or [],
-                            signal_history=list(self.brain.history))
+                            signal_history=list(self.brain.history),
+                            epic=getattr(self.brain,'epic',None),
+                            currency=((self.market or {}).get('currency')
+                                      if isinstance(self.market,dict) else None))
                         self.policy.evolve(
                             self.brain.correct/self.brain.labeled,
                             self.brain.labeled,list(self.brain.history),
@@ -3881,7 +3884,10 @@ class SingleTradeEngine:
             if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',1)):
                 cash=self.policy.policy_cash_rows(
                     getattr(self.profit_learning,'history',[]) or [],
-                    signal_history=list(self.brain.history))
+                    signal_history=list(self.brain.history),
+                    epic=getattr(self.brain,'epic',None),
+                    currency=((self.market or {}).get('currency')
+                              if isinstance(self.market,dict) else None))
                 self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                    self.brain.labeled,list(self.brain.history),
                                    force=False,cash_trades=cash)

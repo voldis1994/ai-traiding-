@@ -73,15 +73,26 @@ def test_fit_and_soft_nudge_agree_boosts_side():
         assert abs(sum(nudged.values()) - 1.0) < 1e-9
 
 
-def test_conflict_does_not_flip_to_opposite_trade():
+def test_conflict_does_not_push_hold_or_flip():
     scores = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
     advice = {'advice': 'SELL', 'confidence': 0.8, 'agree': False, 'reason': 'conflict'}
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 't.sqlite3')
         nudged, meta = forecast_bridge.soft_nudge_scores(scores, advice, store=store)
-        assert meta['nudged'] is True
-        # Argmax should stay BUY or become HOLD — not forced SELL flip
-        assert max(nudged, key=nudged.get) in ('BUY', 'HOLD')
+        assert meta['nudged'] is False
+        assert nudged == scores
+        assert max(nudged, key=nudged.get) == 'BUY'
+
+
+def test_forecast_hold_does_not_suppress_trade():
+    scores = {'BUY': 0.50, 'SELL': 0.30, 'HOLD': 0.20}
+    advice = {'advice': 'HOLD', 'confidence': 0.9, 'agree': False, 'reason': 'f_hold'}
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        nudged, meta = forecast_bridge.soft_nudge_scores(scores, advice, store=store)
+        assert meta['nudged'] is False
+        assert nudged['BUY'] == scores['BUY']
+        assert max(nudged, key=nudged.get) == 'BUY'
 
 
 def test_maybe_refit_and_shadow():

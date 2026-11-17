@@ -148,9 +148,10 @@ def shadow_advice(store, features, *, neural_scores=None):
 
 
 def soft_nudge_scores(scores, advice, *, store=None):
-    """Tilt scores toward forecast h=1 when it agrees; mild HOLD tilt on conflict.
+    """Boost only when forecast h=1 **agrees** with neural BUY/SELL.
 
-    Caps via ``forecast_bridge_nudge``. Renormalizes to sum=1 (same as structure_edge).
+    Never pushes HOLD and never flips the neural side on conflict — that would
+    turn the book into perpetual HOLD. Conflict / forecast-HOLD = log only.
     """
     if not isinstance(scores,dict):
         return scores,{'nudged':False,'reason':'no_scores'}
@@ -167,35 +168,31 @@ def soft_nudge_scores(scores, advice, *, store=None):
     agree=advice.get('agree')
     if side not in out:
         return dict(scores),{'nudged':False,'reason':'bad_side'}
-    # Only nudge when confidence is meaningful.
     if conf<0.40:
         return dict(scores),{'nudged':False,'reason':'low_confidence','advice':advice}
-    delta=strength*min(1.0,conf)
-    if agree is True:
+    # Only reinforce an already-proposed trade side.
+    if agree is True and side in ('BUY','SELL'):
+        delta=strength*min(1.0,conf)
         out[side]+=delta
-        # Slightly reduce opposite trade side
-        opp='SELL' if side=='BUY' else ('BUY' if side=='SELL' else None)
-        if opp:
-            out[opp]=max(0.0,out[opp]-0.5*delta)
-    elif agree is False and side=='HOLD':
-        out['HOLD']+=delta
-        out['BUY']=max(0.0,out['BUY']-0.4*delta)
-        out['SELL']=max(0.0,out['SELL']-0.4*delta)
-    elif agree is False and side in ('BUY','SELL'):
-        # Conflict: do not flip argmax — mild HOLD tilt only.
-        out['HOLD']+=0.6*delta
-        out[side]=max(0.0,out[side]-0.3*delta)
-    else:
-        # No neural compare — soft prefer forecast side
-        out[side]+=0.5*delta
-    for k in out:
-        out[k]=max(0.0,min(1.0,out[k]))
-    s=sum(out.values())
-    if s<=1e-12:
-        return dict(scores),{'nudged':False,'reason':'degenerate'}
-    out={k:out[k]/s for k in out}
-    return out,{'nudged':True,'delta':delta,'advice':side,'agree':agree,
-                'confidence':conf,'reason':advice.get('reason')}
+        opp='SELL' if side=='BUY' else 'BUY'
+        out[opp]=max(0.0,out[opp]-0.35*delta)
+        # Do not inflate HOLD when reinforcing a trade.
+        for k in out:
+            out[k]=max(0.0,min(1.0,out[k]))
+        s=sum(out.values())
+        if s<=1e-12:
+            return dict(scores),{'nudged':False,'reason':'degenerate'}
+        out={k:out[k]/s for k in out}
+        return out,{'nudged':True,'delta':delta,'advice':side,'agree':True,
+                    'confidence':conf,'reason':advice.get('reason')}
+    # Conflict, forecast HOLD, or no neural compare → leave scores alone.
+    return dict(scores),{
+        'nudged':False,
+        'reason':('conflict_no_hold_push' if agree is False
+                  else ('forecast_hold_ignored' if side=='HOLD'
+                        else 'no_agree_boost')),
+        'advice':side,'agree':agree,'confidence':conf,
+    }
 
 
 def maybe_refit_and_advise(store, *, epic=None, features=None, neural_scores=None):

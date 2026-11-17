@@ -37,16 +37,30 @@ def test_budgets_from_equity():
 
 def test_phase_hunt_protect_defend_done():
     params = db.load_params(None)
+    # Defaults: no day profit cap; loss stop = 10% equity.
+    assert float(params.get('profit_target_frac') or 0) == 0.0
+    assert float(params.get('loss_budget_frac') or 0) == pytest.approx(0.10)
+
     daily = {'realized_pnl': 0.0, 'closes': 0}
     b = db.budgets(equity=10_000.0, params=params, daily=daily)
+    assert b['profit_target'] is None
+    assert b['loss_budget'] == pytest.approx(1000.0)
     assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_HUNT
 
-    daily = {'realized_pnl': 150.0, 'closes': 2}  # above ~1% target
+    # Wins do not flip PROTECT/DONE when profit target is off.
+    daily = {'realized_pnl': 1500.0, 'closes': 2}
     b = db.budgets(equity=10_000.0, params=params, daily=daily)
+    assert db.phase_for(daily=daily, budgets_map=b, open_count=1) == db.PHASE_HUNT
+    assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_HUNT
+
+    # Optional profit target still works when explicitly enabled.
+    capped = dict(params, profit_target_frac=0.01)
+    daily = {'realized_pnl': 150.0, 'closes': 2}
+    b = db.budgets(equity=10_000.0, params=capped, daily=daily)
     assert db.phase_for(daily=daily, budgets_map=b, open_count=1) == db.PHASE_PROTECT
     assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_DONE
 
-    daily = {'realized_pnl': -250.0, 'closes': 3}
+    daily = {'realized_pnl': -1000.0, 'closes': 3}  # hits 10% loss stop
     b = db.budgets(equity=10_000.0, params=params, daily=daily)
     assert db.phase_for(daily=daily, budgets_map=b, open_count=0) == db.PHASE_DEFEND
 
@@ -185,10 +199,13 @@ def test_day_phase_protect_tilts_hold():
 def test_record_close_updates_phase():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
+        # No day profit cap → big win stays HUNT (loss stop only).
         db.record_close(s, pnl=120.0, equity=10_000.0, open_count=0)
         snap = db.snapshot(s, equity=10_000.0, positions=[])
         assert snap['daily']['realized_pnl'] == 120.0
-        assert snap['phase'] == db.PHASE_DONE
+        assert snap['phase'] == db.PHASE_HUNT
+        assert snap['budgets']['profit_target'] is None
+        assert snap['budgets']['loss_budget'] == pytest.approx(1000.0)
 
 
 def test_foreign_epic_blocks_add():

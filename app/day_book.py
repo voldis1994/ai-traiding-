@@ -72,8 +72,8 @@ def load_params(store):
     """Robot knobs (seeds in self_params; evolve from £)."""
     sp = _cfg(store)
     return {
-        'profit_target_frac': float(sp.get('day_profit_target_frac', 0.01)),
-        'loss_budget_frac': float(sp.get('day_loss_budget_frac', 0.02)),
+        'profit_target_frac': float(sp.get('day_profit_target_frac', 0.0)),
+        'loss_budget_frac': float(sp.get('day_loss_budget_frac', 0.10)),
         'risk_per_trade_frac': float(sp.get('day_risk_per_trade_frac', 0.005)),
         'be_band_frac': float(sp.get('day_be_band_frac', 0.001)),
         'max_positions': int(sp.get('day_max_positions', 5)),
@@ -250,8 +250,13 @@ def budgets(*, equity, params, daily):
         }
     eq = float(eq)
     p = params or {}
-    profit = max(0.0, eq * float(p.get('profit_target_frac') or 0.01))
-    loss = max(0.0, eq * float(p.get('loss_budget_frac') or 0.02))
+    # 0 / missing profit_target_frac → no day profit cap.
+    try:
+        ptf = float(p.get('profit_target_frac') if p.get('profit_target_frac') is not None else 0.0)
+    except (TypeError, ValueError):
+        ptf = 0.0
+    profit = (max(0.0, eq * ptf) if ptf > 0 else None)
+    loss = max(0.0, eq * float(p.get('loss_budget_frac') or 0.10))
     be = max(0.0, eq * float(p.get('be_band_frac') or 0.001))
     # Full-balance mode: OPEN pack cash-risk at SL ≈ whole account (then
     # multi-lot splits that pack). Fractional mode keeps risk_per_trade_frac.
@@ -273,7 +278,8 @@ def budgets(*, equity, params, daily):
 def phase_for(*, daily, budgets_map, open_count=0):
     """Which book mode the robot is in — data-driven from £ vs equity fracs.
 
-    DEFEND on loss budget. PROTECT/DONE only when profit target is hit.
+    DEFEND on loss budget (default 10% equity). Profit target is optional —
+    when unset/0 there is no PROTECT/DONE from day £ wins.
     Mere BE-band after a scratch/small close must NOT flip DONE/PROTECT
     (that forced HOLD after pennies).
     """
@@ -283,7 +289,7 @@ def phase_for(*, daily, budgets_map, open_count=0):
     loss_cap = _finite(b.get('loss_budget'))
     if loss_cap is not None and realized <= -abs(loss_cap):
         return PHASE_DEFEND
-    if target is not None and realized >= abs(target):
+    if target is not None and target > 0 and realized >= abs(target):
         if int(open_count or 0) <= 0:
             return PHASE_DONE
         return PHASE_PROTECT
@@ -902,5 +908,5 @@ def snapshot(store, *, equity=None, positions=None):
         'open_upl': upl,
         'day_mark_pnl': day_mark,
         'last_plan': store.get(LAST_PLAN_KEY) if store is not None else None,
-        'goal': 'Finish UTC day at plus or break-even; OPEN pack uses full account £ (multi-lot).',
+        'goal': 'No day profit cap; DEFEND at 10% equity loss; OPEN pack uses full account £.',
     }

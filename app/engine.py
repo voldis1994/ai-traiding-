@@ -3076,14 +3076,19 @@ class SingleTradeEngine:
         return self._account_currency()
 
     def _account_equity(self):
-        """Best-effort account equity/balance for drawdown gating (audit #21)."""
+        """Best-effort deployable account £ for sizing + drawdown gating.
+
+        Prefer ``available`` then ``balance`` then ``equity`` so OPEN packs
+        size to cash left in the account (e.g. £20 → use £20), not a stale
+        higher equity figure after open UPL.
+        """
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or
                      a.get('accountId')==self.account.get('currentAccountId')),
                     account[0] if account else {})
         bal=active.get('balance') if isinstance(active,dict) else None
         if isinstance(bal,dict):
-            for key in ('equity','balance','available'):
+            for key in ('available','balance','equity'):
                 v=_num(bal.get(key))
                 if v is not None and v>0:return float(v)
         return _num(bal) if not isinstance(bal,dict) else None
@@ -5151,23 +5156,26 @@ class SingleTradeEngine:
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
             # Capital dealingRules size grid — never invent 0.1009-style lots.
             size_grid=dealing_size_grid(market,mandate_size=self.mandate['size'])
-            # Day book: equity risk → adaptive lot; multi-pos when capacity remains.
+            # Day book: full account balance → lot pack; multi-pos when capacity remains.
             equity=self._account_equity()
-            # When Capital omits valueOfOnePip, lot stayed glued to mandate forever.
-            # Calibrate tick_value so mandate size ≈ day risk_per_trade at this stop.
+            # When Capital omits valueOfOnePip, calibrate so mandate ≈ fractional
+            # risk_per_trade. Skip when size_full_balance — that glue would keep
+            # size at mandate even though risk_cap = whole £ balance.
             tick_val_src='capital'
             if tick_val is None and brackets.get('stop_ticks') and equity:
                 try:
                     params=day_book.load_params(self.store)
-                    bmap=day_book.budgets(
-                        equity=equity,params=params,
-                        daily=day_book.load_daily(self.store,equity=equity))
-                    rpt=_num(bmap.get('risk_per_trade'))
-                    msize=float(Decimal(str(self.mandate['size'])))
-                    st=float(brackets['stop_ticks'])
-                    if rpt and rpt>0 and msize>0 and st>0:
-                        tick_val=rpt/(msize*st)
-                        tick_val_src='mandate_risk_calibrated'
+                    full_bal=int(params.get('size_full_balance') or 0)==1
+                    if not full_bal:
+                        bmap=day_book.budgets(
+                            equity=equity,params=params,
+                            daily=day_book.load_daily(self.store,equity=equity))
+                        rpt=_num(bmap.get('risk_per_trade'))
+                        msize=float(Decimal(str(self.mandate['size'])))
+                        st=float(brackets['stop_ticks'])
+                        if rpt and rpt>0 and msize>0 and st>0:
+                            tick_val=rpt/(msize*st)
+                            tick_val_src='mandate_risk_calibrated'
                 except Exception:
                     tick_val=None
             _scores_for_align,_edge_for_align,_aligned=self._day_book_add_edge()

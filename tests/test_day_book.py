@@ -3,6 +3,8 @@ import tempfile
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from app.engine import Store
 from app import day_book as db
 from app.autonomy import AutoEvolution
@@ -18,12 +20,19 @@ def test_budgets_from_equity():
         'loss_budget_frac': 0.02,
         'risk_per_trade_frac': 0.005,
         'be_band_frac': 0.001,
+        'size_full_balance': 0,
     }
     b = db.budgets(equity=10_000.0, params=params, daily={})
     assert b['profit_target'] == 100.0
     assert b['loss_budget'] == 200.0
     assert b['risk_per_trade'] == 50.0
     assert b['be_band'] == 10.0
+    full = db.budgets(
+        equity=20.0,
+        params={**params, 'size_full_balance': 1},
+        daily={})
+    assert full['risk_per_trade'] == 20.0
+    assert full['size_full_balance'] is True
 
 
 def test_phase_hunt_protect_defend_done():
@@ -79,7 +88,7 @@ def test_propose_size_scales_with_equity_risk():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         daily = db.load_daily(s, equity=10_000.0)
-        params = db.load_params(s)
+        params = dict(db.load_params(s), size_full_balance=0)
         out = db.propose_size(
             mandate_size='1', equity=10_000.0, daily=daily, params=params,
             stop_ticks=20, tick_value=1.0, positions=[], score_edge=0.1)
@@ -87,6 +96,41 @@ def test_propose_size_scales_with_equity_risk():
         assert out['size'] is not None
         assert isinstance(out['size'], Decimal)
         assert out['size'] > 0
+
+
+def test_full_balance_uses_account_and_splits_multi_lot():
+    """£20 account → OPEN pack cash-risk ≈ £20, split across day_open_slices."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        market = {
+            'dealingRules': {
+                'minDealSize': {'value': '0.01'},
+                'minSizeIncrement': {'value': '0.01'},
+                'maxDealSize': {'value': '50'},
+            },
+            'instrument': {},
+            'snapshot': {'decimalPlacesFactor': 2},
+        }
+        params = db.load_params(s)
+        assert int(params.get('size_full_balance') or 0) == 1
+        daily = db.load_daily(s, equity=20.0)
+        # stop_ticks=10, tick_value=1 → size = 20/10 = 2.0 lots total
+        out = db.propose_size(
+            mandate_size='0.25', equity=20.0, daily=daily, params=params,
+            stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.0,
+            market=market)
+        assert out['allowed'] is True
+        assert out['size_full_balance'] is True
+        assert float(out['size']) == pytest.approx(2.0)
+        # Estimated cash risk ≈ full £20
+        assert float(out['estimated_risk']) == pytest.approx(20.0, rel=0.05)
+        slices = db.split_planned_sizes(
+            out['size'], store=s, positions=[], size_grid={
+                'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
+                'max': Decimal('50')},
+            action='BUY', structure='TREND_UP')
+        assert len(slices) == 5
+        assert sum(slices) == Decimal('2.00')
 
 
 def test_soft_nudge_conviction_renormalizes():
@@ -181,8 +225,8 @@ def test_tick_value_missing_calibrated_lot_not_stuck_on_mandate():
             'instrument': {},  # no valueOfOnePip
             'snapshot': {'decimalPlacesFactor': 2, 'marketStatus': 'TRADEABLE'},
         }
-        # Calibrate like submit: mandate ≈ risk_per_trade at stop.
-        params = db.load_params(store)
+        # Calibrate like submit (fractional mode): mandate ≈ risk_per_trade at stop.
+        params = dict(db.load_params(store), size_full_balance=0)
         b = db.budgets(equity=10_000.0, params=params, daily={})
         rpt = float(b['risk_per_trade'])
         stop_ticks = 50

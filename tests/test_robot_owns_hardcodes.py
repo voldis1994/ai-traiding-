@@ -21,7 +21,7 @@ def test_new_knobs_seeded_and_bounded():
     for key in (
         'hold_lean_gap', 'day_add_trend_floor', 'entry_edge_floor',
         'trail_arm_mfe_frac', 'aggression_loss_step', 'bracket_tighten_floor',
-        'day_open_slices', 'day_phase_protect_tilt',
+        'day_open_slices', 'day_phase_protect_tilt', 'day_size_full_balance',
     ):
         assert key in DEFAULTS and key in BOUNDS
 

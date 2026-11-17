@@ -91,6 +91,8 @@ DEFAULTS = {
     'day_profit_target_frac': 0.01,
     'day_loss_budget_frac': 0.02,
     'day_risk_per_trade_frac': 0.005,
+    # 1 = OPEN pack cash-risk ≈ full account balance (split across multi-lot).
+    'day_size_full_balance': 1,
     'day_be_band_frac': 0.001,
     'day_max_positions': 5,
     'day_conviction_nudge': 0.12,
@@ -217,6 +219,7 @@ BOUNDS = {
     'day_profit_target_frac': (0.001, 0.05),
     'day_loss_budget_frac': (0.002, 0.10),
     'day_risk_per_trade_frac': (0.0005, 0.03),
+    'day_size_full_balance': (0, 1),
     'day_be_band_frac': (0.0001, 0.01),
     'day_max_positions': (1, 8),
     'day_conviction_nudge': (0.02, 0.30),
@@ -345,7 +348,7 @@ def _clip(key, value):
                'min_online_labeled','policy_evolve_enabled','policy_live_execute','entry_edge_gate',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
-               'day_max_positions','day_open_slices','trail_ohlc_bars'):
+               'day_max_positions','day_open_slices','day_size_full_balance','trail_ohlc_bars'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

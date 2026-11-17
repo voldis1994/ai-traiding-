@@ -83,6 +83,7 @@ def load_params(store):
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
         'open_slices': int(sp.get('day_open_slices', 5)),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
+        'size_full_balance': int(sp.get('day_size_full_balance', 1)),
     }
 
 
@@ -252,13 +253,19 @@ def budgets(*, equity, params, daily):
     profit = max(0.0, eq * float(p.get('profit_target_frac') or 0.01))
     loss = max(0.0, eq * float(p.get('loss_budget_frac') or 0.02))
     be = max(0.0, eq * float(p.get('be_band_frac') or 0.001))
-    rpt = max(0.0, eq * float(p.get('risk_per_trade_frac') or 0.005))
+    # Full-balance mode: OPEN pack cash-risk at SL ≈ whole account (then
+    # multi-lot splits that pack). Fractional mode keeps risk_per_trade_frac.
+    if int(p.get('size_full_balance') or 0) == 1:
+        rpt = eq
+    else:
+        rpt = max(0.0, eq * float(p.get('risk_per_trade_frac') or 0.005))
     return {
         'equity': eq,
         'profit_target': profit,
         'loss_budget': loss,
         'be_band': be,
         'risk_per_trade': rpt,
+        'size_full_balance': int(p.get('size_full_balance') or 0) == 1,
         'reason': 'ok',
     }
 
@@ -350,24 +357,37 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         }
     committed = committed_risk(
         positions, stop_ticks_by_deal=stop_ticks_by_deal, tick_value=tick_value)
-    # Soft robot cap still on Capital grid (never below broker min / above max).
+    full_bal = int(p.get('size_full_balance') or 0) == 1
     hi_mult = max(1.0, float(p.get('lot_max_mult') or 2.0))
     lo_mult = max(0.0, float(p.get('lot_min_mult') or 0.25))
     minimum = grid['min']
     step = grid['step']
-    robot_cap = seed * Decimal(str(hi_mult))
-    if grid.get('max') is not None:
-        maximum = min(grid['max'], robot_cap)
+    if full_bal:
+        # Use whole account cash-risk: Capital maxDealSize is the only ceiling
+        # (mandate 2× cap would leave most of a £20 book unused).
+        if grid.get('max') is not None:
+            maximum = grid['max']
+        else:
+            maximum = snap_deal_size(
+                seed * Decimal('1000'), min_size=minimum, step=step,
+                max_size=None) or seed
+        maximum = snap_deal_size(
+            maximum, min_size=minimum, step=step, max_size=grid.get('max')) or seed
+        robot_floor = minimum
+        risk_cap = float(rpt)  # already = equity; do not inflate past balance
     else:
-        maximum = robot_cap
-    maximum = snap_deal_size(
-        maximum, min_size=minimum, step=step, max_size=grid.get('max')) or seed
-    # Mandate-relative floor (still snapped to Capital grid).
-    robot_floor = snap_deal_size(
-        seed * Decimal(str(lo_mult)), min_size=minimum, step=step,
-        max_size=maximum)
-    edge = _finite(score_edge) or 0.0
-    risk_cap = float(rpt) * (1.0 + min(0.5, max(0.0, edge)))
+        robot_cap = seed * Decimal(str(hi_mult))
+        if grid.get('max') is not None:
+            maximum = min(grid['max'], robot_cap)
+        else:
+            maximum = robot_cap
+        maximum = snap_deal_size(
+            maximum, min_size=minimum, step=step, max_size=grid.get('max')) or seed
+        robot_floor = snap_deal_size(
+            seed * Decimal(str(lo_mult)), min_size=minimum, step=step,
+            max_size=maximum)
+        edge = _finite(score_edge) or 0.0
+        risk_cap = float(rpt) * (1.0 + min(0.5, max(0.0, edge)))
     try:
         sized = risk_position_size(
             risk_cap, committed, stop_ticks, tick_value, step, minimum, maximum)
@@ -396,7 +416,8 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
                 'size': None, 'reason': 'cannot_snap_to_capital_grid',
                 'allowed': False, 'size_grid': grid,
             }
-    if robot_floor is not None and size is not None and size < robot_floor:
+    if (not full_bal and robot_floor is not None and size is not None
+            and size < robot_floor):
         # Risk room may still forbid the floor — then refuse rather than undersize.
         floor_risk = None
         try:
@@ -413,7 +434,8 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
     scale = float(size / seed) if seed > 0 else 1.0
     return {
         'size': size,
-        'reason': 'equity_risk_on_capital_grid',
+        'reason': ('full_balance_on_capital_grid' if full_bal
+                   else 'equity_risk_on_capital_grid'),
         'allowed': True,
         'budgets': b,
         'committed_risk': committed,
@@ -421,6 +443,7 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         'scale': scale,
         'raw': float(sized.get('raw') or 0),
         'lot_min_mult': lo_mult,
+        'size_full_balance': full_bal,
         'size_grid': {
             'min': str(grid['min']), 'step': str(grid['step']),
             'max': str(grid['max']) if grid.get('max') is not None else None,
@@ -879,5 +902,5 @@ def snapshot(store, *, equity=None, positions=None):
         'open_upl': upl,
         'day_mark_pnl': day_mark,
         'last_plan': store.get(LAST_PLAN_KEY) if store is not None else None,
-        'goal': 'Finish UTC day at plus or break-even; robot sizes risk from equity.',
+        'goal': 'Finish UTC day at plus or break-even; OPEN pack uses full account £ (multi-lot).',
     }

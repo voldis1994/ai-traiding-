@@ -88,8 +88,10 @@ DEFAULTS = {
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
     # Day book — robot equity risk / day +/BE / multi-pos / adaptive lot
-    'day_profit_target_frac': 0.01,
-    'day_loss_budget_frac': 0.02,
+    # 0 = no day profit cap (do not flip PROTECT/DONE on £ target).
+    'day_profit_target_frac': 0.0,
+    # Day loss stop — 10% of equity (was 2%).
+    'day_loss_budget_frac': 0.10,
     'day_risk_per_trade_frac': 0.005,
     # 1 = OPEN pack cash-risk ≈ full account balance (split across multi-lot).
     'day_size_full_balance': 1,
@@ -216,7 +218,7 @@ BOUNDS = {
     'trail_ohlc_buffer_frac': (0.0, 0.5),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
-    'day_profit_target_frac': (0.001, 0.05),
+    'day_profit_target_frac': (0.0, 0.05),
     'day_loss_budget_frac': (0.002, 0.10),
     'day_risk_per_trade_frac': (0.0005, 0.03),
     'day_size_full_balance': (0, 1),
@@ -364,6 +366,9 @@ _LEGACY_SEED_MIGRATIONS = {
     'entry_edge_floor': (0.06, 0.0),
     # Old multi-lot freeze at 0.06 → follow BUY/SELL when flat.
     'day_slice_min_edge': (0.06, 0.04),
+    # Operator: remove day profit cap; widen day loss stop to 10%.
+    'day_profit_target_frac': (0.01, 0.0),
+    'day_loss_budget_frac': (0.02, 0.10),
 }
 
 

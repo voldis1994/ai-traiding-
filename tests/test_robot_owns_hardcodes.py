@@ -41,6 +41,7 @@ def test_broker_loss_moves_entry_hold_trail_slices():
         before = load(store)
         evolve_from_feedback(store, broker_pnl=-2.0, commit=True)
         after = load(store)
+        # Losses may raise soft hint; still never required to hard-block.
         assert after['entry_edge_floor'] >= before['entry_edge_floor']
         assert after['hold_lean_gap'] >= before['hold_lean_gap']
         assert after['trail_arm_mfe_frac'] >= before['trail_arm_mfe_frac']

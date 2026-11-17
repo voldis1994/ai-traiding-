@@ -252,7 +252,8 @@ class AutoEvolution:
             weight=min(1.,max(0.,(samples-100)/400.))
             adjustment=max(-.025,min(.035,(.53-float(accuracy))*.12))*weight
         cost=max(0.,min(.025,float(spread_bps)*.002)) if math.isfinite(float(spread_bps)) else .025
-        return round(min(.25,max(.01,initial+adjustment+cost)),4)
+        # Floor may be 0.0 (signal-first); spread/accuracy can still raise it.
+        return round(min(.25,max(0.,initial+adjustment+cost)),4)
 
     @staticmethod
     def _safe_scores(scores):
@@ -275,7 +276,7 @@ class AutoEvolution:
         # a margin in score points; v1 policies continue to use confidence.
         if threshold is not None:
             if 'MIN_EDGE' in fn.__globals__:
-                fn.__globals__['MIN_EDGE']=min(.25,max(.01,float(threshold)))
+                fn.__globals__['MIN_EDGE']=min(.25,max(0.,float(threshold)))
             elif 'CONFIDENCE' in fn.__globals__:
                 fn.__globals__['CONFIDENCE']=min(.85,max(.55,float(threshold)))
         result=fn(scores,current_direction,age)
@@ -407,24 +408,44 @@ class AutoEvolution:
             'calibration_method':(calibration or {}).get('method'),
         }
         if pol in ('HOLD','CLOSE'):
-            # HOLD mass in softmax is not a reason to veto a clear side lean.
+            # Follow neural side whenever it leans vs opposite — edge floor is
+            # not a hard veto (operator: trade signals, do not freeze on 0.06).
             opp='SELL' if direction=='BUY' else 'BUY'
             try:
                 side_vs_opp=float(scores[direction])-float(scores[opp])
             except (TypeError,ValueError,KeyError):
                 side_vs_opp=None
-            floor=float(edge_floor) if edge_floor is not None else 0.06
-            if side_vs_opp is not None and math.isfinite(side_vs_opp) and side_vs_opp>=floor:
+            try:
+                from .self_params import get as sp_get
+                lean=float(sp_get(getattr(self,'store',None),'hold_lean_gap',0.04))
+                gate_on=int(sp_get(getattr(self,'store',None),'entry_edge_gate',0) or 0)==1
+            except Exception:
+                lean,gate_on=0.04,False
+            floor=float(edge_floor) if edge_floor is not None else 0.0
+            need=max(lean,floor) if gate_on else lean
+            if side_vs_opp is not None and math.isfinite(side_vs_opp) and side_vs_opp>=need:
                 evidence['evolved_policy']['hold_override']=True
                 evidence['evolved_policy']['side_vs_opposite']=side_vs_opp
                 return direction,(
                     f'Neural {direction} overrides evolved {pol} '
-                    f'(side−opp={side_vs_opp:.3f} ≥ edge_floor={floor:.3f}; '
-                    f'HOLD abstention not required)'),evidence
+                    f'(side−opp={side_vs_opp:.3f} ≥ lean={need:.3f}; '
+                    f'follow signal)'),evidence
+            # Still clear argmax vs HOLD mass — do not freeze.
+            try:
+                side_vs_hold=float(scores[direction])-float(scores.get('HOLD') or 0)
+            except (TypeError,ValueError,KeyError):
+                side_vs_hold=None
+            if (side_vs_hold is not None and math.isfinite(side_vs_hold)
+                    and side_vs_hold>=lean):
+                evidence['evolved_policy']['hold_override']=True
+                evidence['evolved_policy']['side_vs_hold']=side_vs_hold
+                return direction,(
+                    f'Neural {direction} overrides evolved {pol} '
+                    f'(side−HOLD={side_vs_hold:.3f}; follow signal)'),evidence
             return 'HOLD',(
                 f'Evolved policy {pol} vetoes neural {direction} '
-                f'(edge_floor={edge_floor:.3f}, '
-                f'gen={evidence["evolved_policy"]["generation"]})'),evidence
+                f'(no lean vs opp/HOLD; gen='
+                f'{evidence["evolved_policy"]["generation"]})'),evidence
         if pol in ('BUY','SELL') and pol!=direction:
             return 'HOLD',(
                 f'Evolved policy {pol} disagrees with neural {direction}; HOLD '

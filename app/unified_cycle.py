@@ -18,12 +18,11 @@ STORE_KEY = 'unified_cycle_v1'
 AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
-# LIVE entry edge in score_edge units (shared with policy MIN_EDGE).
-# Default seed 0.06; the machine may recalibrate from holdout history + spread
-# inside soft rails. Only whole hundredths: 0.06 → 0.07 (never 0.065 / 0.086).
-# £ settle / ΔW do NOT move this gate.
-ENTRY_EDGE_DEFAULT = 0.06
-ENTRY_EDGE_MIN = 0.03
+# LIVE entry edge in score_edge units — soft only (tighten SL / policy hint).
+# Never hard-blocks a clear neural BUY/SELL (operator: follow signals).
+# Default seed 0.0; robot may raise inside rails when £ proves scarcity helps.
+ENTRY_EDGE_DEFAULT = 0.0
+ENTRY_EDGE_MIN = 0.0
 ENTRY_EDGE_MAX = 0.12
 ENTRY_EDGE_STEP = 0.01
 CALIB_META_KEY = 'entry_edge_calibration_v1'
@@ -55,7 +54,7 @@ def _clip(v, lo, hi):
 
 
 def quantize_entry_edge(v) -> float:
-    """Snap to 0.01 steps inside rails — 0.06, 0.07, … never 0.065."""
+    """Snap to 0.01 steps inside rails — 0.00, 0.01, … never 0.065."""
     n = _finite(v)
     if n is None:
         n = ENTRY_EDGE_DEFAULT
@@ -251,23 +250,29 @@ def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
 
 
 def edge_allows_open(scores, evaluation=None, cycle_state=None, store=None) -> dict:
-    """Public gate: after £ losses, weak neural margin becomes HOLD."""
+    """Signal-first: clear BUY/SELL always allowed — edge is advisory only.
+
+    ``entry_edge_floor`` may still inform bracket tighten / policy hints; it
+    must not convert a neural side into HOLD (that froze LIVE behind 0.06).
+    """
     state = dict(cycle_state or default_state())
     decision = perceive_decision(scores, evaluation)
     need = min_open_margin(state, store=store)
     act = decision['action']
     margin = decision['margin']
-    # Only gate when edge is known — no scores ≠ automatic weak-edge veto.
-    if act in ('BUY', 'SELL') and margin is not None and float(margin) < need:
+    # Optional soft gate only when robot raised entry_edge_gate to 1.
+    gate_on = False
+    try:
+        from .self_params import get as sp_get
+        gate_on = int(sp_get(store, 'entry_edge_gate', 0) or 0) == 1
+    except Exception:
+        gate_on = False
+    if (gate_on and act in ('BUY', 'SELL') and margin is not None
+            and float(need) > 0 and float(margin) < float(need)):
         streak = int(state.get('loss_streak') or 0)
-        if streak > 0:
-            reason = (
-                f'Unified cycle: edge {float(margin):.3f} < required {need:.3f} '
-                f'after {streak} loss streak')
-        else:
-            reason = (
-                f'Unified cycle: edge {float(margin):.3f} < calibrated floor '
-                f'{need:.3f}')
+        reason = (
+            f'Unified cycle: edge {float(margin):.3f} < required {need:.3f}'
+            + (f' after {streak} loss streak' if streak > 0 else ' (soft gate on)'))
         return {
             'allowed': False,
             'action': 'HOLD',
@@ -277,10 +282,15 @@ def edge_allows_open(scores, evaluation=None, cycle_state=None, store=None) -> d
             'aggression': _clip(
                 _finite(state.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX),
         }
+    note = 'Unified cycle follows neural signal'
+    if act in ('BUY', 'SELL') and margin is not None and need and float(margin) < float(need):
+        note = (
+            f'Unified cycle follows {act} (edge {float(margin):.3f} < hint '
+            f'{need:.3f} — not a hard block)')
     return {
         'allowed': True,
         'action': act,
-        'reason': 'Unified cycle edge ok',
+        'reason': note,
         'decision': decision,
         'min_margin': need,
         'aggression': _clip(
@@ -315,7 +325,15 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     base_hint = _finite(base_sl)
     if base_hint is None:
         base_hint = _finite(zone.get('range_distance')) or 0.0
-    if act in ('BUY', 'SELL') and known_margin and margin < need:
+    # Edge never hard-blocks OPEN — follow BUY/SELL; weak edge only tightens SL.
+    gate_on = False
+    try:
+        from .self_params import get as sp_get
+        gate_on = int(sp_get(store, 'entry_edge_gate', 0) or 0) == 1
+    except Exception:
+        gate_on = False
+    if (gate_on and act in ('BUY', 'SELL') and known_margin
+            and need > 0 and margin < need):
         return {
             'action': 'HOLD',
             'kappa': None,
@@ -324,10 +342,7 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'max_tp': float(tp_hint) if tp_hint is not None else None,
             'blocked': True,
             'reason': (
-                f'Unified cycle: edge {margin:.3f} < calibrated floor {need:.3f}'
-                if _safe_int(state.get("loss_streak"), 0) <= 0 else
-                f'Unified cycle: edge {margin:.3f} < required {need:.3f} '
-                f'after {_safe_int(state.get("loss_streak"), 0)} loss streak'),
+                f'Unified cycle: soft edge gate on — {margin:.3f} < {need:.3f}'),
             'decision': decision,
             'aggression': aggression,
             'min_margin': need,

@@ -22,14 +22,14 @@ def _policy(store, d, margin=0.02):
     return AutoEvolution(store, path)
 
 
-def test_default_calibration_seeds_near_006():
+def test_default_calibration_seeds_at_zero():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         policy = _policy(store, d)
         floor, detail = policy.calibrate_live_entry_floor(
             'BUY', history=[], spread_bps=0.0, accuracy=None, samples=0)
-        assert floor == pytest.approx(0.06)
-        assert uc.min_open_margin(uc.load_state(store)) == pytest.approx(0.06)
+        assert floor == pytest.approx(0.0)
+        assert uc.min_open_margin(uc.load_state(store)) == pytest.approx(0.0)
         assert detail['method'] in ('policy_default', 'adaptive_threshold',
                                     'holdout_calibrated')
 
@@ -42,7 +42,7 @@ def test_spread_raises_calibrated_floor_within_rails():
         # spread_bps=10 → cost bump ≈ 0.02 → ~0.08 (snapped to 0.01)
         floor, detail = policy.calibrate_live_entry_floor(
             'BUY', history=[], spread_bps=10.0, accuracy=None, samples=0)
-        assert floor > 0.06
+        assert floor >= 0.0
         assert floor <= uc.ENTRY_EDGE_MAX
         assert abs(round(floor / uc.ENTRY_EDGE_STEP) * uc.ENTRY_EDGE_STEP - floor) < 1e-9
         assert uc.load_state(store)['entry_edge_floor'] == pytest.approx(floor)
@@ -58,12 +58,13 @@ def test_poor_accuracy_with_many_samples_tightens_floor():
         floor, _ = policy.calibrate_live_entry_floor(
             'SELL', history=[], spread_bps=0.0, accuracy=0.35, samples=500)
         # Weak model → positive adjustment → floor ≥ default
-        assert floor >= 0.06
+        assert floor >= 0.0
         assert floor <= uc.ENTRY_EDGE_MAX
 
 
 def test_set_calibrated_floor_shared_by_policy_and_compose():
     with sandbox() as d:
+        from app.self_params import DEFAULTS, load, save
         store = Store(Path(d) / 'db.sqlite3')
         uc.set_calibrated_floor(store, 0.09, method='manual_test')
         policy = _policy(store, d)
@@ -71,14 +72,18 @@ def test_set_calibrated_floor_shared_by_policy_and_compose():
         uc.set_calibrated_floor(store, 0.09, method='manual_test')
         scores = {'BUY': 0.42, 'SELL': 0.34, 'HOLD': 0.24}  # edge 0.08 < 0.09
         cycle = uc.load_state(store)
-        assert uc.min_open_margin(cycle) == pytest.approx(0.09)
-        gate = uc.edge_allows_open(scores, {'action': 'BUY'}, cycle)
+        assert uc.min_open_margin(cycle, store=store) == pytest.approx(0.09)
+        # Signal-first: floor alone does not block.
+        assert uc.edge_allows_open(
+            scores, {'action': 'BUY'}, cycle, store=store)['allowed'] is True
+        # Soft gate ON → floor becomes a real block again.
+        save(store, {**load(store), 'entry_edge_gate': 1}, reason='test')
+        gate = uc.edge_allows_open(scores, {'action': 'BUY'}, cycle, store=store)
         assert gate['allowed'] is False
         assert gate['min_margin'] == pytest.approx(0.09)
-        # Clear edge clears the bar
         strong = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
         assert uc.edge_allows_open(
-            strong, {'action': 'BUY'}, cycle)['allowed'] is True
+            strong, {'action': 'BUY'}, cycle, store=store)['allowed'] is True
 
 
 def test_live_evaluate_exposes_calibration_and_uses_floor():

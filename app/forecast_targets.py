@@ -6,6 +6,7 @@ Targets are pure labels for forecasting quality; they do not open/close trades.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 HORIZONS = (1, 3, 5, 15)
 # Match AdaptiveBrain._label: BUY=0, SELL=1, HOLD=2
@@ -35,6 +36,52 @@ def direction_label(entry_mid, exit_mid, *, cost=0.):
     if delta>c:return LABEL_BUY
     if delta<-c:return LABEL_SELL
     return LABEL_HOLD
+
+
+def bar_stamp(value):
+    """Normalize candle/forecast timestamps for equality (UTC aware)."""
+    if value is None:
+        return None
+    if isinstance(value,datetime):
+        dt=value
+    else:
+        try:
+            from .market_context import candle_time
+            dt=candle_time(value)
+        except Exception:
+            try:
+                s=str(value).replace('Z','+00:00')
+                dt=datetime.fromisoformat(s)
+            except Exception:
+                return str(value)
+    if dt.tzinfo is None:
+        dt=dt.replace(tzinfo=timezone.utc)
+    else:
+        dt=dt.astimezone(timezone.utc)
+    # Floor to the minute — M1 bar identity.
+    return dt.replace(second=0,microsecond=0)
+
+
+def candle_bar_time(c):
+    """Store candles use ``at``; forecast rows / tests may use ``time``."""
+    if not isinstance(c,dict):
+        return None
+    return c.get('at',c.get('time'))
+
+
+def candle_mid(c):
+    if not isinstance(c,dict):
+        return None
+    for k in ('mid','close','c'):
+        if c.get(k) is None:
+            continue
+        try:
+            v=float(c[k])
+        except (TypeError,ValueError):
+            continue
+        if math.isfinite(v) and v>0:
+            return v
+    return None
 
 
 def targets_at_horizons(entry_mid, future_mids, *, spread=0., future_spreads=None,
@@ -87,36 +134,55 @@ def targets_at_horizons(entry_mid, future_mids, *, spread=0., future_spreads=Non
 def path_from_candles(candles, *, after_time=None, after_index=None, max_h=15):
     """Extract future mids/spreads after a bar identified by time or index.
 
-    ``candles``: chronological list of dicts with mid|close and optional spread.
+    Matches Store candle ``at`` or test ``time`` via normalized minute stamps.
+    Returns (mids, spreads, matched_index) — matched_index is None on miss.
     """
     if not candles:
-        return [],[]
-    start=None
-    if after_index is not None:
-        start=int(after_index)+1
-    elif after_time is not None:
-        for i,c in enumerate(candles):
-            t=c.get('time') if isinstance(c,dict) else None
-            if t==after_time:
-                start=i+1
-                break
-    if start is None:
-        return [],[]
-    mids=[];spreads=[]
-    for c in candles[start:start+int(max_h)]:
+        return [],[],None
+    # Chronological order by stamp (Store.candles is already ASC, but be safe).
+    indexed=[]
+    for i,c in enumerate(candles):
         if not isinstance(c,dict):
             continue
-        mid=c.get('mid',c.get('close'))
-        try:
-            mid=float(mid)
-        except (TypeError,ValueError):
+        st=bar_stamp(candle_bar_time(c))
+        mid=candle_mid(c)
+        if st is None or mid is None:
             continue
-        if not math.isfinite(mid) or mid<=0:
-            continue
-        mids.append(mid)
         try:
             sp=float(c.get('spread') or 0.)
         except (TypeError,ValueError):
             sp=0.
-        spreads.append(sp if math.isfinite(sp) else 0.)
-    return mids,spreads
+        indexed.append((i,st,mid,sp if math.isfinite(sp) else 0.))
+    if not indexed:
+        return [],[],None
+    indexed.sort(key=lambda x:x[1])
+    start_pos=None
+    if after_index is not None:
+        # after_index refers to original list index; find first sorted entry
+        # whose original index is > after_index.
+        ai=int(after_index)
+        for j,(_,_,_,_) in enumerate(indexed):
+            if indexed[j][0]>ai:
+                start_pos=j
+                break
+    elif after_time is not None:
+        want=bar_stamp(after_time)
+        if want is None:
+            return [],[],None
+        for j,(_,st,_,_) in enumerate(indexed):
+            if st==want:
+                start_pos=j+1  # first bar AFTER the forecast bar
+                break
+        if start_pos is None:
+            # Fallback: first bar strictly after the forecast minute.
+            for j,(_,st,_,_) in enumerate(indexed):
+                if st>want:
+                    start_pos=j
+                    break
+    if start_pos is None:
+        return [],[],None
+    window=indexed[start_pos:start_pos+int(max_h)]
+    mids=[m for _,_,m,_ in window]
+    spreads=[s for _,_,_,s in window]
+    match_idx=indexed[start_pos-1][0] if start_pos>0 else None
+    return mids,spreads,match_idx

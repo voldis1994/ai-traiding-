@@ -1,7 +1,8 @@
 """Chronological holdout: existing neural softmax vs multi-horizon forecast head.
 
 Compares forecasting quality only — no new indicators, trade limits, or
-execution rules. Same rows, time-ordered split.
+execution rules. Same rows, time-ordered split with horizon embargo so
+train labels cannot leak into the validation window.
 """
 from __future__ import annotations
 
@@ -11,21 +12,39 @@ import numpy as np
 
 from .forecast_calibration import expected_calibration_error, summarize_calibration
 from .forecast_model import MultiHorizonForecast
-from .forecast_targets import HORIZONS, LABEL_BUY, LABEL_HOLD, LABEL_SELL
+from .forecast_targets import HORIZONS, LABEL_BUY, LABEL_HOLD, LABEL_SELL, bar_stamp
 
 ACTIONS = ('BUY','SELL','HOLD')
 LABEL_TO_ACTION = {LABEL_BUY:'BUY',LABEL_SELL:'SELL',LABEL_HOLD:'HOLD'}
 
 
-def _chrono_split(rows, *, train_frac=0.7):
-    rows=list(rows or [])
+def chrono_split(rows, *, train_frac=0.7, embargo=None, horizons=HORIZONS):
+    """Time-ordered train/val with embargo ≥ max forecast horizon.
+
+    Without embargo, a train row at t uses y_{t+15} that overlaps features of
+    early validation rows — classic leakage. Embargo drops the gap bars.
+    """
+    rows=sorted(
+        list(rows or []),
+        key=lambda r:(str(bar_stamp(r.get('time')) or ''),int(r.get('id') or 0)))
     if len(rows)<12:
-        return [],[]
+        return [],[],{'embargo':0,'cut':0}
+    max_h=max(int(h) for h in (horizons or HORIZONS))
+    gap=int(embargo) if embargo is not None else max_h
+    gap=max(gap,max_h)
     cut=max(1,int(len(rows)*float(train_frac)))
-    # Leave a tiny embargo when enough data (avoid leakage at the cut).
-    embargo=1 if len(rows)>=20 else 0
+    # Ensure val still has room after embargo.
+    if cut+gap>=len(rows):
+        cut=max(1,len(rows)-gap-4)
     train=rows[:cut]
-    val=rows[cut+embargo:]
+    val=rows[cut+gap:]
+    return train,val,{'embargo':gap,'cut':cut,'max_horizon':max_h}
+
+
+# Back-compat alias
+def _chrono_split(rows, *, train_frac=0.7, embargo=None, horizons=HORIZONS):
+    train,val,_meta=chrono_split(
+        rows,train_frac=train_frac,embargo=embargo,horizons=horizons)
     return train,val
 
 
@@ -66,22 +85,31 @@ def _mae(preds, actuals):
     return float(np.mean([abs(p-a) for p,a in xs])),len(xs)
 
 
-def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0):
+def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
+                  embargo=None, epic=None):
     """Fit MultiHorizonForecast on train; score vs neural argmax on validation."""
-    train,val=_chrono_split(rows,train_frac=train_frac)
+    if epic:
+        rows=[r for r in (rows or []) if str(r.get('epic') or '').upper()==str(epic).upper()]
+    train,val,split_meta=chrono_split(
+        rows,train_frac=train_frac,embargo=embargo,horizons=horizons)
     if len(train)<8 or len(val)<4:
         return {
             'ok':False,
-            'reason':f'need more resolved rows (train={len(train)}, val={len(val)})',
+            'reason':f'need more resolved rows (train={len(train)}, val={len(val)}, '
+                     f'embargo={split_meta.get("embargo")})',
             'train_n':len(train),'val_n':len(val),
+            'split':split_meta,
+            'epic':epic,
         }
     dim=len(train[0].get('features') or [])
     if dim<1:
-        return {'ok':False,'reason':'empty features','train_n':len(train),'val_n':len(val)}
+        return {'ok':False,'reason':'empty features','train_n':len(train),
+                'val_n':len(val),'split':split_meta,'epic':epic}
     model=MultiHorizonForecast(dim=dim,horizons=tuple(horizons),seed=seed)
     fit_info=model.fit(train,horizons=horizons)
     if not fit_info.get('fitted'):
-        return {'ok':False,'reason':fit_info.get('reason'),**fit_info}
+        return {'ok':False,'reason':fit_info.get('reason'),**fit_info,
+                'split':split_meta,'epic':epic}
 
     per_h={}
     for h in horizons:
@@ -118,7 +146,6 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0):
             'delta_acc':(None if base_acc is None or new_acc is None
                          else new_acc-base_acc),
         }
-    # Primary report horizon = 1 (matches LIVE minute teacher).
     cal=summarize_calibration(
         [r.get('scores') for r in val],
         [_label_action(r.get('outcomes'),1) for r in val])
@@ -127,10 +154,26 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0):
         'train_n':len(train),
         'val_n':len(val),
         'dim':dim,
+        'epic':epic,
         'horizons':list(horizons),
+        'split':split_meta,
         'fit':fit_info,
         'by_horizon':per_h,
         'baseline_calibration_h1':cal,
         'note':('Forecast quality only — LIVE entry still NeuralCore + policy gate; '
-                'no new execution rules.'),
+                'embargo ≥ max horizon so val never trains on overlapping labels.'),
     }
+
+
+def run_gold_benchmark(store_or_rows, *, train_frac=0.7, seed=0, limit=5000):
+    """Train + compare on the same GOLD forecast_memory rows (or an explicit list)."""
+    if isinstance(store_or_rows,list):
+        rows=[r for r in store_or_rows
+              if str(r.get('epic') or 'GOLD').upper()=='GOLD']
+    else:
+        from .forecast_memory import ForecastMemory
+        rows=ForecastMemory(store_or_rows).rows(
+            epic='GOLD',resolved_only=True,limit=limit)
+    return run_benchmark(
+        rows,horizons=HORIZONS,train_frac=train_frac,seed=seed,
+        embargo=max(HORIZONS),epic='GOLD')

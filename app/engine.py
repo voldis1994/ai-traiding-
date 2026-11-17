@@ -2191,9 +2191,13 @@ class SingleTradeEngine:
                             # Resolve forecast outcomes while in trade (ledger only).
                             try:
                                 from .forecast_memory import maybe_resolve
-                                maybe_resolve(
-                                    self.store,candles,
-                                    epic=self.mandate.get('epic') if self.mandate else None)
+                                from . import forecast_bridge
+                                epic=self.mandate.get('epic') if self.mandate else None
+                                maybe_resolve(self.store,candles,epic=epic)
+                                feats=(self.market_context or {}).get('features')
+                                forecast_bridge.maybe_refit_and_advise(
+                                    self.store,epic=epic,features=feats,
+                                    neural_scores=(self.last_signal or {}).get('scores_raw'))
                             except Exception:
                                 pass
                     next_signal=None
@@ -2223,8 +2227,13 @@ class SingleTradeEngine:
                     # Resolve multi-horizon forecast outcomes (quality ledger only).
                     try:
                         from .forecast_memory import maybe_resolve
-                        maybe_resolve(self.store,candles,
-                                      epic=self.mandate.get('epic') if self.mandate else None)
+                        from . import forecast_bridge
+                        epic=self.mandate.get('epic') if self.mandate else None
+                        maybe_resolve(self.store,candles,epic=epic)
+                        feats=(self.market_context or {}).get('features')
+                        forecast_bridge.maybe_refit_and_advise(
+                            self.store,epic=epic,features=feats,
+                            neural_scores=(next_signal or {}).get('scores'))
                     except Exception:
                         pass
                     # Audit #32: never run neural growth / feature search before
@@ -2486,9 +2495,23 @@ class SingleTradeEngine:
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
             base_scores,edge_advice,store=self.store,
             live_trend=ctx.get('trend'))
+        # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
+        forecast_meta={'nudged':False}
+        try:
+            from . import forecast_bridge
+            feats=(ctx.get('features') if isinstance(ctx.get('features'),(list,tuple))
+                   else None)
+            f_advice=forecast_bridge.shadow_advice(
+                self.store,feats,neural_scores=base_scores) if feats else {'advice':None}
+            nudged_scores,forecast_meta=forecast_bridge.soft_nudge_scores(
+                nudged_scores,f_advice,store=self.store)
+        except Exception as exc:
+            forecast_meta={'nudged':False,'reason':type(exc).__name__}
+            f_advice={'advice':None}
         self.last_signal=dict(
             self.last_signal,scores=dict(nudged_scores),
-            structure_edge=edge_advice,structure_nudge=nudge_meta)
+            structure_edge=edge_advice,structure_nudge=nudge_meta,
+            forecast_advice=f_advice,forecast_nudge=forecast_meta)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -2498,6 +2521,7 @@ class SingleTradeEngine:
             readiness=readiness,
             spread_bps=self._spread_bps())
         result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
+                    forecast_advice=f_advice,forecast_nudge=forecast_meta,
                     scores=nudged_scores)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])

@@ -113,6 +113,11 @@ DEFAULTS = {
     # Record full feature vectors + scores for multi-horizon forecast quality
     # (does NOT change OPEN/CLOSE rules).
     'forecast_memory_enabled': 1,
+    # Soft LIVE nudge from fitted multi-horizon head (NeuralCore still proposes).
+    'forecast_bridge_enabled': 1,
+    'forecast_bridge_nudge': 0.06,
+    'forecast_bridge_min_resolved': 24,
+    'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -181,6 +186,10 @@ BOUNDS = {
     'policy_evolve_enabled': (0, 1),
     'policy_live_execute': (0, 1),
     'forecast_memory_enabled': (0, 1),
+    'forecast_bridge_enabled': (0, 1),
+    'forecast_bridge_nudge': (0.0, 0.15),
+    'forecast_bridge_min_resolved': (12, 80),
+    'forecast_bridge_refit_every': (4, 40),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -239,7 +248,9 @@ def _clip(key, value):
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
-               'forecast_memory_enabled','structure_edge_min_samples'):
+               'forecast_memory_enabled','forecast_bridge_enabled',
+               'forecast_bridge_min_resolved','forecast_bridge_refit_every',
+               'structure_edge_min_samples'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

@@ -268,18 +268,26 @@ def maybe_record(store, **kwargs):
 
 
 def maybe_resolve(store, candles, *, epic=None, now_utc=None):
-    """Resolve from completed candles; prefer Store HISTORICAL when dense enough."""
+    """Resolve from completed candles — merge HISTORICAL + QUOTE by minute.
+
+    Never prefer HISTORICAL-only when recent completed minutes exist only as
+    QUOTE (Capital PK hole); inference and resolve must see the same minutes.
+    """
     try:
+        from .forecast_bridge import merge_candle_lists
         mem=ForecastMemory(store)
-        use=list(candles or [])
+        hist=[];live=list(candles or [])
         if epic and hasattr(store,'candles'):
             try:
                 hist=store.candles(str(epic),n=500,historical_only=True) or []
-                # Prefer HISTORICAL if it covers the contiguous horizon window.
-                if len(hist)>=max(HORIZONS)+2:
-                    use=hist
+            except Exception:
+                hist=[]
+            try:
+                # Full book (QUOTE+HISTORICAL) so recent closed minutes are not dropped.
+                live=store.candles(str(epic),n=500,historical_only=False) or live
             except Exception:
                 pass
+        use=merge_candle_lists(hist,live,candles,now_utc=now_utc)
         out=mem.resolve_with_candles(use,epic=epic,now_utc=now_utc)
         return int(out.get('resolved') or 0) if isinstance(out,dict) else int(out or 0)
     except Exception:

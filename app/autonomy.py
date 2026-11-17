@@ -769,6 +769,7 @@ class AutoEvolution:
         Each observed class contributes equally, so an always-HOLD strategy
         cannot win merely because the dataset contains many HOLD labels.
         This is a classification proxy, not a claim of trading profitability.
+        Prefer ``_replay_trade_cash`` when enough closed-trade £ rows exist.
         """
         groups={0:[],1:[],2:[]}
         for item in history:
@@ -794,6 +795,42 @@ class AutoEvolution:
         # Require BUY and SELL evidence before a strategy can be promoted.
         if not groups[0] or not groups[1]:return -1.0,0
         return sum(present)/len(present),n
+
+    @staticmethod
+    def _replay_trade_cash(f,trades,margin_override=None,*,min_trades=6):
+        """Score a policy on independent closed-trade £ (after costs), not M1 labels.
+
+        ``trades`` rows need ``scores`` + ``actual_pnl`` (account currency).
+        Returns (mean_£_when_acted, n) or (−inf, 0) when under-powered.
+        HOLD abstentions contribute 0 £ (no trade) and still count toward n.
+        """
+        rows=[]
+        for item in trades or []:
+            if not isinstance(item,dict):continue
+            scores=item.get('scores')
+            if not isinstance(scores,dict):continue
+            try:
+                pnl=float(item.get('actual_pnl'))
+            except (TypeError,ValueError):
+                continue
+            if not math.isfinite(pnl):continue
+            rows.append((scores,pnl))
+        if len(rows)<int(min_trades):
+            return float('-inf'),0
+        total=0.0;n=0
+        for scores,pnl in rows:
+            try:
+                if margin_override is None:signal=f(scores)
+                else:signal=AutoEvolution._call_policy(f,scores,threshold=margin_override)
+            except Exception:
+                continue
+            n+=1
+            if signal in ('BUY','SELL'):
+                total+=float(pnl)
+            # HOLD → 0 £ for that opportunity
+        if n<int(min_trades):
+            return float('-inf'),0
+        return total/n,n
     def _params(self):
         src=self.path.read_text(encoding='utf8')
         tree=self._validate(src)
@@ -868,12 +905,25 @@ class AutoEvolution:
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
         old_train,_=self._replay(incumbent,train,
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
-        winner=None;best=baseline
+        winner=None;best=baseline;best_cash=None
         # Promote on a trade/learning tempo. Generation gates EXIT policy code;
         # LIVE entry is neural vote (lot+market = risk frame).
         need_n=12 if force else 18
         need_val=4 if force else 6
         lift=.001 if (force and loss_trade) else .002
+        # Closed-trade £ after costs (independent of M1 direction labels).
+        cash_rows=[r for r in history if isinstance(r,dict)
+                   and isinstance(r.get('scores'),dict)
+                   and r.get('actual_pnl') is not None]
+        cash_cut=int(len(cash_rows)*.7)
+        cash_train=cash_rows[:cash_cut]
+        cash_val=cash_rows[cash_cut:]
+        use_cash=len(cash_val)>=6 and len(cash_train)>=6
+        old_cash_val,_=self._replay_trade_cash(
+            incumbent,cash_val,
+            margin_override=self.adaptive_threshold(
+                accuracy,sample_count,mean_spread,base=edge),
+            min_trades=6) if use_cash else (None,0)
         for kind,val,source in variants:
             try:
                 fn=self._compile(source)
@@ -881,15 +931,28 @@ class AutoEvolution:
                 new_margin=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=val)
                 train_score,_=self._replay(fn,train,margin_override=new_margin)
                 validation_score,validation_n=self._replay(fn,validation,margin_override=new_margin)
-                if (n>=need_n and validation_n>=need_val and train_score>=old_train and
-                    validation_score>old_validation+lift and reward>best+lift):
-                    best=reward;winner=(kind,val,source)
+                label_ok=(n>=need_n and validation_n>=need_val and train_score>=old_train and
+                          validation_score>old_validation+lift and reward>best+lift)
+                if not label_ok:
+                    continue
+                if use_cash:
+                    cash_score,cash_n=self._replay_trade_cash(
+                        fn,cash_val,margin_override=new_margin,min_trades=6)
+                    if cash_n<6 or cash_score<=(old_cash_val if old_cash_val is not None else 0)+1e-9:
+                        continue
+                    if best_cash is not None and cash_score<=best_cash+1e-9:
+                        continue
+                    best_cash=cash_score
+                best=reward;winner=(kind,val,source)
             except Exception:continue
         if not winner:
             self.last_reason=(f'Waiting for BUY/SELL replay (minimum {need_n} labels)' if n<need_n
-                              else 'No relative-edge candidate passed training and forward holdout replay')
+                              else ('No candidate beat holdout labels + closed-trade £'
+                                    if use_cash else
+                                    'No relative-edge candidate passed training and forward holdout replay'))
             self.store.set('evolution_last_reason',self.last_reason)
-            self.store.event('code','Evolution candidate not promoted',{'reason':self.last_reason,'samples':n})
+            self.store.event('code','Evolution candidate not promoted',{'reason':self.last_reason,'samples':n,
+                             'cash_gate':bool(use_cash)})
             return None
         kind,val,source=winner
         if not self._test_candidate(source):
@@ -905,14 +968,16 @@ class AutoEvolution:
         except Exception:
             os.replace(previous,self.path);raise
         self.generation+=1;self.kind=kind
-        self.last_reason='Candidate promoted after isolated tests'
+        self.last_reason=('Candidate promoted after labels + closed-trade £'
+                          if use_cash else 'Candidate promoted after isolated tests')
         self.store.set('evolution_last_reason',self.last_reason)
         self.store.set('code_generation',self.generation);self.store.set('policy_kind',kind)
         # Do NOT bump learning_generation — policy file ≠ LIVE neural progress.
         digest=hashlib.sha256(source.encode()).hexdigest()
         self.store.event('code','Python policy automatically generated, tested and activated',
             {'generation':self.generation,'type':kind,'required_edge':val,'hash':digest,
-             'replay_score_old':baseline,'replay_score_new':best,'samples':n})
+             'replay_score_old':baseline,'replay_score_new':best,'samples':n,
+             'cash_gate':bool(use_cash),'cash_val_mean':best_cash})
         return val
     def info(self):
         source=self.path.read_text(encoding='utf8')

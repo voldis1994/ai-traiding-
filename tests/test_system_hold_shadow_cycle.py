@@ -70,7 +70,7 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         brain._activate('SIM')
         # Force a known transition for learn_from_trade.
         brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
-        brain.core.step(brain.core.last_z, dt=60.)
+        brain.core.step(brain.core.last_z, dt=1.0)
         assert brain.core.last_transition is not None
 
         e = SingleTradeEngine(store, brain)

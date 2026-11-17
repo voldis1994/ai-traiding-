@@ -100,7 +100,7 @@ def _engine(directory):
     brain = AdaptiveBrain(store, data_dir=directory, seed=7)
     brain._activate(EPIC)
     brain.core.last_z = np.linspace(-0.25, 0.25, brain.core.d)
-    brain.core.step(brain.core.last_z, dt=60.)
+    brain.core.step(brain.core.last_z, dt=1.0)
     e = SingleTradeEngine(store, brain)
     e.mandate = {'epic': EPIC, 'size': 0.1, 'currency': 'GBP'}
     e.market = {

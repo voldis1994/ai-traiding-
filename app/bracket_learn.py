@@ -688,7 +688,7 @@ FIXED_TP_SL_RATIO = 2.0
 
 
 def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
-                              tighten=1.0) -> dict:
+                              tighten=1.0, store=None) -> dict:
     """System decides SL from OHLC; TP is always 2×SL (SL half of TP).
 
     Decision:
@@ -722,7 +722,12 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     t = _finite(tighten)
     if t is None or t <= 0:
         t = 1.0
-    t = max(0.7, min(1.0, float(t)))
+    try:
+        from .self_params import get as sp_get
+        t_floor = float(sp_get(store, 'bracket_tighten_floor', 0.70))
+    except Exception:
+        t_floor = 0.70
+    t = max(t_floor, min(1.0, float(t)))
     ohlc_sl = _finite(z.get('range_distance'))
     if ohlc_sl is None or ohlc_sl <= 0:
         ohlc_sl = _finite(z.get('noise_distance'))
@@ -827,7 +832,8 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
     if max_tp is not None:
         zone=dict(zone);zone['max_tp']=max_tp
     decided=decide_brackets_from_ohlc(
-        zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten)
+        zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten,
+        store=store)
     save_params(store,decided['kappa'],1.0,
                 reason=(f"ohlc_zone κ={decided.get('ohlc_kappa')} "
                         f"sl={decided.get('ohlc_sl')} tp={decided.get('ohlc_tp')}"))

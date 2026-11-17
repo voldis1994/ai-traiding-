@@ -11,11 +11,12 @@ only when broker £ earned *during the trial* beats the equal pre-trial
 window — never from profit earned while the draft was still idle, and never
 for a param set that kept changing mid-trial.
 
-Honest immutable (NOT in this bag — physics / API / layout):
+Honest immutable (NOT in this bag — physics / API / layout / operator RR):
   - Capital has no volume/DOM (public liquidity is EXTERNAL fusion only)
   - Feature vector layout [BASE|DYNAMIC|EXTERNAL]
   - BUY/SELL/HOLD three-class head
   - Broker tick / min-stop / margin rules
+  - LIVE RR lock TP=2×SL (operator rule — robot never loosens this)
 """
 from __future__ import annotations
 
@@ -132,6 +133,38 @@ DEFAULTS = {
     'policy_evolve_enabled': 1,
     # When 1, evaluate_neural_entry consults active_policy.py before OPEN.
     'policy_live_execute': 1,
+    # —— Former hardcodes the robot now owns (safe rails) ——
+    # Anti-HOLD: when abstention is necessary vs when a lean must trade.
+    'hold_lean_gap': 0.04,
+    'hold_side_gap_tie': 0.05,
+    'hold_dominate_extra': 0.12,
+    'hold_dominate_side_gap': 0.06,
+    # Day-book ADD / phase / conviction magnitudes.
+    'day_add_trend_floor': 0.02,
+    'day_phase_protect_tilt': 0.10,
+    'day_phase_defend_tilt': 0.16,
+    'conviction_min_best': 0.28,
+    'conviction_min_best_clear': 0.24,
+    'conviction_min_vs_hold': 0.04,
+    'conviction_min_vs_hold_clear': 0.02,
+    # Unified-cycle aggression settle steps + rails (exits tighten/ease from £).
+    'aggression_min': 0.70,
+    'aggression_max': 1.15,
+    'aggression_loss_step': 0.98,
+    'aggression_loss_step_streak': 0.96,
+    'aggression_win_step': 1.01,
+    'aggression_win_step_streak': 1.02,
+    'aggression_scratch_step': 0.998,
+    'aggression_flat_step': 0.995,
+    # LIVE entry edge floor — robot may ease/tighten inside rails for +£.
+    'entry_edge_floor': 0.06,
+    'entry_edge_min': 0.03,
+    'entry_edge_max': 0.12,
+    # compose_open weak-edge tighten of the *same* OHLC SL plan.
+    'open_edge_scale_base': 0.85,
+    'open_edge_scale_slope': 2.0,
+    # Bracket tighten floor after losses (fraction of OHLC SL).
+    'bracket_tighten_floor': 0.70,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
 }
@@ -215,13 +248,39 @@ BOUNDS = {
     'min_holdout_minute_acc': (0.30, 0.50),
     'policy_evolve_enabled': (0, 1),
     'policy_live_execute': (0, 1),
+    'hold_lean_gap': (0.02, 0.10),
+    'hold_side_gap_tie': (0.02, 0.12),
+    'hold_dominate_extra': (0.06, 0.25),
+    'hold_dominate_side_gap': (0.03, 0.12),
+    'day_add_trend_floor': (0.01, 0.08),
+    'day_phase_protect_tilt': (0.04, 0.25),
+    'day_phase_defend_tilt': (0.06, 0.30),
+    'conviction_min_best': (0.18, 0.40),
+    'conviction_min_best_clear': (0.15, 0.35),
+    'conviction_min_vs_hold': (0.01, 0.10),
+    'conviction_min_vs_hold_clear': (0.005, 0.08),
+    'aggression_min': (0.55, 0.85),
+    'aggression_max': (1.05, 1.30),
+    'aggression_loss_step': (0.90, 0.995),
+    'aggression_loss_step_streak': (0.88, 0.99),
+    'aggression_win_step': (1.005, 1.05),
+    'aggression_win_step_streak': (1.01, 1.08),
+    'aggression_scratch_step': (0.990, 0.9995),
+    'aggression_flat_step': (0.985, 0.999),
+    'entry_edge_floor': (0.03, 0.12),
+    'entry_edge_min': (0.02, 0.08),
+    'entry_edge_max': (0.08, 0.20),
+    'open_edge_scale_base': (0.75, 0.95),
+    'open_edge_scale_slope': (0.5, 4.0),
+    'bracket_tighten_floor': (0.55, 0.90),
     'self_params_horizon_trades': (8, 80),
 }
 
 IMMUTABLE_NOTE = (
     'Capital: no volume/DOM (per-instrument Yahoo/Coinbase/OKX liquidity is EXTERNAL). '
     'Layout: BASE|DYNAMIC|EXTERNAL. Actions: BUY/SELL/HOLD. '
-    'Broker tick/min-stop/margin are exchange rules.'
+    'Broker tick/min-stop/margin are exchange rules. '
+    'LIVE RR locked at TP=2×SL (operator) — robot evolves everything else.'
 )
 
 # learn_lr moves only in whole hundredths — same discipline as entry_edge.
@@ -261,6 +320,14 @@ def _clip(key, value):
         return sorted(out) or list(DEFAULTS['gen_horizons'])
     if key=='learn_lr':
         return quantize_learn_lr(value)
+    if key in ('entry_edge_floor','entry_edge_min','entry_edge_max'):
+        # Same 0.01 discipline as unified_cycle entry edge.
+        n=_finite(value)
+        if n is None:
+            n=float(DEFAULTS[key])
+        snapped=round(round(n/0.01)*0.01,2)
+        lo,hi=BOUNDS[key]
+        return max(float(lo),min(float(hi),snapped))
     bounds=BOUNDS.get(key)
     n=_finite(value)
     if n is None:return DEFAULTS[key]
@@ -314,6 +381,14 @@ def save(store, params: dict, *, reason=''):
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)
+    # Keep unified_cycle entry_edge_floor in sync so Admin/gates see robot knobs.
+    try:
+        from . import unified_cycle as _uc
+        st=_uc.load_state(store)
+        st['entry_edge_floor']=_uc.quantize_entry_edge(clean.get('entry_edge_floor'))
+        _uc.save_state(store,st)
+    except Exception:
+        pass
 
 
 def get(store, key, default=None):
@@ -517,12 +592,49 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['scratch_pnl_abs'])*0.99)
                 p['trail_open_gap_frac']=max(BOUNDS['trail_open_gap_frac'][0],
                     float(p['trail_open_gap_frac'])*0.99)
-                notes.append('win → calm LR; slight ease of friction/scratch/trail')
+                # Positive result → slightly easier entry / earlier BE arm / more slices.
+                p['entry_edge_floor']=max(BOUNDS['entry_edge_floor'][0],
+                    float(p['entry_edge_floor'])-0.01)
+                p['hold_lean_gap']=max(BOUNDS['hold_lean_gap'][0],
+                    float(p['hold_lean_gap'])*0.97)
+                p['trail_arm_mfe_frac']=max(BOUNDS['trail_arm_mfe_frac'][0],
+                    float(p['trail_arm_mfe_frac'])*0.98)
+                p['day_open_slices']=min(BOUNDS['day_open_slices'][1],
+                    int(p['day_open_slices'])+0)  # keep; raise only on strong wins below
+                p['day_slice_min_edge']=max(BOUNDS['day_slice_min_edge'][0],
+                    float(p['day_slice_min_edge'])*0.98)
+                p['day_add_min_edge']=max(BOUNDS['day_add_min_edge'][0],
+                    float(p['day_add_min_edge'])*0.98)
+                p['day_add_trend_floor']=max(BOUNDS['day_add_trend_floor'][0],
+                    float(p['day_add_trend_floor'])*0.97)
+                notes.append('win → ease entry/HOLD lean/BE arm/ADD edges toward +£')
+                if pnl >= float(p.get('scratch_pnl_abs') or 0.05) * 8:
+                    p['day_open_slices']=min(BOUNDS['day_open_slices'][1],
+                        int(p['day_open_slices'])+1)
+                    notes.append('strong win → allow one more open slice')
+            # Meaningful loss extras (trail arm later, scarcer ADD, tighter edge).
+            if pnl is not None and pnl < -float(p.get('scratch_pnl_abs') or 0.05):
+                p['trail_arm_mfe_frac']=min(BOUNDS['trail_arm_mfe_frac'][1],
+                    float(p['trail_arm_mfe_frac'])*1.03)
+                p['entry_edge_floor']=min(BOUNDS['entry_edge_floor'][1],
+                    float(p['entry_edge_floor'])+0.01)
+                p['hold_lean_gap']=min(BOUNDS['hold_lean_gap'][1],
+                    float(p['hold_lean_gap'])*1.03)
+                p['day_add_min_edge']=min(BOUNDS['day_add_min_edge'][1],
+                    float(p['day_add_min_edge'])*1.03)
+                p['day_slice_min_edge']=min(BOUNDS['day_slice_min_edge'][1],
+                    float(p['day_slice_min_edge'])*1.03)
+                p['day_open_slices']=max(BOUNDS['day_open_slices'][0],
+                    int(p['day_open_slices'])-1)
+                p['day_conviction_nudge']=min(BOUNDS['day_conviction_nudge'][1],
+                    float(p['day_conviction_nudge'])*1.02)
+                notes.append('loss → scarcer OPEN/ADD; later BE; raise edge floor')
     return notes
 
 
 def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
                          shadow_promote=None, broker_pnl=None, bracket_reason=None,
+                         day_book_event=None, hold_shadow_taught=None,
                          reason='', commit=True):
     """Nudge knobs from outcomes.
 
@@ -546,6 +658,33 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
     notes=_apply_nudge(p,feature_approved=feature_approved,feature_rejected=feature_rejected,
                        shadow_promote=shadow_promote,broker_pnl=broker_pnl,
                        bracket_reason=bracket_reason)
+    # Day-book close path (was direct save — now trial-safe).
+    dbe=str(day_book_event or '')
+    if dbe=='day_target_hit':
+        p['day_profit_target_frac']=min(BOUNDS['day_profit_target_frac'][1],
+            float(p['day_profit_target_frac'])*1.01)
+        notes.append('day target hit → raise profit_target_frac')
+    elif dbe=='day_loss':
+        p['day_risk_per_trade_frac']=max(BOUNDS['day_risk_per_trade_frac'][0],
+            float(p['day_risk_per_trade_frac'])*0.98)
+        notes.append('day loss → trim risk_per_trade_frac')
+    elif dbe=='day_budget_hit':
+        p['day_loss_budget_frac']=max(BOUNDS['day_loss_budget_frac'][0],
+            float(p['day_loss_budget_frac'])*0.97)
+        p['day_max_positions']=max(BOUNDS['day_max_positions'][0],
+            int(p['day_max_positions'])-1)
+        notes.append('day loss budget hit → tighten budget + max positions')
+    # HOLD-shadow taught opposite TP → ease anti-HOLD so robot does not freeze.
+    if hold_shadow_taught:
+        p['hold_lean_gap']=max(BOUNDS['hold_lean_gap'][0],
+            float(p['hold_lean_gap'])*0.95)
+        p['hold_dominate_extra']=max(BOUNDS['hold_dominate_extra'][0],
+            float(p['hold_dominate_extra'])*0.97)
+        p['entry_edge_floor']=max(BOUNDS['entry_edge_floor'][0],
+            float(p['entry_edge_floor'])-0.01)
+        p['day_conviction_nudge']=min(BOUNDS['day_conviction_nudge'][1],
+            float(p['day_conviction_nudge'])*1.04)
+        notes.append('hold_shadow opposite TP → ease HOLD lean + edge; raise conviction')
     msg=reason or ('; '.join(notes) if notes else 'no change')
     clean={k:_clip(k,p[k]) for k in DEFAULTS}
     if not commit:

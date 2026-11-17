@@ -5340,10 +5340,15 @@ class SingleTradeEngine:
                 self._lock_entry_signal_for_open()
             pending_brain=self._pending_entry_brain
             opened_slices=0
+            # Flat AI OPEN → fire the *whole* planned multi-lot pack in this
+            # submit (all lot sizes now). Do not abort after slice 0 because a
+            # sibling OPEN confirm is still settling / unresolved.
+            flat_burst=len(before_ids)==0 and len(slice_sizes)>1
+            burst_oids=set()
             try:
                 for slice_i,size in enumerate(slice_sizes):
-                    if slice_i>0:
-                        # Refresh book between slices; stop if capacity/unresolved.
+                    if slice_i>0 and not flat_burst:
+                        # Later ADD path: one slice per call — capacity checks apply.
                         await self.sync()
                         if self.store.unresolved():
                             self.store.event('entry',
@@ -5364,6 +5369,27 @@ class SingleTradeEngine:
                                 {'reason':room.get('reason'),
                                  'opened_slices':opened_slices})
                             break
+                    elif slice_i>0 and flat_burst:
+                        # Keep book fresh for dealId binding; never stop the pack
+                        # on our own in-flight OPEN rows from earlier slices.
+                        await self.sync()
+                        foreign=[u for u in (self.store.unresolved() or [])
+                                 if u.get('id') not in burst_oids
+                                 and str(u.get('deal_id') or '') not in before_ids]
+                        if foreign:
+                            self.store.event('entry',
+                                'Multi-lot OPEN pack continues despite foreign unresolved',
+                                {'foreign':len(foreign),'opened_slices':opened_slices})
+                        try:
+                            max_pos=int(day_book.load_params(self.store).get(
+                                'max_positions') or 5)
+                        except Exception:
+                            max_pos=5
+                        if len(self.positions or [])>=max_pos:
+                            self.store.event('entry',
+                                'Multi-lot OPEN pack hit max_positions',
+                                {'opened_slices':opened_slices,'max_positions':max_pos})
+                            break
                     slice_before={str(p['dealId']) for p in (self.positions or [])
                                   if p.get('dealId')}
                     # Durable order record BEFORE a real order is sent.
@@ -5376,7 +5402,10 @@ class SingleTradeEngine:
                             'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                             'day_phase':plan.get('phase'),
                             'slice_index':slice_i,
-                            'slice_count':len(slice_sizes)})
+                            'slice_count':len(slice_sizes),
+                            'flat_burst':bool(flat_burst)})
+                    if oid is not None:
+                        burst_oids.add(oid)
                     receipt=await self.broker.open_position(
                         self.mandate['epic'],action,size,
                         stop_distance=brackets['stop_distance'],
@@ -5430,7 +5459,9 @@ class SingleTradeEngine:
                     self.store.event('entry','Multi-lot OPEN burst',{
                         'direction':action,'opened_slices':opened_slices,
                         'planned_slices':len(slice_sizes),
-                        'sizes':[str(s) for s in slice_sizes[:opened_slices]]})
+                        'sizes':[str(s) for s in slice_sizes[:opened_slices]],
+                        'flat_burst':bool(flat_burst),
+                        'full_pack':opened_slices==len(slice_sizes)})
                 self._pending_entry_brain=None
             except Exception as exc:
                 # Keep UNCERTAIN so a second OPEN cannot fire; operator Resume clears.

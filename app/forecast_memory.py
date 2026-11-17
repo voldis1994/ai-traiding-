@@ -2,7 +2,7 @@
 
 The live ``signals`` table stores scores but not the 32-D feature vector.
 This ledger is the external accumulation path for forecast quality work —
-recording only; it never gates OPEN/CLOSE.
+recording only; it never gates OPEN/CLOSE or updates LIVE weights.
 """
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import json
 import math
 from datetime import datetime, timezone
 
-from .forecast_targets import HORIZONS, path_from_candles, targets_at_horizons
+from .forecast_targets import (
+    HORIZONS, bar_stamp, path_from_candles, targets_at_horizons,
+)
 
 STORE_FLAG = 'forecast_memory_enabled'
 TABLE = 'forecast_memory'
@@ -49,9 +51,15 @@ class ForecastMemory:
             mid REAL,
             spread REAL,
             tick_size REAL,
+            in_position INTEGER DEFAULT 0,
             resolved INTEGER DEFAULT 0,
             outcomes TEXT
         )''')
+        # Migrate older DBs that predate in_position.
+        cols={r[1] for r in self.store.db.execute(f'PRAGMA table_info({TABLE})')}
+        if 'in_position' not in cols:
+            self.store.db.execute(
+                f'ALTER TABLE {TABLE} ADD COLUMN in_position INTEGER DEFAULT 0')
         self.store.db.execute(
             f'CREATE INDEX IF NOT EXISTS idx_{TABLE}_epic_time ON {TABLE}(epic,time)')
         self.store.db.execute(
@@ -66,8 +74,8 @@ class ForecastMemory:
             return True
 
     def record(self, *, epic, features, scores, mid, spread=0., tick_size=0.01,
-               bar_time=None, signal_id=None):
-        """Insert one unresolved forecast row. No-op when disabled or invalid."""
+               bar_time=None, signal_id=None, in_position=False):
+        """Insert one unresolved forecast row (flat or in-trade). No-op if disabled."""
         if not self.enabled():
             return None
         feats=_finite_list(features)
@@ -90,12 +98,22 @@ class ForecastMemory:
                 score_map[k]=v
         if len(score_map)<2:
             return None
+        stamp=bar_stamp(bar_time) if bar_time is not None else None
+        time_s=stamp.isoformat() if stamp is not None else (bar_time or _now())
+        # Dedup same epic+minute (flat and manage ticks can share a bar).
+        existing=self.store.db.execute(
+            f'SELECT id FROM {TABLE} WHERE epic=? AND time=? LIMIT 1',
+            (str(epic or ''),str(time_s))).fetchone()
+        if existing:
+            return int(existing[0])
         cur=self.store.db.execute(
             f'''INSERT INTO {TABLE}
-                (time,epic,signal_id,features,scores,mid,spread,tick_size,resolved,outcomes)
-                VALUES(?,?,?,?,?,?,?,?,0,NULL)''',
-            (bar_time or _now(),str(epic or ''),signal_id,
-             json.dumps(feats),json.dumps(score_map),mid_f,sp,tick))
+                (time,epic,signal_id,features,scores,mid,spread,tick_size,
+                 in_position,resolved,outcomes)
+                VALUES(?,?,?,?,?,?,?,?,?,0,NULL)''',
+            (str(time_s),str(epic or ''),signal_id,
+             json.dumps(feats),json.dumps(score_map),mid_f,sp,tick,
+             1 if in_position else 0))
         self.store.db.commit()
         return cur.lastrowid
 
@@ -109,22 +127,30 @@ class ForecastMemory:
         return [dict(zip(cols,r)) for r in self.store.db.execute(q,args)]
 
     def resolve_with_candles(self, candles, *, epic=None, horizons=HORIZONS):
-        """Fill outcomes for pending rows once enough future M1 bars exist."""
+        """Link each pending M1 forecast to actual 1/3/5/15-minute outcomes.
+
+        Uses normalized minute stamps so Store ``at`` matches forecast ``time``.
+        Only marks resolved when every requested horizon is present.
+        """
         if not candles:
             return 0
+        need=tuple(int(h) for h in horizons)
+        max_h=max(need) if need else 15
         n=0
         for row in self.unresolved(epic=epic,limit=2000):
-            mids,spreads=path_from_candles(
-                candles,after_time=row['time'],max_h=max(horizons))
-            if len(mids)<max(horizons):
+            mids,spreads,_match=path_from_candles(
+                candles,after_time=row['time'],max_h=max_h)
+            if len(mids)<max_h:
                 continue
             outcomes=targets_at_horizons(
                 row['mid'],mids,spread=row.get('spread') or 0.,
-                future_spreads=spreads,horizons=horizons)
-            if len(outcomes)<len(horizons):
+                future_spreads=spreads,horizons=need)
+            if any(h not in outcomes for h in need):
                 continue
-            # JSON keys as strings for portability
-            payload={str(h):outcomes[h] for h in outcomes}
+            # Sanity: h=1 exit must be the first future mid.
+            if abs(float(outcomes[need[0]]['exit_mid'])-float(mids[need[0]-1]))>1e-9:
+                continue
+            payload={str(h):outcomes[h] for h in need}
             self.store.db.execute(
                 f'UPDATE {TABLE} SET resolved=1, outcomes=? WHERE id=?',
                 (json.dumps(payload),row['id']))
@@ -136,7 +162,8 @@ class ForecastMemory:
     def rows(self, *, epic=None, currency=None, resolved_only=True, limit=5000):
         """currency unused — kept for API symmetry with cash rows; epic filters."""
         _=currency
-        q=f'SELECT id,time,epic,signal_id,features,scores,mid,spread,tick_size,resolved,outcomes FROM {TABLE}'
+        q=(f'SELECT id,time,epic,signal_id,features,scores,mid,spread,tick_size,'
+           f'in_position,resolved,outcomes FROM {TABLE}')
         clauses=[];args=[]
         if resolved_only:
             clauses.append('resolved=1')
@@ -144,10 +171,10 @@ class ForecastMemory:
             clauses.append('epic=?');args.append(str(epic))
         if clauses:
             q+=' WHERE '+' AND '.join(clauses)
-        q+=' ORDER BY id ASC LIMIT ?';args.append(int(limit))
+        q+=' ORDER BY time ASC, id ASC LIMIT ?';args.append(int(limit))
         out=[]
         for r in self.store.db.execute(q,args):
-            (rid,t,ep,sid,feat,sc,mid,sp,tick,res,outc)=r
+            (rid,t,ep,sid,feat,sc,mid,sp,tick,inp,res,outc)=r
             try:
                 features=json.loads(feat) if feat else None
                 scores=json.loads(sc) if sc else None
@@ -159,7 +186,9 @@ class ForecastMemory:
             out.append({
                 'id':rid,'time':t,'epic':ep,'signal_id':sid,
                 'features':features,'scores':scores,'mid':mid,
-                'spread':sp,'tick_size':tick,'resolved':bool(res),
+                'spread':sp,'tick_size':tick,
+                'in_position':bool(inp),
+                'resolved':bool(res),
                 'outcomes':outcomes,
             })
         return out
@@ -167,10 +196,12 @@ class ForecastMemory:
     def summary(self, *, epic=None):
         rows=self.rows(epic=epic,resolved_only=False,limit=100000)
         resolved=sum(1 for r in rows if r.get('resolved'))
+        in_pos=sum(1 for r in rows if r.get('in_position'))
         return {
             'total':len(rows),
             'resolved':resolved,
             'unresolved':len(rows)-resolved,
+            'in_position_rows':in_pos,
             'epic':epic,
             'horizons':list(HORIZONS),
         }

@@ -876,15 +876,16 @@ class AdaptiveBrain:
             'action':result['action'],'label':None,'time':bar_time if features is not None else now(),
             'spread_bps':10000*spread/mid,'in_position':bool(in_position)})
         # Forecast quality ledger — full feature vector + scores (not in signals).
-        # Recording only; never gates OPEN/CLOSE.
-        if features is not None and train_entry:
+        # Record flat AND in-position; never gates OPEN/CLOSE or updates weights.
+        if features is not None:
             try:
                 from .forecast_memory import maybe_record
                 maybe_record(self.store,epic=epic,features=list(features),
                              scores=result['scores'],mid=mid,spread=spread,
                              tick_size=tick_size,
                              bar_time=bar_time if features is not None else now(),
-                             signal_id=cur.lastrowid)
+                             signal_id=cur.lastrowid,
+                             in_position=bool(in_position))
             except Exception:
                 pass
         self.last_regime=('HIGH VOLATILITY' if abs(change)>10 else
@@ -2187,6 +2188,14 @@ class SingleTradeEngine:
                                 'entry_train':False,'in_position':True,
                                 'trend':self.market_context.get('trend'),
                                 'regime':self.market_context.get('regime')}
+                            # Resolve forecast outcomes while in trade (ledger only).
+                            try:
+                                from .forecast_memory import maybe_resolve
+                                maybe_resolve(
+                                    self.store,candles,
+                                    epic=self.mandate.get('epic') if self.mandate else None)
+                            except Exception:
+                                pass
                     next_signal=None
                 elif fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,

@@ -75,7 +75,10 @@ def test_vanish_queues_pending_when_history_empty():
             await e.sync()
             row=store.trades(1)[0]
             assert row.get('pnl_source')=='pending_broker_pnl' or row.get('pnl') is None
+            assert row.get('pnl') is None  # still no invented £
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
-            assert not e._trade_already_learned('gold1')
+            # Tick teach runs while cash is pending — once-only claim burns so late
+            # Capital £ only refines the journal.
+            assert e._trade_already_learned('gold1')
     asyncio.run(scenario())

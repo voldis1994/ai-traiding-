@@ -1584,6 +1584,9 @@ class SingleTradeEngine:
             # Audit #1: do not freeze last UPL as realized — mark pending and retry.
             self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
             self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+            # Don't leave the robot "stuck" with no teach: tick-path learn once
+            # while journal stays pending_broker_pnl until Capital £ arrives.
+            self._teach_pending_ticks(prev_id,exit_guess)
             self.store.event('trade','Deal closed; broker cash P&L pending re-request',
                              {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
         self.store.event('trade','Previous broker deal no longer open',
@@ -2750,6 +2753,7 @@ class SingleTradeEngine:
                 exit_lvl=_num(confirmation.get('level'))
                 self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
                 self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                self._teach_pending_ticks(deal_id,exit_lvl)
                 self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
                                  {'deal_id':deal_id,'reference':ref,'pnl_source':src})
             # Confirmed close must leave the robot armed for the next OPEN.
@@ -2984,7 +2988,11 @@ class SingleTradeEngine:
 
         queued_at is when WE noticed the vanish — often a second after Capital
         stamped the cash row. Using it as `from` can miss the close entirely.
+
+        Capital activity/transactions reject ranges > 1 day — clamp ``from`` to
+        now−23h and always send ``to``=now when using a date range.
         """
+        from .broker import capital_api_time
         opened=None
         try:
             opened=(self.store.db.execute(
@@ -2994,9 +3002,10 @@ class SingleTradeEngine:
             opened=None
         raw=opened or queued_at
         from_time=None
+        now_utc=datetime.now(timezone.utc)
+        to_time=capital_api_time(now_utc)
         if raw:
             try:
-                from .broker import capital_api_time
                 # If only queue time is known, back up 6h so close cash is inside window.
                 if not opened and queued_at:
                     try:
@@ -3010,15 +3019,41 @@ class SingleTradeEngine:
                     from_time=capital_api_time(raw)
             except Exception:
                 from_time=None
+        if from_time:
+            try:
+                ft=datetime.fromisoformat(str(from_time))
+                if ft.tzinfo is None:ft=ft.replace(tzinfo=timezone.utc)
+                oldest=now_utc-timedelta(hours=23)
+                if ft<oldest:
+                    from_time=capital_api_time(oldest)
+            except Exception:
+                pass
         # 24h window covers overnight SL/TP after restart when timestamps missing.
-        return {'from_time':from_time,'last_period':None if from_time else 86400}
+        return {
+            'from_time':from_time,
+            'to_time':to_time if from_time else None,
+            'last_period':None if from_time else 86400,
+        }
 
     @staticmethod
-    def _row_cash_pnl(row,details=None):
+    def _parse_cash_num(value):
+        """Parse Capital cash/pnl fields (plain float or '£-0.14' / '1,23')."""
+        if value is None:return None
+        if isinstance(value,(int,float)):
+            return _num(value)
+        s=str(value).strip()
+        if not s:return None
+        for ch in ('£','$','€','GBP','USD','EUR',' '):
+            s=s.replace(ch,'')
+        s=s.replace(',','.') if s.count(',')==1 and '.' not in s else s.replace(',','')
+        return _num(s)
+
+    def _row_cash_pnl(self,row,details=None):
         details=details if isinstance(details,dict) else {}
-        for key in ('profit','pnl','guaranteedStopProfit','realizedPnl','cash'):
-            val=_num(details.get(key))
-            if val is None:val=_num(row.get(key))
+        for key in ('profit','pnl','profitAndLoss','pl','guaranteedStopProfit',
+                    'realizedPnl','cash','netAmount'):
+            val=self._parse_cash_num(details.get(key))
+            if val is None:val=self._parse_cash_num(row.get(key))
             if val is not None and math.isfinite(val):
                 return float(val)
         return None
@@ -3049,6 +3084,24 @@ class SingleTradeEngine:
                 return True
         return False
 
+    def _history_kwargs(self,look,*,for_activity=False,deal_id=None,tx_type='TRADE'):
+        """Build Capital history query kwargs with clamped ≤1d window."""
+        kwargs={}
+        if for_activity:
+            kwargs['detailed']=True
+            if deal_id is not None:
+                kwargs['deal_id']=deal_id
+        elif tx_type is not None:
+            kwargs['tx_type']=tx_type
+        if look.get('from_time'):
+            kwargs['from_time']=look['from_time']
+            kwargs['last_period']=None
+            if look.get('to_time'):
+                kwargs['to_time']=look['to_time']
+        else:
+            kwargs['last_period']=look.get('last_period') or 86400
+        return kwargs
+
     async def _pnl_from_broker_history(self,deal_id,*,queued_at=None,exact_deal=False):
         """Pull closed-trade cash from Capital history/activity (not mid×size)."""
         if not self.broker or not deal_id:return None
@@ -3057,37 +3110,35 @@ class SingleTradeEngine:
         # Activity often names the dealId on SL/TP/USER closes.
         if hasattr(self.broker,'activity'):
             try:
-                kwargs=dict(detailed=True,deal_id=deal)
-                if look['from_time']:
-                    kwargs['from_time']=look['from_time'];kwargs['last_period']=None
-                else:
-                    kwargs['last_period']=look['last_period']
+                kwargs=self._history_kwargs(look,for_activity=True,deal_id=deal)
                 payload=await self.broker.activity(**kwargs)
                 rows=list(payload.get('activities') or [])
                 # Filtered dealId+from_time can return empty on lag; widen once.
-                if not rows and look['from_time']:
+                if not rows and look.get('from_time'):
                     payload=await self.broker.activity(
                         detailed=True,deal_id=deal,last_period=86400)
+                    rows=list(payload.get('activities') or [])
+                # dealId filter sometimes empty even when the row exists — scan window.
+                if not rows:
+                    wide=self._history_kwargs(look,for_activity=True)
+                    payload=await self.broker.activity(**wide)
                     rows=list(payload.get('activities') or [])
                 for row in rows:
                     if not self._activity_matches_deal(row,deal,exact=exact_deal):continue
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
                     val=self._row_cash_pnl(row,details)
                     if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
+                        return float(val),self._cash_currency(
+                            row.get('currency') or details.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
         if hasattr(self.broker,'transactions'):
             try:
-                kwargs=dict(tx_type='TRADE')
-                if look['from_time']:
-                    kwargs['from_time']=look['from_time'];kwargs['last_period']=None
-                else:
-                    kwargs['last_period']=look['last_period']
+                kwargs=self._history_kwargs(look,tx_type='TRADE')
                 payload=await self.broker.transactions(**kwargs)
                 rows=list(payload.get('transactions') or [])
-                if not rows and look['from_time']:
+                if not rows and look.get('from_time'):
                     payload=await self.broker.transactions(
                         last_period=86400,tx_type='TRADE')
                     rows=list(payload.get('transactions') or [])
@@ -3115,11 +3166,7 @@ class SingleTradeEngine:
         epic,size,direction,opened=row[0],str(row[1] or ''),str(row[2] or ''),row[3]
         look=self._history_lookback(deal,queued_at=queued_at or opened)
         try:
-            kwargs=dict(tx_type='TRADE')
-            if look['from_time']:
-                kwargs['from_time']=look['from_time'];kwargs['last_period']=None
-            else:
-                kwargs['last_period']=look['last_period'] or 86400
+            kwargs=self._history_kwargs(look,for_activity=False,tx_type='TRADE')
             payload=await self.broker.transactions(**kwargs)
         except Exception as exc:
             self.store.event('warning','Fuzzy transaction P&L lookup failed',
@@ -3127,6 +3174,11 @@ class SingleTradeEngine:
             return None
         hits=[]
         epic_u=epic.upper()
+        # Normalize sizes so "0.02" matches ".02".
+        def _sz(v):
+            try:return f'{float(v):.6f}'.rstrip('0').rstrip('.')
+            except (TypeError,ValueError):return str(v or '')
+        size_n=_sz(size)
         for tx in payload.get('transactions') or []:
             if self._transaction_matches_deal(tx,deal):
                 # Prefer exact/fuzzy deal match path — caller already tried that.
@@ -3138,13 +3190,19 @@ class SingleTradeEngine:
             # GOLD often shows as "Gold" / "Gold Spot"; keep XAU as alias.
             if epic_u not in blob and not (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)):
                 continue
-            tx_size=str(tx.get('size') or tx.get('quantity') or '')
-            if tx_size and size and tx_size!=size:continue
+            tx_size=_sz(tx.get('size') or tx.get('quantity') or '')
+            if tx_size and size_n and tx_size!=size_n:continue
             tx_dir=str(tx.get('direction') or '').upper()
             if tx_dir and direction and tx_dir!=direction.upper():continue
             hits.append((float(val),self._cash_currency(tx.get('currency'))))
         if len(hits)==1:
             return hits[0]
+        # Multiple GOLD closes in window — pick the one closest to exit_level time
+        # is hard without timestamps; if all share the same cash, that is enough.
+        if len(hits)>1:
+            vals={round(h[0],4) for h in hits}
+            if len(vals)==1:
+                return hits[0]
         return None
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
@@ -3209,6 +3267,25 @@ class SingleTradeEngine:
             pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
             self.store.set('pending_broker_pnl_deals',pending[-40:])
 
+    def _teach_pending_ticks(self,deal_id,exit_level=None):
+        """Neural teach from exit ticks while cash £ is still pending.
+
+        Keeps journal ``pnl_source=pending_broker_pnl`` (no fake £). Late Capital
+        cash overwrites the row without re-learning (once-only claim).
+        """
+        deal=str(deal_id)
+        if self._trade_already_learned(deal):
+            return False
+        if not self.store.get('entry_brain:'+deal):
+            return False
+        conf={'level':exit_level,'source':'pending_ticks_teach'}
+        self._learn_closed_trade(deal,conf)
+        # Ensure source stayed pending (learn path preserves it for this source).
+        self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
+        self.store.event('learning','Pending-cash trade taught from ticks; still waiting for £',
+                         {'deal_id':deal,'exit_level':exit_level})
+        return True
+
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
@@ -3222,8 +3299,8 @@ class SingleTradeEngine:
             exit_level=base.get('exit_level')
             # Pass queued_at so history lookback is not stuck on last 30 minutes.
             found=await self._pnl_from_broker_history(deal,queued_at=queued)
-            # After a few misses, try epic/size single-row fuzzy (not on force-close path).
-            if not found and attempts>=2:
+            # Fuzzy epic/size bind early — Capital tx.reference often ≠ deal UUID.
+            if not found and attempts>=1:
                 try:
                     found=await self._pnl_fuzzy_instrument_cash(deal,queued_at=queued)
                 except Exception as exc:
@@ -3232,6 +3309,9 @@ class SingleTradeEngine:
             # Never write upl_estimate into trades — UPL is not account £.
             # Keep pending until Capital history returns real cash.
             if not found:
+                # First retries: ensure ticks teach happened (older queues may lack it).
+                if attempts<=2:
+                    self._teach_pending_ticks(deal,exit_level)
                 if attempts>=6 and attempts%6==0:
                     snap=self.store.get('last_upl:'+deal) or {}
                     upl=_num(snap.get('upl'))
@@ -3766,8 +3846,16 @@ class SingleTradeEngine:
         if repeats>0 and transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
-        self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
-                               source=pnl_source,overwrite=overwrite)
+        # Tick teach while waiting for Capital £: keep journal as pending_broker_pnl
+        # (never store ticks_only as if it were cash, never invent £).
+        persist_source=pnl_source
+        persist_pnl=pnl_value
+        if (str(confirmation.get('source') or '')=='pending_ticks_teach'
+                and pnl_source!='broker'):
+            persist_source='pending_broker_pnl'
+            persist_pnl=None
+        self.store.close_trade(deal_id,exit_level,persist_pnl,currency=currency,
+                               source=persist_source,overwrite=overwrite)
         self.store.set('last_trade_outcome',{
             'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
             'pnl':pnl_value,'mode':mode})

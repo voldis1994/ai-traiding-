@@ -75,8 +75,14 @@ function renderCard(c){
   const trades=(r.recent_trades||[]).slice(0,6).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
-    const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
-    return `<div><span>${t.direction||'?'} ${t.epic||''}${src}</span><span class="${cls}">${p==null?'—':money(p,tCcy)}</span></div>`;
+    const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
+    const src=pending?' [gaida £]':(t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'');
+    let right;
+    if(p!=null){right=money(p,tCcy);}
+    else if(pending&&t.upl_hint!=null){right=`gaida · UPL ${money(t.upl_hint,tCcy)}`;}
+    else if(pending){right='gaida Capital £';}
+    else{right='—';}
+    return `<div><span>${t.direction||'?'} ${t.epic||''}${src}</span><span class="${cls}">${right}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
   const el=document.createElement('article');
   el.className='card';
@@ -108,6 +114,7 @@ function renderCard(c){
       <div><span>P&amp;L realizēts (${ccy||'konts'})</span><br><strong class="${pnlClass(r.realized_pnl)}">${money(r.realized_pnl,ccy)}</strong></div>
       <div><span>P&amp;L + UPL</span><br><strong class="${pnlClass(r.equity_pnl??r.realized_pnl)}">${money(r.equity_pnl??r.realized_pnl,ccy)}${r.open_upl!=null?` (UPL ${money(r.open_upl,ccy)})`:''}</strong></div>
       <div><span>Darījumu W/L (ne M1)</span><br><strong>${r.wins??0} / ${r.losses??0} (${pct(r.trade_win_rate??r.win_rate)})</strong></div>
+      ${(r.pending_broker_pnl||r.pending_trades)?`<div><span>Gaida broker £</span><br><strong>${r.pending_broker_pnl??0} rindā · ${r.pending_trades??0} žurnālā</strong></div>`:''}
     </div>
     <div class="muted small">${e.neural_adapt_reason||e.last_reason||''}${(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)?(' · '+(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)):''}</div>
     <div class="trades">${trades}</div>

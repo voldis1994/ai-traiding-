@@ -1,6 +1,7 @@
 """Multi-horizon forecast stack: memory, targets, model, calibration, benchmark."""
 from __future__ import annotations
 
+import math
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +13,8 @@ from app.engine import Store
 from app.forecast_benchmark import chrono_split, run_benchmark, run_gold_benchmark
 from app.forecast_calibration import expected_calibration_error, summarize_calibration
 from app.forecast_memory import ForecastMemory
-from app.forecast_model import MultiHorizonForecast
+from app.forecast_benchmark import sigma_error_diagnostics
+from app.forecast_model import MultiHorizonForecast, gaussian_nll_dlog_sigma
 from app.forecast_targets import (
     HORIZONS, direction_label, mid_change, path_from_candles, targets_at_horizons,
 )
@@ -88,6 +90,29 @@ def test_sigma_depends_on_input_features():
     s1 = model.predict_one(x_wild)[0].sigma_hat
     assert s1 > s0
     assert s0 > 0 and s1 > 0
+
+
+def test_gaussian_nll_sigma_grad_includes_div_by_sigma():
+    """∂L/∂z = (1 - err²/σ²) * sigmoid(z) / σ  — not missing /σ."""
+    err, sigma, z = 2.0, 1.5, 0.0
+    got = gaussian_nll_dlog_sigma(err, sigma, z)
+    sigmoid = 0.5  # sigmoid(0)
+    expect = (1.0 - (err * err) / (sigma * sigma)) * sigmoid / sigma
+    assert got == pytest.approx(expect)
+    # Finite-difference check on L = 0.5*(err/σ)² + log(σ), σ=softplus(z)
+    def softplus(v):
+        return math.log1p(math.exp(v))
+
+    def loss(zv):
+        s = softplus(zv) + 1e-6
+        return 0.5 * (err / s) ** 2 + math.log(s)
+
+    eps = 1e-5
+    fd = (loss(z + eps) - loss(z - eps)) / (2 * eps)
+    # Compare against gradient with σ = softplus(z)+1e-6
+    s = softplus(z) + 1e-6
+    analytic = gaussian_nll_dlog_sigma(err, s, z)
+    assert analytic == pytest.approx(fd, rel=1e-3, abs=1e-4)
 
 
 def test_forecast_memory_links_all_horizons_via_at():
@@ -234,3 +259,18 @@ def test_gold_benchmark_same_data_train_and_compare():
     h1 = report['by_horizon'][1]
     assert h1['baseline_argmax_acc'] is not None
     assert h1['forecast_model_acc'] is not None
+    assert h1['sigma_vs_error']['n'] >= 3
+    assert h1['sigma_vs_error']['mean_sigma'] is not None
+    assert report['gold_h1']['sigma_vs_error']['mean_abs_err'] is not None
+    assert report['primary_horizon'] == 1
+
+
+def test_sigma_error_diagnostics_coverage():
+    # Perfectly calibrated 1σ: |err| == σ for half the points below/above.
+    r_hat = [0.0, 0.0, 0.0, 0.0]
+    r_true = [0.5, 0.5, 1.5, 1.5]
+    sigmas = [1.0, 1.0, 1.0, 1.0]
+    d = sigma_error_diagnostics(r_hat, r_true, sigmas)
+    assert d['n'] == 4
+    assert d['coverage_1sigma'] == pytest.approx(0.5)
+    assert d['mean_abs_err'] == pytest.approx(1.0)

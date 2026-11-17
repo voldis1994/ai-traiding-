@@ -7,7 +7,9 @@ import time
 
 import pytest
 
-from app.protection_ai import select_policy,propose_broker_trail,propose_update
+from app.protection_ai import (
+    select_policy,propose_broker_trail,propose_update,completed_1m_candles,
+    ohlc_1m_structure_stop)
 from app.math_rules import stop_take,ohlc_range_distance
 from app.engine import Store,SingleTradeEngine
 from tests.test_integration import BrokerSimulation
@@ -121,9 +123,32 @@ def test_trail_continues_past_break_even_using_ohlc_zone_gap():
     assert out['profit_level']==97.0
 
 
+def test_completed_1m_candles_drops_forming_bucket():
+    now=datetime(2026,10,14,12,5,30,tzinfo=timezone.utc)
+    rows=[
+        {'at':'2026-10-14T12:03:00+00:00','close':100.1},
+        {'at':'2026-10-14T12:04:00+00:00','close':100.2},
+        {'at':'2026-10-14T12:05:00+00:00','close':100.3},  # forming
+    ]
+    done=completed_1m_candles(rows,now_utc=now)
+    assert [r['at'] for r in done]==[
+        '2026-10-14T12:03:00+00:00','2026-10-14T12:04:00+00:00']
+
+
+def test_post_be_trails_without_waiting_half_r_mfe():
+    """After BE, small tip past entry still advances — no 0.5R freeze at BE."""
+    # Opening R=2.0; BE locked; tip only +0.4R — old need≈trail_gap froze here.
+    p=_position(stop=100.0,profit=104.0)
+    market=_market(100.75,100.85);market['min_distance']=0.3
+    out=propose_broker_trail(
+        p,market,_meta(2.0),extreme=100.8,zone_range=0.35)
+    assert out is not None
+    assert out['be_locked'] is True
+    assert out['stop_level']>100.0
+
+
 def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
     """BUY stop sits under recent 1m *closes* — not tip − 35%R / 2×minStop."""
-    from app.protection_ai import ohlc_1m_structure_stop
     # Wide opening R so old tip−floor gap would sit far behind price.
     p=_position(stop=100.05,profit=106.0)
     meta=_meta(3.0)
@@ -491,6 +516,39 @@ def test_trail_runs_when_entry_execution_paused():
             assert b.requests[0][0]=='PROTECT'
             assert b.open[0]['position']['stopLevel']>99.2
             assert b.requests[0][3]==101.6  # TP preserved
+    asyncio.run(scenario())
+
+
+def test_adapt_protection_follows_quote_1m_closes_after_be():
+    """Post-BE trail must see closed QUOTE minutes (not HISTORICAL-only holes)."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            e,b,s=engine_fixture(d)
+            # Already at BE — next move must follow recent completed closes.
+            b.open[0]['position']['stopLevel']=100.0
+            b.open[0]['position']['profitLevel']=106.0
+            e.market=_market(103.45,103.55)
+            meta=dict(_meta(3.0),epic='GOLD',opened='2026-10-14T12:00:00+00:00')
+            s.set('adaptive_protection:auto1',meta)
+            # Only QUOTE provenance (live forming→closed path); no HISTORICAL.
+            for i,close in enumerate((103.2,103.35,103.4,103.45,103.5),start=1):
+                at=f'2026-10-14T12:{i:02d}:00+00:00'
+                s.candle('GOLD',{
+                    'at':at,'open':close-0.05,'high':close+0.05,
+                    'low':close-0.1,'close':close,'spread':0.1},source='QUOTE')
+            await e.sync()
+            # Clear throttle so first adapt fires.
+            s.set('adaptive_runtime:auto1',None)
+            await e.adapt_protection(e.positions[0])
+            assert b.requests and b.requests[0][0]=='PROTECT'
+            new_stop=float(b.open[0]['position']['stopLevel'])
+            assert new_stop>100.0
+            # Under recent completed close swing (min close 103.2 − buffer).
+            assert new_stop>=102.5
+            brief=e.protection_brief or {}
+            prop=brief.get('proposal') or {}
+            assert prop.get('be_locked') is True
+            assert prop.get('structure_stop') is not None or new_stop>100.5
     asyncio.run(scenario())
 
 

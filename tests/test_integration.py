@@ -1,6 +1,7 @@
 """Local integration suite: no Capital.com credentials, no live orders."""
 import asyncio
 import json
+import pytest
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -29,10 +30,10 @@ def test_pdf_long_short_sl_tp_and_rounding():
     assert sell['stop_level']==Decimal('100.24')
     assert sell['profit_level']==Decimal('99.52')
     # min_distance=0 → only buffer (2*tick), not a fake 20-tick invent.
-    bare=stop_take('100','BUY','.03','.01',0)  # default κ=1 (1:1), not 1:2
+    bare=stop_take('100','BUY','.03','.01',0)  # default κ=2 (TP=2×SL)
     assert bare['stop_ticks']==2
-    assert bare['profit_ticks']==2
-    assert bare['kappa']==1.0
+    assert bare['profit_ticks']==4
+    assert bare['kappa']==2.0
     assert bare['sl_scale']==1.0
     wider=stop_take('100','BUY','.03','.01',0,kappa=2,sl_scale=2)
     assert wider['stop_ticks']==4
@@ -317,11 +318,18 @@ def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close
             brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([7.,-4.,-4.])
             await e.poll()  # very next completed new M1 candle; no historical-label minimum
-            assert len([x for x in broker.requests if x[0]=='OPEN'])==1
-            assert e.positions[0]['dealId']=='b2'
-            assert Decimal(str(e.positions[0]['size']))==Decimal('.25')
+            opens=[x for x in broker.requests if x[0]=='OPEN']
+            # Multi-lot may split mandate size into several OPEN slices.
+            assert len(opens)>=1
+            assert sum(Decimal(str(x[3])) for x in opens)==Decimal('.25')
+            assert e.positions  # live book has at least one slice
+            # SL half of TP on every OPEN (κ=2).
+            for op in opens:
+                sl,tp=float(op[4]),float(op[5])
+                assert tp/sl == pytest.approx(2.0, abs=0.05)
+            n_opens=len(opens)
             await e.poll()
-            assert len([x for x in broker.requests if x[0]=='OPEN'])==1
+            assert len([x for x in broker.requests if x[0]=='OPEN'])==n_opens
     async_run(scenario())
 
 def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):

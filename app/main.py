@@ -198,6 +198,11 @@ class HardRiskBody(BaseModel):
     equity_drawdown_limit:float=Field(gt=0,le=1_000_000)
     clear_halt:bool=Field(default=False)
 
+class DayRiskGatesBody(BaseModel):
+    """Admin toggle — when enabled=False, day book phase no longer blocks OPEN."""
+    enabled:bool
+
+
 
 def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     """Explain the failed step, without ever exposing credentials, headers or response body."""
@@ -541,6 +546,27 @@ async def admin_set_hard_risk(client_id:int,data:HardRiskBody,_:dict=Depends(req
         raise HTTPException(400,str(exc)) from None
     return {'ok':True,'hard_risk':snap,
             'card':hub.admin_client_card(platform.get_client(client_id))}
+@app.get('/api/admin/clients/{client_id}/day-risk-gates')
+async def admin_get_day_risk_gates(client_id:int,_:dict=Depends(require_admin)):
+    if not platform.get_client(client_id):raise HTTPException(404,'Client not found')
+    try:
+        snap=hub.client_day_risk_gates(client_id)
+    except FileNotFoundError:
+        raise HTTPException(404,'Klientam vēl nav robota datu') from None
+    return {'ok':True,**snap}
+
+@app.post('/api/admin/clients/{client_id}/day-risk-gates')
+async def admin_set_day_risk_gates(client_id:int,data:DayRiskGatesBody,
+                                   _:dict=Depends(require_admin)):
+    """Turn day-book DEFEND/DONE/PROTECT OPEN blocks on/off (temporary operator switch)."""
+    if not platform.get_client(client_id):raise HTTPException(404,'Client not found')
+    try:
+        snap=hub.set_client_day_risk_gates(client_id,enabled=bool(data.enabled))
+    except FileNotFoundError:
+        raise HTTPException(404,'Klientam vēl nav robota datu') from None
+    return {'ok':True,**snap,
+            'card':hub.admin_client_card(platform.get_client(client_id))}
+
 
 @app.post('/api/admin/reset-learning')
 async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_admin)):

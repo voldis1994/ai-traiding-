@@ -70,7 +70,7 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         brain._activate('SIM')
         # Force a known transition for learn_from_trade.
         brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
-        brain.core.step(brain.core.last_z, dt=60.)
+        brain.core.step(brain.core.last_z, dt=1.0)
         assert brain.core.last_transition is not None
 
         e = SingleTradeEngine(store, brain)
@@ -93,11 +93,6 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         asyncio.run(_prep())
         assert e.mandate and e.mandate['epic'] == 'SIM'
         brain.mark_prep_ready('test fixture')
-        # Flat sync resets recurrent state (entry isolation). Re-seed a transition
-        # so hold_shadow can teach from a real entry-time snapshot.
-        brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
-        brain.core.step(brain.core.last_z, dt=60.)
-        assert brain.core.last_transition is not None
 
         # Warm OHLC for would-be brackets.
         hist = _seed_hist_candles(store, 'SIM', n=90, start_px=100.0, trend=0.01)

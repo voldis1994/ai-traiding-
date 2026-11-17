@@ -13,12 +13,10 @@ from tests.test_integration import BrokerSimulation
 def scored_history(*, action='SELL', fail_holdout=False):
     """240 consecutive, ALREADY-LABELED closed bars; 8-bar horizons.
 
-    Directional score lead clears soft ENTRY_EDGE_MIN (0.03) while staying
-    below the old fixed 0.06 policy default — validates reduced margin.
+    Directional score lead is 3 pp, below the old 6 pp hard margin.
     """
-    # edge = side - max(other, HOLD) → 0.04 (>= 0.03 rail, < 0.06 default)
-    sell={'BUY':.32,'SELL':.37,'HOLD':.33}
-    buy={'BUY':.37,'SELL':.32,'HOLD':.33}
+    sell={'BUY':.32,'SELL':.35,'HOLD':.33}
+    buy={'BUY':.35,'SELL':.32,'HOLD':.33}
     rows=[]
     for block in range(30):
         direction='SELL' if block%2==0 else 'BUY'
@@ -33,13 +31,12 @@ def scored_history(*, action='SELL', fail_holdout=False):
 def test_new_gate_allows_validated_three_point_sell_and_buy():
     with tempfile.TemporaryDirectory() as d:
         p=AutoEvolution(Store(Path(d)/'data.sqlite3'),Path(d)/'policy.py')
-        for action,scores in [('SELL',{'BUY':.32,'SELL':.37,'HOLD':.33}),
-                              ('BUY', {'BUY':.37,'SELL':.32,'HOLD':.33})]:
+        for action,scores in [('SELL',{'BUY':.32,'SELL':.35,'HOLD':.33}),
+                              ('BUY', {'BUY':.35,'SELL':.32,'HOLD':.33})]:
             assert p.decision(scores,threshold=.06)=='HOLD'
             verdict=p.evaluate_entry(scores,scored_history(),accuracy=.43,samples=240,spread_bps=1.8)
             assert verdict['action']==action,verdict
-            # evaluate_entry can report sub-rail selected; LIVE snaps to ≥0.03.
-            assert .01<=verdict['threshold']<=.04
+            assert .01<=verdict['threshold']<.03
             assert verdict['calibration']['method']=='holdout_calibrated'
             assert verdict['calibration']['train_samples']>=8
             assert verdict['calibration']['validation_samples']>=4
@@ -88,8 +85,7 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
             original_tick=brain.tick
             def controlled_tick(*args,**kwargs):
                 result=original_tick(*args,**kwargs)
-                # 4 pp edge clears soft 0.03 rail after holdout calibration.
-                result['scores']={'BUY':.32,'SELL':.37,'HOLD':.33}
+                result['scores']={'BUY':.32,'SELL':.35,'HOLD':.33}
                 result['action']='SELL'
                 return result
             brain.tick=controlled_tick

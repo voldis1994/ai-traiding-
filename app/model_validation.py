@@ -99,6 +99,10 @@ def _row_version(row):
 def single_version_pnls(rows, *, cash_key='actual_pnl', model_version=None):
     """Keep one model_version's cash outcomes — never mix versions in a score.
 
+    ``model_version`` is the *validated* generation (structural / promote), not
+    the per-trade weight-update counter. Many closed trades should share one
+    version so OOS compare has enough samples.
+
     If `model_version` is None, use the latest version present in `rows`.
     Rows without a version are kept only when *no* row is version-tagged
     (legacy histories); otherwise they are dropped so mixed eras stay clean.

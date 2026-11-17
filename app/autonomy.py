@@ -769,6 +769,7 @@ class AutoEvolution:
         Each observed class contributes equally, so an always-HOLD strategy
         cannot win merely because the dataset contains many HOLD labels.
         This is a classification proxy, not a claim of trading profitability.
+        Prefer ``_replay_trade_cash`` when enough closed-trade £ rows exist.
         """
         groups={0:[],1:[],2:[]}
         for item in history:
@@ -794,6 +795,160 @@ class AutoEvolution:
         # Require BUY and SELL evidence before a strategy can be promoted.
         if not groups[0] or not groups[1]:return -1.0,0
         return sum(present)/len(present),n
+
+    @staticmethod
+    def policy_cash_rows(profit_rows, signal_history=None, *, epic=None,
+                         currency=None):
+        """Join profit_learning £ rows with entry scores for cash_gate.
+
+        Prefer scores already stored on the profit row (from entry_brain).
+        Isolates one epic + account currency — GOLD £ must not mix with other
+        instruments or FX accounts.
+        """
+        _ = signal_history  # reserved; deal_id join not available on M1 history
+        want_epic=(str(epic).upper() if epic else None)
+        want_ccy=(str(currency).upper() if currency else None)
+        # When caller omits filters, lock to the modal (epic, currency) bucket
+        # so a mixed history never sums GOLD price units with e.g. FX £.
+        if want_epic is None or want_ccy is None:
+            buckets={}
+            for row in profit_rows or []:
+                if not isinstance(row,dict):continue
+                if not isinstance(row.get('scores'),dict):continue
+                if row.get('actual_pnl') is None:continue
+                e=str(row.get('epic') or '').upper() or None
+                c=str(row.get('currency') or '').upper() or None
+                if not e:continue
+                buckets[(e,c)]=buckets.get((e,c),0)+1
+            if buckets:
+                (dom_e,dom_c),_=max(buckets.items(),key=lambda kv:kv[1])
+                if want_epic is None:want_epic=dom_e
+                if want_ccy is None:want_ccy=dom_c
+        out=[]
+        for row in profit_rows or []:
+            if not isinstance(row,dict):continue
+            scores=row.get('scores')
+            if not isinstance(scores,dict):continue
+            direction=str(row.get('direction') or '').upper()
+            if direction not in ('BUY','SELL'):continue
+            row_epic=str(row.get('epic') or '').upper() or None
+            row_ccy=str(row.get('currency') or '').upper() or None
+            if want_epic and row_epic!=want_epic:continue
+            if want_ccy and row_ccy!=want_ccy:continue
+            try:
+                pnl=float(row.get('actual_pnl'))
+            except (TypeError,ValueError):
+                continue
+            if not math.isfinite(pnl):continue
+            entry=exit_px=None
+            try:
+                if row.get('entry') is not None:entry=float(row['entry'])
+            except (TypeError,ValueError):
+                entry=None
+            try:
+                if row.get('exit') is not None:exit_px=float(row['exit'])
+            except (TypeError,ValueError):
+                exit_px=None
+            out.append({
+                'scores':scores,
+                'direction':direction,
+                'actual_pnl':pnl,
+                'simulated':row.get('simulated') if isinstance(row.get('simulated'),dict) else None,
+                'simulated_cash':(row.get('simulated_cash')
+                                  if isinstance(row.get('simulated_cash'),dict) else None),
+                'deal_id':row.get('deal_id'),
+                'epic':row_epic,
+                'currency':row_ccy,
+                'entry':entry,
+                'exit':exit_px,
+                'at':row.get('at'),
+            })
+        return out
+
+    @staticmethod
+    def _opposite_cash_pnl(item, signal, *, scale=None):
+        """Account-currency £ for an opposite-side candidate, or None.
+
+        ``simulated[buy|sell]`` are price units (GOLD points), NOT £.
+        Prefer ``simulated_cash`` when present; else scale price units by
+        ``cash_per_price_unit``. Never add raw price units into a £ sum.
+        """
+        if signal not in ('BUY','SELL'):
+            return None
+        cash_map=item.get('simulated_cash') if isinstance(item.get('simulated_cash'),dict) else {}
+        key_cash=signal  # BUY/SELL
+        try:
+            if cash_map.get(key_cash) is not None:
+                v=float(cash_map[key_cash])
+                if math.isfinite(v):
+                    return v
+        except (TypeError,ValueError):
+            pass
+        if scale is None or not math.isfinite(float(scale)) or float(scale)==0:
+            return None
+        sim=item.get('simulated') if isinstance(item.get('simulated'),dict) else {}
+        key='buy' if signal=='BUY' else 'sell'
+        try:
+            alt=float(sim.get(key)) if sim.get(key) is not None else None
+        except (TypeError,ValueError):
+            alt=None
+        if alt is None or not math.isfinite(alt):
+            return None
+        return float(alt)*float(scale)
+
+    @staticmethod
+    def _replay_trade_cash(f,trades,margin_override=None,*,min_trades=6):
+        """Score a policy on closed-trade £ — direction-matched, not any BUY/SELL.
+
+        Same direction as the historical deal → credit ``actual_pnl`` (account £).
+        HOLD → 0 £ (abstain).
+        Opposite → account-£ counterfactual only (``simulated_cash`` or price-unit
+        sim × ``cash_per_price_unit``). Never sum GOLD price points into £.
+        """
+        rows=[]
+        for item in trades or []:
+            if not isinstance(item,dict):continue
+            scores=item.get('scores')
+            direction=str(item.get('direction') or '').upper()
+            if not isinstance(scores,dict) or direction not in ('BUY','SELL'):
+                continue
+            try:
+                pnl=float(item.get('actual_pnl'))
+            except (TypeError,ValueError):
+                continue
+            if not math.isfinite(pnl):continue
+            rows.append(item)
+        if len(rows)<int(min_trades):
+            return float('-inf'),0
+        try:
+            from .shadow_paper import cash_per_price_unit
+            scale=cash_per_price_unit(rows,min_samples=5)
+        except Exception:
+            scale=None
+        total=0.0;n=0
+        for item in rows:
+            scores=item['scores']
+            direction=str(item.get('direction') or '').upper()
+            try:
+                if margin_override is None:signal=f(scores)
+                else:signal=AutoEvolution._call_policy(f,scores,threshold=margin_override)
+            except Exception:
+                continue
+            if signal=='HOLD':
+                total+=0.0;n+=1
+                continue
+            if signal not in ('BUY','SELL'):
+                continue
+            if signal==direction:
+                total+=float(item['actual_pnl']);n+=1
+                continue
+            alt=AutoEvolution._opposite_cash_pnl(item,signal,scale=scale)
+            if alt is None:
+                continue  # skip — do not invent £ or mix price units
+            total+=alt;n+=1
+        if n<int(min_trades):
+            return float('-inf'),0
+        return total/n,n
     def _params(self):
         src=self.path.read_text(encoding='utf8')
         tree=self._validate(src)
@@ -802,12 +957,16 @@ class AutoEvolution:
             if isinstance(a,ast.Assign) and len(a.targets)==1 and isinstance(a.targets[0],ast.Name) and isinstance(a.value,ast.Constant):
                 constants[a.targets[0].id]=a.value.value
         return constants
-    def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
+    def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False,
+               cash_trades=None):
         """Search/promote policy candidates that LIVE entry can execute.
 
         Default self_params.policy_evolve_enabled=1 runs the search. Promoted
         modules are consulted by evaluate_neural_entry when policy_live_execute=1
         (also default ON) — neural proposes side, decide() confirms or HOLDs.
+
+        ``cash_trades``: joined profit rows (scores+direction+actual_pnl). When
+        omitted, falls back to rows already embedded in ``history`` (rare).
         """
         try:
             from .self_params import get as sp_get
@@ -868,12 +1027,29 @@ class AutoEvolution:
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
         old_train,_=self._replay(incumbent,train,
             margin_override=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=edge))
-        winner=None;best=baseline
+        winner=None;best=baseline;best_cash=None
         # Promote on a trade/learning tempo. Generation gates EXIT policy code;
         # LIVE entry is neural vote (lot+market = risk frame).
         need_n=12 if force else 18
         need_val=4 if force else 6
         lift=.001 if (force and loss_trade) else .002
+        # Closed-trade £ after costs — must come from profit_learning (+ entry
+        # scores), not M1 brain.history alone (those lack actual_pnl).
+        cash_rows=list(cash_trades) if cash_trades is not None else self.policy_cash_rows(
+            [r for r in history if isinstance(r,dict) and r.get('actual_pnl') is not None])
+        cash_cut=int(len(cash_rows)*.7)
+        cash_train=cash_rows[:cash_cut]
+        cash_val=cash_rows[cash_cut:]
+        # Need ≥6 train + ≥6 val → ≥20 rows after 70/30 (ceil(0.3*n)≥6 ⇒ n≥20).
+        use_cash=len(cash_val)>=6 and len(cash_train)>=6
+        self.last_cash_gate=bool(use_cash)
+        self.store.set('evolution_cash_gate',bool(use_cash))
+        self.store.set('evolution_cash_rows',len(cash_rows))
+        old_cash_val,_=self._replay_trade_cash(
+            incumbent,cash_val,
+            margin_override=self.adaptive_threshold(
+                accuracy,sample_count,mean_spread,base=edge),
+            min_trades=6) if use_cash else (None,0)
         for kind,val,source in variants:
             try:
                 fn=self._compile(source)
@@ -881,15 +1057,28 @@ class AutoEvolution:
                 new_margin=self.adaptive_threshold(accuracy,sample_count,mean_spread,base=val)
                 train_score,_=self._replay(fn,train,margin_override=new_margin)
                 validation_score,validation_n=self._replay(fn,validation,margin_override=new_margin)
-                if (n>=need_n and validation_n>=need_val and train_score>=old_train and
-                    validation_score>old_validation+lift and reward>best+lift):
-                    best=reward;winner=(kind,val,source)
+                label_ok=(n>=need_n and validation_n>=need_val and train_score>=old_train and
+                          validation_score>old_validation+lift and reward>best+lift)
+                if not label_ok:
+                    continue
+                if use_cash:
+                    cash_score,cash_n=self._replay_trade_cash(
+                        fn,cash_val,margin_override=new_margin,min_trades=6)
+                    if cash_n<6 or cash_score<=(old_cash_val if old_cash_val is not None else 0)+1e-9:
+                        continue
+                    if best_cash is not None and cash_score<=best_cash+1e-9:
+                        continue
+                    best_cash=cash_score
+                best=reward;winner=(kind,val,source)
             except Exception:continue
         if not winner:
             self.last_reason=(f'Waiting for BUY/SELL replay (minimum {need_n} labels)' if n<need_n
-                              else 'No relative-edge candidate passed training and forward holdout replay')
+                              else ('No candidate beat holdout labels + closed-trade £'
+                                    if use_cash else
+                                    'No relative-edge candidate passed training and forward holdout replay'))
             self.store.set('evolution_last_reason',self.last_reason)
-            self.store.event('code','Evolution candidate not promoted',{'reason':self.last_reason,'samples':n})
+            self.store.event('code','Evolution candidate not promoted',{'reason':self.last_reason,'samples':n,
+                             'cash_gate':bool(use_cash)})
             return None
         kind,val,source=winner
         if not self._test_candidate(source):
@@ -905,14 +1094,16 @@ class AutoEvolution:
         except Exception:
             os.replace(previous,self.path);raise
         self.generation+=1;self.kind=kind
-        self.last_reason='Candidate promoted after isolated tests'
+        self.last_reason=('Candidate promoted after labels + closed-trade £'
+                          if use_cash else 'Candidate promoted after isolated tests')
         self.store.set('evolution_last_reason',self.last_reason)
         self.store.set('code_generation',self.generation);self.store.set('policy_kind',kind)
         # Do NOT bump learning_generation — policy file ≠ LIVE neural progress.
         digest=hashlib.sha256(source.encode()).hexdigest()
         self.store.event('code','Python policy automatically generated, tested and activated',
             {'generation':self.generation,'type':kind,'required_edge':val,'hash':digest,
-             'replay_score_old':baseline,'replay_score_new':best,'samples':n})
+             'replay_score_old':baseline,'replay_score_new':best,'samples':n,
+             'cash_gate':bool(use_cash),'cash_val_mean':best_cash})
         return val
     def info(self):
         source=self.path.read_text(encoding='utf8')

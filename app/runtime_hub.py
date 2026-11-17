@@ -300,6 +300,15 @@ class RuntimeHub:
             elif kind=='pending':
                 pending_n+=1
                 if val is None:blank_n+=1
+                # Last live UPL as display hint only — not cash £ (#125).
+                snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
+                try:
+                    hint=float(snap.get('upl')) if snap.get('upl') is not None else None
+                except (TypeError,ValueError):
+                    hint=None
+                if hint is not None and __import__('math').isfinite(hint):
+                    row['upl_hint']=round(hint,4)
+                row['pending_cash']=True
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='estimate' and val is not None:
@@ -378,11 +387,18 @@ class RuntimeHub:
             equity=upl
         else:
             equity=None
+        pending_q=0
+        try:
+            pending_q=len(store.get('pending_broker_pnl_deals') or [])
+        except Exception:
+            pending_q=0
         return {
             'closed_trades':closed_n,
             'open_trades_recorded':open_n,
             'cash_trades':cash_n,
             'pending_cash_trades':pending_n,
+            'pending_broker_pnl':pending_q,
+            'pending_trades':pending_n,
             'proxy_trades':proxy_n,
             'estimate_trades':estimate_n,
             'estimate_pnl':round(estimate_sum,4) if estimate_n else None,
@@ -568,6 +584,33 @@ class RuntimeHub:
     def client_hard_risk(self,client_id: int) -> dict:
         from . import hard_risk
         return hard_risk.snapshot(self._client_store(client_id))
+
+
+    def client_day_risk_gates(self,client_id: int) -> dict:
+        """Operator day-book risk gate flag (DEFEND/DONE/PROTECT may block OPEN)."""
+        from . import day_book
+        from .self_params import get as sp_get
+        store=self._client_store(client_id)
+        enabled=int(sp_get(store,'day_risk_gates',1) or 0)==1
+        snap=day_book.snapshot(store)
+        return {
+            'risk_gates':enabled,
+            'day_risk_gates':1 if enabled else 0,
+            'phase':snap.get('phase'),
+            'goal':snap.get('goal'),
+        }
+
+    def set_client_day_risk_gates(self,client_id: int,*,enabled: bool) -> dict:
+        """Admin toggle — temporarily disable day-book OPEN phase blocks."""
+        from . import day_book
+        from .self_params import load as sp_load, save as sp_save
+        store=self._client_store(client_id,create=True)
+        params=sp_load(store)
+        params['day_risk_gates']=1 if enabled else 0
+        sp_save(store,params,reason='admin_day_risk_gates')
+        store.event('risk','Operator day risk gates '+('ON' if enabled else 'OFF'),{
+            'day_risk_gates':params['day_risk_gates']})
+        return self.client_day_risk_gates(client_id)
 
     def save_client_hard_risk(self,client_id: int,*,max_risk_per_trade,daily_loss_limit,
                               equity_drawdown_limit,clear_halt: bool=False) -> dict:

@@ -571,8 +571,14 @@ function renderCard(c){
   const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
-    const src=t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'';
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${p==null?'—':esc(money(p,tCcy))}</span></div>`;
+    const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
+    const src=pending?' [gaida £]':(t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'');
+    let right;
+    if(p!=null){right=money(p,tCcy);}
+    else if(pending&&t.upl_hint!=null){right=`gaida · UPL ${money(t.upl_hint,tCcy)}`;}
+    else if(pending){right='gaida Capital £';}
+    else{right='—';}
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
 
   const dealsHtml=inTrade
@@ -616,6 +622,7 @@ function renderCard(c){
         sb.pnl==null?'—':esc(money(sb.pnl,sb.ccy||ccy))
       }</strong></div>
       <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
+      ${(r.pending_broker_pnl||r.pending_trades||r.pending_cash_trades)?`<div><span>Gaida broker £</span><strong>${esc(r.pending_broker_pnl??0)} rindā · ${esc(r.pending_trades??r.pending_cash_trades??0)} žurnālā</strong></div>`:''}
     </div>
     <div class="muted" style="padding:8px 14px;font-size:12px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)

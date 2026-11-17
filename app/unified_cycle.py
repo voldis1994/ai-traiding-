@@ -4,9 +4,9 @@ Neural scores, OHLC brackets, and £ outcomes used to drift apart (argmax in
 one place, SL ratchet in another, lot from mandate). This module is the single
 coordination point so OPEN is one machine state — not three competing policies.
 
-Lot size is sized by ``day_book`` from equity risk (mandate size is the seed
-grid). Direction stays neural. Risk width (κ / sl_scale dampening) and whether
-a weak edge may OPEN are coordinated here from confidence + recent £ streak.
+Lot size stays the operator mandate. Direction stays neural. Risk width
+(κ / sl_scale dampening) and whether a weak edge may OPEN are coordinated here
+from the same confidence + recent £ streak.
 """
 from __future__ import annotations
 

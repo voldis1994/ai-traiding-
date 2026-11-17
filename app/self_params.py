@@ -56,6 +56,12 @@ DEFAULTS = {
     'learn_lr': 0.28,
     'learn_win_repeats': 4,
     'learn_loss_repeats': 5,
+    # Closed-trade KEEP/ROLLBACK — ΔW sticks only if holdout accuracy improves.
+    'learn_gate_enabled': 1,
+    'learn_gate_min_rows': 12,
+    'learn_gate_margin': 0.002,
+    'learn_gate_cash_min': 8,
+    'learn_gate_cash_weight': 0.35,
     # HOLD opposite-TP teach — light auxiliary (not a full trade-PnL cannon).
     'hold_shadow_repeats': 2,
     'profit_history_rows': 400,
@@ -76,30 +82,12 @@ DEFAULTS = {
     # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
     'scratch_pnl_abs': 0.05,
     # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
-    # After BE, LIVE prefers 1m OHLC swing structure; these are no-zone fallback.
     'trail_min_mult': 2.0,
     'trail_open_gap_frac': 0.35,
     'trail_fallback_frac': 0.5,
-    # 1m structure trail: last N completed bars + pad as frac of median range.
-    'trail_ohlc_bars': 5,
-    'trail_ohlc_buffer_frac': 0.15,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
-    # Day book — robot equity risk / day +/BE / multi-pos / adaptive lot
-    'day_profit_target_frac': 0.01,
-    'day_loss_budget_frac': 0.02,
-    'day_risk_per_trade_frac': 0.005,
-    'day_be_band_frac': 0.001,
-    'day_max_positions': 3,
-    'day_conviction_nudge': 0.12,
-    'day_lot_vs_mandate_max_mult': 2.0,
-    'day_lot_vs_mandate_min_mult': 0.25,
-    'day_add_min_edge': 0.08,
-    # Situation memory: scene×action £ with time decay → soft OPEN influence
-    'situation_memory_min_samples': 3,
-    'situation_memory_nudge': 0.12,
-    'situation_memory_half_life_days': 14.0,
     # Trail self-arm: MFE fraction of opening risk before enabling trail
     'trail_arm_mfe_frac': 0.55,
     'trail_arm_min_ev': 0.0,
@@ -128,8 +116,36 @@ DEFAULTS = {
     'policy_evolve_enabled': 1,
     # When 1, evaluate_neural_entry consults active_policy.py before OPEN.
     'policy_live_execute': 1,
+    # Record full feature vectors + scores for multi-horizon forecast quality
+    # (does NOT change OPEN/CLOSE rules).
+    'forecast_memory_enabled': 1,
+    # Soft LIVE nudge from fitted multi-horizon head (NeuralCore still proposes).
+    'forecast_bridge_enabled': 1,
+    'forecast_bridge_nudge': 0.06,
+    'forecast_bridge_min_resolved': 24,
+    'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
+    # Day book / situation memory (Komandcentrs + Riski)
+    'day_profit_target_frac': 0.0,
+    'day_loss_budget_frac': 0.10,
+    'day_risk_per_trade_frac': 0.005,
+    'day_risk_gates': 1,
+    'day_size_full_balance': 1,
+    'day_be_band_frac': 0.001,
+    'day_max_positions': 5,
+    'day_conviction_nudge': 0.12,
+    'day_lot_vs_mandate_max_mult': 2.0,
+    'day_lot_vs_mandate_min_mult': 0.25,
+    'day_add_min_edge': 0.04,
+    'day_open_slices': 5,
+    'day_slice_min_edge': 0.04,
+    'situation_memory_min_samples': 3,
+    'situation_memory_nudge': 0.12,
+    'situation_memory_half_life_days': 14.0,
+    'day_add_trend_floor': 0.02,
+    'day_phase_protect_tilt': 0.10,
+    'day_phase_defend_tilt': 0.16,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -156,6 +172,30 @@ BOUNDS = {
     'learn_lr': (0.01, 0.50),
     'learn_win_repeats': (1, 8),
     'learn_loss_repeats': (1, 12),
+    'learn_gate_enabled': (0, 1),
+    'learn_gate_min_rows': (4, 80),
+    'learn_gate_margin': (0.0, 0.05),
+    'learn_gate_cash_min': (4, 40),
+    'learn_gate_cash_weight': (0.0, 1.0),
+    'day_profit_target_frac': (0.0, 0.05),
+    'day_loss_budget_frac': (0.002, 0.10),
+    'day_risk_per_trade_frac': (0.0005, 0.03),
+    'day_risk_gates': (0, 1),
+    'day_size_full_balance': (0, 1),
+    'day_be_band_frac': (0.0001, 0.01),
+    'day_max_positions': (5, 8),
+    'day_conviction_nudge': (0.02, 0.30),
+    'day_lot_vs_mandate_max_mult': (1.0, 5.0),
+    'day_lot_vs_mandate_min_mult': (0.05, 1.0),
+    'day_add_min_edge': (0.02, 0.25),
+    'day_open_slices': (3, 8),
+    'day_slice_min_edge': (0.02, 0.25),
+    'situation_memory_min_samples': (2, 30),
+    'situation_memory_nudge': (0.02, 0.30),
+    'situation_memory_half_life_days': (1.0, 90.0),
+    'day_add_trend_floor': (0.01, 0.08),
+    'day_phase_protect_tilt': (0.04, 0.25),
+    'day_phase_defend_tilt': (0.06, 0.30),
     'hold_shadow_repeats': (1, 4),
     'profit_history_rows': (50, 2000),
     'exit_need_streak': (1, 8),
@@ -171,22 +211,8 @@ BOUNDS = {
     'trail_min_mult': (1.0, 4.0),
     'trail_open_gap_frac': (0.15, 0.7),
     'trail_fallback_frac': (0.25, 0.8),
-    'trail_ohlc_bars': (2, 15),
-    'trail_ohlc_buffer_frac': (0.0, 0.5),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
-    'day_profit_target_frac': (0.001, 0.05),
-    'day_loss_budget_frac': (0.002, 0.10),
-    'day_risk_per_trade_frac': (0.0005, 0.03),
-    'day_be_band_frac': (0.0001, 0.01),
-    'day_max_positions': (1, 8),
-    'day_conviction_nudge': (0.02, 0.30),
-    'day_lot_vs_mandate_max_mult': (1.0, 5.0),
-    'day_lot_vs_mandate_min_mult': (0.05, 1.0),
-    'day_add_min_edge': (0.02, 0.25),
-    'situation_memory_min_samples': (2, 30),
-    'situation_memory_nudge': (0.02, 0.30),
-    'situation_memory_half_life_days': (1.0, 90.0),
     'trail_arm_mfe_frac': (0.25, 1.0),
     'trail_arm_min_ev': (-1.0, 2.0),
     'bracket_vs_vol_noise': (0.8, 2.0),
@@ -209,6 +235,11 @@ BOUNDS = {
     'min_holdout_minute_acc': (0.30, 0.50),
     'policy_evolve_enabled': (0, 1),
     'policy_live_execute': (0, 1),
+    'forecast_memory_enabled': (0, 1),
+    'forecast_bridge_enabled': (0, 1),
+    'forecast_bridge_nudge': (0.0, 0.15),
+    'forecast_bridge_min_resolved': (12, 80),
+    'forecast_bridge_refit_every': (4, 40),
     'self_params_horizon_trades': (8, 80),
 }
 
@@ -262,14 +293,18 @@ def _clip(key, value):
                'max_approved_features','val_min_bars','val_min_folds',
                'val_horizon_bars','model_min_oos','shadow_min_broker_trades',
                'shadow_rollback_window','learn_win_repeats','learn_loss_repeats',
+               'learn_gate_enabled','learn_gate_min_rows','learn_gate_cash_min',
                'hold_shadow_repeats',
                'profit_history_rows','exit_need_streak','prune_min_age',
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
+               'forecast_memory_enabled','forecast_bridge_enabled',
+               'forecast_bridge_min_resolved','forecast_bridge_refit_every',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
-               'day_max_positions','trail_ohlc_bars'):
+               'day_max_positions','day_open_slices','day_size_full_balance',
+               'day_risk_gates'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

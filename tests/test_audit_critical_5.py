@@ -223,14 +223,9 @@ def test_protect_put_timeout_marks_uncertain_retains_levels():
             e.broker=Broker()
             await e.protect_position(pos)
             assert e.broker.calls==1
-            # No auto-pause on protect timeout — keep live; journal SUPERSEDED
-            # so a stale PROTECT cannot freeze the one-cycle engine.
-            assert e.execution_enabled and e.armed
-            assert store.unresolved()==[]
-            row=store.db.execute(
-                "select status from orders where kind='PROTECT' order by id desc limit 1"
-            ).fetchone()
-            assert row[0]=='SUPERSEDED'
+            assert not e.execution_enabled and not e.armed
+            unresolved=store.unresolved()
+            assert len(unresolved)==1 and unresolved[0]['status']=='UNCERTAIN'
             # Broker book untouched — no false SL/TP applied.
             assert e.broker.open[0]['position']['stopLevel'] is None
             assert e.broker.open[0]['position']['profitLevel'] is None
@@ -238,7 +233,7 @@ def test_protect_put_timeout_marks_uncertain_retains_levels():
 
 
 def test_protect_confirm_disconnect_not_false_confirmed():
-    """Pre-test #3: confirm ConnectionError → not CONFIRMED; stay live."""
+    """Pre-test #3: confirm ConnectionError → UNCERTAIN, not CONFIRMED."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'db.sqlite3')
@@ -268,15 +263,14 @@ def test_protect_confirm_disconnect_not_false_confirmed():
 
             e.broker=Broker()
             await e.protect_position(pos)
-            # Uncertain confirm must not mark CONFIRMED and must not auto-pause.
-            assert e.execution_enabled and e.armed
-            assert store.unresolved()==[]
+            unresolved=store.unresolved()
+            assert len(unresolved)==1
+            assert unresolved[0]['status']=='UNCERTAIN'
+            assert not e.execution_enabled
             row=store.db.execute(
                 "select status from orders where kind='PROTECT' order by id desc limit 1"
             ).fetchone()
-            assert row[0]=='SUPERSEDED'
-            # Live levels from the accepted PUT stay (disconnect was on confirm).
-            assert e.broker.open[0]['position']['stopLevel'] is not None
+            assert row[0]=='UNCERTAIN'
     asyncio.run(scenario())
 
 

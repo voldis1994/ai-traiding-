@@ -125,7 +125,7 @@ def _trail_knobs(store=None):
 
 
 def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=0.0,
-                           use_close=True):
+                           use_close=True,entry=None):
     """Trail anchor from recent completed 1m OHLC close swings.
 
     BUY → stop under the lowest *close* of the last N completed bars (since open).
@@ -133,9 +133,14 @@ def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=
     Mid close is adjusted by per-bar spread when present so the anchor sits on
     the exit side (bid / ask), matching live trail tips. Falls back to high/low
     when close is missing.
+
+    When ``entry`` is set (post-BE), loss-side closes are skipped so a single
+    pre-BE dip in the lookback cannot pin the swing under/over entry and freeze
+    the trail at BE.
     """
     if direction not in ('BUY','SELL'):
         return None
+    entry_n=_finite(entry)
     rows=[]
     for row in candles or ():
         t=candle_time(row.get('at'))
@@ -152,10 +157,21 @@ def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=
                 c_bid=c-0.5*sp;c_ask=c+0.5*sp
             else:
                 c_bid=c_ask=c
+            # Post-BE: ignore closes still on the loss side of entry.
+            if entry_n is not None:
+                if direction=='BUY' and c_bid<=entry_n:
+                    continue
+                if direction=='SELL' and c_ask>=entry_n:
+                    continue
             rows.append((t,c_ask,c_bid))
             continue
         if sp is not None and sp>=0:
             h=h-0.5*sp;low=low+0.5*sp
+        if entry_n is not None:
+            if direction=='BUY' and low<=entry_n:
+                continue
+            if direction=='SELL' and h>=entry_n:
+                continue
         rows.append((t,h,low))
     if not rows:
         return None
@@ -256,7 +272,16 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
             buf=max(0.0,float(knobs['ohlc_buffer_frac'])*zr)
         structure_stop=ohlc_1m_structure_stop(
             direction,candles,opened_at=opened_at,
-            lookback=knobs['ohlc_bars'],buffer=buf)
+            lookback=knobs['ohlc_bars'],buffer=buf,entry=entry)
+        # Buffer / residual dip can still leave the swing on the loss side of
+        # entry. Clamping to entry then yields new_stop==BE → None forever
+        # ("No broker-native trail improvement"). Drop unusable structure so
+        # the tip−zone ratchet below can advance past BE.
+        if structure_stop is not None:
+            if sign==1 and float(structure_stop)<=entry+1e-12:
+                structure_stop=None
+            elif sign==-1 and float(structure_stop)>=entry-1e-12:
+                structure_stop=None
     else:
         trail_gap=open_gap
     exit_quote=bid if sign==1 else ask
@@ -305,8 +330,8 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
             structure_used=True
             trail_gap=max(minimum,tip-desired) if desired<tip else trail_gap
         elif be_locked:
-            # No structure yet — still ratchet with OHLC zone / minStop gap,
-            # never the full opening R that pins SL at BE.
+            # No usable structure past BE — ratchet with OHLC zone / minStop gap,
+            # never the full opening R that pins SL at entry.
             soft_gap=max(minimum,min(float(trail_gap),zr if zr and zr>0 else float(trail_gap)))
             desired=tip-soft_gap
             desired=min(desired,legal_cap)

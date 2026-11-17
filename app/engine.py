@@ -2469,7 +2469,10 @@ class SingleTradeEngine:
                     # Unlock cold-start OPEN on poll — do not wait for another trade.
                     self._maybe_release_cold_start_prep()
                     rd=self.brain.trading_readiness()
-                    if not rd.get('ready'):
+                    from . import model_readiness as _mr
+                    # Cold-start with 0 bars must still run chronological prep
+                    # when candles exist — ready alone no longer skips it.
+                    if _mr.needs_historical_prep(rd):
                         self.brain.ensure_prep_eval(
                             candles,tick_size=tick or 0.01,spread_fallback=ask-bid)
                 except Exception as exc:
@@ -2601,13 +2604,16 @@ class SingleTradeEngine:
         if not hasattr(self.brain,'trading_readiness'):
             return None
         rd=self.brain.trading_readiness()
-        if rd.get('ready'):
-            return rd
         from . import model_readiness
+        if model_readiness.allows_live_open(rd) and not model_readiness.needs_historical_prep(rd):
+            return rd
+        if model_readiness.allows_live_open(rd) and rd.get('cold_start_open'):
+            # Already granted — keep seeking real bars via ensure_prep_eval.
+            return rd
         return model_readiness.grant_cold_start_open(
             self.store,self.brain,
             reason=('Cold-start OPEN after first manual close — '
-                    'prep holdout was blocking new entries'))
+                    'historical prep not completed; LIVE allowed while candles train'))
 
     def live_open_gates(self,action=None):
         """Shared LIVE OPEN helper for poll/_entry_evaluation/submit (audit #22–#23).
@@ -2617,7 +2623,8 @@ class SingleTradeEngine:
         submit should call this before placing an order.
         """
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
-        if not readiness.get('ready'):
+        from . import model_readiness as _mr
+        if not _mr.allows_live_open(readiness):
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
                     'readiness':readiness,'economic_utility':None,'hard_risk':None}
         # Hard-risk limits are informational only — they never gate LIVE OPEN.
@@ -3352,13 +3359,75 @@ class SingleTradeEngine:
                 return True
         return False
 
-    async def _pnl_from_broker_history(self,deal_id,*,queued_at=None,exact_deal=False):
-        """Pull closed-trade cash from Capital history/activity (not mid×size)."""
+    def _history_cooldown_active(self):
+        """True while Capital history is cooling down after errors / 429 storm."""
+        until=_num(self.store.get('broker_history_cooldown_until'))
+        return until is not None and time.time()<float(until)
+
+    def _arm_history_cooldown(self,*,seconds=60,exc=None,deal_id=None):
+        """Back off history API after failures so we do not mint 10k+ warning events."""
+        prev=_num(self.store.get('broker_history_cooldown_until')) or 0.0
+        until=max(float(prev),time.time()+max(5,int(seconds)))
+        self.store.set('broker_history_cooldown_until',until)
+        # Throttle warning spam: at most one event per cooldown window.
+        last_log=_num(self.store.get('broker_history_fail_logged_at')) or 0.0
+        if time.time()-float(last_log)<float(seconds):
+            return
+        self.store.set('broker_history_fail_logged_at',time.time())
+        detail={'cooldown_s':int(seconds),'until':until}
+        if exc is not None:
+            detail['type']=type(exc).__name__
+            detail['error']=str(exc)[:180]
+        if deal_id is not None:
+            detail['deal_id']=str(deal_id)
+        self.store.event('warning','Broker history P&L lookup cooling down',detail)
+
+    def _match_pnl_in_activity_rows(self,rows,deal,*,exact_deal=False):
+        for row in rows or []:
+            if not self._activity_matches_deal(row,deal,exact=exact_deal):
+                continue
+            details=row.get('details') if isinstance(row.get('details'),dict) else {}
+            val=self._row_cash_pnl(row,details)
+            if val is not None:
+                return float(val),self._cash_currency(
+                    row.get('currency') or details.get('currency'))
+        return None
+
+    def _match_pnl_in_transaction_rows(self,rows,deal,*,exact_deal=False):
+        for row in rows or []:
+            if not self._transaction_matches_deal(row,deal,exact=exact_deal):
+                continue
+            val=self._row_cash_pnl(row)
+            if val is not None:
+                return float(val),self._cash_currency(row.get('currency'))
+        return None
+
+    async def _pnl_from_broker_history(self,deal_id,*,queued_at=None,exact_deal=False,
+                                       shared_activity=None,shared_transactions=None,
+                                       allow_widen=True):
+        """Pull closed-trade cash from Capital history/activity (not mid×size).
+
+        ``shared_*`` payloads let one poll reuse a single 24h fetch across many
+        pending deals — avoids the 86k failed-request storm under 429/backoff.
+        """
         if not self.broker or not deal_id:return None
+        if self._history_cooldown_active():
+            return None
         deal=str(deal_id)
         look=self._history_lookback(deal,queued_at=queued_at)
+        # Prefer shared window first (one fetch for the whole pending queue).
+        if shared_activity is not None:
+            hit=self._match_pnl_in_activity_rows(
+                shared_activity.get('activities') if isinstance(shared_activity,dict)
+                else shared_activity,deal,exact_deal=exact_deal)
+            if hit:return hit
+        if shared_transactions is not None:
+            hit=self._match_pnl_in_transaction_rows(
+                shared_transactions.get('transactions') if isinstance(shared_transactions,dict)
+                else shared_transactions,deal,exact_deal=exact_deal)
+            if hit:return hit
         # Activity often names the dealId on SL/TP/USER closes.
-        if hasattr(self.broker,'activity'):
+        if hasattr(self.broker,'activity') and shared_activity is None:
             try:
                 kwargs=dict(detailed=True,deal_id=deal)
                 if look['from_time']:
@@ -3368,26 +3437,20 @@ class SingleTradeEngine:
                 payload=await self.broker.activity(**kwargs)
                 rows=list(payload.get('activities') or [])
                 # Filtered dealId+from_time can return empty on lag; widen once.
-                if not rows and look['from_time']:
+                if not rows and look['from_time'] and allow_widen:
                     payload=await self.broker.activity(
                         detailed=True,deal_id=deal,last_period=86400)
                     rows=list(payload.get('activities') or [])
                 # Still empty: Capital sometimes ignores dealId filter — scan window.
-                if not rows:
+                if not rows and allow_widen:
                     wide=dict(detailed=True,last_period=86400)
                     payload=await self.broker.activity(**wide)
                     rows=list(payload.get('activities') or [])
-                for row in rows:
-                    if not self._activity_matches_deal(row,deal,exact=exact_deal):continue
-                    details=row.get('details') if isinstance(row.get('details'),dict) else {}
-                    val=self._row_cash_pnl(row,details)
-                    if val is not None:
-                        return float(val),self._cash_currency(
-                            row.get('currency') or details.get('currency'))
+                hit=self._match_pnl_in_activity_rows(rows,deal,exact_deal=exact_deal)
+                if hit:return hit
             except Exception as exc:
-                self.store.event('warning','Activity history P&L lookup failed',
-                                 {'type':type(exc).__name__,'deal_id':deal})
-        if hasattr(self.broker,'transactions'):
+                self._arm_history_cooldown(seconds=90,exc=exc,deal_id=deal)
+        if hasattr(self.broker,'transactions') and shared_transactions is None:
             try:
                 kwargs=dict(tx_type='TRADE')
                 if look['from_time']:
@@ -3396,18 +3459,14 @@ class SingleTradeEngine:
                     kwargs['last_period']=look['last_period']
                 payload=await self.broker.transactions(**kwargs)
                 rows=list(payload.get('transactions') or [])
-                if not rows and look['from_time']:
+                if not rows and look['from_time'] and allow_widen:
                     payload=await self.broker.transactions(
                         last_period=86400,tx_type='TRADE')
                     rows=list(payload.get('transactions') or [])
-                for row in rows:
-                    if not self._transaction_matches_deal(row,deal,exact=exact_deal):continue
-                    val=self._row_cash_pnl(row)
-                    if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
+                hit=self._match_pnl_in_transaction_rows(rows,deal,exact_deal=exact_deal)
+                if hit:return hit
             except Exception as exc:
-                self.store.event('warning','Transaction history P&L lookup failed',
-                                 {'type':type(exc).__name__,'deal_id':deal})
+                self._arm_history_cooldown(seconds=90,exc=exc,deal_id=deal)
         return None
 
     def _requeue_unsettled_cash_closes(self):
@@ -3686,7 +3745,7 @@ class SingleTradeEngine:
         open_n=len([p for p in (self.positions or [])
                     if str(p.get('dealId'))!=deal])
         day_book.record_close(
-            self.store,pnl=val,equity=equity,open_count=open_n)
+            self.store,pnl=val,equity=equity,open_count=open_n,deal_id=deal)
         # Situation memory: bank £ into the OPEN-time scene×action bucket.
         saved=self.store.get('entry_brain:'+deal) or {}
         direction=action or saved.get('direction') or self._trade_direction(deal)
@@ -3799,6 +3858,17 @@ class SingleTradeEngine:
             pass
         return True
 
+    def _pending_pnl_due(self,base,*,now_ts=None):
+        """Exponential backoff so unsettled deals do not hammer Capital every poll."""
+        now_ts=time.time() if now_ts is None else float(now_ts)
+        attempts=int(base.get('attempts') or 0)
+        last=_num(base.get('last_attempt_at'))
+        if last is None or attempts<=0:
+            return True
+        # 0→immediate, then 8,16,32,64,128,256,300s cap.
+        delay=min(300.0,float(2**min(max(attempts,1)+2,8)))
+        return (now_ts-float(last))>=delay
+
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
         if not self.broker:return
@@ -3810,22 +3880,47 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__})
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
         if not pending:return
+        now_ts=time.time()
+        # Global cool-down after history errors — stop minting failure events.
+        if self._history_cooldown_active():
+            self.store.set('pending_broker_pnl_deals',pending)
+            return
+        # One shared 24h window for the whole queue (N deals ≠ N×API storms).
+        shared_act=shared_tx=None
+        try:
+            if hasattr(self.broker,'activity'):
+                shared_act=await self.broker.activity(
+                    detailed=True,last_period=86400)
+            if hasattr(self.broker,'transactions'):
+                shared_tx=await self.broker.transactions(
+                    last_period=86400,tx_type='TRADE')
+        except Exception as exc:
+            self._arm_history_cooldown(seconds=120,exc=exc)
+            self.store.set('pending_broker_pnl_deals',pending)
+            return
         remaining=[]
+        # Cap work per poll so a long queue cannot starve protect/trail.
+        due_budget=5
         for item in pending:
             base=item if isinstance(item,dict) else {'deal_id':item}
             deal=str(base.get('deal_id'))
             queued=base.get('queued_at')
-            attempts=int(base.get('attempts') or 0)+1
             exit_level=base.get('exit_level')
-            # Pass queued_at so history lookback is not stuck on last 30 minutes.
-            found=await self._pnl_from_broker_history(deal,queued_at=queued)
+            if not self._pending_pnl_due(base,now_ts=now_ts) or due_budget<=0:
+                remaining.append(dict(base) if isinstance(item,dict) else base)
+                continue
+            due_budget-=1
+            attempts=int(base.get('attempts') or 0)+1
+            # Shared payloads first; per-deal widen only early attempts.
+            found=await self._pnl_from_broker_history(
+                deal,queued_at=queued,shared_activity=shared_act,
+                shared_transactions=shared_tx,allow_widen=(attempts<=2))
             # Fuzzy epic/size match early — Capital often uses short tx references.
-            if not found and attempts>=1:
+            if not found and attempts<=6 and not self._history_cooldown_active():
                 try:
                     found=await self._pnl_fuzzy_instrument_cash(deal,queued_at=queued)
                 except Exception as exc:
-                    self.store.event('warning','Fuzzy pending P&L failed',
-                                     {'deal_id':deal,'type':type(exc).__name__})
+                    self._arm_history_cooldown(seconds=60,exc=exc,deal_id=deal)
             # Exhausted history: bind last live UPL for Admin display ONLY —
             # never teach from UPL. Keep the deal in pending so a later real
             # broker cash row can overwrite the estimate (do not drop forever).
@@ -3842,11 +3937,12 @@ class SingleTradeEngine:
                         'Pending cash shown from last UPL; still waiting for broker',
                         {'deal_id':deal,'upl':float(upl),'attempts':attempts})
                     nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                    nxt['upl_shown']=True
+                    nxt['upl_shown']=True;nxt['last_attempt_at']=now_ts
                     remaining.append(nxt)
                     continue
             if not found:
                 nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                nxt['last_attempt_at']=now_ts
                 remaining.append(nxt)
                 continue
             pnl,hist_ccy=found
@@ -3859,7 +3955,7 @@ class SingleTradeEngine:
         self.store.set('pending_broker_pnl_deals',remaining)
         # Flat book: also harvest Capital cash for open SQLite rows whose deal vanished
         # before we queued pending (restart / missed sync).
-        if not self.positions:
+        if not self.positions and not self._history_cooldown_active():
             await self._reconcile_orphan_open_trades()
 
     async def _reconcile_orphan_open_trades(self):
@@ -5314,7 +5410,8 @@ class SingleTradeEngine:
         if self._fusion_entry_blocked():
             return ('External fusion gap blocks new entry: '+(
                 self.fusion_block_reason or 'aligned external neural inputs unavailable'))
-        if not readiness.get('ready'):
+        from . import model_readiness as _mr
+        if not _mr.allows_live_open(readiness):
             return 'Model prep/eval not ready: '+(readiness.get('reason') or '')
         bar_done=(self.last_entry_processed_bar==self.last_decision_bar
                   and self.last_decision_bar is not None)
@@ -5349,6 +5446,8 @@ class SingleTradeEngine:
         intermarket=self.intermarket.state
         readiness=(self.brain.trading_readiness()
                    if hasattr(self.brain,'trading_readiness') else {'ready':False})
+        from . import model_readiness as _mr_snap
+        live_ready=_mr_snap.allows_live_open(readiness)
         hr_snap=hard_risk.snapshot(self.store)
         db_snap=day_book.snapshot(
             self.store,equity=self._account_equity(),positions=self.positions)
@@ -5456,7 +5555,7 @@ class SingleTradeEngine:
                 'manage_signal':self._manage_signal,
                 'hard_risk':hr_snap,
                 'day_book':db_snap,
-                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and book_open.get('allowed') and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
+                'entry_eligible':bool(self.market_context.get('ready') and self.mandate and book_open.get('allowed') and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and live_ready),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
                 'entry_policy_reason':evaluation.get('reason') if evaluation else None,

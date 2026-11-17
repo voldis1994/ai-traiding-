@@ -84,10 +84,29 @@ def load_params(store):
     }
 
 
+def _trade_closed_on_utc_date(closed_raw, today):
+    """True when a trades.closed timestamp falls on the given UTC date string."""
+    if closed_raw in (None, '') or not today:
+        return False
+    try:
+        text = str(closed_raw).replace('Z', '+00:00')
+        # SQLite / journal sometimes store 'YYYY-MM-DD HH:MM:SS' without T.
+        if 'T' not in text and ' ' in text[:19]:
+            text = text[:10] + 'T' + text[11:]
+        dt = datetime.fromisoformat(text[:32])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date().isoformat() == today
+    except Exception:
+        # Fallback: prefix match on ISO date.
+        return str(closed_raw)[:10] == today
+
+
 def load_daily(store, *, now=None, equity=None):
     today = _utc_date(now)
     raw = store.get(DAILY_KEY) if store is not None else None
     if isinstance(raw, dict) and raw.get('date') == today:
+        deal_ids = raw.get('deal_ids') if isinstance(raw.get('deal_ids'), list) else []
         state = {
             'date': today,
             'realized_pnl': float(_finite(raw.get('realized_pnl')) or 0.0),
@@ -98,6 +117,7 @@ def load_daily(store, *, now=None, equity=None):
             'start_equity': _finite(raw.get('start_equity')),
             'phase': raw.get('phase') or PHASE_HUNT,
             'updated_at': raw.get('updated_at'),
+            'deal_ids': [str(x) for x in deal_ids],
         }
     else:
         state = {
@@ -110,12 +130,81 @@ def load_daily(store, *, now=None, equity=None):
             'start_equity': _finite(equity),
             'phase': PHASE_HUNT,
             'updated_at': None,
+            'deal_ids': [],
         }
     if state['start_equity'] is None and equity is not None:
         eq = _finite(equity)
         if eq is not None and eq > 0:
             state['start_equity'] = float(eq)
     return state
+
+
+def reconcile_daily_from_trades(store, *, now=None, equity=None, open_count=0):
+    """Rebuild UTC-day closes / realized P&L from the trades table.
+
+    Fixes Admin desync when ``day_book_daily_v1`` stayed at 0 closes while
+    ``trades`` already had several closed rows (missed ``record_close``,
+    restart before bank, or late broker cash).
+    """
+    daily = load_daily(store, now=now, equity=equity)
+    if store is None:
+        return daily
+    today = daily.get('date') or _utc_date(now)
+    try:
+        rows = store.db.execute(
+            'SELECT deal_id,pnl,pnl_source,closed FROM trades '
+            'WHERE closed IS NOT NULL AND pnl IS NOT NULL'
+        ).fetchall()
+    except Exception:
+        return daily
+    # Prefer broker cash when a deal appears twice; otherwise keep any settled pnl.
+    by_deal = {}
+    for deal_id, pnl, src, closed in rows:
+        if not _trade_closed_on_utc_date(closed, today):
+            continue
+        cash = _finite(pnl)
+        if cash is None:
+            continue
+        deal = str(deal_id)
+        src_s = str(src or '').strip().lower()
+        prev = by_deal.get(deal)
+        if prev is None:
+            by_deal[deal] = (float(cash), src_s)
+            continue
+        # Upgrade estimate → broker when cash finally settles.
+        if prev[1] != 'broker' and src_s == 'broker':
+            by_deal[deal] = (float(cash), src_s)
+    if not by_deal:
+        return daily
+    realized = 0.0
+    wins = losses = 0
+    deal_ids = sorted(by_deal.keys())
+    for deal in deal_ids:
+        cash, _src = by_deal[deal]
+        realized += float(cash)
+        if cash > 0:
+            wins += 1
+        elif cash < 0:
+            losses += 1
+    closes = len(deal_ids)
+    daily_closes = int(daily.get('closes') or 0)
+    daily_pnl = float(daily.get('realized_pnl') or 0.0)
+    daily_ids = set(str(x) for x in (daily.get('deal_ids') or []))
+    # Already aligned — leave phase/opens alone.
+    if (daily_closes == closes and abs(daily_pnl - realized) < 1e-9
+            and daily_ids == set(deal_ids)):
+        return daily
+    daily['realized_pnl'] = float(realized)
+    daily['closes'] = int(closes)
+    daily['wins'] = int(wins)
+    daily['losses'] = int(losses)
+    daily['deal_ids'] = list(deal_ids)
+    params = load_params(store)
+    b = budgets(equity=equity, params=params, daily=daily)
+    daily['phase'] = phase_for(
+        daily=daily, budgets_map=b, open_count=int(open_count or 0))
+    save_daily(store, daily)
+    return daily
 
 
 def save_daily(store, state):
@@ -328,9 +417,10 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
     BUY open) — then do not demand a huge softmax edge to ADD on the rebound.
     """
     params = load_params(store)
-    daily = load_daily(store, now=now, equity=equity)
-    b = budgets(equity=equity, params=params, daily=daily)
     open_n = len(positions or [])
+    daily = reconcile_daily_from_trades(
+        store, now=now, equity=equity, open_count=open_n)
+    b = budgets(equity=equity, params=params, daily=daily)
     phase = phase_for(daily=daily, budgets_map=b, open_count=open_n)
     daily['phase'] = phase
     save_daily(store, daily)
@@ -558,12 +648,23 @@ def record_open(store, *, now=None, equity=None):
     return daily
 
 
-def record_close(store, *, pnl, now=None, equity=None, open_count=0):
-    """Bank broker £ into the day book and refresh phase."""
+def record_close(store, *, pnl, now=None, equity=None, open_count=0, deal_id=None):
+    """Bank broker £ into the day book and refresh phase.
+
+    ``deal_id`` makes banking idempotent so reconcile + late cash cannot
+    double-count the same close.
+    """
     cash = _finite(pnl)
     if cash is None:
         return load_daily(store, now=now, equity=equity)
     daily = load_daily(store, now=now, equity=equity)
+    if deal_id is not None:
+        ids = [str(x) for x in (daily.get('deal_ids') or [])]
+        deal = str(deal_id)
+        if deal in ids:
+            return daily
+        ids.append(deal)
+        daily['deal_ids'] = ids
     daily['realized_pnl'] = float(daily.get('realized_pnl') or 0.0) + float(cash)
     daily['closes'] = int(daily.get('closes') or 0) + 1
     if cash > 0:
@@ -628,9 +729,10 @@ def open_upl_sum(positions):
 
 def snapshot(store, *, equity=None, positions=None):
     params = load_params(store)
-    daily = load_daily(store, equity=equity)
-    b = budgets(equity=equity, params=params, daily=daily)
     open_n = len(positions or [])
+    daily = reconcile_daily_from_trades(
+        store, equity=equity, open_count=open_n)
+    b = budgets(equity=equity, params=params, daily=daily)
     phase = phase_for(daily=daily, budgets_map=b, open_count=open_n)
     upl = open_upl_sum(positions)
     day_mark = float(daily.get('realized_pnl') or 0.0) + (float(upl) if upl is not None else 0.0)

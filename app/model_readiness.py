@@ -213,6 +213,27 @@ def _net_bps(rows, i, action):
         return signed - 0.5 * ((sa / entry) * 10000. + (sb / max(exit_px, 1e-12)) * 10000.)
 
 
+def allows_live_open(state) -> bool:
+    """LIVE OPEN when chronological prep passed OR cold-start grant is active."""
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get('ready') or state.get('cold_start_open'))
+
+
+def needs_historical_prep(state) -> bool:
+    """True when chronological train/eval bars are still missing or dishonest."""
+    if not isinstance(state, dict):
+        return True
+    train_b = int(state.get('train_bars') or 0)
+    eval_b = int(state.get('eval_bars') or 0)
+    if state.get('ready') and train_b > 0 and eval_b > 0 and not state.get('cold_start_open'):
+        return False
+    # Warm-path ready can stand in when online labels were written into bars.
+    if state.get('ready') and train_b > 0 and eval_b > 0:
+        return False
+    return True
+
+
 def trading_readiness(store, brain):
     """Public readiness snapshot used by engine / UI / evaluate_neural_entry."""
     epic = getattr(brain, 'epic', None)
@@ -227,19 +248,50 @@ def trading_readiness(store, brain):
         round(minute_acc, 4) if minute_acc is not None else None)
     state['online_labeled_samples'] = labeled
     state['min_online_labeled'] = online_need
-    if state.get('ready'):
+    # Heal legacy cold-start rows that claimed ready=True with 0 train/eval bars.
+    if (state.get('ready') and state.get('cold_start_open')
+            and int(state.get('train_bars') or 0) <= 0
+            and int(state.get('eval_bars') or 0) <= 0):
+        state = dict(state)
+        state.update({
+            'ready': False,
+            'stage': 'cold_start_open',
+            'historical_validation': False,
+            'reason': state.get('reason') or (
+                'Cold-start OPEN — LIVE permitted; historical prep not completed'),
+        })
+        save_state(store, epic, state)
+    state['historical_validation'] = bool(
+        state.get('ready') and int(state.get('train_bars') or 0) > 0
+        and int(state.get('eval_bars') or 0) > 0
+        and not state.get('cold_start_open'))
+    if state.get('ready') and not needs_historical_prep(state):
         state['reason'] = state.get('reason') or 'Prep/eval passed — LIVE OPEN permitted'
+        return state
+    # Cold-start: LIVE OPEN is allowed via cold_start_open, but ready stays
+    # false until chronological prep (or warm online path) actually fills bars.
+    if state.get('cold_start_open'):
+        state['ready'] = False
+        state['stage'] = state.get('stage') or 'cold_start_open'
+        state['reason'] = state.get('reason') or (
+            'Cold-start OPEN — LIVE permitted; historical prep not completed')
+        state['historical_validation'] = False
         return state
     # Warm continue: prior online labels on this epic stand in for cold prep,
     # but still require a completed chronological record or enough labels.
-    if labeled >= online_need and state.get('stage') in ('ready', 'evaluated', 'trained', 'idle'):
+    if labeled >= online_need and state.get('stage') in (
+            'ready', 'evaluated', 'trained', 'idle', 'cold_start_open', 'blocked'):
         # Promote warm brains that already have chronological online evidence.
         if labeled >= online_need and minute_acc is not None:
             state = dict(state)
             state.update({
                 'ready': True,
                 'stage': 'ready',
+                'cold_start_open': False,
+                'train_bars': max(int(state.get('train_bars') or 0), labeled),
+                'eval_bars': max(int(state.get('eval_bars') or 0), min(labeled, online_need)),
                 'minute_direction_accuracy': round(minute_acc, 4),
+                'historical_validation': True,
                 'reason': (f'Online warm path: {labeled} delayed minute labels '
                            f'(minute-direction accuracy {minute_acc:.1%} — not trade win rate)'),
             })
@@ -281,8 +333,10 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
         return _empty(None, reason='No instrument activated for prep/eval')
     epic = brain.epic
     existing = load_state(store, epic)
-    if existing.get('ready'):
+    # Skip only when chronological/warm ready is already honest (bars present).
+    if existing.get('ready') and not needs_historical_prep(existing):
         return existing
+    had_cold_start = bool(existing.get('cold_start_open'))
 
     fl = floors(store)
     need = int(fl['min_prep_candles'])
@@ -291,10 +345,18 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
     train, holdout, rows = chronological_split(candles, store=store)
     state = mark_candles_loaded(store, epic, candles)
     if len(rows) < need or len(train) < MIN_BARS + 8 or len(holdout) < hold_min:
-        state['stage'] = 'candles_loaded'
+        state['stage'] = 'cold_start_open' if had_cold_start else 'candles_loaded'
         state['ready'] = False
-        state['reason'] = (f'Insufficient chronological history for prep/eval '
-                           f'(have {len(rows)}, need ≥{need} with holdout)')
+        state['cold_start_open'] = had_cold_start
+        state['historical_validation'] = False
+        state['train_bars'] = len(train)
+        state['eval_bars'] = len(holdout)
+        state['reason'] = (
+            (f'Cold-start OPEN active; still need ≥{need} chronological candles '
+             f'for historical prep (have {len(rows)})')
+            if had_cold_start else
+            (f'Insufficient chronological history for prep/eval '
+             f'(have {len(rows)}, need ≥{need} with holdout)'))
         return save_state(store, epic, state)
 
     # --- Stage 2: TRAIN on earlier split only ---
@@ -399,24 +461,53 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
     if len(nets) >= 8 and mean_net is not None and mean_net < 0:
         passed = False
 
-    state.update({
-        'stage': 'ready' if passed else 'blocked',
-        'ready': bool(passed),
-        'eval_bars': len(holdout),
-        'eval_samples': total,
-        'minute_direction_accuracy': round(minute_acc, 4) if minute_acc is not None else None,
-        'holdout_net_bps_mean': round(mean_net, 4) if mean_net is not None else None,
-        'train_steps': train_steps,
-        'candles_loaded': len(rows),
-        'min_holdout_bars': hold_min,
-        'min_holdout_minute_acc': acc_floor,
-        'reason': (
-            'Prep/eval passed on chronological holdout — LIVE OPEN permitted'
-            if passed else
-            (f'Prep/eval holdout failed: minute-direction={minute_acc!s}, '
-             f'net_bps_mean={mean_net!s}, samples={total}/{hold_min}')
-        ),
-    })
+    if passed:
+        state.update({
+            'stage': 'ready',
+            'ready': True,
+            'cold_start_open': False,
+            'historical_validation': True,
+            'train_bars': len(train),
+            'eval_bars': len(holdout),
+            'eval_samples': total,
+            'minute_direction_accuracy': (
+                round(minute_acc, 4) if minute_acc is not None else None),
+            'holdout_net_bps_mean': (
+                round(mean_net, 4) if mean_net is not None else None),
+            'train_steps': train_steps,
+            'candles_loaded': len(rows),
+            'min_holdout_bars': hold_min,
+            'min_holdout_minute_acc': acc_floor,
+            'reason': 'Prep/eval passed on chronological holdout — LIVE OPEN permitted',
+        })
+    else:
+        # Holdout failed — keep cold-start LIVE grant if it was already active,
+        # but never claim ready=True with empty validation semantics.
+        state.update({
+            'stage': 'cold_start_open' if had_cold_start else 'blocked',
+            'ready': False,
+            'cold_start_open': had_cold_start,
+            'historical_validation': False,
+            'train_bars': len(train),
+            'eval_bars': len(holdout),
+            'eval_samples': total,
+            'minute_direction_accuracy': (
+                round(minute_acc, 4) if minute_acc is not None else None),
+            'holdout_net_bps_mean': (
+                round(mean_net, 4) if mean_net is not None else None),
+            'train_steps': train_steps,
+            'candles_loaded': len(rows),
+            'min_holdout_bars': hold_min,
+            'min_holdout_minute_acc': acc_floor,
+            'reason': (
+                (f'Cold-start OPEN active; chronological holdout still failing '
+                 f'(minute-direction={minute_acc!s}, net_bps_mean={mean_net!s}, '
+                 f'samples={total}/{hold_min})')
+                if had_cold_start else
+                (f'Prep/eval holdout failed: minute-direction={minute_acc!s}, '
+                 f'net_bps_mean={mean_net!s}, samples={total}/{hold_min}')
+            ),
+        })
     save_state(store, epic, state)
     store.event('learning',
                 'Prep/eval '+('PASSED' if passed else 'BLOCKED')+' for LIVE OPEN',
@@ -434,12 +525,19 @@ def grant_cold_start_open(store, brain, *, reason=None) -> dict:
     Zero-start flow: operator opens one manual trade → it closes → robot must be
     allowed to OPEN. A failed chronological holdout must not freeze the session
     forever while online minute labels are still near zero.
+
+    Honesty: ``ready`` stays False until train/eval bars exist. LIVE permission
+    is ``cold_start_open`` — Admin must not read this as completed historical
+    validation.
     """
     epic = getattr(brain, 'epic', None)
     if not epic:
         return _empty(None, reason='No instrument for cold-start open grant')
     state = load_state(store, epic)
-    if state.get('ready'):
+    if state.get('ready') and not state.get('cold_start_open'):
+        return state
+    if state.get('ready') and int(state.get('train_bars') or 0) > 0 and int(
+            state.get('eval_bars') or 0) > 0:
         return state
     fl = floors(store)
     labeled = int(getattr(brain, 'labeled', 0) or 0)
@@ -450,38 +548,46 @@ def grant_cold_start_open(store, brain, *, reason=None) -> dict:
         return trading_readiness(store, brain)
     msg = (reason or
            'Cold-start OPEN after first manual close — live £ teaches; '
-           'prep holdout no longer hard-blocks this session')
+           'historical prep not completed (train/eval bars still 0 until candles run)')
     state = dict(state)
     state.update({
-        'ready': True,
-        'stage': 'ready',
+        'ready': False,
+        'stage': 'cold_start_open',
         'cold_start_open': True,
+        'historical_validation': False,
         'reason': msg,
     })
     save_state(store, epic, state)
     if store is not None:
         store.event('learning', 'Cold-start prep release — LIVE OPEN permitted',
                     {'epic': epic, 'online_labeled': labeled,
-                     'online_need': online_need, 'reason': msg})
+                     'online_need': online_need, 'ready': False,
+                     'train_bars': int(state.get('train_bars') or 0),
+                     'eval_bars': int(state.get('eval_bars') or 0),
+                     'reason': msg})
     return state
 
 
 def ensure_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0):
     """Idempotent: return current readiness or run prep when needed."""
     status = trading_readiness(store, brain)
-    if status.get('ready'):
+    # Real chronological (or warm) ready — nothing to do.
+    if status.get('ready') and not needs_historical_prep(status):
         return status
     if not candles or not getattr(brain, 'epic', None):
+        # Keep cold-start LIVE grant even when candles are still missing.
+        if status.get('cold_start_open'):
+            return grant_cold_start_open(store, brain, reason=status.get('reason'))
         return status
     # Avoid retraining every poll after a failed holdout; retry when a handful
     # more bars arrive (was +32 — left zero-start sessions stuck too long).
-    if status.get('stage') == 'blocked':
-        # Operator already granted cold-start OPEN for this epic — keep it.
-        if status.get('cold_start_open'):
-            return grant_cold_start_open(store, brain, reason=status.get('reason'))
+    if status.get('stage') == 'blocked' and not status.get('cold_start_open'):
         rows = _sorted_candles(candles)
         prev = int(status.get('candles_loaded') or 0)
         if len(rows) < prev + 8:
             return status
+    # Cold-start with 0 bars: still attempt real prep when candles exist so
+    # train_bars/eval_bars become honest; LIVE stays open via cold_start_open
+    # if holdout fails again.
     return run_prep_eval(store, brain, candles, tick_size=tick_size,
                          spread_fallback=spread_fallback)

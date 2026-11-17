@@ -357,6 +357,42 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
     p = params or load_params(None)
     b = budgets(equity=equity, params=p, daily=daily)
     rpt = _finite(b.get('risk_per_trade'))
+    full_bal = int(p.get('size_full_balance') or 0) == 1
+    minimum = grid['min']
+    step = grid['step']
+    # Full-balance + missing pip value must NOT glue to mandate (that left LIVE
+    # on a single tiny/seed lot while cash-risk budget was the whole £ balance).
+    # Deploy an N×minDealSize pack (N=open_slices) so flat OPEN still multi-tickets.
+    if tick_value is None and full_bal and rpt is not None and rpt > 0:
+        want = max(3, int(p.get('open_slices') or 5))
+        try:
+            pack_raw = Decimal(str(minimum)) * Decimal(int(want))
+        except Exception:
+            pack_raw = minimum
+        pack = snap_deal_size(
+            pack_raw, min_size=minimum, step=step, max_size=grid.get('max'))
+        if pack is None or pack <= 0:
+            pack = snap_deal_size(
+                minimum, min_size=minimum, step=step, max_size=grid.get('max'))
+        if pack is None or pack <= 0:
+            return {
+                'size': None, 'reason': 'full_balance_no_tick_cannot_pack',
+                'allowed': False, 'budgets': b, 'size_grid': grid,
+            }
+        return {
+            'size': pack,
+            'reason': 'full_balance_no_tick_value_min_pack',
+            'allowed': True,
+            'budgets': b,
+            'estimated_risk': None,
+            'scale': float(pack / seed) if seed > 0 else 1.0,
+            'size_full_balance': True,
+            'size_grid': {
+                'min': str(grid['min']), 'step': str(grid['step']),
+                'max': str(grid['max']) if grid.get('max') is not None else None,
+                'source': grid.get('source'),
+            },
+        }
     if rpt is None or rpt <= 0 or stop_ticks is None or tick_value is None:
         return {
             'size': seed, 'reason': 'mandate_on_capital_grid', 'allowed': True,
@@ -365,11 +401,8 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
         }
     committed = committed_risk(
         positions, stop_ticks_by_deal=stop_ticks_by_deal, tick_value=tick_value)
-    full_bal = int(p.get('size_full_balance') or 0) == 1
     hi_mult = max(1.0, float(p.get('lot_max_mult') or 2.0))
     lo_mult = max(0.0, float(p.get('lot_min_mult') or 0.25))
-    minimum = grid['min']
-    step = grid['step']
     if full_bal:
         # Use whole account cash-risk: Capital maxDealSize is the only ceiling
         # (mandate 2× cap would leave most of a £20 book unused).
@@ -585,12 +618,14 @@ def _slice_advantageous(*, score_edge=None, action=None, live_trend=None,
 
 def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=None,
                         score_edge=None, action=None, live_trend=None,
-                        structure=None, returns_bps=None):
+                        structure=None, returns_bps=None, force_flat=False):
     """Split one planned lot into N Capital-grid slices for simultaneous OPEN.
 
-    Flat + BUY/SELL → up to ``day_open_slices`` (default 5) pieces whose
-    sizes sum ≈ total (when the lot covers ≥2 broker mins). Already-open
-    books ADD one slice at a time on later bars.
+    Flat + BUY/SELL → up to ``day_open_slices`` separate tickets, preferring
+    ``N×minDealSize`` (remainder bumped by step) so a 0.03 pack becomes
+    3×0.01 — never one chunk. ``force_flat=True`` ignores an already-open
+    book (submit decided flat before sync ghosts / mid-burst siblings).
+    Already-open ADD path (force_flat False) stays one slice per call.
     """
     grid = size_grid if isinstance(size_grid, dict) else {}
     mn = grid.get('min')
@@ -603,7 +638,7 @@ def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=Non
     params = load_params(store)
     max_pos = max(5, int(params.get('max_positions') or 5))
     want = max(3, int(params.get('open_slices') or 5))
-    open_n = len(positions or [])
+    open_n = 0 if force_flat else len(positions or [])
     room = max(0, max_pos - open_n)
     advantageous = _slice_advantageous(
         score_edge=score_edge, action=action, live_trend=live_trend,
@@ -618,15 +653,16 @@ def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=Non
         # Already in a deal → ADD one slice; HOLD never multi-slices.
         n = 1
     else:
-        # Flat BUY/SELL: always split into as many tickets as the lot covers
-        # (up to open_slices). Do not collapse to one when room was evolved to 1.
+        # Flat BUY/SELL: always split into as many min-lot tickets as the
+        # planned size covers (up to open_slices). Prefer N×minDealSize.
         n = min(want, max_by_min if max_by_min > 0 else 1, max(room, want))
     n = max(1, min(n, max_by_min if max_by_min > 0 else 1))
     if n <= 1:
         one = snap_deal_size(total, min_size=mn, step=step, max_size=mx)
         return [one] if one is not None else []
-    raw = total / Decimal(n)
-    base = snap_deal_size(raw, min_size=mn, step=step, max_size=mx)
+    # Prefer N×minDealSize, then bump remainder onto tickets by step —
+    # never equal-chunk into one fat ticket when several mins fit.
+    base = snap_deal_size(mn, min_size=mn, step=step, max_size=mx)
     if base is None or base <= 0:
         one = snap_deal_size(total, min_size=mn, step=step, max_size=mx)
         return [one] if one is not None else []
@@ -635,14 +671,17 @@ def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=Non
     rem = total - used
     st = Decimal(str(step))
     i = 0
-    while rem >= st - Decimal('1e-12') and i < n:
+    # Guard against infinite bump if snap refuses to grow.
+    guard = 0
+    while rem >= st - Decimal('1e-12') and guard < n * 1000:
         bumped = snap_deal_size(
             sizes[i] + st, min_size=mn, step=step, max_size=mx)
         if bumped is None or bumped <= sizes[i]:
             break
         rem -= (bumped - sizes[i])
         sizes[i] = bumped
-        i += 1
+        i = (i + 1) % n
+        guard += 1
     out = []
     for s in sizes:
         snapped = snap_deal_size(s, min_size=mn, step=step, max_size=mx)

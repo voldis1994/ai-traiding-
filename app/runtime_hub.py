@@ -587,6 +587,32 @@ class RuntimeHub:
         from . import hard_risk
         return hard_risk.snapshot(self._client_store(client_id))
 
+    def client_day_risk_gates(self,client_id: int) -> dict:
+        """Operator day-book risk gate flag (DEFEND/DONE/PROTECT may block OPEN)."""
+        from . import day_book
+        from .self_params import get as sp_get
+        store=self._client_store(client_id)
+        enabled=int(sp_get(store,'day_risk_gates',1) or 0)==1
+        snap=day_book.snapshot(store)
+        return {
+            'risk_gates':enabled,
+            'day_risk_gates':1 if enabled else 0,
+            'phase':snap.get('phase'),
+            'goal':snap.get('goal'),
+        }
+
+    def set_client_day_risk_gates(self,client_id: int,*,enabled: bool) -> dict:
+        """Admin toggle — temporarily disable day-book OPEN phase blocks."""
+        from . import day_book
+        from .self_params import load as sp_load, save as sp_save
+        store=self._client_store(client_id,create=True)
+        params=sp_load(store)
+        params['day_risk_gates']=1 if enabled else 0
+        sp_save(store,params,reason='admin_day_risk_gates')
+        store.event('risk','Operator day risk gates '+('ON' if enabled else 'OFF'),{
+            'day_risk_gates':params['day_risk_gates']})
+        return self.client_day_risk_gates(client_id)
+
     def save_client_hard_risk(self,client_id: int,*,max_risk_per_trade,daily_loss_limit,
                               equity_drawdown_limit,clear_halt: bool=False) -> dict:
         """Operator sets all three monetary limits — required for LIVE OPEN."""

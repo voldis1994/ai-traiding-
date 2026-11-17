@@ -93,6 +93,8 @@ DEFAULTS = {
     # Day loss stop — 10% of equity (was 2%).
     'day_loss_budget_frac': 0.10,
     'day_risk_per_trade_frac': 0.005,
+    # 1 = day book DEFEND/DONE/PROTECT may block OPEN; 0 = operator off (Admin).
+    'day_risk_gates': 1,
     # 1 = OPEN pack cash-risk ≈ full account balance (split across multi-lot).
     'day_size_full_balance': 1,
     'day_be_band_frac': 0.001,
@@ -221,6 +223,7 @@ BOUNDS = {
     'day_profit_target_frac': (0.0, 0.05),
     'day_loss_budget_frac': (0.002, 0.10),
     'day_risk_per_trade_frac': (0.0005, 0.03),
+    'day_risk_gates': (0, 1),
     'day_size_full_balance': (0, 1),
     'day_be_band_frac': (0.0001, 0.01),
     'day_max_positions': (5, 8),
@@ -350,7 +353,8 @@ def _clip(key, value):
                'min_online_labeled','policy_evolve_enabled','policy_live_execute','entry_edge_gate',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
-               'day_max_positions','day_open_slices','day_size_full_balance','trail_ohlc_bars'):
+               'day_max_positions','day_open_slices','day_size_full_balance',
+               'day_risk_gates','trail_ohlc_bars'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

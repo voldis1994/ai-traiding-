@@ -450,7 +450,9 @@ class AutoEvolution:
                     'reason':(f'Neural HOLD dominates {direction} '
                               f'({hold:.1%} > {strength:.1%})')}
         # --- Separate gate: model prep/eval readiness (audit #22) ---
-        if isinstance(readiness,dict) and readiness.get('ready') is False:
+        # Cold-start OPEN is LIVE permission without claiming historical prep passed.
+        from .model_readiness import allows_live_open as _allows_live
+        if isinstance(readiness,dict) and not _allows_live(readiness):
             return {**base,'action':'HOLD',
                     'reason':'Model prep/eval not ready for LIVE OPEN: '+(
                         readiness.get('reason') or 'readiness gate')}
@@ -477,15 +479,18 @@ class AutoEvolution:
                 # Do NOT permanently stall LIVE OPEN after ~64 M1 labels when
                 # prep/eval already passed — choppy GOLD often fails the 8-bar
                 # walk-forward proxy while argmax is still directional.
-                if isinstance(readiness,dict) and readiness.get('ready'):
+                if isinstance(readiness,dict) and _allows_live(readiness):
+                    src=('cold_start_open_fallback'
+                         if readiness.get('cold_start_open') and not readiness.get('ready')
+                         else 'prep_eval_holdout_fallback')
                     economic={
-                        'allowed':True,'source':'prep_eval_holdout_fallback',
+                        'allowed':True,'source':src,
                         'online_utility_failed':True,
                         'online_reason':economic.get('reason'),
                         'samples':readiness.get('eval_samples'),
                         'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
                         'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
-                        'reason':('Online utility weak; prep/eval readiness stands in '
+                        'reason':('Online utility weak; LIVE readiness stands in '
                                   '(score edge is not calibrated profit probability)'),
                     }
                     base['economic_utility']=economic
@@ -494,16 +499,20 @@ class AutoEvolution:
                     return {**base,'action':'HOLD',
                             'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
                                       +str(economic.get('reason') or 'utility gate'))}
-        elif isinstance(readiness,dict) and readiness.get('ready'):
-            # Prep/eval holdout already measured cost-adjusted proxy — use that,
-            # still refusing to treat softmax edge as calibrated profit odds.
+        elif isinstance(readiness,dict) and _allows_live(readiness):
+            # Prep/eval holdout — or cold-start LIVE grant — stands in for utility.
+            src=('cold_start_open' if readiness.get('cold_start_open')
+                 and not readiness.get('ready') else 'prep_eval_holdout')
             economic={
-                'allowed':True,'source':'prep_eval_holdout',
+                'allowed':True,'source':src,
                 'samples':readiness.get('eval_samples'),
                 'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
                 'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
-                'reason':'Prep/eval holdout stands in for economic utility; '
-                         'score edge is not calibrated profit probability',
+                'reason':('Cold-start OPEN stands in for economic utility; '
+                          'historical prep still pending'
+                          if src=='cold_start_open' else
+                          'Prep/eval holdout stands in for economic utility; '
+                          'score edge is not calibrated profit probability'),
             }
             base['economic_utility']=economic
             evidence['economic_utility']=economic

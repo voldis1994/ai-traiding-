@@ -243,3 +243,36 @@ def test_manage_scores_allow_multi_add_when_open_frozen_hold():
             epic='GOLD', mandate_epic='GOLD', score_edge=frozen_edge)
         assert denied['allowed'] is False
         assert denied['reason'] == 'add_needs_stronger_edge'
+
+
+def test_reconcile_daily_from_trades_fills_zero_day_book():
+    """day_book_daily_v1 at 0 closes must catch up from trades closed today."""
+    from datetime import datetime, timezone
+
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        today = datetime.now(timezone.utc).date().isoformat()
+        # Empty day book (the Admin alert state).
+        daily = db.load_daily(s, equity=10_000.0)
+        assert daily['closes'] == 0
+        assert daily['realized_pnl'] == 0.0
+        # Trades table already has closed cash for today.
+        for i, pnl in enumerate((1.2, -0.4, 0.8)):
+            s.db.execute(
+                '''INSERT INTO trades(deal_id,epic,direction,size,entry,exit,pnl,
+                   pnl_source,pnl_currency,opened,closed)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                (f'd{i}', 'GOLD', 'BUY', '0.02', 2000, 2001, pnl, 'broker', 'GBP',
+                 f'{today}T08:00:00+00:00', f'{today}T09:0{i}:00+00:00'))
+        s.db.commit()
+        out = db.reconcile_daily_from_trades(s, equity=10_000.0)
+        assert out['closes'] == 3
+        assert out['wins'] == 2
+        assert out['losses'] == 1
+        assert abs(out['realized_pnl'] - 1.6) < 1e-9
+        snap = db.snapshot(s, equity=10_000.0, positions=[])
+        assert snap['daily']['closes'] == 3
+        # Idempotent record_close for an already-reconciled deal.
+        again = db.record_close(s, pnl=1.2, equity=10_000.0, deal_id='d0')
+        assert again['closes'] == 3
+        assert abs(again['realized_pnl'] - 1.6) < 1e-9

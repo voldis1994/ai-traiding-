@@ -78,9 +78,8 @@ def test_no_flip_exit_vs_live_trail_rules():
         entry=j.position['entry']
         stop=j.position['stop']
         # Opposite SELL signal — must keep position (LIVE = no flip exit).
-        # MFE must stay below BE arm (~30% of R=2) so trail does not close.
-        assert j.on_bar('SELL',mid=100.2,spread=0.2,bar_time='b2',
-                        high=100.4,low=100.0,tick=0.1,**kw) is None
+        assert j.on_bar('SELL',mid=100.5,spread=0.2,bar_time='b2',
+                        high=100.8,low=100.1,tick=0.1,**kw) is None
         assert j.position is not None
         assert j.position['direction']=='BUY'
         assert all(r.get('exit_reason')!='flip' for r in j.history)

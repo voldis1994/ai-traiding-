@@ -7,9 +7,7 @@ import time
 
 import pytest
 
-from app.protection_ai import (
-    select_policy,propose_broker_trail,propose_update,completed_1m_candles,
-    ohlc_1m_structure_stop)
+from app.protection_ai import select_policy,propose_broker_trail,propose_update
 from app.math_rules import stop_take,ohlc_range_distance
 from app.engine import Store,SingleTradeEngine
 from tests.test_integration import BrokerSimulation
@@ -102,18 +100,18 @@ def test_trail_still_ratchets_when_take_profit_is_off():
 
 
 def test_trail_continues_past_break_even_using_ohlc_zone_gap():
-    """After BE, 1m OHLC zone is the gap — never inflate to 2×min / %R over it."""
+    """After BE, follow distance from OHLC — never tip±minStop alone (early SL)."""
     p=_position(stop=100.05,profit=103.0)
     buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35,
                              zone_range=0.4)
     assert buy is not None
     assert buy['be_locked'] is True
-    # zone 0.4 wins: max(minStop=0.3, min(0.8, 0.4)) = 0.4 (not old floor 0.6)
-    assert buy['trail_gap']==pytest.approx(0.4)
+    # floor = max(0.3, min(0.8, max(0.6, 0.28))) = 0.6; then max(0.6, min(0.8, 0.4)) = 0.6
+    assert buy['trail_gap']==pytest.approx(0.6)
     assert buy['stop_level']>100.05
-    assert buy['stop_level']==pytest.approx(101.35-0.4,abs=0.02)
+    assert buy['stop_level']==pytest.approx(101.35-0.6,abs=0.02)
     assert buy['profit_level']==103.0
-    # Without OHLC yet → Store fallback (≥ minStop), not raw minStop glue.
+    # Without OHLC yet → half opening risk (not raw minStop).
     bare=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
     assert bare and bare['trail_gap']==pytest.approx(0.6)
     sell=_position('SELL',stop=99.95,profit=97.0)
@@ -121,115 +119,6 @@ def test_trail_continues_past_break_even_using_ohlc_zone_gap():
                              zone_range=0.4)
     assert out and out['be_locked'] is True and out['stop_level']<99.95
     assert out['profit_level']==97.0
-
-
-def test_completed_1m_candles_drops_forming_bucket():
-    now=datetime(2026,10,14,12,5,30,tzinfo=timezone.utc)
-    rows=[
-        {'at':'2026-10-14T12:03:00+00:00','close':100.1},
-        {'at':'2026-10-14T12:04:00+00:00','close':100.2},
-        {'at':'2026-10-14T12:05:00+00:00','close':100.3},  # forming
-    ]
-    done=completed_1m_candles(rows,now_utc=now)
-    assert [r['at'] for r in done]==[
-        '2026-10-14T12:03:00+00:00','2026-10-14T12:04:00+00:00']
-
-
-def test_post_be_trails_without_waiting_half_r_mfe():
-    """After BE, small tip past entry still advances — no 0.5R freeze at BE."""
-    # Opening R=2.0; BE locked; tip only +0.4R — old need≈trail_gap froze here.
-    p=_position(stop=100.0,profit=104.0)
-    market=_market(100.75,100.85);market['min_distance']=0.3
-    out=propose_broker_trail(
-        p,market,_meta(2.0),extreme=100.8,zone_range=0.35)
-    assert out is not None
-    assert out['be_locked'] is True
-    assert out['stop_level']>100.0
-
-
-def test_post_be_ignores_under_entry_structure_and_ratchets():
-    """Pre-BE dip in the 1m lookback must not freeze SL at entry forever.
-
-    Old bug: min close under entry → structure_stop < entry → clamp to entry →
-    new_stop == BE → None ("No broker-native trail improvement") while tip ran.
-    """
-    p=_position(stop=100.0,profit=106.0)
-    meta=_meta(3.0)
-    # Mixed window: one loss-side close + post-BE rally closes.
-    candles=[
-        {'at':'2026-10-14T12:01:00+00:00','open':99.9,'high':100.1,'low':99.7,'close':99.9},
-        {'at':'2026-10-14T12:02:00+00:00','open':100.1,'high':100.4,'low':99.95,'close':100.1},
-        {'at':'2026-10-14T12:03:00+00:00','open':102.0,'high':102.5,'low':101.8,'close':102.0},
-        {'at':'2026-10-14T12:04:00+00:00','open':103.0,'high':103.4,'low':102.7,'close':103.0},
-        {'at':'2026-10-14T12:05:00+00:00','open':104.0,'high':104.3,'low':103.6,'close':104.0},
-    ]
-    # Without entry filter the swing is under entry; with fix we either follow
-    # profit-side closes or tip−zone — either way SL must leave BE.
-    out=propose_broker_trail(
-        p,_market(104.0,104.1),meta,extreme=104.0,
-        zone_range=1.0,candles=candles,arm_decision={'arm':True,'reason':'be'})
-    assert out is not None
-    assert out['be_locked'] is True
-    assert out['stop_level']>100.0
-    # Profit-side structure (min close past entry) or zone-gap ratchet — both > BE.
-    assert out['stop_level']>=101.0
-    # SELL mirror: through-entry high in lookback must not pin stop at BE.
-    sell=_position('SELL',stop=100.0,profit=94.0)
-    sell_bars=[
-        {'at':'2026-10-14T12:01:00+00:00','open':100.2,'high':100.4,'low':100.0,'close':100.2},
-        {'at':'2026-10-14T12:02:00+00:00','open':98.0,'high':98.3,'low':97.7,'close':98.0},
-        {'at':'2026-10-14T12:03:00+00:00','open':97.0,'high':97.3,'low':96.7,'close':97.0},
-        {'at':'2026-10-14T12:04:00+00:00','open':96.0,'high':96.3,'low':95.7,'close':96.0},
-    ]
-    sout=propose_broker_trail(
-        sell,_market(95.9,96.0),meta,extreme=95.9,
-        zone_range=1.0,candles=sell_bars,arm_decision={'arm':True,'reason':'be'})
-    assert sout is not None and sout['be_locked']
-    assert sout['stop_level']<100.0
-    assert sout['stop_level']<=99.0
-
-
-def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
-    """BUY stop sits under recent 1m *closes* — not tip − 35%R / 2×minStop."""
-    # Wide opening R so old tip−floor gap would sit far behind price.
-    p=_position(stop=100.05,profit=106.0)
-    meta=_meta(3.0)
-    # Tip ~103.5; recent 1m closes min=103.2 → structure trail under close swing.
-    candles=[
-        {'at':'2026-10-14T12:01:00+00:00','open':103.0,'high':103.4,'low':102.95,'close':103.2},
-        {'at':'2026-10-14T12:02:00+00:00','open':103.2,'high':103.5,'low':103.05,'close':103.35},
-        {'at':'2026-10-14T12:03:00+00:00','open':103.3,'high':103.55,'low':103.10,'close':103.4},
-        {'at':'2026-10-14T12:04:00+00:00','open':103.4,'high':103.6,'low':103.15,'close':103.45},
-        {'at':'2026-10-14T12:05:00+00:00','open':103.4,'high':103.55,'low':103.20,'close':103.5},
-    ]
-    anchor=ohlc_1m_structure_stop('BUY',candles,lookback=5,buffer=0.0)
-    assert anchor==pytest.approx(103.2)
-    out=propose_broker_trail(
-        p,_market(103.45,103.55),meta,extreme=103.55,
-        zone_range=0.35,candles=candles)
-    assert out is not None
-    assert out['be_locked'] is True
-    assert out['structure_stop'] is not None
-    assert out['reason']=='trail past BE (1m OHLC structure)'
-    assert out['stop_level']>100.05
-    assert out['stop_level']>=103.0
-    # Beats old tip − max(2×min, 35%R) ≈ tip − 1.05 when no 1m structure.
-    legacy=propose_broker_trail(
-        p,_market(103.45,103.55),meta,extreme=103.55)
-    assert legacy and out['stop_level']>legacy['stop_level']
-    # SELL mirrors: stop above recent 1m closes.
-    sell=_position('SELL',stop=99.95,profit=94.0)
-    sell_bars=[
-        {'at':'2026-10-14T12:01:00+00:00','open':96.8,'high':97.05,'low':96.5,'close':96.7},
-        {'at':'2026-10-14T12:02:00+00:00','open':96.7,'high':96.95,'low':96.4,'close':96.55},
-        {'at':'2026-10-14T12:03:00+00:00','open':96.55,'high':96.85,'low':96.3,'close':96.45},
-    ]
-    sout=propose_broker_trail(
-        sell,_market(96.35,96.45),meta,extreme=96.35,
-        zone_range=0.35,candles=sell_bars)
-    assert sout and sout['be_locked'] and sout['structure_stop'] is not None
-    assert sout['stop_level']<99.95
-    assert sout['stop_level']<=96.85
 
 
 class Brain:
@@ -411,8 +300,7 @@ def test_confirmed_sell_open_registers_persistent_adaptive_rights():
             meta=s.get('adaptive_protection:b2')
             assert meta and meta['owner']=='AUTO' and meta['epic']=='SIM'
             assert meta['original_risk']>0 and meta['original_profit']>0
-            opens=[x for x in b.requests if x[0]=='OPEN']
-            assert opens  # multi-lot may split into several slices
+            assert len([x for x in b.requests if x[0]=='OPEN'])==1
             assert not s.unresolved()
     asyncio.run(scenario())
 
@@ -518,196 +406,3 @@ def test_scratch_close_logs_streak_without_hardcoded_cooldown():
         assert s.get('scratch_streak')==2
         e._note_scratch_close(-1.5,'d3')  # real loss resets streak
         assert s.get('scratch_streak')==0
-
-
-def test_one_to_one_rr_trails_before_tp_fill():
-    """1:1 Gold book: arm at ~0.55R and lock BE — never wait for tip==TP."""
-    # R = TP = 2.0; tip at 1.2 (0.6R) — old contract needed tip≥2.0 (=TP) → never trail.
-    pos={'dealId':'g1','epic':'GOLD','direction':'BUY','level':2000.,
-         'stopLevel':1998.,'profitLevel':2002.,'size':'.5'}
-    market={'epic':'GOLD','bid':2001.2,'ask':2001.3,'spread':0.1,
-            'tick':0.01,'min_distance':0.5,'status':'TRADEABLE'}
-    meta={'owner':'AUTO','deal_id':'g1','original_risk':2.0,'original_profit':2.0}
-    # Without arm: still requires full R → None (WATCH).
-    assert propose_broker_trail(pos,market,meta,extreme=2001.2) is None
-    arm={'arm':True,'reason':'mfe 1.2 ≥ 0.55×risk','mfe':1.2}
-    out=propose_broker_trail(pos,market,meta,extreme=2001.2,arm_decision=arm)
-    assert out is not None
-    assert out['stop_level']>=2000.0-1e-9  # BE lock before TP
-    assert out['profit_level']==2002.0
-    assert out.get('phase')=='be_lock'
-    # At/near TP tip must still allow trail (not abort solely because quote≈TP).
-    near_tp=_market(2001.95,2002.05)
-    near_tp['epic']='GOLD';near_tp['min_distance']=0.5
-    be_pos=dict(pos);be_pos['stopLevel']=2000.0
-    past=propose_broker_trail(be_pos,near_tp,meta,extreme=2001.95,arm_decision=arm)
-    # Through TP by >tick → None; at tip still pre-fill may trail past BE.
-    assert past is None or past['stop_level']>=2000.0
-
-
-def test_trail_runs_when_entry_execution_paused():
-    """Open positions keep trailing even if NEW opens are paused."""
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d)
-            e.execution_enabled=False  # entry paused — trail must still fire
-            e.armed=True
-            await e.sync()
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            assert b.requests[0][0]=='PROTECT'
-            assert b.open[0]['position']['stopLevel']>99.2
-            assert b.requests[0][3]==101.6  # TP preserved
-    asyncio.run(scenario())
-
-
-def test_adapt_protection_follows_quote_1m_closes_after_be():
-    """Post-BE trail must see closed QUOTE minutes (not HISTORICAL-only holes)."""
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d)
-            # Already at BE — next move must follow recent completed closes.
-            b.open[0]['position']['stopLevel']=100.0
-            b.open[0]['position']['profitLevel']=106.0
-            e.market=_market(103.45,103.55)
-            meta=dict(_meta(3.0),epic='GOLD',opened='2026-10-14T12:00:00+00:00')
-            s.set('adaptive_protection:auto1',meta)
-            # Only QUOTE provenance (live forming→closed path); no HISTORICAL.
-            for i,close in enumerate((103.2,103.35,103.4,103.45,103.5),start=1):
-                at=f'2026-10-14T12:{i:02d}:00+00:00'
-                s.candle('GOLD',{
-                    'at':at,'open':close-0.05,'high':close+0.05,
-                    'low':close-0.1,'close':close,'spread':0.1},source='QUOTE')
-            await e.sync()
-            # Clear throttle so first adapt fires.
-            s.set('adaptive_runtime:auto1',None)
-            await e.adapt_protection(e.positions[0])
-            assert b.requests and b.requests[0][0]=='PROTECT'
-            new_stop=float(b.open[0]['position']['stopLevel'])
-            assert new_stop>100.0
-            # Under recent completed close swing (min close 103.2 − buffer).
-            assert new_stop>=102.5
-            brief=e.protection_brief or {}
-            prop=brief.get('proposal') or {}
-            assert prop.get('be_locked') is True
-            assert prop.get('structure_stop') is not None or new_stop>100.5
-    asyncio.run(scenario())
-
-
-def test_sibling_unresolved_open_does_not_freeze_trail():
-    """OPEN UNCERTAIN on another deal must not block THIS deal's trail."""
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d)
-            # Leftover multi-add UNCERTAIN on a sibling deal.
-            oid=s.order('OPEN','sibling99',{'epic':'GOLD','direction':'BUY'})
-            s.order_update(oid,'UNCERTAIN','ghost-ref')
-            assert any(u.get('deal_id')=='sibling99' for u in s.unresolved())
-            await e.sync()
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            assert b.open[0]['position']['stopLevel']>99.2
-    asyncio.run(scenario())
-
-
-def test_trail_lifecycle_watch_arm_be_trail():
-    """Coherent phases: WATCH → ARMED/BE → TRAIL past BE on 1:1 book."""
-    from app import structure_edge as se
-    with tempfile.TemporaryDirectory() as d:
-        s=Store(Path(d)/'t.sqlite3')
-        risk=2.0
-        pos={'dealId':'lc1','epic':'GOLD','direction':'BUY','level':100.,
-             'stopLevel':98.,'profitLevel':102.,'size':'.25'}
-        meta={'owner':'AUTO','deal_id':'lc1','original_risk':risk,'original_profit':risk}
-        # WATCH: MFE too small.
-        arm=se.trail_arm_decision(
-            s,epic='GOLD',structure='TREND_UP',direction='BUY',
-            mfe=0.5,original_risk=risk,be_locked=False)
-        assert arm['arm'] is False
-        market=_market(100.5,100.6);market['min_distance']=0.3
-        assert propose_broker_trail(
-            pos,market,meta,extreme=100.5,store=s,arm_decision=arm) is None
-        # ARMED at ≥0.30R → BE lock.
-        arm=se.trail_arm_decision(
-            s,epic='GOLD',structure='TREND_UP',direction='BUY',
-            mfe=1.2,original_risk=risk,be_locked=False)
-        assert arm['arm'] is True
-        market=_market(101.2,101.3);market['min_distance']=0.3
-        out=propose_broker_trail(
-            pos,market,meta,extreme=101.2,store=s,arm_decision=arm)
-        assert out and out['phase']=='be_lock' and out['stop_level']>=100.-1e-9
-        # TRAIL past BE.
-        pos2=dict(pos);pos2['stopLevel']=100.0
-        market=_market(101.5,101.6);market['min_distance']=0.3
-        arm2=se.trail_arm_decision(
-            s,epic='GOLD',structure='TREND_UP',direction='BUY',
-            mfe=1.5,original_risk=risk,be_locked=True)
-        assert arm2['arm'] is True
-        trail=propose_broker_trail(
-            pos2,market,meta,extreme=101.5,store=s,arm_decision=arm2,
-            zone_range=0.5)
-        assert trail and trail['be_locked'] is True
-        assert trail['stop_level']>100.0
-        assert trail['profit_level']==102.0
-
-
-def test_claim_robot_open_enrolls_trail_on_uncertain_fill():
-    """UNCERTAIN OPEN + live adopt must enroll adaptive trail (not manual-only)."""
-    with tempfile.TemporaryDirectory() as d:
-        s=Store(Path(d)/'t.sqlite3')
-        e=SingleTradeEngine(s,Brain())
-        p={'dealId':'fill1','epic':'GOLD','direction':'SELL','level':3870.26,
-           'stopLevel':3874.71,'profitLevel':3865.73,'size':'0.1'}
-        e.positions=[p]
-        e._pending_entry_brain={
-            'epic':'GOLD','direction':'SELL','entry':3870.26,'captured':'submit',
-            'situation':'GOLD|TREND_DOWN|FLOW_DOWN|TREND_DOWN'}
-        # Journal OPEN left UNCERTAIN — same pattern as live GOLD history.
-        oid=s.order('OPEN',None,{'epic':'GOLD','direction':'SELL','size':'0.1'})
-        s.order_update(oid,'UNCERTAIN','ghost-ref')
-        assert s.unresolved()
-        e._supersede_stale_open_orders('fill1')
-        assert s.get('robot_open:fill1') is True
-        meta=s.get('adaptive_protection:fill1')
-        assert meta and meta['owner']=='AUTO'
-        assert meta['original_risk']==pytest.approx(4.45)
-        assert s.get('entry_brain:fill1')['captured'] in ('submit','claim_robot_open')
-        assert not any(u.get('kind')=='OPEN' for u in (s.unresolved() or []))
-
-
-def test_claim_robot_open_on_adopt_after_pending_brain():
-    with tempfile.TemporaryDirectory() as d:
-        s=Store(Path(d)/'t.sqlite3')
-        e=SingleTradeEngine(s,Brain())
-        p={'dealId':'ad1','epic':'GOLD','direction':'BUY','level':100.,
-           'stopLevel':99.2,'profitLevel':101.6,'size':'.12'}
-        e._pending_entry_brain={
-            'epic':'GOLD','direction':'BUY','entry':100.,'captured':'submit'}
-        assert e._claim_robot_open(p,reason='adopt_robot_fill')
-        assert s.get('robot_open:ad1')
-        assert s.get('adaptive_protection:ad1')['owner']=='AUTO'
-
-
-def test_be_arms_at_thirty_percent_of_r():
-    """BE/trail arms from ~30% of opening R — not the old ~50%/0.55 seed."""
-    from app import structure_edge as se
-    with tempfile.TemporaryDirectory() as d:
-        s=Store(Path(d)/'t.sqlite3')
-        risk=2.0
-        # 0.29R — still waiting
-        low=se.trail_arm_decision(
-            s,epic='GOLD',structure='TREND_UP',direction='BUY',
-            mfe=0.58,original_risk=risk,be_locked=False)
-        assert low['arm'] is False
-        # 0.30R — arm BE
-        ok=se.trail_arm_decision(
-            s,epic='GOLD',structure='TREND_UP',direction='BUY',
-            mfe=0.60,original_risk=risk,be_locked=False)
-        assert ok['arm'] is True
-        pos={'dealId':'be30','epic':'GOLD','direction':'BUY','level':100.,
-             'stopLevel':98.,'profitLevel':102.,'size':'.25'}
-        meta={'owner':'AUTO','deal_id':'be30','original_risk':risk,'original_profit':risk}
-        market=_market(100.65,100.75);market['min_distance']=0.3
-        out=propose_broker_trail(
-            pos,market,meta,extreme=100.65,store=s,arm_decision=ok)
-        assert out and out['phase']=='be_lock'

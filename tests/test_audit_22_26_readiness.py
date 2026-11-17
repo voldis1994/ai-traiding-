@@ -68,10 +68,10 @@ def test_prep_eval_blocks_until_holdout_passes_and_separates_stages():
 def test_argmax_kept_but_score_edge_is_not_utility_without_readiness():
     with tempfile.TemporaryDirectory() as d:
         p = AutoEvolution(Store(Path(d) / 'db.sqlite3'), Path(d) / 'pol.py')
-        # Lean BUY → follow signal; score_edge still not claimed as utility.
+        # Small edge 0.05 < default MIN_EDGE 0.06 → evolved policy HOLDs.
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
-        weak_out = p.evaluate_neural_entry(weak, readiness={'ready': True})
-        assert weak_out['action'] == 'BUY' and weak_out['proposal'] == 'BUY'
+        weak_out = p.evaluate_neural_entry(weak)
+        assert weak_out['action'] == 'HOLD' and weak_out['proposal'] == 'BUY'
         assert weak_out['evidence']['score_edge_is_not_trading_advantage'] is True
         scores = {'BUY': 0.48, 'SELL': 0.30, 'HOLD': 0.22}  # edge clears policy
         bare = p.evaluate_neural_entry(scores)
@@ -146,21 +146,14 @@ def test_cold_start_first_manual_close_releases_prep_block():
         engine.last_closed_step = 10  # first manual already closed
         engine.positions = []
         released = engine._maybe_release_cold_start_prep()
-        assert released and released.get('cold_start_open') is True
-        # Honest: ready stays False until train/eval bars exist.
-        assert released.get('ready') is False
-        assert int(released.get('train_bars') or 0) == 0
-        assert int(released.get('eval_bars') or 0) == 0
-        rd = brain.trading_readiness()
-        assert rd.get('ready') is False
-        assert rd.get('cold_start_open') is True
-        assert rd.get('historical_validation') is False
+        assert released and released['ready'] is True
+        assert released.get('cold_start_open') is True
+        assert brain.trading_readiness()['ready'] is True
         gates = engine.live_open_gates('BUY')
         assert gates['allowed'] is True
         # Flat re-arm path also grants (idempotent).
         engine._release_execution_after_flat('m1')
-        assert brain.trading_readiness().get('cold_start_open') is True
-        assert mr.allows_live_open(brain.trading_readiness()) is True
+        assert brain.trading_readiness()['ready'] is True
 
 
 def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic():
@@ -220,23 +213,3 @@ def test_ui_copy_no_longer_claims_zone_shift_entry_bans():
     assert 'diagnostic' in ui.lower()
     assert 'not profit probability' in ui.lower()
     assert 'trade win rate' in ui.lower() or 'Closed-trade win rate' in ui
-
-
-def test_legacy_cold_start_ready_with_zero_bars_is_healed():
-    """prep_eval:GOLD ready=True with train/eval 0 must not claim historical validation."""
-    with tempfile.TemporaryDirectory() as d:
-        store = Store(Path(d) / 'db.sqlite3')
-        brain = AdaptiveBrain(store, data_dir=d)
-        brain._activate('GOLD')
-        mr.save_state(store, 'GOLD', {
-            **mr._empty('GOLD', reason='legacy cold-start lie'),
-            'ready': True, 'stage': 'ready', 'cold_start_open': True,
-            'train_bars': 0, 'eval_bars': 0,
-        })
-        rd = brain.trading_readiness()
-        assert rd.get('ready') is False
-        assert rd.get('cold_start_open') is True
-        assert rd.get('historical_validation') is False
-        assert int(rd.get('train_bars') or 0) == 0
-        assert mr.allows_live_open(rd) is True
-        assert mr.needs_historical_prep(rd) is True

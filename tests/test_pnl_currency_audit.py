@@ -41,12 +41,8 @@ def test_without_broker_profit_no_fake_dollar_cash():
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition)})
         engine._learn_closed_trade('g2',{'level':2660})
         row=store.trades(1)[0]
-        # Still no invented cash — but re-mark pending so Capital £ can land later.
         assert row['pnl'] is None
-        assert row['pnl_source']=='pending_broker_pnl'
-        pending=store.get('pending_broker_pnl_deals') or []
-        assert any(str((x.get('deal_id') if isinstance(x,dict) else x))=='g2'
-                   for x in pending)
+        assert row['pnl_source']=='ticks_only'
 
 
 def test_pending_close_sync_does_not_clear_entry_brain():

@@ -1,11 +1,11 @@
-"""End-to-end: HOLD-necessary abstention → opposite shadow + teach.
+"""End-to-end: fixed 0.06 floor + policy LIVE + HOLD→opposite shadow + teach.
 
 Proves the pieces work *together*:
-  1. Ambiguous scores → HOLD necessary (proposal still BUY)
+  1. Weak BUY proposal → policy/cycle HOLD (floor stays 0.06)
   2. Engine queues hold_shadow with would-be brackets
   3. Down path → opposite SELL hits TP → learn_from_trade
   4. settle(£) cools aggression but does NOT move entry floor
-  5. Clear signal still OPENs; strategy hint after enough opposite TPs
+  5. Clear edge still OPENs; strategy hint after enough opposite TPs
 """
 from __future__ import annotations
 
@@ -93,11 +93,6 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         asyncio.run(_prep())
         assert e.mandate and e.mandate['epic'] == 'SIM'
         brain.mark_prep_ready('test fixture')
-        # Flat sync resets recurrent state (entry isolation). Re-seed a transition
-        # so hold_shadow can teach from a real entry-time snapshot.
-        brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
-        brain.core.step(brain.core.last_z, dt=60.)
-        assert brain.core.last_transition is not None
 
         # Warm OHLC for would-be brackets.
         hist = _seed_hist_candles(store, 'SIM', n=90, start_px=100.0, trend=0.01)
@@ -113,18 +108,19 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
             'returns_bps': {'1': 1, '5': 2, '15': 3, '60': 4},
         }
         e.last_decision_bar = hold_bar
-        # Tied sides + loud HOLD → abstention necessary; proposal stays BUY.
-        weak = {'BUY': 0.33, 'SELL': 0.32, 'HOLD': 0.35}
+        # Weak BUY edge 0.05 < calibrated seed ~0.06 → policy HOLD, proposal BUY.
+        weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         e.last_signal = {'action': 'BUY', 'scores': weak}
 
-        # ── 1) HOLD necessary; cycle still follows signal if forced BUY ─────
+        # ── 1) Policy + cycle agree: HOLD at calibrated floor ───────────────
         out = e.policy.evaluate_neural_entry(weak, readiness={'ready': True})
         assert out['action'] == 'HOLD'
         assert out['proposal'] == 'BUY'
-        gate = uc.edge_allows_open(
-            {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}, {'action': 'BUY'},
-            uc.load_state(store), store=store)
-        assert gate['allowed'] is True  # edge no longer hard-blocks
+        floor = out['evidence']['evolved_policy']['entry_edge_floor']
+        assert floor > 0.05  # weak 0.05 must stay below gate
+        assert uc.min_open_margin(uc.load_state(store)) == pytest.approx(floor)
+        gate = uc.edge_allows_open(weak, {'action': 'BUY'}, uc.load_state(store))
+        assert gate['allowed'] is False
 
         # ── 2) Engine queues hold_shadow with real would-be brackets ────────
         gen_before = learning_generation.current(store)

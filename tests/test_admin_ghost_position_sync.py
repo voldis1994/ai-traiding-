@@ -124,18 +124,16 @@ def test_open_position_keeps_scores_when_market_context_not_ready():
         e.armed=True;e.execution_enabled=True
         e.mandate={'epic':'GOLD','size':'0.02'}
         e.positions=[{'dealId':'p1','epic':'GOLD','direction':'SELL','size':'0.02'}]
-        # Weak edge so day-book add stays denied → Existing open block reason.
-        # (Snapshot now passes score_edge; a strong edge would fall through.)
-        e.last_signal={'action':'SELL','scores':{'BUY':0.40,'SELL':0.35,'HOLD':0.25},
-                       'confidence':0.35}
+        e.last_signal={'action':'SELL','scores':{'BUY':0.12,'SELL':0.61,'HOLD':0.27},
+                       'confidence':0.61}
         e.market_context={'ready':False,'reason':'Waiting for completed candles'}
         # Simulate the poll branch that used to wipe scores to 0%/—.
         if not e.market_context.get('ready') and not e.positions:
             e.last_signal=None
         elif not e.market_context.get('ready') and e.positions:
             pass  # keep
-        assert e.last_signal['scores']['SELL']==pytest.approx(0.35)
+        assert e.last_signal['scores']['SELL']==pytest.approx(0.61)
         snap=e.snapshot()
         assert 'Existing open position' in (snap['entry_block_reason'] or '')
         assert 'p1' in (snap['entry_block_reason'] or '')
-        assert snap['signal']['scores']['SELL']==pytest.approx(0.35)
+        assert snap['signal']['scores']['SELL']==pytest.approx(0.61)

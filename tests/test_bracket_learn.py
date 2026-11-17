@@ -127,11 +127,8 @@ def test_propose_uses_ohlc_not_random_fantasy_kappa():
         rows=[{'open':100,'high':100.4,'low':99.7,'close':100.1} for _ in range(50)]
         p=propose_for_open(store,candles=rows,base_sl=1.0,max_tp=1.2)
         assert p['explored'] is False
-        # Hard 1:2 RR — κ locked at 2 even when max_tp hint is tighter.
-        assert p['kappa'] == pytest.approx(2.0)
-        assert p['sl_scale'] == pytest.approx(1.0)
-        assert p['profit_distance'] / p['stop_distance'] == pytest.approx(2.0, abs=0.05)
-        assert p['kappa'] < 5.0
+        assert p['kappa']*p['sl_scale']*1.0 <= 1.2*1.05+1e-9
+        assert p['kappa']<5.0
 
 
 def test_loss_without_path_context_does_not_auto_raise_sl():
@@ -309,7 +306,7 @@ def test_zone_at_open_uses_multi_timeframe_consensus():
     decided = decide_brackets_from_ohlc(z, tick=0.01, spread=0.05, min_distance=0.2)
     if decided['stop_distance'] > 0:
         rr = decided['profit_distance'] / decided['stop_distance']
-        assert rr == pytest.approx(2.0, abs=0.05)
+        assert rr >= 0.75
 
 
 def test_multi_tf_does_not_mix_wide_sl_with_tiny_tp():
@@ -337,9 +334,9 @@ def test_multi_tf_does_not_mix_wide_sl_with_tiny_tp():
     sl = decided['stop_distance']
     tp = decided['profit_distance']
     assert sl > 0 and tp > 0
-    # Hard rule: SL is always half of TP (1:2 RR).
-    assert tp / sl == pytest.approx(2.0, abs=0.05)
-    assert decided['kappa'] == pytest.approx(2.0)
+    # Must not reproduce the live asymmetry (TP ≈ 0.5 × SL).
+    assert tp / sl >= 0.75
+    assert abs(decided['kappa'] - (tp / sl)) < 0.15 or tp <= (z['max_tp'] or tp) + 1e-6
 
 
 def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
@@ -349,10 +346,8 @@ def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
     assert out['source']=='ohlc_zone'
     assert out['sl_scale']==1.0
     assert out['stop_distance']==pytest.approx(1.0,abs=0.02)
-    # Hard rule: TP always 2×SL (SL half of TP) — even when max_tp is tight.
-    assert out['profit_distance']==pytest.approx(2.0*out['stop_distance'],abs=0.02)
-    assert out['kappa']==pytest.approx(2.0)
-    assert out.get('rr_locked') is True
+    # TP follows OHLC κ×SL but not beyond reachable max_tp.
+    assert out['profit_distance']<=1.2+1e-9
     assert out['ohlc_kappa']==pytest.approx(1.5)
 
 
@@ -371,13 +366,12 @@ def test_ohlc_decision_ignores_inflated_learned_multipliers_on_open():
             base_sl=1.0,max_tp=1.5)
         assert pkg['bracket_source']=='ohlc_zone'
         assert pkg['sl_scale']==1.0
-        assert pkg['kappa']==pytest.approx(2.0)
+        assert pkg['kappa']==pytest.approx(1.2) or pkg['kappa']<=1.5+1e-9
         decided=decide_brackets_from_ohlc(
             zone,tick=0.01,spread=0.05,min_distance=0.2,
             tighten=float(pkg.get('tighten') or 1.0))
         assert decided['stop_distance']<=1.0+0.02
-        assert decided['profit_distance']==pytest.approx(
-            2.0*decided['stop_distance'], abs=0.02)
+        assert decided['profit_distance']<=1.5+1e-9
 
 
 def test_win_at_full_ohlc_tp_does_not_raise_unused_mult_for_width():

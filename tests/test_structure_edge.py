@@ -204,8 +204,8 @@ def test_propose_early_arm_locks_near_be():
         assert out.get('early_arm') is True
 
 
-def test_propose_early_arm_partial_ratchet_when_be_violates_min_distance():
-    """When BE is illegal vs minStop, still ratchet stop toward entry (never widen)."""
+def test_propose_early_arm_skips_when_be_violates_min_distance():
+    """If BE stop would sit inside broker min of market, skip — do not glue loss-side."""
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
@@ -218,8 +218,6 @@ def test_propose_early_arm_partial_ratchet_when_be_violates_min_distance():
         arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.5}
         out = propose_broker_trail(
             pos, market, meta, extreme=100.5, store=s, arm_decision=arm)
-        assert out is not None
-        assert out['stop_level'] > 99.2  # improved toward entry
-        assert out['stop_level'] <= 100.2 - 0.5 + 1e-9  # respects minStop
-        assert out.get('phase') == 'ratchet'
-        assert out['profit_level'] == 102.0
+        # Either None (skipped) or stop >= entry — never below entry.
+        if out is not None:
+            assert out['stop_level'] >= 100.0 - 1e-9

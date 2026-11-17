@@ -214,9 +214,7 @@ def test_engine_poll_reaches_neurons_from_capital_reference_feed(tmp_path,monkey
                    for entry in state['intermarket_analysis']['peers'] if entry.get('ready'))
         # With confirmed external neural inputs and a completed M1 bar, the
         # trained network may choose BUY/SELL without waiting for 60%/8.1pp.
-        # Multi-lot may open several slices; still one decision burst.
-        opens=[r for r in broker.requests if r[0]=='OPEN']
-        assert len(opens)<=5
+        assert len([r for r in broker.requests if r[0]=='OPEN'])<=1
     asyncio.run(run())
 
 

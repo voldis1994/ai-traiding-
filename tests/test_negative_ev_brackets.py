@@ -1,11 +1,10 @@
-import pytest
-"""SL half of TP (1:2); false flip-loss teach stays gated."""
+"""No TP/SL hardcode — OHLC decides; only false flip-loss teach is gated."""
 from app.bracket_learn import MULT_KAPPA_MIN, decide_brackets_from_ohlc
 from app.profit_learning import label_from_profit
 
 
-def test_ohlc_locks_two_to_one_even_when_max_tp_tiny():
-    """Even with tiny max_tp, LIVE keeps TP=2×SL (SL half of TP)."""
+def test_ohlc_decides_without_forced_one_to_one():
+    """Tiny max_tp may yield TP<SL — market/OHLC call, not our hardcoded ratio."""
     zone = {
         'kappa': 1.5,
         'range_distance': 2.0,
@@ -17,9 +16,7 @@ def test_ohlc_locks_two_to_one_even_when_max_tp_tiny():
         zone, tick=0.01, spread=0.05, min_distance=0.1, tighten=1.0)
     assert d['source'] == 'ohlc_zone'
     assert d['stop_distance'] > 0 and d['profit_distance'] > 0
-    assert d['profit_distance'] / d['stop_distance'] == pytest.approx(2.0, abs=0.05)
-    assert d['kappa'] == pytest.approx(2.0)
-    assert d.get('rr_locked') is True
+    assert not d.get('reshaped')
     assert not d.get('blocked')
 
 

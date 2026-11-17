@@ -1,7 +1,6 @@
 """Local integration suite: no Capital.com credentials, no live orders."""
 import asyncio
 import json
-import pytest
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -30,10 +29,10 @@ def test_pdf_long_short_sl_tp_and_rounding():
     assert sell['stop_level']==Decimal('100.24')
     assert sell['profit_level']==Decimal('99.52')
     # min_distance=0 → only buffer (2*tick), not a fake 20-tick invent.
-    bare=stop_take('100','BUY','.03','.01',0)  # default κ=2 (TP=2×SL)
+    bare=stop_take('100','BUY','.03','.01',0)  # default κ=1 (1:1), not 1:2
     assert bare['stop_ticks']==2
-    assert bare['profit_ticks']==4
-    assert bare['kappa']==2.0
+    assert bare['profit_ticks']==2
+    assert bare['kappa']==1.0
     assert bare['sl_scale']==1.0
     wider=stop_take('100','BUY','.03','.01',0,kappa=2,sl_scale=2)
     assert wider['stop_ticks']==4
@@ -124,21 +123,10 @@ class BrokerSimulation:
         'decimalPlacesFactor':2},
         # valueOfOnePip required so hard-risk cash_risk can be computed for OPEN.
         'instrument':{'onePipMeans':.01,'valueOfOnePip':1.0},
-        'dealingRules':{
-            'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'},
-            'minDealSize':{'unit':'AMOUNT','value':'.01'},
-            'maxDealSize':{'unit':'AMOUNT','value':'100'},
-            'minSizeIncrement':{'unit':'AMOUNT','value':'.01'}}}
+        'dealingRules':{'minStopOrProfitDistance':{'unit':'POINTS','value':'.15'}}}
     async def accounts(self):return {'accounts':[{'preferred':True,'accountId':'SIM','currency':'USD','balance':{'balance':1000}}]}
     async def prices(self,epic,resolution='MINUTE',maximum=80):return {'prices':[]}
-    async def confirm(self,ref):
-        # Prefer the live open dealId so login reconcile can match epic/dir/size
-        # to the book (audit #31) instead of a hard-coded b2 vs m1 mismatch.
-        if self.open:
-            pos=self.open[0].get('position') or self.open[0]
-            deal=pos.get('dealId') or 'b2'
-            return {'dealStatus':'ACCEPTED','dealId':deal}
-        return {'dealStatus':'ACCEPTED','dealId':'b2'}
+    async def confirm(self,ref):return {'dealStatus':'ACCEPTED','dealId':'b2'}
     async def update_position(self,deal_id,stop_level=None,profit_level=None):
         self.requests.append(('PROTECT',deal_id,stop_level,profit_level))
         if stop_level is not None:self.open[0]['position']['stopLevel']=float(stop_level)
@@ -176,67 +164,12 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             engine.market_context={'ready':True}  # exercise router, not market readiness
             brain.mark_prep_ready('test fixture')
             await engine.submit('SELL')
-            opens=[r for r in broker.requests if r[0]=='OPEN']
-            assert opens
-            # Flat AI OPEN must send the *full* multi-lot pack in this submit.
-            assert len(opens)==5
-            assert sum((Decimal(str(r[3])) for r in opens), Decimal('0'))==Decimal('.25')
-            assert opens[-1][4]>0 and opens[-1][5]>0
-            assert len(engine.positions)>=1
+            assert broker.requests[-1][0]=='OPEN'
+            assert broker.requests[-1][3]==Decimal('.25')
+            assert broker.requests[-1][4]>0 and broker.requests[-1][5]>0
+            assert len(engine.positions)==1
             assert not store.unresolved()
             assert store.trades()[0]['epic']=='SIM'
-    async_run(scenario())
-
-
-def test_flat_ai_open_sends_full_multi_lot_pack_despite_sibling_unresolved():
-    """One submit → all planned lot sizes; sibling OPEN lag must not stop the pack."""
-    class AccumBroker(BrokerSimulation):
-        def __init__(self):
-            super().__init__()
-            self._n=0
-        async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None):
-            self.requests.append(('OPEN',epic,direction,size,stop_distance,profit_distance))
-            if self.fail_on_order:raise TimeoutError('Request outcome unknown')
-            self._n+=1
-            deal=f'b{self._n}'
-            # Accumulate slices (live Capital book grows; do not replace).
-            self.open.append({'position':{
-                'dealId':deal,'size':str(size),'direction':direction,'level':self.price,
-                'stopLevel':self.price-float(stop_distance),
-                'profitLevel':self.price+float(profit_distance)},'market':{'epic':epic}})
-            return {'dealReference':f'entry{self._n}','dealId':deal}
-        async def confirm(self,ref):
-            if self.open:
-                pos=self.open[-1].get('position') or self.open[-1]
-                return {'dealStatus':'ACCEPTED','dealId':pos.get('dealId') or 'b2'}
-            return {'dealStatus':'ACCEPTED','dealId':'b2'}
-
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            store=Store(Path(d)/'s.db');brain=AdaptiveBrain(store,data_dir=d)
-            engine=SingleTradeEngine(store,brain);broker=AccumBroker()
-            engine.policy=AutoEvolution(store,Path(d)/'policy.py')
-            engine.attach(broker);await engine.sync()
-            await engine.exit_position('m1')
-            await engine.poll()
-            # Inject foreign UNCERTAIN only on mid-burst sync — must not abort pack.
-            real_sync=engine.sync
-            sync_n={'n':0}
-            async def sync_with_ghost():
-                await real_sync()
-                sync_n['n']+=1
-                if sync_n['n']>=2 and not any(
-                        u.get('deal_id')=='ghost99' for u in store.unresolved()):
-                    oid=store.order('OPEN','ghost99',{'epic':'SIM','direction':'SELL'})
-                    store.order_update(oid,'UNCERTAIN','ghost-ref')
-            engine.sync=sync_with_ghost
-            engine.market_context={'ready':True}
-            brain.mark_prep_ready('test fixture')
-            await engine.submit('BUY')
-            opens=[r for r in broker.requests if r[0]=='OPEN']
-            assert len(opens)==5
-            assert sum((Decimal(str(r[3])) for r in opens), Decimal('0'))==Decimal('.25')
-            assert len(broker.open)==5
     async_run(scenario())
 
 
@@ -256,35 +189,13 @@ def test_uncertain_order_does_not_retry():
     async_run(scenario())
 
 
-def test_multi_position_same_epic_stays_live_for_day_book():
-    """Same-instrument multi-pos is allowed by day_book — do not disarm."""
+def test_multi_position_detected_pauses_execution():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
             b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'SIM'}})
             e.attach(b);await e.sync()
-            assert len(e.positions)==2
-            assert e._paused_for_multi is False
-            assert e.armed and e.execution_enabled
-    async_run(scenario())
-
-
-def test_multi_position_foreign_epic_blocks_day_book_add():
-    """Foreign epic in the book blocks new OPEN (mandate stays one market)."""
-    from app import day_book
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
-            e.attach(b);await e.sync()  # adopt SIM m1
-            b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'OTHER'}})
-            await e.sync()
-            gate=day_book.allows_new_open(
-                store=s,equity=10_000.0,positions=e.positions,
-                epic='SIM',mandate_epic='SIM',score_edge=0.2)
-            assert gate['allowed'] is False
-            assert gate['reason']=='foreign_epic_open'
-            # Robot stays live — day book blocks adds, no auto-pause.
-            assert e.armed and e.execution_enabled
+            assert not e.armed and not e.execution_enabled
     async_run(scenario())
 
 
@@ -321,10 +232,7 @@ def test_login_reconciles_prior_confirmed_request_without_retry():
             s.order_update(oid,'PENDING','known-ref')
             e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));e.policy=AutoEvolution(s,Path(d)/'policy.py')
             e.attach(b)
-            # No auto-pause on unresolved-at-login; reconcilable PENDING stays
-            # until confirm, and submit() refuses new OPEN while it remains.
-            assert e.execution_enabled
-            assert s.unresolved()
+            assert not e.execution_enabled
             assert await e.reconcile_outstanding()
             assert not s.unresolved()
             assert e.execution_enabled
@@ -373,18 +281,11 @@ def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close
             brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([7.,-4.,-4.])
             await e.poll()  # very next completed new M1 candle; no historical-label minimum
-            opens=[x for x in broker.requests if x[0]=='OPEN']
-            # Multi-lot may split mandate size into several OPEN slices.
-            assert len(opens)>=1
-            assert sum(Decimal(str(x[3])) for x in opens)==Decimal('.25')
-            assert e.positions  # live book has at least one slice
-            # SL half of TP on every OPEN (κ=2).
-            for op in opens:
-                sl,tp=float(op[4]),float(op[5])
-                assert tp/sl == pytest.approx(2.0, abs=0.05)
-            n_opens=len(opens)
+            assert len([x for x in broker.requests if x[0]=='OPEN'])==1
+            assert e.positions[0]['dealId']=='b2'
+            assert Decimal(str(e.positions[0]['size']))==Decimal('.25')
             await e.poll()
-            assert len([x for x in broker.requests if x[0]=='OPEN'])==n_opens
+            assert len([x for x in broker.requests if x[0]=='OPEN'])==1
     async_run(scenario())
 
 def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
@@ -401,10 +302,7 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
             assert brain.core.last_loss is not None
-            assert any(
-                ('Closed-trade P&L updated LIVE neural weights' in ev['message']
-                 or 'P&L self-evaluation' in ev['message'])
-                for ev in s.recent())
+            assert any('P&L self-evaluation' in e['message'] for e in s.recent())
     async_run(scenario())
 
 

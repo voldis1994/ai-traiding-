@@ -106,9 +106,8 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
             brain.tick=controlled_tick
             for _ in range(5):await e.poll()
             order=[r for r in broker.requests if r[0]=='OPEN']
-            assert order, (direction,e.snapshot()['entry_block_reason'])
-            assert all(r[2]==direction for r in order)
-            assert sum(Decimal(str(r[3])) for r in order)==Decimal('.25')
+            assert len(order)==1, (direction,e.snapshot()['entry_block_reason'])
+            assert order[0][2]==direction and order[0][3]==Decimal('.25')
             assert e.positions and e.positions[0]['dealId']=='b2'
             assert not s.unresolved()
     for action in ('BUY','SELL'):asyncio.run(scenario(action))

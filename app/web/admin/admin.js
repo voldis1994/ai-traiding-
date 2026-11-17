@@ -423,8 +423,13 @@ function collectRiskAlerts(clients){
     const a=c.activity||{};
     const db=dayBookOf(c);
     const phase=String(db.phase||(db.daily&&db.daily.phase)||'').toUpperCase();
+    if(!riskGatesOn(db)){
+      alerts.push({title:`${name} — riski IZSLĒGTI`,detail:'DEFEND/DONE/PROTECT nebloķē OPEN (Admin poga)',metric:'OFF'});
+    }
     if(phase==='DEFEND'){
-      alerts.push({title:`${name} — dienas zaud. budžets`,detail:'Day book DEFEND — jauni OPEN aizliegti',metric:'DEFEND'});
+      alerts.push({title:`${name} — dienas zaud. budžets`,detail:riskGatesOn(db)
+        ?'Day book DEFEND — jauni OPEN aizliegti'
+        :'Day book DEFEND (vārti OFF — OPEN joprojām atļauti)',metric:'DEFEND'});
     }else if(phase==='DONE'){
       alerts.push({title:`${name} — dienas mērķis sasniegts`,detail:'Day book DONE — plus/BE, gaida nākamo dienu',metric:'DONE'});
     }
@@ -459,6 +464,13 @@ function renderRiskAlerts(clients){
     </div>`).join('');
 }
 
+function riskGatesOn(db){
+  if(db&&typeof db.risk_gates==='boolean')return db.risk_gates;
+  const p=db&&db.params||{};
+  if(p.risk_gates!=null)return Number(p.risk_gates)!==0;
+  return true;
+}
+
 function renderRiskBoard(clients){
   const board=$('riskBoard');
   if(!(clients||[]).length){
@@ -483,14 +495,18 @@ function renderRiskBoard(clients){
     const targetFrac=params.profit_target_frac;
     const lossFrac=params.loss_budget_frac;
     const riskFrac=params.risk_per_trade_frac;
+    const gatesOn=riskGatesOn(db);
     const progress=Number.isFinite(Number(target))&&Number(target)>0&&Number.isFinite(Number(realized))
       ? Math.round((Number(realized)/Number(target))*100)
       : null;
-    return `<article class="card risk-card">
+    return `<article class="card risk-card ${gatesOn?'':'risk-off'}" data-client-id="${esc(c.id)}">
       <div class="card-head">
         <h2>${icon('shield')} ${esc(name)}</h2>
         <span class="state-pill ${phaseClass(phase)}">${esc(String(phase).toUpperCase())}</span>
       </div>
+      <div class="kv"><span>Risku vārti</span><b class="risk-gate-label ${gatesOn?'on':'off'}">${
+        gatesOn?'IESLĒGTI':'IZSLĒGTI'
+      }</b></div>
       <div class="kv"><span>Dienas peļņas mērķis</span><b class="pnl-pos">${
         target==null?'—':esc(money(target,ccy))
       }${targetFrac!=null?` <small>(${(Number(targetFrac)*100).toFixed(2)}%)</small>`:''}</b></div>
@@ -506,8 +522,27 @@ function renderRiskBoard(clients){
       <div class="kv"><span>Atvērtās poz.</span><b>${esc(db.open_count??(a.positions||[]).length??0)}</b></div>
       <div class="kv"><span>Entry block</span><b>${esc(a.entry_block_reason||'—')}</b></div>
       <p class="muted risk-goal">${esc(db.goal||'Dienas mērķis: plusā vai 0 (BE).')}</p>
+      <div class="risk-actions">
+        <button type="button" class="btn tiny ${gatesOn?'btn-ghost':'btn-primary'}"
+          data-risk-gates="${gatesOn?'0':'1'}" data-id="${esc(c.id)}">
+          ${gatesOn?'Izslēgt risku':'Ieslēgt risku'}
+        </button>
+      </div>
     </article>`;
   }).join('');
+  board.querySelectorAll('[data-risk-gates]').forEach(btn=>{
+    btn.onclick=async()=>{
+      const enabled=btn.dataset.riskGates==='1';
+      const label=enabled?'ieslēgt':'izslēgt';
+      if(!confirm(`${label.charAt(0).toUpperCase()+label.slice(1)} dienas risku vārtus klientam #${btn.dataset.id}?`))return;
+      btn.disabled=true;
+      try{
+        await api(`/api/admin/clients/${btn.dataset.id}/day-risk-gates`,'POST',{enabled});
+        await loadOverview();
+      }catch(err){alert(err.message||String(err))}
+      finally{btn.disabled=false}
+    };
+  });
 }
 
 function renderRecentClosed(clients){

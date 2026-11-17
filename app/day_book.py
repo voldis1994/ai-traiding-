@@ -86,6 +86,8 @@ def load_params(store):
         'open_slices': max(3, int(sp.get('day_open_slices', 5))),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
         'size_full_balance': int(sp.get('day_size_full_balance', 1)),
+        # Operator Admin toggle — 0 temporarily disables DEFEND/DONE/PROTECT OPEN blocks.
+        'risk_gates': int(sp.get('day_risk_gates', 1)),
     }
 
 
@@ -618,15 +620,18 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
             'daily': daily, 'budgets': b, 'open_count': open_n,
             'max_positions': max_pos,
         }
-    if phase in (PHASE_DEFEND, PHASE_DONE):
+    risk_gates = int(params.get('risk_gates', 1)) == 1
+    if risk_gates and phase in (PHASE_DEFEND, PHASE_DONE):
         return {
             'allowed': False, 'reason': f'day_phase_{phase.lower()}',
             'phase': phase, 'daily': daily, 'budgets': b, 'open_count': open_n,
+            'risk_gates': True,
         }
-    if phase == PHASE_PROTECT:
+    if risk_gates and phase == PHASE_PROTECT:
         return {
             'allowed': False, 'reason': 'day_protect_bank_target',
             'phase': phase, 'daily': daily, 'budgets': b, 'open_count': open_n,
+            'risk_gates': True,
         }
     # Adding onto an existing book needs a clearer edge than a flat open —
     # unless the live tape already agrees with the book (clear rebound ADD).
@@ -648,10 +653,14 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
                 'open_count': open_n, 'need_edge': need, 'score_edge': edge,
                 'trend_aligned': bool(trend_aligned),
             }
+    reason = 'day_book_hunt'
+    if not risk_gates and phase in (PHASE_DEFEND, PHASE_DONE, PHASE_PROTECT):
+        reason = f'day_risk_gates_off_phase_{str(phase).lower()}'
     return {
-        'allowed': True, 'reason': 'day_book_hunt', 'phase': phase,
+        'allowed': True, 'reason': reason, 'phase': phase,
         'daily': daily, 'budgets': b, 'open_count': open_n,
         'max_positions': max_pos, 'trend_aligned': bool(trend_aligned),
+        'risk_gates': risk_gates,
     }
 
 
@@ -1083,5 +1092,10 @@ def snapshot(store, *, equity=None, positions=None):
         'open_upl': upl,
         'day_mark_pnl': day_mark,
         'last_plan': store.get(LAST_PLAN_KEY) if store is not None else None,
-        'goal': 'No day profit cap; DEFEND at 10% equity loss; OPEN pack uses full account £.',
+        'risk_gates': int(params.get('risk_gates', 1)) == 1,
+        'goal': (
+            'Riski IZSLĒGTI — DEFEND/DONE/PROTECT nebloķē OPEN (Admin poga).'
+            if int(params.get('risk_gates', 1)) != 1 else
+            'No day profit cap; DEFEND at 10% equity loss; OPEN pack uses full account £.'
+        ),
     }

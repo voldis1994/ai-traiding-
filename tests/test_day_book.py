@@ -72,6 +72,38 @@ def test_phase_hunt_protect_defend_done():
     assert db.phase_for(daily=daily, budgets_map=b, open_count=1) == db.PHASE_HUNT
 
 
+def test_risk_gates_off_allows_open_in_defend():
+    """Admin toggle day_risk_gates=0 → DEFEND no longer blocks OPEN."""
+    from app.self_params import load, save
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        # Seed a day already past the 10% loss stop.
+        db.save_daily(s, {
+            'date': db._utc_date(),
+            'realized_pnl': -1500.0,
+            'opens': 3,
+            'closes': 3,
+            'deal_ids': [],
+        })
+        blocked = db.allows_new_open(
+            store=s, equity=10_000.0, positions=[],
+            epic='GOLD', mandate_epic='GOLD', score_edge=0.2)
+        assert blocked['allowed'] is False
+        assert blocked['phase'] == db.PHASE_DEFEND
+        params = load(s)
+        params['day_risk_gates'] = 0
+        save(s, params, reason='test_off')
+        opened = db.allows_new_open(
+            store=s, equity=10_000.0, positions=[],
+            epic='GOLD', mandate_epic='GOLD', score_edge=0.2)
+        assert opened['allowed'] is True
+        assert opened['phase'] == db.PHASE_DEFEND
+        assert opened['risk_gates'] is False
+        assert 'day_risk_gates_off' in opened['reason']
+        snap = db.snapshot(s, equity=10_000.0, positions=[])
+        assert snap['risk_gates'] is False
+
+
 def test_allows_multi_when_edge_strong():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)

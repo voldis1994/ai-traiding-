@@ -99,7 +99,7 @@ DEFAULTS = {
     'day_add_min_edge': 0.04,
     # Flat HUNT: split one planned lot into N simultaneous Capital-grid slices.
     'day_open_slices': 5,
-    'day_slice_min_edge': 0.06,
+    'day_slice_min_edge': 0.04,
     # Situation memory: scene×action £ with time decay → soft OPEN influence
     'situation_memory_min_samples': 3,
     'situation_memory_nudge': 0.12,
@@ -359,6 +359,8 @@ _LEGACY_SEED_MIGRATIONS = {
     'day_max_positions': (3, 5),
     # Old hard 0.06 edge floor → signal-first default (gate off).
     'entry_edge_floor': (0.06, 0.0),
+    # Old multi-lot freeze at 0.06 → follow BUY/SELL when flat.
+    'day_slice_min_edge': (0.06, 0.04),
 }
 
 

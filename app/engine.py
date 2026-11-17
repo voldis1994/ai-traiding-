@@ -3076,14 +3076,19 @@ class SingleTradeEngine:
         return self._account_currency()
 
     def _account_equity(self):
-        """Best-effort account equity/balance for drawdown gating (audit #21)."""
+        """Best-effort deployable account £ for sizing + drawdown gating.
+
+        Prefer ``available`` then ``balance`` then ``equity`` so OPEN packs
+        size to cash left in the account (e.g. £20 → use £20), not a stale
+        higher equity figure after open UPL.
+        """
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or
                      a.get('accountId')==self.account.get('currentAccountId')),
                     account[0] if account else {})
         bal=active.get('balance') if isinstance(active,dict) else None
         if isinstance(bal,dict):
-            for key in ('equity','balance','available'):
+            for key in ('available','balance','equity'):
                 v=_num(bal.get(key))
                 if v is not None and v>0:return float(v)
         return _num(bal) if not isinstance(bal,dict) else None
@@ -5151,23 +5156,26 @@ class SingleTradeEngine:
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
             # Capital dealingRules size grid — never invent 0.1009-style lots.
             size_grid=dealing_size_grid(market,mandate_size=self.mandate['size'])
-            # Day book: equity risk → adaptive lot; multi-pos when capacity remains.
+            # Day book: full account balance → lot pack; multi-pos when capacity remains.
             equity=self._account_equity()
-            # When Capital omits valueOfOnePip, lot stayed glued to mandate forever.
-            # Calibrate tick_value so mandate size ≈ day risk_per_trade at this stop.
+            # When Capital omits valueOfOnePip, calibrate so mandate ≈ fractional
+            # risk_per_trade. Skip when size_full_balance — that glue would keep
+            # size at mandate even though risk_cap = whole £ balance.
             tick_val_src='capital'
             if tick_val is None and brackets.get('stop_ticks') and equity:
                 try:
                     params=day_book.load_params(self.store)
-                    bmap=day_book.budgets(
-                        equity=equity,params=params,
-                        daily=day_book.load_daily(self.store,equity=equity))
-                    rpt=_num(bmap.get('risk_per_trade'))
-                    msize=float(Decimal(str(self.mandate['size'])))
-                    st=float(brackets['stop_ticks'])
-                    if rpt and rpt>0 and msize>0 and st>0:
-                        tick_val=rpt/(msize*st)
-                        tick_val_src='mandate_risk_calibrated'
+                    full_bal=int(params.get('size_full_balance') or 0)==1
+                    if not full_bal:
+                        bmap=day_book.budgets(
+                            equity=equity,params=params,
+                            daily=day_book.load_daily(self.store,equity=equity))
+                        rpt=_num(bmap.get('risk_per_trade'))
+                        msize=float(Decimal(str(self.mandate['size'])))
+                        st=float(brackets['stop_ticks'])
+                        if rpt and rpt>0 and msize>0 and st>0:
+                            tick_val=rpt/(msize*st)
+                            tick_val_src='mandate_risk_calibrated'
                 except Exception:
                     tick_val=None
             _scores_for_align,_edge_for_align,_aligned=self._day_book_add_edge()
@@ -5332,10 +5340,15 @@ class SingleTradeEngine:
                 self._lock_entry_signal_for_open()
             pending_brain=self._pending_entry_brain
             opened_slices=0
+            # Flat AI OPEN → fire the *whole* planned multi-lot pack in this
+            # submit (all lot sizes now). Do not abort after slice 0 because a
+            # sibling OPEN confirm is still settling / unresolved.
+            flat_burst=len(before_ids)==0 and len(slice_sizes)>1
+            burst_oids=set()
             try:
                 for slice_i,size in enumerate(slice_sizes):
-                    if slice_i>0:
-                        # Refresh book between slices; stop if capacity/unresolved.
+                    if slice_i>0 and not flat_burst:
+                        # Later ADD path: one slice per call — capacity checks apply.
                         await self.sync()
                         if self.store.unresolved():
                             self.store.event('entry',
@@ -5356,6 +5369,27 @@ class SingleTradeEngine:
                                 {'reason':room.get('reason'),
                                  'opened_slices':opened_slices})
                             break
+                    elif slice_i>0 and flat_burst:
+                        # Keep book fresh for dealId binding; never stop the pack
+                        # on our own in-flight OPEN rows from earlier slices.
+                        await self.sync()
+                        foreign=[u for u in (self.store.unresolved() or [])
+                                 if u.get('id') not in burst_oids
+                                 and str(u.get('deal_id') or '') not in before_ids]
+                        if foreign:
+                            self.store.event('entry',
+                                'Multi-lot OPEN pack continues despite foreign unresolved',
+                                {'foreign':len(foreign),'opened_slices':opened_slices})
+                        try:
+                            max_pos=int(day_book.load_params(self.store).get(
+                                'max_positions') or 5)
+                        except Exception:
+                            max_pos=5
+                        if len(self.positions or [])>=max_pos:
+                            self.store.event('entry',
+                                'Multi-lot OPEN pack hit max_positions',
+                                {'opened_slices':opened_slices,'max_positions':max_pos})
+                            break
                     slice_before={str(p['dealId']) for p in (self.positions or [])
                                   if p.get('dealId')}
                     # Durable order record BEFORE a real order is sent.
@@ -5368,7 +5402,10 @@ class SingleTradeEngine:
                             'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
                             'day_phase':plan.get('phase'),
                             'slice_index':slice_i,
-                            'slice_count':len(slice_sizes)})
+                            'slice_count':len(slice_sizes),
+                            'flat_burst':bool(flat_burst)})
+                    if oid is not None:
+                        burst_oids.add(oid)
                     receipt=await self.broker.open_position(
                         self.mandate['epic'],action,size,
                         stop_distance=brackets['stop_distance'],
@@ -5422,7 +5459,9 @@ class SingleTradeEngine:
                     self.store.event('entry','Multi-lot OPEN burst',{
                         'direction':action,'opened_slices':opened_slices,
                         'planned_slices':len(slice_sizes),
-                        'sizes':[str(s) for s in slice_sizes[:opened_slices]]})
+                        'sizes':[str(s) for s in slice_sizes[:opened_slices]],
+                        'flat_burst':bool(flat_burst),
+                        'full_pack':opened_slices==len(slice_sizes)})
                 self._pending_entry_brain=None
             except Exception as exc:
                 # Keep UNCERTAIN so a second OPEN cannot fire; operator Resume clears.

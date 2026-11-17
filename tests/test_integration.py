@@ -178,12 +178,65 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             await engine.submit('SELL')
             opens=[r for r in broker.requests if r[0]=='OPEN']
             assert opens
-            # Flat BUY/SELL may multi-lot into day_open_slices (sum stays mandate).
+            # Flat AI OPEN must send the *full* multi-lot pack in this submit.
+            assert len(opens)==5
             assert sum((Decimal(str(r[3])) for r in opens), Decimal('0'))==Decimal('.25')
             assert opens[-1][4]>0 and opens[-1][5]>0
             assert len(engine.positions)>=1
             assert not store.unresolved()
             assert store.trades()[0]['epic']=='SIM'
+    async_run(scenario())
+
+
+def test_flat_ai_open_sends_full_multi_lot_pack_despite_sibling_unresolved():
+    """One submit → all planned lot sizes; sibling OPEN lag must not stop the pack."""
+    class AccumBroker(BrokerSimulation):
+        def __init__(self):
+            super().__init__()
+            self._n=0
+        async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None):
+            self.requests.append(('OPEN',epic,direction,size,stop_distance,profit_distance))
+            if self.fail_on_order:raise TimeoutError('Request outcome unknown')
+            self._n+=1
+            deal=f'b{self._n}'
+            # Accumulate slices (live Capital book grows; do not replace).
+            self.open.append({'position':{
+                'dealId':deal,'size':str(size),'direction':direction,'level':self.price,
+                'stopLevel':self.price-float(stop_distance),
+                'profitLevel':self.price+float(profit_distance)},'market':{'epic':epic}})
+            return {'dealReference':f'entry{self._n}','dealId':deal}
+        async def confirm(self,ref):
+            if self.open:
+                pos=self.open[-1].get('position') or self.open[-1]
+                return {'dealStatus':'ACCEPTED','dealId':pos.get('dealId') or 'b2'}
+            return {'dealStatus':'ACCEPTED','dealId':'b2'}
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store=Store(Path(d)/'s.db');brain=AdaptiveBrain(store,data_dir=d)
+            engine=SingleTradeEngine(store,brain);broker=AccumBroker()
+            engine.policy=AutoEvolution(store,Path(d)/'policy.py')
+            engine.attach(broker);await engine.sync()
+            await engine.exit_position('m1')
+            await engine.poll()
+            # Inject foreign UNCERTAIN only on mid-burst sync — must not abort pack.
+            real_sync=engine.sync
+            sync_n={'n':0}
+            async def sync_with_ghost():
+                await real_sync()
+                sync_n['n']+=1
+                if sync_n['n']>=2 and not any(
+                        u.get('deal_id')=='ghost99' for u in store.unresolved()):
+                    oid=store.order('OPEN','ghost99',{'epic':'SIM','direction':'SELL'})
+                    store.order_update(oid,'UNCERTAIN','ghost-ref')
+            engine.sync=sync_with_ghost
+            engine.market_context={'ready':True}
+            brain.mark_prep_ready('test fixture')
+            await engine.submit('BUY')
+            opens=[r for r in broker.requests if r[0]=='OPEN']
+            assert len(opens)==5
+            assert sum((Decimal(str(r[3])) for r in opens), Decimal('0'))==Decimal('.25')
+            assert len(broker.open)==5
     async_run(scenario())
 
 

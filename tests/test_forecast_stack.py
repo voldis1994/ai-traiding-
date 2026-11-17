@@ -10,13 +10,16 @@ import numpy as np
 import pytest
 
 from app.engine import Store
-from app.forecast_benchmark import chrono_split, run_benchmark, run_gold_benchmark
+from app.forecast_benchmark import (
+    chrono_split, run_benchmark, run_gold_benchmark, run_gold_ohlc_compare,
+    sigma_error_diagnostics,
+)
 from app.forecast_calibration import expected_calibration_error, summarize_calibration
-from app.forecast_memory import ForecastMemory
-from app.forecast_benchmark import sigma_error_diagnostics
+from app.forecast_memory import ForecastMemory, RESOLVED_ABANDONED, RESOLVED_OK
 from app.forecast_model import MultiHorizonForecast, gaussian_nll_dlog_sigma
 from app.forecast_targets import (
-    HORIZONS, direction_label, mid_change, path_from_candles, targets_at_horizons,
+    HORIZONS, completed_candles, direction_label, mid_change, path_from_candles,
+    targets_at_horizons,
 )
 
 
@@ -134,8 +137,10 @@ def test_forecast_memory_links_all_horizons_via_at():
                 'close': 2650.0 + i * 0.5,
                 'spread': 0.3,
             })
-        n = mem.resolve_with_candles(candles, epic='GOLD')
-        assert n == 1
+        # now_utc after the last completed bar so all 16 are finished.
+        now = t0 + timedelta(minutes=20)
+        stats = mem.resolve_with_candles(candles, epic='GOLD', now_utc=now)
+        assert stats['resolved'] == 1
         rows = mem.rows(epic='GOLD', resolved_only=True)
         assert set(rows[0]['outcomes']) == set(HORIZONS)
         assert rows[0]['outcomes'][1]['r'] == pytest.approx(0.5)
@@ -274,3 +279,76 @@ def test_sigma_error_diagnostics_coverage():
     assert d['n'] == 4
     assert d['coverage_1sigma'] == pytest.approx(0.5)
     assert d['mean_abs_err'] == pytest.approx(1.0)
+
+
+def test_completed_candles_excludes_forming_minute():
+    now = datetime(2026, 11, 17, 10, 30, 15, tzinfo=timezone.utc)
+    candles = [
+        {'at': '2026-11-17T10:28:00+00:00', 'close': 2650.0},
+        {'at': '2026-11-17T10:29:00+00:00', 'close': 2651.0},
+        {'at': '2026-11-17T10:30:00+00:00', 'close': 2652.0},  # forming
+    ]
+    done = completed_candles(candles, now_utc=now)
+    assert len(done) == 2
+    assert done[-1]['close'] == 2651.0
+
+
+def test_stuck_old_forecast_abandoned_new_still_resolves():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        mem = ForecastMemory(store)
+        feats = [0.1] * 8
+        scores = {'BUY': 0.4, 'SELL': 0.3, 'HOLD': 0.3}
+        t0 = datetime(2026, 11, 17, 9, 0, tzinfo=timezone.utc)
+        # Old row with a permanent gap after it.
+        mem.record(epic='GOLD', features=feats, scores=scores, mid=2650.0,
+                   bar_time=t0.isoformat(), signal_id=1)
+        # Contiguous candle path starts much later — old row cannot resolve.
+        candles = [{'at': t0.isoformat(), 'close': 2650.0, 'spread': 0.3}]
+        # gap then long contiguous run for a newer forecast
+        t1 = t0 + timedelta(minutes=40)
+        mem.record(epic='GOLD', features=feats, scores=scores, mid=2660.0,
+                   bar_time=t1.isoformat(), signal_id=2)
+        for i in range(0, 20):
+            ts = t1 + timedelta(minutes=i)
+            candles.append({
+                'at': ts.isoformat(),
+                'close': 2660.0 + i * 0.2,
+                'spread': 0.3,
+            })
+        now = t1 + timedelta(minutes=25)
+        stats = mem.resolve_with_candles(
+            candles, epic='GOLD', now_utc=now, abandon_grace_minutes=2)
+        assert stats['abandoned'] >= 1
+        assert stats['resolved'] >= 1
+        rows = mem.rows(epic='GOLD', resolved_only=False)
+        statuses = {r['time'][:16]: r['status'] for r in rows}
+        assert any(r['status'] == RESOLVED_ABANDONED for r in rows)
+        assert any(r['status'] == RESOLVED_OK for r in rows)
+
+
+def test_gold_ohlc_compare_pipeline_completed_bars_only():
+    rng = np.random.default_rng(11)
+    t0 = datetime(2026, 11, 17, 6, 0, tzinfo=timezone.utc)
+    candles = []
+    px = 2650.0
+    for i in range(120):
+        px = px + float(rng.normal(0, 0.4))
+        candles.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': px, 'high': px + 0.2, 'low': px - 0.2, 'close': px,
+            'spread': 0.3,
+        })
+    # Include a forming bar that must be ignored.
+    forming = t0 + timedelta(minutes=120)
+    candles.append({
+        'at': forming.isoformat(),
+        'open': px, 'high': px, 'low': px, 'close': px + 9.0, 'spread': 0.3,
+    })
+    now = forming + timedelta(seconds=30)
+    report = run_gold_ohlc_compare(candles, seed=4, now_utc=now)
+    assert report['ok']
+    assert report['live_neural_replaced'] is False
+    assert report['resolve_stats']['resolved'] >= 20
+    assert report['gold_h1']['accuracy'] is not None
+    assert report['primary_horizon'] == 1

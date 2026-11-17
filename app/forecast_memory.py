@@ -8,14 +8,19 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .forecast_targets import (
-    HORIZONS, bar_stamp, path_from_candles, targets_at_horizons,
+    HORIZONS, bar_stamp, candle_bar_time, completed_candles, path_from_candles,
+    targets_at_horizons,
 )
 
 STORE_FLAG = 'forecast_memory_enabled'
 TABLE = 'forecast_memory'
+# resolved: 0=pending, 1=ok, 2=abandoned (gap / past window — leave the queue)
+RESOLVED_PENDING = 0
+RESOLVED_OK = 1
+RESOLVED_ABANDONED = 2
 
 
 def _now():
@@ -110,54 +115,93 @@ class ForecastMemory:
             f'''INSERT INTO {TABLE}
                 (time,epic,signal_id,features,scores,mid,spread,tick_size,
                  in_position,resolved,outcomes)
-                VALUES(?,?,?,?,?,?,?,?,?,0,NULL)''',
+                VALUES(?,?,?,?,?,?,?,?,?,?,NULL)''',
             (str(time_s),str(epic or ''),signal_id,
              json.dumps(feats),json.dumps(score_map),mid_f,sp,tick,
-             1 if in_position else 0))
+             1 if in_position else 0,RESOLVED_PENDING))
         self.store.db.commit()
         return cur.lastrowid
 
-    def unresolved(self, *, epic=None, limit=500):
-        q=f'SELECT id,time,epic,mid,spread FROM {TABLE} WHERE resolved=0'
-        args=[]
+    def unresolved(self, *, epic=None, limit=500, newest_first=False):
+        q=f'SELECT id,time,epic,mid,spread FROM {TABLE} WHERE resolved=?'
+        args=[RESOLVED_PENDING]
         if epic:
             q+=' AND epic=?';args.append(str(epic))
-        q+=' ORDER BY id ASC LIMIT ?';args.append(int(limit))
+        q+=(' ORDER BY id DESC LIMIT ?' if newest_first
+            else ' ORDER BY id ASC LIMIT ?')
+        args.append(int(limit))
         cols=('id','time','epic','mid','spread')
         return [dict(zip(cols,r)) for r in self.store.db.execute(q,args)]
 
-    def resolve_with_candles(self, candles, *, epic=None, horizons=HORIZONS):
-        """Link each pending M1 forecast to actual 1/3/5/15-minute outcomes.
+    def _pending_scan(self, *, epic=None, scan=400):
+        """Newest + oldest pending — old gaps must not monopolize the queue."""
+        recent=self.unresolved(epic=epic,limit=scan,newest_first=True)
+        older=self.unresolved(epic=epic,limit=scan,newest_first=False)
+        seen=set();out=[]
+        for row in recent+older:
+            rid=row['id']
+            if rid in seen:
+                continue
+            seen.add(rid);out.append(row)
+        return out
 
-        Uses normalized minute stamps so Store ``at`` matches forecast ``time``.
-        Only marks resolved when every requested horizon is present.
+    def resolve_with_candles(self, candles, *, epic=None, horizons=HORIZONS,
+                             now_utc=None, abandon_grace_minutes=2, scan=400):
+        """Link pending M1 forecasts to actual 1/3/5/15 outcomes.
+
+        - Uses only **completed** M1 candles (forming minute excluded).
+        - Scans newest and oldest pending so a stuck early gap cannot block
+          evaluation of fresh rows.
+        - Abandons rows whose outcome window is already past the latest candle
+          but still unresolvable (contiguous path missing).
         """
-        if not candles:
-            return 0
         need=tuple(int(h) for h in horizons)
         max_h=max(need) if need else 15
-        n=0
-        for row in self.unresolved(epic=epic,limit=2000):
+        bars=completed_candles(candles,now_utc=now_utc)
+        if not bars:
+            return {'resolved':0,'abandoned':0,'scanned':0}
+        latest=None
+        for c in bars:
+            st=bar_stamp(candle_bar_time(c))
+            if st is None:
+                continue
+            if latest is None or st>latest:
+                latest=st
+        grace=int(abandon_grace_minutes if abandon_grace_minutes is not None else 2)
+        n_ok=0;n_ab=0
+        pending=self._pending_scan(epic=epic,scan=scan)
+        for row in pending:
             mids,spreads,_match=path_from_candles(
-                candles,after_time=row['time'],max_h=max_h)
-            if len(mids)<max_h:
+                bars,after_time=row['time'],max_h=max_h,require_contiguous=True)
+            if len(mids)>=max_h:
+                outcomes=targets_at_horizons(
+                    row['mid'],mids,spread=row.get('spread') or 0.,
+                    future_spreads=spreads,horizons=need)
+                if any(h not in outcomes for h in need):
+                    continue
+                if abs(float(outcomes[need[0]]['exit_mid'])-float(mids[need[0]-1]))>1e-9:
+                    continue
+                payload={str(h):outcomes[h] for h in need}
+                self.store.db.execute(
+                    f'UPDATE {TABLE} SET resolved=?, outcomes=? WHERE id=?',
+                    (RESOLVED_OK,json.dumps(payload),row['id']))
+                n_ok+=1
                 continue
-            outcomes=targets_at_horizons(
-                row['mid'],mids,spread=row.get('spread') or 0.,
-                future_spreads=spreads,horizons=need)
-            if any(h not in outcomes for h in need):
+            # Stuck? History already past forecast + horizon + grace → abandon.
+            row_st=bar_stamp(row['time'])
+            if row_st is None or latest is None:
                 continue
-            # Sanity: h=1 exit must be the first future mid.
-            if abs(float(outcomes[need[0]]['exit_mid'])-float(mids[need[0]-1]))>1e-9:
-                continue
-            payload={str(h):outcomes[h] for h in need}
-            self.store.db.execute(
-                f'UPDATE {TABLE} SET resolved=1, outcomes=? WHERE id=?',
-                (json.dumps(payload),row['id']))
-            n+=1
-        if n:
+            deadline=row_st+timedelta(minutes=max_h+grace)
+            if latest>=deadline:
+                self.store.db.execute(
+                    f'UPDATE {TABLE} SET resolved=?, outcomes=? WHERE id=?',
+                    (RESOLVED_ABANDONED,
+                     json.dumps({'reason':'gap_or_incomplete_path','max_h':max_h}),
+                     row['id']))
+                n_ab+=1
+        if n_ok or n_ab:
             self.store.db.commit()
-        return n
+        return {'resolved':n_ok,'abandoned':n_ab,'scanned':len(pending)}
 
     def rows(self, *, epic=None, currency=None, resolved_only=True, limit=5000):
         """currency unused — kept for API symmetry with cash rows; epic filters."""
@@ -166,7 +210,7 @@ class ForecastMemory:
            f'in_position,resolved,outcomes FROM {TABLE}')
         clauses=[];args=[]
         if resolved_only:
-            clauses.append('resolved=1')
+            clauses.append('resolved=?');args.append(RESOLVED_OK)
         if epic:
             clauses.append('epic=?');args.append(str(epic))
         if clauses:
@@ -181,14 +225,20 @@ class ForecastMemory:
                 outcomes=json.loads(outc) if outc else None
             except (TypeError,ValueError,json.JSONDecodeError):
                 continue
-            if outcomes:
-                outcomes={int(k):v for k,v in outcomes.items()}
+            if outcomes and int(res)==RESOLVED_OK:
+                try:
+                    outcomes={int(k):v for k,v in outcomes.items()
+                              if str(k).lstrip('-').isdigit()}
+                except Exception:
+                    outcomes=None
             out.append({
                 'id':rid,'time':t,'epic':ep,'signal_id':sid,
                 'features':features,'scores':scores,'mid':mid,
                 'spread':sp,'tick_size':tick,
                 'in_position':bool(inp),
-                'resolved':bool(res),
+                'resolved':int(res)==RESOLVED_OK,
+                'abandoned':int(res)==RESOLVED_ABANDONED,
+                'status':int(res),
                 'outcomes':outcomes,
             })
         return out
@@ -196,11 +246,13 @@ class ForecastMemory:
     def summary(self, *, epic=None):
         rows=self.rows(epic=epic,resolved_only=False,limit=100000)
         resolved=sum(1 for r in rows if r.get('resolved'))
+        abandoned=sum(1 for r in rows if r.get('abandoned'))
         in_pos=sum(1 for r in rows if r.get('in_position'))
         return {
             'total':len(rows),
             'resolved':resolved,
-            'unresolved':len(rows)-resolved,
+            'abandoned':abandoned,
+            'unresolved':len(rows)-resolved-abandoned,
             'in_position_rows':in_pos,
             'epic':epic,
             'horizons':list(HORIZONS),
@@ -215,8 +267,20 @@ def maybe_record(store, **kwargs):
         return None
 
 
-def maybe_resolve(store, candles, *, epic=None):
+def maybe_resolve(store, candles, *, epic=None, now_utc=None):
+    """Resolve from completed candles; prefer Store HISTORICAL when dense enough."""
     try:
-        return ForecastMemory(store).resolve_with_candles(candles,epic=epic)
+        mem=ForecastMemory(store)
+        use=list(candles or [])
+        if epic and hasattr(store,'candles'):
+            try:
+                hist=store.candles(str(epic),n=500,historical_only=True) or []
+                # Prefer HISTORICAL if it covers the contiguous horizon window.
+                if len(hist)>=max(HORIZONS)+2:
+                    use=hist
+            except Exception:
+                pass
+        out=mem.resolve_with_candles(use,epic=epic,now_utc=now_utc)
+        return int(out.get('resolved') or 0) if isinstance(out,dict) else int(out or 0)
     except Exception:
         return 0

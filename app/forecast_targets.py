@@ -84,6 +84,28 @@ def candle_mid(c):
     return None
 
 
+def completed_candles(candles, *, now_utc=None):
+    """Keep only finished M1 bars — never the forming minute.
+
+    Same cutoff rule as ``market_features``: bar stamp must be strictly before
+    the current UTC minute. Incomplete OHLC (no usable mid/close) is dropped.
+    """
+    cutoff=bar_stamp(now_utc if now_utc is not None else datetime.now(timezone.utc))
+    if cutoff is None:
+        return list(candles or [])
+    out=[]
+    for c in candles or []:
+        if not isinstance(c,dict):
+            continue
+        st=bar_stamp(candle_bar_time(c))
+        if st is None or st>=cutoff:
+            continue
+        if candle_mid(c) is None:
+            continue
+        out.append(c)
+    return out
+
+
 def targets_at_horizons(entry_mid, future_mids, *, spread=0., future_spreads=None,
                         horizons=HORIZONS):
     """Build {h: {r, label, sigma_proxy, exit_mid}} for each reachable horizon.

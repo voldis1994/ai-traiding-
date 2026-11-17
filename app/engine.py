@@ -875,6 +875,18 @@ class AdaptiveBrain:
         self.history.append({'signal_id':cur.lastrowid,'price':mid,'scores':result['scores'],
             'action':result['action'],'label':None,'time':bar_time if features is not None else now(),
             'spread_bps':10000*spread/mid,'in_position':bool(in_position)})
+        # Forecast quality ledger — full feature vector + scores (not in signals).
+        # Recording only; never gates OPEN/CLOSE.
+        if features is not None and train_entry:
+            try:
+                from .forecast_memory import maybe_record
+                maybe_record(self.store,epic=epic,features=list(features),
+                             scores=result['scores'],mid=mid,spread=spread,
+                             tick_size=tick_size,
+                             bar_time=bar_time if features is not None else now(),
+                             signal_id=cur.lastrowid)
+            except Exception:
+                pass
         self.last_regime=('HIGH VOLATILITY' if abs(change)>10 else
             'RANGING' if abs(change)<spread/tick_size else 'TRENDING')
         self.last_mid=mid;self.last_change=change
@@ -2199,6 +2211,13 @@ class SingleTradeEngine:
                     self.last_signal=next_signal
                     self.last_decision_bar=bar_t
                     new_closed_bar=True
+                    # Resolve multi-horizon forecast outcomes (quality ledger only).
+                    try:
+                        from .forecast_memory import maybe_resolve
+                        maybe_resolve(self.store,candles,
+                                      epic=self.mandate.get('epic') if self.mandate else None)
+                    except Exception:
+                        pass
                     # Audit #32: never run neural growth / feature search before
                     # open-position protection. Flat books may self-dev now;
                     # open books defer until after trail/protect below.

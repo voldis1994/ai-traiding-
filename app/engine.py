@@ -5160,7 +5160,7 @@ class SingleTradeEngine:
             equity=self._account_equity()
             # When Capital omits valueOfOnePip:
             #  • fractional mode — calibrate so mandate ≈ risk_per_trade
-            #  • full_balance — calibrate so open_slices×minDealSize ≈ equity
+            #  • full_balance — calibrate so edge-scaled N×minDealSize ≈ equity
             #    cash-risk (never leave tick_val None → mandate glue / one chunk)
             tick_val_src='capital'
             if tick_val is None and brackets.get('stop_ticks') and equity:
@@ -5171,7 +5171,9 @@ class SingleTradeEngine:
                     if full_bal and size_grid.get('ok') and st>0:
                         want=max(3,int(params.get('open_slices') or 5))
                         mn=float(Decimal(str(size_grid['min'])))
-                        target=max(mn,mn*want)
+                        strength=day_book._signal_strength(score_edge)
+                        n_pack=want+int(round(want*strength))
+                        target=max(mn,mn*n_pack)
                         if target>0 and equity>0:
                             tick_val=float(equity)/(target*st)
                             tick_val_src='full_balance_min_pack_calibrated'

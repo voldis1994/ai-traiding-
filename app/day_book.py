@@ -483,7 +483,12 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
     if open_n > 0:
         need = float(params.get('add_min_edge') or 0.08)
         if trend_aligned:
-            need = min(need, 0.02)
+            try:
+                from .self_params import get as sp_get
+                floor = float(sp_get(store, 'day_add_trend_floor', 0.02))
+            except Exception:
+                floor = 0.02
+            need = min(need, floor)
         edge = _finite(score_edge)
         if edge is None or edge < need:
             return {
@@ -718,9 +723,18 @@ def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
 
     # Convincing = clear winner over HOLD and over the opposite side.
     # With a matching clear tape, accept a slightly weaker neural lead.
-    min_best = 0.24 if clear == best else 0.28
-    min_vs_hold = 0.02 if clear == best else 0.04
-    min_vs_other = 0.02 if clear == best else 0.03
+    try:
+        from .self_params import get as sp_get
+        min_best = float(sp_get(store, 'conviction_min_best_clear' if clear == best
+                                else 'conviction_min_best',
+                                0.24 if clear == best else 0.28))
+        min_vs_hold = float(sp_get(store, 'conviction_min_vs_hold_clear' if clear == best
+                                   else 'conviction_min_vs_hold',
+                                   0.02 if clear == best else 0.04))
+    except Exception:
+        min_best = 0.24 if clear == best else 0.28
+        min_vs_hold = 0.02 if clear == best else 0.04
+    min_vs_other = min_vs_hold
     if best_v < min_best or (best_v - hold) < min_vs_hold or (best_v - other) < min_vs_other:
         return dict(scores), {'nudged': False, 'reason': 'not_convincing',
                               'clear_side': clear}
@@ -749,7 +763,13 @@ def soft_nudge_day_phase(scores, *, phase, store=None):
     if phase not in (PHASE_PROTECT, PHASE_DEFEND, PHASE_DONE):
         return dict(scores), {'nudged': False, 'reason': 'hunt_no_phase_tilt'}
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
-    delta = 0.10 if phase == PHASE_PROTECT else 0.16
+    try:
+        from .self_params import get as sp_get
+        delta = float(sp_get(store, 'day_phase_protect_tilt', 0.10)
+                      if phase == PHASE_PROTECT
+                      else sp_get(store, 'day_phase_defend_tilt', 0.16))
+    except Exception:
+        delta = 0.10 if phase == PHASE_PROTECT else 0.16
     out['HOLD'] = out['HOLD'] + delta
     out['BUY'] = max(0.0, out['BUY'] - 0.5 * delta)
     out['SELL'] = max(0.0, out['SELL'] - 0.5 * delta)
@@ -805,37 +825,23 @@ def record_close(store, *, pnl, now=None, equity=None, open_count=0, deal_id=Non
 
 
 def _evolve_knobs_from_close(store, *, pnl, daily, budgets_map):
-    """Tiny equity-frac nudges — robot learns 'enough' without hardcode bans."""
+    """Tiny day knobs via self_params trial protocol — never bypass freeze."""
     if store is None:
         return
-    from .self_params import load, save, _clip
-    p = load(store)
-    notes = []
+    from .self_params import evolve_from_feedback
     realized = float((daily or {}).get('realized_pnl') or 0.0)
     target = _finite((budgets_map or {}).get('profit_target'))
     loss_cap = _finite((budgets_map or {}).get('loss_budget'))
-    if pnl < 0:
-        # Losses → slightly smaller per-trade risk next (still inside rails).
-        p['day_risk_per_trade_frac'] = _clip(
-            'day_risk_per_trade_frac',
-            float(p['day_risk_per_trade_frac']) * 0.98)
-        notes.append('day loss → trim risk_per_trade_frac')
-    elif pnl > 0 and target is not None and realized >= abs(target):
-        # Hit day target → ask a touch more next day (ambition climbs slowly).
-        p['day_profit_target_frac'] = _clip(
-            'day_profit_target_frac',
-            float(p['day_profit_target_frac']) * 1.01)
-        notes.append('day target hit → slight raise profit_target_frac')
+    event = None
     if loss_cap is not None and realized <= -abs(loss_cap):
-        p['day_loss_budget_frac'] = _clip(
-            'day_loss_budget_frac',
-            float(p['day_loss_budget_frac']) * 0.97)
-        p['day_max_positions'] = _clip(
-            'day_max_positions',
-            int(p['day_max_positions']) - 1)
-        notes.append('day loss budget hit → tighten budget + max positions')
-    if notes:
-        save(store, p, reason='; '.join(notes))
+        event = 'day_budget_hit'
+    elif pnl < 0:
+        event = 'day_loss'
+    elif pnl > 0 and target is not None and realized >= abs(target):
+        event = 'day_target_hit'
+    if event:
+        evolve_from_feedback(store, day_book_event=event, commit=False,
+                             reason=f'day_book {event}')
 
 
 def open_upl_sum(positions):

@@ -2792,7 +2792,7 @@ class SingleTradeEngine:
             # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
             edge=unified_cycle.edge_allows_open(
                 nudged_scores,result,
-                unified_cycle.load_state(self.store))
+                unified_cycle.load_state(self.store),store=self.store)
             if not edge['allowed']:
                 return dict(result,action='HOLD',reason=edge['reason'],
                             unified_cycle=edge)
@@ -2804,7 +2804,7 @@ class SingleTradeEngine:
         else:
             result=dict(result,unified_cycle=unified_cycle.edge_allows_open(
                 nudged_scores,result,
-                unified_cycle.load_state(self.store)))
+                unified_cycle.load_state(self.store),store=self.store))
         return result
 
     def _live_ohlc_structure(self):
@@ -4138,13 +4138,14 @@ class SingleTradeEngine:
                 'SELL':0.7 if proposal=='SELL' else 0.15,'HOLD':0.15},
             evaluation={'action':proposal,'score_edge':max(0.2,float(edge or 0))},
             zone=zone,learned=learned,cycle_state=cycle_state,base_sl=base_sl,
-            max_tp=zone.get('max_tp'))
+            max_tp=zone.get('max_tp'),store=self.store)
         # Even if edge gate HOLDs LIVE, shadow still needs OHLC-decided distances.
         tighten=float(pkg.get('tighten') or min(1.0,float(
             (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
         decided=bracket_learn.decide_brackets_from_ohlc(
-            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten)
+            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
+            store=self.store)
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
@@ -4228,6 +4229,13 @@ class SingleTradeEngine:
             if taught:
                 if 'opposite_tp' in str(mode):
                     learning_generation.bump(self.store,'hold_shadow_opposite_tp')
+                    try:
+                        from .self_params import evolve_from_feedback
+                        evolve_from_feedback(
+                            self.store,hold_shadow_taught=True,commit=False,
+                            reason='hold_shadow opposite TP teach')
+                    except Exception:
+                        pass
                 elif 'proposal_tp' in str(mode):
                     learning_generation.bump(self.store,'hold_shadow_proposal_tp')
                 else:
@@ -5090,7 +5098,7 @@ class SingleTradeEngine:
             pkg=unified_cycle.compose_open(
                 action=action,scores=scores,evaluation=evaluation,zone=zone,
                 learned=learned,cycle_state=cycle_state,base_sl=base_sl,
-                max_tp=zone.get('max_tp'))
+                max_tp=zone.get('max_tp'),store=self.store)
             if pkg.get('blocked') or pkg.get('action') not in ('BUY','SELL'):
                 self.last_entry_reason=pkg.get('reason') or 'Unified cycle HOLD'
                 self.store.event('entry','OPEN skipped — unified cycle edge gate',{
@@ -5099,7 +5107,7 @@ class SingleTradeEngine:
                 return
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0))
+                tighten=float(pkg.get('tighten') or 1.0),store=self.store)
             # SL/TP from OHLC only — no hardcoded RR reshape.
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])

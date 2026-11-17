@@ -435,12 +435,12 @@ class AutoEvolution:
             f'gen={evidence["evolved_policy"]["generation"]})'),evidence
 
     @staticmethod
-    def hold_necessary(buy,sell,hold,*,returns_bps=None,trend=None,structure=None):
+    def hold_necessary(buy,sell,hold,*,returns_bps=None,trend=None,structure=None,
+                       store=None):
         """True only when abstention is required — not when HOLD is merely loud.
 
-        Stupid HOLD trap: softmax HOLD 50%+ while BUY/SELL already disagree.
-        Keep HOLD when sides are tied/ambiguous or HOLD utterly dominates with
-        no directional lean; never when the tape agrees with the better side.
+        Thresholds live in self_params (hold_lean_gap / dominate_*) so the robot
+        can ease or tighten abstention from £ and HOLD-shadow feedback.
         """
         try:
             buy=float(buy);sell=float(sell);hold=float(hold)
@@ -448,6 +448,14 @@ class AutoEvolution:
             return True
         if not all(math.isfinite(x) for x in (buy,sell,hold)):
             return True
+        try:
+            from .self_params import get as sp_get
+            lean=float(sp_get(store,'hold_lean_gap',0.04))
+            tie=float(sp_get(store,'hold_side_gap_tie',0.05))
+            dom_extra=float(sp_get(store,'hold_dominate_extra',0.12))
+            dom_gap=float(sp_get(store,'hold_dominate_side_gap',0.06))
+        except Exception:
+            lean,tie,dom_extra,dom_gap=0.04,0.05,0.12,0.06
         direction='BUY' if buy>=sell else 'SELL'
         strength=buy if direction=='BUY' else sell
         other=sell if direction=='BUY' else buy
@@ -463,13 +471,13 @@ class AutoEvolution:
         if clear==direction:
             return False
         # Directional lean vs opposite exists — HOLD mass alone is not enough.
-        if (strength-other)>=0.04:
+        if (strength-other)>=lean:
             return False
         # Necessary: no real lean between BUY and SELL, HOLD on top.
-        if side_gap<0.05 and hold+1e-12>=strength:
+        if side_gap<tie and hold+1e-12>=strength:
             return True
         # Necessary: HOLD utterly on top with almost no directional lean.
-        if hold>=strength+0.12 and side_gap<0.06:
+        if hold>=strength+dom_extra and side_gap<dom_gap:
             return True
         # Residual: HOLD still louder than the better side with weak lean.
         return hold>strength
@@ -505,7 +513,7 @@ class AutoEvolution:
               'evidence':evidence}
         if self.hold_necessary(
                 buy,sell,hold,returns_bps=returns_bps,trend=trend,
-                structure=structure):
+                structure=structure, store=getattr(self,'store',None)):
             return {**base,'action':'HOLD',
                     'reason':(f'Neural HOLD necessary vs {direction} '
                               f'(HOLD {hold:.1%} / {direction} {strength:.1%}; '

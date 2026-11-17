@@ -132,7 +132,15 @@ def save_state(store, state: dict) -> dict:
 
 
 def entry_edge_floor(store=None, cycle_state=None) -> float:
-    """LIVE edge shared by cycle gate + policy MIN_EDGE (calibrated or default)."""
+    """LIVE edge — robot Store bag when connected; else cycle state / default."""
+    if store is not None:
+        try:
+            from .self_params import get as sp_get
+            sp_floor = sp_get(store, 'entry_edge_floor', None)
+            if sp_floor is not None:
+                return quantize_entry_edge(sp_floor)
+        except Exception:
+            pass
     state = cycle_state if isinstance(cycle_state, dict) else load_state(store)
     return quantize_entry_edge(
         state.get('entry_edge_floor') or ENTRY_EDGE_DEFAULT)
@@ -182,12 +190,16 @@ def perceive_decision(scores, evaluation=None) -> dict:
     }
 
 
-def min_open_margin(state: dict = None) -> float:
-    """LIVE entry floor — calibrated value in state, else default 0.06.
-
-    Always a whole 0.01 step. Does not ratchet with £/ΔW — only via
-    ``set_calibrated_floor`` (holdout + spread) inside soft rails.
-    """
+def min_open_margin(state: dict = None, store=None) -> float:
+    """LIVE entry floor — Store bag when connected; else explicit cycle state."""
+    if store is not None:
+        try:
+            from .self_params import get as sp_get
+            sp_floor = sp_get(store, 'entry_edge_floor', None)
+            if sp_floor is not None:
+                return quantize_entry_edge(sp_floor)
+        except Exception:
+            pass
     state = state or default_state()
     return quantize_entry_edge(
         state.get('entry_edge_floor') or ENTRY_EDGE_DEFAULT)
@@ -198,14 +210,21 @@ _min_open_margin = min_open_margin
 
 
 def set_calibrated_floor(store, value, *, method='holdout', detail=None) -> dict:
-    """Persist holdout/spread-calibrated edge — never from last £ win/loss.
+    """Persist holdout/spread-calibrated edge into cycle state + self_params.
 
-    Value is snapped to ENTRY_EDGE_STEP (0.01): 0.06, 0.07, … not 0.065.
+    Robot may still nudge entry_edge_floor later via evolve_from_feedback.
     """
     state = load_state(store)
     floor = quantize_entry_edge(value if value is not None else ENTRY_EDGE_DEFAULT)
     state['entry_edge_floor'] = floor
     save_state(store, state)
+    try:
+        from .self_params import load as sp_load, save as sp_save
+        sp = sp_load(store)
+        sp['entry_edge_floor'] = floor
+        sp_save(store, sp, reason=f'calibrated_floor:{method}')
+    except Exception:
+        pass
     meta = {
         'floor': floor,
         'method': str(method or 'holdout'),
@@ -231,11 +250,11 @@ def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
     return load_state(store)
 
 
-def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
+def edge_allows_open(scores, evaluation=None, cycle_state=None, store=None) -> dict:
     """Public gate: after £ losses, weak neural margin becomes HOLD."""
     state = dict(cycle_state or default_state())
     decision = perceive_decision(scores, evaluation)
-    need = min_open_margin(state)
+    need = min_open_margin(state, store=store)
     act = decision['action']
     margin = decision['margin']
     # Only gate when edge is known — no scores ≠ automatic weak-edge veto.
@@ -270,7 +289,7 @@ def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
 
 
 def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
-                 base_sl, max_tp=None) -> dict:
+                 base_sl, max_tp=None, store=None) -> dict:
     """One OPEN package: may HOLD if cycle says edge is too weak after losses.
 
     Returns action, kappa, sl_scale, base_sl, max_tp, cycle metadata.
@@ -283,9 +302,14 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     raw_margin = decision['margin']
     known_margin = raw_margin is not None
     margin = float(raw_margin) if known_margin else 0.0
-    aggression = _clip(_finite(state.get('aggression')) or 1.0,
-                       AGGRESSION_MIN, AGGRESSION_MAX)
-    need = min_open_margin(state)
+    try:
+        from .self_params import get as sp_get
+        a_min = float(sp_get(store, 'aggression_min', AGGRESSION_MIN))
+        a_max = float(sp_get(store, 'aggression_max', AGGRESSION_MAX))
+    except Exception:
+        a_min, a_max = AGGRESSION_MIN, AGGRESSION_MAX
+    aggression = _clip(_finite(state.get('aggression')) or 1.0, a_min, a_max)
+    need = min_open_margin(state, store=store)
     zone = zone if isinstance(zone, dict) else {}
     tp_hint = _finite(max_tp) if max_tp is not None else _finite(zone.get('max_tp'))
     base_hint = _finite(base_sl)
@@ -318,7 +342,13 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     base = float(base_hint)
     tighten = min(1.0, float(aggression))
     # Weak edge → slightly tighter fraction of the *same* OHLC SL (TP stays 2×).
-    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
+    try:
+        from .self_params import get as sp_get
+        _base = float(sp_get(store, 'open_edge_scale_base', 0.85))
+        _slope = float(sp_get(store, 'open_edge_scale_slope', 2.0))
+    except Exception:
+        _base, _slope = 0.85, 2.0
+    edge_scale = _clip(_base + max(0.0, margin) * _slope, _base, 1.0)
     tighten = min(tighten, float(edge_scale))
     return {
         'action': act if act in ('BUY', 'SELL') else decision['action'],
@@ -360,26 +390,36 @@ def settle(store, *, pnl, action=None, exit_reason=None, scratch_band=None) -> d
         return save_state(store, state)
     band = _finite(scratch_band)
     is_scratch = band is not None and band >= 0 and abs(p) <= band
+    try:
+        from .self_params import get as sp_get
+        a_min = float(sp_get(store, 'aggression_min', AGGRESSION_MIN))
+        a_max = float(sp_get(store, 'aggression_max', AGGRESSION_MAX))
+        scratch_s = float(sp_get(store, 'aggression_scratch_step', 0.998))
+        loss1 = float(sp_get(store, 'aggression_loss_step', 0.98))
+        loss2 = float(sp_get(store, 'aggression_loss_step_streak', 0.96))
+        win1 = float(sp_get(store, 'aggression_win_step', 1.01))
+        win2 = float(sp_get(store, 'aggression_win_step_streak', 1.02))
+        flat_s = float(sp_get(store, 'aggression_flat_step', 0.995))
+    except Exception:
+        a_min, a_max = AGGRESSION_MIN, AGGRESSION_MAX
+        scratch_s, loss1, loss2, win1, win2, flat_s = 0.998, 0.98, 0.96, 1.01, 1.02, 0.995
     if is_scratch:
-        # Penny close: tiny cool-off only — do not inflate loss_streak.
-        state['aggression'] = _clip(agg * 0.998, AGGRESSION_MIN, AGGRESSION_MAX)
+        state['aggression'] = _clip(agg * scratch_s, a_min, a_max)
         state['last_scratch'] = True
         return save_state(store, state)
     state['last_scratch'] = False
     if p < 0:
         state['loss_streak'] = _safe_int(state.get('loss_streak'), 0) + 1
         state['win_streak'] = 0
-        # Cool aggression after losses → tighter SL/κ on next OPEN (exits).
-        step = 0.96 if state['loss_streak'] >= 2 else 0.98
-        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
+        step = loss2 if state['loss_streak'] >= 2 else loss1
+        state['aggression'] = _clip(agg * step, a_min, a_max)
     elif p > 0:
         state['win_streak'] = _safe_int(state.get('win_streak'), 0) + 1
         state['loss_streak'] = 0
-        step = 1.02 if state['win_streak'] >= 2 else 1.01
-        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
+        step = win2 if state['win_streak'] >= 2 else win1
+        state['aggression'] = _clip(agg * step, a_min, a_max)
     else:
-        # Flat £ — mild cool-off, do not treat as a win.
-        state['aggression'] = _clip(agg * 0.995, AGGRESSION_MIN, AGGRESSION_MAX)
+        state['aggression'] = _clip(agg * flat_s, a_min, a_max)
     return save_state(store, state)
 
 

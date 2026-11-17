@@ -645,9 +645,8 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
     kappa = float(median(pair_kappa))
     if kappa <= 0 or not math.isfinite(kappa):
         kappa = DEFAULT_KAPPA
-    # Keep reachable bound consistent with the consensus TP plan.
-    if sl > 0 and max_tp > 0 and kappa * sl > max_tp * 1.0001:
-        kappa = max(0.5, max_tp / sl)
+    # Do NOT crush consensus κ to max_tp/sl — LIVE locks RR=2 in
+    # decide_brackets_from_ohlc; max_tp stays reachable metadata only.
     noise = float(median(noises)) if noises else sl
     pull = float(median(pulls)) if pulls else None
     favor = float(median(favors)) if favors else None

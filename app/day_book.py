@@ -158,7 +158,14 @@ def reconcile_daily_from_trades(store, *, now=None, equity=None, open_count=0):
             'WHERE closed IS NOT NULL AND pnl IS NOT NULL'
         ).fetchall()
     except Exception:
-        return daily
+        rows = []
+    # Also count UTC-day opens from trades.opened (capacity / Admin opens).
+    try:
+        open_rows = store.db.execute(
+            'SELECT deal_id,opened FROM trades WHERE opened IS NOT NULL'
+        ).fetchall()
+    except Exception:
+        open_rows = []
     # Prefer broker cash when a deal appears twice; otherwise keep any settled pnl.
     by_deal = {}
     for deal_id, pnl, src, closed in rows:
@@ -176,7 +183,16 @@ def reconcile_daily_from_trades(store, *, now=None, equity=None, open_count=0):
         # Upgrade estimate → broker when cash finally settles.
         if prev[1] != 'broker' and src_s == 'broker':
             by_deal[deal] = (float(cash), src_s)
+    opens_today = 0
+    for deal_id, opened in open_rows or ():
+        if _trade_closed_on_utc_date(opened, today):
+            opens_today += 1
+
     if not by_deal:
+        # Still heal opens count when closes are empty/mismatched.
+        if opens_today and int(daily.get('opens') or 0) != opens_today:
+            daily['opens'] = int(opens_today)
+            save_daily(store, daily)
         return daily
     realized = 0.0
     wins = losses = 0
@@ -201,6 +217,8 @@ def reconcile_daily_from_trades(store, *, now=None, equity=None, open_count=0):
     daily['wins'] = int(wins)
     daily['losses'] = int(losses)
     daily['deal_ids'] = list(deal_ids)
+    if opens_today:
+        daily['opens'] = max(int(daily.get('opens') or 0), int(opens_today))
     params = load_params(store)
     b = budgets(equity=equity, params=params, daily=daily)
     daily['phase'] = phase_for(

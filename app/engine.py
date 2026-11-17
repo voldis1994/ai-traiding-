@@ -2186,11 +2186,13 @@ class SingleTradeEngine:
                          'time':now(),'status':snap.get('marketStatus'),'min_distance':self._min_distance(broker_market,mid),
                          'instrument_name':inst.get('name') or inst.get('epic') or self.mandate['epic'],
                          'source':'WEBSOCKET' if streamed else 'REST'}
-            # Broker protection is handled before slow secondary data calls.
-            # Missing SL → install bracket. Missing TP alone is valid (Capital TP Off
-            # after trail) — never invent TP every poll or trail cannot run.
+            # Broker protection before slow secondary data.
+            # Missing SL → full bracket. Missing TP alone → restore TP unless trail
+            # intentionally cleared it (Capital often confirms OPEN with SL on / TP Off).
             for _p in list(self.positions or []):
                 if _p.get('stopLevel') is None:
+                    await self.protect_position(_p)
+                elif _p.get('profitLevel') is None and self._needs_profit_restore(_p):
                     await self.protect_position(_p)
             if any(p.get('stopLevel') is None for p in (self.positions or [])):
                 return
@@ -2463,7 +2465,7 @@ class SingleTradeEngine:
             # Audit #22: historical candle load → chronological train → holdout eval
             # before autonomous LIVE OPEN. Separate from the live tick above.
             if (not self.positions and self.market_context.get('ready') and
-                hasattr(self.brain,'ensure_prep_eval')):
+                hasattr(self.brain,'ensure_prep_eval') and not self.operator_paused):
                 try:
                     # Already flat after first manual close but prep still blocked?
                     # Unlock cold-start OPEN on poll — do not wait for another trade.
@@ -2498,6 +2500,8 @@ class SingleTradeEngine:
                         if p.get('stopLevel') is None:
                             await self.protect_position(p)
                             continue
+                        if p.get('profitLevel') is None and self._needs_profit_restore(p):
+                            await self.protect_position(p)
                         streak_key='exit_opposite_streak:'+str(p['dealId'])
                         if vote in ('BUY','SELL') and vote!=p['direction']:
                             streak=int(self.store.get(streak_key) or 0)+1
@@ -2522,6 +2526,8 @@ class SingleTradeEngine:
                     if p.get('stopLevel') is None:
                         await self.protect_position(p)
                         continue
+                    if p.get('profitLevel') is None and self._needs_profit_restore(p):
+                        await self.protect_position(p)
                     await self.adapt_protection(p)
                 # Fall through: day book may ADD another position on a new bar.
             if not self.execution_enabled:return
@@ -2532,16 +2538,14 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','hold_shadow resolve skipped',
                                     {'type':type(exc).__name__})
-            # Multi-pos ADD edge from manage scores — frozen OPEN often HOLD-tilted.
-            _poll_scores,_poll_src=self._entry_vote_scores()
-            _poll_edge=(self.policy.score_edge(_poll_scores)
-                        if _poll_scores and hasattr(self.policy,'score_edge') else None)
+            # Multi-pos ADD edge — anti-HOLD + trend_aligned (same as snapshot gate).
+            _poll_scores,_poll_edge,_poll_aligned=self._day_book_add_edge()
             book_allows=day_book.allows_new_open(
                 store=self.store,equity=self._account_equity(),
                 positions=self.positions,
                 epic=(self.mandate or {}).get('epic'),
                 mandate_epic=(self.mandate or {}).get('epic'),
-                score_edge=_poll_edge).get('allowed')
+                score_edge=_poll_edge,trend_aligned=_poll_aligned).get('allowed')
             if (book_allows and (_poll_scores or self.last_signal) and
                   self.last_closed_step>=0 and new_closed_bar and
                   self.last_entry_processed_bar!=self.last_decision_bar):
@@ -3866,6 +3870,10 @@ class SingleTradeEngine:
         last=_num(base.get('last_attempt_at'))
         if last is None or attempts<=0:
             return True
+        # UPL already on Admin — shared history fetch is free this poll; do not
+        # leave £ stuck on upl_estimate behind a 256s backoff.
+        if base.get('upl_shown'):
+            return True
         # 0→immediate, then 8,16,32,64,128,256,300s cap.
         delay=min(300.0,float(2**min(max(attempts,1)+2,8)))
         return (now_ts-float(last))>=delay
@@ -4875,6 +4883,40 @@ class SingleTradeEngine:
                 'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                 'broker_error':_safe_broker_error(exc)})
 
+    def _needs_profit_restore(self,p):
+        """True when robot OPEN never got a TP (Capital SL-on / TP-Off).
+
+        Trail may intentionally clear profitLevel — do not fight that every poll.
+        Only restore when we still have planned profit_distance and trail has
+        not marked TP Off / BE-TRAIL active.
+        """
+        if not p or p.get('profitLevel') is not None:
+            return False
+        deal=str(p.get('dealId') or '')
+        if not deal:
+            return False
+        brain=self.store.get('entry_brain:'+deal) or {}
+        if not isinstance(brain,dict):
+            return False
+        # Only robot-owned / planned brackets — never invent TP on pure manual.
+        if not (brain.get('robot_open') or brain.get('profit_distance')
+                or brain.get('bracket_source')=='ohlc_zone'):
+            return False
+        prot=self.store.get('adaptive_protection:'+deal) or {}
+        if isinstance(prot,dict) and prot.get('tp_cleared_for_trail'):
+            return False
+        # If trail already advanced past BE, Capital TP Off is intentional.
+        if isinstance(prot,dict) and (prot.get('be_locked') or prot.get('trail_active')
+                                       or prot.get('phase') in ('TRAIL','BE','ARMED')):
+            return False
+        pd=brain.get('profit_distance')
+        try:
+            if pd is not None and float(pd)<=0:
+                return False
+        except (TypeError,ValueError):
+            pass
+        return True
+
     async def protect_position(self,p):
         if self.pending_order or self.pending_close:return
         if p.get('stopLevel') is not None and p.get('profitLevel') is not None:
@@ -5325,12 +5367,26 @@ class SingleTradeEngine:
                                if p.get('dealId')}
                         new_ids=[d for d in after if d not in slice_before]
                         deal_id=None
-                        if len(new_ids)==1:
+                        # Prefer confirm receipt dealId when present.
+                        conf_deal=None
+                        try:
+                            conf_deal=(receipt or {}).get('dealId') or (
+                                (receipt or {}).get('dealReference'))
+                        except Exception:
+                            conf_deal=None
+                        if conf_deal is not None and str(conf_deal) in after:
+                            deal_id=str(conf_deal)
+                        elif len(new_ids)==1:
                             deal_id=new_ids[0]
                         else:
                             latest=self.store.get('latest_robot_deal_id')
                             if latest is not None and str(latest) in after:
                                 deal_id=str(latest)
+                            elif len(new_ids)>1:
+                                # Stable pick: newest id not yet bound.
+                                unbound=[d for d in new_ids
+                                         if self.store.get('entry_brain:'+d) is None]
+                                deal_id=unbound[-1] if unbound else new_ids[-1]
                             elif len(after)==1:
                                 deal_id=next(iter(after))
                         key='entry_brain:'+str(deal_id) if deal_id else None
@@ -5362,12 +5418,18 @@ class SingleTradeEngine:
                     self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
                 if pending_brain and self._pending_entry_brain is None:
                     self._pending_entry_brain=pending_brain
-                self.execution_enabled=False
-                self.store.event('error',
-                    'Entry outcome uncertain; no automatic retry until Resume',
+                opened=opened_slices if 'opened_slices' in locals() else 0
+                # Partial multi-lot fill: keep execution so trail/protect continue.
+                if opened<=0:
+                    self.execution_enabled=False
+                self.store.event('error' if opened<=0 else 'warning',
+                    ('Entry outcome uncertain; no automatic retry until Resume'
+                     if opened<=0 else
+                     'Multi-lot OPEN partial — keeping execution for filled slices'),
                     {'type':type(exc).__name__,
-                     'opened_slices':opened_slices if 'opened_slices' in locals() else 0,
-                     'pending_entry_brain_kept':bool(self._pending_entry_brain)})
+                     'opened_slices':opened,
+                     'pending_entry_brain_kept':bool(self._pending_entry_brain),
+                     'execution_enabled':bool(self.execution_enabled)})
         finally:self.pending_order=False
     def _manage_perceive_ohlc(self,*,mid,spread,tick,epic,bar_t,features):
         """Forward-only manage scores when fusion EXTERNAL is gapped.
@@ -5488,7 +5550,11 @@ class SingleTradeEngine:
             if not book.get('allowed'):
                 return (self._existing_open_block_reason()
                         + ' · day book: ' + str(book.get('reason') or book.get('phase')))
-            # Capacity remains — fall through to normal readiness/signal reasons.
+            # Capacity for ADD left — still name the open book when cold-start /
+            # market context cannot actually fire another OPEN yet.
+            if self.last_closed_step<0 or not self.market_context.get('ready'):
+                return self._existing_open_block_reason()
+            # Otherwise fall through to readiness/signal reasons for ADD.
         if not self.mandate:
             return 'No adoptive size this session — open a new manual trade'
         if self.last_closed_step<0:
@@ -6033,14 +6099,19 @@ class SingleTradeEngine:
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             bp=bracket_learn.propose_for_open(
                 self.store,ohlc_kappa=zone.get('kappa'),base_sl=base_sl,
-                max_tp=zone.get('max_tp'),candles=rows)
-            entry_proxy=float(mid)+abs(float(spread or 0))/2.
-            brackets=stop_take(entry_proxy,'BUY',tick,spread,minimum,
-                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
-                               range_distance=float(rng) if rng is not None else 0)
-            stop_d=float(brackets['stop_distance'])
-            profit_d=float(brackets['profit_distance'])
-            kappa=bp['kappa'];sl_scale=bp['sl_scale']
+                max_tp=zone.get('max_tp'),candles=rows,
+                tick=tick,spread=spread,min_distance=minimum)
+            # Same decided distances as LIVE — do not re-run stop_take on raw rng.
+            stop_d=_num(bp.get('stop_distance'))
+            profit_d=_num(bp.get('profit_distance'))
+            if stop_d is None or profit_d is None or stop_d<=0 or profit_d<=0:
+                entry_proxy=float(mid)+abs(float(spread or 0))/2.
+                brackets=stop_take(entry_proxy,'BUY',tick,spread,minimum,
+                                   kappa=bp['kappa'],sl_scale=1.0,
+                                   range_distance=float(rng) if rng is not None else 0)
+                stop_d=float(brackets['stop_distance'])
+                profit_d=float(brackets['profit_distance'])
+            kappa=bp.get('kappa') or 2.0;sl_scale=1.0
         except Exception:
             stop_d=profit_d=None
         # Critical #4: friction from Store self_params — robot evolves these.

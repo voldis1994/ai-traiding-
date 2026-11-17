@@ -328,6 +328,9 @@ def stop_take(entry, direction, tick_size, spread, min_distance=0, kappa=2, sl_s
     raised = False
     if floor_ticks and sl_ticks < floor_ticks:
         sl_ticks = floor_ticks; rho = tick * sl_ticks; raised = True
+        # Re-lock TP = κ×SL after SL raise (keeps 1:2 when κ=2).
+        tp_ticks = int((kappa*rho/tick).to_integral_value(rounding=ROUND_CEILING))
+        if tp_ticks < 1:tp_ticks=1
     if floor_ticks and tp_ticks < floor_ticks:
         tp_ticks = floor_ticks; raised = True
     profit_distance = tick * tp_ticks

@@ -341,6 +341,7 @@ def test_reconcile_daily_from_trades_fills_zero_day_book():
 def test_split_planned_sizes_into_five_when_advantageous():
     """One planned lot splits into up to 5 Capital-grid slices when flat + BUY/SELL."""
     from decimal import Decimal
+    from app.self_params import DEFAULTS, save
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
@@ -373,6 +374,15 @@ def test_split_planned_sizes_into_five_when_advantageous():
             Decimal('0.10'), store=s, positions=[], size_grid=grid,
             action='HOLD')
         assert len(hold) == 1
+        # Evolved max_positions=1 must NOT freeze flat pack to one 0.03 ticket.
+        low = dict(DEFAULTS)
+        low['day_max_positions'] = 1
+        low['day_open_slices'] = 1
+        save(s, low, reason='test_low')
+        forced = db.split_planned_sizes(
+            Decimal('0.03'), store=s, positions=[], size_grid=grid, action='BUY')
+        assert len(forced) == 3
+        assert sum(forced) == Decimal('0.03')
 
 
 def test_default_max_positions_is_five():

@@ -5380,11 +5380,13 @@ class SingleTradeEngine:
                             self.store.event('entry',
                                 'Multi-lot OPEN pack continues despite foreign unresolved',
                                 {'foreign':len(foreign),'opened_slices':opened_slices})
+                        # Pack was pre-planned for len(slice_sizes) tickets —
+                        # do not stop early on a stale evolved max_positions=1.
                         try:
-                            max_pos=int(day_book.load_params(self.store).get(
-                                'max_positions') or 5)
+                            max_pos=max(5,int(day_book.load_params(self.store).get(
+                                'max_positions') or 5),len(slice_sizes))
                         except Exception:
-                            max_pos=5
+                            max_pos=max(5,len(slice_sizes))
                         if len(self.positions or [])>=max_pos:
                             self.store.event('entry',
                                 'Multi-lot OPEN pack hit max_positions',

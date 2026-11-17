@@ -223,12 +223,12 @@ BOUNDS = {
     'day_risk_per_trade_frac': (0.0005, 0.03),
     'day_size_full_balance': (0, 1),
     'day_be_band_frac': (0.0001, 0.01),
-    'day_max_positions': (1, 8),
+    'day_max_positions': (5, 8),
     'day_conviction_nudge': (0.02, 0.30),
     'day_lot_vs_mandate_max_mult': (1.0, 5.0),
     'day_lot_vs_mandate_min_mult': (0.05, 1.0),
     'day_add_min_edge': (0.02, 0.25),
-    'day_open_slices': (1, 8),
+    'day_open_slices': (3, 8),
     'day_slice_min_edge': (0.02, 0.25),
     'situation_memory_min_samples': (2, 30),
     'situation_memory_nudge': (0.02, 0.30),
@@ -371,6 +371,12 @@ _LEGACY_SEED_MIGRATIONS = {
     'day_loss_budget_frac': (0.02, 0.10),
 }
 
+# Values below these floors were evolved/seeded too low and froze multi-lot to 1.
+_MIN_FLOOR = {
+    'day_max_positions': 5,
+    'day_open_slices': 3,
+}
+
 
 def load(store) -> dict:
     raw=store.get(STORE_KEY) if store is not None else None
@@ -387,12 +393,27 @@ def load(store) -> dict:
             continue
         if abs(cur-float(old))<1e-12:
             out[key]=_clip(key,new)
+    # Never leave multi-lot floors below operator minimums (1 ticket freeze).
+    for key,floor in _MIN_FLOOR.items():
+        try:
+            cur=int(round(float(out.get(key))))
+        except (TypeError,ValueError):
+            cur=int(floor)
+        if cur<int(floor):
+            out[key]=_clip(key,floor)
     return out
 
 
 def save(store, params: dict, *, reason=''):
     if store is None:return
     clean={k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS}
+    for key,floor in _MIN_FLOOR.items():
+        try:
+            cur=int(round(float(clean.get(key))))
+        except (TypeError,ValueError):
+            cur=int(floor)
+        if cur<int(floor):
+            clean[key]=_clip(key,floor)
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)

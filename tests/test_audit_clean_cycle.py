@@ -63,13 +63,12 @@ def test_pending_pnl_due_when_upl_shown():
     assert SingleTradeEngine._pending_pnl_due(e, base) is True
 
 
-def test_edge_reason_no_false_loss_streak():
+def test_edge_follows_signal_without_hard_block():
     gate = uc.edge_allows_open(
         {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25},
         {'action': 'BUY'}, uc.default_state())
-    assert gate['allowed'] is False
-    assert 'loss streak' not in gate['reason']
-    assert 'calibrated floor' in gate['reason']
+    assert gate['allowed'] is True
+    assert gate['action'] == 'BUY'
 
 
 def test_needs_profit_restore_for_robot_open_without_tp():

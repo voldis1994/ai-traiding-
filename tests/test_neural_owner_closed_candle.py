@@ -42,11 +42,9 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
         assert opened['action']=='SELL' and opened['proposal']=='SELL'
         assert p.evaluate_neural_entry({'BUY':.9,'SELL':.05,'HOLD':.05})['action']=='BUY'
         up={'5':2,'15':3,'60':4}
-        # Tiny edge 0.01 < default MIN_EDGE 0.06 → evolved policy HOLDs (proposal still BUY).
-        tied=p.evaluate_neural_entry({'BUY':.34,'SELL':.33,'HOLD':.33},
-            returns_bps=up,trend='UP',regime='ALIGNED')
+        # Near-tie + HOLD mass, no clear tape → abstention (proposal still BUY).
+        tied=p.evaluate_neural_entry({'BUY':.32,'SELL':.31,'HOLD':.37})
         assert tied['action']=='HOLD' and tied['proposal']=='BUY'
-        assert 'evolved policy' in tied['reason'].lower() or 'vetoes' in tied['reason'].lower()
         entered=p.evaluate_neural_entry({'BUY':.45,'SELL':.28,'HOLD':.27},
             returns_bps=up,trend='UP',regime='ALIGNED')
         assert entered['action']=='BUY'

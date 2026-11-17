@@ -157,9 +157,11 @@ DEFAULTS = {
     'aggression_scratch_step': 0.998,
     'aggression_flat_step': 0.995,
     # LIVE entry edge floor — robot may ease/tighten inside rails for +£.
-    'entry_edge_floor': 0.06,
-    'entry_edge_min': 0.03,
+    'entry_edge_floor': 0.0,  # soft hint; gate off by default
+    'entry_edge_min': 0.0,
     'entry_edge_max': 0.12,
+    # 0 = follow neural BUY/SELL always; 1 = optional hard edge block.
+    'entry_edge_gate': 0,
     # compose_open weak-edge tighten of the *same* OHLC SL plan.
     'open_edge_scale_base': 0.85,
     'open_edge_scale_slope': 2.0,
@@ -267,9 +269,10 @@ BOUNDS = {
     'aggression_win_step_streak': (1.01, 1.08),
     'aggression_scratch_step': (0.990, 0.9995),
     'aggression_flat_step': (0.985, 0.999),
-    'entry_edge_floor': (0.03, 0.12),
-    'entry_edge_min': (0.02, 0.08),
+    'entry_edge_floor': (0.0, 0.12),
+    'entry_edge_min': (0.0, 0.08),
     'entry_edge_max': (0.08, 0.20),
+    'entry_edge_gate': (0, 1),
     'open_edge_scale_base': (0.75, 0.95),
     'open_edge_scale_slope': (0.5, 4.0),
     'bracket_tighten_floor': (0.55, 0.90),
@@ -339,7 +342,7 @@ def _clip(key, value):
                'profit_history_rows','exit_need_streak','prune_min_age',
                'exec_fill_delay_bars','self_params_horizon_trades',
                'bracket_min_batch_samples','min_prep_candles','min_holdout_bars',
-               'min_online_labeled','policy_evolve_enabled','policy_live_execute',
+               'min_online_labeled','policy_evolve_enabled','policy_live_execute','entry_edge_gate',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
                'day_max_positions','day_open_slices','trail_ohlc_bars'):
@@ -354,6 +357,8 @@ def _clip(key, value):
 _LEGACY_SEED_MIGRATIONS = {
     'trail_arm_mfe_frac': (0.55, 0.30),
     'day_max_positions': (3, 5),
+    # Old hard 0.06 edge floor → signal-first default (gate off).
+    'entry_edge_floor': (0.06, 0.0),
 }
 
 

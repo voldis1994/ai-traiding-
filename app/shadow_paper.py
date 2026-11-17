@@ -233,7 +233,13 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
                 opened_ts=None
         structure_stop=ohlc_1m_structure_stop(
             direction,candles,opened_at=opened_ts,
-            lookback=knobs['ohlc_bars'],buffer=buf)
+            lookback=knobs['ohlc_bars'],buffer=buf,entry=entry)
+        # Match LIVE: under-entry structure after buffer must not freeze at BE.
+        if structure_stop is not None:
+            if sign==1 and float(structure_stop)<=entry+1e-12:
+                structure_stop=None
+            elif sign==-1 and float(structure_stop)>=entry-1e-12:
+                structure_stop=None
     else:
         trail_gap=open_gap
     tip_fav=sign*(tip-entry)

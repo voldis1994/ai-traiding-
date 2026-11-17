@@ -147,6 +147,48 @@ def test_post_be_trails_without_waiting_half_r_mfe():
     assert out['stop_level']>100.0
 
 
+def test_post_be_ignores_under_entry_structure_and_ratchets():
+    """Pre-BE dip in the 1m lookback must not freeze SL at entry forever.
+
+    Old bug: min close under entry → structure_stop < entry → clamp to entry →
+    new_stop == BE → None ("No broker-native trail improvement") while tip ran.
+    """
+    p=_position(stop=100.0,profit=106.0)
+    meta=_meta(3.0)
+    # Mixed window: one loss-side close + post-BE rally closes.
+    candles=[
+        {'at':'2026-10-14T12:01:00+00:00','open':99.9,'high':100.1,'low':99.7,'close':99.9},
+        {'at':'2026-10-14T12:02:00+00:00','open':100.1,'high':100.4,'low':99.95,'close':100.1},
+        {'at':'2026-10-14T12:03:00+00:00','open':102.0,'high':102.5,'low':101.8,'close':102.0},
+        {'at':'2026-10-14T12:04:00+00:00','open':103.0,'high':103.4,'low':102.7,'close':103.0},
+        {'at':'2026-10-14T12:05:00+00:00','open':104.0,'high':104.3,'low':103.6,'close':104.0},
+    ]
+    # Without entry filter the swing is under entry; with fix we either follow
+    # profit-side closes or tip−zone — either way SL must leave BE.
+    out=propose_broker_trail(
+        p,_market(104.0,104.1),meta,extreme=104.0,
+        zone_range=1.0,candles=candles,arm_decision={'arm':True,'reason':'be'})
+    assert out is not None
+    assert out['be_locked'] is True
+    assert out['stop_level']>100.0
+    # Profit-side structure (min close past entry) or zone-gap ratchet — both > BE.
+    assert out['stop_level']>=101.0
+    # SELL mirror: through-entry high in lookback must not pin stop at BE.
+    sell=_position('SELL',stop=100.0,profit=94.0)
+    sell_bars=[
+        {'at':'2026-10-14T12:01:00+00:00','open':100.2,'high':100.4,'low':100.0,'close':100.2},
+        {'at':'2026-10-14T12:02:00+00:00','open':98.0,'high':98.3,'low':97.7,'close':98.0},
+        {'at':'2026-10-14T12:03:00+00:00','open':97.0,'high':97.3,'low':96.7,'close':97.0},
+        {'at':'2026-10-14T12:04:00+00:00','open':96.0,'high':96.3,'low':95.7,'close':96.0},
+    ]
+    sout=propose_broker_trail(
+        sell,_market(95.9,96.0),meta,extreme=95.9,
+        zone_range=1.0,candles=sell_bars,arm_decision={'arm':True,'reason':'be'})
+    assert sout is not None and sout['be_locked']
+    assert sout['stop_level']<100.0
+    assert sout['stop_level']<=99.0
+
+
 def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
     """BUY stop sits under recent 1m *closes* — not tip − 35%R / 2×minStop."""
     # Wide opening R so old tip−floor gap would sit far behind price.

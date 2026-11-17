@@ -76,12 +76,14 @@ def load_params(store):
         'loss_budget_frac': float(sp.get('day_loss_budget_frac', 0.10)),
         'risk_per_trade_frac': float(sp.get('day_risk_per_trade_frac', 0.005)),
         'be_band_frac': float(sp.get('day_be_band_frac', 0.001)),
-        'max_positions': int(sp.get('day_max_positions', 5)),
+        # Floor concurrent deals / flat pack slices — evolve must not collapse
+        # LIVE back to a single ticket (operator: always multi-lot when flat).
+        'max_positions': max(5, int(sp.get('day_max_positions', 5))),
         'conviction_nudge': float(sp.get('day_conviction_nudge', 0.12)),
         'lot_max_mult': float(sp.get('day_lot_vs_mandate_max_mult', 2.0)),
         'lot_min_mult': float(sp.get('day_lot_vs_mandate_min_mult', 0.25)),
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
-        'open_slices': int(sp.get('day_open_slices', 5)),
+        'open_slices': max(3, int(sp.get('day_open_slices', 5))),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
         'size_full_balance': int(sp.get('day_size_full_balance', 1)),
     }
@@ -599,23 +601,26 @@ def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=Non
         one = snap_deal_size(total_size, min_size=mn, step=step, max_size=mx) if mn is not None and step is not None else None
         return [one] if one is not None else []
     params = load_params(store)
-    max_pos = max(1, int(params.get('max_positions') or 5))
-    want = max(1, int(params.get('open_slices') or 5))
+    max_pos = max(5, int(params.get('max_positions') or 5))
+    want = max(3, int(params.get('open_slices') or 5))
     open_n = len(positions or [])
     room = max(0, max_pos - open_n)
     advantageous = _slice_advantageous(
         score_edge=score_edge, action=action, live_trend=live_trend,
         structure=structure, returns_bps=returns_bps, store=store)
-    if open_n > 0 or not advantageous or room <= 1:
-        n = 1
-    else:
-        n = min(want, room)
     # How many min-lots fit in the planned total?
     try:
         max_by_min = int((total / Decimal(str(mn))).to_integral_value(
             rounding=ROUND_FLOOR))
     except Exception:
         max_by_min = 1
+    if open_n > 0 or not advantageous:
+        # Already in a deal → ADD one slice; HOLD never multi-slices.
+        n = 1
+    else:
+        # Flat BUY/SELL: always split into as many tickets as the lot covers
+        # (up to open_slices). Do not collapse to one when room was evolved to 1.
+        n = min(want, max_by_min if max_by_min > 0 else 1, max(room, want))
     n = max(1, min(n, max_by_min if max_by_min > 0 else 1))
     if n <= 1:
         one = snap_deal_size(total, min_size=mn, step=step, max_size=mx)

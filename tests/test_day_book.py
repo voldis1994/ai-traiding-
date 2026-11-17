@@ -278,13 +278,13 @@ def test_reconcile_daily_from_trades_fills_zero_day_book():
         assert abs(again['realized_pnl'] - 1.6) < 1e-9
 
 def test_split_planned_sizes_into_five_when_advantageous():
-    """One planned lot splits into up to 5 Capital-grid slices when flat + clear."""
+    """One planned lot splits into up to 5 Capital-grid slices when flat + BUY/SELL."""
     from decimal import Decimal
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
                 'max': Decimal('50')}
-        # Flat + TREND_UP BUY → 5 slices summing ≈ 0.10
+        # Flat + BUY → 5 slices summing ≈ 0.10 (signal-first, not 0.06 freeze)
         slices = db.split_planned_sizes(
             Decimal('0.10'), store=s, positions=[], size_grid=grid,
             score_edge=0.02, action='BUY', structure='TREND_UP')
@@ -297,11 +297,21 @@ def test_split_planned_sizes_into_five_when_advantageous():
             size_grid=grid, score_edge=0.20, action='BUY', structure='TREND_UP')
         assert len(one) == 1
         assert one[0] == Decimal('0.10')
-        # Weak edge + no clear tape → single lot (not forced multi)
+        # Weak edge / CHOP still multi when LIVE action is BUY (follow signal)
         weak = db.split_planned_sizes(
             Decimal('0.10'), store=s, positions=[], size_grid=grid,
             score_edge=0.01, action='BUY', structure='CHOP', live_trend='MIXED')
-        assert len(weak) == 1
+        assert len(weak) == 5
+        # Tiny lot that cannot cover 2× broker min → stays one ticket
+        tiny = db.split_planned_sizes(
+            Decimal('0.01'), store=s, positions=[], size_grid=grid,
+            score_edge=0.20, action='BUY', structure='TREND_UP')
+        assert len(tiny) == 1
+        # HOLD action never multi-slices
+        hold = db.split_planned_sizes(
+            Decimal('0.10'), store=s, positions=[], size_grid=grid,
+            action='HOLD')
+        assert len(hold) == 1
 
 
 def test_default_max_positions_is_five():

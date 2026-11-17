@@ -82,7 +82,7 @@ def load_params(store):
         'lot_min_mult': float(sp.get('day_lot_vs_mandate_min_mult', 0.25)),
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
         'open_slices': int(sp.get('day_open_slices', 5)),
-        'slice_min_edge': float(sp.get('day_slice_min_edge', 0.06)),
+        'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
     }
 
 
@@ -430,11 +430,14 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
 
 
 def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
-                    score_edge=None, now=None, trend_aligned=False):
+                    score_edge=None, now=None, trend_aligned=False,
+                    skip_add_edge=False):
     """May the robot add/open another deal on the mandated instrument?
 
     ``trend_aligned``: live tape matches the open book side (e.g. TREND_UP with
     BUY open) — then do not demand a huge softmax edge to ADD on the rebound.
+    ``skip_add_edge``: mid multi-lot burst — capacity/phase only (edge already
+    cleared for the planned N slices).
     """
     params = load_params(store)
     open_n = len(positions or [])
@@ -480,7 +483,8 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
         }
     # Adding onto an existing book needs a clearer edge than a flat open —
     # unless the live tape already agrees with the book (clear rebound ADD).
-    if open_n > 0:
+    # Planned multi-lot burst skips this — edge was checked once for the pack.
+    if open_n > 0 and not skip_add_edge:
         need = float(params.get('add_min_edge') or 0.08)
         if trend_aligned:
             try:
@@ -538,14 +542,14 @@ def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
 
 def _slice_advantageous(*, score_edge=None, action=None, live_trend=None,
                         structure=None, returns_bps=None, store=None):
-    """True when the tape/edge justifies splitting one lot into many slices."""
-    clear = _clear_trend_side(
-        live_trend=live_trend, structure=structure, returns_bps=returns_bps)
-    if action in ('BUY', 'SELL') and clear == action:
-        return True
-    edge = _finite(score_edge)
-    need = float(load_params(store).get('slice_min_edge') or 0.06)
-    return edge is not None and edge >= need
+    """True when flat OPEN should split into several simultaneous slices.
+
+    Signal-first: a LIVE BUY/SELL that already cleared HOLD-necessary is enough
+    to multi-lot when flat. Do not re-freeze behind a 0.06 score-edge hardcode.
+    ``score_edge`` / tape args are kept for callers and future evolve hints.
+    """
+    _ = (score_edge, live_trend, structure, returns_bps, store)
+    return action in ('BUY', 'SELL')
 
 
 def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=None,
@@ -553,8 +557,9 @@ def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=Non
                         structure=None, returns_bps=None):
     """Split one planned lot into N Capital-grid slices for simultaneous OPEN.
 
-    Flat + advantageous → up to ``day_open_slices`` (default 5) pieces whose
-    sizes sum ≈ total. Already-open books ADD one slice at a time.
+    Flat + BUY/SELL → up to ``day_open_slices`` (default 5) pieces whose
+    sizes sum ≈ total (when the lot covers ≥2 broker mins). Already-open
+    books ADD one slice at a time on later bars.
     """
     grid = size_grid if isinstance(size_grid, dict) else {}
     mn = grid.get('min')

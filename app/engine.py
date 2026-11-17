@@ -5343,7 +5343,8 @@ class SingleTradeEngine:
                             epic=self.mandate.get('epic'),
                             mandate_epic=self.mandate.get('epic'),
                             score_edge=score_edge if score_edge is not None else _edge_for_align,
-                            trend_aligned=True)
+                            trend_aligned=True,
+                            skip_add_edge=True)
                         if not room.get('allowed'):
                             self.store.event('entry',
                                 'Multi-lot OPEN stopped — day book capacity',

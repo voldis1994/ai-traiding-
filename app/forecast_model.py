@@ -26,6 +26,22 @@ def _softmax(logits):
     return e/np.maximum(e.sum(),1e-12)
 
 
+def gaussian_nll_dlog_sigma(err, sigma, z_sigma):
+    """∂/∂z_σ of ½(err/σ)² + log σ with σ = softplus(z_σ).
+
+    Exact chain rule (audit):
+      ∂L/∂z_σ = (1 - err²/σ²) * sigmoid(z_σ) / σ
+    """
+    try:
+        e=float(err);s=float(sigma);z=float(z_sigma)
+    except (TypeError,ValueError):
+        return 0.0
+    if not (math.isfinite(e) and math.isfinite(s) and math.isfinite(z)) or s<=0:
+        return 0.0
+    sigmoid=1.0/(1.0+math.exp(-float(np.clip(z,-40,40))))
+    return float((1.0-(e*e)/(s*s))*sigmoid/s)
+
+
 @dataclass
 class ForecastPrediction:
     horizon: int
@@ -152,9 +168,8 @@ class MultiHorizonForecast:
                         self.b_r[i]-=self.lr*d_r
                         self.W_r[i]=np.clip(np.nan_to_num(self.W_r[i],nan=0.0),-20.0,20.0)
                         self.b_r[i]=float(np.clip(self.b_r[i],-20.0,20.0))
-                    # ∂NLL/∂z_s ≈ (1 - err²/σ²) * softplus'(z_s)
-                    sigmoid=1/(1+math.exp(-float(np.clip(z_s,-40,40))))
-                    d_ls=(1.0-(err*err)/(sig*sig))*sigmoid
+                    # ∂NLL/∂z_s = (1 - err²/σ²) * sigmoid(z_s) / σ  (not missing /σ)
+                    d_ls=gaussian_nll_dlog_sigma(err,sig,z_s)
                     if math.isfinite(d_ls):
                         d_ls=float(np.clip(d_ls,-50.0,50.0))
                         self.W_s[i]-=self.lr*0.05*(d_ls*x+self.l2*self.W_s[i])

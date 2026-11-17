@@ -85,6 +85,36 @@ def _mae(preds, actuals):
     return float(np.mean([abs(p-a) for p,a in xs])),len(xs)
 
 
+def sigma_error_diagnostics(r_hats, r_true, sigmas):
+    """Check whether σ̂ matches the scale of |r − r̂| on holdout.
+
+    Returns mean |err|, mean σ̂, ratio, and 1σ coverage (Gaussian ≈ 0.68).
+    """
+    triples=[]
+    for rh,rt,sg in zip(r_hats or [],r_true or [],sigmas or []):
+        try:
+            e=abs(float(rh)-float(rt));s=float(sg)
+        except (TypeError,ValueError):
+            continue
+        if not (math.isfinite(e) and math.isfinite(s)) or s<=0:
+            continue
+        triples.append((e,s))
+    if len(triples)<3:
+        return {'n':len(triples),'mean_abs_err':None,'mean_sigma':None,
+                'err_over_sigma':None,'coverage_1sigma':None}
+    errs=np.array([e for e,_ in triples],dtype=float)
+    sigs=np.array([s for _,s in triples],dtype=float)
+    mean_e=float(errs.mean());mean_s=float(sigs.mean())
+    return {
+        'n':len(triples),
+        'mean_abs_err':mean_e,
+        'mean_sigma':mean_s,
+        'err_over_sigma':(mean_e/mean_s if mean_s>0 else None),
+        'coverage_1sigma':float(np.mean(errs<=sigs)),
+        'rmse':float(np.sqrt(np.mean(errs**2))),
+    }
+
+
 def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
                   embargo=None, epic=None):
     """Fit MultiHorizonForecast on train; score vs neural argmax on validation."""
@@ -115,7 +145,7 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
     for h in horizons:
         base_preds=[];new_preds=[];labels=[]
         base_probs=[];new_probs=[]
-        r_hats=[];r_true=[]
+        r_hats=[];r_true=[];sigmas=[]
         for row in val:
             lab=_label_action(row.get('outcomes'),h)
             if lab is None:
@@ -132,9 +162,11 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
             o=(row.get('outcomes') or {}).get(h) or {}
             if pred is not None and o.get('r') is not None:
                 r_hats.append(pred.r_hat);r_true.append(float(o['r']))
+                sigmas.append(pred.sigma_hat)
         base_acc,n=_accuracy(base_preds,labels)
         new_acc,_=_accuracy(new_preds,labels)
         mae,n_r=_mae(r_hats,r_true)
+        sigma_diag=sigma_error_diagnostics(r_hats,r_true,sigmas)
         per_h[int(h)]={
             'n':n,
             'baseline_argmax_acc':base_acc,
@@ -145,10 +177,13 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
             'forecast_ece':expected_calibration_error(new_probs,labels),
             'delta_acc':(None if base_acc is None or new_acc is None
                          else new_acc-base_acc),
+            'sigma_vs_error':sigma_diag,
         }
     cal=summarize_calibration(
         [r.get('scores') for r in val],
         [_label_action(r.get('outcomes'),1) for r in val])
+    # Primary focus: 1-minute horizon (LIVE neural teacher cadence).
+    primary=per_h.get(1) or {}
     return {
         'ok':True,
         'train_n':len(train),
@@ -159,14 +194,19 @@ def run_benchmark(rows, *, horizons=HORIZONS, train_frac=0.7, seed=0,
         'split':split_meta,
         'fit':fit_info,
         'by_horizon':per_h,
+        'primary_horizon':1,
+        'primary':primary,
         'baseline_calibration_h1':cal,
         'note':('Forecast quality only — LIVE entry still NeuralCore + policy gate; '
-                'embargo ≥ max horizon so val never trains on overlapping labels.'),
+                'embargo ≥ max horizon; σ̂ checked vs |r−r̂| on holdout (esp. h=1).'),
     }
 
 
 def run_gold_benchmark(store_or_rows, *, train_frac=0.7, seed=0, limit=5000):
-    """Train + compare on the same GOLD forecast_memory rows (or an explicit list)."""
+    """Train + compare on the same GOLD forecast_memory rows (or an explicit list).
+
+    Emphasizes 1-minute accuracy, class ECE, and σ̂ vs error magnitude.
+    """
     if isinstance(store_or_rows,list):
         rows=[r for r in store_or_rows
               if str(r.get('epic') or 'GOLD').upper()=='GOLD']
@@ -174,6 +214,16 @@ def run_gold_benchmark(store_or_rows, *, train_frac=0.7, seed=0, limit=5000):
         from .forecast_memory import ForecastMemory
         rows=ForecastMemory(store_or_rows).rows(
             epic='GOLD',resolved_only=True,limit=limit)
-    return run_benchmark(
+    report=run_benchmark(
         rows,horizons=HORIZONS,train_frac=train_frac,seed=seed,
         embargo=max(HORIZONS),epic='GOLD')
+    if report.get('ok'):
+        h1=report.get('by_horizon',{}).get(1) or {}
+        report['gold_h1']={
+            'accuracy':h1.get('forecast_model_acc'),
+            'baseline_accuracy':h1.get('baseline_argmax_acc'),
+            'r_mae':h1.get('r_mae'),
+            'forecast_ece':h1.get('forecast_ece'),
+            'sigma_vs_error':h1.get('sigma_vs_error'),
+        }
+    return report

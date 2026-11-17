@@ -289,8 +289,12 @@ class ProfitLearning:
                       bars=None, stop_distance=None, profit_distance=None,
                       tick=None, min_distance=None, trail=True, spread_exit=None,
                       structure_prefer_hold=False, path_mfe=None, path_mae=None,
-                      structure_frame_advice=None):
-        """Record a closed trade. Fake ±1 cash is refused when require_broker_pnl."""
+                      structure_frame_advice=None, scores=None):
+        """Record a closed trade. Fake ±1 cash is refused when require_broker_pnl.
+
+        ``scores`` = entry-time neural softmax (from entry_brain) so policy
+        cash_gate can join scores + actual_pnl on one row.
+        """
         cf_kw=dict(spread=spread,slip_bps=slip_bps,bars=bars,
                    stop_distance=stop_distance,profit_distance=profit_distance,
                    tick=tick,min_distance=min_distance,trail=trail,
@@ -308,11 +312,22 @@ class ProfitLearning:
                                    entry=entry,exit_level=exit_level,
                                    **cf_kw,**teach_kw)
         sim=best_action_from_counterfactual(entry,exit_level,**cf_kw)
+        score_map=None
+        if isinstance(scores,dict):
+            try:
+                score_map={k:float(scores[k]) for k in ('BUY','SELL','HOLD')
+                           if k in scores and scores[k] is not None
+                           and math.isfinite(float(scores[k]))}
+                if len(score_map)<2:
+                    score_map=None
+            except (TypeError,ValueError):
+                score_map=None
         row={
             'at':datetime.now(timezone.utc).isoformat(),
             'deal_id':deal_id,'epic':epic,'direction':direction,
             'entry':_finite(entry),'exit':_finite(exit_level),
             'actual_pnl':actual,'currency':currency,
+            'scores':score_map,
             'simulated':{k:sim.get(k) for k in ('best','buy','sell','hold','method','ranking')
                          } if sim else None,
             'label':decision['label'],'mode':decision['mode'],

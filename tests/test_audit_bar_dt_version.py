@@ -67,13 +67,54 @@ def test_replay_trade_cash_prefers_pound_not_label_accuracy():
         return 'BUY'
 
     trades = [
-        {'scores': {'BUY': 0.6, 'SELL': 0.2, 'HOLD': 0.2}, 'actual_pnl': 1.0},
-        {'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25}, 'actual_pnl': -0.5},
-        {'scores': {'BUY': 0.7, 'SELL': 0.1, 'HOLD': 0.2}, 'actual_pnl': 2.0},
-        {'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}, 'actual_pnl': -0.2},
-        {'scores': {'BUY': 0.65, 'SELL': 0.2, 'HOLD': 0.15}, 'actual_pnl': 0.8},
-        {'scores': {'BUY': 0.6, 'SELL': 0.25, 'HOLD': 0.15}, 'actual_pnl': -0.1},
+        {'scores': {'BUY': 0.6, 'SELL': 0.2, 'HOLD': 0.2}, 'direction': 'BUY',
+         'actual_pnl': 1.0},
+        {'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25}, 'direction': 'BUY',
+         'actual_pnl': -0.5},
+        {'scores': {'BUY': 0.7, 'SELL': 0.1, 'HOLD': 0.2}, 'direction': 'BUY',
+         'actual_pnl': 2.0},
+        {'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}, 'direction': 'BUY',
+         'actual_pnl': -0.2},
+        {'scores': {'BUY': 0.65, 'SELL': 0.2, 'HOLD': 0.15}, 'direction': 'BUY',
+         'actual_pnl': 0.8},
+        {'scores': {'BUY': 0.6, 'SELL': 0.25, 'HOLD': 0.15}, 'direction': 'BUY',
+         'actual_pnl': -0.1},
     ]
     mean, n = AutoEvolution._replay_trade_cash(always_buy, trades, min_trades=6)
     assert n == 6
     assert mean == pytest.approx(sum(t['actual_pnl'] for t in trades) / 6)
+
+
+def test_replay_trade_cash_does_not_credit_opposite_with_buy_pnl():
+    """SELL candidate must not inherit a BUY trade's +£10."""
+    def always_sell(scores, threshold=None):
+        return 'SELL'
+
+    # Without counterfactual for SELL → row skipped (not +10).
+    bare = [{
+        'scores': {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1},
+        'direction': 'BUY', 'actual_pnl': 10.0,
+    }] * 6
+    mean, n = AutoEvolution._replay_trade_cash(always_sell, bare, min_trades=6)
+    assert n == 0
+    assert mean == float('-inf')
+    # With path counterfactual — use simulated SELL £, not BUY's +10.
+    with_sim = [{
+        'scores': {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1},
+        'direction': 'BUY', 'actual_pnl': 10.0,
+        'simulated': {'buy': 10.0, 'sell': -3.0, 'hold': 0.0, 'method': 'path'},
+    }] * 6
+    mean2, n2 = AutoEvolution._replay_trade_cash(always_sell, with_sim, min_trades=6)
+    assert n2 == 6
+    assert mean2 == pytest.approx(-3.0)
+
+
+def test_policy_cash_rows_join_requires_scores_on_profit():
+    profit = [
+        {'direction': 'BUY', 'actual_pnl': 1.2, 'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}},
+        {'direction': 'SELL', 'actual_pnl': -0.4},  # no scores → dropped
+        {'direction': 'BUY', 'actual_pnl': 0.8, 'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25}},
+    ]
+    joined = AutoEvolution.policy_cash_rows(profit, signal_history=[])
+    assert len(joined) == 2
+    assert all('scores' in r and 'direction' in r and 'actual_pnl' in r for r in joined)

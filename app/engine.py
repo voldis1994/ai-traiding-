@@ -2257,9 +2257,13 @@ class SingleTradeEngine:
                 try:
                     from .self_params import get as sp_get
                     if int(sp_get(self.store,'policy_evolve_enabled',1)):
+                        cash=self.policy.policy_cash_rows(
+                            getattr(self.profit_learning,'history',[]) or [],
+                            signal_history=list(self.brain.history))
                         self.policy.evolve(
                             self.brain.correct/self.brain.labeled,
-                            self.brain.labeled,list(self.brain.history))
+                            self.brain.labeled,list(self.brain.history),
+                            cash_trades=cash)
                 except Exception:
                     pass
             # Audit #22: historical candle load → chronological train → holdout eval
@@ -3611,6 +3615,7 @@ class SingleTradeEngine:
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
         # Profit ledger: ONLY broker-confirmed £ — never ±1 tick fakes.
+        entry_scores=saved.get('scores') if isinstance(saved.get('scores'),dict) else None
         if pnl_source=='broker' and pnl_value is not None:
             decision=self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,
@@ -3619,6 +3624,7 @@ class SingleTradeEngine:
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
                 shadow_action=shadow_action,require_broker_pnl=True,
+                scores=entry_scores,
                 **cf,**teach_extra)
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
@@ -3643,6 +3649,7 @@ class SingleTradeEngine:
                 model_version=getattr(self.brain,'model_version',0),
                 feature_schema=getattr(self.brain,'feature_schema',None),
                 shadow_action=shadow_action,require_broker_pnl=True,
+                scores=entry_scores,
                 **cf,**teach_extra)
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
@@ -3872,9 +3879,12 @@ class SingleTradeEngine:
             before_reason=self.store.get('neural_adapt_reason')
             from .self_params import get as sp_get
             if weights_updated and int(sp_get(self.store,'policy_evolve_enabled',1)):
+                cash=self.policy.policy_cash_rows(
+                    getattr(self.profit_learning,'history',[]) or [],
+                    signal_history=list(self.brain.history))
                 self.policy.evolve(self.brain.correct/max(1,self.brain.labeled),
                                    self.brain.labeled,list(self.brain.history),
-                                   force=False)
+                                   force=False,cash_trades=cash)
             if before_reason:
                 self.store.set('neural_adapt_reason',before_reason)
         except Exception as exc:

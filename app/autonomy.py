@@ -797,37 +797,89 @@ class AutoEvolution:
         return sum(present)/len(present),n
 
     @staticmethod
-    def _replay_trade_cash(f,trades,margin_override=None,*,min_trades=6):
-        """Score a policy on independent closed-trade £ (after costs), not M1 labels.
+    def policy_cash_rows(profit_rows, signal_history=None):
+        """Join profit_learning £ rows with entry scores for cash_gate.
 
-        ``trades`` rows need ``scores`` + ``actual_pnl`` (account currency).
-        Returns (mean_£_when_acted, n) or (−inf, 0) when under-powered.
-        HOLD abstentions contribute 0 £ (no trade) and still count toward n.
+        Prefer scores already stored on the profit row (from entry_brain).
+        ``signal_history`` alone cannot fill deal-scoped scores reliably —
+        callers must pass scores into ``record_closed``.
+        """
+        _ = signal_history  # reserved; deal_id join not available on M1 history
+        out=[]
+        for row in profit_rows or []:
+            if not isinstance(row,dict):continue
+            scores=row.get('scores')
+            if not isinstance(scores,dict):continue
+            direction=str(row.get('direction') or '').upper()
+            if direction not in ('BUY','SELL'):continue
+            try:
+                pnl=float(row.get('actual_pnl'))
+            except (TypeError,ValueError):
+                continue
+            if not math.isfinite(pnl):continue
+            out.append({
+                'scores':scores,
+                'direction':direction,
+                'actual_pnl':pnl,
+                'simulated':row.get('simulated') if isinstance(row.get('simulated'),dict) else None,
+                'deal_id':row.get('deal_id'),
+                'epic':row.get('epic'),
+                'at':row.get('at'),
+            })
+        return out
+
+    @staticmethod
+    def _replay_trade_cash(f,trades,margin_override=None,*,min_trades=6):
+        """Score a policy on closed-trade £ — direction-matched, not any BUY/SELL.
+
+        Same direction as the historical deal → credit ``actual_pnl``.
+        HOLD → 0 £ (abstain).
+        Opposite → use path/endpoint counterfactual ``simulated[buy|sell]`` when
+        present (GOLD is not a mirror); otherwise skip the row (never invent
+        −actual_pnl).
         """
         rows=[]
         for item in trades or []:
             if not isinstance(item,dict):continue
             scores=item.get('scores')
-            if not isinstance(scores,dict):continue
+            direction=str(item.get('direction') or '').upper()
+            if not isinstance(scores,dict) or direction not in ('BUY','SELL'):
+                continue
             try:
                 pnl=float(item.get('actual_pnl'))
             except (TypeError,ValueError):
                 continue
             if not math.isfinite(pnl):continue
-            rows.append((scores,pnl))
+            rows.append(item)
         if len(rows)<int(min_trades):
             return float('-inf'),0
         total=0.0;n=0
-        for scores,pnl in rows:
+        for item in rows:
+            scores=item['scores']
+            direction=str(item.get('direction') or '').upper()
             try:
                 if margin_override is None:signal=f(scores)
                 else:signal=AutoEvolution._call_policy(f,scores,threshold=margin_override)
             except Exception:
                 continue
-            n+=1
-            if signal in ('BUY','SELL'):
-                total+=float(pnl)
-            # HOLD → 0 £ for that opportunity
+            if signal=='HOLD':
+                total+=0.0;n+=1
+                continue
+            if signal not in ('BUY','SELL'):
+                continue
+            if signal==direction:
+                total+=float(item['actual_pnl']);n+=1
+                continue
+            # Opposite side — need a counterfactual, not the other side's £.
+            sim=item.get('simulated') if isinstance(item.get('simulated'),dict) else {}
+            key='buy' if signal=='BUY' else 'sell'
+            try:
+                alt=float(sim.get(key)) if sim.get(key) is not None else None
+            except (TypeError,ValueError):
+                alt=None
+            if alt is None or not math.isfinite(alt):
+                continue  # skip — do not invent mirror PnL
+            total+=alt;n+=1
         if n<int(min_trades):
             return float('-inf'),0
         return total/n,n
@@ -839,12 +891,16 @@ class AutoEvolution:
             if isinstance(a,ast.Assign) and len(a.targets)==1 and isinstance(a.targets[0],ast.Name) and isinstance(a.value,ast.Constant):
                 constants[a.targets[0].id]=a.value.value
         return constants
-    def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False):
+    def evolve(self,accuracy,sample_count,history=None,force=False,loss_trade=False,
+               cash_trades=None):
         """Search/promote policy candidates that LIVE entry can execute.
 
         Default self_params.policy_evolve_enabled=1 runs the search. Promoted
         modules are consulted by evaluate_neural_entry when policy_live_execute=1
         (also default ON) — neural proposes side, decide() confirms or HOLDs.
+
+        ``cash_trades``: joined profit rows (scores+direction+actual_pnl). When
+        omitted, falls back to rows already embedded in ``history`` (rare).
         """
         try:
             from .self_params import get as sp_get
@@ -911,10 +967,10 @@ class AutoEvolution:
         need_n=12 if force else 18
         need_val=4 if force else 6
         lift=.001 if (force and loss_trade) else .002
-        # Closed-trade £ after costs (independent of M1 direction labels).
-        cash_rows=[r for r in history if isinstance(r,dict)
-                   and isinstance(r.get('scores'),dict)
-                   and r.get('actual_pnl') is not None]
+        # Closed-trade £ after costs — must come from profit_learning (+ entry
+        # scores), not M1 brain.history alone (those lack actual_pnl).
+        cash_rows=list(cash_trades) if cash_trades is not None else self.policy_cash_rows(
+            [r for r in history if isinstance(r,dict) and r.get('actual_pnl') is not None])
         cash_cut=int(len(cash_rows)*.7)
         cash_train=cash_rows[:cash_cut]
         cash_val=cash_rows[cash_cut:]

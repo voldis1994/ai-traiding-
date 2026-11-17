@@ -252,8 +252,7 @@ class AutoEvolution:
             weight=min(1.,max(0.,(samples-100)/400.))
             adjustment=max(-.025,min(.035,(.53-float(accuracy))*.12))*weight
         cost=max(0.,min(.025,float(spread_bps)*.002)) if math.isfinite(float(spread_bps)) else .025
-        # Floor may be 0.0 (signal-first); spread/accuracy can still raise it.
-        return round(min(.25,max(0.,initial+adjustment+cost)),4)
+        return round(min(.25,max(.01,initial+adjustment+cost)),4)
 
     @staticmethod
     def _safe_scores(scores):
@@ -276,7 +275,7 @@ class AutoEvolution:
         # a margin in score points; v1 policies continue to use confidence.
         if threshold is not None:
             if 'MIN_EDGE' in fn.__globals__:
-                fn.__globals__['MIN_EDGE']=min(.25,max(0.,float(threshold)))
+                fn.__globals__['MIN_EDGE']=min(.25,max(.01,float(threshold)))
             elif 'CONFIDENCE' in fn.__globals__:
                 fn.__globals__['CONFIDENCE']=min(.85,max(.55,float(threshold)))
         result=fn(scores,current_direction,age)
@@ -408,44 +407,10 @@ class AutoEvolution:
             'calibration_method':(calibration or {}).get('method'),
         }
         if pol in ('HOLD','CLOSE'):
-            # Follow neural side whenever it leans vs opposite — edge floor is
-            # not a hard veto (operator: trade signals, do not freeze on 0.06).
-            opp='SELL' if direction=='BUY' else 'BUY'
-            try:
-                side_vs_opp=float(scores[direction])-float(scores[opp])
-            except (TypeError,ValueError,KeyError):
-                side_vs_opp=None
-            try:
-                from .self_params import get as sp_get
-                lean=float(sp_get(getattr(self,'store',None),'hold_lean_gap',0.04))
-                gate_on=int(sp_get(getattr(self,'store',None),'entry_edge_gate',0) or 0)==1
-            except Exception:
-                lean,gate_on=0.04,False
-            floor=float(edge_floor) if edge_floor is not None else 0.0
-            need=max(lean,floor) if gate_on else lean
-            if side_vs_opp is not None and math.isfinite(side_vs_opp) and side_vs_opp>=need:
-                evidence['evolved_policy']['hold_override']=True
-                evidence['evolved_policy']['side_vs_opposite']=side_vs_opp
-                return direction,(
-                    f'Neural {direction} overrides evolved {pol} '
-                    f'(side−opp={side_vs_opp:.3f} ≥ lean={need:.3f}; '
-                    f'follow signal)'),evidence
-            # Still clear argmax vs HOLD mass — do not freeze.
-            try:
-                side_vs_hold=float(scores[direction])-float(scores.get('HOLD') or 0)
-            except (TypeError,ValueError,KeyError):
-                side_vs_hold=None
-            if (side_vs_hold is not None and math.isfinite(side_vs_hold)
-                    and side_vs_hold>=lean):
-                evidence['evolved_policy']['hold_override']=True
-                evidence['evolved_policy']['side_vs_hold']=side_vs_hold
-                return direction,(
-                    f'Neural {direction} overrides evolved {pol} '
-                    f'(side−HOLD={side_vs_hold:.3f}; follow signal)'),evidence
             return 'HOLD',(
                 f'Evolved policy {pol} vetoes neural {direction} '
-                f'(no lean vs opp/HOLD; gen='
-                f'{evidence["evolved_policy"]["generation"]})'),evidence
+                f'(edge_floor={edge_floor:.3f}, '
+                f'gen={evidence["evolved_policy"]["generation"]})'),evidence
         if pol in ('BUY','SELL') and pol!=direction:
             return 'HOLD',(
                 f'Evolved policy {pol} disagrees with neural {direction}; HOLD '
@@ -455,65 +420,14 @@ class AutoEvolution:
             f'(edge_floor={edge_floor:.3f}, '
             f'gen={evidence["evolved_policy"]["generation"]})'),evidence
 
-    @staticmethod
-    def hold_necessary(buy,sell,hold,*,returns_bps=None,trend=None,structure=None,
-                       store=None):
-        """True only when abstention is required — not when HOLD is merely loud.
-
-        Thresholds live in self_params (hold_lean_gap / dominate_*) so the robot
-        can ease or tighten abstention from £ and HOLD-shadow feedback.
-        """
-        try:
-            buy=float(buy);sell=float(sell);hold=float(hold)
-        except (TypeError,ValueError):
-            return True
-        if not all(math.isfinite(x) for x in (buy,sell,hold)):
-            return True
-        try:
-            from .self_params import get as sp_get
-            lean=float(sp_get(store,'hold_lean_gap',0.04))
-            tie=float(sp_get(store,'hold_side_gap_tie',0.05))
-            dom_extra=float(sp_get(store,'hold_dominate_extra',0.12))
-            dom_gap=float(sp_get(store,'hold_dominate_side_gap',0.06))
-        except Exception:
-            lean,tie,dom_extra,dom_gap=0.04,0.05,0.12,0.06
-        direction='BUY' if buy>=sell else 'SELL'
-        strength=buy if direction=='BUY' else sell
-        other=sell if direction=='BUY' else buy
-        side_gap=abs(buy-sell)
-        clear=None
-        try:
-            from .day_book import _clear_trend_side
-            clear=_clear_trend_side(
-                live_trend=trend,structure=structure,returns_bps=returns_bps)
-        except Exception:
-            clear=None
-        # Tape already picks a side — do not abstain just because HOLD is loud.
-        if clear==direction:
-            return False
-        # Directional lean vs opposite exists — HOLD mass alone is not enough.
-        if (strength-other)>=lean:
-            return False
-        # Necessary: no real lean between BUY and SELL, HOLD on top.
-        if side_gap<tie and hold+1e-12>=strength:
-            return True
-        # Necessary: HOLD utterly on top with almost no directional lean.
-        if hold>=strength+dom_extra and side_gap<dom_gap:
-            return True
-        # Residual: HOLD still louder than the better side with weak lean.
-        return hold>strength
-
     def evaluate_neural_entry(self,scores,*,returns_bps=None,trend=None,regime=None,
-                              history=None,readiness=None,spread_bps=0.0,
-                              structure=None):
+                              history=None,readiness=None,spread_bps=0.0):
         """LIVE: neural argmax proposes; evolved policy may confirm or HOLD.
 
-        Argmax chooses BUY/SELL — HOLD only when abstention is necessary.
-        Zone/SHIFT/trend are evidence only, never entry bans. When
-        ``policy_live_execute`` is on (default), promoted policy may still
-        confirm; a HOLD veto is ignored when side−opposite already clears the
-        edge floor (HOLD mass is not a trading reason). Readiness + economic
-        utility remain separate (audit #22–#23).
+        Argmax chooses BUY/SELL/HOLD — zone/SHIFT/trend are evidence only, never
+        entry bans. When ``policy_live_execute`` is on (default), promoted
+        ``active_policy.py`` / ``policy.py`` decide() gates OPEN. Readiness +
+        economic utility remain separate (audit #22–#23).
         """
         if not AutoEvolution._safe_scores(scores):
             return {'action':'HOLD','proposal':'HOLD','threshold':None,
@@ -525,24 +439,18 @@ class AutoEvolution:
         strength=buy if direction=='BUY' else sell
         score_edge=self.score_edge(scores)
         evidence={'returns_bps':returns_bps,'trend':trend,'regime':regime,
-                  'structure':structure,
                   'scores':{'BUY':buy,'SELL':sell,'HOLD':hold},
                   'score_edge':score_edge,
                   'score_edge_is_not_trading_advantage':True}
         base={'proposal':direction,'threshold':None,'calibration':None,
               'score_edge':score_edge,'readiness':readiness,'economic_utility':None,
               'evidence':evidence}
-        if self.hold_necessary(
-                buy,sell,hold,returns_bps=returns_bps,trend=trend,
-                structure=structure, store=getattr(self,'store',None)):
+        if hold>strength:
             return {**base,'action':'HOLD',
-                    'reason':(f'Neural HOLD necessary vs {direction} '
-                              f'(HOLD {hold:.1%} / {direction} {strength:.1%}; '
-                              f'sides tied or no lean)')}
+                    'reason':(f'Neural HOLD dominates {direction} '
+                              f'({hold:.1%} > {strength:.1%})')}
         # --- Separate gate: model prep/eval readiness (audit #22) ---
-        # Cold-start OPEN is LIVE permission without claiming historical prep passed.
-        from .model_readiness import allows_live_open as _allows_live
-        if isinstance(readiness,dict) and not _allows_live(readiness):
+        if isinstance(readiness,dict) and readiness.get('ready') is False:
             return {**base,'action':'HOLD',
                     'reason':'Model prep/eval not ready for LIVE OPEN: '+(
                         readiness.get('reason') or 'readiness gate')}
@@ -569,18 +477,15 @@ class AutoEvolution:
                 # Do NOT permanently stall LIVE OPEN after ~64 M1 labels when
                 # prep/eval already passed — choppy GOLD often fails the 8-bar
                 # walk-forward proxy while argmax is still directional.
-                if isinstance(readiness,dict) and _allows_live(readiness):
-                    src=('cold_start_open_fallback'
-                         if readiness.get('cold_start_open') and not readiness.get('ready')
-                         else 'prep_eval_holdout_fallback')
+                if isinstance(readiness,dict) and readiness.get('ready'):
                     economic={
-                        'allowed':True,'source':src,
+                        'allowed':True,'source':'prep_eval_holdout_fallback',
                         'online_utility_failed':True,
                         'online_reason':economic.get('reason'),
                         'samples':readiness.get('eval_samples'),
                         'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
                         'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
-                        'reason':('Online utility weak; LIVE readiness stands in '
+                        'reason':('Online utility weak; prep/eval readiness stands in '
                                   '(score edge is not calibrated profit probability)'),
                     }
                     base['economic_utility']=economic
@@ -589,20 +494,16 @@ class AutoEvolution:
                     return {**base,'action':'HOLD',
                             'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
                                       +str(economic.get('reason') or 'utility gate'))}
-        elif isinstance(readiness,dict) and _allows_live(readiness):
-            # Prep/eval holdout — or cold-start LIVE grant — stands in for utility.
-            src=('cold_start_open' if readiness.get('cold_start_open')
-                 and not readiness.get('ready') else 'prep_eval_holdout')
+        elif isinstance(readiness,dict) and readiness.get('ready'):
+            # Prep/eval holdout already measured cost-adjusted proxy — use that,
+            # still refusing to treat softmax edge as calibrated profit odds.
             economic={
-                'allowed':True,'source':src,
+                'allowed':True,'source':'prep_eval_holdout',
                 'samples':readiness.get('eval_samples'),
                 'minute_direction_accuracy':readiness.get('minute_direction_accuracy'),
                 'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
-                'reason':('Cold-start OPEN stands in for economic utility; '
-                          'historical prep still pending'
-                          if src=='cold_start_open' else
-                          'Prep/eval holdout stands in for economic utility; '
-                          'score edge is not calibrated profit probability'),
+                'reason':'Prep/eval holdout stands in for economic utility; '
+                         'score edge is not calibrated profit probability',
             }
             base['economic_utility']=economic
             evidence['economic_utility']=economic

@@ -267,24 +267,22 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
         return out
     risk = _finite(original_risk)
     mfe_n = _finite(mfe)
-    frac = float(cfg.get('trail_arm_mfe_frac', 0.30))
-    frac = max(0.25, min(1.0, frac))
+    frac = float(cfg.get('trail_arm_mfe_frac', 0.55))
     if risk is not None and risk > 0 and mfe_n is not None and mfe_n >= frac * risk:
         out['arm'] = True
         out['reason'] = (
-            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk {risk:.4f} — arm BE/trail')
+            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk {risk:.4f} — arm trail')
         return out
     need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
     st = side_stats(store, epic, structure, direction)
     min_ev = float(cfg.get('trail_arm_min_ev', 0.0))
-    # Structure EV path still needs a partial MFE — same ~30% floor as BE arm.
     if (st['samples'] >= need and st['mean_pnl'] is not None
             and float(st['mean_pnl']) > min_ev
-            and mfe_n is not None and risk is not None and mfe_n >= frac * risk):
+            and mfe_n is not None and risk is not None and mfe_n >= 0.35 * risk):
         out['arm'] = True
         out['reason'] = (
             f'structure {structure}/{direction} mean £={st["mean_pnl"]:.4f} '
-            f'+ partial mfe — arm BE/trail')
+            f'+ partial mfe — arm trail')
         return out
     out['reason'] = (
         f'waiting: mfe={mfe_n} risk={risk} structure_mean='

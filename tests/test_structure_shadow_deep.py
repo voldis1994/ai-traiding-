@@ -273,8 +273,6 @@ def test_deep_brackets_still_ohlc_only():
     assert d['source'] == 'ohlc_zone'
     assert not d.get('reshaped')
     assert d.get('blocked') in (None, False)
-    assert d['profit_distance'] / d['stop_distance'] == pytest.approx(2.0, abs=0.05)
-    assert d['kappa'] == pytest.approx(2.0)
     # Structure module must not export a bracket override API.
     assert not hasattr(ss, 'decide_brackets_from_ohlc')
     assert not hasattr(ss, 'reshape_brackets')

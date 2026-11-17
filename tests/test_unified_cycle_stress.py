@@ -103,8 +103,9 @@ def test_thousand_losses_aggression_stays_bounded_not_dead():
         gate = uc.edge_allows_open(strong, {'action': 'BUY'}, state)
         assert gate['allowed'] is True
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # margin 0.05
-        # Signal-first: weak BUY still allowed unless soft gate explicitly on.
-        assert uc.edge_allows_open(weak, {'action': 'BUY'}, state)['allowed'] is True
+        # Weak vs default/calibrated floor (~0.06) → blocked when floor > 0.05
+        if need > 0.05:
+            assert uc.edge_allows_open(weak, {'action': 'BUY'}, state)['allowed'] is False
 
 
 def test_thousand_wins_aggression_capped():

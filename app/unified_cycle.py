@@ -4,9 +4,9 @@ Neural scores, OHLC brackets, and £ outcomes used to drift apart (argmax in
 one place, SL ratchet in another, lot from mandate). This module is the single
 coordination point so OPEN is one machine state — not three competing policies.
 
-Lot size is sized by ``day_book`` from equity risk (mandate size is the seed
-grid). Direction stays neural. Risk width (κ / sl_scale dampening) and whether
-a weak edge may OPEN are coordinated here from confidence + recent £ streak.
+Lot size stays the operator mandate. Direction stays neural. Risk width
+(κ / sl_scale dampening) and whether a weak edge may OPEN are coordinated here
+from the same confidence + recent £ streak.
 """
 from __future__ import annotations
 
@@ -18,11 +18,12 @@ STORE_KEY = 'unified_cycle_v1'
 AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
-# LIVE entry edge in score_edge units — soft only (tighten SL / policy hint).
-# Never hard-blocks a clear neural BUY/SELL (operator: follow signals).
-# Default seed 0.0; robot may raise inside rails when £ proves scarcity helps.
-ENTRY_EDGE_DEFAULT = 0.0
-ENTRY_EDGE_MIN = 0.0
+# LIVE entry edge in score_edge units (shared with policy MIN_EDGE).
+# Default seed 0.06; the machine may recalibrate from holdout history + spread
+# inside soft rails. Only whole hundredths: 0.06 → 0.07 (never 0.065 / 0.086).
+# £ settle / ΔW do NOT move this gate.
+ENTRY_EDGE_DEFAULT = 0.06
+ENTRY_EDGE_MIN = 0.03
 ENTRY_EDGE_MAX = 0.12
 ENTRY_EDGE_STEP = 0.01
 CALIB_META_KEY = 'entry_edge_calibration_v1'
@@ -54,7 +55,7 @@ def _clip(v, lo, hi):
 
 
 def quantize_entry_edge(v) -> float:
-    """Snap to 0.01 steps inside rails — 0.00, 0.01, … never 0.065."""
+    """Snap to 0.01 steps inside rails — 0.06, 0.07, … never 0.065."""
     n = _finite(v)
     if n is None:
         n = ENTRY_EDGE_DEFAULT
@@ -131,15 +132,7 @@ def save_state(store, state: dict) -> dict:
 
 
 def entry_edge_floor(store=None, cycle_state=None) -> float:
-    """LIVE edge — robot Store bag when connected; else cycle state / default."""
-    if store is not None:
-        try:
-            from .self_params import get as sp_get
-            sp_floor = sp_get(store, 'entry_edge_floor', None)
-            if sp_floor is not None:
-                return quantize_entry_edge(sp_floor)
-        except Exception:
-            pass
+    """LIVE edge shared by cycle gate + policy MIN_EDGE (calibrated or default)."""
     state = cycle_state if isinstance(cycle_state, dict) else load_state(store)
     return quantize_entry_edge(
         state.get('entry_edge_floor') or ENTRY_EDGE_DEFAULT)
@@ -189,16 +182,12 @@ def perceive_decision(scores, evaluation=None) -> dict:
     }
 
 
-def min_open_margin(state: dict = None, store=None) -> float:
-    """LIVE entry floor — Store bag when connected; else explicit cycle state."""
-    if store is not None:
-        try:
-            from .self_params import get as sp_get
-            sp_floor = sp_get(store, 'entry_edge_floor', None)
-            if sp_floor is not None:
-                return quantize_entry_edge(sp_floor)
-        except Exception:
-            pass
+def min_open_margin(state: dict = None) -> float:
+    """LIVE entry floor — calibrated value in state, else default 0.06.
+
+    Always a whole 0.01 step. Does not ratchet with £/ΔW — only via
+    ``set_calibrated_floor`` (holdout + spread) inside soft rails.
+    """
     state = state or default_state()
     return quantize_entry_edge(
         state.get('entry_edge_floor') or ENTRY_EDGE_DEFAULT)
@@ -209,21 +198,14 @@ _min_open_margin = min_open_margin
 
 
 def set_calibrated_floor(store, value, *, method='holdout', detail=None) -> dict:
-    """Persist holdout/spread-calibrated edge into cycle state + self_params.
+    """Persist holdout/spread-calibrated edge — never from last £ win/loss.
 
-    Robot may still nudge entry_edge_floor later via evolve_from_feedback.
+    Value is snapped to ENTRY_EDGE_STEP (0.01): 0.06, 0.07, … not 0.065.
     """
     state = load_state(store)
     floor = quantize_entry_edge(value if value is not None else ENTRY_EDGE_DEFAULT)
     state['entry_edge_floor'] = floor
     save_state(store, state)
-    try:
-        from .self_params import load as sp_load, save as sp_save
-        sp = sp_load(store)
-        sp['entry_edge_floor'] = floor
-        sp_save(store, sp, reason=f'calibrated_floor:{method}')
-    except Exception:
-        pass
     meta = {
         'floor': floor,
         'method': str(method or 'holdout'),
@@ -249,48 +231,30 @@ def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
     return load_state(store)
 
 
-def edge_allows_open(scores, evaluation=None, cycle_state=None, store=None) -> dict:
-    """Signal-first: clear BUY/SELL always allowed — edge is advisory only.
-
-    ``entry_edge_floor`` may still inform bracket tighten / policy hints; it
-    must not convert a neural side into HOLD (that froze LIVE behind 0.06).
-    """
+def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
+    """Public gate: after £ losses, weak neural margin becomes HOLD."""
     state = dict(cycle_state or default_state())
     decision = perceive_decision(scores, evaluation)
-    need = min_open_margin(state, store=store)
+    need = min_open_margin(state)
     act = decision['action']
     margin = decision['margin']
-    # Optional soft gate only when robot raised entry_edge_gate to 1.
-    gate_on = False
-    try:
-        from .self_params import get as sp_get
-        gate_on = int(sp_get(store, 'entry_edge_gate', 0) or 0) == 1
-    except Exception:
-        gate_on = False
-    if (gate_on and act in ('BUY', 'SELL') and margin is not None
-            and float(need) > 0 and float(margin) < float(need)):
-        streak = int(state.get('loss_streak') or 0)
-        reason = (
-            f'Unified cycle: edge {float(margin):.3f} < required {need:.3f}'
-            + (f' after {streak} loss streak' if streak > 0 else ' (soft gate on)'))
+    # Only gate when edge is known — no scores ≠ automatic weak-edge veto.
+    if act in ('BUY', 'SELL') and margin is not None and float(margin) < need:
         return {
             'allowed': False,
             'action': 'HOLD',
-            'reason': reason,
+            'reason': (
+                f'Unified cycle: edge {float(margin):.3f} < required {need:.3f} '
+                f'after {int(state.get("loss_streak") or 0)} loss streak'),
             'decision': decision,
             'min_margin': need,
             'aggression': _clip(
                 _finite(state.get('aggression')) or 1.0, AGGRESSION_MIN, AGGRESSION_MAX),
         }
-    note = 'Unified cycle follows neural signal'
-    if act in ('BUY', 'SELL') and margin is not None and need and float(margin) < float(need):
-        note = (
-            f'Unified cycle follows {act} (edge {float(margin):.3f} < hint '
-            f'{need:.3f} — not a hard block)')
     return {
         'allowed': True,
         'action': act,
-        'reason': note,
+        'reason': 'Unified cycle edge ok',
         'decision': decision,
         'min_margin': need,
         'aggression': _clip(
@@ -299,7 +263,7 @@ def edge_allows_open(scores, evaluation=None, cycle_state=None, store=None) -> d
 
 
 def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
-                 base_sl, max_tp=None, store=None) -> dict:
+                 base_sl, max_tp=None) -> dict:
     """One OPEN package: may HOLD if cycle says edge is too weak after losses.
 
     Returns action, kappa, sl_scale, base_sl, max_tp, cycle metadata.
@@ -312,28 +276,15 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     raw_margin = decision['margin']
     known_margin = raw_margin is not None
     margin = float(raw_margin) if known_margin else 0.0
-    try:
-        from .self_params import get as sp_get
-        a_min = float(sp_get(store, 'aggression_min', AGGRESSION_MIN))
-        a_max = float(sp_get(store, 'aggression_max', AGGRESSION_MAX))
-    except Exception:
-        a_min, a_max = AGGRESSION_MIN, AGGRESSION_MAX
-    aggression = _clip(_finite(state.get('aggression')) or 1.0, a_min, a_max)
-    need = min_open_margin(state, store=store)
+    aggression = _clip(_finite(state.get('aggression')) or 1.0,
+                       AGGRESSION_MIN, AGGRESSION_MAX)
+    need = min_open_margin(state)
     zone = zone if isinstance(zone, dict) else {}
     tp_hint = _finite(max_tp) if max_tp is not None else _finite(zone.get('max_tp'))
     base_hint = _finite(base_sl)
     if base_hint is None:
         base_hint = _finite(zone.get('range_distance')) or 0.0
-    # Edge never hard-blocks OPEN — follow BUY/SELL; weak edge only tightens SL.
-    gate_on = False
-    try:
-        from .self_params import get as sp_get
-        gate_on = int(sp_get(store, 'entry_edge_gate', 0) or 0) == 1
-    except Exception:
-        gate_on = False
-    if (gate_on and act in ('BUY', 'SELL') and known_margin
-            and need > 0 and margin < need):
+    if act in ('BUY', 'SELL') and known_margin and margin < need:
         return {
             'action': 'HOLD',
             'kappa': None,
@@ -342,29 +293,29 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'max_tp': float(tp_hint) if tp_hint is not None else None,
             'blocked': True,
             'reason': (
-                f'Unified cycle: soft edge gate on — {margin:.3f} < {need:.3f}'),
+                f'Unified cycle: edge {margin:.3f} < required {need:.3f} '
+                f'after {_safe_int(state.get("loss_streak"), 0)} loss streak'),
             'decision': decision,
             'aggression': aggression,
             'min_margin': need,
         }
-    # SL from OHLC range; TP always 2×SL (SL half of TP). Learned mults
-    # never set width. Aggression may only *tighten* after losses (≤1).
+    # SL/TP width is an OHLC decision (zone κ / range / max_tp) — not learned
+    # multipliers. Aggression may only *tighten* after losses (≤1).
     del learned  # width ignores raise/cut mults; keep arg for call-site compat
-    from .bracket_learn import FIXED_TP_SL_RATIO
-    kappa = float(FIXED_TP_SL_RATIO)
+    kappa = _finite(zone.get('kappa')) or 1.0
+    if kappa <= 0:
+        kappa = 1.0
     ohlc_sl = _finite(zone.get('range_distance'))
     tp = tp_hint
     base = float(base_hint)
     tighten = min(1.0, float(aggression))
-    # Weak edge → slightly tighter fraction of the *same* OHLC SL (TP stays 2×).
-    try:
-        from .self_params import get as sp_get
-        _base = float(sp_get(store, 'open_edge_scale_base', 0.85))
-        _slope = float(sp_get(store, 'open_edge_scale_slope', 2.0))
-    except Exception:
-        _base, _slope = 0.85, 2.0
-    edge_scale = _clip(_base + max(0.0, margin) * _slope, _base, 1.0)
+    # Weak edge → slightly tighter fraction of the *same* OHLC plan.
+    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
     tighten = min(tighten, float(edge_scale))
+    if base > 0 and tp is not None and tp > 0:
+        room = float(tp) / base
+        if kappa > room:
+            kappa = max(0.5, room)
     return {
         'action': act if act in ('BUY', 'SELL') else decision['action'],
         'kappa': float(kappa),
@@ -372,7 +323,7 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
         'base_sl': base,
         'max_tp': float(tp) if tp is not None else None,
         'blocked': False,
-        'reason': 'Unified cycle OPEN (OHLC SL, TP=2×SL)',
+        'reason': 'Unified cycle OPEN (OHLC zone decides SL/TP)',
         'decision': decision,
         'aggression': aggression,
         'min_margin': need,
@@ -405,36 +356,26 @@ def settle(store, *, pnl, action=None, exit_reason=None, scratch_band=None) -> d
         return save_state(store, state)
     band = _finite(scratch_band)
     is_scratch = band is not None and band >= 0 and abs(p) <= band
-    try:
-        from .self_params import get as sp_get
-        a_min = float(sp_get(store, 'aggression_min', AGGRESSION_MIN))
-        a_max = float(sp_get(store, 'aggression_max', AGGRESSION_MAX))
-        scratch_s = float(sp_get(store, 'aggression_scratch_step', 0.998))
-        loss1 = float(sp_get(store, 'aggression_loss_step', 0.98))
-        loss2 = float(sp_get(store, 'aggression_loss_step_streak', 0.96))
-        win1 = float(sp_get(store, 'aggression_win_step', 1.01))
-        win2 = float(sp_get(store, 'aggression_win_step_streak', 1.02))
-        flat_s = float(sp_get(store, 'aggression_flat_step', 0.995))
-    except Exception:
-        a_min, a_max = AGGRESSION_MIN, AGGRESSION_MAX
-        scratch_s, loss1, loss2, win1, win2, flat_s = 0.998, 0.98, 0.96, 1.01, 1.02, 0.995
     if is_scratch:
-        state['aggression'] = _clip(agg * scratch_s, a_min, a_max)
+        # Penny close: tiny cool-off only — do not inflate loss_streak.
+        state['aggression'] = _clip(agg * 0.998, AGGRESSION_MIN, AGGRESSION_MAX)
         state['last_scratch'] = True
         return save_state(store, state)
     state['last_scratch'] = False
     if p < 0:
         state['loss_streak'] = _safe_int(state.get('loss_streak'), 0) + 1
         state['win_streak'] = 0
-        step = loss2 if state['loss_streak'] >= 2 else loss1
-        state['aggression'] = _clip(agg * step, a_min, a_max)
+        # Cool aggression after losses → tighter SL/κ on next OPEN (exits).
+        step = 0.96 if state['loss_streak'] >= 2 else 0.98
+        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
     elif p > 0:
         state['win_streak'] = _safe_int(state.get('win_streak'), 0) + 1
         state['loss_streak'] = 0
-        step = win2 if state['win_streak'] >= 2 else win1
-        state['aggression'] = _clip(agg * step, a_min, a_max)
+        step = 1.02 if state['win_streak'] >= 2 else 1.01
+        state['aggression'] = _clip(agg * step, AGGRESSION_MIN, AGGRESSION_MAX)
     else:
-        state['aggression'] = _clip(agg * flat_s, a_min, a_max)
+        # Flat £ — mild cool-off, do not treat as a win.
+        state['aggression'] = _clip(agg * 0.995, AGGRESSION_MIN, AGGRESSION_MAX)
     return save_state(store, state)
 
 

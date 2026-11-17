@@ -35,15 +35,15 @@ def test_compose_open_allows_explicit_action_without_scores():
     assert uc.edge_allows_open(None, {'action': 'BUY'}, uc.default_state())['allowed'] is True
 
 
-def test_edge_allows_open_follows_signal_by_default():
-    """Hard edge block is OFF — weak BUY still allowed (follow signals)."""
+def test_edge_allows_open_blocks_weak_edge_at_fixed_floor():
     state = uc.default_state()
-    state['loss_streak'] = 3
-    scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # margin 0.05
+    state['loss_streak'] = 3  # streak must NOT raise the 0.06 gate
+    scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # margin 0.05 < 0.06
     gate = uc.edge_allows_open(scores, {'action': 'BUY'}, state)
-    assert gate['allowed'] is True
-    assert gate['action'] == 'BUY'
-    assert gate['min_margin'] == pytest.approx(0.0)
+    assert gate['allowed'] is False
+    assert gate['action'] == 'HOLD'
+    assert gate['min_margin'] == pytest.approx(0.06)
+    assert 'Unified cycle' in gate['reason']
 
 
 def test_edge_allows_open_when_margin_clear():
@@ -56,7 +56,7 @@ def test_edge_allows_open_when_margin_clear():
 
 
 def test_compose_open_uses_ohlc_kappa_and_loss_tighten_only():
-    zone = {'kappa': 1.1, 'range_distance': 1.0, 'max_tp': 4.0}
+    zone = {'kappa': 2.0, 'range_distance': 1.0, 'max_tp': 4.0}
     learned = {'kappa': 2.5, 'sl_scale': 2.5}  # inflated — must NOT set width
     state = uc.default_state()
     state['aggression'] = 0.80
@@ -67,25 +67,25 @@ def test_compose_open_uses_ohlc_kappa_and_loss_tighten_only():
     assert pkg['blocked'] is False
     assert pkg['action'] == 'BUY'
     assert pkg['bracket_source'] == 'ohlc_zone'
-    # Hard 1:2 RR — learned mult and zone κ ignored for width.
+    # Width from OHLC zone κ — learned mult ignored.
     assert pkg['kappa'] == pytest.approx(2.0)
     assert pkg['sl_scale'] == pytest.approx(1.0)
     # Loss cool-down only tightens the OHLC plan (≤ aggression).
     assert pkg['tighten'] == pytest.approx(0.80)
 
 
-def test_compose_open_follows_weak_edge_signal():
+def test_compose_open_hold_when_edge_too_weak():
     state = uc.default_state()
-    state['loss_streak'] = 5
-    scores = {'BUY': 0.42, 'SELL': 0.40, 'HOLD': 0.18}  # weak margin — still OPEN
+    state['loss_streak'] = 5  # still need fixed 0.06
+    scores = {'BUY': 0.42, 'SELL': 0.40, 'HOLD': 0.18}  # margin 0.02 < 0.06
     pkg = uc.compose_open(
         action='BUY', scores=scores, evaluation={'action': 'BUY'},
         zone={'kappa': 1.5}, learned={'kappa': 1.0, 'sl_scale': 1.0},
         cycle_state=state, base_sl=1.0)
-    assert pkg['blocked'] is False
-    assert pkg['action'] == 'BUY'
-    assert pkg['kappa'] == pytest.approx(2.0)
-    assert pkg['min_margin'] == pytest.approx(0.0)
+    assert pkg['blocked'] is True
+    assert pkg['action'] == 'HOLD'
+    assert pkg['kappa'] is None
+    assert pkg['min_margin'] == pytest.approx(0.06)
 
 
 def test_settle_cools_aggression_on_losses_and_warms_on_wins():
@@ -127,11 +127,12 @@ def test_note_open_increments_counter():
 
 
 def test_min_open_margin_uses_calibrated_floor_within_rails():
-    # Default floor is 0 (signal-first); explicit state still wins without Store.
-    assert uc.min_open_margin({'loss_streak': 0}) == pytest.approx(0.0)
-    assert uc.min_open_margin({'loss_streak': 20}) == pytest.approx(0.0)
+    # Streak alone must not raise the gate; calibrated store value is used.
+    assert uc.min_open_margin({'loss_streak': 0}) == pytest.approx(0.06)
+    assert uc.min_open_margin({'loss_streak': 20}) == pytest.approx(0.06)
     assert uc.min_open_margin({'entry_edge_floor': 0.03}) == pytest.approx(0.03)
     assert uc.min_open_margin({'entry_edge_floor': 0.10}) == pytest.approx(0.10)
+    # Above MAX → clipped.
     assert uc.min_open_margin({'entry_edge_floor': 0.50}) == pytest.approx(uc.ENTRY_EDGE_MAX)
 
 
@@ -162,14 +163,15 @@ def test_policy_live_uses_calibrated_edge_floor_as_cycle():
                 confidence=0.60, reversal=0.30, min_hold=3, margin=0.02),
             encoding='utf8')
         policy = AutoEvolution(store, path)
-        # Clear lean → follow signal (edge gate off by default).
+        # No history → seed ~0.06; weak edge HOLDs.
         scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # edge 0.05
         out = policy.evaluate_neural_entry(scores, readiness={'ready': True})
-        assert out['action'] == 'BUY'
-        floor = uc.min_open_margin(uc.load_state(store), store=store)
+        assert out['action'] == 'HOLD'
+        floor = out['evidence']['evolved_policy']['entry_edge_floor']
         assert uc.ENTRY_EDGE_MIN <= floor <= uc.ENTRY_EDGE_MAX
-        gate = uc.edge_allows_open(scores, {'action': 'BUY'}, uc.load_state(store), store=store)
-        assert gate['allowed'] is True
+        assert floor == pytest.approx(uc.min_open_margin(uc.load_state(store)))
+        gate = uc.edge_allows_open(scores, {'action': 'BUY'}, uc.load_state(store))
+        assert gate['allowed'] is False
 
 
 def test_machine_spec_documents_unified_cycle():

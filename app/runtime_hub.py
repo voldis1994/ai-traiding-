@@ -129,7 +129,8 @@ class RuntimeHub:
     def _cash_pnl_source(src) -> str:
         """Classify journal source: cash | pending | proxy."""
         s=(src or '').strip().lower()
-        if s in ('ticks_only','price_size','position_disappeared'):
+        # upl_estimate is banned — never count as account £ (legacy rows only).
+        if s in ('ticks_only','price_size','position_disappeared','upl_estimate'):
             return 'proxy'
         if s in ('pending_close_sync','pending_broker_pnl'):
             return 'pending'

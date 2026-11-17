@@ -4774,7 +4774,12 @@ class SingleTradeEngine:
         if self.market.get('status')!='TRADEABLE':return
         if self.market.get('tick') is None or self.market.get('min_distance') is None:return
         opened=candle_time(meta.get('opened')) if meta.get('opened') else None
-        candles=self.store.candles(p['epic'],n=120,historical_only=True)
+        # Include closed QUOTE minutes — HISTORICAL-only punched holes and froze
+        # post-BE trail on missing recent closes (same bug as live features).
+        # Drop the forming bucket so anchors stay on completed 1m closes.
+        from .protection_ai import completed_1m_candles
+        raw_candles=self.store.candles(p['epic'],n=120,historical_only=False)
+        candles=completed_1m_candles(raw_candles)
         zone_range=ohlc_range_distance(candles)  # lookback from data
         extreme=trail_extreme_from_broker(
             p['direction'],self.market.get('bid'),self.market.get('ask'),

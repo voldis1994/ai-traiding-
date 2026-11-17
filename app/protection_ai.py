@@ -12,7 +12,7 @@ Live trail lifecycle (WATCH → ARMED → RATCHET/BE → TRAIL):
     No invented retention / activation_r / TP-multiplier policy grid on the live path.
 Walk-forward `select_policy` remains as an offline research helper / tests only.
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 import math
 import statistics
@@ -25,6 +25,30 @@ def _finite(v):
         n=float(v)
         return n if math.isfinite(n) else None
     except (ValueError,TypeError):return None
+
+
+def completed_1m_candles(candles, *, now_utc=None):
+    """Keep only finished M1 bars — never the forming minute.
+
+    Trail anchors on completed closes. Live poll writes the current bucket as
+    QUOTE; excluding it (same cutoff as market_features) keeps swing lows/highs
+    on closed candles only.
+    """
+    current = now_utc or datetime.now(timezone.utc)
+    if getattr(current, 'tzinfo', None) is None:
+        current = current.replace(tzinfo=timezone.utc)
+    cutoff = current.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    out = []
+    for row in candles or ():
+        t = candle_time(row.get('at'))
+        if t is None:
+            continue
+        if getattr(t, 'tzinfo', None) is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if t >= cutoff:
+            continue
+        out.append(row)
+    return out
 
 
 def _quantize(v,tick,up):
@@ -265,12 +289,12 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         need=floor_need
         phase='armed'
     else:
-        # After BE with 1m structure, do not wait for another full gap of MFE —
-        # any favorable tip past entry can advance the swing-based stop.
-        if be_locked and structure_stop is not None:
+        # After BE: follow completed 1m closes. Do not wait for another ~0.5R
+        # of MFE — that freezes SL at entry while candles already advanced.
+        if be_locked:
             need=minimum
         else:
-            need=open_gap if not be_locked else trail_gap
+            need=open_gap
     if tip_fav<need:return None
     if sign==1:
         tip=max(tip,bid)
@@ -280,6 +304,13 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
             desired=min(float(structure_stop),legal_cap,tip-tick)
             structure_used=True
             trail_gap=max(minimum,tip-desired) if desired<tip else trail_gap
+        elif be_locked:
+            # No structure yet — still ratchet with OHLC zone / minStop gap,
+            # never the full opening R that pins SL at BE.
+            soft_gap=max(minimum,min(float(trail_gap),zr if zr and zr>0 else float(trail_gap)))
+            desired=tip-soft_gap
+            desired=min(desired,legal_cap)
+            trail_gap=soft_gap
         else:
             desired=tip-trail_gap
             desired=min(desired,legal_cap)
@@ -316,6 +347,11 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
             desired=max(float(structure_stop),legal_floor,tip+tick)
             structure_used=True
             trail_gap=max(minimum,desired-tip) if desired>tip else trail_gap
+        elif be_locked:
+            soft_gap=max(minimum,min(float(trail_gap),zr if zr and zr>0 else float(trail_gap)))
+            desired=tip+soft_gap
+            desired=max(desired,legal_floor)
+            trail_gap=soft_gap
         else:
             desired=tip+trail_gap
             desired=max(desired,legal_floor)

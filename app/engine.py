@@ -268,6 +268,10 @@ class AdaptiveBrain:
         self.ohlc_schema=FEATURE_SCHEMA
         self.fusion_schema=FUSION_SCHEMA
         self.model_version=0
+        # Weight updates after closed-trade learn — NOT the validated model_version.
+        # model_version only advances on structural / promote events so LIVE vs
+        # shadow compare can accumulate many trades under one version.
+        self.weight_updates=0
         # Backward-compatible old brain.npz: bind once to the first observed EPIC.
         # Once bound, never load the saved brain for another instrument.
         self.load()
@@ -360,6 +364,7 @@ class AdaptiveBrain:
         self.ohlc_dim=FEATURE_DIM;self.fusion_dim=FUSION_DIM
         self.ohlc_schema=FEATURE_SCHEMA;self.fusion_schema=FUSION_SCHEMA
         self.model_version=0
+        self.weight_updates=0
 
     def _core_snapshot(self):
         """In-memory clone of weights + schema so a failed restore can roll back."""
@@ -375,6 +380,7 @@ class AdaptiveBrain:
             'ohlc_dim':self.ohlc_dim,'fusion_dim':self.fusion_dim,
             'ohlc_schema':self.ohlc_schema,'fusion_schema':self.fusion_schema,
             'model_version':self.model_version,
+            'weight_updates':int(getattr(self,'weight_updates',0) or 0),
         }
 
     def _apply_core_snapshot(self, snap):
@@ -391,6 +397,7 @@ class AdaptiveBrain:
         self.ohlc_dim=int(snap['ohlc_dim']);self.fusion_dim=int(snap['fusion_dim'])
         self.ohlc_schema=snap['ohlc_schema'];self.fusion_schema=snap['fusion_schema']
         self.model_version=int(snap['model_version'])
+        self.weight_updates=int(snap.get('weight_updates') or 0)
 
     def _read_weight_file(self, path, expected_epic=None):
         """Parse + validate a .npz brain file. Raises on corrupt/mismatch. No mutate."""
@@ -434,6 +441,7 @@ class AdaptiveBrain:
                 'ohlc_dim':ohlc_dim,'fusion_dim':fusion_dim,
                 'ohlc_schema':ohlc_schema,'fusion_schema':fusion_schema,
                 'model_version':int(d['model_version']) if 'model_version' in d else 0,
+                'weight_updates':int(d['weight_updates']) if 'weight_updates' in d else 0,
                 'neuron_ids':neuron_ids,'next_neuron_id':next_neuron_id,
             }
             arrays['neuron_ids']=neuron_ids
@@ -453,6 +461,7 @@ class AdaptiveBrain:
         self.ohlc_dim=int(meta['ohlc_dim']);self.fusion_dim=int(meta['fusion_dim'])
         self.ohlc_schema=meta['ohlc_schema'];self.fusion_schema=meta['fusion_schema']
         self.model_version=int(meta['model_version'])
+        self.weight_updates=int(meta.get('weight_updates') or 0)
 
     def load(self,path=None,expected_epic=None):
         """Boot-time load. Corrupt files reset to a fresh core (return False)."""
@@ -500,6 +509,7 @@ class AdaptiveBrain:
                        ohlc_dim=self.ohlc_dim,fusion_dim=self.fusion_dim,
                        ohlc_schema=self.ohlc_schema,fusion_schema=self.fusion_schema,
                        model_version=self.model_version,
+                       weight_updates=int(getattr(self,'weight_updates',0) or 0),
                        pending_json=json.dumps(list(self.pending),separators=(',',':')))
         np.savez_compressed(tmp,**payload)
         tmp.replace(path)
@@ -811,7 +821,13 @@ class AdaptiveBrain:
                             item['label']=label
                             break
 
-        result=self.core.step(x,max(.1,min(float(dt),60)))
+        # Bar units only (NEURAL_BAR_DT=1 per M1). Never wall-clock seconds —
+        # dt=60 with τ=10 made LIVE λ≈0.998 while shadow stayed at λ≈0.095.
+        from .core import NEURAL_BAR_DT, NEURAL_BAR_DT_MAX
+        bar_dt=float(dt) if dt is not None else NEURAL_BAR_DT
+        if not math.isfinite(bar_dt) or bar_dt<=0:
+            bar_dt=NEURAL_BAR_DT
+        result=self.core.step(x,max(.1,min(bar_dt,NEURAL_BAR_DT_MAX)))
         # Structural growth is separate from learning; cap + cooldown stop
         # losing clients ballooning (196 vs 55) while Paaudze looks busy.
         # Freeze grow/prune while in-trade — architecture must not move under
@@ -2142,13 +2158,13 @@ class SingleTradeEngine:
                         if fused is not None:
                             manage=self.brain.tick(
                                 self.market_context['close'],ask-bid,tick,
-                                self.mandate['epic'],dt=60,features=fused,
+                                self.mandate['epic'],dt=1.0,features=fused,
                                 bar_time=bar_t,external_features=True,
                                 in_position=True)
                         elif not on_fusion:
                             manage=self.brain.tick(
                                 self.market_context['close'],ask-bid,tick,
-                                self.mandate['epic'],dt=60,
+                                self.mandate['epic'],dt=1.0,
                                 features=self.market_context['features'],
                                 bar_time=bar_t,in_position=True)
                         if manage is not None:
@@ -2162,12 +2178,12 @@ class SingleTradeEngine:
                     next_signal=None
                 elif fused is not None:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
-                        self.mandate['epic'],dt=60,features=fused,
+                        self.mandate['epic'],dt=1.0,features=fused,
                         bar_time=bar_t,external_features=True,
                         in_position=False)
                 elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
-                        self.mandate['epic'],dt=60,features=self.market_context['features'],
+                        self.mandate['epic'],dt=1.0,features=self.market_context['features'],
                         bar_time=bar_t,in_position=False)
                 else:
                     next_signal=None
@@ -3748,7 +3764,11 @@ class SingleTradeEngine:
             learning_generation.bump(self.store,'closed_trade_weight_update')
             self.store.set('neural_adapt_reason',
                 f'Closed {direction} £{pnl_value} → LIVE learn×{repeats} mode={mode}')
-            self.brain.model_version=int(getattr(self.brain,'model_version',0) or 0)+1
+            # Count weight updates separately — do NOT bump model_version here.
+            # Version stays stable across many closed trades so LIVE↔shadow
+            # compare has enough samples (audit: one-trade-per-version).
+            self.brain.weight_updates=int(
+                getattr(self.brain,'weight_updates',0) or 0)+1
         # Critical #5: mark learned ONLY when we claimed + trained (or claimed
         # with no ΔW). Never burn the once-only slot on label=None / scratch skip
         # — that blocked later CF retry and left the same bad entry untaught.
@@ -4486,6 +4506,7 @@ class SingleTradeEngine:
                     fusion_block_reason=self.fusion_block_reason,
                     external_trained_labels=getattr(self.brain,'fusion_labels',0),
                     model_version=getattr(self.brain,'model_version',0),
+                    weight_updates=getattr(self.brain,'weight_updates',0),
                     ohlc_dim=getattr(self.brain,'ohlc_dim',None),
                     fusion_dim=getattr(self.brain,'fusion_dim',None),
                     feature_registry=self.feature_registry.snapshot()),

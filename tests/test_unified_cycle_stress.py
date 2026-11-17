@@ -252,7 +252,7 @@ def test_toxic_market_200_trades_no_nan_state():
             candle_buf.append(bar)
             if len(candle_buf) > 200:
                 candle_buf = candle_buf[-200:]
-            sig = brain.tick(mid, SPREAD, TICK, EPIC, dt=60., bar_time=bar['at'])
+            sig = brain.tick(mid, SPREAD, TICK, EPIC, dt=1.0, bar_time=bar['at'])
             scores = (sig or {}).get('scores')
             if open_pos is not None:
                 dirc = open_pos['direction']

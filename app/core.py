@@ -3,6 +3,11 @@
 Outputs are uncalibrated model scores, NOT proven trading forecasts. Delayed targets
 are explicit delayed price-direction proxies (the source PDF does not define y_t).
 Gradients flow through P,W,R,O,b,tau,tau_c,G for a one-step recurrent unroll.
+
+Time unit: ``dt`` is in **completed M1 bars** (not wall-clock seconds).
+``tau`` / ``tau_c`` are therefore bar-time constants. One closed minute → ``dt=1``.
+LIVE, shadow, and historical readiness must all use the same bar unit so
+λ = 1−exp(−dt/τ) matches (~0.095 at τ=10, dt=1) — never LIVE dt=60 vs shadow dt=1.
 """
 import hashlib
 import numpy as np
@@ -10,6 +15,11 @@ import torch
 import torch.nn.functional as F
 
 ACTIONS=('BUY','SELL','HOLD')
+
+# One completed M1 candle. Keep LIVE / shadow / holdout on this same scale.
+NEURAL_BAR_DT = 1.0
+# Soft cap for multi-bar gaps that still advance without a full state reset.
+NEURAL_BAR_DT_MAX = 8.0
 
 # Audit #17 — two distinct supervised objectives share the same NeuralCore.
 # Minute-direction (next M1 bar) is frequent and auxiliary; closed-trade P&L is
@@ -79,7 +89,7 @@ class NeuralCore:
         logits=self.R@hn+self.O@cn+self.b
         return hn,cn,logits
 
-    def step(self,x,dt=1.0,epsilon=1e-6,zeta=.01):
+    def step(self,x,dt=NEURAL_BAR_DT,epsilon=1e-6,zeta=.01):
         x=np.asarray(x,dtype=float)
         if x.shape!=(self.d,) or not np.isfinite(x).all() or dt<=0:raise ValueError('Invalid input or time interval')
         sigma=np.maximum(np.sqrt(self.nu),epsilon)

@@ -90,7 +90,7 @@ def _run_campaign(*, freeze_in_trade: bool, reset_flat: bool, structure_hold: bo
         brain = AdaptiveBrain(store, data_dir=d)
         # Warm OHLC schema so tick accepts features.
         t0 = '2026-05-01T00:00:00+00:00'
-        brain.tick(4000.0, 0.5, 0.1, EPIC, dt=60, features=_ohlc_features(brain),
+        brain.tick(4000.0, 0.5, 0.1, EPIC, dt=1.0, features=_ohlc_features(brain),
                    bar_time=t0, in_position=False)
         tr0 = _make_transition(brain)
         _bias_buy(brain, tr0)
@@ -110,7 +110,7 @@ def _run_campaign(*, freeze_in_trade: bool, reset_flat: bool, structure_hold: bo
                 holds += 1
                 # Flat perceive+train ok.
                 brain.tick(
-                    mid, 0.5, 0.1, EPIC, dt=60, features=_ohlc_features(brain),
+                    mid, 0.5, 0.1, EPIC, dt=1.0, features=_ohlc_features(brain),
                     bar_time=f'2026-05-01T{minute // 60:02d}:{minute % 60:02d}:00+00:00',
                     in_position=False)
                 minute += 1
@@ -132,7 +132,7 @@ def _run_campaign(*, freeze_in_trade: bool, reset_flat: bool, structure_hold: bo
                 bt = f'2026-05-01T{minute // 60:02d}:{minute % 60:02d}:00+00:00'
                 minute += 1
                 brain.tick(
-                    mid, 0.5, 0.1, EPIC, dt=60, features=_ohlc_features(brain),
+                    mid, 0.5, 0.1, EPIC, dt=1.0, features=_ohlc_features(brain),
                     bar_time=bt, in_position=freeze_in_trade)
                 if not freeze_in_trade and not won:
                     # Old bug: adverse M1 flips entry weights to the opposite side.
@@ -194,14 +194,14 @@ def test_in_position_tick_does_not_move_entry_weights():
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
         brain.tick(
-            4000.0, 0.5, 0.1, EPIC, dt=60, features=_ohlc_features(brain),
+            4000.0, 0.5, 0.1, EPIC, dt=1.0, features=_ohlc_features(brain),
             bar_time='2026-04-01T00:00:00+00:00', in_position=False)
         before = brain.core.R.copy()
         mid = 4000.0
         for j in range(1, 21):
             mid -= 0.5
             out = brain.tick(
-                mid, 0.5, 0.1, EPIC, dt=60, features=_ohlc_features(brain),
+                mid, 0.5, 0.1, EPIC, dt=1.0, features=_ohlc_features(brain),
                 bar_time=f'2026-04-01T00:{j:02d}:00+00:00',
                 in_position=True)
             assert out is not None

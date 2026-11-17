@@ -326,7 +326,8 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
         feats = list(snap['features'][:brain.ohlc_dim])
         if len(feats) != brain.ohlc_dim:
             continue
-        result = brain.tick(mid, spread, tick, epic, dt=60., features=feats,
+        # Same bar-time dt as LIVE/shadow (not wall-clock 60s).
+        result = brain.tick(mid, spread, tick, epic, dt=1.0, features=feats,
                             bar_time=train[i]['at'], external_features=None)
         if result is not None:
             train_steps += 1

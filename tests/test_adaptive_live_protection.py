@@ -122,13 +122,12 @@ def test_trail_continues_past_break_even_using_ohlc_zone_gap():
 
 
 def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
-    """BUY stop sits under recent 1m lows — not tip − 35%R / 2×minStop."""
+    """BUY stop sits under recent 1m *closes* — not tip − 35%R / 2×minStop."""
     from app.protection_ai import ohlc_1m_structure_stop
     # Wide opening R so old tip−floor gap would sit far behind price.
     p=_position(stop=100.05,profit=106.0)
     meta=_meta(3.0)
-    # Tip ~103.5; recent 1m lows ~103.1 → structure trail ~103.1
-    # Old floor max(2×0.3, 0.35×3)≈1.05 → tip−gap≈102.45 (much looser).
+    # Tip ~103.5; recent 1m closes min=103.2 → structure trail under close swing.
     candles=[
         {'at':'2026-10-14T12:01:00+00:00','open':103.0,'high':103.4,'low':102.95,'close':103.2},
         {'at':'2026-10-14T12:02:00+00:00','open':103.2,'high':103.5,'low':103.05,'close':103.35},
@@ -137,7 +136,7 @@ def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
         {'at':'2026-10-14T12:05:00+00:00','open':103.4,'high':103.55,'low':103.20,'close':103.5},
     ]
     anchor=ohlc_1m_structure_stop('BUY',candles,lookback=5,buffer=0.0)
-    assert anchor==pytest.approx(102.95)
+    assert anchor==pytest.approx(103.2)
     out=propose_broker_trail(
         p,_market(103.45,103.55),meta,extreme=103.55,
         zone_range=0.35,candles=candles)
@@ -146,12 +145,12 @@ def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
     assert out['structure_stop'] is not None
     assert out['reason']=='trail past BE (1m OHLC structure)'
     assert out['stop_level']>100.05
-    assert out['stop_level']>=102.8
+    assert out['stop_level']>=103.0
     # Beats old tip − max(2×min, 35%R) ≈ tip − 1.05 when no 1m structure.
     legacy=propose_broker_trail(
         p,_market(103.45,103.55),meta,extreme=103.55)
     assert legacy and out['stop_level']>legacy['stop_level']
-    # SELL mirrors: stop above recent 1m highs.
+    # SELL mirrors: stop above recent 1m closes.
     sell=_position('SELL',stop=99.95,profit=94.0)
     sell_bars=[
         {'at':'2026-10-14T12:01:00+00:00','open':96.8,'high':97.05,'low':96.5,'close':96.7},
@@ -163,7 +162,7 @@ def test_trail_past_be_follows_1m_ohlc_structure_not_huge_gap():
         zone_range=0.35,candles=sell_bars)
     assert sout and sout['be_locked'] and sout['structure_stop'] is not None
     assert sout['stop_level']<99.95
-    assert sout['stop_level']<=97.2
+    assert sout['stop_level']<=96.85
 
 
 class Brain:
@@ -527,7 +526,7 @@ def test_trail_lifecycle_watch_arm_be_trail():
         market=_market(100.5,100.6);market['min_distance']=0.3
         assert propose_broker_trail(
             pos,market,meta,extreme=100.5,store=s,arm_decision=arm) is None
-        # ARMED at 0.55R → BE lock.
+        # ARMED at ≥0.30R → BE lock.
         arm=se.trail_arm_decision(
             s,epic='GOLD',structure='TREND_UP',direction='BUY',
             mfe=1.2,original_risk=risk,be_locked=False)
@@ -586,3 +585,28 @@ def test_claim_robot_open_on_adopt_after_pending_brain():
         assert e._claim_robot_open(p,reason='adopt_robot_fill')
         assert s.get('robot_open:ad1')
         assert s.get('adaptive_protection:ad1')['owner']=='AUTO'
+
+
+def test_be_arms_at_thirty_percent_of_r():
+    """BE/trail arms from ~30% of opening R — not the old ~50%/0.55 seed."""
+    from app import structure_edge as se
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'t.sqlite3')
+        risk=2.0
+        # 0.29R — still waiting
+        low=se.trail_arm_decision(
+            s,epic='GOLD',structure='TREND_UP',direction='BUY',
+            mfe=0.58,original_risk=risk,be_locked=False)
+        assert low['arm'] is False
+        # 0.30R — arm BE
+        ok=se.trail_arm_decision(
+            s,epic='GOLD',structure='TREND_UP',direction='BUY',
+            mfe=0.60,original_risk=risk,be_locked=False)
+        assert ok['arm'] is True
+        pos={'dealId':'be30','epic':'GOLD','direction':'BUY','level':100.,
+             'stopLevel':98.,'profitLevel':102.,'size':'.25'}
+        meta={'owner':'AUTO','deal_id':'be30','original_risk':risk,'original_profit':risk}
+        market=_market(100.65,100.75);market['min_distance']=0.3
+        out=propose_broker_trail(
+            pos,market,meta,extreme=100.65,store=s,arm_decision=ok)
+        assert out and out['phase']=='be_lock'

@@ -76,11 +76,13 @@ def load_params(store):
         'loss_budget_frac': float(sp.get('day_loss_budget_frac', 0.02)),
         'risk_per_trade_frac': float(sp.get('day_risk_per_trade_frac', 0.005)),
         'be_band_frac': float(sp.get('day_be_band_frac', 0.001)),
-        'max_positions': int(sp.get('day_max_positions', 3)),
+        'max_positions': int(sp.get('day_max_positions', 5)),
         'conviction_nudge': float(sp.get('day_conviction_nudge', 0.12)),
         'lot_max_mult': float(sp.get('day_lot_vs_mandate_max_mult', 2.0)),
         'lot_min_mult': float(sp.get('day_lot_vs_mandate_min_mult', 0.25)),
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
+        'open_slices': int(sp.get('day_open_slices', 5)),
+        'slice_min_edge': float(sp.get('day_slice_min_edge', 0.06)),
     }
 
 
@@ -481,11 +483,13 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
 
 def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
               positions=None, stop_ticks_by_deal=None, score_edge=None,
-              epic=None, mandate_epic=None, now=None, market=None):
+              epic=None, mandate_epic=None, now=None, market=None,
+              trend_aligned=False):
     """Full OPEN plan: allow? + Capital-grid size. Persist last plan for Admin."""
     gate = allows_new_open(
         store=store, equity=equity, positions=positions, epic=epic,
-        mandate_epic=mandate_epic, score_edge=score_edge, now=now)
+        mandate_epic=mandate_epic, score_edge=score_edge, now=now,
+        trend_aligned=trend_aligned)
     out = dict(gate)
     if not gate.get('allowed'):
         out['size'] = None
@@ -507,6 +511,84 @@ def plan_open(*, store, equity, mandate_size, stop_ticks, tick_value,
             for k, v in out.items()
         })
     return out
+
+
+def _slice_advantageous(*, score_edge=None, action=None, live_trend=None,
+                        structure=None, returns_bps=None, store=None):
+    """True when the tape/edge justifies splitting one lot into many slices."""
+    clear = _clear_trend_side(
+        live_trend=live_trend, structure=structure, returns_bps=returns_bps)
+    if action in ('BUY', 'SELL') and clear == action:
+        return True
+    edge = _finite(score_edge)
+    need = float(load_params(store).get('slice_min_edge') or 0.06)
+    return edge is not None and edge >= need
+
+
+def split_planned_sizes(total_size, *, store=None, positions=None, size_grid=None,
+                        score_edge=None, action=None, live_trend=None,
+                        structure=None, returns_bps=None):
+    """Split one planned lot into N Capital-grid slices for simultaneous OPEN.
+
+    Flat + advantageous → up to ``day_open_slices`` (default 5) pieces whose
+    sizes sum ≈ total. Already-open books ADD one slice at a time.
+    """
+    grid = size_grid if isinstance(size_grid, dict) else {}
+    mn = grid.get('min')
+    step = grid.get('step')
+    mx = grid.get('max')
+    total = _dec(total_size)
+    if total is None or total <= 0 or mn is None or step is None:
+        one = snap_deal_size(total_size, min_size=mn, step=step, max_size=mx) if mn is not None and step is not None else None
+        return [one] if one is not None else []
+    params = load_params(store)
+    max_pos = max(1, int(params.get('max_positions') or 5))
+    want = max(1, int(params.get('open_slices') or 5))
+    open_n = len(positions or [])
+    room = max(0, max_pos - open_n)
+    advantageous = _slice_advantageous(
+        score_edge=score_edge, action=action, live_trend=live_trend,
+        structure=structure, returns_bps=returns_bps, store=store)
+    if open_n > 0 or not advantageous or room <= 1:
+        n = 1
+    else:
+        n = min(want, room)
+    # How many min-lots fit in the planned total?
+    try:
+        max_by_min = int((total / Decimal(str(mn))).to_integral_value(
+            rounding=ROUND_FLOOR))
+    except Exception:
+        max_by_min = 1
+    n = max(1, min(n, max_by_min if max_by_min > 0 else 1))
+    if n <= 1:
+        one = snap_deal_size(total, min_size=mn, step=step, max_size=mx)
+        return [one] if one is not None else []
+    raw = total / Decimal(n)
+    base = snap_deal_size(raw, min_size=mn, step=step, max_size=mx)
+    if base is None or base <= 0:
+        one = snap_deal_size(total, min_size=mn, step=step, max_size=mx)
+        return [one] if one is not None else []
+    sizes = [base] * n
+    used = base * n
+    rem = total - used
+    st = Decimal(str(step))
+    i = 0
+    while rem >= st - Decimal('1e-12') and i < n:
+        bumped = snap_deal_size(
+            sizes[i] + st, min_size=mn, step=step, max_size=mx)
+        if bumped is None or bumped <= sizes[i]:
+            break
+        rem -= (bumped - sizes[i])
+        sizes[i] = bumped
+        i += 1
+    out = []
+    for s in sizes:
+        snapped = snap_deal_size(s, min_size=mn, step=step, max_size=mx)
+        if snapped is not None and snapped > 0:
+            out.append(snapped)
+    return out or ([snap_deal_size(total, min_size=mn, step=step, max_size=mx)]
+                   if snap_deal_size(total, min_size=mn, step=step, max_size=mx)
+                   else [])
 
 
 def _clear_trend_side(*, live_trend=None, structure=None, returns_bps=None):

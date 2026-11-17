@@ -241,11 +241,11 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     if not be_locked and early_arm and tip_fav>0:
         try:
             from .self_params import load as _sp_load
-            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.55))
+            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.30))
         except Exception:
-            arm_frac=0.55
+            arm_frac=0.30
         arm_frac=max(0.25,min(1.0,arm_frac))
-        floor_need=min(arm_frac,0.35)*open_gap
+        floor_need=arm_frac*open_gap
         if tip_fav<floor_need:
             return None
         trail_gap=min(open_gap,max(minimum,tip_fav))

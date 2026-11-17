@@ -4800,9 +4800,23 @@ class SingleTradeEngine:
         if not proposal:return
         runtime=self.store.get('adaptive_runtime:'+str(p['dealId']),{}) or {}
         now_mono=time.monotonic()
-        wait=15.0 if runtime.get('status')=='REJECTED' else 3.0
+        # After BE, ratchet SL promptly as each 1m close swing advances —
+        # physical stop location must move on the broker, not only in memory.
+        be_now=bool(proposal.get('be_locked') or proposal.get('phase') in (
+            'trail','be_lock'))
+        if runtime.get('status')=='REJECTED':
+            wait=12.0
+        elif be_now:
+            wait=1.5
+        else:
+            wait=3.0
         last_mono=runtime.get('mono')
         if last_mono is not None and (now_mono-float(last_mono))<wait:return
+        # Skip no-op PUTs that would leave SL at the same price.
+        prev_stop=_num(runtime.get('stop'))
+        if (prev_stop is not None and abs(float(proposal['stop_level'])-float(prev_stop))
+                < float(self.market.get('tick') or 0)*0.5):
+            return
         stop=proposal['stop_level']
         # Always re-send live TP on trail. Omitting profitLevel on Capital PUT
         # turns Take Profit Off — TP mark can be touched with no fill left.
@@ -5100,14 +5114,15 @@ class SingleTradeEngine:
                         tick_val_src='mandate_risk_calibrated'
                 except Exception:
                     tick_val=None
+            _scores_for_align,_edge_for_align,_aligned=self._day_book_add_edge()
             plan=day_book.plan_open(
                 store=self.store,equity=equity,mandate_size=self.mandate['size'],
                 stop_ticks=brackets.get('stop_ticks'),tick_value=tick_val,
                 positions=self.positions,
                 stop_ticks_by_deal=self._stop_ticks_by_deal(tick),
-                score_edge=score_edge,
+                score_edge=score_edge if score_edge is not None else _edge_for_align,
                 epic=self.mandate.get('epic'),mandate_epic=self.mandate.get('epic'),
-                market=market)
+                market=market,trend_aligned=_aligned)
             if not plan.get('allowed') or plan.get('size') is None:
                 self.last_entry_reason=plan.get('reason') or 'day_book_blocked'
                 self.store.event('entry','OPEN skipped — day book',{
@@ -5131,6 +5146,29 @@ class SingleTradeEngine:
                     max_size=size_grid.get('max')):
                 self.last_entry_reason='size_grid_check_failed'
                 return
+            # Split one planned lot into simultaneous Capital-grid slices when
+            # flat + advantageous (e.g. 5× BUY/SELL). ADD path stays 1 slice.
+            sit_struct=((self.last_signal or {}).get('structure_edge') or {}).get('structure')
+            if not sit_struct:
+                sit_struct=zone.get('structure')
+            live_trend=(self.market_context or {}).get('trend') or (
+                self.last_signal or {}).get('trend')
+            returns_bps=(self.market_context or {}).get('returns_bps') or (
+                self.last_signal or {}).get('returns_bps')
+            slice_sizes=day_book.split_planned_sizes(
+                size,store=self.store,positions=self.positions,size_grid=size_grid,
+                score_edge=score_edge if score_edge is not None else _edge_for_align,
+                action=action,live_trend=live_trend,structure=sit_struct,
+                returns_bps=returns_bps)
+            if not slice_sizes:
+                self.last_entry_reason='size_slice_empty'
+                return
+            for sl in slice_sizes:
+                if not on_deal_size_grid(
+                        sl,min_size=size_grid['min'],step=size_grid['step'],
+                        max_size=size_grid.get('max')):
+                    self.last_entry_reason='size_grid_check_failed'
+                    return
             # SL/TP distances on the price tick grid (Capital POINTS).
             sd=snap_distance(brackets['stop_distance'],tick,minimum=minimum,round_up=True)
             pd=snap_distance(brackets['profit_distance'],tick,minimum=minimum,round_up=True)
@@ -5150,16 +5188,19 @@ class SingleTradeEngine:
                     'profit_distance':brackets['profit_distance'],
                     'min_distance':float(minimum)})
                 return
+            total_size=sum(slice_sizes,Decimal('0'))
             proposed=None
             if tick_val is not None:
                 try:
-                    proposed=float(cash_risk(size,brackets['stop_ticks'],tick_val))
+                    proposed=float(cash_risk(total_size,brackets['stop_ticks'],tick_val))
                 except (ValueError,TypeError,ArithmeticError):
                     proposed=None
             gate=self._hard_risk_gate(proposed_risk=proposed)
             self.store.event('risk','Day-book OPEN cash-risk (Capital-grid sized)',{
-                'proposed_risk':proposed,'size':str(size),
-                'size_wire':broker_wire_number(size),
+                'proposed_risk':proposed,'size':str(total_size),
+                'size_wire':broker_wire_number(total_size),
+                'slices':[str(s) for s in slice_sizes],
+                'slice_count':len(slice_sizes),
                 'mandate_size':str(self.mandate['size']),
                 'size_scale':plan.get('scale'),
                 'size_grid':plan.get('size_grid') or {
@@ -5195,7 +5236,7 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'learn_samples':bp.get('nudge_samples'),
                 'day_phase':plan.get('phase'),'size_scale':plan.get('scale'),
-                'size':str(size)})
+                'size':str(total_size),'slices':[str(s) for s in slice_sizes]})
             # Snapshot the neural state that voted for THIS entry — not a later bar.
             if self.brain.core.last_transition and len(self.brain.core.last_transition['h'])==self.brain.core.n:
                 open_ctx=champion_library.context_from(
@@ -5205,7 +5246,6 @@ class SingleTradeEngine:
                     regime=(self.market_context or {}).get('regime')
                            or (self.last_signal or {}).get('regime'),
                     news=self._news_risk())
-                sit_struct=((self.last_signal or {}).get('structure_edge') or {}).get('structure')
                 sit_fp=self._situation_fingerprint_now(structure=sit_struct)
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
@@ -5221,64 +5261,111 @@ class SingleTradeEngine:
                     'profit_distance':float(brackets['profit_distance']),
                     'champion_context':open_ctx,
                     'day_phase':plan.get('phase'),
-                    'size':str(size),'size_scale':plan.get('scale'),
+                    'size':str(total_size),'size_scale':plan.get('scale'),
+                    'slices':[str(s) for s in slice_sizes],
                     # Situation at OPEN — £ banks into this scene on close.
                     'situation':sit_fp,
                     'trend':(self.market_context or {}).get('trend'),
                     'returns_bps':(self.market_context or {}).get('returns_bps'),
                     'structure':sit_struct,
                 }
-            # Durable order record BEFORE a real order is sent; never blindly retry.
-            oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
-                'stop_distance':str(brackets['stop_distance']),'profit_distance':str(brackets['profit_distance']),
-                'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],'day_phase':plan.get('phase')})
             self.last_entry_signal_step=self.brain.core.steps
             # Freeze UI scores at the OPEN decision before manage ticks start.
             # Only freeze when this is the first open — multi-add keeps manage votes live.
             if not before_ids:
                 self._lock_entry_signal_for_open()
+            pending_brain=self._pending_entry_brain
+            opened_slices=0
             try:
-                receipt=await self.broker.open_position(self.mandate['epic'],action,size,
-                    stop_distance=brackets['stop_distance'],profit_distance=brackets['profit_distance'])
-                self.last_order_ref=receipt.get('dealReference')
-                await self._confirm_reconcile(receipt,oid,'OPEN')
-                if self.positions and self._pending_entry_brain:
-                    after={str(p['dealId']):p for p in self.positions if p.get('dealId')}
-                    new_ids=[d for d in after if d not in before_ids]
-                    # Multi-pos safe: never fall back to positions[0] (wrong deal).
-                    # Prefer sole newcomer, else latest_robot_deal_id from confirm.
-                    deal_id=None
-                    if len(new_ids)==1:
-                        deal_id=new_ids[0]
-                    else:
-                        latest=self.store.get('latest_robot_deal_id')
-                        if latest is not None and str(latest) in after:
-                            deal_id=str(latest)
-                        elif len(after)==1:
-                            deal_id=next(iter(after))
-                    key='entry_brain:'+str(deal_id) if deal_id else None
-                    pos=after.get(str(deal_id)) if deal_id else {}
-                    if deal_id and key and self.store.get(key) is None:
-                        pending=self._pending_entry_brain
-                        self.store.set(key,{**pending,
-                            'entry':(pos.get('level') if pos and pos.get('level') is not None
-                                     else pending.get('entry'))})
-                    elif self._pending_entry_brain and not deal_id:
-                        self.store.event('warning',
-                            'OPEN entry_brain not bound — ambiguous multi-pos dealId',
-                            {'new_ids':new_ids,'open':list(after.keys())})
-                    self._pending_entry_brain=None
+                for slice_i,size in enumerate(slice_sizes):
+                    if slice_i>0:
+                        # Refresh book between slices; stop if capacity/unresolved.
+                        await self.sync()
+                        if self.store.unresolved():
+                            self.store.event('entry',
+                                'Multi-lot OPEN stopped — unresolved after prior slice',
+                                {'opened_slices':opened_slices,
+                                 'remaining':len(slice_sizes)-slice_i})
+                            break
+                        room=day_book.allows_new_open(
+                            store=self.store,equity=equity,positions=self.positions,
+                            epic=self.mandate.get('epic'),
+                            mandate_epic=self.mandate.get('epic'),
+                            score_edge=score_edge if score_edge is not None else _edge_for_align,
+                            trend_aligned=True)
+                        if not room.get('allowed'):
+                            self.store.event('entry',
+                                'Multi-lot OPEN stopped — day book capacity',
+                                {'reason':room.get('reason'),
+                                 'opened_slices':opened_slices})
+                            break
+                    slice_before={str(p['dealId']) for p in (self.positions or [])
+                                  if p.get('dealId')}
+                    # Durable order record BEFORE a real order is sent.
+                    oid=self.store.order(
+                        'OPEN',None,{
+                            'epic':self.mandate['epic'],'direction':action,
+                            'size':str(size),
+                            'stop_distance':str(brackets['stop_distance']),
+                            'profit_distance':str(brackets['profit_distance']),
+                            'kappa':bp['kappa'],'sl_scale':bp['sl_scale'],
+                            'day_phase':plan.get('phase'),
+                            'slice_index':slice_i,
+                            'slice_count':len(slice_sizes)})
+                    receipt=await self.broker.open_position(
+                        self.mandate['epic'],action,size,
+                        stop_distance=brackets['stop_distance'],
+                        profit_distance=brackets['profit_distance'])
+                    self.last_order_ref=receipt.get('dealReference')
+                    await self._confirm_reconcile(receipt,oid,'OPEN')
+                    opened_slices+=1
+                    if self.positions and pending_brain:
+                        after={str(p['dealId']):p for p in self.positions
+                               if p.get('dealId')}
+                        new_ids=[d for d in after if d not in slice_before]
+                        deal_id=None
+                        if len(new_ids)==1:
+                            deal_id=new_ids[0]
+                        else:
+                            latest=self.store.get('latest_robot_deal_id')
+                            if latest is not None and str(latest) in after:
+                                deal_id=str(latest)
+                            elif len(after)==1:
+                                deal_id=next(iter(after))
+                        key='entry_brain:'+str(deal_id) if deal_id else None
+                        pos=after.get(str(deal_id)) if deal_id else {}
+                        if deal_id and key and self.store.get(key) is None:
+                            self.store.set(key,{**pending_brain,
+                                'size':str(size),
+                                'slice_index':slice_i,
+                                'entry':(pos.get('level') if pos and pos.get('level') is not None
+                                         else pending_brain.get('entry'))})
+                        elif pending_brain and not deal_id:
+                            self.store.event('warning',
+                                'OPEN entry_brain not bound — ambiguous multi-pos dealId',
+                                {'new_ids':new_ids,'open':list(after.keys()),
+                                 'slice_index':slice_i})
+                        day_book.record_open(self.store,equity=equity)
+                if opened_slices>0:
                     unified_cycle.note_open(self.store,action=action)
-                    day_book.record_open(self.store,equity=equity)
+                    self.store.event('entry','Multi-lot OPEN burst',{
+                        'direction':action,'opened_slices':opened_slices,
+                        'planned_slices':len(slice_sizes),
+                        'sizes':[str(s) for s in slice_sizes[:opened_slices]]})
+                self._pending_entry_brain=None
             except Exception as exc:
                 # Keep UNCERTAIN so a second OPEN cannot fire; operator Resume clears.
                 # Keep _pending_entry_brain — Capital often filled while confirm failed;
                 # next sync adopt/supersede must claim robot_open + trail + brain.
-                self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
+                if 'oid' in locals() and oid is not None:
+                    self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
+                if pending_brain and self._pending_entry_brain is None:
+                    self._pending_entry_brain=pending_brain
                 self.execution_enabled=False
                 self.store.event('error',
                     'Entry outcome uncertain; no automatic retry until Resume',
                     {'type':type(exc).__name__,
+                     'opened_slices':opened_slices if 'opened_slices' in locals() else 0,
                      'pending_entry_brain_kept':bool(self._pending_entry_brain)})
         finally:self.pending_order=False
     def _manage_perceive_ohlc(self,*,mid,spread,tick,epic,bar_t,features):

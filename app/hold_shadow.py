@@ -110,8 +110,11 @@ def save_pending(store, rows: list) -> list:
 
 def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
                    profit_distance=None, tick=None, min_distance=None,
-                   trail=True, slip_bps=0.):
+                   trail=False, slip_bps=0.):
     """Replay proposal + opposite under identical bracket/cost rules.
+
+    Default ``trail=False``: HOLD-missed teaching is about SL/TP brackets.
+    BE/trail can exit opposite before TP and poison the teacher (false both_lost).
 
     ``slip_bps`` must match LIVE/shadow_paper friction — zero-slip sims were
     optimistic and taught opposite into LIVE on paths that would not clear costs.
@@ -158,7 +161,7 @@ def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
 
 def enqueue(store, *, proposal, reason, bar_time, epic, entry, spread,
             stop_distance, profit_distance, tick, min_distance, transition,
-            scores=None, trail=True, slip_bps=0.):
+            scores=None, trail=False, slip_bps=0.):
     """Queue a HOLD abstention for later opposite-path shadow."""
     if proposal not in ('BUY', 'SELL'):
         return None
@@ -236,7 +239,7 @@ def resolve_one(case: dict, bars: list) -> dict | None:
         profit_distance=case.get('profit_distance'),
         tick=case.get('tick'),
         min_distance=case.get('min_distance'),
-        trail=case.get('trail', True),
+        trail=case.get('trail', False),
         slip_bps=case.get('slip_bps') or 0.)
 
 

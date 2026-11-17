@@ -95,8 +95,10 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
             brain.tick=controlled_tick
             for _ in range(5):await engine.poll()
             opens=[r for r in broker.requests if r[0]=='OPEN']
-            assert len(opens)==1,engine.snapshot()['entry_block_reason']
-            assert opens[0][2]=='SELL'
+            assert opens,engine.snapshot()['entry_block_reason']
+            assert all(r[2]=='SELL' for r in opens)
+            from decimal import Decimal
+            assert sum(Decimal(str(r[3])) for r in opens)==Decimal('.25')
             assert engine.positions and engine.positions[0]['dealId']=='b2'
             assert not store.unresolved()
             assert engine.snapshot()['entry_margin_calibration'] is None # with open position, no new entry

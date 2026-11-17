@@ -240,12 +240,19 @@ def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
     margin = decision['margin']
     # Only gate when edge is known — no scores ≠ automatic weak-edge veto.
     if act in ('BUY', 'SELL') and margin is not None and float(margin) < need:
+        streak = int(state.get('loss_streak') or 0)
+        if streak > 0:
+            reason = (
+                f'Unified cycle: edge {float(margin):.3f} < required {need:.3f} '
+                f'after {streak} loss streak')
+        else:
+            reason = (
+                f'Unified cycle: edge {float(margin):.3f} < calibrated floor '
+                f'{need:.3f}')
         return {
             'allowed': False,
             'action': 'HOLD',
-            'reason': (
-                f'Unified cycle: edge {float(margin):.3f} < required {need:.3f} '
-                f'after {int(state.get("loss_streak") or 0)} loss streak'),
+            'reason': reason,
             'decision': decision,
             'min_margin': need,
             'aggression': _clip(
@@ -293,6 +300,8 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'max_tp': float(tp_hint) if tp_hint is not None else None,
             'blocked': True,
             'reason': (
+                f'Unified cycle: edge {margin:.3f} < calibrated floor {need:.3f}'
+                if _safe_int(state.get("loss_streak"), 0) <= 0 else
                 f'Unified cycle: edge {margin:.3f} < required {need:.3f} '
                 f'after {_safe_int(state.get("loss_streak"), 0)} loss streak'),
             'decision': decision,

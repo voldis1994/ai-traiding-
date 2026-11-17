@@ -3228,32 +3228,24 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','Fuzzy pending P&L failed',
                                      {'deal_id':deal,'type':type(exc).__name__})
-            # Exhausted history: bind last live UPL for Admin display ONLY —
-            # never teach from UPL. Keep the deal in pending so a later real
-            # broker cash row can overwrite the estimate (do not drop forever).
-            if not found and attempts>=6 and not base.get('upl_shown'):
-                snap=self.store.get('last_upl:'+deal) or {}
-                upl=_num(snap.get('upl'))
-                if upl is not None and math.isfinite(upl):
-                    ccy_upl=self._cash_currency(snap.get('currency'))
-                    self.store.close_trade(
-                        deal,exit_level,float(upl),currency=ccy_upl,
-                        source='upl_estimate',overwrite=True)
-                    self.store.event('trade',
-                        'Pending cash shown from last UPL; still waiting for broker',
-                        {'deal_id':deal,'upl':float(upl),'attempts':attempts})
-                    nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                    nxt['upl_shown']=True
-                    remaining.append(nxt)
-                    continue
+            # Never write upl_estimate into trades — UPL is not account £.
+            # Keep pending until Capital history returns real cash.
             if not found:
+                if attempts>=6 and attempts%6==0:
+                    snap=self.store.get('last_upl:'+deal) or {}
+                    upl=_num(snap.get('upl'))
+                    self.store.event('trade',
+                        'Still waiting for broker cash P&L (UPL not stored as realized)',
+                        {'deal_id':deal,'attempts':attempts,
+                         'last_upl':float(upl) if upl is not None and math.isfinite(upl) else None})
                 nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                # Drop obsolete Admin flag if any old pending carried it.
+                nxt.pop('upl_shown',None)
                 remaining.append(nxt)
                 continue
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
             already=self._trade_already_learned(deal)
-            # Real broker cash always overwrites a prior upl_estimate display.
             self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
             if already:
                 self.store.event('trade','Late broker P&L refined record without re-learning',

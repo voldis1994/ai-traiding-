@@ -206,6 +206,7 @@ def run_gold_benchmark(store_or_rows, *, train_frac=0.7, seed=0, limit=5000):
     """Train + compare on the same GOLD forecast_memory rows (or an explicit list).
 
     Emphasizes 1-minute accuracy, class ECE, and σ̂ vs error magnitude.
+    Separate forecast-quality model — does **not** replace LIVE NeuralCore.
     """
     if isinstance(store_or_rows,list):
         rows=[r for r in store_or_rows
@@ -226,4 +227,80 @@ def run_gold_benchmark(store_or_rows, *, train_frac=0.7, seed=0, limit=5000):
             'forecast_ece':h1.get('forecast_ece'),
             'sigma_vs_error':h1.get('sigma_vs_error'),
         }
+    report['live_neural_replaced']=False
+    return report
+
+
+def _ohlc_feature_scores(closes, i, *, spread=0.3):
+    """Cheap path features + baseline scores from completed GOLD closes only."""
+    c=float(closes[i])
+    def ret(n):
+        j=i-n
+        if j<0:return 0.0
+        p=float(closes[j])
+        return (c-p)/p if p>0 else 0.0
+    feats=[ret(1),ret(3),ret(5),ret(15),
+           abs(ret(1)),abs(ret(5)),float(spread)/max(c,1e-9),
+           ret(1)-ret(3)]
+    # Baseline "neural-like" scores from short return sign — not LIVE weights.
+    r1=ret(1)
+    if r1>1e-6:
+        scores={'BUY':0.55,'SELL':0.20,'HOLD':0.25}
+    elif r1<-1e-6:
+        scores={'BUY':0.20,'SELL':0.55,'HOLD':0.25}
+    else:
+        scores={'BUY':0.30,'SELL':0.30,'HOLD':0.40}
+    return feats,scores,c
+
+
+def run_gold_ohlc_compare(candles, *, store=None, seed=0, train_frac=0.7,
+                          now_utc=None, epic='GOLD'):
+    """Seed forecast_memory from completed GOLD M1 OHLC, resolve, benchmark.
+
+    Quality comparison only — does not touch LIVE neural weights or execution.
+    ``candles`` must be chronological completed bars (``at``/OHLC).
+    """
+    from .forecast_memory import ForecastMemory
+    from .forecast_targets import completed_candles, candle_bar_time, candle_mid
+
+    bars=completed_candles(candles,now_utc=now_utc)
+    if len(bars)<max(HORIZONS)+40:
+        return {'ok':False,'reason':f'need ≥{max(HORIZONS)+40} completed GOLD bars',
+                'n_bars':len(bars),'live_neural_replaced':False}
+    closes=[]
+    times=[]
+    spreads=[]
+    for c in bars:
+        mid=candle_mid(c)
+        st=candle_bar_time(c)
+        if mid is None or st is None:
+            continue
+        closes.append(mid);times.append(st)
+        try:
+            spreads.append(float(c.get('spread') or 0.3))
+        except (TypeError,ValueError):
+            spreads.append(0.3)
+    if store is None:
+        import tempfile
+        from pathlib import Path
+        from .engine import Store
+        tmp=tempfile.TemporaryDirectory()
+        store=Store(Path(tmp.name)/'gold_compare.sqlite3')
+        store._gold_tmp=tmp  # keep alive for caller duration
+    mem=ForecastMemory(store)
+    # Record forecasts on bars that still have +15 completed minutes ahead.
+    last_i=len(closes)-max(HORIZONS)-1
+    recorded=0
+    for i in range(20,last_i+1):  # need lookback for features
+        feats,scores,mid=_ohlc_feature_scores(closes,i,spread=spreads[i])
+        rid=mem.record(epic=epic,features=feats,scores=scores,mid=mid,
+                       spread=spreads[i],bar_time=times[i],in_position=False)
+        if rid:recorded+=1
+    stats=mem.resolve_with_candles(bars,epic=epic,now_utc=now_utc)
+    rows=mem.rows(epic=epic,resolved_only=True,limit=100000)
+    report=run_gold_benchmark(rows,train_frac=train_frac,seed=seed)
+    report['ohlc_bars']=len(closes)
+    report['recorded']=recorded
+    report['resolve_stats']=stats
+    report['live_neural_replaced']=False
     return report

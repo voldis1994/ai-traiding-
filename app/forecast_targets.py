@@ -131,10 +131,14 @@ def targets_at_horizons(entry_mid, future_mids, *, spread=0., future_spreads=Non
     return out
 
 
-def path_from_candles(candles, *, after_time=None, after_index=None, max_h=15):
+def path_from_candles(candles, *, after_time=None, after_index=None, max_h=15,
+                      require_contiguous=True):
     """Extract future mids/spreads after a bar identified by time or index.
 
     Matches Store candle ``at`` or test ``time`` via normalized minute stamps.
+    When ``require_contiguous`` (default), each successive bar must be exactly
+    +1 minute from the previous — a gap (10:00 → 10:02) stops the path so h=1
+    is never filled with the 10:02 price.
     Returns (mids, spreads, matched_index) — matched_index is None on miss.
     """
     if not candles:
@@ -157,13 +161,17 @@ def path_from_candles(candles, *, after_time=None, after_index=None, max_h=15):
         return [],[],None
     indexed.sort(key=lambda x:x[1])
     start_pos=None
+    anchor_st=None
     if after_index is not None:
         # after_index refers to original list index; find first sorted entry
         # whose original index is > after_index.
         ai=int(after_index)
-        for j,(_,_,_,_) in enumerate(indexed):
-            if indexed[j][0]>ai:
+        for j,(oi,st,_,_) in enumerate(indexed):
+            if oi>ai:
                 start_pos=j
+                # Anchor = previous bar stamp when available, else this − 1m.
+                if j>0:
+                    anchor_st=indexed[j-1][1]
                 break
     elif after_time is not None:
         want=bar_stamp(after_time)
@@ -172,17 +180,33 @@ def path_from_candles(candles, *, after_time=None, after_index=None, max_h=15):
         for j,(_,st,_,_) in enumerate(indexed):
             if st==want:
                 start_pos=j+1  # first bar AFTER the forecast bar
+                anchor_st=st
                 break
         if start_pos is None:
             # Fallback: first bar strictly after the forecast minute.
             for j,(_,st,_,_) in enumerate(indexed):
                 if st>want:
                     start_pos=j
+                    anchor_st=want
                     break
     if start_pos is None:
         return [],[],None
-    window=indexed[start_pos:start_pos+int(max_h)]
-    mids=[m for _,_,m,_ in window]
-    spreads=[s for _,_,_,s in window]
+    need=int(max_h)
+    mids=[];spreads=[]
+    prev_st=anchor_st
+    for k in range(need):
+        pos=start_pos+k
+        if pos>=len(indexed):
+            break
+        _i,st,mid,sp=indexed[pos]
+        if require_contiguous:
+            if prev_st is None:
+                break
+            gap_min=(st-prev_st).total_seconds()/60.0
+            # Exact +1 minute step (allow tiny float noise via round).
+            if abs(gap_min-1.0)>1e-9:
+                break  # gap / duplicate — do not invent a 1m outcome
+        mids.append(mid);spreads.append(sp)
+        prev_st=st
     match_idx=indexed[start_pos-1][0] if start_pos>0 else None
     return mids,spreads,match_idx

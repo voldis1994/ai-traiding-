@@ -3,7 +3,8 @@
 Output form (audit):
   f_θ(X) = { r̂_{t,h}, σ̂_{t,h}, p̂_{t,h} }_{h ∈ {1,3,5,15}}
 
-Does not replace LIVE NeuralCore entry — used for quality comparison.
+σ̂ is input-dependent: softplus(W_σ·X + b_σ) per horizon — not a constant
+log_sigma scalar. Does not replace LIVE NeuralCore entry.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ class ForecastPrediction:
 
 @dataclass
 class MultiHorizonForecast:
-    """Linear multi-task head: shared features → per-horizon r, logσ, class logits."""
+    """Linear multi-task head: shared features → per-horizon r, σ(x), class logits."""
     dim: int
     horizons: tuple = HORIZONS
     lr: float = 0.05
@@ -44,7 +45,8 @@ class MultiHorizonForecast:
     seed: int = 0
     W_r: np.ndarray = field(default=None,repr=False)
     b_r: np.ndarray = field(default=None,repr=False)
-    log_sigma: np.ndarray = field(default=None,repr=False)
+    W_s: np.ndarray = field(default=None,repr=False)  # log-σ head depends on X
+    b_s: np.ndarray = field(default=None,repr=False)
     W_p: np.ndarray = field(default=None,repr=False)
     b_p: np.ndarray = field(default=None,repr=False)
 
@@ -54,15 +56,24 @@ class MultiHorizonForecast:
         if self.W_r is None:
             self.W_r=rng.normal(0,0.01,size=(H,D))
             self.b_r=np.zeros(H)
-            self.log_sigma=np.zeros(H)  # σ = softplus(log_sigma) ≈ 0.69 initially via softplus(0)
+            self.W_s=rng.normal(0,0.01,size=(H,D))
+            self.b_s=np.zeros(H)
             self.W_p=rng.normal(0,0.01,size=(H,3,D))
             self.b_p=np.zeros((H,3))
 
     @staticmethod
     def _softplus(x):
-        # numerically stable softplus
         x=np.asarray(x,dtype=float)
         return np.where(x>20,x,np.log1p(np.exp(np.clip(x,-40,20))))
+
+    def _log_sigma(self, i, x):
+        z=float(self.W_s[i]@x+self.b_s[i])
+        if not math.isfinite(z):
+            return 0.0
+        return float(np.clip(z,-8.0,8.0))
+
+    def _sigma(self, i, x):
+        return float(self._softplus(self._log_sigma(i,x))+1e-6)
 
     def predict_one(self, x):
         x=np.asarray(x,dtype=float).ravel()
@@ -71,7 +82,7 @@ class MultiHorizonForecast:
         out=[]
         for i,h in enumerate(self.horizons):
             r=float(self.W_r[i]@x+self.b_r[i])
-            sig=float(self._softplus(self.log_sigma[i])+1e-6)
+            sig=self._sigma(i,x)
             logits=self.W_p[i]@x+self.b_p[i]
             p=_softmax(logits)
             out.append(ForecastPrediction(
@@ -125,18 +136,31 @@ class MultiHorizonForecast:
                 for i in range(len(self.horizons)):
                     if not mask[idx,i]:
                         continue
-                    # Return head + heteroscedastic NLL
+                    # Return head + heteroscedastic NLL with σ(x)
                     r_hat=float(self.W_r[i]@x+self.b_r[i])
-                    sig=float(self._softplus(self.log_sigma[i])+1e-6)
+                    if not math.isfinite(r_hat):
+                        self.W_r[i]=np.nan_to_num(self.W_r[i],nan=0.0)
+                        self.b_r[i]=0.0
+                        continue
+                    z_s=self._log_sigma(i,x)
+                    sig=float(self._softplus(z_s)+1e-6)
                     err=r_hat-float(Y_r[idx,i])
-                    # d/dθ ½(err/σ)² + log σ
                     d_r=err/(sig*sig)
-                    self.W_r[i]-=self.lr*(d_r*x+self.l2*self.W_r[i])
-                    self.b_r[i]-=self.lr*d_r
-                    # softplus'(z)=sigmoid(z); ∂NLL/∂z ≈ (1 - err²/σ²)*sigmoid
-                    sigmoid=1/(1+math.exp(-float(np.clip(self.log_sigma[i],-40,40))))
+                    if math.isfinite(d_r):
+                        d_r=float(np.clip(d_r,-50.0,50.0))
+                        self.W_r[i]-=self.lr*(d_r*x+self.l2*self.W_r[i])
+                        self.b_r[i]-=self.lr*d_r
+                        self.W_r[i]=np.clip(np.nan_to_num(self.W_r[i],nan=0.0),-20.0,20.0)
+                        self.b_r[i]=float(np.clip(self.b_r[i],-20.0,20.0))
+                    # ∂NLL/∂z_s ≈ (1 - err²/σ²) * softplus'(z_s)
+                    sigmoid=1/(1+math.exp(-float(np.clip(z_s,-40,40))))
                     d_ls=(1.0-(err*err)/(sig*sig))*sigmoid
-                    self.log_sigma[i]-=self.lr*0.1*d_ls
+                    if math.isfinite(d_ls):
+                        d_ls=float(np.clip(d_ls,-50.0,50.0))
+                        self.W_s[i]-=self.lr*0.05*(d_ls*x+self.l2*self.W_s[i])
+                        self.b_s[i]-=self.lr*0.05*d_ls
+                        self.W_s[i]=np.clip(np.nan_to_num(self.W_s[i],nan=0.0),-5.0,5.0)
+                        self.b_s[i]=float(np.clip(self.b_s[i],-5.0,5.0))
                     # Classification CE
                     logits=self.W_p[i]@x+self.b_p[i]
                     p=_softmax(logits)
@@ -144,7 +168,10 @@ class MultiHorizonForecast:
                     g=p.copy();g[y]-=1.0
                     self.W_p[i]-=self.lr*(np.outer(g,x)+self.l2*self.W_p[i])
                     self.b_p[i]-=self.lr*g
-        return {'fitted':True,'n':n,'horizons':list(self.horizons),'dim':self.dim}
+                    self.W_p[i]=np.nan_to_num(self.W_p[i],nan=0.0)
+                    self.b_p[i]=np.nan_to_num(self.b_p[i],nan=0.0)
+        return {'fitted':True,'n':n,'horizons':list(self.horizons),'dim':self.dim,
+                'sigma_input_dependent':True}
 
     def action_at(self, x, horizon=1):
         pred=self.predict_dict(x).get(int(horizon))

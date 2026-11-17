@@ -49,6 +49,47 @@ def test_path_from_candles_matches_store_at_key():
     assert mids[14] == pytest.approx(2657.5)  # h=15
 
 
+def test_path_from_candles_rejects_minute_gap():
+    """10:00 then 10:02 must not become a fake h=1 outcome."""
+    t0 = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+    candles = [
+        {'at': t0.isoformat(), 'close': 2650.0, 'spread': 0.3},
+        # missing 10:01
+        {'at': (t0 + timedelta(minutes=2)).isoformat(), 'close': 2652.0, 'spread': 0.3},
+        {'at': (t0 + timedelta(minutes=3)).isoformat(), 'close': 2653.0, 'spread': 0.3},
+    ]
+    mids, spreads, matched = path_from_candles(
+        candles, after_time=t0.isoformat(), max_h=15)
+    assert matched is not None
+    assert mids == []  # gap stops path before any horizon
+    # Contiguous prefix then gap: keep only bars before the hole.
+    candles2 = [
+        {'at': t0.isoformat(), 'close': 2650.0, 'spread': 0.3},
+        {'at': (t0 + timedelta(minutes=1)).isoformat(), 'close': 2651.0, 'spread': 0.3},
+        {'at': (t0 + timedelta(minutes=2)).isoformat(), 'close': 2652.0, 'spread': 0.3},
+        # skip 10:03
+        {'at': (t0 + timedelta(minutes=4)).isoformat(), 'close': 2654.0, 'spread': 0.3},
+    ]
+    mids2, _, _ = path_from_candles(candles2, after_time=t0.isoformat(), max_h=15)
+    assert len(mids2) == 2
+    assert mids2[0] == pytest.approx(2651.0)
+    assert mids2[1] == pytest.approx(2652.0)
+
+
+def test_sigma_depends_on_input_features():
+    model = MultiHorizonForecast(dim=4, epochs=1, seed=0)
+    x_quiet = np.zeros(4)
+    x_wild = np.array([3.0, 0.0, 0.0, 0.0])
+    # Feature-dependent σ head: first feature raises uncertainty.
+    model.W_s[:] = 0.0
+    model.W_s[:, 0] = 0.5
+    model.b_s[:] = -1.0
+    s0 = model.predict_one(x_quiet)[0].sigma_hat
+    s1 = model.predict_one(x_wild)[0].sigma_hat
+    assert s1 > s0
+    assert s0 > 0 and s1 > 0
+
+
 def test_forecast_memory_links_all_horizons_via_at():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 't.sqlite3')

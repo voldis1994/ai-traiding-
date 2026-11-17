@@ -128,10 +128,10 @@ def test_full_balance_uses_account_and_splits_multi_lot():
         params = db.load_params(s)
         assert int(params.get('size_full_balance') or 0) == 1
         daily = db.load_daily(s, equity=20.0)
-        # stop_ticks=10, tick_value=1 → size = 20/10 = 2.0 lots total
+        # Strong signal + stop_ticks=10, tick_value=1 → size = 20/10 = 2.0
         out = db.propose_size(
             mandate_size='0.25', equity=20.0, daily=daily, params=params,
-            stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.0,
+            stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.25,
             market=market)
         assert out['allowed'] is True
         assert out['size_full_balance'] is True
@@ -142,9 +142,11 @@ def test_full_balance_uses_account_and_splits_multi_lot():
             out['size'], store=s, positions=[], size_grid={
                 'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
                 'max': Decimal('50')},
-            action='BUY', structure='TREND_UP')
+            action='BUY', structure='TREND_UP', score_edge=0.25)
         assert len(slices) == 5
         assert sum(slices) == Decimal('2.00')
+        # Strong edge front-loads: lead ticket > last ticket.
+        assert slices[0] > slices[-1]
 
 
 def test_full_balance_no_tick_value_deploys_min_pack_not_mandate():
@@ -160,14 +162,20 @@ def test_full_balance_no_tick_value_deploys_min_pack_not_mandate():
         }
         params = db.load_params(s)
         assert int(params.get('size_full_balance') or 0) == 1
+        # Weak/zero edge → open_slices(5)×min (not mandate glue).
         out = db.propose_size(
             mandate_size='0.1', equity=15.0, daily={}, params=params,
             stop_ticks=500, tick_value=None, positions=[], score_edge=0.0,
             market=market)
         assert out['allowed'] is True
         assert out['reason'] == 'full_balance_no_tick_value_min_pack'
-        # open_slices(5)×min(0.01) — not mandate 0.1 glue / not one tiny seed.
         assert float(out['size']) == pytest.approx(0.05)
+        # Strong edge grows the no-tick pack (signal strength before submit).
+        strong = db.propose_size(
+            mandate_size='0.1', equity=15.0, daily={}, params=params,
+            stop_ticks=500, tick_value=None, positions=[], score_edge=0.20,
+            market=market)
+        assert float(strong['size']) == pytest.approx(0.10)
         slices = db.split_planned_sizes(
             out['size'], store=s, positions=[], size_grid={
                 'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
@@ -189,7 +197,7 @@ def test_gold_like_full_balance_splits_three_min_lots():
             },
         }
         params = db.load_params(s)
-        # stop_ticks=500, tick_value=1 → size = 15/500 = 0.03
+        # stop_ticks=500, tick_value=1 → size = 15/500 = 0.03 (unknown edge = full £)
         out = db.propose_size(
             mandate_size='0.1', equity=15.0, daily={}, params=params,
             stop_ticks=500, tick_value=1.0, positions=[], market=market)
@@ -211,6 +219,54 @@ def test_gold_like_full_balance_splits_three_min_lots():
             positions=[{'dealId': 'live', 'epic': 'GOLD', 'size': '0.01'}],
             size_grid=grid, action='BUY')
         assert add == [Decimal('0.03')]
+
+
+def test_signal_strength_scales_full_balance_pack():
+    """Stronger score_edge → larger full-balance pack (before order submit)."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        market = {
+            'dealingRules': {
+                'minDealSize': {'value': '0.01'},
+                'minSizeIncrement': {'value': '0.01'},
+                'maxDealSize': {'value': '50'},
+            },
+        }
+        params = db.load_params(s)
+        weak = db.propose_size(
+            mandate_size='0.1', equity=20.0, daily={}, params=params,
+            stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.0,
+            market=market)
+        strong = db.propose_size(
+            mandate_size='0.1', equity=20.0, daily={}, params=params,
+            stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.20,
+            market=market)
+        assert float(weak['size']) == pytest.approx(1.0)   # 50% of £20 / 10
+        assert float(strong['size']) == pytest.approx(2.0)  # 100% of £20 / 10
+        assert float(strong['size']) > float(weak['size'])
+
+
+def test_edge_weighted_split_front_loads_strong_signal():
+    """Strong edge → uneven multi lots (0.08/0.05/0.03…), not five equal chunks."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
+                'max': Decimal('50')}
+        strong = db.split_planned_sizes(
+            Decimal('0.19'), store=s, positions=[], size_grid=grid,
+            score_edge=0.25, action='BUY', structure='TREND_UP')
+        assert len(strong) == 5
+        assert sum(strong) == Decimal('0.19')
+        assert strong[0] >= Decimal('0.05')
+        assert strong[0] > strong[-1]
+        assert min(strong) == Decimal('0.01')
+        weak = db.split_planned_sizes(
+            Decimal('0.19'), store=s, positions=[], size_grid=grid,
+            score_edge=0.0, action='BUY', structure='TREND_UP')
+        assert len(weak) == 5
+        assert sum(weak) == Decimal('0.19')
+        # Weak stays near-equal (round-robin bumps), not steeply front-loaded.
+        assert max(weak) - min(weak) <= Decimal('0.01')
 
 
 def test_soft_nudge_conviction_renormalizes():

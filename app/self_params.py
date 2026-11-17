@@ -126,6 +126,26 @@ DEFAULTS = {
     'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
     'self_params_horizon_trades': 20,
+    # Day book / situation memory (Komandcentrs + Riski)
+    'day_profit_target_frac': 0.0,
+    'day_loss_budget_frac': 0.10,
+    'day_risk_per_trade_frac': 0.005,
+    'day_risk_gates': 1,
+    'day_size_full_balance': 1,
+    'day_be_band_frac': 0.001,
+    'day_max_positions': 5,
+    'day_conviction_nudge': 0.12,
+    'day_lot_vs_mandate_max_mult': 2.0,
+    'day_lot_vs_mandate_min_mult': 0.25,
+    'day_add_min_edge': 0.04,
+    'day_open_slices': 5,
+    'day_slice_min_edge': 0.04,
+    'situation_memory_min_samples': 3,
+    'situation_memory_nudge': 0.12,
+    'situation_memory_half_life_days': 14.0,
+    'day_add_trend_floor': 0.02,
+    'day_phase_protect_tilt': 0.10,
+    'day_phase_defend_tilt': 0.16,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -157,6 +177,25 @@ BOUNDS = {
     'learn_gate_margin': (0.0, 0.05),
     'learn_gate_cash_min': (4, 40),
     'learn_gate_cash_weight': (0.0, 1.0),
+    'day_profit_target_frac': (0.0, 0.05),
+    'day_loss_budget_frac': (0.002, 0.10),
+    'day_risk_per_trade_frac': (0.0005, 0.03),
+    'day_risk_gates': (0, 1),
+    'day_size_full_balance': (0, 1),
+    'day_be_band_frac': (0.0001, 0.01),
+    'day_max_positions': (5, 8),
+    'day_conviction_nudge': (0.02, 0.30),
+    'day_lot_vs_mandate_max_mult': (1.0, 5.0),
+    'day_lot_vs_mandate_min_mult': (0.05, 1.0),
+    'day_add_min_edge': (0.02, 0.25),
+    'day_open_slices': (3, 8),
+    'day_slice_min_edge': (0.02, 0.25),
+    'situation_memory_min_samples': (2, 30),
+    'situation_memory_nudge': (0.02, 0.30),
+    'situation_memory_half_life_days': (1.0, 90.0),
+    'day_add_trend_floor': (0.01, 0.08),
+    'day_phase_protect_tilt': (0.04, 0.25),
+    'day_phase_defend_tilt': (0.06, 0.30),
     'hold_shadow_repeats': (1, 4),
     'profit_history_rows': (50, 2000),
     'exit_need_streak': (1, 8),
@@ -262,7 +301,10 @@ def _clip(key, value):
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
                'forecast_memory_enabled','forecast_bridge_enabled',
                'forecast_bridge_min_resolved','forecast_bridge_refit_every',
-               'structure_edge_min_samples'):
+               'structure_edge_min_samples',
+               'situation_memory_min_samples',
+               'day_max_positions','day_open_slices','day_size_full_balance',
+               'day_risk_gates'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

@@ -31,6 +31,82 @@ class AccountRuntime:
     last_start_error: Optional[str]=None
     started: bool=False
 
+    @staticmethod
+    def _deal_protection_truth(engine, position, brief=None) -> dict:
+        """Admin-facing SL/TP/trail truth for one live deal."""
+        p=position if isinstance(position,dict) else {}
+        deal=str(p.get('dealId') or '')
+        brief=brief if isinstance(brief,dict) else (getattr(engine,'protection_brief',None) or {})
+        store=getattr(engine,'store',None)
+        robot=bool(store and deal and store.get('robot_open:'+deal))
+        meta=(store.get('adaptive_protection:'+deal) if store and deal else None) or {}
+        runtime=(store.get('adaptive_runtime:'+deal) if store and deal else None) or {}
+        has_sl=p.get('stopLevel') is not None
+        has_tp=p.get('profitLevel') is not None
+        enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
+        phase='flat'
+        if not deal:
+            phase='unknown'
+        elif not robot:
+            phase='manual'
+        elif not enrolled:
+            phase='watch'
+        else:
+            prop=brief.get('proposal') if isinstance(brief.get('proposal'),dict) else {}
+            cand=(runtime.get('phase') or prop.get('phase')
+                  or brief.get('phase') or '')
+            status=str(brief.get('status') or '').lower()
+            if cand in ('watch','armed','ratchet','be_lock','trail'):
+                phase=cand
+            elif 'waiting for adaptive arm' in status:
+                phase='watch'
+            elif 'confirmed trail' in status or runtime.get('status')=='CONFIRMED':
+                phase='trail'
+            elif 'be' in status and 'lock' in status:
+                phase='be_lock'
+            elif 'ratchet' in status:
+                phase='ratchet'
+            elif enrolled:
+                phase='armed'
+            else:
+                phase='watch'
+        # Only attach brief text when it belongs to this deal (or sole open).
+        brief_deal=str(brief.get('deal_id') or '')
+        sole=len(getattr(engine,'positions',None) or [])==1
+        status_txt=None
+        if brief_deal==deal or (sole and brief.get('status')):
+            status_txt=brief.get('status')
+        return {
+            'has_sl':has_sl,
+            'has_tp':has_tp,
+            'robot_open':robot,
+            'enrolled':enrolled,
+            'trail_phase':phase,
+            'trail_status':status_txt,
+            'original_risk':meta.get('original_risk') if isinstance(meta,dict) else None,
+            'last_trail_stop':runtime.get('stop') if isinstance(runtime,dict) else None,
+        }
+
+    def _enrich_positions(self,engine,positions,brief=None) -> list:
+        out=[]
+        for p in positions or []:
+            if not isinstance(p,dict):
+                continue
+            truth=self._deal_protection_truth(engine,p,brief=brief)
+            out.append({
+                'dealId':p.get('dealId'),
+                'epic':p.get('epic'),
+                'direction':p.get('direction'),
+                'size':p.get('size'),
+                'level':p.get('level'),
+                'stopLevel':p.get('stopLevel'),
+                'profitLevel':p.get('profitLevel'),
+                'upl':p.get('upl'),
+                'currency':p.get('currency'),
+                **truth,
+            })
+        return out
+
     def client_view(self) -> dict:
         snap=self.engine.snapshot()
         signal=snap.get('signal') or {}
@@ -38,6 +114,9 @@ class AccountRuntime:
         neural=snap.get('neural') or {}
         mandate=snap.get('mandate')
         positions=snap.get('positions') or []
+        manage=snap.get('manage_signal') if isinstance(snap.get('manage_signal'),dict) else None
+        brief=snap.get('adaptive_protection') if isinstance(snap.get('adaptive_protection'),dict) else None
+        enriched=self._enrich_positions(self.engine,positions,brief=brief)
         # After restart last_signal is empty until the first completed M1+fusion
         # vote — surface the latest journaled scores so admin is not stuck at 0%.
         # Never do this while a LIVE deal is open: journal rows may be mid-trade
@@ -57,8 +136,28 @@ class AccountRuntime:
                                 'from_journal':True}
             except Exception:
                 pass
+        # Open deal with cleared last_signal (adopt/restart): show locked OPEN or
+        # first manage vote so Admin is not stuck at 0% forever.
+        if positions and not any(float(scores.get(k) or 0) for k in ('BUY','HOLD','SELL')):
+            for src in (signal, manage):
+                if not isinstance(src,dict):
+                    continue
+                raw=src.get('scores')
+                if isinstance(raw,dict) and any(float(raw.get(k) or 0) for k in ('BUY','HOLD','SELL')):
+                    scores=raw
+                    if not signal.get('action') and src.get('action'):
+                        signal={**signal,'action':src.get('action'),
+                                'from_manage':src is manage}
+                    break
         code=self.engine.policy.info() if self.engine.policy else {}
         phase='guide' if not mandate else 'robot'
+        # Mid-trade: prefer reverse-watch status over a stale "M1 label updated…"
+        # reason that still sits in the store from before the deal opened.
+        if positions and manage and manage.get('action'):
+            adapt_reason=('Reverse watch {0} (manage)'.format(manage.get('action')))
+        else:
+            adapt_reason=(snap.get('neural_adapt_reason') or code.get('last_reason'))
+        day_book=snap.get('day_book') if isinstance(snap.get('day_book'),dict) else None
         return {
             'phase':phase,
             'connected':bool(self.engine.broker),
@@ -66,13 +165,16 @@ class AccountRuntime:
             'armed':bool(snap.get('armed')),
             'operator_paused':bool(getattr(self.engine,'operator_paused',False)),
             'mandate':mandate,
-            'position':positions[0] if positions else None,
+            'position':enriched[0] if enriched else None,
+            'positions':enriched,
+            'protection':brief,
+            'day_book':day_book,
             'scores':{
                 'BUY':float(scores.get('BUY') or 0),
                 'HOLD':float(scores.get('HOLD') or 0),
                 'SELL':float(scores.get('SELL') or 0),
             },
-            'action':signal.get('action'),
+            'action':signal.get('action') or (manage or {}).get('action'),
             # Uncalibrated model score — not calibrated profit probability (audit #24).
             'confidence':signal.get('confidence'),
             'model_score':signal.get('model_score',signal.get('confidence')),
@@ -85,8 +187,8 @@ class AccountRuntime:
                 'policy_generation':int(snap.get('policy_generation') or code.get('generation') or 0),
                 'strategy':code.get('strategy'),
                 'attempts':int(code.get('attempts') or 0),
-                'last_reason':(snap.get('neural_adapt_reason') or code.get('last_reason')),
-                'neural_adapt_reason':snap.get('neural_adapt_reason'),
+                'last_reason':adapt_reason,
+                'neural_adapt_reason':adapt_reason,
                 'model_version':neural.get('model_version') or snap.get('neural',{}).get('model_version'),
                 'labeled_samples':int(snap.get('labeled_samples') or 0),
                 'neurons':neural.get('neurons'),
@@ -102,9 +204,10 @@ class AccountRuntime:
             'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
             'model_readiness':snap.get('model_readiness') or snap.get('prep_eval'),
             'hard_risk':snap.get('hard_risk'),
-            'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',True)),
-            'neural_close_executable':False,
+            'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',False)),
+            'neural_close_executable':bool(snap.get('neural_close_executable',True)),
             'neural_exit_intent':snap.get('neural_exit_intent'),
+            'manage_signal':manage,
             'neural_seed':int(getattr(self.brain,'init_seed',0) or 0),
             'error':self.last_error or snap.get('error'),
             'tick_count':snap.get('tick_count') or 0,
@@ -127,13 +230,15 @@ class RuntimeHub:
 
     @staticmethod
     def _cash_pnl_source(src) -> str:
-        """Classify journal source: cash | pending | proxy."""
+        """Classify journal source: cash | pending | estimate | proxy."""
         s=(src or '').strip().lower()
-        # upl_estimate is banned — never count as account £ (legacy rows only).
-        if s in ('ticks_only','price_size','position_disappeared','upl_estimate'):
+        if s in ('ticks_only','price_size','position_disappeared'):
             return 'proxy'
         if s in ('pending_close_sync','pending_broker_pnl'):
             return 'pending'
+        # Last UPL shown while waiting for Capital cash — display only, not broker £.
+        if s in ('upl_estimate',):
+            return 'estimate'
         # Explicit broker, or legacy blank source with a settled pnl figure.
         if s in ('broker','') or not s:
             return 'cash'
@@ -158,11 +263,21 @@ class RuntimeHub:
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
         signed=[]
+        estimate_signed=[]
         recent=[]
         cash_n=0
+        pending_n=0
+        proxy_n=0
+        estimate_n=0
+        estimate_sum=0.0
+        blank_n=0
         for t in closed_rows:
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
+                proxy_n+=1
+                if len(recent)<12:
+                    recent.append({**t,'pnl_currency':(
+                        (t.get('pnl_currency') or '').strip().upper() or acct or '?')})
                 continue
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
             val=None
@@ -182,21 +297,34 @@ class RuntimeHub:
                     signed.append(val)
                 if len(recent)<12:
                     recent.append(row)
-            elif kind=='pending' or (val is not None and kind=='other'):
-                if kind=='pending':
-                    # Attach last live UPL as a display hint only — not cash £.
-                    snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
-                    try:
-                        hint=float(snap.get('upl')) if snap.get('upl') is not None else None
-                    except (TypeError,ValueError):
-                        hint=None
-                    if hint is not None and __import__('math').isfinite(hint):
-                        row['upl_hint']=round(hint,4)
-                    row['pending_cash']=True
+            elif kind=='pending':
+                pending_n+=1
+                if val is None:blank_n+=1
+                # Last live UPL as display hint only — not cash £ (#125).
+                snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
+                try:
+                    hint=float(snap.get('upl')) if snap.get('upl') is not None else None
+                except (TypeError,ValueError):
+                    hint=None
+                if hint is not None and __import__('math').isfinite(hint):
+                    row['upl_hint']=round(hint,4)
+                row['pending_cash']=True
+                if len(recent)<12:
+                    recent.append(row)
+            elif kind=='estimate' and val is not None:
+                estimate_n+=1
+                estimate_sum+=float(val)
+                estimate_signed.append(float(val))
+                if len(recent)<12:
+                    recent.append(row)
+            elif kind=='other' or (kind=='cash' and val is None):
+                if kind=='cash' and val is None:blank_n+=1
                 if len(recent)<12:
                     recent.append(row)
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
+        est_wins=sum(1 for p in estimate_signed if p>0)
+        est_losses=sum(1 for p in estimate_signed if p<0)
         primary=None
         if len(by_ccy)==1:
             ccy,vals=next(iter(by_ccy.items()))
@@ -204,7 +332,44 @@ class RuntimeHub:
         elif acct and acct in by_ccy:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
-        realized=primary['realized_pnl'] if primary else 0.0
+        # Never invent 0.00 when multi-currency cash cannot be summed.
+        closed_n=len(closed_rows)
+        if primary:
+            realized=primary['realized_pnl']
+        elif by_ccy:
+            realized=None
+        elif closed_n>0 and cash_n==0:
+            # Never invent a fake 0.00 when closes lack broker cash.
+            realized=None
+        else:
+            realized=0.0
+        # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
+        if closed_n>0 and cash_n==0:
+            pnl_status='closed_without_broker_cash'
+        elif pending_n>0 or blank_n>0:
+            pnl_status='broker_cash_pending'
+        elif cash_n>0:
+            pnl_status='broker_cash_ok'
+        else:
+            pnl_status='no_closes'
+        # Operator display: prefer broker £; else UPL-estimate sum so Admin is
+        # not stuck on lying 0 / empty while Capital history is pending.
+        if realized is not None and cash_n>0:
+            working_pnl=realized
+            working_pnl_source='broker'
+        elif estimate_n>0:
+            working_pnl=round(estimate_sum,4)
+            working_pnl_source='upl_estimate'
+        else:
+            working_pnl=realized
+            working_pnl_source=('broker' if realized is not None and cash_n>0
+                                else ('none' if closed_n else 'empty'))
+        if cash_n>0:
+            display_wins,display_losses,wl_source=wins,losses,'broker'
+        elif estimate_n>0:
+            display_wins,display_losses,wl_source=est_wins,est_losses,'upl_estimate'
+        else:
+            display_wins,display_losses,wl_source=0,0,'none'
         upl=None
         if open_upl is not None:
             try:
@@ -213,32 +378,57 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
-        equity=round(realized+(upl or 0.0),4) if upl is not None else realized
+        base_for_equity=working_pnl if working_pnl is not None else realized
+        if base_for_equity is not None and upl is not None:
+            equity=round(float(base_for_equity)+float(upl),4)
+        elif base_for_equity is not None:
+            equity=base_for_equity
+        elif upl is not None:
+            equity=upl
+        else:
+            equity=None
         pending_q=0
         try:
             pending_q=len(store.get('pending_broker_pnl_deals') or [])
         except Exception:
             pending_q=0
-        pending_rows=sum(1 for t in closed_rows
-                         if self._cash_pnl_source(t.get('pnl_source'))=='pending')
         return {
-            'closed_trades':len(closed_rows),
+            'closed_trades':closed_n,
             'open_trades_recorded':open_n,
             'cash_trades':cash_n,
+            'pending_cash_trades':pending_n,
             'pending_broker_pnl':pending_q,
-            'pending_trades':pending_rows,
+            'pending_trades':pending_n,
+            'proxy_trades':proxy_n,
+            'estimate_trades':estimate_n,
+            'estimate_pnl':round(estimate_sum,4) if estimate_n else None,
+            'estimate_wins':est_wins,
+            'estimate_losses':est_losses,
+            'blank_pnl_trades':blank_n,
+            'pnl_status':pnl_status,
             'realized_pnl':realized,
+            'working_pnl':working_pnl,
+            'working_pnl_source':working_pnl_source,
             'open_upl':upl,
             'equity_pnl':equity,
             'pnl_currency':primary['currency'] if primary else acct,
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
+            'display_wins':display_wins,
+            'display_losses':display_losses,
+            'wl_source':wl_source,
             # Closed-trade win rate — NOT minute-direction accuracy (audit #24).
-            'win_rate':round(wins/max(1,wins+losses),3),
-            'trade_win_rate':round(wins/max(1,wins+losses),3),
+            'win_rate':round(display_wins/max(1,display_wins+display_losses),3),
+            'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
             'recent_trades':recent[:12],
+            # Compact ledger for Admin cards — every closed row with a number.
+            'pnl_ledger':[
+                {'pnl':float(v),'source':'broker'} for v in signed
+            ]+[
+                {'pnl':float(v),'source':'upl_estimate'} for v in estimate_signed
+            ],
         }
 
     def admin_client_card(self,client: dict) -> dict:
@@ -262,6 +452,7 @@ class RuntimeHub:
             },
             'activity':{
                 'tick_count':0,'market':None,'mandate':None,'position':None,
+                'positions':[],'protection':None,'day_book':None,
                 'entry_block_reason':None,'error':None,'last_start_error':None,
             },
             'last_start_error':self._start_errors.get(cid),
@@ -330,6 +521,10 @@ class RuntimeHub:
                     'market_status':(snap.get('market') or {}).get('status'),
                     'mandate':view.get('mandate'),
                     'position':view.get('position'),
+                    'positions':view.get('positions') or (
+                        [view['position']] if view.get('position') else []),
+                    'protection':view.get('protection') or snap.get('adaptive_protection'),
+                    'day_book':view.get('day_book') or snap.get('day_book'),
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')
                                                or snap.get('entry_can_submit_now')),
@@ -390,6 +585,33 @@ class RuntimeHub:
         from . import hard_risk
         return hard_risk.snapshot(self._client_store(client_id))
 
+
+    def client_day_risk_gates(self,client_id: int) -> dict:
+        """Operator day-book risk gate flag (DEFEND/DONE/PROTECT may block OPEN)."""
+        from . import day_book
+        from .self_params import get as sp_get
+        store=self._client_store(client_id)
+        enabled=int(sp_get(store,'day_risk_gates',1) or 0)==1
+        snap=day_book.snapshot(store)
+        return {
+            'risk_gates':enabled,
+            'day_risk_gates':1 if enabled else 0,
+            'phase':snap.get('phase'),
+            'goal':snap.get('goal'),
+        }
+
+    def set_client_day_risk_gates(self,client_id: int,*,enabled: bool) -> dict:
+        """Admin toggle — temporarily disable day-book OPEN phase blocks."""
+        from . import day_book
+        from .self_params import load as sp_load, save as sp_save
+        store=self._client_store(client_id,create=True)
+        params=sp_load(store)
+        params['day_risk_gates']=1 if enabled else 0
+        sp_save(store,params,reason='admin_day_risk_gates')
+        store.event('risk','Operator day risk gates '+('ON' if enabled else 'OFF'),{
+            'day_risk_gates':params['day_risk_gates']})
+        return self.client_day_risk_gates(client_id)
+
     def save_client_hard_risk(self,client_id: int,*,max_risk_per_trade,daily_loss_limit,
                               equity_drawdown_limit,clear_halt: bool=False) -> dict:
         """Operator sets all three monetary limits — required for LIVE OPEN."""
@@ -418,8 +640,16 @@ class RuntimeHub:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]
         running=sum(1 for c in clients if c.get('robot_running'))
         total_closed=sum(int((c.get('results') or {}).get('closed_trades') or 0) for c in clients)
+        total_cash=sum(int((c.get('results') or {}).get('cash_trades') or 0) for c in clients)
+        total_pending=sum(int((c.get('results') or {}).get('pending_cash_trades') or 0)
+                          for c in clients)
+        total_proxy=sum(int((c.get('results') or {}).get('proxy_trades') or 0) for c in clients)
+        total_estimate=sum(int((c.get('results') or {}).get('estimate_trades') or 0) for c in clients)
         # Never add GBP + USD into one number.
         by_ccy: dict[str,float]={}
+        working_by_ccy: dict[str,float]={}
+        display_wins=0
+        display_losses=0
         for c in clients:
             res=c.get('results') or {}
             for ccy,val in (res.get('pnl_by_currency') or {}).items():
@@ -427,18 +657,52 @@ class RuntimeHub:
             if not res.get('pnl_by_currency') and res.get('pnl_currency') and res.get('realized_pnl') is not None:
                 ccy=res['pnl_currency']
                 by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(res.get('realized_pnl') or 0),4)
+            wp=res.get('working_pnl')
+            wccy=(res.get('pnl_currency') or '').strip().upper() or None
+            if wp is not None and wccy:
+                working_by_ccy[wccy]=round(working_by_ccy.get(wccy,0.0)+float(wp),4)
+            display_wins+=int(res.get('display_wins') or 0)
+            display_losses+=int(res.get('display_losses') or 0)
         primary=None
         if len(by_ccy)==1:
             ccy,val=next(iter(by_ccy.items()))
             primary={'currency':ccy,'realized_pnl':val}
+        working_primary=None
+        if len(working_by_ccy)==1:
+            ccy,val=next(iter(working_by_ccy.items()))
+            working_primary={'currency':ccy,'working_pnl':val}
+        if total_closed>0 and total_cash==0:
+            pnl_status='closed_without_broker_cash'
+        elif total_pending>0:
+            pnl_status='broker_cash_pending'
+        elif total_cash>0:
+            pnl_status='broker_cash_ok'
+        else:
+            pnl_status='no_closes'
+        wl_source=('broker' if total_cash>0 else
+                   ('upl_estimate' if total_estimate>0 else 'none'))
         return {
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
+                # Multi-currency: never sum GBP+USD into one number (or fake 0.0).
                 'realized_pnl_all':primary['realized_pnl'] if primary else None,
-                'pnl_currency':primary['currency'] if primary else None,
+                'working_pnl_all':(working_primary['working_pnl'] if working_primary else None),
+                'working_pnl_source':('broker' if total_cash>0 else
+                                     ('upl_estimate' if total_estimate>0 else 'none')),
+                'pnl_currency':(working_primary['currency'] if working_primary
+                                else (primary['currency'] if primary else None)),
                 'pnl_by_currency':by_ccy,
+                'working_pnl_by_currency':working_by_ccy,
                 'closed_trades_all':total_closed,
+                'cash_trades_all':total_cash,
+                'pending_cash_trades_all':total_pending,
+                'proxy_trades_all':total_proxy,
+                'estimate_trades_all':total_estimate,
+                'display_wins_all':display_wins,
+                'display_losses_all':display_losses,
+                'wl_source':wl_source,
+                'pnl_status':pnl_status,
             },
             'clients':clients,
         }

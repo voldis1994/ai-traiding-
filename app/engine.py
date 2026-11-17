@@ -48,6 +48,8 @@ from . import learning_generation
 from . import champion_library
 from . import structure_shadow
 from . import structure_edge
+from . import situation_memory
+from . import day_book
 
 DB=DATA/'robot.sqlite3'
 
@@ -2511,10 +2513,32 @@ class SingleTradeEngine:
         except Exception as exc:
             forecast_meta={'nudged':False,'reason':type(exc).__name__}
             f_advice={'advice':None}
-        self.last_signal=dict(
-            self.last_signal,scores=dict(nudged_scores),
-            structure_edge=edge_advice,structure_nudge=nudge_meta,
-            forecast_advice=f_advice,forecast_nudge=forecast_meta)
+        # Situation memory: scene×£ soft tilt after structure edge / forecast.
+        sit_advice=self._situation_memory_advice(
+            structure=(edge_advice or {}).get('structure'))
+        nudged_scores,sit_nudge=situation_memory.soft_nudge_scores(
+            nudged_scores,sit_advice,store=self.store)
+        # Day book: anti-HOLD when move is clear; HOLD tilt when day already banked.
+        equity=self._account_equity()
+        db_snap=day_book.snapshot(self.store,equity=equity,positions=self.positions)
+        phase=db_snap.get('phase') or day_book.PHASE_HUNT
+        nudged_scores,conv_meta=day_book.soft_nudge_conviction(
+            nudged_scores,phase=phase,store=self.store)
+        nudged_scores,phase_meta=day_book.soft_nudge_day_phase(
+            nudged_scores,phase=phase,store=self.store)
+        # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.
+        if isinstance(self.last_signal,dict) and not self.positions:
+            self.last_signal=dict(
+                self.last_signal,scores=dict(nudged_scores),
+                structure_edge=edge_advice,structure_nudge=nudge_meta,
+                forecast_advice=f_advice,forecast_nudge=forecast_meta,
+                situation_memory=sit_advice,situation_nudge=sit_nudge,
+                day_book=db_snap,day_conviction=conv_meta,day_phase_nudge=phase_meta)
+        else:
+            self.last_signal=dict(
+                self.last_signal,scores=dict(nudged_scores),
+                structure_edge=edge_advice,structure_nudge=nudge_meta,
+                forecast_advice=f_advice,forecast_nudge=forecast_meta)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -2525,7 +2549,9 @@ class SingleTradeEngine:
             spread_bps=self._spread_bps())
         result=dict(result,structure_edge=edge_advice,structure_nudge=nudge_meta,
                     forecast_advice=f_advice,forecast_nudge=forecast_meta,
-                    scores=nudged_scores)
+                    situation_memory=sit_advice,situation_nudge=sit_nudge,
+                    day_book=db_snap,day_conviction=conv_meta,
+                    day_phase_nudge=phase_meta,scores=nudged_scores)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -2534,6 +2560,18 @@ class SingleTradeEngine:
             safety=self._external_entry_check(result['action'])
             if not safety['entry_allowed']:
                 return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
+            # Robot day book: multi-pos / day phase capacity (equity risk).
+            score_edge=result.get('score_edge')
+            if score_edge is None and hasattr(self.policy,'score_edge'):
+                score_edge=self.policy.score_edge(nudged_scores)
+            book=day_book.allows_new_open(
+                store=self.store,equity=equity,positions=self.positions,
+                epic=(self.mandate or {}).get('epic'),
+                mandate_epic=(self.mandate or {}).get('epic'),
+                score_edge=score_edge)
+            result=dict(result,day_book_gate=book)
+            if not book.get('allowed'):
+                return dict(result,action='HOLD',reason=book.get('reason') or 'day_book_blocked')
             # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
             edge=unified_cycle.edge_allows_open(
                 nudged_scores,result,
@@ -2572,6 +2610,71 @@ class SingleTradeEngine:
         advice=structure_edge.compare_frame(self.store,epic=epic,structure=structure)
         structure_edge.persist_advice(self.store,advice)
         return advice
+
+
+    def _entry_vote_scores(self):
+        """Scores for flat OPEN or multi-pos ADD.
+
+        While a deal is live, Admin keeps the frozen OPEN vote — but ADD must
+        use the fresh manage perceive scores. Frozen HOLD-tilt OPEN votes were
+        blocking every multi-pos add (add_needs_stronger_edge forever).
+        """
+        if self.positions and isinstance(getattr(self,'_manage_signal',None),dict):
+            ms=self._manage_signal.get('scores')
+            if isinstance(ms,dict) and self.policy and self.policy._safe_scores(ms):
+                return dict(ms),'manage'
+        if isinstance(self.last_signal,dict):
+            raw=(self.last_signal.get('scores_raw')
+                 if isinstance(self.last_signal.get('scores_raw'),dict) else None)
+            if raw and self.policy and self.policy._safe_scores(raw):
+                return dict(raw),'entry_raw'
+            sc=self.last_signal.get('scores')
+            if isinstance(sc,dict) and self.policy and self.policy._safe_scores(sc):
+                return dict(sc),'entry'
+        return {},'none'
+
+    def _live_ohlc_structure(self):
+        """Current OHLC layout label (TREND_UP/…/CHOP) for edge + situation memory."""
+        if not self.mandate:
+            return 'CHOP', None
+        epic=self.mandate.get('epic')
+        try:
+            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
+        except Exception:
+            candles=[]
+        chron=sorted(candles or [],key=lambda r:r.get('at') or '')
+        n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))
+        n_pre=int(getattr(structure_shadow,'ADVISE_PRE_BARS',40))
+        path=chron[-n_path:] if len(chron)>n_path else chron
+        pre=chron[-(n_path+n_pre):-n_path] if len(chron)>n_path else chron[:max(0,len(chron)//2)]
+        mid=_num(self.market.get('mid'))
+        frame=structure_shadow.frame_from_ohlc(path,entry=mid,exit_level=None,pre_bars=pre)
+        structure=(frame or {}).get('structure') or 'CHOP'
+        return structure, frame
+
+    def _situation_memory_advice(self, *, structure=None):
+        """Scene×£ advice for the live situation — soft evidence, not a ban."""
+        if not self.mandate:
+            return {'advice':None,'reason':'no_mandate'}
+        ctx=self.market_context or {}
+        epic=self.mandate.get('epic')
+        if not structure:
+            structure,_=self._live_ohlc_structure()
+        sit=situation_memory.fingerprint(
+            epic=epic,market_context=ctx,structure=structure,
+            returns_bps=ctx.get('returns_bps'),trend=ctx.get('trend'))
+        advice=situation_memory.compare_situation(self.store,situation=sit)
+        situation_memory.persist_advice(self.store,advice)
+        return advice
+
+    def _situation_fingerprint_now(self, *, structure=None):
+        ctx=self.market_context or {}
+        epic=(self.mandate or {}).get('epic')
+        if not structure:
+            structure,_=self._live_ohlc_structure()
+        return situation_memory.fingerprint(
+            epic=epic,market_context=ctx,structure=structure,
+            returns_bps=ctx.get('returns_bps'),trend=ctx.get('trend'))
 
     def _structure_shadow_advice(self,proposal):
         """Evidence/UI: does current OHLC match prior SL graves? Not a LIVE gate."""
@@ -4650,6 +4753,8 @@ class SingleTradeEngine:
         readiness=(self.brain.trading_readiness()
                    if hasattr(self.brain,'trading_readiness') else {'ready':False})
         hr_snap=hard_risk.snapshot(self.store)
+        db_snap=day_book.snapshot(
+            self.store,equity=self._account_equity(),positions=self.positions)
         minute_acc=(self.brain.correct/self.brain.labeled) if self.brain.labeled else None
         # Closed-trade win rate is separate from minute-direction accuracy (audit #24).
         trade_wins=trade_losses=0
@@ -4742,7 +4847,7 @@ class SingleTradeEngine:
                 'neural_exit_intent':raw_exit_intent,
                 'neural_exit_rule':'confirmed opposite manage vote + aligned 5/15m → market CLOSE; else broker SL/TP/trail',
                 'manage_signal':self._manage_signal,
-                'hard_risk':hr_snap,
+                'hard_risk':hr_snap,'day_book':db_snap,'situation_memory':situation_memory.snapshot(self.store),
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),

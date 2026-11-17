@@ -276,3 +276,35 @@ def test_reconcile_daily_from_trades_fills_zero_day_book():
         again = db.record_close(s, pnl=1.2, equity=10_000.0, deal_id='d0')
         assert again['closes'] == 3
         assert abs(again['realized_pnl'] - 1.6) < 1e-9
+
+def test_split_planned_sizes_into_five_when_advantageous():
+    """One planned lot splits into up to 5 Capital-grid slices when flat + clear."""
+    from decimal import Decimal
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        grid = {'ok': True, 'min': Decimal('0.01'), 'step': Decimal('0.01'),
+                'max': Decimal('50')}
+        # Flat + TREND_UP BUY → 5 slices summing ≈ 0.10
+        slices = db.split_planned_sizes(
+            Decimal('0.10'), store=s, positions=[], size_grid=grid,
+            score_edge=0.02, action='BUY', structure='TREND_UP')
+        assert len(slices) == 5
+        assert sum(slices) == Decimal('0.10')
+        # Already open → single ADD slice
+        one = db.split_planned_sizes(
+            Decimal('0.10'), store=s,
+            positions=[{'dealId': '1', 'epic': 'GOLD', 'direction': 'BUY'}],
+            size_grid=grid, score_edge=0.20, action='BUY', structure='TREND_UP')
+        assert len(one) == 1
+        assert one[0] == Decimal('0.10')
+        # Weak edge + no clear tape → single lot (not forced multi)
+        weak = db.split_planned_sizes(
+            Decimal('0.10'), store=s, positions=[], size_grid=grid,
+            score_edge=0.01, action='BUY', structure='CHOP', live_trend='MIXED')
+        assert len(weak) == 1
+
+
+def test_default_max_positions_is_five():
+    params = db.load_params(None)
+    assert params['max_positions'] == 5
+    assert params['open_slices'] == 5

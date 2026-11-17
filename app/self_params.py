@@ -91,17 +91,21 @@ DEFAULTS = {
     'day_loss_budget_frac': 0.02,
     'day_risk_per_trade_frac': 0.005,
     'day_be_band_frac': 0.001,
-    'day_max_positions': 3,
+    'day_max_positions': 5,
     'day_conviction_nudge': 0.12,
     'day_lot_vs_mandate_max_mult': 2.0,
     'day_lot_vs_mandate_min_mult': 0.25,
     'day_add_min_edge': 0.04,
+    # Flat HUNT: split one planned lot into N simultaneous Capital-grid slices.
+    'day_open_slices': 5,
+    'day_slice_min_edge': 0.06,
     # Situation memory: scene×action £ with time decay → soft OPEN influence
     'situation_memory_min_samples': 3,
     'situation_memory_nudge': 0.12,
     'situation_memory_half_life_days': 14.0,
-    # Trail self-arm: MFE fraction of opening risk before enabling trail
-    'trail_arm_mfe_frac': 0.55,
+    # Trail self-arm: MFE fraction of opening risk before BE + 1m swing trail
+    # (was 0.55 ≈ 50%; operator wants BE from ~30% of R).
+    'trail_arm_mfe_frac': 0.30,
     'trail_arm_min_ev': 0.0,
     # Bracket teacher schedule (seeds) — thresholds/steps evolve; mults already Store.
     'bracket_vs_vol_noise': 1.15,
@@ -184,6 +188,8 @@ BOUNDS = {
     'day_lot_vs_mandate_max_mult': (1.0, 5.0),
     'day_lot_vs_mandate_min_mult': (0.05, 1.0),
     'day_add_min_edge': (0.02, 0.25),
+    'day_open_slices': (1, 8),
+    'day_slice_min_edge': (0.02, 0.25),
     'situation_memory_min_samples': (2, 30),
     'situation_memory_nudge': (0.02, 0.30),
     'situation_memory_half_life_days': (1.0, 90.0),
@@ -269,12 +275,19 @@ def _clip(key, value):
                'min_online_labeled','policy_evolve_enabled','policy_live_execute',
                'structure_edge_min_samples',
                'situation_memory_min_samples',
-               'day_max_positions','trail_ohlc_bars'):
+               'day_max_positions','day_open_slices','trail_ohlc_bars'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds
         n=max(lo,min(hi,n))
     return n
+
+
+# Exact prior seeds → new seeds (only when the Store still holds the old default).
+_LEGACY_SEED_MIGRATIONS = {
+    'trail_arm_mfe_frac': (0.55, 0.30),
+    'day_max_positions': (3, 5),
+}
 
 
 def load(store) -> dict:
@@ -284,6 +297,14 @@ def load(store) -> dict:
         for k,v in raw.items():
             if k in DEFAULTS:
                 out[k]=_clip(k,v)
+    # Promote robots still on the old BE≈50% / max_pos=3 seeds.
+    for key,(old,new) in _LEGACY_SEED_MIGRATIONS.items():
+        try:
+            cur=float(out.get(key))
+        except (TypeError,ValueError):
+            continue
+        if abs(cur-float(old))<1e-12:
+            out[key]=_clip(key,new)
     return out
 
 

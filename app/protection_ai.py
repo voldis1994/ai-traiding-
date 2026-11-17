@@ -100,13 +100,15 @@ def _trail_knobs(store=None):
     }
 
 
-def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=0.0):
-    """Trail anchor from recent completed 1m OHLC swings.
+def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=0.0,
+                           use_close=True):
+    """Trail anchor from recent completed 1m OHLC close swings.
 
-    BUY → stop under the lowest low of the last N bars (since open).
-    SELL → stop above the highest high of the last N bars.
-    Mid OHLC is adjusted by per-bar spread when present so the anchor sits
-    on the exit side (bid lows / ask highs), matching live trail tips.
+    BUY → stop under the lowest *close* of the last N completed bars (since open).
+    SELL → stop above the highest *close* of those bars.
+    Mid close is adjusted by per-bar spread when present so the anchor sits on
+    the exit side (bid / ask), matching live trail tips. Falls back to high/low
+    when close is missing.
     """
     if direction not in ('BUY','SELL'):
         return None
@@ -116,9 +118,18 @@ def ohlc_1m_structure_stop(direction,candles,*,opened_at=None,lookback=5,buffer=
         if opened_at and t and t<opened_at:
             continue
         h=_finite(row.get('high'));low=_finite(row.get('low'))
+        c=_finite(row.get('close'))
         if h is None or low is None or h<=0 or low<=0 or h<low:
             continue
         sp=_finite(row.get('spread'))
+        if use_close and c is not None and c>0:
+            # Completed 1m close → exit-side approx for swing low/high.
+            if sp is not None and sp>=0:
+                c_bid=c-0.5*sp;c_ask=c+0.5*sp
+            else:
+                c_bid=c_ask=c
+            rows.append((t,c_ask,c_bid))
+            continue
         if sp is not None and sp>=0:
             h=h-0.5*sp;low=low+0.5*sp
         rows.append((t,h,low))
@@ -241,12 +252,12 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if not be_locked and early_arm and tip_fav>0:
         try:
             from .self_params import load as _sp_load
-            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.55))
+            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.30))
         except Exception:
-            arm_frac=0.55
+            arm_frac=0.30
         arm_frac=max(0.25,min(1.0,arm_frac))
-        # Structure EV may arm at ~0.35R; MFE path uses trail_arm_mfe_frac.
-        floor_need=min(arm_frac,0.35)*open_gap
+        # BE from ~30% of opening R (operator), then 1m close-swing trail.
+        floor_need=arm_frac*open_gap
         if tip_fav<floor_need:
             return None
         # Shrink gap to tip_fav so the first ratchet can lock near BE.

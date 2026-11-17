@@ -3818,24 +3818,46 @@ class SingleTradeEngine:
                 repeats=0
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
+        # Real self-improvement: snapshot → learn → holdout £/acc gate →
+        # KEEP weights only if holdout improves; else ROLLBACK (learn_gate).
         last_delta=None
         any_real_dw=False
-        for i in range(repeats):
-            step_loss=self.brain.learn_from_trade(
-                transition,label,lr=learn_lr,won=pnl_sign>0,count_sample=(i==0))
-            if step_loss is not None:losses.append(step_loss)
-            meta=getattr(self.brain.core,'last_learn_meta',None) or {}
-            dn=meta.get('delta_norm')
-            if dn is not None:
-                last_delta=dn
-                if (not meta.get('restored')) and float(dn or 0)>1e-9:
-                    any_real_dw=True
+        gate_decision=None
+        if repeats>0 and label is not None and claimed_neural:
+            from . import learn_gate
+            def _closed_trade_weight_steps():
+                local_losses=[];local_delta=None;local_dw=False
+                for i in range(repeats):
+                    step_loss=self.brain.learn_from_trade(
+                        transition,label,lr=learn_lr,won=pnl_sign>0,
+                        count_sample=(i==0))
+                    if step_loss is not None:local_losses.append(step_loss)
+                    meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+                    dn=meta.get('delta_norm')
+                    if dn is not None:
+                        local_delta=dn
+                        if (not meta.get('restored')) and float(dn or 0)>1e-9:
+                            local_dw=True
+                return {'any_real_dw':local_dw,'losses':local_losses,
+                        'last_delta':local_delta}
+            gate_decision=learn_gate.gate_closed_trade_learn(
+                self,_closed_trade_weight_steps,epic=epic,deal_id=deal_id)
+            learn_meta=(gate_decision or {}).get('learn') or {}
+            losses=list(learn_meta.get('losses') or [])
+            last_delta=learn_meta.get('last_delta')
+            kept=bool((gate_decision or {}).get('keep')) and not bool(
+                (gate_decision or {}).get('rolled_back'))
+            any_real_dw=bool(kept and learn_meta.get('any_real_dw'))
+            if (gate_decision or {}).get('rolled_back'):
+                losses=[];last_delta=None;any_real_dw=False
         # ΔW already updated neural scores (entry quality). Entry floor stays
         # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
-        if repeats>0 and label is not None and claimed_neural:
+        # Skip on ROLLBACK — rejected ΔW must not count as cycle evidence.
+        if repeats>0 and label is not None and claimed_neural and any_real_dw:
             unified_cycle.note_weight_update(
                 self.store,won=pnl_sign>0,delta_norm=last_delta)
         # Independent shadow core trains on same label using *its* decision-time h/c.
+        # Shadow keeps its own promote/rollback; still teach even if LIVE rolled back.
         if repeats>0 and label is not None and claimed_neural:
             self._shadow_learn(None,label,lr=learn_lr)
         if pnl_source=='broker' and pnl_value is not None:
@@ -3922,6 +3944,16 @@ class SingleTradeEngine:
             self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
         self.brain.save()
         weights_updated=bool(repeats>0 and weights_moved and claimed_neural)
+        gate_info=None
+        if isinstance(gate_decision,dict):
+            gate_info={
+                'keep':bool(gate_decision.get('keep')),
+                'rolled_back':bool(gate_decision.get('rolled_back')),
+                'reason':gate_decision.get('reason'),
+                'lift':gate_decision.get('lift'),
+                'before_acc':((gate_decision.get('before') or {}).get('accuracy')),
+                'after_acc':((gate_decision.get('after') or {}).get('accuracy')),
+            }
         if weights_updated:
             self.store.event('learning','Closed-trade P&L updated LIVE neural weights',
                 {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
@@ -3931,15 +3963,18 @@ class SingleTradeEngine:
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'last_loss':losses[-1] if losses else None,
                  'weights_updated':True,'tick_size':tick,
+                 'learn_gate':gate_info,
                  'learning_generation':learning_generation.current(self.store),
                  'bracket':bracket_learn.load_params(self.store)})
         else:
-            # Honest: claim burned, weights unchanged (scratch / null label).
+            # Honest: claim burned, weights unchanged (scratch / null label /
+            # learn_gate ROLLBACK).
             self.store.event('learning','Closed-trade recorded without weight update',
                 {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
                  'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
                  'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
                  'target':label,'weights_updated':False,
+                 'learn_gate':gate_info,
                  'learning_generation':learning_generation.current(self.store)})
         # Structure shadow: bank loss AND win OHLC frames (memory of what works).
         # Teach label itself comes from label_from_profit (listens to library/MFE).

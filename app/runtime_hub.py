@@ -260,9 +260,9 @@ class RuntimeHub:
             return 'proxy'
         if s in ('pending_close_sync','pending_broker_pnl'):
             return 'pending'
-        # Last UPL shown while waiting for Capital cash — display only, not broker £.
+        # Last live UPL settled as peļņa when Capital history lags — count as cash.
         if s in ('upl_estimate',):
-            return 'estimate'
+            return 'cash'
         # Explicit broker, or legacy blank source with a settled pnl figure.
         if s in ('broker','') or not s:
             return 'cash'

@@ -483,7 +483,7 @@ def test_fuzzy_binds_signed_size_and_open_level():
     asyncio.run(scenario())
 
 
-def test_requeue_upl_estimate_then_bind_broker_cash():
+def test_requeue_pending_then_bind_broker_or_upl():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -496,12 +496,10 @@ def test_requeue_upl_estimate_then_bind_broker_cash():
                                     'balance':{'equity':10_000}}]}
             store.upsert_trade({'dealId':'est1','epic':'GOLD','size':'0.02',
                                 'direction':'SELL','level':2651})
-            store.close_trade('est1',2650, -0.39, currency='GBP',
-                              source='upl_estimate', overwrite=True)
+            store.close_trade('est1',2650, source='pending_broker_pnl', overwrite=True)
             store.set('entry_brain:est1',{
                 'epic':'GOLD','direction':'SELL','entry':2651,'tick_size':.1,
                 'transition':brain._json_transition(brain.core.last_transition)})
-            # Pending queue empty — Admin stuck until requeue.
             store.set('pending_broker_pnl_deals',[])
             broker.tx=[{'reference':'est1','pnl':-0.41,'currency':'GBP',
                         'size':'0.02','openLevel':'2651'}]

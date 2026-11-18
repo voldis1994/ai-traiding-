@@ -41,12 +41,15 @@ def test_evolve_from_feedback_moves_knobs():
 
 
 def test_learn_lr_only_two_decimal_places():
-    """learn_lr must be 0.28 / 0.29 / 0.30 — never 0.294 or 0.123."""
+    """learn_lr on 0.01 steps; default 0.10 with light win/loss repeats."""
     assert LEARN_LR_STEP == 0.01
+    assert DEFAULTS['learn_lr'] == pytest.approx(0.10)
+    assert DEFAULTS['learn_win_repeats'] == 2
+    assert DEFAULTS['learn_loss_repeats'] == 3
     assert quantize_learn_lr(0.294) == pytest.approx(0.29)
     assert quantize_learn_lr(0.123) == pytest.approx(0.12)
-    assert quantize_learn_lr(0.286) == pytest.approx(0.29)
-    assert quantize_learn_lr(0.28) == pytest.approx(0.28)
+    assert quantize_learn_lr(0.104) == pytest.approx(0.10)
+    assert quantize_learn_lr(0.10) == pytest.approx(0.10)
     assert quantize_learn_lr(None) == pytest.approx(DEFAULTS['learn_lr'])
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')

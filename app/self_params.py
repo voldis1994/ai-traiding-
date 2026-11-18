@@ -50,12 +50,12 @@ DEFAULTS = {
     'shadow_min_broker_trades': 6,
     'shadow_rollback_window': 8,
     'shadow_rollback_delta': 0.35,
-    # Learning — faster defaults so closed-trade + HOLD-shadow teach right away
-    # (weights move on the close bar, not after a long idle wait).
-    # learn_lr is always 0.01 steps (0.28, 0.29, 0.30…) — never 0.294 / 0.123.
-    'learn_lr': 0.28,
-    'learn_win_repeats': 4,
-    'learn_loss_repeats': 5,
+    # Learning — moderate pace for sparse broker £ feedback.
+    # High LR (0.28+) + many repeats caused fast forgetfulness / instability.
+    # learn_lr is always 0.01 steps (0.10, 0.11, 0.12…) — never 0.104 / 0.123.
+    'learn_lr': 0.10,
+    'learn_win_repeats': 2,
+    'learn_loss_repeats': 3,
     # Closed-trade KEEP/ROLLBACK — ΔW sticks only if holdout accuracy improves.
     'learn_gate_enabled': 1,
     'learn_gate_min_rows': 12,
@@ -286,7 +286,7 @@ def _finite(v):
 
 
 def quantize_learn_lr(v) -> float:
-    """Snap learn_lr to 0.01 steps within rails: 0.28 → 0.29, never 0.294."""
+    """Snap learn_lr to 0.01 steps within rails: 0.10 → 0.11, never 0.104."""
     n=_finite(v)
     if n is None:
         n=float(DEFAULTS['learn_lr'])

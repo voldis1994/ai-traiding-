@@ -16,6 +16,11 @@ import torch.nn.functional as F
 
 ACTIONS=('BUY','SELL','HOLD')
 
+# Trainable multi-TF period importance inside NeuralCore (not a second AI).
+# Softmax(period_logits) gates OHLC period evidence from 1→60 minutes.
+PERIOD_TF = ('m1', 'm5', 'm15', 'm30', 'm60')
+PERIOD_N = len(PERIOD_TF)
+
 # One completed M1 candle. Keep LIVE / shadow / holdout on this same scale.
 NEURAL_BAR_DT = 1.0
 # Soft cap for multi-bar gaps that still advance without a full state reset.
@@ -39,7 +44,10 @@ MINUTE_VS_TRADE_WEIGHT_RATIO = (
 
 # Audit #18 — ordinary online updates snapshot prior weights, bound ΔW, and
 # restore when the same-example CE criterion worsens. Never "proven".
-WEIGHT_PARAM_NAMES = ('P', 'W', 'R', 'O', 'b', 'G', 'tau', 'tau_c')
+# period_logits / period_V: same learn() chain — period importance is learned,
+# not swapped by a separate formula AI.
+WEIGHT_PARAM_NAMES = ('P', 'W', 'R', 'O', 'b', 'G', 'tau', 'tau_c',
+                      'period_logits', 'period_V')
 DEFAULT_MAX_WEIGHT_DELTA_NORM = 2.0
 
 
@@ -71,6 +79,9 @@ class NeuralCore:
         self.mu=np.zeros(d);self.nu=np.ones(d)
         self.age=np.zeros(n,dtype=int);self.utility=np.zeros(n)
         self.G=rng.normal(0,.12,(d,n))
+        # Period importance (M1…M60): learned softmax gates over TF evidence.
+        self.period_logits=np.zeros(PERIOD_N)
+        self.period_V=rng.normal(0,.05,(3,PERIOD_N))
         self.vbar=0.;self.steps=0;self.last_z=np.zeros(d);self.last_transition=None
         self.births=0;self.deaths=0;self.last_loss=None;self.last_grad=0.;self.accuracy=0.
         self.last_learn_meta=None  # audit #17–18: objective + controlled-update status
@@ -81,25 +92,44 @@ class NeuralCore:
     def _softmax(logits):
         ex=np.exp(logits-np.max(logits));return ex/ex.sum()
 
-    def _forward(self,z,h,c,dt):
+    def period_weights(self):
+        """Learned M1→M60 importance — same model as BUY/SELL/HOLD, not a formula AI."""
+        w=self._softmax(np.asarray(self.period_logits,dtype=float))
+        return {name:float(w[i]) for i,name in enumerate(PERIOD_TF)}
+
+    def _normalize_period_x(self,period_x):
+        if period_x is None:
+            return np.zeros(PERIOD_N,dtype=float)
+        px=np.asarray(period_x,dtype=float).reshape(-1)
+        if px.shape!=(PERIOD_N,) or not np.isfinite(px).all():
+            return np.zeros(PERIOD_N,dtype=float)
+        return np.clip(px,-3.,3.)
+
+    def _forward(self,z,h,c,dt,period_x=None):
         lam=1-np.exp(-dt/self.tau)
         hn=h+lam*(np.tanh(self.P@z+self.W@h)-h)
         gamma=1-np.exp(-dt/self.tau_c)
         cn=c+gamma*(np.tanh(.5*hn+.2*c)-c)
         logits=self.R@hn+self.O@cn+self.b
+        # Trainable period gate: w ⊙ evidence → action logits (one decision head).
+        px=self._normalize_period_x(period_x)
+        w=self._softmax(self.period_logits)
+        logits=logits+(self.period_V@(w*px))
         return hn,cn,logits
 
-    def step(self,x,dt=NEURAL_BAR_DT,epsilon=1e-6,zeta=.01):
+    def step(self,x,dt=NEURAL_BAR_DT,epsilon=1e-6,zeta=.01,period_x=None):
         x=np.asarray(x,dtype=float)
         if x.shape!=(self.d,) or not np.isfinite(x).all() or dt<=0:raise ValueError('Invalid input or time interval')
         sigma=np.maximum(np.sqrt(self.nu),epsilon)
         z=np.clip((x-self.mu)/sigma,-7,7)
         h0=self.h.copy();c0=self.c.copy()
-        hn,cn,logits=self._forward(z,h0,c0,dt)
+        px=self._normalize_period_x(period_x)
+        hn,cn,logits=self._forward(z,h0,c0,dt,period_x=px)
         prob=self._softmax(logits)
         residual=float(np.linalg.norm(z-self.G@hn));self.vbar=.95*self.vbar+.05*residual
         self.last_transition={'z':z.copy(),'h':h0,'c':c0,'dt':dt,
-                              'neuron_ids':self.neuron_ids.copy()}
+                              'neuron_ids':self.neuron_ids.copy(),
+                              'period_x':px.copy()}
         self.last_z=z.copy();self.h=hn;self.c=cn;self.age+=1;self.steps+=1
         old_mu=self.mu.copy();self.mu=(1-zeta)*self.mu+zeta*x
         self.nu=(1-zeta)*self.nu+zeta*(x-old_mu)**2
@@ -107,7 +137,9 @@ class NeuralCore:
         action=ACTIONS[int(np.argmax(prob))]
         return {'action':action,'scores':dict(zip(ACTIONS,map(float,prob))),
                 'neurons':self.n,'reconstruction_error':residual,'smoothed_error':self.vbar,
-                'z':z.tolist(),'logits':logits.tolist()}
+                'z':z.tolist(),'logits':logits.tolist(),
+                'period_weights':self.period_weights(),
+                'period_x':px.tolist()}
 
     def _aligned_state(self,h,c,ids=None):
         """Map a saved recurrent state into current neuron IDs, zero-filling births.
@@ -136,6 +168,7 @@ class NeuralCore:
 
     def snapshot_weights(self):
         """Copy trainable matrices for controlled update / restore (audit #18)."""
+        self.ensure_period_params()
         return {name: np.asarray(getattr(self, name), dtype=float).copy()
                 for name in WEIGHT_PARAM_NAMES}
 
@@ -180,11 +213,8 @@ class NeuralCore:
         dt = float(transition['dt'])
         if z.shape != (self.d,) or not np.isfinite(dt) or dt <= 0:
             return None
-        lam = 1 - np.exp(-dt / np.maximum(self.tau, 0.01))
-        hn = h + lam * (np.tanh(self.P @ z + self.W @ h) - h)
-        gamma = 1 - np.exp(-dt / np.maximum(self.tau_c, 0.01))
-        cn = c + gamma * (np.tanh(0.5 * hn + 0.2 * c) - c)
-        logits = self.R @ hn + self.O @ cn + self.b
+        px = self._normalize_period_x(transition.get('period_x'))
+        _, _, logits = self._forward(z, h, c, dt, period_x=px)
         prob = self._softmax(logits)
         p = max(float(prob[label]), 1e-15)
         return float(-np.log(p))
@@ -197,6 +227,8 @@ class NeuralCore:
         Prior weights are snapshotted; the step is projected onto
         max_delta_norm; if same-example CE worsens, weights restore.
         Ordinary learn never reports proven_improvement.
+
+        Period logits/V train in the same backward pass as P/W/R/O — one chain.
         """
         if lr is None:
             lr = self.DEFAULT_LR
@@ -210,23 +242,32 @@ class NeuralCore:
         if max_delta_norm is None:
             max_delta_norm = DEFAULT_MAX_WEIGHT_DELTA_NORM
         max_delta_norm = float(max_delta_norm)
+        # Old brains / transitions may lack period params — ensure tensors exist.
+        if not hasattr(self, 'period_logits') or np.asarray(self.period_logits).shape != (PERIOD_N,):
+            self.period_logits = np.zeros(PERIOD_N)
+        if not hasattr(self, 'period_V') or np.asarray(self.period_V).shape != (3, PERIOD_N):
+            self.period_V = self.rng.normal(0, .05, (3, PERIOD_N))
         prior = self.snapshot_weights()
         ce_before = self._ce_on_transition(transition, label)
 
         t = lambda value, grad=False: torch.tensor(value, dtype=torch.float64, requires_grad=grad)
         tensors = {name: t(getattr(self, name), True) for name in WEIGHT_PARAM_NAMES}
-        p, w, r, o, b, g, tau, tauc = (tensors[name] for name in WEIGHT_PARAM_NAMES)
+        p, w, r, o, b, g, tau, tauc, plog, pv = (tensors[name] for name in WEIGHT_PARAM_NAMES)
         aligned = self._aligned_state(transition['h'], transition['c'], transition.get('neuron_ids'))
         if aligned is None:
             return None
         z = t(transition['z']); h = t(aligned[0]); c = t(aligned[1]); dt = float(transition['dt'])
         if tuple(z.shape) != (self.d,) or not np.isfinite(float(dt)) or dt <= 0:
             return None
+        px = t(self._normalize_period_x(transition.get('period_x')))
         lam = 1 - torch.exp(-dt / torch.clamp(tau, min=.01))
         hn = h + lam * (torch.tanh(p @ z + w @ h) - h)
         gamma = 1 - torch.exp(-dt / torch.clamp(tauc, min=.01))
         cn = c + gamma * (torch.tanh(.5 * hn + .2 * c) - c)
         logits = r @ hn + o @ cn + b
+        # Softmax period gate inside the same graph as action CE.
+        pw = torch.softmax(plog, dim=0)
+        logits = logits + (pv @ (pw * px))
         ce = F.cross_entropy(logits.unsqueeze(0), torch.tensor([label]))
         reconstruction = F.mse_loss(g @ hn, z)
         loss = ce + reconstruction_weight * reconstruction
@@ -453,6 +494,9 @@ class NeuralCore:
         self.b[:]=other.b
         self.mu[:]=other.mu;self.nu[:]=other.nu
         self.tau[:n]=other.tau[:n];self.tau_c[:n]=other.tau_c[:n]
+        if hasattr(other,'period_logits') and hasattr(other,'period_V'):
+            self.period_logits=np.asarray(other.period_logits,dtype=float).copy()
+            self.period_V=np.asarray(other.period_V,dtype=float).copy()
         return True
 
     def clone_architecture(self, *, n=None, seed=None, copy_weights=False):
@@ -477,10 +521,22 @@ class NeuralCore:
         self.c[:]=0.
         self.last_transition=None
 
+    def ensure_period_params(self):
+        """Backfill trainable period gate for brains saved before PERIOD_TF."""
+        if (not hasattr(self,'period_logits')
+                or np.asarray(getattr(self,'period_logits')).shape!=(PERIOD_N,)):
+            self.period_logits=np.zeros(PERIOD_N)
+        if (not hasattr(self,'period_V')
+                or np.asarray(getattr(self,'period_V')).shape!=(3,PERIOD_N)):
+            self.period_V=self.rng.normal(0,.05,(3,PERIOD_N))
+
     def snapshot(self):
+        self.ensure_period_params()
         return {'neurons':self.n,'steps':self.steps,'smoothed_error':self.vbar,
                 'mean_activation':float(np.mean(np.abs(self.h))),
                 'births':self.births,'pruned':self.deaths,'loss':self.last_loss,
                 'gradient_norm':self.last_grad,'utility_mean':float(np.mean(self.utility)),
                 'activations':self.h[:72].round(4).tolist(),'memory':self.c[:72].round(4).tolist(),
-                'edges':int(np.count_nonzero(self.W)),'input_dim':self.d}
+                'edges':int(np.count_nonzero(self.W)),'input_dim':self.d,
+                'period_weights':self.period_weights(),
+                'period_tf':list(PERIOD_TF)}

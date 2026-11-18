@@ -662,6 +662,17 @@ function renderCard(c){
         (a.mtf_momentum&&a.mtf_momentum.stop_hint_atr14!=null)
           ?(' · ATR '+esc(num(a.mtf_momentum.stop_hint_atr14,2))) : ''
       }</strong></div>
+      ${(()=>{
+        const pw=(a.mtf_momentum&&(a.mtf_momentum.neural_period_weights||a.mtf_momentum.period_weights))||null;
+        if(!pw||typeof pw!=='object')return '';
+        const bits=['m1','m5','m15','m30','m60'].map(k=>{
+          const v=Number(pw[k]);
+          return Number.isFinite(v)?`${k}:${Math.round(v*100)}`:'';
+        }).filter(Boolean);
+        return bits.length
+          ?`<div><span>TF svari (neironi)</span><strong>${esc(bits.join(' '))}</strong></div>`
+          :'';
+      })()}
       <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
       <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>
       <div><span>Tirgus</span><strong>${esc(a.market||'—')}</strong></div>

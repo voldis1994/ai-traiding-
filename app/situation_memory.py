@@ -259,10 +259,12 @@ def compare_situation(store, *, situation, now=None):
     return out
 
 
-def soft_nudge_scores(scores, advice, *, store=None):
+def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
     """Tilt scores toward situation £ advice — never a hard veto.
 
     Renormalizes to sum=1 so autonomy._safe_scores stays valid.
+    When live multi-TF trend fights historical scene advice, skip — do not
+    glue the robot to yesterday's SELL while the tape has already turned UP.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -273,9 +275,16 @@ def soft_nudge_scores(scores, advice, *, store=None):
     conf = float(advice.get('confidence') or 0)
     if conf < 0.35 or strength <= 0:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence'}
+    target = advice['advice']
+    trend = (live_trend or '').upper() if isinstance(live_trend, str) else None
+    if target in ('BUY', 'SELL') and trend in ('UP', 'DOWN'):
+        if (target == 'BUY' and trend == 'DOWN') or (target == 'SELL' and trend == 'UP'):
+            return dict(scores), {
+                'nudged': False, 'reason': 'live_trend_disagrees',
+                'target': target, 'live_trend': trend,
+            }
     delta = strength * conf
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
-    target = advice['advice']
     if target in ('BUY', 'SELL'):
         out[target] = out.get(target, 0) + delta
         other = 'SELL' if target == 'BUY' else 'BUY'

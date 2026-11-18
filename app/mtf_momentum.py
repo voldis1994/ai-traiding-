@@ -679,8 +679,13 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
     return out
 
 
-def soft_nudge_scores(scores, analysis, *, store=None):
-    """Tilt BUY/SELL/HOLD toward MTF preferred mode. SHIFT boosts reverse for CLOSE."""
+def soft_nudge_scores(scores, analysis, *, store=None, live_trend=None):
+    """Tilt BUY/SELL/HOLD toward MTF preferred mode. SHIFT boosts reverse for CLOSE.
+
+    When live multi-TF trend already flipped but KAMA lag still prefers the old
+    side (and mode is not SHIFT), skip the reinforce — do not glue sticky SELL
+    into an UP tape. SHIFT keeps authority (pressure/structure early flip).
+    """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
     if not isinstance(analysis, dict) or not analysis.get('ready'):
@@ -693,6 +698,14 @@ def soft_nudge_scores(scores, analysis, *, store=None):
     conf = float(analysis.get('confidence') or 0)
     if conf < 0.4:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence', 'mode': mode}
+    trend = (live_trend or '').upper() if isinstance(live_trend, str) else None
+    if (mode != 'SHIFT' and preferred in ('BUY', 'SELL') and trend in ('UP', 'DOWN')
+            and ((preferred == 'SELL' and trend == 'UP')
+                 or (preferred == 'BUY' and trend == 'DOWN'))):
+        return dict(scores), {
+            'nudged': False, 'reason': 'live_trend_disagrees',
+            'mode': mode, 'target': preferred, 'live_trend': trend,
+        }
     # Mode tilt only — period importance is learned inside NeuralCore, not here.
     delta = float(cfg['nudge']) * conf
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}

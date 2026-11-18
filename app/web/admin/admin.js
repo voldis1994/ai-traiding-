@@ -656,6 +656,9 @@ function renderCard(c){
     </div>
     <div class="facts">
       <div><span>Signāls</span><strong>${esc(c.action||'—')}</strong></div>
+      <div><span>MTF režīms</span><strong>${esc(((a.mtf_momentum||{}).mode)||'—')}${
+        (a.mtf_momentum&&a.mtf_momentum.preferred)?(' · '+esc(a.mtf_momentum.preferred)) : ''
+      }</strong></div>
       <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
       <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>
       <div><span>Tirgus</span><strong>${esc(a.market||'—')}</strong></div>

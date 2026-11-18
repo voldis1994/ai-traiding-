@@ -180,6 +180,7 @@ class AccountRuntime:
         else:
             adapt_reason=(snap.get('neural_adapt_reason') or code.get('last_reason'))
         day_book=snap.get('day_book') if isinstance(snap.get('day_book'),dict) else None
+        mtf=snap.get('mtf_momentum') if isinstance(snap.get('mtf_momentum'),dict) else None
         return {
             'phase':phase,
             'connected':bool(self.engine.broker),
@@ -191,6 +192,7 @@ class AccountRuntime:
             'positions':enriched,
             'protection':brief,
             'day_book':day_book,
+            'mtf_momentum':mtf,
             'scores':{
                 'BUY':float(scores.get('BUY') or 0),
                 'HOLD':float(scores.get('HOLD') or 0),
@@ -553,6 +555,7 @@ class RuntimeHub:
                         [view['position']] if view.get('position') else []),
                     'protection':view.get('protection') or snap.get('adaptive_protection'),
                     'day_book':view.get('day_book') or snap.get('day_book'),
+                    'mtf_momentum':view.get('mtf_momentum') or snap.get('mtf_momentum'),
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')
                                                or snap.get('entry_can_submit_now')),

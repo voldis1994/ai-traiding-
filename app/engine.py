@@ -1789,7 +1789,17 @@ class SingleTradeEngine:
         latest=self._map_positions(raw)
         latest=await self._fill_missing_epic(latest)
         prev_id=str(self.last_position_id) if self.last_position_id is not None else None
+        # Track every live dealId so multi-pos vanishes are recorded and siblings
+        # do not get falsely closed when the book grows from 1 → N.
+        prev_open=set(getattr(self,'_open_deal_ids',None) or set())
+        if prev_id:
+            prev_open.add(prev_id)
+        for p in (self.positions or []):
+            if p.get('dealId') is not None:
+                prev_open.add(str(p['dealId']))
+        latest_ids={str(p['dealId']) for p in latest if p.get('dealId') is not None}
         self.positions=latest
+        self._open_deal_ids=set(latest_ids)
         if len(latest)>1:
             # Do not pause — submit() already refuses OPEN while any position is open.
             if not self._paused_for_multi:
@@ -1801,25 +1811,30 @@ class SingleTradeEngine:
             self.store.event('reconcile','Multiple-position conflict resolved')
         current=latest[0]['dealId'] if len(latest)==1 else None
         if current is not None:current=str(current)
-        if prev_id and prev_id!=current:
-            await self._record_vanished_deal(prev_id)
+        # Sibling-safe: only deals that left the live book (not "current is None").
+        for vanished in sorted(prev_open-latest_ids):
+            await self._record_vanished_deal(vanished)
+        # Persist every live deal (multi-pos inclusive) so sibling vanishes can settle £.
+        for p in latest:
+            self.store.upsert_trade(p)
+            self._snapshot_open_upl(p)
         if current:
             self.position_age=(self.position_age+1 if current==prev_id else 0)
-            self.store.upsert_trade(latest[0])
-            self._snapshot_open_upl(latest[0])
             # Capital sometimes keeps a stale open while history already has cash.
             # Check after a couple of polls so we don't race a brand-new open.
             if self.position_age>=2 and await self._force_close_if_history_settled(current):
                 latest=[];current=None
                 self.positions=[];self.position_age=0
+                self._open_deal_ids=set()
         else:
             self.position_age=0
-            # Flat book: harvest any SQLite/pending cash every sync, not only on retry.
-            try:
-                await self._retry_pending_broker_pnl()
-            except Exception as exc:
-                self.store.event('warning','Flat-book pending P&L sync failed',
-                                 {'type':type(exc).__name__})
+        # Harvest pending Capital £ every sync — even while a sibling is still open.
+        # Never invent UPL as cash; retry only binds history/activity £.
+        try:
+            await self._retry_pending_broker_pnl()
+        except Exception as exc:
+            self.store.event('warning','Pending P&L sync failed',
+                             {'type':type(exc).__name__})
         self.last_position_id=current
         # Live open position → this session's instrument/size mandate.
         # After login, mandate is intentionally empty; the first valid broker
@@ -3779,7 +3794,6 @@ class SingleTradeEngine:
             self.store.event('warning','Unsettled cash requeue failed',
                              {'type':type(exc).__name__})
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
-        if not pending:return
         remaining=[]
         for item in pending:
             base=item if isinstance(item,dict) else {'deal_id':item}
@@ -3821,14 +3835,20 @@ class SingleTradeEngine:
             self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
-        # Flat book: also harvest Capital cash for open SQLite rows whose deal vanished
-        # before we queued pending (restart / missed sync).
-        if not self.positions:
-            await self._reconcile_orphan_open_trades()
+        # Also harvest Capital cash for open SQLite rows whose deal vanished
+        # before we queued pending (restart / missed sync). Sibling-safe.
+        await self._reconcile_orphan_open_trades()
 
     async def _reconcile_orphan_open_trades(self):
-        """When flat, close SQLite rows still open if Capital history has cash P&L."""
-        if self.positions or not self.broker:return
+        """Close SQLite open rows for deals no longer live when Capital has cash £.
+
+        Sibling-safe: a still-open broker position must not block harvesting cash
+        for already-gone deals (Admin [gaida £] / pending_broker_pnl freeze).
+        Never invent UPL as cash — exact/fuzzy history £ only.
+        """
+        if not self.broker:return
+        live={str(p.get('dealId')) for p in (self.positions or [])
+              if p.get('dealId') is not None}
         try:
             rows=self.store.db.execute(
                 'SELECT deal_id,exit FROM trades WHERE closed IS NULL '
@@ -3837,6 +3857,8 @@ class SingleTradeEngine:
             return
         for deal_id,exit_lvl in rows:
             deal=str(deal_id)
+            if deal in live:
+                continue  # still open at broker — do not settle
             found=await self._pnl_from_broker_history(deal)
             if not found:
                 try:

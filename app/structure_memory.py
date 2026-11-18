@@ -302,6 +302,58 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
     return {'needed': True, 'ok': True, 'reason': 'left_prior_range'}
 
 
+def extension_chase(action, *, candles=None, market_context=None, atr=None,
+                    lookback=30, top_frac=0.85, min_atr_mult=2.0) -> dict:
+    """Block BUY/SELL that chase a vertical impulse into the extreme.
+
+    Classic failure: huge M1 rally (or dump), neuron still BUY, entry near the
+    local high on a weak bounce — then mean-reversion. Structure memory after a
+    prior trade does not catch this on a fresh OPEN.
+    """
+    if action not in ('BUY', 'SELL'):
+        return {'needed': False, 'ok': True, 'reason': 'not_directional'}
+    path = normalise(candles, limit=max(10, int(lookback)))
+    if len(path) < 8:
+        return {'needed': False, 'ok': True, 'reason': 'need_more_bars'}
+    hi = max(b['high'] for b in path)
+    lo = min(b['low'] for b in path)
+    span = hi - lo
+    if span <= 1e-12:
+        return {'needed': False, 'ok': True, 'reason': 'flat_path'}
+    mid = None
+    if isinstance(market_context, dict):
+        mid = _finite(market_context.get('mid') or market_context.get('close'))
+    if mid is None:
+        mid = path[-1]['close']
+    atr_v = _finite(atr)
+    # Impulse must be large vs ATR (or absolute span if ATR unknown).
+    if atr_v is not None and atr_v > 0:
+        if span < float(min_atr_mult) * atr_v:
+            return {'needed': False, 'ok': True, 'reason': 'impulse_not_large',
+                    'span': span, 'atr': atr_v}
+    pos = (mid - lo) / span  # 0=bottom, 1=top of lookback range
+    # Recent micro-turn against the chase (rollover / bounce failure).
+    last3 = path[-3:]
+    reds = sum(1 for b in last3 if b['close'] < b['open'])
+    greens = sum(1 for b in last3 if b['close'] > b['open'])
+    frac = float(top_frac)
+    if action == 'BUY' and pos >= frac:
+        # At top of a large impulse — refuse chase, especially if already rolling.
+        return {
+            'needed': True, 'ok': False, 'reason': 'chase_extension_high',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo, 'rolling': reds >= 2,
+        }
+    if action == 'SELL' and pos <= (1.0 - frac):
+        return {
+            'needed': True, 'ok': False, 'reason': 'chase_extension_low',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo, 'rolling': greens >= 2,
+        }
+    return {'needed': False, 'ok': True, 'reason': 'not_extended',
+            'pos': round(pos, 3), 'span': span}
+
+
 def gate_reentry(*, action, last_outcome=None, candles=None,
                  market_context=None, atr=None) -> dict:
     """OPEN gate: after a close, require structure development vs that trade."""

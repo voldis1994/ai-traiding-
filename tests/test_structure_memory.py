@@ -71,11 +71,10 @@ def test_missing_prior_range_holds_same_dir():
     assert out['reason'] == 'need_structure_range'
 
 
-def test_extension_chase_blocks_buy_near_spike_high():
-    """Replay: Gold-like vertical rally then BUY near local high → HOLD."""
+def test_extension_chase_blocks_buy_only_on_rollover_at_high():
+    """BUY at spike high after red rollover → HOLD; continuing greens → allow."""
     t0 = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
     rows = []
-    # Dump then sharp rally 3756 → ~3790 (matches the live screenshot shape).
     px = 3780.0
     for i in range(40):
         if i < 15:
@@ -88,7 +87,14 @@ def test_extension_chase_blocks_buy_near_spike_high():
             'open': o, 'high': max(o, px) + 0.4, 'low': min(o, px) - 0.4,
             'close': px,
         })
-    # Entry mid near the high of the impulse (~3786 on a ~3756–3790 range).
+    # Roll over at the high with two red M1 — classic late BUY chase.
+    for j in range(2):
+        o = px
+        px -= 0.8
+        rows.append({
+            'at': (t0 + timedelta(minutes=40 + j)).isoformat(),
+            'open': o, 'high': o + 0.1, 'low': px - 0.2, 'close': px,
+        })
     hi = max(r['high'] for r in rows)
     lo = min(r['low'] for r in rows)
     entry = lo + 0.9 * (hi - lo)
@@ -106,6 +112,36 @@ def test_extension_chase_blocks_buy_near_spike_high():
     assert ok.get('ok') is True
 
 
+def test_extension_allows_sell_dump_continuation_at_low():
+    """Live screenshot: consecutive red M1 dump — must NOT HOLD as chase."""
+    t0 = datetime(2026, 11, 18, 14, 30, tzinfo=timezone.utc)
+    rows = []
+    px = 3780.0
+    for i in range(40):
+        o = px
+        px -= 0.65  # steady dump like 15:00–15:10 Gold
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': o + 0.15, 'low': px - 0.1, 'close': px,
+        })
+    entry = px
+    chase = sm.extension_chase(
+        'SELL', candles=rows, market_context={'mid': entry, 'close': entry},
+        atr=3.0)
+    assert chase.get('ok') is True
+    assert chase.get('reason') == 'continuation_at_low'
+
+    scores_raw = {'SELL': 0.55, 'BUY': 0.20, 'HOLD': 0.25}
+    out = rc.evaluate(
+        action='SELL', scores_raw=scores_raw,
+        market_context={'trend': 'DOWN', 'close': entry, 'mid': entry},
+        mtf_analysis={'ready': True, 'stop_hint_atr14': 3.0,
+                      'structure_break': 'DOWN', 'preferred': 'SELL', 'mode': 'SELL'},
+        candles=rows)
+    assert out['allowed'] is True
+    assert (out.get('extension_chase') or {}).get('reason') == 'continuation_at_low'
+
+
 def test_reentry_evaluate_blocks_chase_extension():
     scores_raw = {'BUY': 0.55, 'SELL': 0.20, 'HOLD': 0.25}
     t0 = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
@@ -116,6 +152,14 @@ def test_reentry_evaluate_blocks_chase_extension():
         rows.append({
             'at': (t0 + timedelta(minutes=i)).isoformat(),
             'open': px - 0.2, 'high': px + 0.5, 'low': px - 0.5, 'close': px,
+        })
+    # Rollover reds at the high before the late BUY.
+    for j in range(2):
+        o = px
+        px -= 0.7
+        rows.append({
+            'at': (t0 + timedelta(minutes=35 + j)).isoformat(),
+            'open': o, 'high': o + 0.1, 'low': px - 0.1, 'close': px,
         })
     hi = max(r['high'] for r in rows)
     lo = min(r['low'] for r in rows)

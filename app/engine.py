@@ -51,6 +51,7 @@ from . import structure_edge
 from . import situation_memory
 from . import day_book
 from . import mtf_momentum
+from . import reentry_confirm
 
 DB=DATA/'robot.sqlite3'
 
@@ -2681,6 +2682,14 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',reason=edge['reason'],
                             unified_cycle=edge)
             result=dict(result,unified_cycle=edge)
+            # Adaptive re-entry: raw neural strength + new tape proof (ATR/structure/M1).
+            reentry=self._reentry_confirm_gate(
+                result['action'],scores_raw=base_scores,mtf_analysis=mtf_analysis)
+            result=dict(result,reentry_confirm=reentry)
+            if not reentry.get('allowed',True):
+                return dict(result,action='HOLD',
+                            reason=reentry.get('reason') or 'reentry_confirm_hold',
+                            proposal=result.get('proposal') or result['action'])
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(
@@ -2690,6 +2699,32 @@ class SingleTradeEngine:
                 nudged_scores,result,
                 unified_cycle.load_state(self.store)))
         return result
+
+    def _reentry_confirm_gate(self,action,*,scores_raw=None,mtf_analysis=None):
+        """Raw neural + post-close move proof before same-dir / medium OPEN."""
+        epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+        candles=[]
+        if epic:
+            try:
+                candles=self.store.candles(epic,n=40,historical_only=False) or []
+            except Exception:
+                candles=[]
+        last=self.store.get('last_trade_outcome') if self.store else None
+        gate=reentry_confirm.evaluate(
+            action=action,
+            scores_raw=scores_raw or (
+                (self.last_signal or {}).get('scores_raw')
+                if isinstance(self.last_signal,dict) else None),
+            last_outcome=last,
+            mtf_analysis=mtf_analysis or (
+                (self.last_signal or {}).get('mtf_momentum')
+                if isinstance(self.last_signal,dict) else None),
+            market_context=self.market_context,
+            candles=candles,
+            store=self.store)
+        if isinstance(self.last_signal,dict):
+            self.last_signal=dict(self.last_signal,reentry_confirm=gate)
+        return gate
 
     def _structure_edge_advice(self):
         """BUY vs SELL EV in the live OHLC frame — soft evidence, not a gate."""
@@ -4433,9 +4468,13 @@ class SingleTradeEngine:
             persist_pnl=None
         self.store.close_trade(deal_id,exit_level,persist_pnl,currency=currency,
                                source=persist_source,overwrite=overwrite)
+        exit_mid=exit_level
+        if exit_mid is None:
+            exit_mid=_num((self.market or {}).get('mid'))
         self.store.set('last_trade_outcome',{
             'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
-            'pnl':pnl_value,'mode':mode})
+            'pnl':pnl_value,'mode':mode,'exit_mid':exit_mid,
+            'exit_level':exit_level})
         # Joint system: cash P&L also teaches SL/TP shape (lot+market stay the risk frame).
         if cash_like:
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
@@ -4452,6 +4491,16 @@ class SingleTradeEngine:
                 exit_reason=path_ctx.get('exit_reason'),
                 scratch_band=float(sp.get('scratch_pnl_abs') or 0.05),
                 source=pnl_source)
+            # Learn re-entry floors from fast / same-dir outcomes after costs.
+            try:
+                reentry_confirm.observe_close(
+                    self.store,
+                    reentry_meta=(saved.get('reentry_confirm')
+                                  if isinstance(saved,dict) else None),
+                    broker_pnl=pnl_value,spread=spread_cost)
+            except Exception as exc:
+                self.store.event('warning','Re-entry confirm learn skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
@@ -5075,11 +5124,14 @@ class SingleTradeEngine:
                     regime=(self.market_context or {}).get('regime')
                            or (self.last_signal or {}).get('regime'),
                     news=self._news_risk())
+                reentry_gate=((self.last_signal or {}).get('reentry_confirm')
+                              if isinstance(self.last_signal,dict) else None)
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
                     'transition':self.brain._json_transition(self.brain.core.last_transition),
                     'scores':(self.last_signal or {}).get('scores'),
+                    'scores_raw':(self.last_signal or {}).get('scores_raw'),
                     'shadow_scores':self._shadow_scores_now(),
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],
@@ -5088,6 +5140,8 @@ class SingleTradeEngine:
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
                     'champion_context':open_ctx,
+                    'reentry_confirm':reentry_confirm.open_meta_from_gate(
+                        reentry_gate,action=action),
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),

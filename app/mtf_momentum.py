@@ -1,33 +1,37 @@
-"""Multi-timeframe Momentum + Market Structure + ADX + ATR.
+"""Adaptive KAMA + ADX/DI + ATR + Market Pressure + Multi-TF AI.
 
-Starting stack for GOLD testing (operator-chosen — not yet self-tuned):
+Operator-chosen start stack for GOLD testing (not free self-mutation every trade):
 
-  M1  EMA 5/13 + 3-candle structure break   → react first
-  M5  EMA 9/21 + ATR 14                     → confirm direction
-  M15 ADX 14 + DI+/DI-                      → strength
-  M30 ATR-normalized momentum               → medium tendency
-  M60 EMA 20 slope + price structure       → context
+  KAMA        ER10 / Fast2 / Slow30     → adaptive trend (fast in move, slow in noise)
+  ADX + DI    14 on M5/M15              → strength + directional dominance
+  ATR         7 / 14 / 21               → volatility, stop hint, move size
+  Pressure    3 / 5 / 10 M1 candles     → early direction change from OHLC
+  Structure   M1 / M5                   → breaks, breakouts, corrections
+  Semivariance up/down realized vol     → is volatility more up or down?
+  AI weights  M1–M60                    → period importance (pre-tested modes)
 
-Modes (UI / soft evidence — NeuralCore stays BUY/SELL/HOLD):
-  BUY   — M5 up + M15 strength, AI prefers BUY
-  SHIFT — M1 structure break against bias; evaluate CLOSE without waiting M60
-  SELL  — M5 down impulse + move > costs
-  HOLD  — conflict / weak trend / spread too wide
-
-Does not invent RSI/MACD. Soft-nudges scores like structure_edge; never a hard veto.
+Direction change (soft evidence — NeuralCore stays BUY/SELL/HOLD):
+  1. BUY     — KAMA up, DI+ dominates, ADX confirms
+  2. SHIFT   — M1 structure + normalized pressure flip (CLOSE without waiting M60)
+  3. CLOSE   — confirmed opposite impulse (exit streak lowered in SHIFT)
+  4. SELL/HOLD — SELL only if new direction confirmed and edge covers spread+slip
 """
 from __future__ import annotations
 
 import math
-from typing import Any
 
 from .bracket_learn import resample_m1_ohlc
 
-# Enough M1 history to pack M15/M30/M60 indicators with Warmup headroom.
-# Capital price history is capped elsewhere; this is the MTF readiness floor.
 DEFAULT_MIN_M1_BARS = 480
 ADX_MIN = 18.0
 STORE_KEY = 'mtf_momentum_v1'
+
+# Pre-tested mode presets — robot picks among these; does not invent free knobs mid-trade.
+MODE_PRESETS = {
+    'trend_follow': {'nudge': 0.10, 'adx_min': 18.0, 'spread_atr_mult': 0.35},
+    'fast_shift': {'nudge': 0.12, 'adx_min': 16.0, 'spread_atr_mult': 0.40},
+    'noise_hold': {'nudge': 0.08, 'adx_min': 22.0, 'spread_atr_mult': 0.50},
+}
 
 
 def _finite(v):
@@ -46,9 +50,16 @@ def _cfg(store=None) -> dict:
         'adx_min': ADX_MIN,
         'spread_atr_mult': 0.35,
         'shift_exit_streak': 1,
+        'kama_er': 10,
+        'kama_fast': 2,
+        'kama_slow': 30,
+        'pressure_windows': (3, 5, 10),
+        'semivar_bars': 30,
+        'mode_preset': 'trend_follow',
+        'exec_slip_bps': 2.0,
     }
     if store is None:
-        return out
+        return _apply_preset(out)
     try:
         from .self_params import get as sp_get
         out['enabled'] = int(sp_get(store, 'mtf_momentum_enabled', 1))
@@ -57,9 +68,31 @@ def _cfg(store=None) -> dict:
         out['adx_min'] = float(sp_get(store, 'mtf_adx_min', ADX_MIN))
         out['spread_atr_mult'] = float(sp_get(store, 'mtf_spread_atr_mult', 0.35))
         out['shift_exit_streak'] = int(sp_get(store, 'mtf_shift_exit_streak', 1))
+        out['kama_er'] = int(sp_get(store, 'mtf_kama_er', 10))
+        out['kama_fast'] = int(sp_get(store, 'mtf_kama_fast', 2))
+        out['kama_slow'] = int(sp_get(store, 'mtf_kama_slow', 30))
+        out['semivar_bars'] = int(sp_get(store, 'mtf_semivar_bars', 30))
+        out['mode_preset'] = str(sp_get(store, 'mtf_mode_preset', 'trend_follow') or 'trend_follow')
+        out['exec_slip_bps'] = float(sp_get(store, 'exec_slip_bps', 2.0))
     except Exception:
         pass
-    return out
+    return _apply_preset(out)
+
+
+def _apply_preset(cfg: dict) -> dict:
+    """Clamp live knobs to a pre-tested mode — no free per-trade mutation."""
+    preset = MODE_PRESETS.get(str(cfg.get('mode_preset') or ''), MODE_PRESETS['trend_follow'])
+    # Soft blend: stored nudge stays inside preset ±20% rails.
+    for k, v in preset.items():
+        cur = _finite(cfg.get(k))
+        if cur is None:
+            cfg[k] = v
+            continue
+        lo, hi = float(v) * 0.8, float(v) * 1.2
+        if k == 'adx_min':
+            lo, hi = float(v) - 4.0, float(v) + 4.0
+        cfg[k] = min(hi, max(lo, cur))
+    return cfg
 
 
 def ema_series(closes, span: int) -> list[float]:
@@ -69,6 +102,30 @@ def ema_series(closes, span: int) -> list[float]:
     out = [float(closes[0])]
     for c in closes[1:]:
         out.append(out[-1] + k * (float(c) - out[-1]))
+    return out
+
+
+def kama_series(closes, er_period: int = 10, fast: int = 2, slow: int = 30) -> list[float]:
+    """Kaufman Adaptive Moving Average — fast in clear trends, slow in noise."""
+    n = len(closes)
+    if n == 0:
+        return []
+    er_n = max(1, int(er_period))
+    fast_sc = 2.0 / (max(1, int(fast)) + 1)
+    slow_sc = 2.0 / (max(1, int(slow)) + 1)
+    out = [float(closes[0])] * n
+    for i in range(1, n):
+        if i < er_n:
+            # Warmup: simple EMA toward close with slow SC.
+            out[i] = out[i - 1] + slow_sc * (float(closes[i]) - out[i - 1])
+            continue
+        change = abs(float(closes[i]) - float(closes[i - er_n]))
+        volatility = 0.0
+        for j in range(i - er_n + 1, i + 1):
+            volatility += abs(float(closes[j]) - float(closes[j - 1]))
+        er = 0.0 if volatility <= 1e-12 else change / volatility
+        sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+        out[i] = out[i - 1] + sc * (float(closes[i]) - out[i - 1])
     return out
 
 
@@ -90,6 +147,14 @@ def atr_wilder(bars, period: int = 14) -> float | None:
     for tr in trs[n:]:
         atr = (atr * (n - 1) + tr) / n
     return atr if math.isfinite(atr) and atr > 0 else None
+
+
+def atr_bundle(bars) -> dict:
+    return {
+        'atr7': atr_wilder(bars, 7),
+        'atr14': atr_wilder(bars, 14),
+        'atr21': atr_wilder(bars, 21),
+    }
 
 
 def adx_di(bars, period: int = 14) -> dict | None:
@@ -146,6 +211,86 @@ def adx_di(bars, period: int = 14) -> dict | None:
     }
 
 
+def market_pressure(bars, window: int) -> float | None:
+    """Normalized OHLC pressure over last N completed candles ∈ [-1, 1].
+
+    Positive = buyers dominating candle bodies; negative = sellers.
+    """
+    w = max(1, int(window))
+    if len(bars) < w:
+        return None
+    chunk = bars[-w:]
+    up = down = 0.0
+    for b in chunk:
+        o, h, l, c = float(b['open']), float(b['high']), float(b['low']), float(b['close'])
+        span = max(h - l, 1e-12)
+        body = c - o
+        # Body share of range, signed.
+        up += max(body, 0.0) / span
+        down += max(-body, 0.0) / span
+        # Close location in range (buying/selling pressure).
+        loc = (c - l) / span
+        up += loc
+        down += (1.0 - loc)
+    tot = up + down
+    if tot <= 1e-12:
+        return 0.0
+    return float((up - down) / tot)
+
+
+def pressure_bundle(bars, windows=(3, 5, 10)) -> dict:
+    out = {}
+    vals = []
+    for w in windows:
+        p = market_pressure(bars, w)
+        out[f'p{w}'] = p
+        if p is not None:
+            vals.append(p)
+    out['mean'] = float(sum(vals) / len(vals)) if vals else None
+    # Flip signal: short window disagrees with longer (early turn).
+    p3, p10 = out.get('p3'), out.get('p10')
+    out['flip'] = None
+    if p3 is not None and p10 is not None:
+        if p3 < -0.15 and p10 > 0.05:
+            out['flip'] = 'SELL'
+        elif p3 > 0.15 and p10 < -0.05:
+            out['flip'] = 'BUY'
+    return out
+
+
+def realized_semivariance(closes, bars: int = 30) -> dict:
+    """Upside / downside realized semivariance from log returns.
+
+    Lets the AI see whether volatility is more up-moves or down-moves
+    (intraday momentum / reversal literature — test on GOLD M1, not assumed).
+    """
+    n = max(2, int(bars))
+    if len(closes) < n + 1:
+        return {'rs_up': None, 'rs_down': None, 'rs_share_up': None, 'n': 0}
+    use = [float(c) for c in closes[-(n + 1):]]
+    rs_up = rs_down = 0.0
+    count = 0
+    for i in range(1, len(use)):
+        if use[i - 1] <= 0 or use[i] <= 0:
+            continue
+        r = math.log(use[i] / use[i - 1])
+        if not math.isfinite(r):
+            continue
+        count += 1
+        if r > 0:
+            rs_up += r * r
+        elif r < 0:
+            rs_down += r * r
+    tot = rs_up + rs_down
+    share = None if tot <= 1e-18 else rs_up / tot
+    return {
+        'rs_up': rs_up if count else None,
+        'rs_down': rs_down if count else None,
+        'rs_share_up': share,
+        'n': count,
+    }
+
+
 def three_candle_break(bars_m1: list) -> dict:
     """M1: last close vs prior 3-candle high/low structure."""
     if len(bars_m1) < 4:
@@ -181,6 +326,20 @@ def price_structure_bias(bars: list) -> str | None:
     return 'MIXED'
 
 
+def period_weights(*, adx_v, pressure_flip, structure_break, kama_slope, strong) -> dict:
+    """AI period importance across M1–M60 — discrete pre-tested emphasis, not free float."""
+    # Defaults: balanced; SHIFT emphasizes M1; strong trend emphasizes M15/M60.
+    w = {'m1': 0.20, 'm5': 0.25, 'm15': 0.25, 'm30': 0.15, 'm60': 0.15}
+    if pressure_flip or structure_break:
+        w = {'m1': 0.40, 'm5': 0.25, 'm15': 0.15, 'm30': 0.10, 'm60': 0.10}
+    elif strong and adx_v is not None and adx_v >= 25:
+        w = {'m1': 0.10, 'm5': 0.20, 'm15': 0.30, 'm30': 0.15, 'm60': 0.25}
+    elif kama_slope is not None and abs(kama_slope) < 1e-6:
+        w = {'m1': 0.15, 'm5': 0.20, 'm15': 0.20, 'm30': 0.20, 'm60': 0.25}
+    s = sum(w.values()) or 1.0
+    return {k: round(v / s, 4) for k, v in w.items()}
+
+
 def _ohlc_tuples_to_dicts(bars_tuples) -> list:
     """Accept list of (o,h,l,c) or dict OHLC."""
     out = []
@@ -205,7 +364,7 @@ def _ohlc_tuples_to_dicts(bars_tuples) -> list:
 
 
 def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None) -> dict:
-    """Compute MTF stack + mode from completed M1 OHLC rows."""
+    """Compute KAMA/ADX/ATR/Pressure/Structure/Semivar stack + mode."""
     cfg = _cfg(store)
     rows = _ohlc_tuples_to_dicts(candles)
     need = max(61, int(cfg['min_m1_bars']))
@@ -219,6 +378,7 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         'bars_m1': len(rows),
         'need_m1': need,
         'enabled': bool(cfg['enabled']),
+        'stack': 'kama_adx_atr_pressure',
         'tf': {},
     }
     if not cfg['enabled']:
@@ -231,120 +391,180 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
     m15 = resample_m1_ohlc(rows, 15)
     m30 = resample_m1_ohlc(rows, 30)
     m60 = resample_m1_ohlc(rows, 60)
-    if len(m1) < 20 or len(m5) < 25 or len(m15) < 30:
+    if len(m1) < 40 or len(m5) < 35 or len(m15) < 30:
         return dict(base, reason='higher_tf_warmup_incomplete',
                     bars_m1=len(rows), tf={
                         'm1': len(m1), 'm5': len(m5), 'm15': len(m15),
                         'm30': len(m30), 'm60': len(m60),
                     })
 
-    # --- M1 ---
+    # --- KAMA (adaptive trend on M5; M1 for early slope) ---
     c1 = [float(b['close']) for b in m1]
+    c5 = [float(b['close']) for b in m5]
+    kama_m5 = kama_series(c5, cfg['kama_er'], cfg['kama_fast'], cfg['kama_slow'])
+    kama_m1 = kama_series(c1, cfg['kama_er'], cfg['kama_fast'], cfg['kama_slow'])
+    kama_slope = None
+    if len(kama_m5) >= 4:
+        kama_slope = kama_m5[-1] - kama_m5[-4]
+    kama_up = kama_slope is not None and kama_slope > 0
+    kama_down = kama_slope is not None and kama_slope < 0
+    kama_rising = len(kama_m5) >= 2 and kama_m5[-1] > kama_m5[-2]
+
+    # --- Structure M1 / M5 ---
+    br = three_candle_break(m1)
+    struct_m5 = price_structure_bias(m5)
+    # Legacy EMA retained as secondary (compat with older tests/UI).
     e5 = ema_series(c1, 5)
     e13 = ema_series(c1, 13)
-    br = three_candle_break(m1)
-    m1_up = e5[-1] > e13[-1]
-    tf_m1 = {
-        'ema5': e5[-1], 'ema13': e13[-1], 'ema_up': m1_up,
-        'structure_break': br.get('break'),
-        'prior_high': br.get('prior_high'), 'prior_low': br.get('prior_low'),
-    }
-
-    # --- M5 ---
-    c5 = [float(b['close']) for b in m5]
     e9 = ema_series(c5, 9)
     e21 = ema_series(c5, 21)
-    atr5 = atr_wilder(m5, 14)
+    m1_up = e5[-1] > e13[-1]
     m5_up = e9[-1] > e21[-1]
     m5_down = e9[-1] < e21[-1]
-    tf_m5 = {
-        'ema9': e9[-1], 'ema21': e21[-1], 'ema_up': m5_up, 'ema_down': m5_down,
-        'atr14': atr5,
-    }
 
-    # --- M15 ---
-    adx = adx_di(m15, 14) or {}
-    adx_v = _finite(adx.get('adx'))
-    di_p = _finite(adx.get('di_plus'))
-    di_m = _finite(adx.get('di_minus'))
+    # --- Pressure 3/5/10 ---
+    pressure = pressure_bundle(m1, cfg['pressure_windows'])
+
+    # --- ATR 7/14/21 (M5 primary for stops / move size) ---
+    atrs = atr_bundle(m5)
+    atr14 = atrs.get('atr14')
+
+    # --- ADX + DI on M5 and M15 ---
+    adx5 = adx_di(m5, 14) or {}
+    adx15 = adx_di(m15, 14) or {}
+    adx_v = _finite(adx15.get('adx'))
+    if adx_v is None:
+        adx_v = _finite(adx5.get('adx'))
+    di_p = _finite(adx15.get('di_plus'))
+    if di_p is None:
+        di_p = _finite(adx5.get('di_plus'))
+    di_m = _finite(adx15.get('di_minus'))
+    if di_m is None:
+        di_m = _finite(adx5.get('di_minus'))
     adx_min = float(cfg['adx_min'])
     strong = adx_v is not None and adx_v >= adx_min
     di_buy = di_p is not None and di_m is not None and di_p > di_m
     di_sell = di_p is not None and di_m is not None and di_m > di_p
-    tf_m15 = {
-        'adx': adx_v, 'di_plus': di_p, 'di_minus': di_m,
-        'strong': strong, 'di_buy': di_buy, 'di_sell': di_sell,
-    }
 
-    # --- M30 ---
+    # --- Semivariance (M1) ---
+    semivar = realized_semivariance(c1, cfg['semivar_bars'])
+
+    # --- M30 / M60 context ---
     atr30 = atr_wilder(m30, 14) if len(m30) >= 16 else None
     mom30 = None
     if len(m30) >= 2 and atr30 and atr30 > 0:
         mom30 = (float(m30[-1]['close']) - float(m30[-2]['close'])) / atr30
-    tf_m30 = {'atr14': atr30, 'mom_atr': mom30}
-
-    # --- M60 ---
     c60 = [float(b['close']) for b in m60] if m60 else []
-    e20 = ema_series(c60, 20) if len(c60) >= 5 else []
-    slope = None
-    if len(e20) >= 3:
-        slope = e20[-1] - e20[-3]
+    kama60 = kama_series(c60, cfg['kama_er'], cfg['kama_fast'], cfg['kama_slow']) if len(c60) >= 5 else []
+    slope60 = (kama60[-1] - kama60[-3]) if len(kama60) >= 3 else None
     struct60 = price_structure_bias(m60) if m60 else None
-    m60_up = (slope is not None and slope > 0) or struct60 == 'UP'
-    m60_down = (slope is not None and slope < 0) or struct60 == 'DOWN'
+    m60_up = (slope60 is not None and slope60 > 0) or struct60 == 'UP'
+    m60_down = (slope60 is not None and slope60 < 0) or struct60 == 'DOWN'
+
+    close = float(m1[-1]['close'])
+    spr = _finite(spread) or 0.0
+    slip = max(0.0, float(cfg.get('exec_slip_bps') or 0)) * close / 10000.0
+    cost = spr + slip
+    # Expected move (ATR14) must cover spread + slippage * mult.
+    move_ok = True
+    if atr14 is not None and atr14 > 0 and close > 0:
+        move_ok = atr14 >= cost * float(cfg['spread_atr_mult'])
+    spread_blocked = not move_ok and cost > 0
+
+    weights = period_weights(
+        adx_v=adx_v,
+        pressure_flip=pressure.get('flip'),
+        structure_break=br.get('break'),
+        kama_slope=kama_slope,
+        strong=strong,
+    )
+
+    # --- Mode: BUY → SHIFT(pressure) → CLOSE path → SELL/HOLD ---
+    mode = 'HOLD'
+    preferred = 'HOLD'
+    conf = 0.35
+    reason = 'signals_conflict_or_weak'
+    p_flip = pressure.get('flip')
+    p_mean = pressure.get('mean')
+
+    # 2) Pressure / structure turn — SHIFT (CLOSE without waiting M60).
+    if (br.get('break') == 'DOWN' or p_flip == 'SELL') and (kama_up or m5_up or m60_up):
+        mode, preferred, conf = 'SHIFT', 'SELL', 0.74
+        reason = 'pressure_or_structure_flip_sell'
+    elif (br.get('break') == 'UP' or p_flip == 'BUY') and (kama_down or m5_down or m60_down):
+        mode, preferred, conf = 'SHIFT', 'BUY', 0.74
+        reason = 'pressure_or_structure_flip_buy'
+    elif spread_blocked or (adx_v is not None and adx_v < adx_min * 0.75):
+        mode, preferred, conf = 'HOLD', 'HOLD', 0.55
+        reason = 'spread_slip_or_weak_adx' if spread_blocked else 'weak_adx'
+    # 1) BUY trend: KAMA up + DI+ + ADX
+    elif (kama_up or kama_rising) and strong and di_buy and move_ok:
+        mode, preferred = 'BUY', 'BUY'
+        conf = 0.55 + min(0.35, (adx_v - adx_min) / 100.0)
+        if m60_up:
+            conf = min(0.95, conf + 0.06)
+        if p_mean is not None and p_mean > 0:
+            conf = min(0.95, conf + 0.04)
+        if semivar.get('rs_share_up') is not None and semivar['rs_share_up'] > 0.55:
+            conf = min(0.95, conf + 0.04)
+        reason = 'kama_up_di_plus_adx_confirms'
+    # 4) SELL only if confirmed + edge covers costs
+    elif (kama_down or (not kama_rising and m5_down)) and strong and di_sell and move_ok:
+        mode, preferred = 'SELL', 'SELL'
+        conf = 0.55 + min(0.35, (adx_v - adx_min) / 100.0)
+        if m60_down:
+            conf = min(0.95, conf + 0.06)
+        if p_mean is not None and p_mean < 0:
+            conf = min(0.95, conf + 0.04)
+        if semivar.get('rs_share_up') is not None and semivar['rs_share_up'] < 0.45:
+            conf = min(0.95, conf + 0.04)
+        reason = 'kama_down_confirmed_edge_covers_costs'
+    elif not strong or (di_buy and kama_down) or (di_sell and kama_up):
+        mode, preferred, conf = 'HOLD', 'HOLD', 0.5
+        reason = 'tf_conflict_or_weak_trend'
+
+    stop_hint = None
+    if atr14 is not None and close > 0:
+        # Soft stop distance suggestion (ATR14) — brackets still own LIVE SL.
+        stop_hint = round(float(atr14), 6)
+
+    tf_m1 = {
+        'kama': kama_m1[-1] if kama_m1 else None,
+        'ema5': e5[-1], 'ema13': e13[-1], 'ema_up': m1_up,
+        'structure_break': br.get('break'),
+        'prior_high': br.get('prior_high'), 'prior_low': br.get('prior_low'),
+        'pressure': pressure,
+        'semivariance': semivar,
+    }
+    tf_m5 = {
+        'kama': kama_m5[-1] if kama_m5 else None,
+        'kama_slope': kama_slope,
+        'kama_up': kama_up, 'kama_down': kama_down,
+        'ema9': e9[-1], 'ema21': e21[-1], 'ema_up': m5_up, 'ema_down': m5_down,
+        'structure': struct_m5,
+        'atr': atrs,
+        'atr14': atr14,
+        'adx': _finite(adx5.get('adx')),
+        'di_plus': _finite(adx5.get('di_plus')),
+        'di_minus': _finite(adx5.get('di_minus')),
+    }
+    tf_m15 = {
+        'adx': _finite(adx15.get('adx')),
+        'di_plus': _finite(adx15.get('di_plus')),
+        'di_minus': _finite(adx15.get('di_minus')),
+        'strong': strong, 'di_buy': di_buy, 'di_sell': di_sell,
+    }
+    tf_m30 = {'atr14': atr30, 'mom_atr': mom30}
     tf_m60 = {
-        'ema20': e20[-1] if e20 else None,
-        'ema20_slope': slope,
+        'kama': kama60[-1] if kama60 else None,
+        'kama_slope': slope60,
+        'ema20_slope': slope60,  # compat key for older persist/UI
         'structure': struct60,
         'bias_up': bool(m60_up and not m60_down),
         'bias_down': bool(m60_down and not m60_up),
     }
 
-    close = float(m1[-1]['close'])
-    spr = _finite(spread) or 0.0
-    # Expected move proxy: M5 ATR; costs = spread. Require move > cost * mult.
-    move_ok = True
-    if atr5 is not None and atr5 > 0 and close > 0:
-        move_ok = atr5 >= max(spr, 0.0) * float(cfg['spread_atr_mult'])
-    spread_blocked = not move_ok and spr > 0
-
-    # --- Mode selection (hierarchy: M1 reacts, M5 confirms, M15 strength, M60 context) ---
-    mode = 'HOLD'
-    preferred = 'HOLD'
-    conf = 0.35
-    reason = 'signals_conflict_or_weak'
-
-    # SHIFT: M1 structure break against M5/M60 bias — react before M60 flips.
-    if br.get('break') == 'DOWN' and (m5_up or tf_m60.get('bias_up')):
-        mode, preferred, conf = 'SHIFT', 'SELL', 0.72
-        reason = 'm1_structure_break_down_against_bias'
-    elif br.get('break') == 'UP' and (m5_down or tf_m60.get('bias_down')):
-        mode, preferred, conf = 'SHIFT', 'BUY', 0.72
-        reason = 'm1_structure_break_up_against_bias'
-    elif spread_blocked or (adx_v is not None and adx_v < adx_min * 0.75):
-        mode, preferred, conf = 'HOLD', 'HOLD', 0.55
-        reason = 'spread_or_weak_adx' if spread_blocked else 'weak_adx'
-    elif m5_up and strong and di_buy and move_ok:
-        mode, preferred = 'BUY', 'BUY'
-        conf = 0.55 + min(0.35, (adx_v - adx_min) / 100.0)
-        if tf_m60.get('bias_up'):
-            conf = min(0.95, conf + 0.08)
-        if mom30 is not None and mom30 > 0:
-            conf = min(0.95, conf + 0.05)
-        reason = 'm5_ema_up_m15_adx_confirms'
-    elif m5_down and strong and di_sell and move_ok:
-        mode, preferred = 'SELL', 'SELL'
-        conf = 0.55 + min(0.35, (adx_v - adx_min) / 100.0)
-        if tf_m60.get('bias_down'):
-            conf = min(0.95, conf + 0.08)
-        if mom30 is not None and mom30 < 0:
-            conf = min(0.95, conf + 0.05)
-        reason = 'm5_ema_down_impulse_covers_costs'
-    elif not strong or (di_buy and m5_down) or (di_sell and m5_up):
-        mode, preferred, conf = 'HOLD', 'HOLD', 0.5
-        reason = 'tf_conflict_or_weak_trend'
-
-    out = {
+    return {
         'ready': True,
         'mode': mode,
         'preferred': preferred,
@@ -354,8 +574,14 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         'bars_m1': len(rows),
         'need_m1': need,
         'enabled': True,
+        'stack': 'kama_adx_atr_pressure',
         'spread': spr,
+        'slip_price': round(slip, 6),
+        'cost': round(cost, 6),
         'move_ok': move_ok,
+        'stop_hint_atr14': stop_hint,
+        'period_weights': weights,
+        'mode_preset': cfg.get('mode_preset'),
         'tf': {
             'm1': tf_m1, 'm5': tf_m5, 'm15': tf_m15,
             'm30': tf_m30, 'm60': tf_m60,
@@ -364,13 +590,12 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
                 'm30': len(m30), 'm60': len(m60),
             },
         },
-        'hierarchy': 'M60=context M15=strength M5=direction M1=react',
+        'hierarchy': 'KAMA=trend ADX=strength ATR=noise Pressure=reversal M1=react',
     }
-    return out
 
 
 def soft_nudge_scores(scores, analysis, *, store=None):
-    """Tilt BUY/SELL/HOLD toward MTF preferred mode. SHIFT boosts opposite side + HOLD damp."""
+    """Tilt BUY/SELL/HOLD toward MTF preferred mode. SHIFT boosts reverse for CLOSE."""
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
     if not isinstance(analysis, dict) or not analysis.get('ready'):
@@ -383,10 +608,12 @@ def soft_nudge_scores(scores, analysis, *, store=None):
     conf = float(analysis.get('confidence') or 0)
     if conf < 0.4:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence', 'mode': mode}
-    delta = float(cfg['nudge']) * conf
+    # Scale nudge by AI period weight on the reacting TF (M1 on SHIFT, else M5/M15).
+    weights = analysis.get('period_weights') or {}
+    w_scale = float(weights.get('m1' if mode == 'SHIFT' else 'm5') or 0.25)
+    delta = float(cfg['nudge']) * conf * (0.7 + 0.6 * w_scale)
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     if mode == 'SHIFT' and preferred in ('BUY', 'SELL'):
-        # Turning: damp current conviction HOLD, lift reverse side for CLOSE/re-entry.
         out[preferred] = out.get(preferred, 0) + delta
         out['HOLD'] = out.get('HOLD', 0) - 0.25 * delta
         other = 'SELL' if preferred == 'BUY' else 'BUY'
@@ -411,12 +638,12 @@ def soft_nudge_scores(scores, analysis, *, store=None):
     return out, {
         'nudged': True, 'mode': mode, 'target': preferred,
         'delta': delta, 'confidence': conf, 'reason': analysis.get('reason'),
-        'renormalized': True,
+        'period_weights': weights, 'renormalized': True,
     }
 
 
 def exit_need_streak(analysis, *, store=None, default: int = 2) -> int:
-    """SHIFT: evaluate CLOSE sooner — do not wait for M60 EMA flip."""
+    """SHIFT/pressure flip: evaluate CLOSE sooner — do not wait for M60 trend flip."""
     cfg = _cfg(store)
     if (isinstance(analysis, dict) and analysis.get('ready')
             and str(analysis.get('mode') or '').upper() == 'SHIFT'):
@@ -428,6 +655,8 @@ def persist(store, analysis: dict) -> None:
     if store is None or not isinstance(analysis, dict):
         return
     try:
+        m5 = (analysis.get('tf') or {}).get('m5') or {}
+        m1 = (analysis.get('tf') or {}).get('m1') or {}
         slim = {
             'mode': analysis.get('mode'),
             'preferred': analysis.get('preferred'),
@@ -435,11 +664,17 @@ def persist(store, analysis: dict) -> None:
             'reason': analysis.get('reason'),
             'ready': analysis.get('ready'),
             'bars_m1': analysis.get('bars_m1'),
+            'stack': analysis.get('stack'),
+            'stop_hint_atr14': analysis.get('stop_hint_atr14'),
+            'period_weights': analysis.get('period_weights'),
             'tf': {
-                'm5_up': ((analysis.get('tf') or {}).get('m5') or {}).get('ema_up'),
+                'kama_up': m5.get('kama_up'),
+                'm5_up': m5.get('ema_up'),
                 'm15_adx': ((analysis.get('tf') or {}).get('m15') or {}).get('adx'),
-                'm1_break': ((analysis.get('tf') or {}).get('m1') or {}).get('structure_break'),
-                'm60_slope': ((analysis.get('tf') or {}).get('m60') or {}).get('ema20_slope'),
+                'm1_break': m1.get('structure_break'),
+                'pressure_flip': (m1.get('pressure') or {}).get('flip'),
+                'rs_share_up': (m1.get('semivariance') or {}).get('rs_share_up'),
+                'm60_slope': ((analysis.get('tf') or {}).get('m60') or {}).get('kama_slope'),
             },
         }
         store.set(STORE_KEY, slim)

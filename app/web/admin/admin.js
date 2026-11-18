@@ -658,6 +658,9 @@ function renderCard(c){
       <div><span>Signāls</span><strong>${esc(c.action||'—')}</strong></div>
       <div><span>MTF režīms</span><strong>${esc(((a.mtf_momentum||{}).mode)||'—')}${
         (a.mtf_momentum&&a.mtf_momentum.preferred)?(' · '+esc(a.mtf_momentum.preferred)) : ''
+      }${
+        (a.mtf_momentum&&a.mtf_momentum.stop_hint_atr14!=null)
+          ?(' · ATR '+esc(num(a.mtf_momentum.stop_hint_atr14,2))) : ''
       }</strong></div>
       <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
       <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>

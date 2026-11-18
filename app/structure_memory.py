@@ -304,11 +304,17 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
 
 def extension_chase(action, *, candles=None, market_context=None, atr=None,
                     lookback=30, top_frac=0.85, min_atr_mult=2.0) -> dict:
-    """Block BUY/SELL that chase a vertical impulse into the extreme.
+    """Block only exhaustion chases — not clear trend continuation.
 
-    Classic failure: huge M1 rally (or dump), neuron still BUY, entry near the
-    local high on a weak bounce — then mean-reversion. Structure memory after a
-    prior trade does not catch this on a fresh OPEN.
+    Block:
+      • BUY at the top of a large impulse while M1 is already rolling (reds)
+      • SELL at the bottom while M1 is bouncing (greens)
+
+    Allow:
+      • SELL still printing reds at the low (the live dump that became HOLD)
+      • BUY still printing greens at the high (continuation, not a weak bounce)
+
+    Earlier “always block at extreme” turned every sustained move into HOLD.
     """
     if action not in ('BUY', 'SELL'):
         return {'needed': False, 'ok': True, 'reason': 'not_directional'}
@@ -332,23 +338,53 @@ def extension_chase(action, *, candles=None, market_context=None, atr=None,
             return {'needed': False, 'ok': True, 'reason': 'impulse_not_large',
                     'span': span, 'atr': atr_v}
     pos = (mid - lo) / span  # 0=bottom, 1=top of lookback range
-    # Recent micro-turn against the chase (rollover / bounce failure).
     last3 = path[-3:]
     reds = sum(1 for b in last3 if b['close'] < b['open'])
     greens = sum(1 for b in last3 if b['close'] > b['open'])
+    # Same-dir M1 streak = clear candle pressure — do not HOLD for “weak body”.
+    same_dir = 0
+    for b in reversed(path[-8:]):
+        if action == 'SELL' and b['close'] < b['open']:
+            same_dir += 1
+        elif action == 'BUY' and b['close'] > b['open']:
+            same_dir += 1
+        else:
+            break
     frac = float(top_frac)
     if action == 'BUY' and pos >= frac:
-        # At top of a large impulse — refuse chase, especially if already rolling.
+        if same_dir >= 2:
+            return {
+                'needed': False, 'ok': True, 'reason': 'continuation_at_high',
+                'pos': round(pos, 3), 'span': span, 'mid': mid,
+                'same_dir_streak': same_dir,
+            }
+        if reds >= 2:
+            return {
+                'needed': True, 'ok': False, 'reason': 'chase_extension_high',
+                'pos': round(pos, 3), 'span': span, 'mid': mid,
+                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+            }
         return {
-            'needed': True, 'ok': False, 'reason': 'chase_extension_high',
-            'pos': round(pos, 3), 'span': span, 'mid': mid,
-            'range_hi': hi, 'range_lo': lo, 'rolling': reds >= 2,
+            'needed': False, 'ok': True, 'reason': 'top_without_rollover',
+            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'reds': reds,
         }
     if action == 'SELL' and pos <= (1.0 - frac):
+        if same_dir >= 2:
+            # Clear dump with consecutive red M1 — OPEN allowed (user screenshot).
+            return {
+                'needed': False, 'ok': True, 'reason': 'continuation_at_low',
+                'pos': round(pos, 3), 'span': span, 'mid': mid,
+                'same_dir_streak': same_dir,
+            }
+        if greens >= 2:
+            return {
+                'needed': True, 'ok': False, 'reason': 'chase_extension_low',
+                'pos': round(pos, 3), 'span': span, 'mid': mid,
+                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+            }
         return {
-            'needed': True, 'ok': False, 'reason': 'chase_extension_low',
-            'pos': round(pos, 3), 'span': span, 'mid': mid,
-            'range_hi': hi, 'range_lo': lo, 'rolling': greens >= 2,
+            'needed': False, 'ok': True, 'reason': 'low_without_bounce',
+            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'greens': greens,
         }
     return {'needed': False, 'ok': True, 'reason': 'not_extended',
             'pos': round(pos, 3), 'span': span}

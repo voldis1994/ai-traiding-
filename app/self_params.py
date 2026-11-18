@@ -146,14 +146,20 @@ DEFAULTS = {
     'day_add_trend_floor': 0.02,
     'day_phase_protect_tilt': 0.10,
     'day_phase_defend_tilt': 0.16,
-    # Multi-TF Momentum + Structure + ADX + ATR (start config for GOLD tests).
+    # Adaptive KAMA + ADX/DI + ATR + Pressure + Semivariance (GOLD start stack).
     # Soft evidence only — NeuralCore stays BUY/SELL/HOLD; SHIFT is a mode.
+    # Params pick among pre-tested presets — not free mutation every trade.
     'mtf_momentum_enabled': 1,
     'mtf_momentum_nudge': 0.10,
     'mtf_min_m1_bars': 480,
     'mtf_adx_min': 18.0,
     'mtf_spread_atr_mult': 0.35,
     'mtf_shift_exit_streak': 1,
+    'mtf_kama_er': 10,
+    'mtf_kama_fast': 2,
+    'mtf_kama_slow': 30,
+    'mtf_semivar_bars': 30,
+    'mtf_mode_preset': 'trend_follow',  # trend_follow | fast_shift | noise_hold
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -255,6 +261,10 @@ BOUNDS = {
     'mtf_adx_min': (10.0, 40.0),
     'mtf_spread_atr_mult': (0.1, 1.5),
     'mtf_shift_exit_streak': (1, 3),
+    'mtf_kama_er': (5, 20),
+    'mtf_kama_fast': (2, 5),
+    'mtf_kama_slow': (20, 40),
+    'mtf_semivar_bars': (10, 120),
 }
 
 IMMUTABLE_NOTE = (

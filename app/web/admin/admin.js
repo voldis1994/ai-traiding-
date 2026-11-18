@@ -36,7 +36,7 @@ function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${
 
 function sourceLabel(src){
   if(src==='broker')return 'broker £';
-  if(src==='upl_estimate')return 'UPL estimate';
+  if(src==='upl_estimate')return 'UPL peļņa';
   if(src==='open_upl')return 'live UPL';
   if(src==='working')return 'working';
   if(src==='none'||src==='empty')return 'nav skaitļu';
@@ -615,7 +615,8 @@ function renderCard(c){
     const p=t.pnl;const cls=pnlClass(p);
     const tCcy=t.pnl_currency||ccy;
     const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
-    const src=pending?' [gaida £]':(t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'');
+    const src=pending?' [gaida £]':(t.pnl_source==='upl_estimate'?' [UPL]':
+      (t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:''));
     let right;
     if(p!=null){right=money(p,tCcy);}
     else if(pending&&t.upl_hint!=null){right=`gaida · UPL ${money(t.upl_hint,tCcy)}`;}

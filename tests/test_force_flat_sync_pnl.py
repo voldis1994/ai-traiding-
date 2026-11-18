@@ -95,8 +95,8 @@ def test_flat_sync_retries_pending_and_binds():
     asyncio.run(scenario())
 
 
-def test_pending_never_writes_upl_estimate():
-    """After many retries, still no upl_estimate row — wait for broker cash only."""
+def test_pending_settles_last_upl_as_realized():
+    """Capital cash lag → bank last live UPL as peļņa and clear [gaida £]."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -105,29 +105,27 @@ def test_pending_never_writes_upl_estimate():
             e.policy=AutoEvolution(store,Path(d)/'policy.py')
             broker=HistoryBroker()
             e.attach(broker)
-            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1',
+                                    'balance':{'equity':10_000}}]}
             store.upsert_trade({'dealId':'upl1','epic':'GOLD','size':'.02','direction':'SELL','level':100})
             store.set('entry_brain:upl1',{
                 'epic':'GOLD','direction':'SELL','entry':100,'tick_size':.01,
                 'transition':brain._json_transition(brain.core.last_transition)})
             store.set('last_upl:upl1',{'upl':-0.19,'currency':'GBP'})
             store.set('pending_broker_pnl_deals',
-                      [{'deal_id':'upl1','exit_level':99.8,'attempts':5,
+                      [{'deal_id':'upl1','exit_level':99.8,'attempts':1,
                         'queued_at':'2026-10-29T10:00:00+00:00'}])
             await e._retry_pending_broker_pnl()
-            # Trade may still be open/pending — must NOT have upl_estimate pnl.
-            rows=store.trades(5)
-            for row in rows:
-                assert row.get('pnl_source')!='upl_estimate'
-            pending=store.get('pending_broker_pnl_deals') or []
-            assert any(str(x.get('deal_id'))=='upl1' for x in pending)
-            assert not any(x.get('upl_shown') for x in pending if isinstance(x,dict))
-            assert not e._trade_already_learned('upl1')
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.19)
+            assert row['pnl_source']=='upl_estimate'
+            assert not (store.get('pending_broker_pnl_deals') or [])
+            assert store.get('broker_cash_banked:upl1')
     asyncio.run(scenario())
 
 
 def test_broker_cash_after_pending_without_upl_estimate():
-    """Pending stays empty of estimates; first real £ learns once."""
+    """No last UPL → stay pending; first real Capital £ learns once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -141,7 +139,7 @@ def test_broker_cash_after_pending_without_upl_estimate():
             store.set('entry_brain:upl2',{
                 'epic':'GOLD','direction':'BUY','entry':100,'tick_size':.01,
                 'transition':brain._json_transition(brain.core.last_transition)})
-            store.set('last_upl:upl2',{'upl':-0.25,'currency':'GBP'})
+            # No last_upl — must wait for Capital cash.
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'upl2','exit_level':99.7,'attempts':5,
                         'queued_at':'2026-10-29T10:00:00+00:00'}])

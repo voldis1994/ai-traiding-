@@ -88,11 +88,29 @@ class AccountRuntime:
         }
 
     def _enrich_positions(self,engine,positions,brief=None) -> list:
+        market=getattr(engine,'market',None) if engine is not None else None
+        if not isinstance(market,dict):
+            market={}
+        m_mid=market.get('mid')
+        m_bid=market.get('bid')
+        m_ask=market.get('ask') if market.get('ask') is not None else market.get('offer')
         out=[]
         for p in positions or []:
             if not isinstance(p,dict):
                 continue
             truth=self._deal_protection_truth(engine,p,brief=brief)
+            bid=p.get('bid') if p.get('bid') is not None else m_bid
+            ask=(p.get('ask') if p.get('ask') is not None
+                 else (p.get('offer') if p.get('offer') is not None else m_ask))
+            mid=p.get('mid')
+            if mid is None:
+                mid=m_mid
+            if mid is None and bid is not None and ask is not None:
+                try:mid=(float(bid)+float(ask))/2.0
+                except (TypeError,ValueError):mid=None
+            current=(p.get('currentLevel') if p.get('currentLevel') is not None
+                     else (p.get('current_price') if p.get('current_price') is not None
+                           else (p.get('mark') if p.get('mark') is not None else mid)))
             out.append({
                 'dealId':p.get('dealId'),
                 'epic':p.get('epic'),
@@ -103,6 +121,10 @@ class AccountRuntime:
                 'profitLevel':p.get('profitLevel'),
                 'upl':p.get('upl'),
                 'currency':p.get('currency'),
+                'bid':bid,
+                'ask':ask,
+                'mid':mid,
+                'currentLevel':current,
                 **truth,
             })
         return out
@@ -333,13 +355,15 @@ class RuntimeHub:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
         # Never invent 0.00 when multi-currency cash cannot be summed.
+        # Also never invent 0.00 when there are simply no closed trades — that
+        # blanked Admin "Kopējais P&L" while live open UPL was available.
         closed_n=len(closed_rows)
         if primary:
             realized=primary['realized_pnl']
         elif by_ccy:
             realized=None
-        elif closed_n>0 and cash_n==0:
-            # Never invent a fake 0.00 when closes lack broker cash.
+        elif closed_n==0 or cash_n==0:
+            # No closes, or closes without broker cash — do not fake 0.00.
             realized=None
         else:
             realized=0.0
@@ -361,9 +385,8 @@ class RuntimeHub:
             working_pnl=round(estimate_sum,4)
             working_pnl_source='upl_estimate'
         else:
-            working_pnl=realized
-            working_pnl_source=('broker' if realized is not None and cash_n>0
-                                else ('none' if closed_n else 'empty'))
+            working_pnl=None
+            working_pnl_source=('none' if closed_n else 'empty')
         if cash_n>0:
             display_wins,display_losses,wl_source=wins,losses,'broker'
         elif estimate_n>0:
@@ -519,6 +542,11 @@ class RuntimeHub:
                     'tick_count':int(view.get('tick_count') or snap.get('tick_count') or 0),
                     'market':(view.get('mandate') or {}).get('epic') or (snap.get('market') or {}).get('epic'),
                     'market_status':(snap.get('market') or {}).get('status'),
+                    'market_mid':(snap.get('market') or {}).get('mid'),
+                    'market_bid':(snap.get('market') or {}).get('bid'),
+                    'market_ask':((snap.get('market') or {}).get('ask')
+                                 if (snap.get('market') or {}).get('ask') is not None
+                                 else (snap.get('market') or {}).get('offer')),
                     'mandate':view.get('mandate'),
                     'position':view.get('position'),
                     'positions':view.get('positions') or (
@@ -552,10 +580,22 @@ class RuntimeHub:
         if store is not None:
             try:
                 upl=None
-                pos=card.get('activity',{}).get('position') or {}
-                if isinstance(pos,dict) and pos.get('upl') is not None:
-                    try:upl=float(pos['upl'])
-                    except (TypeError,ValueError):upl=None
+                pos_list=card.get('activity',{}).get('positions') or []
+                if not pos_list:
+                    one=card.get('activity',{}).get('position')
+                    pos_list=[one] if isinstance(one,dict) else []
+                vals=[]
+                for pos in pos_list:
+                    if not isinstance(pos,dict) or pos.get('upl') is None:
+                        continue
+                    try:
+                        u=float(pos['upl'])
+                    except (TypeError,ValueError):
+                        continue
+                    if __import__('math').isfinite(u):
+                        vals.append(u)
+                if vals:
+                    upl=sum(vals)
                 card['results']=self._trade_stats(
                     store,card.get('account_currency'),open_upl=upl)
             except Exception:pass
@@ -648,19 +688,35 @@ class RuntimeHub:
         # Never add GBP + USD into one number.
         by_ccy: dict[str,float]={}
         working_by_ccy: dict[str,float]={}
+        open_upl_by_ccy: dict[str,float]={}
         display_wins=0
         display_losses=0
+        open_positions=0
         for c in clients:
             res=c.get('results') or {}
+            act=c.get('activity') or {}
             for ccy,val in (res.get('pnl_by_currency') or {}).items():
                 by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(val or 0),4)
             if not res.get('pnl_by_currency') and res.get('pnl_currency') and res.get('realized_pnl') is not None:
                 ccy=res['pnl_currency']
                 by_ccy[ccy]=round(by_ccy.get(ccy,0.0)+float(res.get('realized_pnl') or 0),4)
             wp=res.get('working_pnl')
-            wccy=(res.get('pnl_currency') or '').strip().upper() or None
-            if wp is not None and wccy:
+            wsrc=(res.get('working_pnl_source') or '').strip().lower()
+            wccy=(res.get('pnl_currency') or c.get('account_currency') or '').strip().upper() or None
+            # Skip empty/none working_pnl placeholders — they used to force fleet 0.00.
+            if wp is not None and wccy and wsrc not in ('none','empty',''):
                 working_by_ccy[wccy]=round(working_by_ccy.get(wccy,0.0)+float(wp),4)
+            ou=res.get('open_upl')
+            if ou is not None and wccy:
+                try:
+                    ou_f=float(ou)
+                except (TypeError,ValueError):
+                    ou_f=None
+                if ou_f is not None and __import__('math').isfinite(ou_f):
+                    open_upl_by_ccy[wccy]=round(open_upl_by_ccy.get(wccy,0.0)+ou_f,4)
+            pos_list=act.get('positions') or (
+                [act['position']] if isinstance(act.get('position'),dict) else [])
+            open_positions+=sum(1 for p in pos_list if isinstance(p,dict))
             display_wins+=int(res.get('display_wins') or 0)
             display_losses+=int(res.get('display_losses') or 0)
         primary=None
@@ -671,6 +727,10 @@ class RuntimeHub:
         if len(working_by_ccy)==1:
             ccy,val=next(iter(working_by_ccy.items()))
             working_primary={'currency':ccy,'working_pnl':val}
+        open_upl_primary=None
+        if len(open_upl_by_ccy)==1:
+            ccy,val=next(iter(open_upl_by_ccy.items()))
+            open_upl_primary={'currency':ccy,'open_upl':val}
         if total_closed>0 and total_cash==0:
             pnl_status='closed_without_broker_cash'
         elif total_pending>0:
@@ -681,17 +741,23 @@ class RuntimeHub:
             pnl_status='no_closes'
         wl_source=('broker' if total_cash>0 else
                    ('upl_estimate' if total_estimate>0 else 'none'))
+        working_src=('broker' if total_cash>0 else
+                     ('upl_estimate' if total_estimate>0 else
+                      ('open_upl' if open_upl_primary else 'none')))
         return {
             'summary':{
                 'clients':len(clients),
                 'running_robots':running,
+                'open_trades_all':open_positions,
                 # Multi-currency: never sum GBP+USD into one number (or fake 0.0).
                 'realized_pnl_all':primary['realized_pnl'] if primary else None,
                 'working_pnl_all':(working_primary['working_pnl'] if working_primary else None),
-                'working_pnl_source':('broker' if total_cash>0 else
-                                     ('upl_estimate' if total_estimate>0 else 'none')),
+                'working_pnl_source':working_src,
+                'open_upl_all':(open_upl_primary['open_upl'] if open_upl_primary else None),
+                'open_upl_by_currency':open_upl_by_ccy,
                 'pnl_currency':(working_primary['currency'] if working_primary
-                                else (primary['currency'] if primary else None)),
+                                else (open_upl_primary['currency'] if open_upl_primary
+                                      else (primary['currency'] if primary else None))),
                 'pnl_by_currency':by_ccy,
                 'working_pnl_by_currency':working_by_ccy,
                 'closed_trades_all':total_closed,

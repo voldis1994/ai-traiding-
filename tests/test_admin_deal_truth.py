@@ -1,4 +1,6 @@
 """Admin Signal Deck: lot / side / TP / trail truth on live deals."""
+import pytest
+
 from app.runtime_hub import AccountRuntime
 
 
@@ -57,6 +59,23 @@ def test_enrich_positions_includes_lot_and_flags():
     assert out[0]['has_tp'] is False
     assert out[0]['has_sl'] is True
     assert out[0]['trail_phase'] == 'watch'
+
+
+def test_enrich_positions_includes_market_mid():
+    e = _Engine()
+    e.market = {'bid': 3790.1, 'ask': 3790.5, 'mid': 3790.3, 'epic': 'GOLD'}
+    p = {
+        'dealId': 'd3', 'direction': 'BUY', 'size': '0.1', 'level': 3782.93,
+        'stopLevel': 3770., 'profitLevel': None, 'upl': 0.45, 'epic': 'GOLD',
+    }
+    e.positions = [p]
+    e.store.d['robot_open:d3'] = True
+    rt = AccountRuntime.__new__(AccountRuntime)
+    out = AccountRuntime._enrich_positions(rt, e, [p], brief=None)
+    assert out[0]['mid'] == pytest.approx(3790.3)
+    assert out[0]['currentLevel'] == pytest.approx(3790.3)
+    assert out[0]['bid'] == pytest.approx(3790.1)
+    assert out[0]['ask'] == pytest.approx(3790.5)
 
 
 def test_manual_position_not_marked_trailing():

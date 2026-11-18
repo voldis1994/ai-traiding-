@@ -4154,7 +4154,7 @@ class SingleTradeEngine:
         def _learn(label,transition,mode,detail):
             # Light teach — not full trade-PnL cannon (was overwriting M1).
             sp=load_self_params(self.store)
-            lr=float(sp.get('learn_lr',0.28))
+            lr=float(sp.get('learn_lr',0.10))
             repeats=max(1,min(4,int(sp.get('hold_shadow_repeats',2))))
             taught=False
             for i in range(repeats):

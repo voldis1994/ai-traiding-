@@ -699,14 +699,130 @@ def zone_at_open(candles, *, n: int|None=None, reach_n: int|None=None,
     }
 
 
+def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
+                          min_distance=0., atr=None, zone=None) -> dict:
+    """Place SL/TP on swing High/Low — not entry ± abstract median distance.
+
+    BUY:  SL beyond last swing low,  TP at/near last swing high.
+    SELL: SL beyond last swing high, TP at/near last swing low.
+
+    Distances are clamped vs the multi-TF zone so a day-range swing cannot
+    reinvent fantasy brackets after a win streak.
+    """
+    from . import structure_memory
+    out = {
+        'ready': False, 'reason': 'no_swings', 'source': 'swing_anchor',
+        'stop_distance': None, 'profit_distance': None,
+        'stop_level': None, 'profit_level': None,
+        'swing_hi': None, 'swing_lo': None,
+    }
+    if action not in ('BUY', 'SELL'):
+        return dict(out, reason='bad_action')
+    entry_f = _finite(entry)
+    if entry_f is None or entry_f <= 0:
+        return dict(out, reason='bad_entry')
+    try:
+        tick_f = float(tick)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    if not math.isfinite(tick_f) or tick_f <= 0:
+        tick_f = 0.01
+    try:
+        sp = float(spread or 0.)
+    except (TypeError, ValueError):
+        sp = 0.
+    try:
+        mn = float(min_distance or 0.)
+    except (TypeError, ValueError):
+        mn = 0.
+    atr_v = _finite(atr)
+    buffer = max(2.0 * tick_f, 2.0 * sp)
+    if atr_v is not None and atr_v > 0:
+        buffer = max(buffer, 0.15 * atr_v)
+    floor = mn + buffer if (mn + buffer) > 0 else tick_f
+
+    path = structure_memory.normalise(candles, limit=80)
+    bos = structure_memory.bos_choch(path, left=2, right=2)
+    hi = _finite(bos.get('range_hi'))
+    lo = _finite(bos.get('range_lo'))
+    if hi is None or lo is None or hi <= lo:
+        return dict(out, reason='no_swing_range', bos_event=bos.get('event'))
+    out['swing_hi'] = float(hi)
+    out['swing_lo'] = float(lo)
+    out['bos_event'] = bos.get('event')
+    out['bos_bias'] = bos.get('bias')
+
+    if action == 'BUY':
+        stop_level = float(lo) - buffer
+        # Target the swing high; if already above it (chase), no structural TP.
+        if float(hi) <= entry_f + floor:
+            return dict(out, reason='entry_above_swing_high',
+                        stop_level=stop_level, ready=False)
+        profit_level = float(hi)
+        stop_d = entry_f - stop_level
+        profit_d = profit_level - entry_f
+    else:
+        stop_level = float(hi) + buffer
+        if float(lo) >= entry_f - floor:
+            return dict(out, reason='entry_below_swing_low',
+                        stop_level=stop_level, ready=False)
+        profit_level = float(lo)
+        stop_d = stop_level - entry_f
+        profit_d = entry_f - profit_level
+
+    if stop_d < floor or profit_d < floor:
+        return dict(out, reason='swing_distances_below_floor',
+                    stop_distance=stop_d, profit_distance=profit_d,
+                    stop_level=stop_level, profit_level=profit_level)
+
+    # Clamp vs zone median geometry — keep swings, reject day-range fantasy.
+    z = zone if isinstance(zone, dict) else {}
+    zone_sl = _finite(z.get('range_distance')) or _finite(z.get('noise_distance'))
+    zone_tp = _finite(z.get('max_tp'))
+    if zone_sl is not None and zone_sl > 0:
+        lo_cap = 0.5 * float(zone_sl)
+        hi_cap = STRUCTURE_VS_MEDIAN_CAP * float(zone_sl)
+        if stop_d > hi_cap:
+            # Pull SL closer to entry but still beyond a fraction of the swing.
+            stop_d = hi_cap
+            stop_level = (entry_f - stop_d) if action == 'BUY' else (entry_f + stop_d)
+        elif stop_d < lo_cap:
+            stop_d = lo_cap
+            stop_level = (entry_f - stop_d) if action == 'BUY' else (entry_f + stop_d)
+    if zone_tp is not None and zone_tp > 0 and profit_d > STRUCTURE_VS_MEDIAN_CAP * float(zone_tp):
+        profit_d = STRUCTURE_VS_MEDIAN_CAP * float(zone_tp)
+        profit_level = (entry_f + profit_d) if action == 'BUY' else (entry_f - profit_d)
+
+    if stop_d < floor or profit_d < floor:
+        return dict(out, reason='clamped_below_floor',
+                    stop_distance=stop_d, profit_distance=profit_d)
+
+    return {
+        'ready': True,
+        'reason': 'swing_levels',
+        'source': 'swing_anchor',
+        'stop_distance': float(stop_d),
+        'profit_distance': float(profit_d),
+        'stop_level': float(stop_level),
+        'profit_level': float(profit_level),
+        'swing_hi': float(hi),
+        'swing_lo': float(lo),
+        'kappa': float(profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA,
+        'bos_event': bos.get('event'),
+        'bos_bias': bos.get('bias'),
+        'buffer': float(buffer),
+    }
+
+
 def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
-                              tighten=1.0) -> dict:
+                              tighten=1.0, entry=None, action=None,
+                              candles=None, atr=None) -> dict:
     """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
-    Decision from candles:
-      SL = observed adverse range (``range_distance``), floored by broker min
-      κ  = observed favor/adverse ratio (``zone.kappa``)
-      TP = κ×SL, but not beyond reachable favor span (``max_tp``)
+    Preference order:
+      1. Swing High/Low anchors when ``entry``+``action``+``candles`` are given
+         (real chart levels — not entry ± median bar span).
+      2. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
 
     ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
     *same* OHLC decision, never an invented wider target.
@@ -736,6 +852,51 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     if t is None or t <= 0:
         t = 1.0
     t = max(0.7, min(1.0, float(t)))
+
+    # --- Prefer swing-anchored levels (chart structure) ---
+    swing = None
+    if entry is not None and action in ('BUY', 'SELL') and candles:
+        swing = swing_anchor_brackets(
+            candles=candles, entry=entry, action=action, tick=tick_f,
+            spread=sp, min_distance=mn, atr=atr, zone=z)
+        if swing.get('ready'):
+            stop_d = float(swing['stop_distance']) * t
+            profit_d = float(swing['profit_distance']) * t
+            eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
+            snapped = stop_take(
+                float(entry), action, tick_f, sp, mn,
+                kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+                range_distance=stop_d)
+            # Re-derive levels from snapped distances so broker grid wins.
+            sign = 1 if action == 'BUY' else -1
+            e = float(entry)
+            return {
+                'stop_distance': float(snapped['stop_distance']),
+                'profit_distance': float(snapped['profit_distance']),
+                'stop_level': e - sign * float(snapped['stop_distance']),
+                'profit_level': e + sign * float(snapped['profit_distance']),
+                'kappa': float(snapped.get('kappa') or eff_kappa),
+                'sl_scale': 1.0,
+                'ohlc_kappa': float(swing.get('kappa') or eff_kappa),
+                'ohlc_sl': float(swing['stop_distance']),
+                'ohlc_tp': float(swing['profit_distance']),
+                'tighten': float(t),
+                'source': 'swing_anchor',
+                'ready': True,
+                'lookback': z.get('lookback'),
+                'median_up': z.get('median_up'),
+                'median_down': z.get('median_down'),
+                'pull_share': z.get('pull_share'),
+                'favor_share': z.get('favor_share'),
+                'swing_hi': swing.get('swing_hi'),
+                'swing_lo': swing.get('swing_lo'),
+                'bos_event': swing.get('bos_event'),
+                'stop_ticks': snapped.get('stop_ticks'),
+                'profit_ticks': snapped.get('profit_ticks'),
+                'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
+                'swing': swing,
+            }
+
     ohlc_sl = _finite(z.get('range_distance'))
     if ohlc_sl is None or ohlc_sl <= 0:
         ohlc_sl = _finite(z.get('noise_distance'))
@@ -745,7 +906,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     ohlc_tp = _finite(z.get('max_tp'))
     buffer = max(2.0 * tick_f, 2.0 * sp)
     floor = mn + buffer if (mn + buffer) > 0 else tick_f
-    # Core decision: SL from OHLC adverse move (or broker floor if quieter).
+    # Fallback: SL from OHLC adverse move (or broker floor if quieter).
     raw_sl = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else floor
     stop_d = max(floor, raw_sl) * t
     # TP from OHLC κ, limited by what this window actually reaches.
@@ -756,17 +917,20 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
     # Effective κ from OHLC only — no hardcoded 1:1 reshape / RR floor.
-    # The robot decides width from candles; we do not invent TP/SL ratios.
     eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else float(ohlc_kappa)
     # Snap onto broker tick grid via stop_take (sl_scale=1 — no invent layer).
-    entry = 1000.0  # levels unused by callers that only need distances
+    entry_f = _finite(entry) or 1000.0
+    act = action if action in ('BUY', 'SELL') else 'BUY'
     snapped = stop_take(
-        entry, 'BUY', tick_f, sp, mn,
+        entry_f, act, tick_f, sp, mn,
         kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
         range_distance=stop_d)
+    sign = 1 if act == 'BUY' else -1
     return {
         'stop_distance': float(snapped['stop_distance']),
         'profit_distance': float(snapped['profit_distance']),
+        'stop_level': float(entry_f) - sign * float(snapped['stop_distance']),
+        'profit_level': float(entry_f) + sign * float(snapped['profit_distance']),
         'kappa': float(snapped.get('kappa') or eff_kappa),
         'sl_scale': 1.0,
         'ohlc_kappa': float(ohlc_kappa),
@@ -783,6 +947,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         'stop_ticks': snapped.get('stop_ticks'),
         'profit_ticks': snapped.get('profit_ticks'),
         'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
+        'swing': swing,
     }
 
 

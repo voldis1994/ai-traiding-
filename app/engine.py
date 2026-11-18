@@ -322,11 +322,15 @@ class AdaptiveBrain:
 
     def _json_transition(self,transition):
         if transition is None:return None
-        return {'z':np.asarray(transition['z']).tolist(),
-                'h':np.asarray(transition['h']).tolist(),
-                'c':np.asarray(transition['c']).tolist(),
-                'dt':float(transition['dt']),
-                'neuron_ids':np.asarray(transition.get('neuron_ids',np.arange(len(transition['h'])))).tolist()}
+        out={'z':np.asarray(transition['z']).tolist(),
+             'h':np.asarray(transition['h']).tolist(),
+             'c':np.asarray(transition['c']).tolist(),
+             'dt':float(transition['dt']),
+             'neuron_ids':np.asarray(transition.get('neuron_ids',np.arange(len(transition['h'])))).tolist()}
+        px=transition.get('period_x')
+        if px is not None:
+            out['period_x']=np.asarray(px,dtype=float).tolist()
+        return out
 
     def _activate(self,epic):
         if self.epic==epic:return
@@ -372,7 +376,9 @@ class AdaptiveBrain:
     def _core_snapshot(self):
         """In-memory clone of weights + schema so a failed restore can roll back."""
         c=self.core
-        names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G','neuron_ids')
+        c.ensure_period_params()
+        names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G',
+               'neuron_ids','period_logits','period_V')
         arrays={n:getattr(c,n).copy() for n in names if hasattr(c,n)}
         return {
             'arrays':arrays,
@@ -411,6 +417,12 @@ class AdaptiveBrain:
                 raise ValueError('Brain file instrument mismatch')
             names=('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G')
             arrays={name:d[name].copy() for name in names}
+            # Optional period gate (brains before NeuralCore period weights).
+            from .core import PERIOD_N
+            if 'period_logits' in d and d['period_logits'].shape==(PERIOD_N,):
+                arrays['period_logits']=d['period_logits'].copy()
+            if 'period_V' in d and d['period_V'].shape==(3,PERIOD_N):
+                arrays['period_V']=d['period_V'].copy()
             n=len(arrays['h']);d_in=arrays['P'].shape[1]
             feature_schema=str(d['feature_schema']) if 'feature_schema' in d else None
             ohlc_dim=int(d['ohlc_dim']) if 'ohlc_dim' in d else FEATURE_DIM
@@ -459,6 +471,7 @@ class AdaptiveBrain:
         c.steps=int(meta['steps']);c.vbar=float(meta['vbar'])
         c.births=int(meta['births']);c.deaths=int(meta['deaths'])
         c.next_neuron_id=int(meta['next_neuron_id'])
+        c.ensure_period_params()
         self.feature_schema=meta['feature_schema']
         self.fusion_labels=int(meta['fusion_labels'])
         self.ohlc_dim=int(meta['ohlc_dim']);self.fusion_dim=int(meta['fusion_dim'])
@@ -504,7 +517,10 @@ class AdaptiveBrain:
         self.path.parent.mkdir(exist_ok=True,parents=True)
         path=self._path_for(self.epic) if self.epic else self.path
         tmp=path.with_suffix('.tmp.npz');c=self.core
-        payload={k:getattr(c,k) for k in ('P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G','neuron_ids')}
+        c.ensure_period_params()
+        payload={k:getattr(c,k) for k in (
+            'P','W','R','O','b','h','c','tau','tau_c','mu','nu','age','utility','G',
+            'neuron_ids','period_logits','period_V')}
         payload.update(steps=c.steps,vbar=c.vbar,births=c.births,deaths=c.deaths,
                        next_neuron_id=c.next_neuron_id,epic=self.epic or '',
                        feature_schema=self.feature_schema or 'legacy_quote_v2',
@@ -730,8 +746,11 @@ class AdaptiveBrain:
         return 0 if delta>cost else (1 if delta < -cost else 2)
 
     def tick(self,mid,spread,tick_size,epic,dt=1.,features=None,bar_time=None,
-             external_features=None,in_position=False):
+             external_features=None,in_position=False,period_x=None):
         """One M1 step. ``in_position`` freezes entry-policy teachers.
+
+        ``period_x`` — optional length-5 M1→M60 evidence for NeuralCore's
+        trainable period gate (same learn chain; not a second AI).
 
         While a LIVE deal is open the brain may still *perceive* (step + audit
         signals), but must NOT:
@@ -830,7 +849,8 @@ class AdaptiveBrain:
         bar_dt=float(dt) if dt is not None else NEURAL_BAR_DT
         if not math.isfinite(bar_dt) or bar_dt<=0:
             bar_dt=NEURAL_BAR_DT
-        result=self.core.step(x,max(.1,min(bar_dt,NEURAL_BAR_DT_MAX)))
+        result=self.core.step(x,max(.1,min(bar_dt,NEURAL_BAR_DT_MAX)),
+                              period_x=period_x)
         # Structural growth is separate from learning; cap + cooldown stop
         # losing clients ballooning (196 vs 55) while Paaudze looks busy.
         # Freeze grow/prune while in-trade — architecture must not move under
@@ -2166,6 +2186,11 @@ class SingleTradeEngine:
                 # Pre-fusion OHLC models may still tick on local features alone.
                 in_pos=bool(self.positions)
                 bar_t=self.market_context.get('bar_time')
+                # MTF period evidence → NeuralCore trainable gate (one machine).
+                try:
+                    period_x=mtf_momentum.period_evidence(self._mtf_momentum_analysis())
+                except Exception:
+                    period_x=None
                 if in_pos:
                     # Admin/UI stays pinned to the OPEN vote (no mid-trade churn).
                     # Separately *perceive* each new M1 with in_position=True so a
@@ -2180,13 +2205,13 @@ class SingleTradeEngine:
                                 self.market_context['close'],ask-bid,tick,
                                 self.mandate['epic'],dt=1.0,features=fused,
                                 bar_time=bar_t,external_features=True,
-                                in_position=True)
+                                in_position=True,period_x=period_x)
                         elif not on_fusion:
                             manage=self.brain.tick(
                                 self.market_context['close'],ask-bid,tick,
                                 self.mandate['epic'],dt=1.0,
                                 features=self.market_context['features'],
-                                bar_time=bar_t,in_position=True)
+                                bar_time=bar_t,in_position=True,period_x=period_x)
                         if manage is not None:
                             self._manage_signal={
                                 'scores':dict(manage.get('scores') or {}),
@@ -2194,7 +2219,8 @@ class SingleTradeEngine:
                                 'bar_time':bar_t,
                                 'entry_train':False,'in_position':True,
                                 'trend':self.market_context.get('trend'),
-                                'regime':self.market_context.get('regime')}
+                                'regime':self.market_context.get('regime'),
+                                'period_weights':manage.get('period_weights')}
                             # Resolve forecast outcomes while in trade (ledger only).
                             try:
                                 from .forecast_memory import maybe_resolve
@@ -2212,11 +2238,11 @@ class SingleTradeEngine:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=1.0,features=fused,
                         bar_time=bar_t,external_features=True,
-                        in_position=False)
+                        in_position=False,period_x=period_x)
                 elif not on_fusion:
                     next_signal=self.brain.tick(self.market_context['close'],ask-bid,tick,
                         self.mandate['epic'],dt=1.0,features=self.market_context['features'],
-                        bar_time=bar_t,in_position=False)
+                        bar_time=bar_t,in_position=False,period_x=period_x)
                 else:
                     next_signal=None
                 if next_signal is not None and not in_pos:
@@ -2647,6 +2673,24 @@ class SingleTradeEngine:
         mtf_momentum.persist(self.store,analysis)
         self._mtf_momentum=analysis
         return analysis
+
+    def _mtf_snapshot_for_ui(self):
+        """MTF analysis + NeuralCore-learned period weights (one decision source)."""
+        m=(getattr(self,'_mtf_momentum',None)
+           or mtf_momentum.load(self.store)
+           or self._mtf_momentum_analysis())
+        if not isinstance(m,dict):
+            return m
+        try:
+            nw=self.brain.core.period_weights()
+        except Exception:
+            nw=None
+        out=dict(m)
+        if nw:
+            out['neural_period_weights']=nw
+            out['period_weights']=nw
+            out['period_weights_source']='neural_core'
+        return out
 
 
     def _entry_vote_scores(self):
@@ -4884,9 +4928,7 @@ class SingleTradeEngine:
                 'neural_exit_intent':raw_exit_intent,
                 'neural_exit_rule':'confirmed opposite manage vote + aligned 5/15m → market CLOSE; else broker SL/TP/trail',
                 'manage_signal':self._manage_signal,
-                'mtf_momentum':(getattr(self,'_mtf_momentum',None)
-                                or mtf_momentum.load(self.store)
-                                or self._mtf_momentum_analysis()),
+                'mtf_momentum':self._mtf_snapshot_for_ui(),
                 'hard_risk':hr_snap,'day_book':db_snap,'situation_memory':situation_memory.snapshot(self.store),
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),

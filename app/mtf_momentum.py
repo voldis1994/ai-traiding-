@@ -327,8 +327,11 @@ def price_structure_bias(bars: list) -> str | None:
 
 
 def period_weights(*, adx_v, pressure_flip, structure_break, kama_slope, strong) -> dict:
-    """AI period importance across M1–M60 — discrete pre-tested emphasis, not free float."""
-    # Defaults: balanced; SHIFT emphasizes M1; strong trend emphasizes M15/M60.
+    """Diagnostic heuristic only — NOT the decision source.
+
+    True M1→M60 importance is learned inside NeuralCore.period_logits (same
+    train chain as BUY/SELL/HOLD). This formula is UI/fallback evidence only.
+    """
     w = {'m1': 0.20, 'm5': 0.25, 'm15': 0.25, 'm30': 0.15, 'm60': 0.15}
     if pressure_flip or structure_break:
         w = {'m1': 0.40, 'm5': 0.25, 'm15': 0.15, 'm30': 0.10, 'm60': 0.10}
@@ -338,6 +341,84 @@ def period_weights(*, adx_v, pressure_flip, structure_break, kama_slope, strong)
         w = {'m1': 0.15, 'm5': 0.20, 'm15': 0.20, 'm30': 0.20, 'm60': 0.25}
     s = sum(w.values()) or 1.0
     return {k: round(v / s, 4) for k, v in w.items()}
+
+
+def period_evidence(analysis: dict | None) -> list[float]:
+    """Per-TF directional evidence ∈ [-1, 1] for NeuralCore period gate.
+
+    Order: m1, m5, m15, m30, m60. Positive = bullish lean. The *weights* that
+    mix these channels are learned by NeuralCore — not chosen here.
+    """
+    from .core import PERIOD_N
+    out = [0.0] * PERIOD_N
+    if not isinstance(analysis, dict) or not analysis.get('ready'):
+        return out
+    tf = analysis.get('tf') or {}
+    m1, m5, m15, m30, m60 = (tf.get(k) or {} for k in ('m1', 'm5', 'm15', 'm30', 'm60'))
+
+    # M1: structure break + pressure mean
+    br = m1.get('structure_break')
+    pmean = (m1.get('pressure') or {}).get('mean')
+    e1 = 0.0
+    if br == 'UP':
+        e1 += 0.6
+    elif br == 'DOWN':
+        e1 -= 0.6
+    if pmean is not None:
+        e1 += 0.5 * float(np_clip(pmean, -1, 1))
+    out[0] = float(np_clip(e1, -1, 1))
+
+    # M5: KAMA slope / EMA
+    e5 = 0.0
+    if m5.get('kama_up'):
+        e5 += 0.7
+    elif m5.get('kama_down'):
+        e5 -= 0.7
+    elif m5.get('ema_up'):
+        e5 += 0.4
+    elif m5.get('ema_down'):
+        e5 -= 0.4
+    slope = _finite(m5.get('kama_slope'))
+    if slope is not None:
+        e5 += float(np_clip(slope * 50.0, -0.3, 0.3))
+    out[1] = float(np_clip(e5, -1, 1))
+
+    # M15: DI dominance scaled by ADX strength
+    e15 = 0.0
+    if m15.get('di_buy'):
+        e15 += 0.6
+    elif m15.get('di_sell'):
+        e15 -= 0.6
+    adx = _finite(m15.get('adx'))
+    if adx is not None:
+        e15 *= float(np_clip(adx / 40.0, 0.25, 1.25))
+    out[2] = float(np_clip(e15, -1, 1))
+
+    # M30: ATR-normalized momentum
+    mom = _finite(m30.get('mom_atr'))
+    out[3] = float(np_clip(mom if mom is not None else 0.0, -1, 1))
+
+    # M60: KAMA / structure bias
+    e60 = 0.0
+    if m60.get('bias_up'):
+        e60 += 0.7
+    elif m60.get('bias_down'):
+        e60 -= 0.7
+    s60 = _finite(m60.get('kama_slope') if m60.get('kama_slope') is not None else m60.get('ema20_slope'))
+    if s60 is not None:
+        e60 += float(np_clip(s60 * 20.0, -0.3, 0.3))
+    out[4] = float(np_clip(e60, -1, 1))
+    return out
+
+
+def np_clip(v, lo, hi):
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(n):
+        return 0.0
+    return max(lo, min(hi, n))
 
 
 def _ohlc_tuples_to_dicts(bars_tuples) -> list:
@@ -564,7 +645,7 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         'bias_down': bool(m60_down and not m60_up),
     }
 
-    return {
+    out = {
         'ready': True,
         'mode': mode,
         'preferred': preferred,
@@ -580,6 +661,8 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         'cost': round(cost, 6),
         'move_ok': move_ok,
         'stop_hint_atr14': stop_hint,
+        # Heuristic diagnostic only — NeuralCore.period_weights() is the learned source.
+        'period_weights_heuristic': weights,
         'period_weights': weights,
         'mode_preset': cfg.get('mode_preset'),
         'tf': {
@@ -590,8 +673,10 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
                 'm30': len(m30), 'm60': len(m60),
             },
         },
-        'hierarchy': 'KAMA=trend ADX=strength ATR=noise Pressure=reversal M1=react',
+        'hierarchy': 'KAMA=trend ADX=strength ATR=noise Pressure=reversal; NeuralCore learns TF weights',
     }
+    out['period_evidence'] = period_evidence(out)
+    return out
 
 
 def soft_nudge_scores(scores, analysis, *, store=None):
@@ -608,10 +693,8 @@ def soft_nudge_scores(scores, analysis, *, store=None):
     conf = float(analysis.get('confidence') or 0)
     if conf < 0.4:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence', 'mode': mode}
-    # Scale nudge by AI period weight on the reacting TF (M1 on SHIFT, else M5/M15).
-    weights = analysis.get('period_weights') or {}
-    w_scale = float(weights.get('m1' if mode == 'SHIFT' else 'm5') or 0.25)
-    delta = float(cfg['nudge']) * conf * (0.7 + 0.6 * w_scale)
+    # Mode tilt only — period importance is learned inside NeuralCore, not here.
+    delta = float(cfg['nudge']) * conf
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     if mode == 'SHIFT' and preferred in ('BUY', 'SELL'):
         out[preferred] = out.get(preferred, 0) + delta
@@ -638,7 +721,7 @@ def soft_nudge_scores(scores, analysis, *, store=None):
     return out, {
         'nudged': True, 'mode': mode, 'target': preferred,
         'delta': delta, 'confidence': conf, 'reason': analysis.get('reason'),
-        'period_weights': weights, 'renormalized': True,
+        'renormalized': True,
     }
 
 

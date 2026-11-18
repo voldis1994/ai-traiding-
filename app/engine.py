@@ -50,6 +50,7 @@ from . import structure_shadow
 from . import structure_edge
 from . import situation_memory
 from . import day_book
+from . import mtf_momentum
 
 DB=DATA/'robot.sqlite3'
 
@@ -1006,6 +1007,7 @@ class SingleTradeEngine:
         self.last_entry_audit_key=None
         # In-trade perception only (no entry ΔW) — used for reverse CLOSE.
         self._manage_signal=None
+        self._mtf_momentum=None
         self.protected=set();self._seen_initial=False;self._unresolved_at_login=False
         self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
         self.protection_brief={'status':'Awaiting first robot-opened position'}
@@ -2364,15 +2366,23 @@ class SingleTradeEngine:
                     else:
                         streak=0
                     self.store.set(streak_key,streak)
+                    mtf_live=self._mtf_momentum_analysis()
+                    from .self_params import get as sp_get
+                    base_streak=int(sp_get(self.store,'exit_need_streak',2))
+                    need_streak=mtf_momentum.exit_need_streak(
+                        mtf_live,store=self.store,default=base_streak)
                     intent=self.policy.evaluate_neural_exit(
                         scores,p['direction'],
                         returns_bps=self.market_context.get('returns_bps'),
-                        opposite_streak=streak,store=self.store)
+                        opposite_streak=streak,need_streak=need_streak,
+                        store=self.store)
                     if intent=='CLOSE':
                         self.store.event('exit',
                             'Neural CLOSE on confirmed reverse — market exit',
                             {'deal_id':p['dealId'],'direction':p['direction'],
                              'vote':vote,'streak':streak,
+                             'need_streak':need_streak,
+                             'mtf_mode':(mtf_live or {}).get('mode'),
                              'returns_bps':self.market_context.get('returns_bps'),
                              'manage_bar':manage_bar,
                              'neural_market_exit':True})
@@ -2526,6 +2536,10 @@ class SingleTradeEngine:
             nudged_scores,phase=phase,store=self.store)
         nudged_scores,phase_meta=day_book.soft_nudge_day_phase(
             nudged_scores,phase=phase,store=self.store)
+        # Multi-TF Momentum+Structure+ADX+ATR — soft tilt; SHIFT is a mode.
+        mtf_analysis=self._mtf_momentum_analysis()
+        nudged_scores,mtf_meta=mtf_momentum.soft_nudge_scores(
+            nudged_scores,mtf_analysis,store=self.store)
         # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.
         if isinstance(self.last_signal,dict) and not self.positions:
             self.last_signal=dict(
@@ -2533,12 +2547,14 @@ class SingleTradeEngine:
                 structure_edge=edge_advice,structure_nudge=nudge_meta,
                 forecast_advice=f_advice,forecast_nudge=forecast_meta,
                 situation_memory=sit_advice,situation_nudge=sit_nudge,
-                day_book=db_snap,day_conviction=conv_meta,day_phase_nudge=phase_meta)
+                day_book=db_snap,day_conviction=conv_meta,day_phase_nudge=phase_meta,
+                mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
         else:
             self.last_signal=dict(
                 self.last_signal,scores=dict(nudged_scores),
                 structure_edge=edge_advice,structure_nudge=nudge_meta,
-                forecast_advice=f_advice,forecast_nudge=forecast_meta)
+                forecast_advice=f_advice,forecast_nudge=forecast_meta,
+                mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
         result=self.policy.evaluate_neural_entry(
             nudged_scores,
             returns_bps=ctx.get('returns_bps'),
@@ -2551,7 +2567,8 @@ class SingleTradeEngine:
                     forecast_advice=f_advice,forecast_nudge=forecast_meta,
                     situation_memory=sit_advice,situation_nudge=sit_nudge,
                     day_book=db_snap,day_conviction=conv_meta,
-                    day_phase_nudge=phase_meta,scores=nudged_scores)
+                    day_phase_nudge=phase_meta,scores=nudged_scores,
+                    mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -2610,6 +2627,26 @@ class SingleTradeEngine:
         advice=structure_edge.compare_frame(self.store,epic=epic,structure=structure)
         structure_edge.persist_advice(self.store,advice)
         return advice
+
+    def _mtf_momentum_analysis(self):
+        """M1→M60 Momentum+Structure+ADX+ATR stack — soft evidence + SHIFT mode."""
+        epic=(self.mandate or {}).get('epic')
+        if not epic:
+            return {'ready':False,'mode':'HOLD','reason':'no_mandate'}
+        need=mtf_momentum.min_history_bars(self.store)
+        try:
+            candles=self.store.candles(epic,n=need,historical_only=True) or []
+        except Exception:
+            candles=[]
+        chron=sorted(candles,key=lambda r:r.get('at') or '')
+        spr=_num((self.market or {}).get('spread'))
+        if spr is None:
+            spr=0.0
+        analysis=mtf_momentum.analyze(
+            chron,spread=float(spr),store=self.store,epic=epic)
+        mtf_momentum.persist(self.store,analysis)
+        self._mtf_momentum=analysis
+        return analysis
 
 
     def _entry_vote_scores(self):
@@ -4847,6 +4884,9 @@ class SingleTradeEngine:
                 'neural_exit_intent':raw_exit_intent,
                 'neural_exit_rule':'confirmed opposite manage vote + aligned 5/15m → market CLOSE; else broker SL/TP/trail',
                 'manage_signal':self._manage_signal,
+                'mtf_momentum':(getattr(self,'_mtf_momentum',None)
+                                or mtf_momentum.load(self.store)
+                                or self._mtf_momentum_analysis()),
                 'hard_risk':hr_snap,'day_book':db_snap,'situation_memory':situation_memory.snapshot(self.store),
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),

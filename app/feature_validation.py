@@ -99,8 +99,18 @@ def recommended_live_history_bars(store=None):
     Only external clamp is BROKER_PRICE_HISTORY_MAX (Capital.com). When the
     operator/self_params change val_oos_frac / val_min_bars / val_horizon_bars,
     this number moves with them.
+
+    When MTF momentum is enabled, floor at mtf_min_m1_bars so M30/M60
+    indicators have enough packed candles (61 M1 alone is not enough).
     """
     need=min_bars_for_train_oos_split(store)
+    try:
+        from . import mtf_momentum
+        from .self_params import get as sp_get
+        if int(sp_get(store, 'mtf_momentum_enabled', 1)) == 1:
+            need = max(need, int(mtf_momentum.min_history_bars(store)))
+    except Exception:
+        pass
     return int(min(BROKER_PRICE_HISTORY_MAX, need))
 
 

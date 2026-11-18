@@ -323,11 +323,20 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
         return dict(meta, allowed=False, reason=same.get('reason') or 'need_new_move')
 
     # Structure memory: same-dir re-entry needs new BOS/CHoCH/retest / left range.
+    # Also refuse fresh OPEN that chases a vertical impulse into the extreme
+    # (e.g. BUY near local high after a spike — structure memory alone misses that).
     try:
         from . import structure_memory
+        atr_v = _atr14(mtf_analysis)
+        chase = structure_memory.extension_chase(
+            action, candles=candles, market_context=market_context, atr=atr_v)
+        meta['extension_chase'] = chase
+        if chase.get('needed') and not chase.get('ok'):
+            return dict(meta, allowed=False,
+                        reason=chase.get('reason') or 'chase_extension')
         struct_gate = structure_memory.gate_reentry(
             action=action, last_outcome=last_outcome, candles=candles,
-            market_context=market_context, atr=_atr14(mtf_analysis))
+            market_context=market_context, atr=atr_v)
         meta['structure_memory'] = struct_gate
         if struct_gate.get('needed') and not struct_gate.get('ok'):
             return dict(meta, allowed=False,

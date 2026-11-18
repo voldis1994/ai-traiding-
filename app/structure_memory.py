@@ -175,17 +175,22 @@ def snapshot_from_frame(frame, *, mid=None, bos=None) -> dict:
     """Compact structure snapshot stored on entry_brain / last_trade_outcome."""
     frame = frame if isinstance(frame, dict) else {}
     bos = bos if isinstance(bos, dict) else {}
-    hi = _finite(frame.get('range'))
     # Prefer swing range when available.
-    range_hi = _finite(bos.get('range_hi'))
-    range_lo = _finite(bos.get('range_lo'))
+    range_hi = _finite(bos.get('range_hi')) or _finite(frame.get('swing_range_hi'))
+    range_lo = _finite(bos.get('range_lo')) or _finite(frame.get('swing_range_lo'))
     if range_hi is None or range_lo is None:
-        # Fallback: path span around mid.
+        # Fallback: path span around mid (frame['range'] = high-low span).
         span = _finite(frame.get('range')) or 0.0
         m = _finite(mid) or _finite(frame.get('exit')) or _finite(frame.get('entry'))
         if m is not None and span > 0:
             range_hi = m + 0.5 * span
             range_lo = m - 0.5 * span
+    # Last resort: tiny ATR-less band around mid so memory always has a box.
+    if (range_hi is None or range_lo is None) and _finite(mid) is not None:
+        m = float(mid)
+        band = max(abs(m) * 1e-4, 0.05)
+        range_hi = m + band
+        range_lo = m - band
     return {
         'structure': str(frame.get('structure') or 'CHOP').upper(),
         'net_over_range': _finite(frame.get('net_over_range')),
@@ -283,12 +288,70 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
         if action is None and live_st not in ('CHOP', 'RANGE', prev_st):
             return {'needed': True, 'ok': True, 'reason': 'structure_label_changed'}
 
+    prior_lo = _finite(prior.get('range_lo'))
+    prior_hi = _finite(prior.get('range_hi'))
+    if prior_lo is None or prior_hi is None or prior_hi <= prior_lo:
+        # Incomplete memory must not silently allow same-dir re-entry.
+        return {'needed': True, 'ok': False, 'reason': 'need_structure_range',
+                'mid': live.get('mid')}
     if same_range(prior, live, atr=atr):
         return {'needed': True, 'ok': False, 'reason': 'same_range_no_new_structure',
                 'range_hi': prior.get('range_hi'), 'range_lo': prior.get('range_lo'),
                 'mid': live.get('mid')}
     # Left the range without a clean event — still count as development.
     return {'needed': True, 'ok': True, 'reason': 'left_prior_range'}
+
+
+def extension_chase(action, *, candles=None, market_context=None, atr=None,
+                    lookback=30, top_frac=0.85, min_atr_mult=2.0) -> dict:
+    """Block BUY/SELL that chase a vertical impulse into the extreme.
+
+    Classic failure: huge M1 rally (or dump), neuron still BUY, entry near the
+    local high on a weak bounce — then mean-reversion. Structure memory after a
+    prior trade does not catch this on a fresh OPEN.
+    """
+    if action not in ('BUY', 'SELL'):
+        return {'needed': False, 'ok': True, 'reason': 'not_directional'}
+    path = normalise(candles, limit=max(10, int(lookback)))
+    if len(path) < 8:
+        return {'needed': False, 'ok': True, 'reason': 'need_more_bars'}
+    hi = max(b['high'] for b in path)
+    lo = min(b['low'] for b in path)
+    span = hi - lo
+    if span <= 1e-12:
+        return {'needed': False, 'ok': True, 'reason': 'flat_path'}
+    mid = None
+    if isinstance(market_context, dict):
+        mid = _finite(market_context.get('mid') or market_context.get('close'))
+    if mid is None:
+        mid = path[-1]['close']
+    atr_v = _finite(atr)
+    # Impulse must be large vs ATR (or absolute span if ATR unknown).
+    if atr_v is not None and atr_v > 0:
+        if span < float(min_atr_mult) * atr_v:
+            return {'needed': False, 'ok': True, 'reason': 'impulse_not_large',
+                    'span': span, 'atr': atr_v}
+    pos = (mid - lo) / span  # 0=bottom, 1=top of lookback range
+    # Recent micro-turn against the chase (rollover / bounce failure).
+    last3 = path[-3:]
+    reds = sum(1 for b in last3 if b['close'] < b['open'])
+    greens = sum(1 for b in last3 if b['close'] > b['open'])
+    frac = float(top_frac)
+    if action == 'BUY' and pos >= frac:
+        # At top of a large impulse — refuse chase, especially if already rolling.
+        return {
+            'needed': True, 'ok': False, 'reason': 'chase_extension_high',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo, 'rolling': reds >= 2,
+        }
+    if action == 'SELL' and pos <= (1.0 - frac):
+        return {
+            'needed': True, 'ok': False, 'reason': 'chase_extension_low',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo, 'rolling': greens >= 2,
+        }
+    return {'needed': False, 'ok': True, 'reason': 'not_extended',
+            'pos': round(pos, 3), 'span': span}
 
 
 def gate_reentry(*, action, last_outcome=None, candles=None,

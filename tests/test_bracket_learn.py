@@ -351,6 +351,45 @@ def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
     assert out['ohlc_kappa']==pytest.approx(1.5)
 
 
+def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
+    """SL/TP must sit on swing high/low — not random ±κ around entry."""
+    from app.bracket_learn import swing_anchor_brackets
+    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    # Clear swings: SL~103, SH~112, entry mid-range.
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
+        (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
+        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+    ]
+    rows = [{
+        'at': (t0 + timedelta(minutes=i)).isoformat(),
+        'open': o, 'high': h, 'low': l, 'close': c,
+    } for i, (o, h, l, c) in enumerate(seq)]
+    entry = 107.0
+    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
+    swing = swing_anchor_brackets(
+        candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
+        min_distance=0.2, atr=2.0, zone=zone)
+    assert swing['ready'] is True
+    assert swing['swing_lo'] == 103.0
+    assert swing['swing_hi'] == 112.0
+    # Not symmetric ± around entry (the live Gold bug: ±12.21 both sides).
+    assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
+    assert swing['stop_level'] < entry < swing['profit_level']
+    # SL below swing low, TP at swing high.
+    assert swing['stop_level'] < swing['swing_lo']
+    assert swing['profit_level'] == pytest.approx(112.0, abs=0.05)
+
+    decided = decide_brackets_from_ohlc(
+        zone, tick=0.01, spread=0.05, min_distance=0.2,
+        entry=entry, action='BUY', candles=rows, atr=2.0)
+    assert decided['source'] == 'swing_anchor'
+    assert decided['swing_lo'] == 103.0
+    assert decided['swing_hi'] == 112.0
+
+
 def test_ohlc_decision_ignores_inflated_learned_multipliers_on_open():
     """Even if Store mults are huge, OPEN width still comes from OHLC zone."""
     with sandbox() as d:

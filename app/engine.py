@@ -2707,7 +2707,8 @@ class SingleTradeEngine:
         candles=[]
         if epic:
             try:
-                candles=self.store.candles(epic,n=40,historical_only=False) or []
+                # 80 M1 so swing BOS/CHoCH memory has enough pivots (not 40).
+                candles=self.store.candles(epic,n=80,historical_only=False) or []
             except Exception:
                 candles=[]
         last=self.store.get('last_trade_outcome') if self.store else None
@@ -4079,14 +4080,17 @@ class SingleTradeEngine:
             (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
         decided=bracket_learn.decide_brackets_from_ohlc(
-            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten)
+            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
+            entry=entry,action=proposal,candles=candles)
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
             'stop_distance':float(decided['stop_distance']),
             'profit_distance':float(decided['profit_distance']),
-            'bracket_source':'ohlc_zone',
+            'bracket_source':str(decided.get('source') or 'ohlc_zone'),
             'ohlc_kappa':decided.get('ohlc_kappa'),
+            'swing_hi':decided.get('swing_hi'),
+            'swing_lo':decided.get('swing_lo'),
             'epic':epic,
         }
 
@@ -5068,21 +5072,33 @@ class SingleTradeEngine:
                     'reason':self.last_entry_reason,'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
                 return
+            mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0))
-            # SL/TP from OHLC only — no hardcoded RR reshape.
+                tighten=float(pkg.get('tighten') or 1.0),
+                entry=entry,action=action,candles=candles,atr=atr_hint)
+            # Prefer swing-anchored levels when ready; else entry ± zone distance.
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
+            stop_level=decided.get('stop_level')
+            profit_level=decided.get('profit_level')
+            if stop_level is None:
+                stop_level=float(entry)-sign*sd
+            if profit_level is None:
+                profit_level=float(entry)+sign*pd
+            bracket_source=str(decided.get('source') or 'ohlc_zone')
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
-                'stop_level':float(entry)-sign*sd,
-                'profit_level':float(entry)+sign*pd,
+                'stop_level':float(stop_level),
+                'profit_level':float(profit_level),
                 'stop_ticks':decided.get('stop_ticks'),
                 'profit_ticks':decided.get('profit_ticks'),
                 'kappa':decided.get('kappa'),'sl_scale':1.0,
                 'raised_to_broker_min':decided.get('raised_to_broker_min'),
-                'bracket_source':'ohlc_zone',
+                'bracket_source':bracket_source,
+                'swing_hi':decided.get('swing_hi'),
+                'swing_lo':decided.get('swing_lo'),
             }
             bp={'kappa':decided['kappa'],'sl_scale':1.0,'explored':False,
                 'kappa_mult':learned.get('kappa'),'sl_mult':learned.get('sl_scale'),
@@ -5090,10 +5106,10 @@ class SingleTradeEngine:
                 'lookback':zone.get('lookback'),
                 'nudge_samples':len(self.store.get('bracket_outcome_history',[]) or []),
                 'aggression':pkg.get('aggression'),'edge_scale':pkg.get('edge_scale'),
-                'tighten':decided.get('tighten'),'bracket_source':'ohlc_zone'}
+                'tighten':decided.get('tighten'),'bracket_source':bracket_source}
             bracket_learn.save_params(
                 self.store,bp['kappa'],1.0,
-                reason=(f"ohlc_zone κ={decided.get('ohlc_kappa')} "
+                reason=(f"{bracket_source} κ={decided.get('ohlc_kappa')} "
                         f"sl={decided.get('ohlc_sl')} tp={decided.get('ohlc_tp')} "
                         f"tighten={float(decided.get('tighten') or 1):.3f}"))
             bracket_learn.note_open_bracket_meta(self.store,decided)
@@ -5121,11 +5137,15 @@ class SingleTradeEngine:
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
                 'open_gated':False})
-            self.store.event('bracket','OPEN brackets decided from multi-TF OHLC',{
+            self.store.event('bracket','OPEN brackets decided from OHLC structure',{
                 'kappa':bp['kappa'],'sl_scale':1.0,
+                'source':bracket_source,
                 'ohlc_kappa':decided.get('ohlc_kappa'),
                 'ohlc_sl':decided.get('ohlc_sl'),'ohlc_tp':decided.get('ohlc_tp'),
                 'tighten':decided.get('tighten'),
+                'swing_hi':decided.get('swing_hi'),'swing_lo':decided.get('swing_lo'),
+                'stop_level':brackets['stop_level'],
+                'profit_level':brackets['profit_level'],
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),

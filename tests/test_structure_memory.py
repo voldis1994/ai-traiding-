@@ -43,26 +43,91 @@ def test_swing_pivots_find_turns():
 
 
 def test_bos_up_after_swing_break():
-    rows = _up_trend(30, 2600.0)
-    # Flat range then break above.
+    """Deterministic swing path: two SH/SL then close above last SH → BOS_UP."""
+    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
+        (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
+        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+        (110.5, 113, 110.3, 112.8), (112.8, 114, 112.5, 113.5),
+    ]
+    rows = [{
+        'at': (t0 + timedelta(minutes=i)).isoformat(),
+        'open': o, 'high': h, 'low': l, 'close': c,
+    } for i, (o, h, l, c) in enumerate(seq)]
+    bos = sm.bos_choch(rows, left=2, right=2)
+    assert bos.get('event') == 'BOS_UP'
+    assert bos.get('range_hi') == 112.0
+    assert bos.get('last_close') == 113.5
+
+
+def test_missing_prior_range_holds_same_dir():
+    prior = {'structure': 'RANGE', 'mid': 100.0}  # no range_hi/lo
+    live = {'structure': 'RANGE', 'mid': 100.1, 'live_event': None}
+    out = sm.developed_since(prior, live, action='BUY', atr=1.0)
+    assert out['ok'] is False
+    assert out['reason'] == 'need_structure_range'
+
+
+def test_extension_chase_blocks_buy_near_spike_high():
+    """Replay: Gold-like vertical rally then BUY near local high → HOLD."""
     t0 = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
-    base = rows[-1]['close']
-    range_rows = []
-    for i in range(12):
-        o = base + (0.1 if i % 2 == 0 else -0.1)
-        range_rows.append({
+    rows = []
+    # Dump then sharp rally 3756 → ~3790 (matches the live screenshot shape).
+    px = 3780.0
+    for i in range(40):
+        if i < 15:
+            px -= 1.5
+        else:
+            px += 2.2
+        o = px - 0.3
+        rows.append({
             'at': (t0 + timedelta(minutes=i)).isoformat(),
-            'open': o, 'high': base + 0.5, 'low': base - 0.5, 'close': o,
+            'open': o, 'high': max(o, px) + 0.4, 'low': min(o, px) - 0.4,
+            'close': px,
         })
-    # Confirmed break above range high.
-    break_rows = [{
-        'at': (t0 + timedelta(minutes=12)).isoformat(),
-        'open': base + 0.4, 'high': base + 1.2, 'low': base + 0.3,
-        'close': base + 1.1,
-    }]
-    bos = sm.bos_choch(range_rows + break_rows, left=1, right=1)
-    assert bos.get('event') in ('BOS_UP', 'CHOCH_UP', None) or bos.get('bias') in (
-        'UP', 'DOWN', 'RANGE')
+    # Entry mid near the high of the impulse (~3786 on a ~3756–3790 range).
+    hi = max(r['high'] for r in rows)
+    lo = min(r['low'] for r in rows)
+    entry = lo + 0.9 * (hi - lo)
+    chase = sm.extension_chase(
+        'BUY', candles=rows, market_context={'mid': entry, 'close': entry},
+        atr=3.0)
+    assert chase['needed'] is True
+    assert chase['ok'] is False
+    assert chase['reason'] == 'chase_extension_high'
+
+    # Mid-range continuation is allowed.
+    mid = lo + 0.5 * (hi - lo)
+    ok = sm.extension_chase(
+        'BUY', candles=rows, market_context={'mid': mid}, atr=3.0)
+    assert ok.get('ok') is True
+
+
+def test_reentry_evaluate_blocks_chase_extension():
+    scores_raw = {'BUY': 0.55, 'SELL': 0.20, 'HOLD': 0.25}
+    t0 = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 3780.0
+    for i in range(35):
+        px = px - 1.2 if i < 12 else px + 2.0
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': px - 0.2, 'high': px + 0.5, 'low': px - 0.5, 'close': px,
+        })
+    hi = max(r['high'] for r in rows)
+    lo = min(r['low'] for r in rows)
+    entry = lo + 0.92 * (hi - lo)
+    out = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        market_context={'trend': 'UP', 'close': entry, 'mid': entry},
+        mtf_analysis={'ready': True, 'stop_hint_atr14': 3.0,
+                      'structure_break': 'UP', 'preferred': 'BUY', 'mode': 'BUY'},
+        candles=rows)
+    assert out['allowed'] is False
+    assert out['reason'] == 'chase_extension_high'
 
 
 def test_same_range_blocks_reentry():

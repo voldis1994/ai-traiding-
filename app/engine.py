@@ -1002,7 +1002,8 @@ class SingleTradeEngine:
     def __init__(self,store,brain,policy_path=None):
         self.store=store;self.brain=brain;self.broker=None
         self.armed=False;self.execution_enabled=False;self.mandate=None
-        self.positions=[];self.account={};self.market={};self.last_signal=None;self.last_error=None
+        self.positions=[];self._open_deal_ids=set()
+        self.account={};self.market={};self.last_signal=None;self.last_error=None
         # OPEN-time BUY/HOLD/SELL locked for UI while a LIVE deal is managed.
         self._locked_entry_signal=None
         self._last_in_trade_protect_bar=None
@@ -1411,31 +1412,38 @@ class SingleTradeEngine:
     def _order_fully_matched(self, kind, req, deal_id, confirmation=None, ref=None):
         """Full broker reconcile check — epic alone is never enough (audit #31).
 
-        OPEN: epic + direction + size, and when the confirm carries a dealId it
-        must identify the live position. CLOSE: deal gone. PROTECT: dealId + levels.
+        OPEN: epic + direction + size among *all* positions, bound to confirm
+        dealId (multi-pos safe). CLOSE: deal gone. PROTECT: dealId + levels
+        among all positions (not only positions[0] with len==1).
         """
         if kind=='CLOSE':
             return not any(p.get('dealId')==deal_id for p in self.positions)
         if kind=='PROTECT':
-            return (len(self.positions)==1 and self.positions[0].get('dealId')==deal_id and
-                    self._protection_matches(self.positions[0],req or {}))
+            live=next((p for p in (self.positions or [])
+                       if p.get('dealId')==deal_id),None)
+            return live is not None and self._protection_matches(live,req or {})
         if kind!='OPEN' or not req or not self.mandate:
             return False
-        if len(self.positions)!=1:return False
-        p=self.positions[0]
-        try:
-            size_ok=Decimal(str(p.get('size')))==Decimal(str(req.get('size')))
-        except (ValueError,TypeError,ArithmeticError):
-            size_ok=False
-        epic_ok=(p.get('epic')==self.mandate.get('epic') and
-                 (req.get('epic') is None or p.get('epic')==req.get('epic')))
-        dir_ok=p.get('direction')==req.get('direction')
-        if not (epic_ok and dir_ok and size_ok):
-            return False
-        # Critical #3: OPEN must bind broker-confirmed dealId to the live position.
         conf=confirmation or {}
         conf_deal=conf.get('dealId') or conf.get('dealID')
-        if conf_deal is None or str(p.get('dealId'))!=str(conf_deal):
+        # Critical #3: OPEN must bind broker-confirmed dealId to a live position.
+        if conf_deal is None:
+            return False
+        matched=None
+        for p in (self.positions or []):
+            if str(p.get('dealId'))!=str(conf_deal):
+                continue
+            try:
+                size_ok=Decimal(str(p.get('size')))==Decimal(str(req.get('size')))
+            except (ValueError,TypeError,ArithmeticError):
+                size_ok=False
+            epic_ok=(p.get('epic')==self.mandate.get('epic') and
+                     (req.get('epic') is None or p.get('epic')==req.get('epic')))
+            dir_ok=p.get('direction')==req.get('direction')
+            if epic_ok and dir_ok and size_ok:
+                matched=p
+                break
+        if matched is None:
             return False
         # dealReference already authenticated the accept; require it when provided.
         if ref and conf.get('dealReference') not in (None,ref):
@@ -1698,9 +1706,18 @@ class SingleTradeEngine:
         if exit_guess is None:
             snap=self.store.get('last_upl:'+deal) or {}
             exit_guess=_num(snap.get('exit_hint'))
-        self.positions=[]
-        self.position_age=0
-        self.last_position_id=None
+        # Multi-pos safe: drop only this dealId from the local book.
+        self.positions=[p for p in (self.positions or [])
+                        if str(p.get('dealId'))!=deal]
+        self._open_deal_ids={str(p['dealId']) for p in self.positions
+                             if p.get('dealId') is not None}
+        if not self.positions:
+            self.position_age=0
+            self.last_position_id=None
+        else:
+            head=self.positions[0].get('dealId')
+            self.last_position_id=str(head) if head is not None else None
+            self.position_age=0
         self.last_closed_step=self.brain.core.steps
         self.latest_close_id=deal
         conf={'level':exit_guess,'profit':float(pnl),'pnl_currency':self._cash_currency(ccy),
@@ -1708,7 +1725,8 @@ class SingleTradeEngine:
         self._learn_closed_trade(deal,conf)
         self.store.event('reconcile',
             'Open deal settled from Capital history cash',
-            {'deal_id':deal,'pnl':float(pnl),'source':source})
+            {'deal_id':deal,'pnl':float(pnl),'source':source,
+             'remaining_open':len(self.positions)})
         self._release_execution_after_flat(deal)
         return True
 
@@ -1724,26 +1742,40 @@ class SingleTradeEngine:
             return False
 
     async def _recover_ghost_open_after_positions_error(self,exc):
-        """positions() REST failed — Capital may already be flat on last_position_id.
+        """positions() REST failed — Capital may already be flat on open dealIds.
 
         Leaving self.positions unchanged freezes Admin on 'Existing open position',
         blocks orphan £ reconcile, and clears neural scores while ON.
+        Multi-pos: try every known open dealId (not only positions[0]).
         """
-        deal=self.last_position_id
-        if deal is None and self.positions:
-            deal=self.positions[0].get('dealId')
-        if deal is None:
+        candidates=[]
+        seen=set()
+        def _add(d):
+            if d is None:return
+            s=str(d)
+            if s in seen:return
+            seen.add(s);candidates.append(s)
+        _add(self.last_position_id)
+        for d in (getattr(self,'_open_deal_ids',None) or set()):
+            _add(d)
+        for p in (self.positions or []):
+            _add(p.get('dealId'))
+        if not candidates:
             return False
-        deal=str(deal)
-        ok=await self._settle_deal_from_history_cash(
-            deal,source='ghost_positions_error_recover')
-        if not ok:
+        settled=[]
+        for deal in candidates:
+            ok=await self._settle_deal_from_history_cash(
+                deal,source='ghost_positions_error_recover')
+            if ok:
+                settled.append(deal)
+        if not settled:
             self.store.event('warning','Positions sync failed; ghost open not confirmed closed',
-                {'deal_id':deal,'type':type(exc).__name__})
+                {'deal_ids':candidates,'type':type(exc).__name__})
             return False
         self.store.event('reconcile',
             'Cleared ghost open after positions API error; Capital history has cash close',
-            {'deal_id':deal,'error':type(exc).__name__})
+            {'deal_ids':settled,'remaining_open':len(self.positions or []),
+             'error':type(exc).__name__})
         return True
 
     async def sync(self):
@@ -3336,58 +3368,175 @@ class SingleTradeEngine:
                                  {'type':type(exc).__name__,'deal_id':deal})
         return None
 
+    @staticmethod
+    def _parse_broker_ts(raw):
+        if raw in (None,''):
+            return None
+        try:
+            text=str(raw).replace('Z','+00:00')
+            dt=datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt=dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).timestamp()
+        except Exception:
+            return None
+
+    def _requeue_unsettled_cash_closes(self):
+        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue."""
+        try:
+            rows=self.store.db.execute(
+                "SELECT deal_id,exit,opened,closed,pnl_source FROM trades "
+                "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
+                "('pending_broker_pnl','pending_close_sync','upl_estimate',"
+                "'ticks_only','price_size','position_disappeared')) "
+                "ORDER BY closed DESC LIMIT 80").fetchall()
+        except Exception:
+            return 0
+        n=0
+        for deal_id,exit_lvl,_opened,_closed,src in rows:
+            deal=str(deal_id)
+            if self.store.get('broker_cash_banked:'+deal):
+                continue
+            self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
+            n+=1
+        return n
+
+    def _tx_fingerprint(self,tx):
+        """Stable id for a Capital TRADE row — used to consume fuzzy binds once."""
+        if not isinstance(tx,dict):
+            return None
+        for key in ('reference','transactionId','dealId','dealReference','id'):
+            ref=tx.get(key)
+            if ref not in (None,''):
+                return str(key)+':'+str(ref)
+        val=self._row_cash_pnl(tx)
+        blob='|'.join(str(tx.get(k) or '') for k in
+                      ('instrumentName','marketName','epic','size','quantity','date','dateUtc'))
+        if val is None and not blob.strip('|'):
+            return None
+        return 'fallback:'+str(val)+':'+blob
+
+    def _fuzzy_tx_consumed(self):
+        raw=self.store.get('fuzzy_pnl_tx_consumed') or []
+        return set(str(x) for x in raw) if isinstance(raw,list) else set()
+
+    def _mark_fuzzy_tx_consumed(self,fingerprint,*,deal_id=None):
+        fp=str(fingerprint or '')
+        if not fp:
+            return
+        used=list(self.store.get('fuzzy_pnl_tx_consumed') or [])
+        if fp not in used:
+            used.append(fp)
+        if len(used)>2000:
+            used=used[-2000:]
+        self.store.set('fuzzy_pnl_tx_consumed',used)
+        if deal_id is not None:
+            self.store.set('fuzzy_pnl_tx_for:'+str(deal_id),fp)
+
     async def _pnl_fuzzy_instrument_cash(self,deal_id,*,queued_at=None):
-        """When dealId refs miss, bind the single TRADE cash row for this epic/size."""
+        """When dealId refs miss, bind one unused closing TRADE for this deal.
+
+        Capital often omits instrumentName and uses signed size / opposite close
+        direction. With many GOLD closes, ``len(hits)==1`` never fires — pick the
+        closest unused TRADE by openLevel / close time instead of staying pending.
+        """
         if not self.broker or not hasattr(self.broker,'transactions'):return None
         deal=str(deal_id)
         try:
             row=self.store.db.execute(
-                'SELECT epic,size,direction,opened FROM trades WHERE deal_id=?',
-                (deal,)).fetchone()
+                'SELECT epic,size,direction,opened,closed,entry,exit FROM trades '
+                'WHERE deal_id=?',(deal,)).fetchone()
         except Exception:
             row=None
         if not row or not row[0]:return None
-        epic,size,direction,opened=row[0],str(row[1] or ''),str(row[2] or ''),row[3]
+        epic,size,direction,opened,closed,entry,exit_lvl=(
+            row[0],str(row[1] or ''),str(row[2] or ''),row[3],row[4],
+            _num(row[5]),_num(row[6]))
+        del direction  # close TRADE direction is often opposite of open
         look=self._history_lookback(deal,queued_at=queued_at or opened)
         try:
             kwargs=self._history_kwargs(look,for_activity=False,tx_type='TRADE')
             payload=await self.broker.transactions(**kwargs)
+            if not (payload.get('transactions') or []) and look.get('from_time'):
+                payload=await self.broker.transactions(
+                    last_period=86400,tx_type='TRADE')
         except Exception as exc:
             self.store.event('warning','Fuzzy transaction P&L lookup failed',
                              {'type':type(exc).__name__,'deal_id':deal})
             return None
         hits=[]
         epic_u=epic.upper()
-        # Normalize sizes so "0.02" matches ".02".
-        def _sz(v):
-            try:return f'{float(v):.6f}'.rstrip('0').rstrip('.')
-            except (TypeError,ValueError):return str(v or '')
-        size_n=_sz(size)
+        consumed=self._fuzzy_tx_consumed()
+        already=self.store.get('fuzzy_pnl_tx_for:'+deal)
+        target_ts=(self._parse_broker_ts(closed) or self._parse_broker_ts(queued_at)
+                   or self._parse_broker_ts(opened))
         for tx in payload.get('transactions') or []:
             if self._transaction_matches_deal(tx,deal):
-                # Prefer exact/fuzzy deal match path — caller already tried that.
+                continue
+            fp=self._tx_fingerprint(tx)
+            if fp and fp in consumed and fp!=already:
                 continue
             val=self._row_cash_pnl(tx)
             if val is None:continue
+            # Opening TRADE / flat fill is not closing cash — never bank £0 fuzzy.
+            if abs(float(val))<1e-12:
+                continue
             blob=' '.join(str(tx.get(k) or '') for k in
                           ('instrumentName','marketName','epic','description','note')).upper()
-            # GOLD often shows as "Gold" / "Gold Spot"; keep XAU as alias.
-            if epic_u not in blob and not (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)):
+            has_instrument=bool(blob.strip())
+            instrument_ok=(not has_instrument) or (
+                epic_u in blob or (epic_u=='GOLD' and ('GOLD' in blob or 'XAU' in blob)))
+            if not instrument_ok:
                 continue
-            tx_size=_sz(tx.get('size') or tx.get('quantity') or '')
-            if tx_size and size_n and tx_size!=size_n:continue
-            tx_dir=str(tx.get('direction') or '').upper()
-            if tx_dir and direction and tx_dir!=direction.upper():continue
-            hits.append((float(val),self._cash_currency(tx.get('currency'))))
-        if len(hits)==1:
-            return hits[0]
-        # Multiple GOLD closes in window — pick the one closest to exit_level time
-        # is hard without timestamps; if all share the same cash, that is enough.
-        if len(hits)>1:
-            vals={round(h[0],4) for h in hits}
-            if len(vals)==1:
-                return hits[0]
-        return None
+            tx_size_raw=tx.get('size') if tx.get('size') not in (None,'') else tx.get('quantity')
+            size_ok=True
+            if tx_size_raw not in (None,'') and size not in (None,''):
+                try:
+                    size_ok=(abs(Decimal(str(tx_size_raw)))==abs(Decimal(str(size))))
+                except (ValueError,TypeError,ArithmeticError):
+                    size_ok=False
+            if not size_ok:
+                continue
+            tx_ts=(self._parse_broker_ts(tx.get('dateUtc'))
+                   or self._parse_broker_ts(tx.get('dateUTC'))
+                   or self._parse_broker_ts(tx.get('date')))
+            open_lvl=_num(tx.get('openLevel') or tx.get('open_level'))
+            close_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+            score=0.0
+            if has_instrument:
+                score-=10.0
+            if entry is not None and open_lvl is not None:
+                diff=abs(float(entry)-float(open_lvl))
+                if diff<=1e-6:
+                    score-=1000.0
+                else:
+                    score+=min(200.0,diff*20.0)
+            elif entry is not None and open_lvl is None:
+                score+=25.0
+            if exit_lvl is not None and close_lvl is not None:
+                cdiff=abs(float(exit_lvl)-float(close_lvl))
+                if cdiff<=1e-6:
+                    score-=50.0
+                else:
+                    score+=min(40.0,cdiff*5.0)
+            if target_ts is not None and tx_ts is not None:
+                score+=abs(tx_ts-target_ts)/60.0
+            elif target_ts is not None and tx_ts is None:
+                score+=500.0
+            hits.append((score,float(val),self._cash_currency(tx.get('currency')),fp,tx_ts))
+        if not hits:
+            return None
+        hits.sort(key=lambda h:h[0])
+        best=hits[0]
+        if len(hits)>1 and (hits[1][0]-best[0])<0.5:
+            self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
+                             {'deal_id':deal,'candidates':len(hits),
+                              'best_score':best[0],'second_score':hits[1][0]})
+            return None
+        _score,pnl,ccy,fp,_ts=best
+        if fp:
+            self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
+        return pnl,ccy
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
         """Confirm.profit → history/activity only.
@@ -3411,6 +3560,12 @@ class SingleTradeEngine:
         if not found and (hasattr(self.broker,'activity') or hasattr(self.broker,'transactions')):
             await asyncio.sleep(.8)
             found=await self._pnl_from_broker_history(deal_id,queued_at=queued)
+        if not found:
+            try:
+                found=await self._pnl_fuzzy_instrument_cash(deal_id,queued_at=queued)
+            except Exception as exc:
+                self.store.event('warning','Fuzzy resolve P&L failed',
+                                 {'deal_id':deal_id,'type':type(exc).__name__})
         if found:
             pnl,hist_ccy=found
             return pnl,'broker',self._cash_currency(hist_ccy)
@@ -3445,11 +3600,145 @@ class SingleTradeEngine:
             'mode':mode,'pnl':pnl,'source':source})
 
     def _queue_pending_pnl(self,deal_id,*,exit_level=None):
+        """Queue Capital £ harvest. Cap 500 — never drop unresolved new closes."""
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
         deal=str(deal_id)
-        if deal not in [str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]:
+        ids=[str(x.get('deal_id') if isinstance(x,dict) else x) for x in pending]
+        if deal not in ids:
             pending.append({'deal_id':deal,'exit_level':exit_level,'queued_at':now()})
-            self.store.set('pending_broker_pnl_deals',pending[-40:])
+        if len(pending)>500:
+            def _done(item):
+                d=str(item.get('deal_id') if isinstance(item,dict) else item)
+                return bool(self.store.get('broker_cash_banked:'+d))
+            open_q=[x for x in pending if not _done(x)]
+            if len(open_q)<=500:
+                pending=open_q
+            else:
+                pending=open_q[-500:]
+        self.store.set('pending_broker_pnl_deals',pending)
+
+    def _bank_broker_cash_side_effects(self,deal_id,pnl,*,currency=None,action=None,
+                                       exit_reason=None,scratch_band=None):
+        """Once-only day-book / hard-risk / cycle / scratch bank from broker £.
+
+        Must run even when neural already learned (late Capital cash). Keyed by
+        ``broker_cash_banked:{deal}`` so ticks-then-£ and retry paths cannot
+        double-count the same deal. A prior £0 poison bind may be corrected.
+        """
+        if pnl is None or deal_id is None:
+            return False
+        try:
+            val=float(pnl)
+        except (TypeError,ValueError):
+            return False
+        if not math.isfinite(val):
+            return False
+        deal=str(deal_id)
+        key='broker_cash_banked:'+deal
+        prev=self.store.get(key)
+        if isinstance(prev,dict):
+            prev_pnl=_num(prev.get('pnl'))
+            if not (prev_pnl is not None and abs(prev_pnl)<1e-12 and abs(val)>=1e-12):
+                return False
+        hard_risk.record_realized_pnl(self.store,val)
+        equity=self._account_equity()
+        open_n=len([p for p in (self.positions or [])
+                    if str(p.get('dealId'))!=deal])
+        day_book.record_close(
+            self.store,pnl=val,equity=equity,open_count=open_n,deal_id=deal)
+        self._settle_unified_cycle(
+            pnl=val,action=action,exit_reason=exit_reason,deal_id=deal,
+            scratch_band=scratch_band)
+        self._note_scratch_close(val,deal)
+        self.store.set(key,{
+            'at':now(),'pnl':val,'currency':currency,'action':action})
+        return True
+
+    def _trade_direction(self,deal_id):
+        try:
+            row=self.store.db.execute(
+                'SELECT direction FROM trades WHERE deal_id=?',
+                (str(deal_id),)).fetchone()
+            if row and row[0] in ('BUY','SELL'):
+                return row[0]
+        except Exception:
+            pass
+        return None
+
+    def _stop_ticks_by_deal(self,tick):
+        """Per-deal stop distance in ticks for day-book committed risk."""
+        out={}
+        tick_f=_num(tick)
+        if tick_f is None or tick_f<=0:
+            return out
+        for p in (self.positions or []):
+            deal=p.get('dealId')
+            if deal is None:
+                continue
+            meta=self.store.get('adaptive_protection:'+str(deal)) or {}
+            risk=_num(meta.get('original_risk'))
+            if risk is None:
+                entry=_num(p.get('level'));stop=_num(p.get('stopLevel'))
+                if entry is not None and stop is not None:
+                    risk=abs(entry-stop)
+            if risk is None or risk<=0:
+                continue
+            out[str(deal)]=float(risk)/float(tick_f)
+        return out
+
+    def _late_broker_teacher_update(self,deal_id,saved,*,broker_pnl,currency,
+                                    exit_level=None,action=None):
+        """Feed profit_learning + bracket_learn when Capital £ arrives after ticks."""
+        if broker_pnl is None or not math.isfinite(float(broker_pnl)):
+            return False
+        saved=saved if isinstance(saved,dict) else self.store.get('entry_brain:'+str(deal_id))
+        direction=(action or (saved or {}).get('direction')
+                   or self._trade_direction(deal_id))
+        epic=(saved or {}).get('epic') or (self.mandate or {}).get('epic')
+        entry=_num((saved or {}).get('entry'))
+        try:
+            row=self.store.db.execute(
+                'SELECT epic,entry,direction FROM trades WHERE deal_id=?',
+                (str(deal_id),)).fetchone()
+        except Exception:
+            row=None
+        if row:
+            if not epic and row[0]:
+                epic=row[0]
+            if entry is None:
+                entry=_num(row[1])
+            if direction not in ('BUY','SELL') and row[2] in ('BUY','SELL'):
+                direction=row[2]
+        exit_lvl=_num(exit_level)
+        spread=_num((saved or {}).get('entry_spread')) or 0.
+        if direction in ('BUY','SELL') and epic and entry is not None:
+            try:
+                self.profit_learning.record_closed(
+                    deal_id=deal_id,epic=epic,direction=direction,entry=entry,
+                    exit_level=exit_lvl if exit_lvl is not None else entry,
+                    broker_pnl=float(broker_pnl),currency=currency,spread=spread,
+                    require_broker_pnl=True)
+            except Exception as exc:
+                self.store.event('warning','Late profit_learning skipped',
+                                 {'deal_id':deal_id,'type':type(exc).__name__})
+        try:
+            bk=(saved or {}).get('bracket_kappa')
+            bs=(saved or {}).get('bracket_sl_scale')
+            if bk is None or bs is None:
+                cur=bracket_learn.load_params(self.store);bk,bs=cur['kappa'],cur['sl_scale']
+            bracket_learn.record_outcome(
+                self.store,kappa=bk,sl_scale=bs,pnl=float(broker_pnl),
+                currency=currency,deal_id=deal_id)
+        except Exception as exc:
+            self.store.event('warning','Late bracket_learn skipped',
+                             {'deal_id':deal_id,'type':type(exc).__name__})
+        try:
+            from .self_params import evolve_from_feedback, maybe_commit_long_horizon
+            evolve_from_feedback(self.store,broker_pnl=float(broker_pnl),commit=False)
+            maybe_commit_long_horizon(self.store,self.profit_learning.broker_pnls())
+        except Exception:
+            pass
+        return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
         """Neural teach from exit ticks while cash £ is still pending.
@@ -3472,8 +3761,15 @@ class SingleTradeEngine:
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
+        if not self.broker:return
+        # Re-arm journal rows stuck pending / old upl_estimate every poll.
+        try:
+            self._requeue_unsettled_cash_closes()
+        except Exception as exc:
+            self.store.event('warning','Unsettled cash requeue failed',
+                             {'type':type(exc).__name__})
         pending=list(self.store.get('pending_broker_pnl_deals') or [])
-        if not pending or not self.broker:return
+        if not pending:return
         remaining=[]
         for item in pending:
             base=item if isinstance(item,dict) else {'deal_id':item}
@@ -3504,20 +3800,15 @@ class SingleTradeEngine:
                         {'deal_id':deal,'attempts':attempts,
                          'last_upl':float(upl) if upl is not None and math.isfinite(upl) else None})
                 nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                # Drop obsolete Admin flag if any old pending carried it.
                 nxt.pop('upl_shown',None)
                 remaining.append(nxt)
                 continue
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
-            already=self._trade_already_learned(deal)
-            self.store.close_trade(deal,exit_level,pnl,currency=ccy,source='broker',overwrite=True)
-            if already:
-                self.store.event('trade','Late broker P&L refined record without re-learning',
-                                 {'deal_id':deal,'pnl':pnl,'pnl_currency':ccy})
-            else:
-                conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,'source':'pending_pnl_retry'}
-                self._learn_closed_trade(deal,conf)
+            # Always through learn path — already_learned banks £ + late teachers once.
+            conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,
+                  'source':'pending_pnl_retry'}
+            self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
         # Flat book: also harvest Capital cash for open SQLite rows whose deal vanished
@@ -3537,6 +3828,11 @@ class SingleTradeEngine:
         for deal_id,exit_lvl in rows:
             deal=str(deal_id)
             found=await self._pnl_from_broker_history(deal)
+            if not found:
+                try:
+                    found=await self._pnl_fuzzy_instrument_cash(deal)
+                except Exception:
+                    found=None
             if not found:continue
             pnl,ccy=found
             ccy=self._cash_currency(ccy)
@@ -3545,6 +3841,8 @@ class SingleTradeEngine:
             if self._trade_already_learned(deal):
                 self.store.close_trade(deal,_num(exit_lvl),pnl,currency=ccy,
                                       source='broker',overwrite=True)
+                self._bank_broker_cash_side_effects(
+                    deal,pnl,currency=ccy,action=self._trade_direction(deal))
             else:
                 self._learn_closed_trade(deal,conf)
             self.store.event('reconcile','Orphan open trade closed from Capital history',
@@ -3824,13 +4122,25 @@ class SingleTradeEngine:
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         already_learned=self._trade_already_learned(deal_id)
         # Late broker cash may refine the journal without repeating training.
+        # Still bank £ once — neural-once-only must not skip day_book / hard_risk /
+        # profit_learning / bracket_learn teachers.
         if already_learned:
             if broker_pnl is not None:
-                currency=hint_ccy or self._account_currency()
+                currency=self._cash_currency(hint_ccy) or self._account_currency()
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker',overwrite=True)
+                action=self._trade_direction(deal_id) or (
+                    saved.get('direction') if isinstance(saved,dict) else None)
+                banked=self._bank_broker_cash_side_effects(
+                    deal_id,broker_pnl,currency=currency,action=action)
+                teacher_key='late_cash_teachers:'+str(deal_id)
+                if banked and not self.store.get(teacher_key):
+                    self._late_broker_teacher_update(
+                        deal_id,saved,broker_pnl=broker_pnl,currency=currency,
+                        exit_level=exit_level,action=action)
+                    self.store.set(teacher_key,{'at':now(),'pnl':broker_pnl})
                 self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
-                                 {'deal_id':deal_id,'pnl':broker_pnl})
+                                 {'deal_id':deal_id,'pnl':broker_pnl,'banked':banked})
             return
         # Even without a saved neural entry state, still record broker cash P&L.
         if not saved:
@@ -3841,17 +4151,22 @@ class SingleTradeEngine:
                     deal_id,row[0],exit_level,row[1],broker_pnl,currency=hint_ccy)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker':
-                    self._settle_unified_cycle(pnl=pnl_value,action=row[1],deal_id=deal_id)
-                    self._note_scratch_close(pnl_value,deal_id)
+                if pnl_source=='broker' and pnl_value is not None:
+                    self._bank_broker_cash_side_effects(
+                        deal_id,pnl_value,currency=currency,action=row[1])
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
             elif exit_level is not None or broker_pnl is not None:
-                currency=hint_ccy or (self._account_currency() if broker_pnl is not None else None)
+                currency=self._cash_currency(hint_ccy) or (
+                    self._account_currency() if broker_pnl is not None else None)
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source='broker' if broker_pnl is not None else None,
                                        overwrite=overwrite)
                 if broker_pnl is not None:
-                    self._settle_unified_cycle(pnl=broker_pnl,deal_id=deal_id)
-                    self._note_scratch_close(broker_pnl,deal_id)
+                    self._bank_broker_cash_side_effects(
+                        deal_id,broker_pnl,currency=currency)
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
             return
         epic=saved.get('epic')
         entry=_num(saved.get('entry'))
@@ -4075,13 +4390,10 @@ class SingleTradeEngine:
             bracket_learn.record_outcome(
                 self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
                 currency=currency,deal_id=deal_id,**path_ctx)
-            # Audit #21: operator daily loss / drawdown halt from realized cash.
-            hard_risk.record_realized_pnl(self.store,pnl_value)
-            # One feedback bus: £ → cycle aggression / streak for next OPEN.
-            # Pass scratch band so pennies do not tighten brackets like real losses.
-            self._settle_unified_cycle(
-                pnl=pnl_value,action=direction,
-                exit_reason=path_ctx.get('exit_reason'),deal_id=deal_id,
+            # Audit #21 + day book + cycle: once-only bank (also used on late £).
+            self._bank_broker_cash_side_effects(
+                deal_id,pnl_value,currency=currency,action=direction,
+                exit_reason=path_ctx.get('exit_reason'),
                 scratch_band=float(sp.get('scratch_pnl_abs') or 0.05))
             equity=self._account_equity()
             if equity is not None:
@@ -4090,7 +4402,6 @@ class SingleTradeEngine:
             if promoted:
                 self.store.event('bracket','SL/TP shape promoted from cash P&L history',promoted)
                 learning_generation.bump(self.store,'bracket_shape_promoted')
-            self._note_scratch_close(pnl_value,deal_id)
         if repeats>0 and self.brain.core.last_z is not None:
             grow_th=float(sp['grow_error_threshold'])
             nmax=int(sp.get('max_neurons',64))

@@ -21,10 +21,12 @@ def test_defaults_need_more_than_legacy_190_bars():
 
 
 def test_recommended_equals_computed_need_not_magic_floor():
-    """Robot asks for what val_* math requires — no human 400 floor."""
+    """Robot asks for val_* math, floored by MTF M1 depth — no human 400 floor."""
+    from app import mtf_momentum
     need = min_bars_for_train_oos_split(None)
+    mtf_floor = mtf_momentum.min_history_bars(None)
     hist = recommended_live_history_bars(None)
-    assert hist == min(BROKER_PRICE_HISTORY_MAX, need)
+    assert hist == min(BROKER_PRICE_HISTORY_MAX, max(need, mtf_floor))
     assert hist >= need or hist == BROKER_PRICE_HISTORY_MAX
 
 
@@ -61,8 +63,12 @@ def test_window_tracks_val_horizon_without_hardcode():
                 self._p = dict(value)
 
     base = dict(DEFAULTS)
-    short = _Store({**base, 'val_horizon_bars': 5})
-    long = _Store({**base, 'val_horizon_bars': 21})
+    # Keep MTF floor below val_* so horizon change is visible in recommended().
+    short = _Store({**base, 'val_horizon_bars': 5, 'mtf_min_m1_bars': 61,
+                    'mtf_momentum_enabled': 1})
+    long = _Store({**base, 'val_horizon_bars': 21, 'mtf_min_m1_bars': 61,
+                   'mtf_momentum_enabled': 1})
+    assert min_bars_for_train_oos_split(long) > min_bars_for_train_oos_split(short)
     assert recommended_live_history_bars(long) > recommended_live_history_bars(short)
 
 

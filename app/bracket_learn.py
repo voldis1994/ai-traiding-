@@ -438,10 +438,11 @@ BRACKET_TF_MINUTES = (1, 5, 15, 60)
 
 
 def resample_m1_ohlc(candles, minutes: int) -> list:
-    """Build higher-TF OHLC by packing sequential completed M1 bars.
+    """Build higher-TF OHLC from calendar-aligned completed M1 buckets.
 
-    Uses elapsed-bar packs (5/15/60 M1 → M5/M15/H1), matching the neural
-    multi-horizon tape — not a single minute window alone.
+    M5/M15/M30/M60 bars start on wall-clock UTC boundaries (…:00/:05/:15/:30).
+    Incomplete buckets (gaps / missing minutes) are skipped so a hole does not
+    glue unrelated M1 rows into a fake higher-TF candle.
     """
     from .market_context import candle_time
     m = max(1, int(minutes))
@@ -469,11 +470,24 @@ def resample_m1_ohlc(candles, minutes: int) -> list:
                 row['spread'] = r['spread']
             out1.append(row)
         return out1
+    # Group by UTC epoch-minute floor to calendar period.
+    buckets = {}
+    order = []
+    for r in cleaned:
+        epoch_min = int(r['_dt'].timestamp()) // 60
+        key = (epoch_min // m) * m
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(r)
     out = []
-    for i in range(0, len(cleaned) - m + 1, m):
-        chunk = cleaned[i:i + m]
-        if len(chunk) < m:
-            break
+    for key in order:
+        chunk = buckets[key]
+        # Require a full period of distinct minutes — drop gapped buckets.
+        minutes_seen = {int(c['_dt'].timestamp()) // 60 for c in chunk}
+        if len(minutes_seen) < m:
+            continue
+        chunk = sorted(chunk, key=lambda c: c['_dt'])
         spreads = [c['spread'] for c in chunk if c.get('spread') is not None]
         row = {
             'at': chunk[-1]['at'],
@@ -481,6 +495,8 @@ def resample_m1_ohlc(candles, minutes: int) -> list:
             'high': max(c['high'] for c in chunk),
             'low': min(c['low'] for c in chunk),
             'close': chunk[-1]['close'],
+            'bucket_start': key,
+            'm1_count': len(minutes_seen),
         }
         if spreads:
             row['spread'] = float(sum(spreads) / len(spreads))

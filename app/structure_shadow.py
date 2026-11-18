@@ -165,6 +165,16 @@ def feature_vector_from_frame(frame) -> list:
         br = -1.0
     else:
         br = 0.0
+    # Encode swing BOS/CHoCH into the same breakout channel (schema stays 5-D).
+    event = str(frame.get('bos_event') or '').upper()
+    if event in ('BOS_UP', 'CHOCH_UP'):
+        br = 1.0 if event == 'BOS_UP' else 0.6
+    elif event in ('BOS_DOWN', 'CHOCH_DOWN'):
+        br = -1.0 if event == 'BOS_DOWN' else -0.6
+    if frame.get('retest') == 'UP' and not frame.get('false_break'):
+        br = max(br, 0.4)
+    elif frame.get('retest') == 'DOWN' and not frame.get('false_break'):
+        br = min(br, -0.4)
     # Clip to same soft range as other OHLC features.
     def clip(x, lo=-5.0, hi=5.0):
         try:
@@ -215,13 +225,24 @@ def frame_from_ohlc(bars, *, entry=None, exit_level=None,
         }
     net = closes[-1] - closes[0]
     net_r = net / span
-    # Swing structure: successive close pivots vs prior extremes.
+    # Keep sequential counts for compat, but classify with true swing BOS/CHoCH.
     hh_hl = lh_ll = 0
     for i in range(1, len(path)):
         if highs[i] >= highs[i - 1] and lows[i] >= lows[i - 1]:
             hh_hl += 1
         elif highs[i] <= highs[i - 1] and lows[i] <= lows[i - 1]:
             lh_ll += 1
+    from . import structure_memory
+    bos = structure_memory.bos_choch(path, left=2, right=2)
+    swing_hh = len((bos.get('swing') or {}).get('swing_highs') or [])
+    swing_ll = len((bos.get('swing') or {}).get('swing_lows') or [])
+    # Prefer swing HH/HL counts when pivots exist (neuron sees path shape better).
+    if swing_hh + swing_ll >= 2:
+        # Rising swings → hh_hl weight; falling → lh_ll.
+        if bos.get('bias') == 'UP':
+            hh_hl = max(hh_hl, swing_hh + swing_ll)
+        elif bos.get('bias') == 'DOWN':
+            lh_ll = max(lh_ll, swing_hh + swing_ll)
     # Prior range (pre-entry) → breakout if exit pierces it.
     pre = normalise_bars(pre_bars or [], limit=MAX_PRE_BARS)
     breakout = False
@@ -236,12 +257,27 @@ def frame_from_ohlc(bars, *, entry=None, exit_level=None,
                 breakout, breakout_side = True, 'UP'
             elif exit_px < pre_lo - 0.05 * pre_span:
                 breakout, breakout_side = True, 'DOWN'
+    event = bos.get('event')
     if breakout and breakout_side == 'UP':
         structure = 'BREAKOUT_UP'
         reason = 'exit_above_pre_range'
     elif breakout and breakout_side == 'DOWN':
         structure = 'BREAKOUT_DOWN'
         reason = 'exit_below_pre_range'
+    elif event in ('BOS_UP', 'CHOCH_UP'):
+        structure = 'BREAKOUT_UP' if event == 'BOS_UP' else 'TREND_UP'
+        reason = event.lower()
+        breakout = event == 'BOS_UP'
+    elif event in ('BOS_DOWN', 'CHOCH_DOWN'):
+        structure = 'BREAKOUT_DOWN' if event == 'BOS_DOWN' else 'TREND_DOWN'
+        reason = event.lower()
+        breakout = event == 'BOS_DOWN'
+    elif bos.get('bias') == 'UP' and net_r >= 0.15:
+        structure = 'TREND_UP'
+        reason = 'swing_bias_up'
+    elif bos.get('bias') == 'DOWN' and net_r <= -0.15:
+        structure = 'TREND_DOWN'
+        reason = 'swing_bias_down'
     elif abs(net_r) < 0.25 and max(hh_hl, lh_ll) < max(2, len(path) // 3):
         structure = 'RANGE'
         reason = 'contained_net'
@@ -270,6 +306,12 @@ def frame_from_ohlc(bars, *, entry=None, exit_level=None,
         'breakout': bool(breakout),
         'entry': _finite(entry),
         'exit': float(exit_px),
+        'bos_event': event,
+        'bos_bias': bos.get('bias'),
+        'retest': bos.get('retest'),
+        'false_break': bool(bos.get('false_break')),
+        'swing_range_hi': bos.get('range_hi'),
+        'swing_range_lo': bos.get('range_lo'),
     }
 
 

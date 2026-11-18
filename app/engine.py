@@ -2467,40 +2467,66 @@ class SingleTradeEngine:
                 # No self-dev / feature search while a LIVE deal is open — that
                 # mutates entry-policy architecture under an active manage MDP.
             elif (len(self.positions)==0 and self.last_signal and
-                  self.last_closed_step>=0 and new_closed_bar and
-                  self.last_entry_processed_bar!=self.last_decision_bar):
-                # After fusion transition, refuse new entries while EXTERNAL data
-                # is gapped — never act on a stale pre-gap neural vote.
-                on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
-                           and getattr(self.brain,'fusion_schema',None) is not None)
-                if on_fusion and not self.latest_fusion_ready:
-                    self.last_entry_reason='External fusion gap blocks new entry: '+(
-                        self.fusion_block_reason or 'aligned external neural inputs unavailable')
-                    self.store.event('entry','New entry blocked — fusion data gap',
-                        {'epic':self.mandate['epic'],'bar_time':self.market_context.get('bar_time'),
-                         'block':self.fusion_block_reason,'open_protection':'continues_if_position'})
-                else:
-                    self.last_entry_processed_bar=self.last_decision_bar
-                    # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
-                    evaluation=self._entry_evaluation()
-                    action=evaluation['action']
-                    self.last_policy_decision=action
-                    self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
-                    self.store.event('entry',
-                        'Neural entry approved' if action in ('BUY','SELL') else 'Neural HOLD or external execution pause',
-                        {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
-                         'proposal':evaluation.get('proposal'), 'decision':action,
-                         'reason':self.last_entry_reason,'model_step':self.brain.core.steps})
-                    # HOLD with a directional proposal → shadow opposite path later
-                    # (same brackets) so abstention does not collapse to forever-HOLD.
-                    if action=='HOLD' and evaluation.get('proposal') in ('BUY','SELL'):
-                        self._enqueue_hold_shadow(evaluation)
-                    # One entry opportunity per completed M1 bar. The first new
-                    # confirmed bar after a broker-verified close can already act.
-                    if (action in ('BUY','SELL') and
-                        self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
-                        snap.get('marketStatus')=='TRADEABLE'):
-                        await self.submit(action,broker_market)
+                  self.last_closed_step>=0):
+                # Entry triggers: (1) new completed M1 bar as before, OR
+                # (2) live OHLC/mid move confirms a strong/medium raw neural side
+                # mid-bar — do not wait another candle when price already moved.
+                bar_ready=(new_closed_bar and
+                           self.last_entry_processed_bar!=self.last_decision_bar)
+                live_trig={'ready':False}
+                if not bar_ready:
+                    try:
+                        live_trig=reentry_confirm.live_entry_trigger(
+                            scores_raw=(self.last_signal or {}).get('scores_raw')
+                            or (self.last_signal or {}).get('scores'),
+                            last_outcome=self.store.get('last_trade_outcome'),
+                            mtf_analysis=self._mtf_momentum_analysis(),
+                            market_context=self.market_context,
+                            live_mid=self._live_mid_now(),
+                            store=self.store)
+                    except Exception:
+                        live_trig={'ready':False}
+                    # Debounce: one live attempt per distinct mid (or per bar).
+                    live_mid=self._live_mid_now()
+                    last_live=getattr(self,'_last_live_entry_mid',None)
+                    if live_trig.get('ready') and live_mid is not None:
+                        if last_live is not None and abs(float(live_mid)-float(last_live))<1e-9:
+                            live_trig={'ready':False,'reason':'live_mid_unchanged'}
+                if bar_ready or live_trig.get('ready'):
+                    # After fusion transition, refuse new entries while EXTERNAL data
+                    # is gapped — never act on a stale pre-gap neural vote.
+                    on_fusion=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
+                               and getattr(self.brain,'fusion_schema',None) is not None)
+                    if on_fusion and not self.latest_fusion_ready:
+                        self.last_entry_reason='External fusion gap blocks new entry: '+(
+                            self.fusion_block_reason or 'aligned external neural inputs unavailable')
+                        self.store.event('entry','New entry blocked — fusion data gap',
+                            {'epic':self.mandate['epic'],'bar_time':self.market_context.get('bar_time'),
+                             'block':self.fusion_block_reason,'open_protection':'continues_if_position'})
+                    else:
+                        if bar_ready:
+                            self.last_entry_processed_bar=self.last_decision_bar
+                        if live_trig.get('ready') and self._live_mid_now() is not None:
+                            self._last_live_entry_mid=float(self._live_mid_now())
+                        evaluation=self._entry_evaluation()
+                        action=evaluation['action']
+                        self.last_policy_decision=action
+                        self.last_entry_reason=self._signal_reason(
+                            action,snap.get('marketStatus'),evaluation)
+                        self.store.event('entry',
+                            'Neural entry approved' if action in ('BUY','SELL')
+                            else 'Neural HOLD or external execution pause',
+                            {'epic':self.mandate['epic'],'bar_time':self.last_decision_bar,
+                             'proposal':evaluation.get('proposal'),'decision':action,
+                             'reason':self.last_entry_reason,'model_step':self.brain.core.steps,
+                             'trigger':('completed_m1' if bar_ready else 'live_ohlc'),
+                             'live_ohlc':bool(live_trig.get('ready'))})
+                        if action=='HOLD' and evaluation.get('proposal') in ('BUY','SELL'):
+                            self._enqueue_hold_shadow(evaluation)
+                        if (action in ('BUY','SELL') and
+                            self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
+                            snap.get('marketStatus')=='TRADEABLE'):
+                            await self.submit(action,broker_market)
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -2700,8 +2726,14 @@ class SingleTradeEngine:
                 unified_cycle.load_state(self.store)))
         return result
 
+    def _live_mid_now(self):
+        mid=_num((self.market or {}).get('mid'))
+        if mid is not None:
+            return mid
+        return _num((self.market_context or {}).get('close'))
+
     def _reentry_confirm_gate(self,action,*,scores_raw=None,mtf_analysis=None):
-        """Raw neural + post-close move proof before same-dir / medium OPEN."""
+        """Raw neural + live OHLC / post-close move proof before OPEN."""
         epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
         candles=[]
         if epic:
@@ -2710,6 +2742,20 @@ class SingleTradeEngine:
             except Exception:
                 candles=[]
         last=self.store.get('last_trade_outcome') if self.store else None
+        ctx=dict(self.market_context or {})
+        # Forming bucket from live quote — not a completed candle.
+        live_mid=self._live_mid_now()
+        if live_mid is not None:
+            forming=ctx.get('forming') if isinstance(ctx.get('forming'),dict) else {}
+            forming=dict(forming)
+            if forming.get('open') is None:
+                forming['open']=_num((self.market or {}).get('open')) or live_mid
+            forming['high']=max(_num(forming.get('high')) or live_mid, live_mid)
+            forming['low']=min(_num(forming.get('low')) or live_mid, live_mid)
+            forming['close']=live_mid
+            ctx['forming']=forming
+            ctx['mid']=live_mid
+            ctx['live_mid']=live_mid
         gate=reentry_confirm.evaluate(
             action=action,
             scores_raw=scores_raw or (
@@ -2719,9 +2765,10 @@ class SingleTradeEngine:
             mtf_analysis=mtf_analysis or (
                 (self.last_signal or {}).get('mtf_momentum')
                 if isinstance(self.last_signal,dict) else None),
-            market_context=self.market_context,
+            market_context=ctx,
             candles=candles,
-            store=self.store)
+            store=self.store,
+            live_mid=live_mid)
         if isinstance(self.last_signal,dict):
             self.last_signal=dict(self.last_signal,reentry_confirm=gate)
         return gate

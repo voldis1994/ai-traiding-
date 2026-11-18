@@ -48,7 +48,7 @@ def test_medium_needs_two_m1_closes():
         mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
         candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 100}])
     assert one['allowed'] is False
-    assert one['reason'] == 'medium_need_m1_confirm'
+    assert one['reason'] == 'medium_need_ohlc_or_m1'
     two = rc.evaluate(
         action='BUY', scores_raw=scores_raw,
         market_context={'trend': 'MIXED'},
@@ -60,6 +60,62 @@ def test_medium_needs_two_m1_closes():
         ])
     assert two['allowed'] is True
     assert two['reason'] == 'medium_m1_confirm'
+
+
+def test_strong_live_mid_allows_without_completed_candle():
+    """Strong raw + live mid ATR move → OPEN now (no completed M1 wait)."""
+    scores_raw = {'BUY': 0.55, 'SELL': 0.20, 'HOLD': 0.25}  # edge 0.30
+    out = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        live_mid=2652.0,
+        last_outcome={'direction': 'SELL', 'exit_mid': 2650.0},
+        market_context={'close': 2650.0, 'forming': {'open': 2650.2, 'high': 2652.0, 'low': 2650.0}},
+        mtf_analysis={'ready': True, 'stop_hint_atr14': 4.0,
+                      'preferred': 'HOLD', 'mode': 'HOLD'},
+        candles=[])  # no completed M1 proof
+    assert out['allowed'] is True
+    assert out['tier'] == 'strong'
+    assert out.get('live_ohlc') is True
+    assert out['reason'] == 'strong_live_ohlc'
+
+
+def test_medium_live_forming_ohlc_without_m1_streak():
+    scores_raw = {'BUY': 0.42, 'SELL': 0.28, 'HOLD': 0.30}  # edge 0.12
+    out = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        live_mid=2651.0,
+        market_context={
+            'close': 2650.0,
+            'forming': {'open': 2650.0, 'high': 2651.0, 'low': 2649.8, 'close': 2651.0},
+        },
+        mtf_analysis={'ready': True, 'stop_hint_atr14': 4.0,
+                      'preferred': 'HOLD', 'mode': 'HOLD'},
+        candles=[{'open': 100, 'close': 99}])  # wrong-dir M1 — must use live OHLC
+    assert out['allowed'] is True
+    assert out['reason'] == 'medium_live_ohlc_confirm'
+
+
+def test_live_entry_trigger_ready_on_mid_move():
+    trig = rc.live_entry_trigger(
+        scores_raw={'BUY': 0.55, 'SELL': 0.20, 'HOLD': 0.25},
+        live_mid=2652.0,
+        last_outcome={'exit_mid': 2650.0},
+        market_context={'close': 2650.0},
+        mtf_analysis={'stop_hint_atr14': 4.0})
+    assert trig['ready'] is True
+    assert trig['action'] == 'BUY'
+    assert trig.get('live_ohlc') is True
+
+
+def test_live_entry_trigger_waits_without_move():
+    trig = rc.live_entry_trigger(
+        scores_raw={'BUY': 0.55, 'SELL': 0.20, 'HOLD': 0.25},
+        live_mid=2650.05,
+        last_outcome={'exit_mid': 2650.0},
+        market_context={'close': 2650.0},
+        mtf_analysis={'stop_hint_atr14': 4.0})
+    assert trig['ready'] is False
+    assert trig['reason'] == 'wait_live_move'
 
 
 def test_same_dir_reentry_needs_new_atr_move():

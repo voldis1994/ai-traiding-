@@ -204,11 +204,63 @@ def m1_same_dir_streak(candles, action, *, need=2) -> dict:
             'reason': 'm1_streak_ok' if streak >= need else 'm1_streak_short'}
 
 
-def price_confirms(action, *, mtf_analysis=None, market_context=None,
-                   candles=None) -> dict:
-    """Tape agrees with action: structure break, live trend, or last M1 close."""
+def live_ohlc_move(action, *, live_mid=None, ref_mid=None, atr=None,
+                   atr_frac=0.25, forming=None) -> dict:
+    """Confirm direction from live mid / forming OHLC — not a completed candle.
+
+    ``ref_mid`` = last close exit or last completed bar close. ``forming`` may
+    carry open/high/low/close of the in-progress M1 bucket from the quote path.
+    """
     if action not in ('BUY', 'SELL'):
         return {'ok': False, 'reason': 'bad_action'}
+    mid = _finite(live_mid)
+    ref = _finite(ref_mid)
+    atr_v = _finite(atr)
+    frac = max(0.1, float(atr_frac or 0.25))
+    if mid is not None and ref is not None and atr_v is not None and atr_v > 0:
+        move = mid - ref
+        need = frac * atr_v
+        if action == 'BUY' and move >= need:
+            return {'ok': True, 'reason': 'live_mid_atr_up', 'move': move, 'need': need}
+        if action == 'SELL' and (-move) >= need:
+            return {'ok': True, 'reason': 'live_mid_atr_down', 'move': move, 'need': need}
+    if isinstance(forming, dict) and mid is not None:
+        o = _finite(forming.get('open'))
+        hi = _finite(forming.get('high'))
+        lo = _finite(forming.get('low'))
+        if o is not None:
+            if action == 'BUY' and mid > o and (hi is None or hi >= mid):
+                # Forming bar already printing in BUY direction.
+                if atr_v is None or atr_v <= 0 or (mid - o) >= 0.15 * atr_v:
+                    return {'ok': True, 'reason': 'forming_ohlc_up', 'move': mid - o}
+            if action == 'SELL' and mid < o and (lo is None or lo <= mid):
+                if atr_v is None or atr_v <= 0 or (o - mid) >= 0.15 * atr_v:
+                    return {'ok': True, 'reason': 'forming_ohlc_down', 'move': mid - o}
+    return {'ok': False, 'reason': 'no_live_ohlc_move'}
+
+
+def price_confirms(action, *, mtf_analysis=None, market_context=None,
+                   candles=None, live_mid=None, last_outcome=None) -> dict:
+    """Tape agrees with action — prefer live OHLC/mid, then structure/trend, then M1."""
+    if action not in ('BUY', 'SELL'):
+        return {'ok': False, 'reason': 'bad_action'}
+    atr = _atr14(mtf_analysis)
+    ref = None
+    forming = None
+    if isinstance(last_outcome, dict):
+        ref = _finite(last_outcome.get('exit_mid') or last_outcome.get('exit_level'))
+    if isinstance(market_context, dict):
+        if ref is None:
+            ref = _finite(market_context.get('close'))
+        forming = market_context.get('forming') if isinstance(
+            market_context.get('forming'), dict) else None
+        if live_mid is None:
+            live_mid = _finite(market_context.get('mid') or market_context.get('live_mid'))
+    live = live_ohlc_move(
+        action, live_mid=live_mid, ref_mid=ref, atr=atr,
+        atr_frac=0.25, forming=forming)
+    if live.get('ok'):
+        return live
     br = _structure_break(mtf_analysis)
     if (action == 'BUY' and br == 'UP') or (action == 'SELL' and br == 'DOWN'):
         return {'ok': True, 'reason': 'structure_break'}
@@ -226,10 +278,10 @@ def price_confirms(action, *, mtf_analysis=None, market_context=None,
                 return {'ok': True, 'reason': 'returns_up'}
             if action == 'SELL' and r1 < 0 and r5 < 0:
                 return {'ok': True, 'reason': 'returns_down'}
+    # Completed M1 is fallback only — live OHLC is preferred.
     streak = m1_same_dir_streak(candles, action, need=1)
     if streak.get('ok'):
         return {'ok': True, 'reason': 'last_m1_close'}
-    # MTF preferred agrees.
     pref = str((mtf_analysis or {}).get('preferred') or '').upper()
     mode = str((mtf_analysis or {}).get('mode') or '').upper()
     if pref == action and mode in ('BUY', 'SELL', 'SHIFT'):
@@ -252,7 +304,11 @@ def same_dir_new_move(action, *, last_outcome=None, mtf_analysis=None,
     close_mid = _finite(last.get('exit_mid') or last.get('exit') or last.get('exit_level'))
     live_mid = None
     if isinstance(market_context, dict):
-        live_mid = _finite(market_context.get('close') or market_context.get('mid'))
+        # Prefer live quote mid over last completed bar close.
+        live_mid = _finite(
+            market_context.get('live_mid')
+            or market_context.get('mid')
+            or market_context.get('close'))
     if live_mid is None and candles:
         live_mid = _finite((candles[-1] or {}).get('close'))
     frac = float(p.get('same_dir_atr_frac') or DEFAULTS['same_dir_atr_frac'])
@@ -277,7 +333,7 @@ def same_dir_new_move(action, *, last_outcome=None, mtf_analysis=None,
 
 
 def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
-             market_context=None, candles=None, store=None) -> dict:
+             market_context=None, candles=None, store=None, live_mid=None) -> dict:
     """Gate a proposed BUY/SELL. HOLD proposals pass through unchanged."""
     params = load_params(store)
     meta = {
@@ -317,41 +373,80 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
 
     same = same_dir_new_move(
         action, last_outcome=last_outcome, mtf_analysis=mtf_analysis,
-        market_context=market_context, candles=candles, params=params)
+        market_context=dict(market_context or {}, mid=live_mid),
+        candles=candles, params=params)
     meta['same_dir'] = same
     if same.get('needed') and not same.get('ok'):
         return dict(meta, allowed=False, reason=same.get('reason') or 'need_new_move')
 
     confirm = price_confirms(
         action, mtf_analysis=mtf_analysis, market_context=market_context,
-        candles=candles)
+        candles=candles, live_mid=live_mid, last_outcome=last_outcome)
     meta['price_confirm'] = confirm
 
     if tier == 'strong':
         if confirm.get('ok'):
-            return dict(meta, allowed=True, reason='strong_immediate',
-                        fast_entry=True)
-        # Strong but no tape yet — ask one M1 confirm instead of waiting forever.
-        streak = m1_same_dir_streak(candles, action, need=1)
-        meta['m1_confirm'] = streak
-        if streak.get('ok'):
-            return dict(meta, allowed=True, reason='strong_m1_confirm',
-                        fast_entry=True)
-        return dict(meta, allowed=False, reason='strong_wait_price_confirm',
+            live_reasons = (
+                'live_mid_atr_up', 'live_mid_atr_down',
+                'forming_ohlc_up', 'forming_ohlc_down',
+                'structure_break', 'live_trend', 'returns_up', 'returns_down')
+            return dict(meta, allowed=True,
+                        reason=('strong_live_ohlc' if confirm.get('reason') in live_reasons
+                                else 'strong_immediate'),
+                        fast_entry=True,
+                        live_ohlc=confirm.get('reason') in live_reasons)
+        # Strong without live tape yet — do NOT wait for a new completed candle.
+        return dict(meta, allowed=False, reason='strong_wait_live_ohlc',
                     fast_entry=False)
 
-    # Medium: need consecutive M1 closes (or structure break already counted).
+    # Medium: live OHLC continuation OR consecutive completed M1 closes.
     need = int(params.get('medium_m1_streak') or 2)
-    if confirm.get('reason') == 'structure_break':
-        return dict(meta, allowed=True, reason='medium_structure_confirm',
-                    fast_entry=False)
+    if confirm.get('reason') in (
+            'structure_break', 'live_mid_atr_up', 'live_mid_atr_down',
+            'forming_ohlc_up', 'forming_ohlc_down'):
+        return dict(meta, allowed=True, reason='medium_live_ohlc_confirm',
+                    fast_entry=False, live_ohlc=True)
     streak = m1_same_dir_streak(candles, action, need=need)
     meta['m1_confirm'] = streak
     if streak.get('ok'):
         return dict(meta, allowed=True, reason='medium_m1_confirm',
                     fast_entry=False)
-    return dict(meta, allowed=False, reason='medium_need_m1_confirm',
+    return dict(meta, allowed=False, reason='medium_need_ohlc_or_m1',
                 fast_entry=False)
+
+
+def live_entry_trigger(*, scores_raw=None, last_outcome=None, mtf_analysis=None,
+                       market_context=None, live_mid=None, store=None) -> dict:
+    """True when poll may attempt OPEN mid-bar on live OHLC (not only new M1)."""
+    params = load_params(store)
+    if not params.get('enabled'):
+        return {'ready': False, 'reason': 'disabled'}
+    raw_dir = raw_direction(scores_raw)
+    if raw_dir not in ('BUY', 'SELL'):
+        return {'ready': False, 'reason': 'no_raw_dir'}
+    edge = raw_score_edge(scores_raw, action=raw_dir)
+    if edge is None or edge < float(params['raw_medium']):
+        return {'ready': False, 'reason': 'raw_not_ready', 'raw_edge': edge}
+    atr = _atr14(mtf_analysis)
+    ref = None
+    if isinstance(last_outcome, dict):
+        ref = _finite(last_outcome.get('exit_mid') or last_outcome.get('exit_level'))
+    if ref is None and isinstance(market_context, dict):
+        ref = _finite(market_context.get('close'))
+    move = live_ohlc_move(
+        raw_dir, live_mid=live_mid, ref_mid=ref, atr=atr,
+        atr_frac=float(params.get('same_dir_atr_frac') or 0.35) * 0.7,
+        forming=(market_context or {}).get('forming')
+        if isinstance(market_context, dict) else None)
+    if move.get('ok'):
+        return {'ready': True, 'reason': move.get('reason'), 'action': raw_dir,
+                'raw_edge': edge, 'live_ohlc': True}
+    br = _structure_break(mtf_analysis)
+    if (raw_dir == 'BUY' and br == 'UP') or (raw_dir == 'SELL' and br == 'DOWN'):
+        return {'ready': True, 'reason': 'structure_break', 'action': raw_dir,
+                'raw_edge': edge, 'live_ohlc': True}
+    return {'ready': False, 'reason': 'wait_live_move', 'raw_edge': edge,
+            'action': raw_dir}
 
 
 def open_meta_from_gate(gate: dict, *, action) -> dict:

@@ -889,9 +889,33 @@ def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
         opp = 'SELL' if clear == 'BUY' else 'BUY'
         opp_v = out[opp]
         # Do not fight a strongly opposite neural vote.
-        if opp_v >= 0.45 and opp_v > side_v + 0.10:
-            pass  # fall through to ordinary conviction path
-        elif hold >= side_v or (side_v - hold) < 0.05:
+        strong_opposite = (opp_v >= 0.45 and opp_v > side_v + 0.10)
+        if strong_opposite:
+            # Soft damp only — never invent opposite OPEN when neural is stuck.
+            # Stops lean_anti_hold from amplifying sticky SELL into an UP tape.
+            damp = min(opp_v * 0.12, strength * 0.55)
+            if damp > 1e-6 and opp_v > side_v:
+                out[opp] = max(0.0, opp_v - damp)
+                out[clear] = side_v + 0.40 * damp
+                out['HOLD'] = hold + 0.60 * damp
+                total = sum(out.values())
+                if total <= 1e-12:
+                    return dict(scores), {'nudged': False, 'reason': 'degenerate'}
+                out = {k: v / total for k, v in out.items()}
+                return out, {
+                    'nudged': True, 'target': clear, 'delta': damp,
+                    'reason': 'clear_tape_dampen_wrong_side',
+                    'phase': phase or PHASE_HUNT,
+                    'structure': structure, 'live_trend': live_trend,
+                    'neural_best': best, 'renormalized': True,
+                    'sum': sum(out.values()),
+                }
+            return dict(scores), {
+                'nudged': False, 'reason': 'clear_disagrees_skip_amplify',
+                'clear_side': clear, 'neural_best': best,
+                'structure': structure, 'live_trend': live_trend,
+            }
+        if hold >= side_v or (side_v - hold) < 0.05:
             # Need side to lead HOLD by a small margin after transfer.
             lead = 0.06
             need = max(0.0, (hold - side_v) + lead)
@@ -915,6 +939,14 @@ def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
                     'structure': structure, 'live_trend': live_trend,
                     'renormalized': True, 'sum': sum(out.values()),
                 }
+        # Tape clear and neural already leans that way — fall through to amplify.
+        # If neural still prefers the fighting side (mild), never amplify it.
+        if best != clear:
+            return dict(scores), {
+                'nudged': False, 'reason': 'clear_disagrees_skip_amplify',
+                'clear_side': clear, 'neural_best': best,
+                'structure': structure, 'live_trend': live_trend,
+            }
 
     # Even a modest lean vs the opposite side → drain loud HOLD (HUNT only).
     # Stupid HOLD trap: HOLD 50%+ while BUY already beats SELL (or reverse).

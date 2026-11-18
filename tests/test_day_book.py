@@ -339,8 +339,26 @@ def test_clear_trend_does_not_fight_strong_opposite():
         scores, phase=db.PHASE_HUNT, store=None,
         structure='TREND_UP')
     # Strong SELL vote — do not force BUY from TREND_UP alone.
-    assert meta.get('target') != 'BUY' or meta.get('reason') != 'clear_trend_anti_hold'
+    assert meta.get('reason') != 'clear_trend_anti_hold'
+    assert meta.get('reason') in (
+        'clear_tape_dampen_wrong_side', 'clear_disagrees_skip_amplify')
     assert nudged['SELL'] >= nudged['BUY']
+    # Soft damp may trim sticky SELL — never amplify it against UP tape.
+    assert nudged['SELL'] <= scores['SELL'] + 1e-9
+
+
+def test_clear_tape_does_not_amplify_sticky_sell_on_up_move():
+    """Market turns UP while neural still leans SELL — do not lean_anti_hold SELL."""
+    # HOLD already below BUY so clear_trend_anti_hold does not fire; without the
+    # clear-disagrees guard, conviction_anti_hold would amplify sticky SELL.
+    scores = {'BUY': 0.34, 'SELL': 0.43, 'HOLD': 0.23}
+    nudged, meta = db.soft_nudge_conviction(
+        scores, phase=db.PHASE_HUNT, store=None,
+        live_trend='UP', returns_bps={'1': 8.0, '5': 5.0})
+    assert meta.get('reason') not in ('lean_anti_hold', 'conviction_anti_hold')
+    assert nudged['SELL'] <= scores['SELL'] + 1e-9
+    assert meta.get('reason') in (
+        'clear_disagrees_skip_amplify', 'clear_tape_dampen_wrong_side')
 
 
 def test_day_phase_protect_tilts_hold():

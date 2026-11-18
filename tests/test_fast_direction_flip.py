@@ -30,6 +30,40 @@ def test_soft_nudge_skips_when_live_trend_disagrees():
         assert nudged == scores
 
 
+def test_situation_memory_skips_when_live_trend_disagrees():
+    from app import situation_memory as sm
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        advice = {'advice': 'SELL', 'confidence': 0.9, 'reason': 'hist_scene'}
+        scores = {'BUY': 0.35, 'SELL': 0.40, 'HOLD': 0.25}
+        nudged, meta = sm.soft_nudge_scores(
+            scores, advice, store=store, live_trend='UP')
+        assert meta['nudged'] is False
+        assert meta['reason'] == 'live_trend_disagrees'
+        assert nudged == scores
+
+
+def test_mtf_skips_lagging_preferred_when_live_trend_flipped():
+    """KAMA still SELL while live trend UP — do not reinforce sticky short."""
+    from app import mtf_momentum as mtf
+    scores = {'BUY': 0.30, 'SELL': 0.45, 'HOLD': 0.25}
+    analysis = {
+        'ready': True, 'mode': 'SELL', 'preferred': 'SELL',
+        'confidence': 0.8, 'reason': 'kama_down_lag',
+    }
+    nudged, meta = mtf.soft_nudge_scores(
+        scores, analysis, store=None, live_trend='UP')
+    assert meta['nudged'] is False
+    assert meta['reason'] == 'live_trend_disagrees'
+    assert nudged == scores
+    # SHIFT keeps authority for early pressure flip.
+    shift = dict(analysis, mode='SHIFT', preferred='BUY', reason='pressure_flip')
+    nudged2, meta2 = mtf.soft_nudge_scores(
+        scores, shift, store=None, live_trend='DOWN')
+    assert meta2['nudged'] is True
+    assert meta2['target'] == 'BUY'
+
+
 def test_reverse_loss_teaches_opposite_not_gave_then_hold():
     """Went green then SL on a reverse — teach SELL, not HOLD spam."""
     bars = [

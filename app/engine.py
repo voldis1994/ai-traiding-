@@ -2582,22 +2582,32 @@ class SingleTradeEngine:
             forecast_meta={'nudged':False,'reason':type(exc).__name__}
             f_advice={'advice':None}
         # Situation memory: scene×£ soft tilt after structure edge / forecast.
+        # Skip when live trend fights historical scene advice (same as structure_edge).
         sit_advice=self._situation_memory_advice(
-            structure=(edge_advice or {}).get('structure'))
+            structure=(edge_advice or {}).get('structure') or ctx.get('structure'))
         nudged_scores,sit_nudge=situation_memory.soft_nudge_scores(
-            nudged_scores,sit_advice,store=self.store)
+            nudged_scores,sit_advice,store=self.store,
+            live_trend=ctx.get('trend'))
         # Day book: anti-HOLD when move is clear; HOLD tilt when day already banked.
+        # Must pass live tape — without it lean_anti_hold only amplifies neural
+        # winner (sticky SELL after SELL wins) and clear_trend_anti_hold never runs.
         equity=self._account_equity()
         db_snap=day_book.snapshot(self.store,equity=equity,positions=self.positions)
         phase=db_snap.get('phase') or day_book.PHASE_HUNT
+        live_structure=((edge_advice or {}).get('structure')
+                        or ctx.get('structure'))
         nudged_scores,conv_meta=day_book.soft_nudge_conviction(
-            nudged_scores,phase=phase,store=self.store)
+            nudged_scores,phase=phase,store=self.store,
+            live_trend=ctx.get('trend'),structure=live_structure,
+            returns_bps=ctx.get('returns_bps'))
         nudged_scores,phase_meta=day_book.soft_nudge_day_phase(
             nudged_scores,phase=phase,store=self.store)
         # Multi-TF Momentum+Structure+ADX+ATR — soft tilt; SHIFT is a mode.
+        # Pass live trend so lagging KAMA cannot reinforce sticky old side.
         mtf_analysis=self._mtf_momentum_analysis()
         nudged_scores,mtf_meta=mtf_momentum.soft_nudge_scores(
-            nudged_scores,mtf_analysis,store=self.store)
+            nudged_scores,mtf_analysis,store=self.store,
+            live_trend=ctx.get('trend'))
         # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.
         if isinstance(self.last_signal,dict) and not self.positions:
             self.last_signal=dict(

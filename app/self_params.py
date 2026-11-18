@@ -419,9 +419,24 @@ def _clear_trial_fields():
 
 
 def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
-                 shadow_promote=None, broker_pnl=None, bracket_reason=None):
+                 shadow_promote=None, broker_pnl=None, bracket_reason=None,
+                 day_book_event=None):
     """Mutate a param dict from one evidence event. Returns note strings."""
     notes=[]
+    ev=str(day_book_event or '')
+    if ev=='day_loss':
+        # Soften aggression after a day-book loss close (not a full budget hit).
+        p['scratch_pnl_abs']=min(BOUNDS['scratch_pnl_abs'][1],
+            float(p['scratch_pnl_abs'])*1.02)
+        notes.append('day_book loss → slight scratch widen')
+    elif ev=='day_budget_hit':
+        p['day_loss_budget_frac']=max(BOUNDS['day_loss_budget_frac'][0],
+            float(p['day_loss_budget_frac'])*0.98)
+        notes.append('day_book budget hit → slightly tighter day loss frac')
+    elif ev=='day_target_hit':
+        p['scratch_pnl_abs']=max(BOUNDS['scratch_pnl_abs'][0],
+            float(p['scratch_pnl_abs'])*0.99)
+        notes.append('day_book target hit → slight scratch tighten')
     if feature_approved:
         p['bars_between_search']=max(BOUNDS['bars_between_search'][0],
             int(p['bars_between_search']*0.9))
@@ -561,7 +576,7 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
 
 def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
                          shadow_promote=None, broker_pnl=None, bracket_reason=None,
-                         reason='', commit=True):
+                         day_book_event=None, reason='', commit=True):
     """Nudge knobs from outcomes.
 
     commit=False → queue draft, then *activate as trial* so subsequent broker £
@@ -583,7 +598,7 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
     p={k:_clip(k,base.get(k,DEFAULTS[k])) for k in DEFAULTS}
     notes=_apply_nudge(p,feature_approved=feature_approved,feature_rejected=feature_rejected,
                        shadow_promote=shadow_promote,broker_pnl=broker_pnl,
-                       bracket_reason=bracket_reason)
+                       bracket_reason=bracket_reason,day_book_event=day_book_event)
     msg=reason or ('; '.join(notes) if notes else 'no change')
     clean={k:_clip(k,p[k]) for k in DEFAULTS}
     if not commit:
@@ -597,6 +612,7 @@ def evolve_from_feedback(store, *, feature_approved=None, feature_rejected=None,
                 'shadow_promote':shadow_promote,
                 'broker_pnl':broker_pnl,
                 'bracket_reason':bracket_reason,
+                'day_book_event':day_book_event,
                 'trial_id':pending.get('trial_id'),
             })
             # First draft → activate trial under new params; mark trade index.

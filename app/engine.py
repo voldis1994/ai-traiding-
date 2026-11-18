@@ -2707,7 +2707,8 @@ class SingleTradeEngine:
         candles=[]
         if epic:
             try:
-                candles=self.store.candles(epic,n=40,historical_only=False) or []
+                # 80 M1 so swing BOS/CHoCH memory has enough pivots (not 40).
+                candles=self.store.candles(epic,n=80,historical_only=False) or []
             except Exception:
                 candles=[]
         last=self.store.get('last_trade_outcome') if self.store else None

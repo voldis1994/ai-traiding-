@@ -43,26 +43,32 @@ def test_swing_pivots_find_turns():
 
 
 def test_bos_up_after_swing_break():
-    rows = _up_trend(30, 2600.0)
-    # Flat range then break above.
-    t0 = datetime(2026, 11, 18, 13, 0, tzinfo=timezone.utc)
-    base = rows[-1]['close']
-    range_rows = []
-    for i in range(12):
-        o = base + (0.1 if i % 2 == 0 else -0.1)
-        range_rows.append({
-            'at': (t0 + timedelta(minutes=i)).isoformat(),
-            'open': o, 'high': base + 0.5, 'low': base - 0.5, 'close': o,
-        })
-    # Confirmed break above range high.
-    break_rows = [{
-        'at': (t0 + timedelta(minutes=12)).isoformat(),
-        'open': base + 0.4, 'high': base + 1.2, 'low': base + 0.3,
-        'close': base + 1.1,
-    }]
-    bos = sm.bos_choch(range_rows + break_rows, left=1, right=1)
-    assert bos.get('event') in ('BOS_UP', 'CHOCH_UP', None) or bos.get('bias') in (
-        'UP', 'DOWN', 'RANGE')
+    """Deterministic swing path: two SH/SL then close above last SH → BOS_UP."""
+    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
+        (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
+        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+        (110.5, 113, 110.3, 112.8), (112.8, 114, 112.5, 113.5),
+    ]
+    rows = [{
+        'at': (t0 + timedelta(minutes=i)).isoformat(),
+        'open': o, 'high': h, 'low': l, 'close': c,
+    } for i, (o, h, l, c) in enumerate(seq)]
+    bos = sm.bos_choch(rows, left=2, right=2)
+    assert bos.get('event') == 'BOS_UP'
+    assert bos.get('range_hi') == 112.0
+    assert bos.get('last_close') == 113.5
+
+
+def test_missing_prior_range_holds_same_dir():
+    prior = {'structure': 'RANGE', 'mid': 100.0}  # no range_hi/lo
+    live = {'structure': 'RANGE', 'mid': 100.1, 'live_event': None}
+    out = sm.developed_since(prior, live, action='BUY', atr=1.0)
+    assert out['ok'] is False
+    assert out['reason'] == 'need_structure_range'
 
 
 def test_same_range_blocks_reentry():

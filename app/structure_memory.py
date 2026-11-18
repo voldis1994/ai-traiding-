@@ -175,17 +175,22 @@ def snapshot_from_frame(frame, *, mid=None, bos=None) -> dict:
     """Compact structure snapshot stored on entry_brain / last_trade_outcome."""
     frame = frame if isinstance(frame, dict) else {}
     bos = bos if isinstance(bos, dict) else {}
-    hi = _finite(frame.get('range'))
     # Prefer swing range when available.
-    range_hi = _finite(bos.get('range_hi'))
-    range_lo = _finite(bos.get('range_lo'))
+    range_hi = _finite(bos.get('range_hi')) or _finite(frame.get('swing_range_hi'))
+    range_lo = _finite(bos.get('range_lo')) or _finite(frame.get('swing_range_lo'))
     if range_hi is None or range_lo is None:
-        # Fallback: path span around mid.
+        # Fallback: path span around mid (frame['range'] = high-low span).
         span = _finite(frame.get('range')) or 0.0
         m = _finite(mid) or _finite(frame.get('exit')) or _finite(frame.get('entry'))
         if m is not None and span > 0:
             range_hi = m + 0.5 * span
             range_lo = m - 0.5 * span
+    # Last resort: tiny ATR-less band around mid so memory always has a box.
+    if (range_hi is None or range_lo is None) and _finite(mid) is not None:
+        m = float(mid)
+        band = max(abs(m) * 1e-4, 0.05)
+        range_hi = m + band
+        range_lo = m - band
     return {
         'structure': str(frame.get('structure') or 'CHOP').upper(),
         'net_over_range': _finite(frame.get('net_over_range')),
@@ -283,6 +288,12 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
         if action is None and live_st not in ('CHOP', 'RANGE', prev_st):
             return {'needed': True, 'ok': True, 'reason': 'structure_label_changed'}
 
+    prior_lo = _finite(prior.get('range_lo'))
+    prior_hi = _finite(prior.get('range_hi'))
+    if prior_lo is None or prior_hi is None or prior_hi <= prior_lo:
+        # Incomplete memory must not silently allow same-dir re-entry.
+        return {'needed': True, 'ok': False, 'reason': 'need_structure_range',
+                'mid': live.get('mid')}
     if same_range(prior, live, atr=atr):
         return {'needed': True, 'ok': False, 'reason': 'same_range_no_new_structure',
                 'range_hi': prior.get('range_hi'), 'range_lo': prior.get('range_lo'),

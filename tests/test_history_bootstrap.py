@@ -47,9 +47,9 @@ def test_bootstrap_pulls_full_need_in_one_shot_without_live_wait():
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
         eng = SingleTradeEngine(store, brain)
-        eng.broker = FakeBroker(n=400)
-        eng.mandate = {'epic': 'GOLD', 'size': '0.1'}
         need = recommended_live_history_bars(store)
+        eng.broker = FakeBroker(n=max(400, need + 50))
+        eng.mandate = {'epic': 'GOLD', 'size': '0.1'}
         assert need >= 260
         assert eng._historical_candle_count('GOLD') == 0
         got = asyncio.run(eng._bootstrap_historical_candles('GOLD', need=need))
@@ -66,11 +66,12 @@ def test_account_and_candles_eager_when_history_thin():
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
         eng = SingleTradeEngine(store, brain)
-        eng.broker = FakeBroker(n=400)
+        need = recommended_live_history_bars(store)
+        eng.broker = FakeBroker(n=max(400, need + 50))
         eng.mandate = {'epic': 'GOLD', 'size': '0.1'}
         eng.tick_count = 1
         eng.last_candle_tick = 0  # would NOT be due under 20-tick rule
         eng.last_account_tick = 1
         asyncio.run(eng._account_and_candles())
-        assert eng._historical_candle_count('GOLD') >= recommended_live_history_bars(store)
+        assert eng._historical_candle_count('GOLD') >= need
         assert len(eng.broker.calls) >= 1

@@ -49,6 +49,7 @@ from . import champion_library
 from . import structure_shadow
 from . import structure_edge
 from . import situation_memory
+from . import structure_memory
 from . import day_book
 from . import mtf_momentum
 from . import reentry_confirm
@@ -4471,10 +4472,37 @@ class SingleTradeEngine:
         exit_mid=exit_level
         if exit_mid is None:
             exit_mid=_num((self.market or {}).get('mid'))
+        # Structure memory: open snapshot (from entry_brain) + close frame/BOS.
+        structure_at_open=(saved.get('structure_at_open')
+                           if isinstance(saved,dict) else None)
+        close_frame=(struct_ctx.get('frame')
+                     if isinstance(struct_ctx,dict) else None) or {}
+        close_bos=structure_memory.bos_choch(
+            (struct_ctx.get('pre_bars') or [])[-5:] + (cf.get('bars') or [])
+            if isinstance(struct_ctx,dict) else (cf.get('bars') or []))
+        structure_at_close=structure_memory.snapshot_from_frame(
+            close_frame,mid=exit_mid,bos=close_bos)
+        if not structure_at_open:
+            structure_at_open=structure_at_close
+        structure_memory.persist_last(self.store,structure_at_close)
+        # Bank scene×action £ so situation_memory soft-nudge has live evidence.
+        try:
+            sit=self._situation_fingerprint_now(
+                structure=(close_frame.get('structure')
+                           if isinstance(close_frame,dict) else None))
+            if sit and direction in ('BUY','SELL') and pnl_value is not None:
+                situation_memory.record_outcome(
+                    self.store,situation=sit,action=direction,pnl=pnl_value,
+                    epic=epic,deal_id=deal_id)
+        except Exception as exc:
+            self.store.event('warning','Situation memory bank skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set('last_trade_outcome',{
             'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
             'pnl':pnl_value,'mode':mode,'exit_mid':exit_mid,
-            'exit_level':exit_level})
+            'exit_level':exit_level,
+            'structure_at_open':structure_at_open,
+            'structure_at_close':structure_at_close})
         # Joint system: cash P&L also teaches SL/TP shape (lot+market stay the risk frame).
         if cash_like:
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
@@ -5126,6 +5154,15 @@ class SingleTradeEngine:
                     news=self._news_risk())
                 reentry_gate=((self.last_signal or {}).get('reentry_confirm')
                               if isinstance(self.last_signal,dict) else None)
+                # Freeze OHLC structure at OPEN so close can compare development.
+                try:
+                    open_candles=self.store.candles(
+                        self.mandate['epic'],n=80,historical_only=False) or []
+                except Exception:
+                    open_candles=[]
+                structure_at_open=structure_memory.snapshot_live(
+                    candles=open_candles,market_context=self.market_context,
+                    mid=entry)
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -5142,6 +5179,7 @@ class SingleTradeEngine:
                     'champion_context':open_ctx,
                     'reentry_confirm':reentry_confirm.open_meta_from_gate(
                         reentry_gate,action=action),
+                    'structure_at_open':structure_at_open,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),

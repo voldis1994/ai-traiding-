@@ -22,7 +22,8 @@ import math
 
 from .bracket_learn import resample_m1_ohlc
 
-DEFAULT_MIN_M1_BARS = 480
+# ≥720 M1 → ≥12 calendar M60 bars so KAMA ER10 can adapt on H1 (was 480→8).
+DEFAULT_MIN_M1_BARS = 720
 ADX_MIN = 18.0
 STORE_KEY = 'mtf_momentum_v1'
 
@@ -292,24 +293,43 @@ def realized_semivariance(closes, bars: int = 30) -> dict:
 
 
 def three_candle_break(bars_m1: list) -> dict:
-    """M1: last close vs prior 3-candle high/low structure."""
-    if len(bars_m1) < 4:
-        return {'break': None, 'prior_high': None, 'prior_low': None}
-    prior = bars_m1[-4:-1]
-    last = bars_m1[-1]
-    hi = max(float(b['high']) for b in prior)
-    lo = min(float(b['low']) for b in prior)
-    c = float(last['close'])
+    """M1 structure break — prefer swing BOS/CHoCH, fall back to 3-candle H/L."""
+    from . import structure_memory
+    bos = structure_memory.bos_choch(bars_m1, left=2, right=2)
+    event = bos.get('event')
     br = None
-    if c > hi:
+    if event in ('BOS_UP', 'CHOCH_UP'):
         br = 'UP'
-    elif c < lo:
+    elif event in ('BOS_DOWN', 'CHOCH_DOWN'):
         br = 'DOWN'
-    return {'break': br, 'prior_high': hi, 'prior_low': lo, 'close': c}
+    prior_high = bos.get('range_hi')
+    prior_low = bos.get('range_lo')
+    close = bos.get('last_close')
+    if br is None and len(bars_m1) >= 4:
+        # Legacy micro-break when swings are not ready yet.
+        prior = bars_m1[-4:-1]
+        last = bars_m1[-1]
+        prior_high = max(float(b['high']) for b in prior)
+        prior_low = min(float(b['low']) for b in prior)
+        close = float(last['close'])
+        if close > prior_high:
+            br = 'UP'
+        elif close < prior_low:
+            br = 'DOWN'
+    return {
+        'break': br, 'prior_high': prior_high, 'prior_low': prior_low,
+        'close': close, 'bos_event': event, 'bos_bias': bos.get('bias'),
+        'retest': bos.get('retest'), 'false_break': bool(bos.get('false_break')),
+    }
 
 
 def price_structure_bias(bars: list) -> str | None:
-    """HH/HL vs LH/LL on recent higher-TF bars."""
+    """Swing bias (BOS/CHoCH) on higher-TF bars; fallback to sequential HH/HL."""
+    from . import structure_memory
+    bos = structure_memory.bos_choch(bars, left=1, right=1)
+    bias = bos.get('bias')
+    if bias in ('UP', 'DOWN'):
+        return bias
     if len(bars) < 4:
         return None
     recent = bars[-4:]
@@ -614,6 +634,10 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         'ema5': e5[-1], 'ema13': e13[-1], 'ema_up': m1_up,
         'structure_break': br.get('break'),
         'prior_high': br.get('prior_high'), 'prior_low': br.get('prior_low'),
+        'bos_event': br.get('bos_event'),
+        'bos_bias': br.get('bos_bias'),
+        'retest': br.get('retest'),
+        'false_break': br.get('false_break'),
         'pressure': pressure,
         'semivariance': semivar,
     }

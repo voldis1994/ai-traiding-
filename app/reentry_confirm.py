@@ -322,6 +322,21 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
     if same.get('needed') and not same.get('ok'):
         return dict(meta, allowed=False, reason=same.get('reason') or 'need_new_move')
 
+    # Structure memory: same-dir re-entry needs new BOS/CHoCH/retest / left range.
+    try:
+        from . import structure_memory
+        struct_gate = structure_memory.gate_reentry(
+            action=action, last_outcome=last_outcome, candles=candles,
+            market_context=market_context, atr=_atr14(mtf_analysis))
+        meta['structure_memory'] = struct_gate
+        if struct_gate.get('needed') and not struct_gate.get('ok'):
+            return dict(meta, allowed=False,
+                        reason=struct_gate.get('reason') or 'same_range_hold')
+    except Exception as exc:
+        meta['structure_memory'] = {'needed': False, 'ok': True,
+                                    'reason': 'structure_memory_error',
+                                    'error': type(exc).__name__}
+
     confirm = price_confirms(
         action, mtf_analysis=mtf_analysis, market_context=market_context,
         candles=candles)

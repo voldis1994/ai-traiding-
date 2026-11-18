@@ -7,7 +7,7 @@ from app import mtf_momentum
 from app.feature_validation import recommended_live_history_bars, BROKER_PRICE_HISTORY_MAX
 
 
-def _bars(n=520, *, trend=1.0, start=2000.0, break_down=False, pressure_sell=False):
+def _bars(n=750, *, trend=1.0, start=2000.0, break_down=False, pressure_sell=False):
     """Synthetic M1 OHLC. trend>0 uptrend, <0 downtrend."""
     t0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
     out = []
@@ -38,12 +38,12 @@ def _bars(n=520, *, trend=1.0, start=2000.0, break_down=False, pressure_sell=Fal
 def test_insufficient_history_not_ready():
     a = mtf_momentum.analyze(_bars(80), spread=0.2)
     assert a['ready'] is False
-    assert a['need_m1'] >= 480
+    assert a['need_m1'] >= mtf_momentum.DEFAULT_MIN_M1_BARS
     assert a['mode'] == 'HOLD'
 
 
 def test_uptrend_kama_buy_path():
-    a = mtf_momentum.analyze(_bars(520, trend=1.0), spread=0.15)
+    a = mtf_momentum.analyze(_bars(750, trend=1.0), spread=0.15)
     assert a['ready'] is True
     assert a['stack'] == 'kama_adx_atr_pressure'
     assert a['tf']['m5']['kama'] is not None
@@ -51,17 +51,20 @@ def test_uptrend_kama_buy_path():
     assert a['stop_hint_atr14'] is None or a['stop_hint_atr14'] > 0
     assert 'period_weights' in a
     assert abs(sum(a['period_weights'].values()) - 1.0) < 1e-6
+    # Calendar M60 depth enough for KAMA ER10 (≥12 H1 from ≥720 M1).
+    assert a['bars_m1'] >= 720
+    assert a['tf']['m60'].get('kama') is not None or a['tf']['m60'].get('kama_slope') is not None
 
 
 def test_downtrend_can_sell_when_confirmed():
-    a = mtf_momentum.analyze(_bars(520, trend=-1.0), spread=0.15)
+    a = mtf_momentum.analyze(_bars(750, trend=-1.0), spread=0.15)
     assert a['ready'] is True
     assert a['preferred'] != 'BUY' or a['mode'] == 'SHIFT'
     assert a['tf']['m5'].get('kama_down') or a['tf']['m5'].get('ema_down')
 
 
 def test_structure_or_pressure_triggers_shift():
-    bars = _bars(520, trend=1.0, break_down=True, pressure_sell=True)
+    bars = _bars(750, trend=1.0, break_down=True, pressure_sell=True)
     a = mtf_momentum.analyze(bars, spread=0.15)
     assert a['ready'] is True
     assert a['mode'] == 'SHIFT'

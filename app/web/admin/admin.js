@@ -3,6 +3,10 @@ const $=id=>document.getElementById(id);
 let pollTimer=null;
 let lastOverview=null;
 let chartRange='1W';
+let overviewInFlight=null;
+let lastSyncAt=null;
+const POLL_IDLE_MS=5000;
+const POLL_LIVE_MS=2000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();
@@ -33,9 +37,18 @@ function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${
 function sourceLabel(src){
   if(src==='broker')return 'broker £';
   if(src==='upl_estimate')return 'UPL estimate';
+  if(src==='open_upl')return 'live UPL';
   if(src==='working')return 'working';
   if(src==='none'||src==='empty')return 'nav skaitļu';
   return src||'—';
+}
+
+function hasRealWorkingPnl(r){
+  if(r==null||r.working_pnl==null||!Number.isFinite(Number(r.working_pnl)))return false;
+  const src=String(r.working_pnl_source||'').toLowerCase();
+  // Backend used to emit working_pnl=0 with source empty/none — treat as missing.
+  if(src==='none'||src==='empty')return false;
+  return true;
 }
 
 /** Prefer working/estimate P&L + W/L — never show a lying 0 when estimates exist (from main #89). */
@@ -46,12 +59,14 @@ function scoreboard(r){
   const recent=Array.isArray(r.recent_trades)?r.recent_trades:[];
   let pnl=null,src='none',wins=0,losses=0;
 
-  if(r.working_pnl!=null && Number.isFinite(Number(r.working_pnl))){
+  if(hasRealWorkingPnl(r)){
     pnl=Number(r.working_pnl);src=r.working_pnl_source||'working';
   }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
     pnl=Number(r.realized_pnl);src='broker';
   }else if(r.estimate_pnl!=null && Number.isFinite(Number(r.estimate_pnl))){
     pnl=Number(r.estimate_pnl);src='upl_estimate';
+  }else if(r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
+    pnl=Number(r.open_upl);src='open_upl';
   }
 
   if(r.display_wins!=null || r.display_losses!=null){
@@ -112,6 +127,21 @@ function setView(name){
   });
 }
 
+function positionMid(p,activity){
+  if(!p)return null;
+  const a=activity||{};
+  const direct=p.currentLevel??p.current_price??p.mark??p.mid??null;
+  if(direct!=null && Number.isFinite(Number(direct)))return Number(direct);
+  const bid=p.bid??a.market_bid;
+  const ask=p.ask??a.market_ask;
+  if(bid!=null && ask!=null && Number.isFinite(Number(bid)) && Number.isFinite(Number(ask))){
+    return (Number(bid)+Number(ask))/2;
+  }
+  const m=a.market_mid;
+  if(m!=null && Number.isFinite(Number(m)))return Number(m);
+  return null;
+}
+
 function collectOpenTrades(clients){
   const rows=[];
   (clients||[]).forEach(c=>{
@@ -129,7 +159,7 @@ function collectOpenTrades(clients){
         direction:String(p.direction||'').toUpperCase(),
         size:p.size,
         open:p.level,
-        current:p.currentLevel??p.current_price??p.mark??null,
+        current:positionMid(p,a),
         upl:p.upl,
         currency:p.currency&&p.currency!==ccy?p.currency:ccy,
       });
@@ -189,20 +219,31 @@ function fleetPnl(s,clients){
   let wins=s.display_wins_all;
   let losses=s.display_losses_all;
   const ccy=s.pnl_currency||'';
+  // Treat empty/none fleet totals as missing so live open UPL can surface.
+  if(total!=null && (src==='none'||src==='empty'))total=null;
+  if(total==null && s.open_upl_all!=null && Number.isFinite(Number(s.open_upl_all))){
+    total=Number(s.open_upl_all);src='open_upl';
+  }
   if(total==null || wins==null || losses==null){
-    let sum=0,n=0,w=0,l=0,anyEst=false;
+    let sum=0,n=0,w=0,l=0,anyEst=false,anyOpen=false;
     for(const c of clients||[]){
       const sb=scoreboard(c.results||{});
       if(sb.pnl!=null){sum+=sb.pnl;n++}
       w+=sb.wins;l+=sb.losses;
       if(sb.src==='upl_estimate')anyEst=true;
+      if(sb.src==='open_upl')anyOpen=true;
     }
-    if(total==null && n){total=sum;src=anyEst?'upl_estimate':src}
+    if(total==null && n){
+      total=sum;
+      src=anyEst?'upl_estimate':(anyOpen?'open_upl':src);
+    }
     if(wins==null)wins=w;
     if(losses==null)losses=l;
   }
   // Multi-currency: never invent one number from mixed books.
-  const by=s.working_pnl_by_currency||s.pnl_by_currency||{};
+  const by=(src==='open_upl'
+    ?(s.open_upl_by_currency||{})
+    :(s.working_pnl_by_currency||s.pnl_by_currency||{}));
   const keys=Object.keys(by);
   let pnlLabel,pnlNum=total;
   if(keys.length>1 && total==null){
@@ -505,7 +546,7 @@ function trailFlag(phase){
   return `<span class="flag trail-${esc(p)}${on?'':''}">${esc(label)}</span>`;
 }
 
-function renderDeal(p,ccy){
+function renderDeal(p,ccy,activity){
   if(!p){
     return `<div class="deal flat">Nav atvērta pozīcija — robots gaida OPEN</div>`;
   }
@@ -516,6 +557,7 @@ function renderDeal(p,ccy){
   const sl=p.has_sl || p.stopLevel!=null;
   const phase=p.trail_phase||(p.enrolled?'armed':'flat');
   const uplCcy=p.currency&&p.currency!==ccy?p.currency:ccy;
+  const mid=positionMid(p,activity);
   return `<div class="deal">
     <div class="side ${sideCls}">${esc(dir||'—')}</div>
     <div>
@@ -523,6 +565,7 @@ function renderDeal(p,ccy){
       <div class="deal-meta">
         <span>Epic <strong>${esc(p.epic||'—')}</strong></span>
         <span>Entry <strong>${esc(num(p.level,2))}</strong></span>
+        <span>Mid <strong>${mid==null?'—':esc(num(mid,2))}</strong></span>
         <span>SL <strong>${p.stopLevel==null?'—':esc(num(p.stopLevel,2))}</strong></span>
         <span>TP <strong>${p.profitLevel==null?'OFF':esc(num(p.profitLevel,2))}</strong></span>
         <span>UPL <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
@@ -582,8 +625,8 @@ function renderCard(c){
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
 
   const dealsHtml=inTrade
-    ?positions.map(p=>renderDeal(p,ccy)).join('')
-    :renderDeal(null,ccy);
+    ?positions.map(p=>renderDeal(p,ccy,a)).join('')
+    :renderDeal(null,ccy,a);
 
   const trailNote=(()=>{
     const live=positions.find(p=>p.trail_status)||positions[0];
@@ -658,19 +701,43 @@ function renderCard(c){
   return el;
 }
 
+function formatSyncClock(ts){
+  if(!ts)return '';
+  try{
+    return new Date(ts).toLocaleTimeString('lv-LV',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }catch(_){return ''}
+}
+
 function updateSystemStatus(data){
   const s=data.summary||{};
   const el=$('systemStatus');
   const running=Number(s.running_robots)||0;
+  const open=Number(s.open_trades_all)||collectOpenTrades(data.clients||[]).length;
   const alerts=collectRiskAlerts(data.clients||[]);
+  const sync=formatSyncClock(lastSyncAt);
+  const syncBit=sync?` · ${sync}`:'';
   if(alerts.some(a=>a.metric==='HALT'||a.metric==='ERR')){
     el.classList.add('warn');
-    el.querySelector('span:last-child').textContent='Nepieciešama uzmanība';
+    el.querySelector('span:last-child').textContent='Nepieciešama uzmanība'+syncBit;
   }else{
     el.classList.remove('warn');
-    el.querySelector('span:last-child').textContent=
-      running>0?`Sistēma aktīva · ${running} roboti`:'Sistēma aktīva';
+    let msg='Sistēma aktīva';
+    if(running>0)msg+=` · ${running} roboti`;
+    if(open>0)msg+=` · ${open} open`;
+    el.querySelector('span:last-child').textContent=msg+syncBit;
   }
+}
+
+function desiredPollMs(data){
+  const s=(data&&data.summary)||{};
+  const running=Number(s.running_robots)||0;
+  const open=Number(s.open_trades_all)||collectOpenTrades((data&&data.clients)||[]).length;
+  return (running>0 || open>0)?POLL_LIVE_MS:POLL_IDLE_MS;
+}
+
+function schedulePoll(ms){
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(()=>loadOverview().catch(()=>{}),ms);
 }
 
 async function loadBrokers(){
@@ -685,40 +752,51 @@ async function loadBrokers(){
 }
 
 async function loadOverview(){
-  const data=await api('/api/admin/overview');
-  lastOverview=data;
-  renderSummary(data);
-  updateSystemStatus(data);
-  const open=collectOpenTrades(data.clients||[]);
-  $('openTradesPreview').innerHTML=renderTradesTable(open.slice(0,8));
-  $('openTradesFull').innerHTML=renderTradesTable(open);
-  renderTopClients(data.clients);
-  renderRiskAlerts(data.clients);
-  renderRiskBoard(data.clients);
-  renderRecentClosed(data.clients);
-  drawPerfChart(data.clients);
+  // Coalesce overlapping polls so a slow /overview cannot stack and freeze UI.
+  if(overviewInFlight)return overviewInFlight;
+  overviewInFlight=(async()=>{
+    const data=await api('/api/admin/overview');
+    lastOverview=data;
+    lastSyncAt=Date.now();
+    renderSummary(data);
+    updateSystemStatus(data);
+    const open=collectOpenTrades(data.clients||[]);
+    $('openTradesPreview').innerHTML=renderTradesTable(open.slice(0,8));
+    $('openTradesFull').innerHTML=renderTradesTable(open);
+    renderTopClients(data.clients);
+    renderRiskAlerts(data.clients);
+    renderRiskBoard(data.clients);
+    renderRecentClosed(data.clients);
+    drawPerfChart(data.clients);
 
-  const room=$('controlRoom');room.innerHTML='';
-  const clients=data.clients||[];
-  const n=clients.length;
-  room.dataset.count=String(n);
-  room.dataset.dense=n>=4?'1':'0';
-  room.style.setProperty('--cols',String(layoutCols(n)));
-  const pick=$('brokerClient');const prev=pick.value;pick.innerHTML='';
-  clients.forEach(c=>{
-    room.appendChild(renderCard(c));
-    const opt=document.createElement('option');opt.value=c.id;
-    opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);
-  });
-  if(prev)pick.value=prev;
+    const room=$('controlRoom');
+    const clients=data.clients||[];
+    const n=clients.length;
+    room.dataset.count=String(n);
+    room.dataset.dense=n>=4?'1':'0';
+    room.style.setProperty('--cols',String(layoutCols(n)));
+    const pick=$('brokerClient');const prev=pick.value;pick.innerHTML='';
+    const frag=document.createDocumentFragment();
+    clients.forEach(c=>{
+      const card=renderCard(c);
+      card.dataset.cid=String(c.id);
+      frag.appendChild(card);
+      const opt=document.createElement('option');opt.value=c.id;
+      opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);
+    });
+    room.replaceChildren(frag);
+    if(prev)pick.value=prev;
+    schedulePoll(desiredPollMs(data));
+  })();
+  try{return await overviewInFlight;}
+  finally{overviewInFlight=null}
 }
 
 async function enterDash(){
   show(false);
   await loadBrokers();
   await loadOverview();
-  if(pollTimer)clearInterval(pollTimer);
-  pollTimer=setInterval(()=>loadOverview().catch(()=>{}),5000);
+  schedulePoll(desiredPollMs(lastOverview));
 }
 
 document.querySelectorAll('.nav-item').forEach(btn=>{
@@ -736,6 +814,11 @@ document.querySelectorAll('.range-tab').forEach(btn=>{
 });
 window.addEventListener('resize',()=>{
   if(lastOverview)drawPerfChart(lastOverview.clients);
+});
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible' && !$('dash').classList.contains('hidden')){
+    loadOverview().catch(()=>{});
+  }
 });
 
 $('loginForm').onsubmit=async ev=>{

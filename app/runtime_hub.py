@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,8 +83,14 @@ class AccountRuntime:
         robot=bool(store and deal and store.get('robot_open:'+deal))
         meta=(store.get('adaptive_protection:'+deal) if store and deal else None) or {}
         runtime=(store.get('adaptive_runtime:'+deal) if store and deal else None) or {}
-        has_sl=p.get('stopLevel') is not None
-        has_tp=p.get('profitLevel') is not None
+        def _live_lvl(v):
+            try:
+                n=float(v)
+            except (TypeError,ValueError):
+                return None
+            return n if math.isfinite(n) and n>0 else None
+        has_sl=_live_lvl(p.get('stopLevel')) is not None
+        has_tp=_live_lvl(p.get('profitLevel')) is not None
         enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
         phase='flat'
         if not deal:
@@ -822,15 +829,24 @@ class RuntimeHub:
             except Exception as exc:
                 swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
+        def _level_or_none(raw):
+            """Broker unset SL/TP often arrives as 0 — omit for chart + Admin."""
+            try:
+                n=float(raw)
+            except (TypeError,ValueError):
+                return None
+            if not math.isfinite(n) or n<=0:
+                return None
+            return n
         for p in positions:
             if not isinstance(p,dict):
                 continue
             open_levels.append({
                 'deal_id':p.get('dealId'),
                 'direction':p.get('direction'),
-                'entry':p.get('level'),
-                'stop':p.get('stopLevel'),
-                'profit':p.get('profitLevel'),
+                'entry':_level_or_none(p.get('level')),
+                'stop':_level_or_none(p.get('stopLevel')),
+                'profit':_level_or_none(p.get('profitLevel')),
             })
         # Compact candle payload for canvas (popup may ask for more history).
         bare=[]

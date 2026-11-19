@@ -152,11 +152,66 @@ def test_protect_attaches_tp_on_manual_sl_only_position():
             assert protects, 'expected PROTECT to attach missing manual TP'
             _, deal_id, stop, profit = protects[0]
             assert deal_id == 'manual-tp'
-            assert stop is None  # SL already live
+            # Capital omits clear the other bracket — always re-send both.
+            assert stop is not None and float(stop) == 100.8  # keep live SL
             assert profit is not None and float(profit) < 100.0  # SELL TP below entry
             assert store.get('tp_attach_done:manual-tp')
             assert store.get('robot_open:manual-tp')
             meta = store.get('adaptive_protection:manual-tp')
             assert meta and meta.get('owner') == 'AUTO'
+
+    asyncio.run(scenario())
+
+
+def test_protect_restores_sl_when_tp_only_left():
+    """TP-only PUT used to wipe SL; recovery must re-send BOTH in one shot."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(Path(d) / 's.db')
+            brain = AdaptiveBrain(store, data_dir=d)
+            engine = SingleTradeEngine(store, brain)
+            engine.policy = AutoEvolution(store, Path(d) / 'policy.py')
+            broker = _OpenCaptureBroker()
+            broker.price = 3717.0
+            # Screenshot state: TP ON, SL OFF after a TP-only protect wipe.
+            broker.open = [{'position': {
+                'dealId': 'andris-sl-off', 'size': '.08', 'direction': 'BUY',
+                'level': 3718.95, 'stopLevel': None, 'profitLevel': 3721.01, 'upl': -0.14,
+            }, 'market': {'epic': 'GOLD'}}]
+
+            async def _confirm(ref):
+                req = [r for r in broker.requests if r[0] == 'PROTECT'][-1]
+                _, deal_id, stop, profit = req
+                pos = broker.open[0]['position']
+                if stop is not None:
+                    pos['stopLevel'] = float(stop)
+                if profit is not None:
+                    pos['profitLevel'] = float(profit)
+                return {'dealStatus': 'ACCEPTED', 'dealId': deal_id}
+
+            async def _update(deal_id, stop_level=None, profit_level=None):
+                broker.requests.append(('PROTECT', deal_id, stop_level, profit_level))
+                return {'dealReference': 'protect-both'}
+
+            broker.confirm = _confirm
+            broker.update_position = _update
+            engine.attach(broker)
+            await engine.sync()
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'GOLD')
+            engine.market = {
+                'epic': 'GOLD', 'mid': 3717.20, 'bid': 3717.0, 'ask': 3717.4,
+                'spread': 0.4, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
+            }
+            pos = engine.positions[0]
+            assert engine._needs_protect_brackets(pos) is True
+            await engine.protect_position(pos)
+            protects = [r for r in broker.requests if r[0] == 'PROTECT']
+            assert protects
+            _, deal_id, stop, profit = protects[0]
+            assert deal_id == 'andris-sl-off'
+            assert stop is not None and float(stop) < 3718.95  # BUY SL below entry
+            assert profit is not None and float(profit) == 3721.01  # keep live TP
+            assert store.get('tp_attach_done:andris-sl-off')
 
     asyncio.run(scenario())

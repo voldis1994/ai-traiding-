@@ -70,8 +70,8 @@ def test_protect_attaches_tp_when_broker_shows_profit_level_zero():
             assert protects, 'expected PROTECT PUT to attach missing TP'
             _, deal_id, stop, profit = protects[0]
             assert deal_id == 'm-tp0'
-            # SL already live — only TP should be sent.
-            assert stop is None
+            # Capital omits clear the other bracket — always re-send both.
+            assert stop is not None and float(stop) == 99.2
             assert profit is not None and float(profit) > 100.0
 
     asyncio.run(scenario())

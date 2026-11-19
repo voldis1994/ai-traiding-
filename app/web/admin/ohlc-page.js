@@ -171,8 +171,8 @@ function schedulePoll(){
     if(document.hidden)return;
     load().catch(()=>{});
   };
-  // 200ms tracks Capital tape; paint() skips redraw when view unchanged.
-  pollTimer=setInterval(tick,200);
+  // Popup only (~2s) — no main-board hammer; paint() skips when unchanged.
+  pollTimer=setInterval(tick,2000);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});

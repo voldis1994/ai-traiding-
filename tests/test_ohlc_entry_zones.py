@@ -39,20 +39,39 @@ def test_entry_allows_open_waits_until_price_in_buy_zone():
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     assert buy
-    # Far above discount band → wait.
+    # Far above discount band, no break proof → wait (pullback path).
     far = float(buy['hi']) + 5.0
     gate = oez.entry_allows_open(
         'BUY', candles=rows, mid=far, ask=far, bid=far - 0.1,
         tick=0.1, spread=0.2)
     assert gate['allowed'] is False
     assert 'wait' in (gate['reason'] or '')
-    # Inside band → allow.
+    # Inside band → zone trigger.
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
     gate2 = oez.entry_allows_open(
         'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
         tick=0.1, spread=0.2)
     assert gate2['allowed'] is True
     assert gate2['reason'] == 'ohlc_entry_zone_touch'
+    assert gate2.get('trigger') == 'zone'
+
+
+def test_entry_allows_open_on_structure_break_without_zone():
+    """Unified break trigger: structure UP + BUY intent → OPEN outside discount band."""
+    rows = _swing_candles()
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    far = float(buy['hi']) + 5.0
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.8, 'structure_break': 'UP', 'move_ok': True,
+    }
+    gate = oez.entry_allows_open(
+        'BUY', candles=rows, mid=far, ask=far, bid=far - 0.1,
+        tick=0.1, spread=0.2, mtf=mtf)
+    assert gate['allowed'] is True
+    assert gate.get('trigger') == 'break'
+    assert 'break' in (gate.get('reason') or '')
 
 
 def test_entry_allows_open_sell_zone():

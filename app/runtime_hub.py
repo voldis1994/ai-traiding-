@@ -16,6 +16,29 @@ from .stream import CapitalQuoteStream
 log=logging.getLogger('runtime_hub')
 
 
+def _remap_swing_marks(marks,full_n: int,display_n: int,limit: int=6):
+    """Map swing pivot indices from full history onto the displayed candle slice."""
+    out=[]
+    try:
+        offset=max(0,int(full_n)-int(display_n))
+    except (TypeError,ValueError):
+        offset=0
+    for m in (marks or [])[-limit:]:
+        if not isinstance(m,dict):
+            continue
+        i=m.get('i')
+        try:
+            i=int(i) if i is not None else None
+        except (TypeError,ValueError):
+            i=None
+        if i is not None:
+            i=i-offset
+            if i<0 or i>=display_n:
+                continue
+        out.append({'price':m.get('price'),'i':i})
+    return out
+
+
 @dataclass
 class AccountRuntime:
     client_id: int
@@ -809,12 +832,11 @@ class RuntimeHub:
                 'event':ez.get('event') or (live or {}).get('live_event'),
                 'range_hi':range_hi,
                 'range_lo':range_lo,
-                'swing_highs':[
-                    {'price':h.get('price'),'i':h.get('i')}
-                    for h in (piv.get('swing_highs') or [])[-6:]],
-                'swing_lows':[
-                    {'price':s.get('price'),'i':s.get('i')}
-                    for s in (piv.get('swing_lows') or [])[-6:]],
+                # Remap pivot i onto the displayed candle window (not full hist).
+                'swing_highs':_remap_swing_marks(
+                    piv.get('swing_highs'),len(candles_full or []),len(bare)),
+                'swing_lows':_remap_swing_marks(
+                    piv.get('swing_lows'),len(candles_full or []),len(bare)),
             },
             'zones':{
                 'support':ez.get('support'),

@@ -55,6 +55,26 @@ def test_admin_structure_view_builds_zones():
         assert isinstance(ov.get('kama'), list) and len(ov['kama']) >= 20
         assert isinstance(ov.get('ema5'), list)
         assert 'mtf' in view
+        # Swing marks remapped into the displayed candle window.
+        n = len(view['candles'])
+        for mark in (view['structure'].get('swing_highs') or []):
+            if mark.get('i') is not None:
+                assert 0 <= int(mark['i']) < n
+
+
+def test_remap_swing_marks_onto_display_window():
+    from app.runtime_hub import _remap_swing_marks
+    marks = [
+        {'price': 10.0, 'i': 5},      # outside after remap
+        {'price': 12.0, 'i': 650},    # → 20 in 90-window
+        {'price': 11.0, 'i': 700},    # → 70
+    ]
+    out = _remap_swing_marks(marks, full_n=720, display_n=90)
+    idxs = [m['i'] for m in out]
+    assert all(0 <= i < 90 for i in idxs)
+    assert {'price': 12.0, 'i': 20} in out
+    assert {'price': 11.0, 'i': 70} in out
+    assert all(m['price'] != 10.0 for m in out)
 
 
 def test_admin_ohlc_page_route_exists():
@@ -63,7 +83,14 @@ def test_admin_ohlc_page_route_exists():
     with TestClient(app) as c:
         r = c.get('/admin/ohlc')
         assert r.status_code == 200
-        assert b'ohlc-full' in r.content or b'OHLC' in r.content
+        body = r.content
+        assert b'ohlc-full' in body or b'OHLC' in body
+        # #146 readable/live popup contract.
+        assert b'liveBadge' in body
+        assert b'chartWrap' in body
+        assert b'btnFullscreen' in body
+        assert b'ohlc-page.js?v=3' in body
+        assert b'ohlc-chart.js?v=3' in body
 
 
 def test_structure_view_never_invents_gold_without_epic():

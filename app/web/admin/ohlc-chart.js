@@ -1,12 +1,19 @@
 'use strict';
-/** Shared OHLC + entry-zone canvas renderer for Admin mini + popup windows.
- *  Draws the same info stack LIVE uses: swings, entry zones, KAMA/EMA, ATR,
- *  ADX legend, and swing-anchored SL/TP (with ATR/KAMA when provided).
+/** Shared OHLC + entry-zone canvas for Admin mini + popup.
+ *  Draws the LIVE info stack: swings, entry zones, KAMA/EMA, ATR, ADX legend,
+ *  swing SL/TP. Popup passes {labels:true, maxCandles} for readable denser bars.
  */
 
-function drawOhlcStructure(canvas,view){
+function _ohlcFinite(v){
+  const n=Number(v);
+  return Number.isFinite(n)?n:null;
+}
+
+function drawOhlcStructure(canvas,view,opts){
   if(!canvas||!view)return;
-  const dpr=Math.min(2,window.devicePixelRatio||1);
+  opts=opts||{};
+  const showLabels=!!opts.labels;
+  const dpr=Math.min(2.5,window.devicePixelRatio||1);
   const rect=canvas.getBoundingClientRect();
   if(rect.width<20||rect.height<20)return;
   const w=rect.width,h=rect.height;
@@ -14,82 +21,112 @@ function drawOhlcStructure(canvas,view){
   const ctx=canvas.getContext('2d');
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,w,h);
-  ctx.fillStyle='rgba(8,12,14,.92)';
+  ctx.fillStyle='rgba(8,12,14,.94)';
   ctx.fillRect(0,0,w,h);
-  const candles=(view.candles||[]).filter(c=>
+
+  let candles=(view.candles||[]).filter(c=>
     ['open','high','low','close'].every(k=>Number.isFinite(Number(c[k]))));
+  const maxN=Math.max(20,Number(opts.maxCandles)||candles.length);
+  const slicedOff=candles.length>maxN?candles.length-maxN:0;
+  if(slicedOff)candles=candles.slice(-maxN);
   if(!candles.length){
-    ctx.fillStyle='#8a9a92';ctx.font='12px Manrope,sans-serif';ctx.textAlign='center';
+    ctx.fillStyle='#8a9a92';ctx.font='13px Manrope,sans-serif';ctx.textAlign='center';
     ctx.fillText('Gaida OHLC sveces…',w/2,h/2);
     return;
   }
+
   let low=Math.min(...candles.map(c=>+c.low));
   let high=Math.max(...candles.map(c=>+c.high));
   const zones=view.zones||{};
   for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
     if(!z)continue;
-    if(Number.isFinite(+z.lo))low=Math.min(low,+z.lo);
-    if(Number.isFinite(+z.hi))high=Math.max(high,+z.hi);
+    const a=_ohlcFinite(z.lo),b=_ohlcFinite(z.hi);
+    if(a!=null)low=Math.min(low,a);
+    if(b!=null)high=Math.max(high,b);
   }
   const br=view.swing_brackets||{};
   for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
-    if(Number.isFinite(+br[k])){low=Math.min(low,+br[k]);high=Math.max(high,+br[k]);}
+    const v=_ohlcFinite(br[k]);
+    if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
   }
   for(const p of (view.open_levels||[])){
     for(const k of ['entry','stop','profit']){
-      if(Number.isFinite(+p[k])){low=Math.min(low,+p[k]);high=Math.max(high,+p[k]);}
+      const v=_ohlcFinite(p[k]);
+      if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
     }
   }
   const ov=view.overlays||{};
-  for(const series of [ov.kama,ov.ema5,ov.ema13]){
-    if(!Array.isArray(series))continue;
+  // Align overlay series to the same candle window we display.
+  const sliceSeries=(arr)=>{
+    if(!Array.isArray(arr)||!arr.length)return [];
+    if(arr.length<=candles.length)return arr.slice();
+    return arr.slice(-candles.length);
+  };
+  const kamaSeries=sliceSeries(ov.kama);
+  const ema5Series=sliceSeries(ov.ema5);
+  const ema13Series=sliceSeries(ov.ema13);
+  for(const series of [kamaSeries,ema5Series,ema13Series]){
     for(const v of series){
       if(Number.isFinite(+v)){low=Math.min(low,+v);high=Math.max(high,+v);}
     }
   }
-  if(Number.isFinite(+ov.kama_level)){
-    low=Math.min(low,+ov.kama_level);high=Math.max(high,+ov.kama_level);
+  const mid=_ohlcFinite(view.mid);
+  if(mid!=null){low=Math.min(low,mid);high=Math.max(high,mid);}
+  const atr=_ohlcFinite(ov.atr14)||_ohlcFinite((view.mtf||{}).atr14);
+  if(atr!=null&&mid!=null){
+    low=Math.min(low,mid-atr);high=Math.max(high,mid+atr);
   }
-  if(Number.isFinite(+view.mid)){low=Math.min(low,+view.mid);high=Math.max(high,+view.mid);}
-  const atr=Number.isFinite(+ov.atr14)?+ov.atr14
-    :(Number.isFinite(+(view.mtf||{}).atr14)?+(view.mtf||{}).atr14:null);
-  if(atr!=null&&Number.isFinite(+view.mid)){
-    low=Math.min(low,+view.mid-atr);high=Math.max(high,+view.mid+atr);
-  }
-  const pad=(high-low||Math.abs(high)*.001||.01)*.18;
+
+  const pad=(high-low||Math.abs(high)*.001||.01)*(showLabels?.12:.18);
   low-=pad;high+=pad;
-  const yPadTop=18,yPadBot=28;
-  const y=p=>yPadTop+(high-p)/(high-low)*(h-yPadTop-yPadBot);
-  const leftPad=14,rightPad=56;
+  const yPadTop=showLabels?28:16;
+  const yPadBot=showLabels?36:28;
+  const leftPad=showLabels?18:12;
+  const rightPad=showLabels?78:56;
   const chartW=Math.max(40,w-leftPad-rightPad);
-  const spacing=chartW/candles.length;
+  const y=p=>yPadTop+(high-p)/(high-low)*(h-yPadTop-yPadBot);
+
+  // Soft grid (popup).
+  if(showLabels){
+    ctx.strokeStyle='rgba(232,240,236,.06)';
+    ctx.lineWidth=1;
+    for(let k=0;k<=4;k++){
+      const yy=yPadTop+(h-yPadTop-yPadBot)*k/4;
+      ctx.beginPath();ctx.moveTo(leftPad,yy);ctx.lineTo(leftPad+chartW,yy);ctx.stroke();
+    }
+  }
+
   const band=(z,fill,stroke)=>{
     if(!z)return;
-    const a=Number.isFinite(+z.lo)?+z.lo:null;
-    const b=Number.isFinite(+z.hi)?+z.hi:a;
+    const a=_ohlcFinite(z.lo);
+    const b=_ohlcFinite(z.hi);
     if(a==null)return;
-    const y1=y(Math.max(a,b)),y2=y(Math.min(a,b));
+    const hi=b!=null?Math.max(a,b):a;
+    const lo=b!=null?Math.min(a,b):a;
+    const y1=y(hi),y2=y(lo);
     ctx.fillStyle=fill;
-    ctx.fillRect(leftPad,y1,chartW,Math.max(2,y2-y1));
+    ctx.fillRect(leftPad,y1,chartW,Math.max(showLabels?3:2,y2-y1));
     if(stroke){
-      ctx.strokeStyle=stroke;ctx.setLineDash([]);ctx.lineWidth=1;
+      ctx.strokeStyle=stroke;ctx.setLineDash([]);ctx.lineWidth=showLabels?1.25:1;
       ctx.beginPath();ctx.moveTo(leftPad,y(a));ctx.lineTo(leftPad+chartW,y(a));ctx.stroke();
       if(b!=null&&b!==a){
         ctx.beginPath();ctx.moveTo(leftPad,y(b));ctx.lineTo(leftPad+chartW,y(b));ctx.stroke();
       }
     }
   };
-  band(zones.resistance,'rgba(255,92,122,.14)','rgba(255,92,122,.55)');
-  band(zones.support,'rgba(57,255,136,.12)','rgba(57,255,136,.5)');
+
+  band(zones.resistance,'rgba(255,92,122,.12)','rgba(255,92,122,.45)');
+  band(zones.support,'rgba(57,255,136,.10)','rgba(57,255,136,.4)');
   const pref=view.preferred;
-  if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.22)',null);
-  if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.20)',null);
-  // ATR envelope around mid — same stop_hint scale LIVE uses.
-  if(atr!=null&&Number.isFinite(+view.mid)){
-    const mid=+view.mid;
+  if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.28)',null);
+  if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.26)',null);
+
+  if(atr!=null&&mid!=null){
     ctx.fillStyle='rgba(120,160,200,.08)';
     ctx.fillRect(leftPad,y(mid+atr),chartW,Math.max(2,y(mid-atr)-y(mid+atr)));
   }
+
+  const spacing=chartW/candles.length;
   const polyline=(series,color,width)=>{
     if(!Array.isArray(series)||!series.length)return;
     const offset=Math.max(0,candles.length-series.length);
@@ -105,29 +142,35 @@ function drawOhlcStructure(canvas,view){
     }
     if(started)ctx.stroke();
   };
-  polyline(ov.ema13,'rgba(140,160,180,.55)',1);
-  polyline(ov.ema5,'rgba(100,180,220,.7)',1.1);
-  polyline(ov.kama,'rgba(240,193,75,.95)',1.6);
+  polyline(ema13Series,'rgba(140,160,180,.55)',1);
+  polyline(ema5Series,'rgba(100,180,220,.7)',1.1);
+  polyline(kamaSeries,'rgba(240,193,75,.95)',1.6);
+
+  // Candles — keep readable body width even with many bars.
+  const bodyW=Math.max(2.5,Math.min(14,spacing*(showLabels?.72:.64)));
   candles.forEach((c,i)=>{
     const x=leftPad+(i+.5)*spacing;
     const rising=+c.close>=+c.open;
     ctx.strokeStyle=rising?'#39ff88':'#ff5c7a';
     ctx.fillStyle=ctx.strokeStyle;
+    ctx.lineWidth=Math.max(1,Math.min(2,bodyW*.35));
     ctx.beginPath();ctx.moveTo(x,y(+c.high));ctx.lineTo(x,y(+c.low));ctx.stroke();
     const y1=y(+c.open),y2=y(+c.close);
-    ctx.fillRect(x-Math.max(1,spacing*.32),Math.min(y1,y2),
-      Math.max(2,spacing*.64),Math.max(1,Math.abs(y1-y2)));
+    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(1.5,Math.abs(y1-y2)));
   });
-  // Swing pivot markers (already in payload).
+
+  // Swing pivot markers — remap i when display window is a slice.
   const mark=(list,color)=>{
     if(!Array.isArray(list))return;
     ctx.fillStyle=color;
     for(const s of list){
-      if(!Number.isFinite(+s.price))continue;
-      const idx=Number.isFinite(+s.i)?+s.i:null;
-      const x=idx!=null&&idx>=0&&idx<candles.length
+      if(!_ohlcFinite(s.price))continue;
+      let idx=_ohlcFinite(s.i);
+      if(idx!=null)idx=idx-slicedOff;
+      const x=(idx!=null&&idx>=0&&idx<candles.length)
         ?leftPad+(idx+.5)*spacing
-        :leftPad+chartW-6;
+        :null;
+      if(x==null)continue;
       const yy=y(+s.price);
       ctx.beginPath();ctx.arc(x,yy,2.5,0,Math.PI*2);ctx.fill();
     }
@@ -135,41 +178,96 @@ function drawOhlcStructure(canvas,view){
   const st=view.structure||{};
   mark(st.swing_highs,'rgba(255,92,122,.85)');
   mark(st.swing_lows,'rgba(57,255,136,.85)');
-  const hline=(price,color,dash)=>{
-    if(!Number.isFinite(+price))return;
-    ctx.strokeStyle=color;ctx.lineWidth=1.25;
+
+  const labels=[];
+  const hline=(price,color,dash,label)=>{
+    const p=_ohlcFinite(price);
+    if(p==null)return;
+    ctx.strokeStyle=color;ctx.lineWidth=showLabels?1.6:1.25;
     ctx.setLineDash(dash||[]);
-    ctx.beginPath();ctx.moveTo(leftPad,y(+price));ctx.lineTo(leftPad+chartW,y(+price));ctx.stroke();
+    const yy=y(p);
+    ctx.beginPath();ctx.moveTo(leftPad,yy);ctx.lineTo(leftPad+chartW,yy);ctx.stroke();
     ctx.setLineDash([]);
+    if(showLabels&&label)labels.push({y:yy,color,label,price:p});
   };
+
   if(br&&br.ready){
-    hline(br.stop_level,'#ff5c7a',[4,3]);
-    hline(br.profit_level,'#39ff88',[4,3]);
+    hline(br.stop_level,'#ff5c7a',[5,4],'swing SL');
+    hline(br.profit_level,'#39ff88',[5,4],'swing TP');
   }
-  hline(view.mid,'#f0c14b',[]);
+  hline(mid,'#f0c14b',[],'mid');
   for(const p of (view.open_levels||[])){
-    hline(p.entry,'#eef6f1',[]);
-    hline(p.stop,'#ff5c7a',[5,3]);
-    hline(p.profit,'#39ff88',[5,3]);
+    hline(p.entry,'#eef6f1',[],'entry');
+    hline(p.stop,'#ff5c7a',[5,3],'poz. SL');
+    hline(p.profit,'#39ff88',[5,3],'poz. TP');
   }
-  ctx.fillStyle='#8a9a92';ctx.font='10px Manrope,sans-serif';ctx.textAlign='left';
+  if(showLabels){
+    if(zones.buy_entry&&(!pref||pref==='BUY')){
+      const z=zones.buy_entry;
+      const midZ=((_ohlcFinite(z.lo)||0)+(_ohlcFinite(z.hi)||_ohlcFinite(z.lo)||0))/2;
+      labels.push({y:y(midZ),color:'#39ff88',label:'BUY zona',price:midZ});
+    }
+    if(zones.sell_entry&&(!pref||pref==='SELL')){
+      const z=zones.sell_entry;
+      const midZ=((_ohlcFinite(z.lo)||0)+(_ohlcFinite(z.hi)||_ohlcFinite(z.lo)||0))/2;
+      labels.push({y:y(midZ),color:'#ff5c7a',label:'SELL zona',price:midZ});
+    }
+  }
+
+  const digits=Math.abs(high)<50?2:(Math.abs(high)<500?1:0);
+  ctx.fillStyle='#8a9a92';
+  ctx.font=(showLabels?'11px':'10px')+' Manrope,sans-serif';
+  ctx.textAlign='left';
   for(let k=0;k<=4;k++){
     const price=high-(high-low)*k/4;
-    ctx.fillText(price.toFixed(Math.abs(high)<20?2:1),w-rightPad+6,yPadTop+(h-yPadTop-yPadBot)*k/4);
+    const yy=yPadTop+(h-yPadTop-yPadBot)*k/4;
+    ctx.fillText(price.toFixed(digits),w-rightPad+8,yy+4);
   }
-  // Legend: MTF mode / ADX / ATR — same stack the robot reads.
+
+  if(showLabels&&labels.length){
+    labels.sort((a,b)=>a.y-b.y);
+    let lastY=-999;
+    ctx.font='600 11px Manrope,sans-serif';
+    for(const L of labels){
+      let yy=L.y;
+      if(yy-lastY<14)yy=lastY+14;
+      lastY=yy;
+      const text=`${L.label} ${L.price.toFixed(digits)}`;
+      const tw=ctx.measureText(text).width+10;
+      const tx=leftPad+10;
+      ctx.fillStyle='rgba(8,12,14,.82)';
+      ctx.fillRect(tx-4,yy-11,tw,16);
+      ctx.fillStyle=L.color;
+      ctx.textAlign='left';
+      ctx.fillText(text,tx,yy+1);
+    }
+  }
+
+  // Footer: time window (popup) + MTF stack summary.
   const mtf=view.mtf||{};
   const parts=[];
+  if(showLabels){
+    const last=candles[candles.length-1];
+    const first=candles[0];
+    const fmt=iso=>{
+      if(!iso)return '';
+      try{
+        return new Date(iso).toLocaleTimeString('lv-LV',{hour:'2-digit',minute:'2-digit'});
+      }catch(_){return ''}
+    };
+    parts.push(`${fmt(first.at)}–${fmt(last.at)}`);
+    parts.push(`${candles.length} M1`);
+  }
   if(mtf.mode||ov.mode)parts.push(`MTF ${mtf.mode||ov.mode}`);
-  if(Number.isFinite(+(mtf.adx||ov.adx)))parts.push(`ADX ${Number(mtf.adx||ov.adx).toFixed(0)}`);
-  if(Number.isFinite(+(mtf.atr14||ov.atr14)))parts.push(`ATR ${Number(mtf.atr14||ov.atr14).toFixed(2)}`);
-  if(ov.kama_level!=null)parts.push('KAMA');
+  if(_ohlcFinite(mtf.adx||ov.adx)!=null)parts.push(`ADX ${Number(mtf.adx||ov.adx).toFixed(0)}`);
+  if(_ohlcFinite(mtf.atr14||ov.atr14)!=null)parts.push(`ATR ${Number(mtf.atr14||ov.atr14).toFixed(2)}`);
+  if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');
   if(view.info_stack)parts.push(String(view.info_stack));
   if(parts.length){
     ctx.fillStyle='rgba(180,200,190,.85)';
     ctx.font='9px Manrope,sans-serif';
     ctx.textAlign='left';
-    ctx.fillText(parts.join(' · '),leftPad,h-8);
+    ctx.fillText(parts.join(' · '),leftPad,h-10);
   }
 }
 

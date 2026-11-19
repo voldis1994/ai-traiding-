@@ -23,6 +23,12 @@ def test_needs_protect_when_manual_tp_off():
         }
         assert _broker_price_level(p['profitLevel']) is None
         assert engine._needs_protect_brackets(p) is True
+        # Flag alone is not enough while broker still shows TP Off — clear + retry.
+        store.set('tp_attach_done:man1', True)
+        assert engine._needs_protect_brackets(p) is True
+        assert store.get('tp_attach_done:man1') is False
+        # Once broker has a real TP, flag stops further protect.
+        p['profitLevel'] = 3700.0
         store.set('tp_attach_done:man1', True)
         assert engine._needs_protect_brackets(p) is False
 
@@ -39,6 +45,60 @@ def test_needs_protect_skips_after_trail_runtime():
             'stopLevel': 99.2, 'profitLevel': None, 'epic': 'SIM', 'size': '1',
         }
         assert engine._needs_protect_brackets(p) is False
+
+
+def test_protect_ignores_foreign_unresolved_orders():
+    """Stale journal rows for other deals must not freeze this client's TP."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(Path(d) / 's.db')
+            brain = AdaptiveBrain(store, data_dir=d)
+            engine = SingleTradeEngine(store, brain)
+            engine.policy = AutoEvolution(store, Path(d) / 'policy.py')
+            broker = _OpenCaptureBroker()
+            broker.price = 3714.0
+            broker.open = [{'position': {
+                'dealId': 'andris-lv', 'size': '.08', 'direction': 'BUY',
+                'level': 3714.61, 'stopLevel': 3705.69, 'profitLevel': 0, 'upl': -0.11,
+            }, 'market': {'epic': 'GOLD'}}]
+
+            async def _confirm(ref):
+                req = [r for r in broker.requests if r[0] == 'PROTECT'][-1]
+                _, deal_id, stop, profit = req
+                pos = broker.open[0]['position']
+                if stop is not None:
+                    pos['stopLevel'] = float(stop)
+                if profit is not None:
+                    pos['profitLevel'] = float(profit)
+                return {'dealStatus': 'ACCEPTED', 'dealId': deal_id}
+
+            async def _update(deal_id, stop_level=None, profit_level=None):
+                broker.requests.append(('PROTECT', deal_id, stop_level, profit_level))
+                return {'dealReference': 'protect-lv'}
+
+            broker.confirm = _confirm
+            broker.update_position = _update
+            engine.attach(broker)
+            await engine.sync()
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'GOLD')
+            # Leftover unresolved CLOSE/PROTECT from another account/deal.
+            store.order('CLOSE', 'other-deal', {'size': 0.1})
+            store.order('PROTECT', 'other-deal', {'stop': 1, 'profit': 2})
+            engine.market = {
+                'epic': 'GOLD', 'mid': 3713.28, 'bid': 3713.0, 'ask': 3713.5,
+                'spread': 0.5, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
+            }
+            pos = engine.positions[0]
+            await engine.protect_position(pos)
+            protects = [r for r in broker.requests if r[0] == 'PROTECT']
+            assert protects, 'foreign unresolved must not block LV manual TP'
+            assert store.get('tp_attach_done:andris-lv')
+            assert store.get('robot_open:andris-lv')
+            brief = engine.protection_brief or {}
+            assert 'Manual adopt protected' in str(brief.get('status') or '')
+
+    asyncio.run(scenario())
 
 
 def test_protect_attaches_tp_on_manual_sl_only_position():

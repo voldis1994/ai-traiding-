@@ -41,8 +41,18 @@ def test_admin_structure_view_builds_zones():
         view = hub.admin_client_structure_view(cid, n=90)
         assert view['ok'] is True
         assert view['epic'] == 'GOLD'
+        assert view.get('client_name') == 'Chart One' or view.get('username') == 'chart1'
         assert len(view['candles']) >= 40
         zones = view['zones']
         # At least one structural or entry zone should be present when swings exist.
         assert zones.get('buy_entry') or zones.get('sell_entry') or zones.get('support')
         assert 'structure' in view
+
+
+def test_admin_ohlc_page_route_exists():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as c:
+        r = c.get('/admin/ohlc')
+        assert r.status_code == 200
+        assert b'ohlc-full' in r.content or b'OHLC' in r.content

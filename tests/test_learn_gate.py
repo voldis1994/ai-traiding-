@@ -86,6 +86,20 @@ def test_decide_keep_demands_larger_lift_when_degrading():
     assert decide_keep(before,after_clear,degradation=deg)['keep'] is True
 
 
+def test_decide_keep_refuses_loss_in_red_cash_tiny_lift():
+    """Dump smoking gun: KEEP on −£0.47 with +0.0417 while cash OOS red."""
+    before={'ok':True,'n':24,'accuracy':0.29}
+    after={'ok':True,'n':24,'accuracy':0.333}  # +0.043 < 0.08
+    cash={'ok':True,'n':6,'mean':-0.15,'net':-0.9,'trade_count':12}
+    out=decide_keep(before,after,cash=cash,trade_pnl=-0.47)
+    assert out['keep'] is False
+    assert 'loss_in_red_cash' in out['reason']
+    after_clear={'ok':True,'n':24,'accuracy':0.38}  # +0.09 ≥ 0.08
+    assert decide_keep(before,after_clear,cash=cash,trade_pnl=-0.47)['keep'] is True
+    # Win in red cash still uses normal (slightly raised) margin, not 0.08 floor.
+    assert decide_keep(before,after,cash=cash,trade_pnl=0.40)['keep'] is True
+
+
 def test_should_skip_teach_when_degrading():
     good=[{'actual_pnl':2.0} for _ in range(5)]
     bad=[{'actual_pnl':-4.0} for _ in range(5)]
@@ -267,17 +281,18 @@ def test_engine_rollback_skips_weight_update_event():
         # Monkeypatch gate to force rollback after a real ΔW.
         import app.learn_gate as lg
         real_gate=lg.gate_closed_trade_learn
-        def force_rollback(eng,learn_fn,*,epic=None,deal_id=None):
+        def force_rollback(eng,learn_fn,*,epic=None,deal_id=None,trade_pnl=None):
             pre=eng.brain._core_snapshot()
             result=learn_fn()
             if result.get('any_real_dw'):
                 eng.brain._apply_core_snapshot(pre)
                 out={'keep':False,'rolled_back':True,'reason':'forced_test_rollback',
                      'learn':result,'before':{'ok':True,'accuracy':0.5},
-                     'after':{'ok':True,'accuracy':0.1}}
+                     'after':{'ok':True,'accuracy':0.1},'trade_pnl':trade_pnl}
                 eng.store.set(lg.STORE_LAST,out)
                 return out
-            return {'keep':True,'rolled_back':False,'reason':'no_dw','learn':result}
+            return {'keep':True,'rolled_back':False,'reason':'no_dw','learn':result,
+                    'trade_pnl':trade_pnl}
         lg.gate_closed_trade_learn=force_rollback
         try:
             engine._learn_closed_trade('lg2',{'level':99.0,'profit':-12.5})

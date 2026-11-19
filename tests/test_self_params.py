@@ -8,7 +8,8 @@ from app.engine import Store
 from app.self_params import (DEFAULTS, STORE_KEY, PENDING_KEY, load, save, get,
                              evolve_from_feedback, maybe_commit_long_horizon,
                              snapshot, IMMUTABLE_NOTE, quantize_learn_lr,
-                             LEARN_LR_STEP, LEARN_LR_SOFT_MAX)
+                             LEARN_LR_STEP, LEARN_LR_SOFT_MAX,
+                             migrate_soft_ceilings)
 from app.feature_discovery import FeatureDiscovery
 from app.feature_validation import validate_feature
 
@@ -59,8 +60,17 @@ def test_learn_lr_only_two_decimal_places():
         save(store,{**DEFAULTS,'learn_lr':0.12345},reason='poison float')
         assert get(store,'learn_lr') == pytest.approx(0.12)
         # Stale hot LR in Store is clamped on load.
-        store.set(STORE_KEY,{**DEFAULTS,'learn_lr':0.28})
+        store.set(STORE_KEY,{**DEFAULTS,'learn_lr':0.28,
+                             'learn_win_repeats':4,'learn_loss_repeats':5})
         assert load(store)['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
+        # migrate_soft_ceilings persists the clamp so Store no longer holds 0.28.
+        migrated=migrate_soft_ceilings(store)
+        assert migrated is not None
+        raw=store.get(STORE_KEY)
+        assert raw['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
+        assert raw['learn_win_repeats'] <= 3
+        assert raw['learn_loss_repeats'] <= 3
+        assert migrate_soft_ceilings(store) is None  # idempotent
         # Meaningful loss calms LR by exactly one hundredth (no amplify-mistakes).
         before=get(store,'learn_lr')
         evolve_from_feedback(store,broker_pnl=-1.5)

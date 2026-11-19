@@ -1056,6 +1056,13 @@ class SingleTradeEngine:
         self.model_validator=ModelValidator(store)
         from .shadow_paper import ShadowPaperJournal
         self.shadow_paper=ShadowPaperJournal(store)
+        # Persist soft LR/repeats ceilings so stale Store 0.28 does not keep teaching hot.
+        try:
+            from .self_params import migrate_soft_ceilings
+            migrate_soft_ceilings(store)
+        except Exception as exc:
+            self.store.event('warning','self_params soft-ceiling migrate deferred',
+                {'type':type(exc).__name__,'detail':str(exc)[:160]})
         if hasattr(self.brain,'apply_registry'):
             try:
                 self.brain.apply_registry(self.feature_registry)
@@ -4436,7 +4443,8 @@ class SingleTradeEngine:
                 return {'any_real_dw':local_dw,'losses':local_losses,
                         'last_delta':local_delta}
             gate_decision=learn_gate.gate_closed_trade_learn(
-                self,_closed_trade_weight_steps,epic=epic,deal_id=deal_id)
+                self,_closed_trade_weight_steps,epic=epic,deal_id=deal_id,
+                trade_pnl=(pnl_value if cash_like else None))
             learn_meta=(gate_decision or {}).get('learn') or {}
             losses=list(learn_meta.get('losses') or [])
             last_delta=learn_meta.get('last_delta')

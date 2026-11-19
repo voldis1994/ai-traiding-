@@ -346,14 +346,8 @@ def _clip(key, value):
     return n
 
 
-def load(store) -> dict:
-    raw=store.get(STORE_KEY) if store is not None else None
-    out=dict(DEFAULTS)
-    if isinstance(raw,dict):
-        for k,v in raw.items():
-            if k in DEFAULTS:
-                out[k]=_clip(k,v)
-    # Soft ceilings — migrate hot LR / heavy repeats left over from older builds.
+def _apply_soft_ceilings(out: dict) -> dict:
+    """Clamp hot LR / heavy repeats left over from older builds (in-place)."""
     out['learn_lr']=quantize_learn_lr(out.get('learn_lr'))
     try:
         out['learn_win_repeats']=min(
@@ -368,20 +362,61 @@ def load(store) -> dict:
     return out
 
 
+def load(store) -> dict:
+    raw=store.get(STORE_KEY) if store is not None else None
+    out=dict(DEFAULTS)
+    if isinstance(raw,dict):
+        for k,v in raw.items():
+            if k in DEFAULTS:
+                out[k]=_clip(k,v)
+    return _apply_soft_ceilings(out)
+
+
+def migrate_soft_ceilings(store):
+    """Persist soft ceilings when Store still holds 0.28 LR / heavy repeats.
+
+    Live dumps showed clients stuck at learn_lr=0.27–0.28 after #140 defaults —
+    load() clamped in memory but never wrote back, so UI/Store stayed hot.
+    Returns the migrated params dict when a write happened, else None.
+    """
+    if store is None:
+        return None
+    raw=store.get(STORE_KEY)
+    if not isinstance(raw,dict):
+        return None
+    before_lr=_finite(raw.get('learn_lr'))
+    before_win=_finite(raw.get('learn_win_repeats'))
+    before_loss=_finite(raw.get('learn_loss_repeats'))
+    needs=False
+    if before_lr is not None and before_lr > float(LEARN_LR_SOFT_MAX)+1e-9:
+        needs=True
+    if before_win is not None and before_win > float(LEARN_WIN_REPEATS_SOFT_MAX)+1e-9:
+        needs=True
+    if before_loss is not None and before_loss > float(LEARN_LOSS_REPEATS_SOFT_MAX)+1e-9:
+        needs=True
+    if not needs:
+        return None
+    migrated=load(store)  # already soft-capped in memory
+    save(store,migrated,reason='soft_ceiling_migrate_hot_lr')
+    try:
+        store.event('learning','Migrated hot learn_lr/repeats to soft ceilings',{
+            'before_learn_lr':before_lr,
+            'after_learn_lr':migrated.get('learn_lr'),
+            'before_win_repeats':before_win,
+            'after_win_repeats':migrated.get('learn_win_repeats'),
+            'before_loss_repeats':before_loss,
+            'after_loss_repeats':migrated.get('learn_loss_repeats'),
+            'soft_max_lr':LEARN_LR_SOFT_MAX,
+        })
+    except Exception:
+        pass
+    return migrated
+
+
 def save(store, params: dict, *, reason=''):
     if store is None:return
-    clean={k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS}
-    clean['learn_lr']=quantize_learn_lr(clean.get('learn_lr'))
-    try:
-        clean['learn_win_repeats']=min(
-            int(LEARN_WIN_REPEATS_SOFT_MAX),
-            max(1,int(clean.get('learn_win_repeats') or DEFAULTS['learn_win_repeats'])))
-        clean['learn_loss_repeats']=min(
-            int(LEARN_LOSS_REPEATS_SOFT_MAX),
-            max(1,int(clean.get('learn_loss_repeats') or DEFAULTS['learn_loss_repeats'])))
-    except (TypeError,ValueError):
-        clean['learn_win_repeats']=int(DEFAULTS['learn_win_repeats'])
-        clean['learn_loss_repeats']=int(DEFAULTS['learn_loss_repeats'])
+    clean=_apply_soft_ceilings(
+        {k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS})
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)

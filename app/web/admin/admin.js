@@ -7,12 +7,14 @@ let overviewInFlight=null;
 let lastSyncAt=null;
 const POLL_IDLE_MS=10000;
 const POLL_LIVE_MS=5000;
-// Match Capital quote stream feel — engine poll is ~3s; chart tracks mid live.
-const OHLC_REFRESH_MS=2000;
+// Track Capital quote stream — 200ms refresh; paint skips when view unchanged.
+const OHLC_REFRESH_MS=200;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();
 let currentPollMs=null;
+let sharedOhlcTimer=null;
+let sharedOhlcInFlight=null;
 let lastPerfKey='';
 
 /** Only rewrite DOM when markup actually changed — stops poll flicker. */
@@ -671,24 +673,18 @@ function renderCard(c){
     </div>
     <div class="deals">${dealsHtml}</div>
     ${trailNote}
-    <div class="ohlc-panel" data-ohlc-client="${c.id}" tabindex="0"
-         role="button" aria-label="OHLC klienta #${c.id} — hover palielina, klikšķis atver logu"
-         data-ohlc-name="${esc(c.display_name||c.username||('#'+c.id))}">
-      <div class="ohlc-head">
-        <span>OHLC · entry zonas</span>
-        <em class="ohlc-meta muted">ielādē…</em>
-      </div>
-      <span class="ohlc-hint">hover = palielināt · klikšķis = jauns logs</span>
-      <canvas class="ohlc-mini" width="640" height="160"></canvas>
-      <div class="ohlc-legend muted"></div>
-    </div>
     <div class="nerve">
       <div class="buy"><em>BUY</em><b>${pct(sc.BUY)}</b></div>
       <div><em>HOLD</em><b>${pct(sc.HOLD)}</b></div>
       <div class="sell"><em>SELL</em><b>${pct(sc.SELL)}</b></div>
     </div>
     <div class="facts">
-      <div><span>Signāls</span><strong>${esc(c.action||'—')}</strong></div>
+      <div><span>Signāls</span><strong>${esc((()=>{
+        const act=c.action||'—';
+        const prop=c.proposal;
+        if(act==='HOLD'&&prop&&prop!=='HOLD'&&prop!==act)return `HOLD → ${prop}`;
+        return act;
+      })())}</strong></div>
       <div><span>MTF režīms</span><strong>${esc(((a.mtf_momentum||{}).mode)||'—')}${
         (a.mtf_momentum&&a.mtf_momentum.preferred)?(' · '+esc(a.mtf_momentum.preferred)) : ''
       }${
@@ -763,24 +759,26 @@ function renderCard(c){
   });
   el.dataset.cid=String(c.id);
   el.dataset.contentKey=cardContentKey(c);
-  // Lazy-load OHLC structure chart (not every overview tick payload).
-  queueMicrotask(()=>wireOhlcPanel(el,c.id).catch(()=>{}));
   return el;
 }
 
-function openClientOhlcWindow(clientId,label){
-  const id=Number(clientId);
+function openMarketOhlcWindow(epic,donorClientId,label){
+  const id=Number(donorClientId);
   if(!Number.isFinite(id)||id<=0)return;
   const w=Math.min(1120,Math.max(760,(window.screen&&screen.availWidth||1200)-48));
   const h=Math.min(780,Math.max(520,(window.screen&&screen.availHeight||800)-80));
   const left=Math.max(0,Math.round(((window.screenX||0)+((window.outerWidth||w)-w)/2)));
   const top=Math.max(0,Math.round(((window.screenY||0)+((window.outerHeight||h)-h)/2)));
-  const name=`nta_ohlc_${id}`;
+  const key=String(epic||id).replace(/[^\w.-]+/g,'_');
+  const name=`nta_ohlc_${key}`;
   const features=[
     'popup=yes',`width=${Math.round(w)}`,`height=${Math.round(h)}`,
     `left=${left}`,`top=${top}`,'noopener=yes','noreferrer=yes',
   ].join(',');
-  const url=`/admin/ohlc?client=${id}${label?('&name='+encodeURIComponent(label)):''}`;
+  const q=[`client=${id}`];
+  if(epic)q.push(`epic=${encodeURIComponent(epic)}`);
+  if(label)q.push(`name=${encodeURIComponent(label)}`);
+  const url=`/admin/ohlc?${q.join('&')}`;
   const win=window.open(url,name,features);
   if(win)try{win.focus()}catch(_){}
 }
@@ -791,12 +789,8 @@ function paintOhlcPanel(panel){
   if(canvas&&typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,panel._ohlcView);
 }
 
-async function wireOhlcPanel(cardEl,clientId){
-  const panel=cardEl&&cardEl.querySelector(`[data-ohlc-client="${clientId}"]`);
-  if(!panel||panel.dataset.ohlcWired==='1'){
-    await refreshOhlcPanel(cardEl,clientId);
-    return;
-  }
+function wireSharedOhlcPanel(panel,epic,donorId,label){
+  if(!panel||panel.dataset.ohlcWired==='1')return;
   panel.dataset.ohlcWired='1';
   const redraw=()=>requestAnimationFrame(()=>paintOhlcPanel(panel));
   panel.addEventListener('mouseenter',redraw);
@@ -808,68 +802,128 @@ async function wireOhlcPanel(cardEl,clientId){
     const canvas=panel.querySelector('canvas.ohlc-mini');
     if(canvas)ro.observe(canvas);
   }
-  const open=()=>{
-    const label=panel.dataset.ohlcName||(`#${clientId}`);
-    openClientOhlcWindow(clientId,label);
-  };
-  panel.addEventListener('click',ev=>{
-    ev.preventDefault();
-    open();
-  });
+  const open=()=>openMarketOhlcWindow(epic,donorId||panel._donorId,label||epic);
+  panel.addEventListener('click',ev=>{ev.preventDefault();open();});
   panel.addEventListener('keydown',ev=>{
-    if(ev.key==='Enter'||ev.key===' '){
-      ev.preventDefault();
-      open();
-    }
+    if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();open();}
   });
-  await refreshOhlcPanel(cardEl,clientId);
 }
 
-async function refreshOhlcPanel(cardEl,clientId,{force=false}={}){
-  const panel=cardEl&&cardEl.querySelector(`[data-ohlc-client="${clientId}"]`);
-  if(!panel)return;
-  const now=Date.now();
-  if(!force&&panel._ohlcAt&&(now-panel._ohlcAt)<OHLC_REFRESH_MS&&panel._ohlcView){
-    return;
-  }
+function applySharedOhlcView(panel,view){
+  if(!panel||!view)return;
+  panel._ohlcAt=Date.now();
+  panel._ohlcView=view;
   const meta=panel.querySelector('.ohlc-meta');
   const legend=panel.querySelector('.ohlc-legend');
   const canvas=panel.querySelector('canvas.ohlc-mini');
-  try{
-    const data=await api(`/api/admin/clients/${clientId}/structure-view?n=90`);
-    const view=data||{};
-    panel._ohlcView=view;
-    panel._ohlcAt=now;
-    if(view.ok===false||view.reason==='no_epic'||!view.epic){
-      if(meta)meta.textContent='nav epic — atver Capital manuālu darījumu jebkurā tirgū';
-      if(legend)legend.textContent=view.hint
-        ||'Robots adoptē tirgu no Capital (ne tikai GOLD). Entry/SL/TP no tā OHLC.';
-      if(typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,{candles:[]});
-      return;
-    }
-    const st=view.structure||{};
-    if(meta){
-      meta.textContent=[
-        view.epic||'',
-        view.epic_source&&view.epic_source!=='live_quote'&&view.epic_source!=='mandate'
-          ?`(${view.epic_source})`:'',
-        st.bias?`bias ${st.bias}`:'',
-        st.event||'',
-        view.preferred?`zona ${view.preferred}`:'abas zonas',
-      ].filter(Boolean).join(' · ');
-    }
-    if(legend){
-      const bits=[];
-      if(view.zones&&view.zones.buy_entry)bits.push('zaļa = BUY entry zona pie swing low');
-      if(view.zones&&view.zones.sell_entry)bits.push('sarkana = SELL entry zona pie swing high');
-      bits.push('dzeltena = mid');
-      if(view.swing_brackets&&view.swing_brackets.ready)bits.push('punktētas = swing SL/TP');
-      legend.textContent=bits.join(' · ');
-    }
-    if(typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,view);
-  }catch(err){
-    if(meta)meta.textContent=String(err.message||err).slice(0,80);
+  const epic=view.epic||panel.dataset.ohlcEpic||'—';
+  const mid=view.mid!=null?Number(view.mid).toFixed(2):'—';
+  const mtf=view.mtf||{};
+  const names=(view.client_names||[]).filter(Boolean);
+  if(view.ok===false||view.reason==='no_epic'||!view.epic){
+    if(meta)meta.textContent='nav epic — atver Capital manuālu darījumu jebkurā tirgū';
+    if(legend)legend.textContent=view.hint
+      ||'Robots adoptē tirgu no Capital. Entry/SL/TP no tā OHLC.';
+    if(typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,{candles:[]});
+    return;
   }
+  const st=view.structure||{};
+  if(meta){
+    meta.textContent=[
+      epic,
+      mid!=='—'?`mid ${mid}`:'',
+      mtf.mode?`MTF ${mtf.mode}`:'',
+      st.bias?`bias ${st.bias}`:'',
+      view.preferred?`zona ${view.preferred}`:'abas zonas',
+      names.length?names.slice(0,3).join(', '):'',
+    ].filter(Boolean).join(' · ');
+  }
+  if(legend){
+    const bits=[];
+    if(view.zones&&view.zones.buy_entry)bits.push('zaļa = BUY entry zona');
+    if(view.zones&&view.zones.sell_entry)bits.push('sarkana = SELL entry zona');
+    bits.push('dzeltena = mid');
+    if(view.swing_brackets&&view.swing_brackets.ready)bits.push('punktētas = swing SL/TP');
+    if(names.length>1)bits.push(`${names.length} klienti`);
+    legend.textContent=bits.join(' · ');
+  }
+  if(canvas&&typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,view);
+}
+
+function renderSharedOhlc(markets){
+  const room=$('sharedOhlc');
+  if(!room)return;
+  const list=Array.isArray(markets)?markets:[];
+  if(!list.length){
+    room.innerHTML='<div class="shared-ohlc-empty">Nav atvērta tirgus OHLC — startē robotu vai atver Capital pozīciju. Jauns tirgus = jauns OHLC panelis / logs.</div>';
+    return;
+  }
+  const keep=new Map();
+  [...room.querySelectorAll('[data-ohlc-epic]')].forEach(el=>{
+    if(el&&el.dataset&&el.dataset.ohlcEpic)keep.set(el.dataset.ohlcEpic,el);
+  });
+  const seen=new Set();
+  list.forEach(view=>{
+    const epic=String(view.epic||'');
+    if(!epic)return;
+    seen.add(epic);
+    const donor=Number(view.donor_client_id||view.client_id||0);
+    const label=epic+((view.client_names&&view.client_names[0])?` · ${view.client_names[0]}`:'');
+    let panel=keep.get(epic);
+    if(!panel){
+      panel=document.createElement('div');
+      panel.className='ohlc-panel';
+      panel.dataset.ohlcEpic=epic;
+      panel.tabIndex=0;
+      panel.setAttribute('role','button');
+      panel.setAttribute('aria-label',`OHLC ${epic} — hover palielina, klikšķis atver logu`);
+      panel.innerHTML=`
+        <div class="ohlc-head">
+          <span>OHLC · ${esc(epic)}</span>
+          <em class="ohlc-meta muted">ielādē…</em>
+        </div>
+        <span class="ohlc-hint">hover = palielināt · klikšķis = jauns logs · jauns tirgus = jauns panelis</span>
+        <canvas class="ohlc-mini" width="640" height="180"></canvas>
+        <div class="ohlc-legend muted"></div>`;
+      room.appendChild(panel);
+      wireSharedOhlcPanel(panel,epic,donor,label);
+    }else{
+      keep.delete(epic);
+      const head=panel.querySelector('.ohlc-head span');
+      if(head)head.textContent=`OHLC · ${epic}`;
+    }
+    panel.dataset.ohlcName=label;
+    panel._donorId=donor;
+    applySharedOhlcView(panel,view);
+  });
+  keep.forEach((el,epic)=>{if(!seen.has(epic))el.remove();});
+  const empty=room.querySelector('.shared-ohlc-empty');
+  if(empty&&list.length)empty.remove();
+}
+
+async function refreshSharedOhlc({force=false}={}){
+  const room=$('sharedOhlc');
+  if(!room)return;
+  if(document.hidden&&!force)return;
+  if(sharedOhlcInFlight)return sharedOhlcInFlight;
+  sharedOhlcInFlight=(async()=>{
+    try{
+      const data=await api(`/api/admin/markets-ohlc?n=90&_=${Date.now()}`);
+      renderSharedOhlc(data.markets||[]);
+    }catch(_){
+      if(!room.querySelector('[data-ohlc-epic]')&&!room.querySelector('.shared-ohlc-empty')){
+        room.innerHTML='<div class="shared-ohlc-empty">OHLC ielāde neizdevās — mēģināšu vēlreiz.</div>';
+      }
+    }
+  })();
+  try{return await sharedOhlcInFlight;}
+  finally{sharedOhlcInFlight=null}
+}
+
+function scheduleSharedOhlc(){
+  if(sharedOhlcTimer)return;
+  sharedOhlcTimer=setInterval(()=>refreshSharedOhlc().catch(()=>{}),OHLC_REFRESH_MS);
+  refreshSharedOhlc({force:true}).catch(()=>{});
 }
 
 function formatSyncClock(ts){
@@ -928,12 +982,14 @@ function cardContentKey(c){
   const a=c.activity||{},e=c.evolution||{},r=c.results||{};
   const pos=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
   const sb=scoreboard(r);
+  const mtf=a.mtf_momentum||{};
   return [
-    c.id,c.robot_running?1:0,c.operator_paused?1:0,c.action||'',
+    c.id,c.robot_running?1:0,c.operator_paused?1:0,c.action||'',c.proposal||'',
     pos.map(p=>[p.dealId,p.direction,p.size,p.level,p.stopLevel,p.profitLevel,
       p.has_sl,p.has_tp,p.trail_phase,Number(p.upl).toFixed(2),p.epic].join('/')).join('|'),
     (a.day_book&&a.day_book.phase)||'',
     (a.mandate&&a.mandate.size)||'',a.market||'',
+    mtf.mode||'',mtf.preferred||'',mtf.stop_hint_atr14??'',
     e.neurons,e.steps,e.learning_generation??e.generation,
     sb.pnl,sb.wins,sb.losses,sb.src,
     r.pending_broker_pnl,r.pending_trades,
@@ -947,7 +1003,7 @@ function cardContentKey(c){
 function softPatchCard(el,c){
   const next=renderCard(c);
   el.className=next.className;
-  // Keep OHLC panel + action buttons (wired once); swap only changing slots.
+  // Keep action buttons (wired once); swap only changing slots.
   const slots=['.head','.deals','.trail-line','.nerve','.facts','.trades'];
   slots.forEach(sel=>{
     const a=el.querySelector(sel);
@@ -955,15 +1011,15 @@ function softPatchCard(el,c){
     if(a&&b){
       if(a.outerHTML!==b.outerHTML)a.replaceWith(b);
     }else if(!a&&b){
-      const panel=el.querySelector('.ohlc-panel');
-      if(panel)panel.before(b);else el.appendChild(b);
+      const actions=el.querySelector('.actions');
+      if(actions)actions.before(b);else el.appendChild(b);
     }else if(a&&!b){
       a.remove();
     }
   });
   // Reason / error line is a bare .muted without other class.
-  const oldMuted=[...el.children].find(n=>n.classList&&n.classList.contains('muted')&&!n.classList.contains('ohlc-legend'));
-  const newMuted=[...next.children].find(n=>n.classList&&n.classList.contains('muted')&&!n.classList.contains('ohlc-legend'));
+  const oldMuted=[...el.children].find(n=>n.classList&&n.classList.contains('muted'));
+  const newMuted=[...next.children].find(n=>n.classList&&n.classList.contains('muted'));
   if(oldMuted&&newMuted&&oldMuted.outerHTML!==newMuted.outerHTML){
     oldMuted.replaceWith(newMuted);
   }else if(!oldMuted&&newMuted){
@@ -1020,7 +1076,6 @@ async function loadOverview(){
         if(old.dataset.contentKey!==key){
           softPatchCard(old,c);
         }
-        queueMicrotask(()=>refreshOhlcPanel(old,c.id).catch(()=>{}));
         keep.delete(id);
       }else{
         const card=renderCard(c);
@@ -1032,6 +1087,7 @@ async function loadOverview(){
     keep.forEach((el,id)=>{if(!seen.has(id))el.remove();});
     if(prev)pick.value=prev;
     schedulePoll(desiredPollMs(data));
+    scheduleSharedOhlc();
   })();
   try{return await overviewInFlight;}
   finally{overviewInFlight=null}
@@ -1042,6 +1098,7 @@ async function enterDash(){
   await loadBrokers();
   await loadOverview();
   schedulePoll(desiredPollMs(lastOverview));
+  scheduleSharedOhlc();
 }
 
 document.querySelectorAll('.nav-item').forEach(btn=>{

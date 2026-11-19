@@ -445,6 +445,15 @@ async def admin_client_structure_view(client_id:int,n:int=90,_:dict=Depends(requ
         raise HTTPException(404,'Client store not found') from None
     return {'ok':True,**view}
 
+@app.get('/api/admin/markets-ohlc')
+async def admin_markets_ohlc(n:int=90,_:dict=Depends(require_admin)):
+    """Shared Admin OHLC — one panel per open Capital epic (not per client card)."""
+    try:
+        out=hub.admin_markets_ohlc(n=n)
+    except Exception as exc:
+        raise HTTPException(500,str(exc)) from None
+    return {'ok':True,**out}
+
 @app.post('/api/admin/clients/{client_id}/prepare-new-market')
 async def admin_prepare_new_market(client_id:int,_:dict=Depends(require_admin)):
     """Drop current mandate — next Capital manual trade may be ANY instrument."""

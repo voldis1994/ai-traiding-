@@ -84,14 +84,17 @@ DEFAULTS = {
     'scratch_pnl_abs': 0.05,
     # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
     'trail_min_mult': 2.0,
-    'trail_open_gap_frac': 0.35,
-    'trail_fallback_frac': 0.5,
+    'trail_open_gap_frac': 0.40,
+    'trail_fallback_frac': 0.55,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
-    # Trail self-arm: MFE fraction of opening risk before enabling trail
-    'trail_arm_mfe_frac': 0.55,
+    # Trail self-arm: wait near ~1R before first lock — early 0.55R BE-locks
+    # were killed by micro bounce-backs and ate the real move.
+    'trail_arm_mfe_frac': 0.90,
     'trail_arm_min_ev': 0.0,
+    # First lock sits BE+ (profit cushion) so a small bounce does not scratch.
+    'trail_be_cushion_frac': 0.15,
     # Bracket teacher schedule (seeds) — thresholds/steps evolve; mults already Store.
     'bracket_vs_vol_noise': 1.15,
     'bracket_vs_stop_noise': 1.05,
@@ -225,12 +228,13 @@ BOUNDS = {
     'exec_fill_delay_bars': (0, 5),
     'scratch_pnl_abs': (0.01, 0.5),
     'trail_min_mult': (1.0, 4.0),
-    'trail_open_gap_frac': (0.15, 0.7),
-    'trail_fallback_frac': (0.25, 0.8),
+    'trail_open_gap_frac': (0.20, 0.75),
+    'trail_fallback_frac': (0.30, 0.85),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
-    'trail_arm_mfe_frac': (0.25, 1.0),
+    'trail_arm_mfe_frac': (0.55, 1.0),
     'trail_arm_min_ev': (-1.0, 2.0),
+    'trail_be_cushion_frac': (0.05, 0.35),
     'bracket_vs_vol_noise': (0.8, 2.0),
     'bracket_vs_stop_noise': (0.8, 1.5),
     'bracket_shape_wide': (1.1, 2.5),
@@ -611,22 +615,31 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['exec_slip_bps'])*1.05)
                 p['exec_fill_delay_bars']=min(BOUNDS['exec_fill_delay_bars'][1],
                     int(p['exec_fill_delay_bars'])+1)
-                # Losses → slightly wider post-BE trail gap (fewer early scratches).
+                # Losses → wider post-BE gap + later first arm (breathe vs bounce).
                 p['trail_open_gap_frac']=min(BOUNDS['trail_open_gap_frac'][1],
                     float(p['trail_open_gap_frac'])*1.04)
                 p['trail_min_mult']=min(BOUNDS['trail_min_mult'][1],
                     float(p['trail_min_mult'])*1.03)
+                p['trail_arm_mfe_frac']=min(BOUNDS['trail_arm_mfe_frac'][1],
+                    float(p.get('trail_arm_mfe_frac',DEFAULTS['trail_arm_mfe_frac']))+0.02)
+                p['trail_be_cushion_frac']=min(BOUNDS['trail_be_cushion_frac'][1],
+                    float(p.get('trail_be_cushion_frac',DEFAULTS['trail_be_cushion_frac']))*1.05)
                 # Harder birth after losses — never ease threshold (runaway n).
                 p['grow_error_threshold']=min(BOUNDS['grow_error_threshold'][1],
                     float(p['grow_error_threshold'])*1.02)
-                notes.append('meaningful loss → calm LR; raise grow threshold (cap runaway birth)')
+                notes.append('meaningful loss → later trail arm + wider BE+/gap')
             elif pnl<0:
                 # Scratch band itself adapts — repeated pennies widen recognition.
                 p['scratch_pnl_abs']=min(BOUNDS['scratch_pnl_abs'][1],
                     float(p['scratch_pnl_abs'])*1.05)
                 p['trail_open_gap_frac']=min(BOUNDS['trail_open_gap_frac'][1],
                     float(p['trail_open_gap_frac'])*1.06)
-                notes.append('scratch loss — widen scratch band + trail gap')
+                # Early BE scratches → wait for more R next time + thicker cushion.
+                p['trail_arm_mfe_frac']=min(BOUNDS['trail_arm_mfe_frac'][1],
+                    float(p.get('trail_arm_mfe_frac',DEFAULTS['trail_arm_mfe_frac']))+0.03)
+                p['trail_be_cushion_frac']=min(BOUNDS['trail_be_cushion_frac'][1],
+                    float(p.get('trail_be_cushion_frac',DEFAULTS['trail_be_cushion_frac']))*1.08)
+                notes.append('scratch loss — later arm + wider trail cushion/gap')
             elif pnl>0:
                 p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
@@ -639,6 +652,9 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                     float(p['scratch_pnl_abs'])*0.99)
                 p['trail_open_gap_frac']=max(BOUNDS['trail_open_gap_frac'][0],
                     float(p['trail_open_gap_frac'])*0.99)
+                # Tiny ease only — never re-open the 0.55R early-arm hole fast.
+                p['trail_arm_mfe_frac']=max(BOUNDS['trail_arm_mfe_frac'][0],
+                    float(p.get('trail_arm_mfe_frac',DEFAULTS['trail_arm_mfe_frac']))-0.005)
                 notes.append('win → calm LR; slight ease of friction/scratch/trail')
     return notes
 

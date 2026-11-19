@@ -171,6 +171,18 @@ def record_realized_pnl(store, pnl, *, now=None) -> dict:
     return state
 
 
+def refine_realized_pnl(store, old_pnl, new_pnl, *, now=None) -> dict:
+    """Apply £ delta when UPL provisional bank is replaced by Capital cash."""
+    old = _finite(old_pnl)
+    new = _finite(new_pnl)
+    if old is None or new is None or store is None:
+        return _daily_state(store, now=now)
+    delta = float(new) - float(old)
+    if abs(delta) < 1e-12:
+        return _daily_state(store, now=now)
+    return record_realized_pnl(store, delta, now=now)
+
+
 def update_peak_equity(store, equity) -> float | None:
     eq = _finite(equity)
     if eq is None or store is None:

@@ -125,9 +125,12 @@ def test_pending_settles_last_upl_as_realized():
             assert any(str((x.get('deal_id') if isinstance(x,dict) else x))=='upl1'
                        for x in pending)
             assert store.get('broker_cash_banked:upl1')  # banked from UPL — no wait
+            banked=store.get('broker_cash_banked:upl1')
+            assert banked.get('source')=='upl_estimate'
             assert e._trade_already_learned('upl1')
             labeled=brain.trade_labeled
-            # Real broker £ later → journal refine, no second neural teach / bank.
+            # Real broker £ later → journal + day-book/hard-risk refine (delta),
+            # no second neural teach.
             broker.tx=[{'reference':'upl1','pnl':-0.21,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
@@ -135,6 +138,10 @@ def test_pending_settles_last_upl_as_realized():
             assert row['pnl_source']=='broker'
             assert e._trade_already_learned('upl1')
             assert brain.trade_labeled==labeled
+            banked2=store.get('broker_cash_banked:upl1')
+            assert banked2.get('source')=='broker'
+            assert banked2.get('refined_from')=='upl_estimate'
+            assert banked2.get('pnl')==pytest.approx(-0.21)
     asyncio.run(scenario())
 
 

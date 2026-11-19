@@ -1050,6 +1050,48 @@ def record_close(store, *, pnl, now=None, equity=None, open_count=0, deal_id=Non
     return daily
 
 
+def refine_close(store, *, deal_id, old_pnl, new_pnl, now=None, equity=None,
+                 open_count=0):
+    """Adjust day-book cash when provisional UPL is replaced by broker £.
+
+    Does not increment closes / deal_ids — only the £ delta and win/loss tags.
+    """
+    deal = str(deal_id or '')
+    old = _finite(old_pnl)
+    new = _finite(new_pnl)
+    if not deal or old is None or new is None:
+        return load_daily(store, now=now, equity=equity)
+    daily = load_daily(store, now=now, equity=equity)
+    ids = [str(x) for x in (daily.get('deal_ids') or [])]
+    if deal not in ids:
+        # Never banked — fall through to first-time record.
+        return record_close(store, pnl=new, now=now, equity=equity,
+                            open_count=open_count, deal_id=deal)
+    delta = float(new) - float(old)
+    if abs(delta) < 1e-12:
+        return daily
+    daily['realized_pnl'] = float(daily.get('realized_pnl') or 0.0) + delta
+    # Fix win/loss counters when the sign flipped after refine.
+    if old > 0 and new <= 0:
+        daily['wins'] = max(0, int(daily.get('wins') or 0) - 1)
+        if new < 0:
+            daily['losses'] = int(daily.get('losses') or 0) + 1
+    elif old < 0 and new >= 0:
+        daily['losses'] = max(0, int(daily.get('losses') or 0) - 1)
+        if new > 0:
+            daily['wins'] = int(daily.get('wins') or 0) + 1
+    elif old == 0 and new > 0:
+        daily['wins'] = int(daily.get('wins') or 0) + 1
+    elif old == 0 and new < 0:
+        daily['losses'] = int(daily.get('losses') or 0) + 1
+    params = load_params(store)
+    b = budgets(equity=equity, params=params, daily=daily)
+    daily['phase'] = phase_for(
+        daily=daily, budgets_map=b, open_count=open_count)
+    save_daily(store, daily)
+    return daily
+
+
 def _evolve_knobs_from_close(store, *, pnl, daily, budgets_map):
     """Tiny day knobs via self_params trial protocol — never bypass freeze."""
     if store is None:

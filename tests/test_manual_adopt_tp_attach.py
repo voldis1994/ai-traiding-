@@ -43,12 +43,32 @@ def test_needs_protect_skips_after_trail_runtime():
         brain = AdaptiveBrain(store, data_dir=d)
         engine = SingleTradeEngine(store, brain)
         store.set('robot_open:r1', True)
-        store.set('adaptive_runtime:r1', {'status': 'CONFIRMED', 'phase': 'trail'})
+        store.set('tp_attach_done:r1', True)  # had TP, then trail cleared it
+        store.set('adaptive_protection:r1', {
+            'owner': 'AUTO', 'original_risk': 0.8, 'original_profit': 1.2})
+        store.set('adaptive_runtime:r1', {'status': 'CONFIRMED'})
         p = {
             'dealId': 'r1', 'direction': 'BUY', 'level': 100.,
             'stopLevel': 99.2, 'profitLevel': None, 'epic': 'SIM', 'size': '1',
         }
         assert engine._needs_protect_brackets(p) is False
+
+
+def test_needs_protect_after_trail_if_tp_never_attached():
+    """Trail CONFIRMED before any TP attach must not freeze Take Profit Off."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 's.db')
+        brain = AdaptiveBrain(store, data_dir=d)
+        engine = SingleTradeEngine(store, brain)
+        store.set('robot_open:r2', True)
+        store.set('adaptive_protection:r2', {
+            'owner': 'AUTO', 'original_risk': 0.8})  # no original_profit
+        store.set('adaptive_runtime:r2', {'status': 'CONFIRMED'})
+        p = {
+            'dealId': 'r2', 'direction': 'BUY', 'level': 100.,
+            'stopLevel': 99.2, 'profitLevel': None, 'epic': 'SIM', 'size': '1',
+        }
+        assert engine._needs_protect_brackets(p) is True
 
 
 def test_protect_ignores_foreign_unresolved_orders():

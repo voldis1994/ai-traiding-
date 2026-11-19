@@ -213,17 +213,23 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     else:
         trail_gap=open_gap
     tip_fav=sign*(tip-entry)
+    cushion=0.0
     if not be_locked and early_arm and tip_fav>0:
         try:
-            from .self_params import load as _sp_load
-            arm_frac=float((_sp_load(store) or {}).get('trail_arm_mfe_frac',0.55))
+            from .self_params import load as _sp_load, DEFAULTS as _SP_DEF
+            sp=_sp_load(store) or {}
+            arm_frac=float(sp.get('trail_arm_mfe_frac',_SP_DEF['trail_arm_mfe_frac']))
+            cush_frac=float(sp.get('trail_be_cushion_frac',
+                                   _SP_DEF.get('trail_be_cushion_frac',0.15)))
         except Exception:
-            arm_frac=0.55
-        arm_frac=max(0.25,min(1.0,arm_frac))
-        floor_need=min(arm_frac,0.35)*open_gap
+            arm_frac=0.90;cush_frac=0.15
+        arm_frac=max(0.55,min(1.0,arm_frac))
+        cush_frac=max(0.05,min(0.35,cush_frac))
+        floor_need=arm_frac*open_gap
         if tip_fav<floor_need:
             return None
-        trail_gap=min(open_gap,max(minimum,tip_fav))
+        cushion=min(tip_fav*0.5,cush_frac*open_gap)
+        trail_gap=min(open_gap,max(minimum,tip_fav-cushion))
         need=floor_need
     else:
         need=open_gap if not be_locked else trail_gap
@@ -234,7 +240,7 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
         if tip<=entry:return None
         desired=min(tip-trail_gap,bid-minimum)
         if early_arm and not be_locked:
-            desired=max(desired,entry)
+            desired=max(desired,entry+cushion)
         new_stop=math.floor(desired/tick+1e-12)*tick
         if early_arm and not be_locked and new_stop<entry-1e-12:
             return None
@@ -246,7 +252,7 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
     if tip>=entry:return None
     desired=max(tip+trail_gap,ask+minimum)
     if early_arm and not be_locked:
-        desired=min(desired,entry)
+        desired=min(desired,entry-cushion)
     new_stop=math.ceil(desired/tick-1e-12)*tick
     if early_arm and not be_locked and new_stop>entry+1e-12:
         return None

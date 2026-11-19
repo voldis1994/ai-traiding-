@@ -157,9 +157,14 @@ def test_label_from_profit_uses_structure_frame_advice():
 def test_trail_arm_on_mfe_fraction():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        arm = se.trail_arm_decision(
+        # Seed ~0.90R — micro 0.5/0.8 must wait; real ~1R arms.
+        weak = se.trail_arm_decision(
             s, epic='GOLD', structure='TREND_UP', direction='BUY',
             mfe=0.5, original_risk=0.8, be_locked=False)
+        assert weak['arm'] is False
+        arm = se.trail_arm_decision(
+            s, epic='GOLD', structure='TREND_UP', direction='BUY',
+            mfe=0.75, original_risk=0.8, be_locked=False)
         assert arm['arm'] is True
         assert 'mfe' in arm['reason']
 
@@ -183,41 +188,47 @@ def test_trail_stop_only_min_distance_when_tp_near_market():
         'BUY', 100.55, None, bid=101.35, ask=101.45, min_distance=0.3)
 
 
-def test_propose_early_arm_locks_near_be():
-    with tempfile.TemporaryDirectory() as d:
-        s = _store(d)
-        pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
-               'stopLevel': 99.2, 'profitLevel': 101.6, 'size': '.25'}
-        market = {'epic': 'GOLD', 'bid': 100.5, 'ask': 100.6, 'spread': 0.1,
-                  'tick': 0.01, 'min_distance': 0.3, 'status': 'TRADEABLE'}
-        meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
-                'original_profit': 1.6}
-        # Without arm: tip_fav=0.5 < open_gap 0.8 → no trail.
-        assert propose_broker_trail(pos, market, meta, extreme=100.5, store=s) is None
-        # With adaptive arm: allow BE-lock ratchet.
-        arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.5}
-        out = propose_broker_trail(
-            pos, market, meta, extreme=100.5, store=s, arm_decision=arm)
-        assert out is not None
-        assert out['stop_level'] >= 100.0 - 1e-9  # BE lock — never loss-side of entry
-        assert out['profit_level'] == 101.6  # TP preserved
-        assert out.get('early_arm') is True
-
-
-def test_propose_early_arm_skips_when_be_violates_min_distance():
-    """If BE stop would sit inside broker min of market, skip — do not glue loss-side."""
+def test_propose_early_arm_locks_be_plus_cushion():
+    """First arm locks BE+ cushion — micro bounce must not scratch at exact entry."""
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
                'stopLevel': 99.2, 'profitLevel': 102.0, 'size': '.25'}
-        # bid barely above entry; minStop large → bid-min below entry
+        # ~0.9R tip (risk 0.8 → need 0.72); bid still above cushion.
+        market = {'epic': 'GOLD', 'bid': 100.75, 'ask': 100.85, 'spread': 0.1,
+                  'tick': 0.01, 'min_distance': 0.3, 'status': 'TRADEABLE'}
+        meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
+                'original_profit': 2.0}
+        # Without arm: tip_fav < open_gap → no trail.
+        assert propose_broker_trail(pos, market, meta, extreme=100.75, store=s) is None
+        # Micro tip still waits (below ~0.9R).
+        arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.5}
+        assert propose_broker_trail(
+            pos, market, meta, extreme=100.5, store=s, arm_decision=arm) is None
+        arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.75}
+        out = propose_broker_trail(
+            pos, market, meta, extreme=100.75, store=s, arm_decision=arm)
+        assert out is not None
+        assert out['stop_level'] >= 100.0 - 1e-9  # never loss-side
+        assert out['stop_level'] > 100.0 + 1e-9   # BE+ cushion, not exact BE
+        assert out['profit_level'] == 102.0
+        assert out.get('early_arm') is True
+
+
+def test_propose_early_arm_skips_when_be_violates_min_distance():
+    """If BE+ stop would sit inside broker min of market, skip — do not glue loss-side."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
+               'stopLevel': 99.2, 'profitLevel': 102.0, 'size': '.25'}
+        # tip enough for 0.9R but bid barely above entry; minStop large
         market = {'epic': 'GOLD', 'bid': 100.2, 'ask': 100.3, 'spread': 0.1,
                   'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE'}
         meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
                 'original_profit': 2.0}
-        arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.5}
+        arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.75}
         out = propose_broker_trail(
-            pos, market, meta, extreme=100.5, store=s, arm_decision=arm)
+            pos, market, meta, extreme=100.75, store=s, arm_decision=arm)
         # Either None (skipped) or stop >= entry — never below entry.
         if out is not None:
             assert out['stop_level'] >= 100.0 - 1e-9

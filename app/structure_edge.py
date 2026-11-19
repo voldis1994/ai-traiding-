@@ -252,8 +252,9 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
 
     Adaptive evidence (any one is enough once past noise):
       • stop already at/through BE → always arm (lock gains)
-      • MFE ≥ trail_arm_mfe_frac × opening risk
-      • structure×side mean £ > trail_arm_min_ev with enough samples
+      • MFE ≥ trail_arm_mfe_frac × opening risk (~0.9R seed — not micro bounce)
+      • structure×side mean £ > trail_arm_min_ev AND MFE ≥ same arm frac
+        (no 0.35R shortcut — that BE-locked into bounce scratches)
     """
     cfg = _cfg(store)
     out = {
@@ -267,7 +268,8 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
         return out
     risk = _finite(original_risk)
     mfe_n = _finite(mfe)
-    frac = float(cfg.get('trail_arm_mfe_frac', 0.55))
+    frac = float(cfg.get('trail_arm_mfe_frac', 0.90))
+    frac = max(0.55, min(1.0, frac))
     if risk is not None and risk > 0 and mfe_n is not None and mfe_n >= frac * risk:
         out['arm'] = True
         out['reason'] = (
@@ -276,16 +278,19 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
     need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
     st = side_stats(store, epic, structure, direction)
     min_ev = float(cfg.get('trail_arm_min_ev', 0.0))
+    # Same MFE bar as the primary path — structure EV must not re-open the
+    # 0.35R early-arm hole that bounced trades out of a real move.
     if (st['samples'] >= need and st['mean_pnl'] is not None
             and float(st['mean_pnl']) > min_ev
-            and mfe_n is not None and risk is not None and mfe_n >= 0.35 * risk):
+            and mfe_n is not None and risk is not None and risk > 0
+            and mfe_n >= frac * risk):
         out['arm'] = True
         out['reason'] = (
             f'structure {structure}/{direction} mean £={st["mean_pnl"]:.4f} '
-            f'+ partial mfe — arm trail')
+            f'+ mfe≥{frac:.2f}R — arm trail')
         return out
     out['reason'] = (
-        f'waiting: mfe={mfe_n} risk={risk} structure_mean='
+        f'waiting: mfe={mfe_n} risk={risk} need≥{frac:.2f}R structure_mean='
         f'{st.get("mean_pnl")} n={st.get("samples")}')
     return out
 

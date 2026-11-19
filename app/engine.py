@@ -5089,9 +5089,14 @@ class SingleTradeEngine:
         if not deal:
             return True
         # Stuck recovery: flag said done but broker still Take Profit Off.
+        # Do not clear during protect backoff — that re-armed a 3s PUT hammer.
         if self.store.get('tp_attach_done:'+deal) and live_tp is None:
+            if self._protect_in_backoff(deal):
+                return True  # still needed, but protect_position will no-op PUT
             self.store.set('tp_attach_done:'+deal,False)
             self.protected.discard(deal)
+            # Cool down before the next attach PUT (Capital lag / reject flap).
+            self._mark_protect_runtime(deal,'RETRY_TP',wait_sec=15.0)
         elif self.store.get('tp_attach_done:'+deal):
             return False
         runtime=self.store.get('adaptive_runtime:'+deal) or {}
@@ -5105,6 +5110,34 @@ class SingleTradeEngine:
         if not deal_id:return
         self.store.set('tp_attach_done:'+str(deal_id),True)
         self.protected.add(deal_id)
+        self._clear_protect_runtime(deal_id)
+
+    def _protect_runtime_key(self,deal_id):
+        return 'protect_runtime:'+str(deal_id)
+
+    def _protect_in_backoff(self,deal_id):
+        """True while we must not re-PUT protect (reject / flap cooldown)."""
+        if not deal_id:return False
+        rt=self.store.get(self._protect_runtime_key(deal_id)) or {}
+        if not isinstance(rt,dict):return False
+        last=rt.get('mono')
+        if last is None:return False
+        wait=float(rt.get('wait_sec') or 0)
+        if wait<=0:return False
+        return (time.monotonic()-float(last))<wait
+
+    def _mark_protect_runtime(self,deal_id,status,*,wait_sec=15.0,**extra):
+        if not deal_id:return
+        payload={'mono':time.monotonic(),'status':str(status),
+                 'wait_sec':float(wait_sec),'at':now()}
+        payload.update(extra)
+        self.store.set(self._protect_runtime_key(deal_id),payload)
+
+    def _clear_protect_runtime(self,deal_id):
+        if not deal_id:return
+        key=self._protect_runtime_key(deal_id)
+        if self.store.get(key) is not None:
+            self.store.set(key,None)
 
     def _protect_defer(self,p,reason,**extra):
         """Surface why TP/SL protect is waiting — Admin was stuck on stale brief."""
@@ -5143,9 +5176,18 @@ class SingleTradeEngine:
         live_tp=_broker_price_level(p.get('profitLevel'))
         if live_sl is not None and live_tp is not None:
             self._mark_tp_attach_done(p.get('dealId'));return
+        deal_s=str(p.get('dealId'))
+        # Same idea as adapt_protection REJECTED wait — failed/pending protect
+        # must not re-PUT every 3s poll (Capital UI jerks SL/TP on one client).
+        if self._protect_in_backoff(deal_s):
+            rt=self.store.get(self._protect_runtime_key(deal_s)) or {}
+            self.protection_brief={
+                'status':'Protect backoff: '+str(rt.get('status') or 'reject'),
+                'deal_id':p.get('dealId'),'wait_sec':rt.get('wait_sec'),
+                'reason':rt.get('status')}
+            return
         # Only block on a live OPEN still in flight — stale journal rows used to
         # freeze manual TP forever on some accounts (andris) while peers worked.
-        deal_s=str(p.get('dealId'))
         for item in (self.store.unresolved() or []):
             kind=item.get('kind')
             if kind=='PROTECT' and str(item.get('deal_id'))==deal_s:
@@ -5238,6 +5280,8 @@ class SingleTradeEngine:
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
         if live_sl is None and not distances_meet_broker_min(
                 result['stop_distance'],result['profit_distance'],min_dist):
+            # Soft quote/rule wait — short cool-down so we do not spam PUT.
+            self._mark_protect_runtime(p.get('dealId'),'MIN_DIST',wait_sec=5.0)
             self._protect_defer(p,'SL/TP below broker min distance',
                                stop_distance=result['stop_distance'],
                                profit_distance=result['profit_distance'],
@@ -5246,6 +5290,7 @@ class SingleTradeEngine:
         if (live_tp is None and profit_lvl is not None and bid is not None and ask is not None
                 and not levels_meet_broker_min(
                     direction,live_sl or stop_lvl,profit_lvl,bid,ask,min_dist)):
+            self._mark_protect_runtime(p.get('dealId'),'TP_TOO_CLOSE',wait_sec=5.0)
             self._protect_defer(p,'TP inside broker min from live quote',
                                profit_level=profit_lvl,bid=bid,ask=ask,
                                min_distance=float(min_dist))
@@ -5255,11 +5300,25 @@ class SingleTradeEngine:
         profit=result['profit_level'] if live_tp is None else None
         if stop is None and profit is None:
             self._mark_tp_attach_done(p.get('dealId'));return
+        # One PUT per backoff window — blocks same-poll triple call (early /
+        # after-candles / mid-manage) from hammering Capital.
+        self._mark_protect_runtime(p.get('dealId'),'IN_FLIGHT',wait_sec=8.0)
         manual=not bool(self.store.get('robot_open:'+str(p.get('dealId'))))
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=profit)
             if await self._confirm_reconcile(receipt,order_id,'PROTECT',p['dealId']):
+                # Only mark done when broker actually shows the TP we asked for.
+                live_after=next((x for x in (self.positions or [])
+                                 if str(x.get('dealId'))==str(p.get('dealId'))),None)
+                attached_tp=_broker_price_level(
+                    (live_after or {}).get('profitLevel') if live_after else None)
+                if profit is not None and attached_tp is None:
+                    # Accepted but TP still Off — treat as reject + cool down.
+                    self._mark_protect_runtime(p.get('dealId'),'TP_NOT_ON_BROKER',wait_sec=15.0)
+                    self._protect_defer(p,'protect accepted but TP still Off on broker',
+                                       requested_profit=profit)
+                    return
                 self._mark_tp_attach_done(p.get('dealId'))
                 # Manual adopt: mark robot_open so trail can enroll after SL/TP on.
                 if manual:
@@ -5289,12 +5348,14 @@ class SingleTradeEngine:
                     return
                 # Rejected while still open — keep existing levels, do not pause.
                 self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
+                self._mark_protect_runtime(p.get('dealId'),'REJECTED',wait_sec=15.0)
                 self._protect_defer(p,'broker rejected protect PUT',
                                    reference=receipt.get('dealReference'),
                                    requested_stop=stop,requested_profit=profit)
                 self.store.event('warning','Protection rejected; kept live levels without pause',
                     {'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),
-                     'requested_stop':str(stop),'requested_profit':str(profit)})
+                     'requested_stop':str(stop),'requested_profit':str(profit),
+                     'backoff_sec':15})
         except Exception as exc:
             if not await self._position_still_open(p.get('dealId')):
                 self.store.order_update(order_id,'SUPERSEDED')
@@ -5303,12 +5364,14 @@ class SingleTradeEngine:
                 self._release_execution_after_flat(p.get('dealId'))
                 return
             self.store.order_update(order_id,'SUPERSEDED')
+            self._mark_protect_runtime(p.get('dealId'),'EXCEPTION',wait_sec=15.0)
             self._protect_defer(p,'protect exception: '+type(exc).__name__)
             self.store.event('warning','Position protection uncertain; kept live levels without pause',
                 {'type':type(exc).__name__,
                  'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                  'broker_error':_safe_broker_error(exc),'deal_id':p.get('dealId'),
-                 'stop_level':str(stop),'take_profit_level':str(profit)})
+                 'stop_level':str(stop),'take_profit_level':str(profit),
+                 'backoff_sec':15})
     async def exit_position(self,deal_id):
         if self.pending_order or self.pending_close or not self.execution_enabled:return
         self.pending_close=True

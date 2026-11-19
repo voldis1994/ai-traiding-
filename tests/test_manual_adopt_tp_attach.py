@@ -23,10 +23,12 @@ def test_needs_protect_when_manual_tp_off():
         }
         assert _broker_price_level(p['profitLevel']) is None
         assert engine._needs_protect_brackets(p) is True
-        # Flag alone is not enough while broker still shows TP Off — clear + retry.
+        # Flag alone is not enough while broker still shows TP Off — clear + cool-down.
         store.set('tp_attach_done:man1', True)
         assert engine._needs_protect_brackets(p) is True
         assert store.get('tp_attach_done:man1') is False
+        rt = store.get('protect_runtime:man1')
+        assert rt and rt.get('status') == 'RETRY_TP'
         # Once broker has a real TP, flag stops further protect.
         p['profitLevel'] = 3700.0
         store.set('tp_attach_done:man1', True)

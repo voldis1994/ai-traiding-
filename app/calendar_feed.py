@@ -1,8 +1,9 @@
 """Forex Factory's public weekly JSON export -> validated local news snapshot.
 
 The feed is fetched over HTTPS, never by scraping HTML. Times are parsed with
-UTC offsets exactly as published. Fetch failure is returned to the engine,
-which blocks new entries. No manufactured economic events or API credentials.
+UTC offsets exactly as published. Fetch failure is reported to the engine; LIVE
+must keep trading on the last good cache (429 must not freeze OPEN). No
+manufactured economic events or API credentials.
 """
 import json
 import os
@@ -13,6 +14,8 @@ import httpx
 from .external_risk import _utc
 
 FOREX_FACTORY_JSON='https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+# Weekly FF dump — 1h max_age made every rate-limit turn into a LIVE freeze.
+DEFAULT_MAX_AGE_HOURS=24
 
 
 def convert_forex_factory(events, *, now=None):
@@ -40,22 +43,29 @@ def convert_forex_factory(events, *, now=None):
     return {'enabled':True,'source':'Forex Factory weekly JSON',
             'source_url':FOREX_FACTORY_JSON,'updated_at':now.isoformat(),
             'coverage_start':sunday.isoformat(),'coverage_end':end.isoformat(),
-            'max_age_hours':1,'before_minutes':30,'after_minutes':30,
+            'max_age_hours':DEFAULT_MAX_AGE_HOURS,'before_minutes':30,'after_minutes':30,
             'events':out}
 
 
 async def refresh_calendar(path, *, url=None, client=None, now=None):
     url = url if url is not None else os.getenv('NEURAL_ECONOMIC_CALENDAR_URL', FOREX_FACTORY_JSON).strip()
     if not url:
-        return {'configured':False,'updated':False,'reason':'No economic calendar URL configured'}
+        return {'configured':False,'updated':False,'reason':'No economic calendar URL configured',
+                'rate_limited':False}
     parsed=urlparse(url)
     if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password:
-        return {'configured':True,'updated':False,'reason':'Calendar URL must be HTTPS without credentials in URL'}
+        return {'configured':True,'updated':False,'rate_limited':False,
+                'reason':'Calendar URL must be HTTPS without credentials in URL'}
     try:
         if client is None:
             async with httpx.AsyncClient(timeout=12,follow_redirects=False) as session:
                 response=await session.get(url)
         else:response=await client.get(url)
+        if response.status_code==429:
+            retry=response.headers.get('Retry-After')
+            return {'configured':True,'updated':False,'rate_limited':True,
+                    'retry_after':retry,
+                    'reason':'Calendar feed rate-limited (429); keeping last cache for LIVE'}
         response.raise_for_status()
         if len(response.content)>2_000_000:raise ValueError('calendar payload too large')
         raw=response.json()
@@ -75,8 +85,9 @@ async def refresh_calendar(path, *, url=None, client=None, now=None):
         temp=path.with_suffix('.download')
         temp.write_text(json.dumps(payload,ensure_ascii=False),encoding='utf-8')
         temp.replace(path)
-        return {'configured':True,'updated':True,'reason':'Calendar feed refreshed',
+        return {'configured':True,'updated':True,'rate_limited':False,
+                'reason':'Calendar feed refreshed',
                 'count':len(payload['events']),'source':payload.get('source','Custom JSON calendar')}
     except (httpx.HTTPError,ValueError,KeyError,OSError,TypeError) as exc:
-        return {'configured':True,'updated':False,
+        return {'configured':True,'updated':False,'rate_limited':False,
                 'reason':'Calendar feed refresh failed: '+type(exc).__name__+': '+str(exc)[:110]}

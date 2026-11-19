@@ -67,7 +67,8 @@ def test_fused_input_has_crossmarket_and_news_with_no_future_candle(tmp_path):
     assert fusion_features({'ready':True,'bar_time':BASE.isoformat(),
         'features':[0.]*FEATURE_DIM},stale,'EURUSD',file,['EUR','USD'],now=BASE,
         liquidity_path=liq) is None
-    assert news_features('EURUSD',tmp_path/'missing.json',['EUR','USD'],now=BASE) is None
+    # Missing calendar soft-degrades to neutral news dims (LIVE must not freeze).
+    assert news_features('EURUSD',tmp_path/'missing.json',['EUR','USD'],now=BASE)==[0.,0.]
 
 
 def test_news_currency_specific_and_future_after_event(tmp_path):

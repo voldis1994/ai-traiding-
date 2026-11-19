@@ -50,7 +50,9 @@ def test_high_impact_window_only_and_stale_fail_closed(tmp_path):
     # High event 31 min away -> no block, low even within range -> no block.
     assert assess_news('EURUSD',file,now=NOW,instrument_currencies=['EUR','USD'])['status']=='CLEAR'
     assert assess_news('EURUSD',file,now=NOW+timedelta(minutes=2),instrument_currencies=['EUR','USD'])['status']=='NEWS_WINDOW'
-    assert assess_news('EURUSD',file,now=NOW+timedelta(hours=2),instrument_currencies=['EUR','USD'])['status']=='CALENDAR_UNAVAILABLE'
+    # Weekly FF cache stays valid for 24h — rate-limits must not stale-out LIVE.
+    assert assess_news('EURUSD',file,now=NOW+timedelta(hours=2),instrument_currencies=['EUR','USD'])['status']=='CLEAR'
+    assert assess_news('EURUSD',file,now=NOW+timedelta(hours=25),instrument_currencies=['EUR','USD'])['status']=='CALENDAR_UNAVAILABLE'
 
 
 def test_profile_multiple_asset_classes():
@@ -151,7 +153,7 @@ def test_engine_news_guard_applies_without_duplicate_intermarket_veto(tmp_path):
     assert e._external_entry_check('BUY')['entry_allowed']  # Neural features already evaluate peer data.
 
 
-def test_cleared_or_deleted_calendar_blocks_new_entries(tmp_path):
+def test_cleared_or_rate_limited_calendar_does_not_freeze_live(tmp_path):
     from app.engine import Store,AdaptiveBrain,SingleTradeEngine
     s=Store(tmp_path/'robot.db');brain=AdaptiveBrain(s,data_dir=tmp_path)
     e=SingleTradeEngine(s,brain)
@@ -159,9 +161,14 @@ def test_cleared_or_deleted_calendar_blocks_new_entries(tmp_path):
     e.mandate={'epic':'GOLD'}
     e.instrument_profile=instrument_profile('GOLD')
     e.news_calendar_path=tmp_path/'missing.json'
-    assert e._news_risk()['status']=='CALENDAR_UNAVAILABLE'
-    e.calendar_feed_error='Service unavailable'
-    assert e._news_risk()['status']=='CALENDAR_FEED_ERROR'
+    # Missing calendar → news inactive, OPEN still allowed.
+    risk=e._news_risk()
+    assert risk['entry_allowed'] is True
+    assert risk['status'] in ('UNCONFIGURED','CALENDAR_WAITING')
+    e.calendar_feed_error="HTTPStatusError: Client error '429 Too Many Requests'"
+    soft=e._news_risk()
+    assert soft['entry_allowed'] is True
+    assert soft['status']=='CALENDAR_FEED_DEGRADED'
 
 
 def test_explicit_new_market_requires_flat_broker_and_preserves_learning(tmp_path):

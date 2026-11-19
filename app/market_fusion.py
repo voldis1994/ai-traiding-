@@ -92,13 +92,22 @@ def peer_features(state, bar_time, *, max_lag_seconds=0):
 
 
 def news_features(epic, calendar_path, currencies, *, now=None):
-    """Known scheduled event proximity only; never train on actual surprise data."""
+    """Known scheduled event proximity only; never train on actual surprise data.
+
+    When the calendar feed is rate-limited / stale, return neutral [0,0] so
+    fusion does not freeze LIVE OPEN (operator: calendar soft-fail).
+    """
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         return None
     current = current.astimezone(timezone.utc)
     guard = assess_news(epic, calendar_path, now=current, instrument_currencies=currencies)
-    if not guard.get('enabled') or guard.get('status') not in ('CLEAR','NEWS_WINDOW'):
+    status = guard.get('status')
+    if not guard.get('enabled') or status not in ('CLEAR','NEWS_WINDOW'):
+        # Soft degrade — missing/stale/rate-limited calendar must not gap fusion.
+        if status in ('CALENDAR_UNAVAILABLE','UNCONFIGURED','DISABLED','CALENDAR_WAITING',
+                      'CALENDAR_FEED_ERROR','CALENDAR_FEED_DEGRADED',None):
+            return [0., 0.]
         return None
     try:
         config = json.loads(Path(calendar_path).read_text(encoding='utf-8'))
@@ -117,9 +126,9 @@ def news_features(epic, calendar_path, currencies, *, now=None):
             if -120 <= remaining < 0:
                 after=max(after, 1.+remaining/120.)
         out = [ahead,after]
-        return out if all(math.isfinite(x) and 0<=x<=1 for x in out) else None
+        return out if all(math.isfinite(x) and 0<=x<=1 for x in out) else [0., 0.]
     except (KeyError, TypeError, ValueError, OSError):
-        return None
+        return [0., 0.]
 
 
 def _liquidity_vector_ok(values):

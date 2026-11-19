@@ -1039,6 +1039,7 @@ class SingleTradeEngine:
         self.last_calendar_refresh=0.0
         self._calendar_task=None
         self.calendar_feed_error=None
+        self._calendar_backoff_sec=300
         self.last_liquidity_refresh=0.0
         self._liquidity_task=None
         self.liquidity_feed_error=None
@@ -1083,33 +1084,50 @@ class SingleTradeEngine:
             # A transient network failure does not invalidate a still-current
             # verified cached calendar; the freshness checks are in assess_news.
             if self.calendar_feed_error:
-                return dict(result,reason=result['reason']+' (using fresh cached calendar)')
+                return dict(result,reason=result['reason']+' (using cached calendar)')
             return result
+        # Feed 429 / refresh failure must NOT freeze LIVE — only a real NEWS_WINDOW
+        # (handled above with entry_allowed=False) blocks new entries.
         if self.calendar_feed_error:
-            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_FEED_ERROR',
-                    'reason':self.calendar_feed_error}
+            return {'enabled':True,'entry_allowed':True,'status':'CALENDAR_FEED_DEGRADED',
+                    'reason':'Calendar soft-fail — LIVE continues: '+str(self.calendar_feed_error)[:160]}
         if not self.last_calendar_refresh and not self.news_calendar_path.exists():
-            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_WAITING',
-                    'reason':'Waiting for Forex Factory calendar download'}
+            return {'enabled':True,'entry_allowed':True,'status':'CALENDAR_WAITING',
+                    'reason':'Waiting for Forex Factory calendar — LIVE not blocked'}
         if not result.get('enabled'):
-            return {'enabled':True,'entry_allowed':False,'status':'CALENDAR_UNAVAILABLE',
-                    'reason':'News protection inactive or calendar file missing; new entries blocked'}
+            # No calendar configured → news protection inactive, do not freeze OPEN.
+            return {'enabled':False,'entry_allowed':True,
+                    'status':result.get('status') or 'UNCONFIGURED',
+                    'reason':result.get('reason') or 'News protection inactive'}
         return result
 
     async def _refresh_calendar_if_due(self):
         moment=time.monotonic()
-        if self.last_calendar_refresh and moment-self.last_calendar_refresh<300:return
+        # Rate-limit backoff: FF 429 persists if we hammer every 5 minutes.
+        backoff=float(getattr(self,'_calendar_backoff_sec',300) or 300)
+        if self.last_calendar_refresh and moment-self.last_calendar_refresh<backoff:return
         self.last_calendar_refresh=moment
         result=await refresh_calendar(self.news_calendar_path)
-        self.calendar_feed_error=None if result['updated'] else result['reason']
-        if not result['updated']:
-            self.store.event('warning','Forex Factory calendar unavailable; new entries blocked',
-                             {'reason':result['reason']})
+        if result.get('updated'):
+            self.calendar_feed_error=None
+            self._calendar_backoff_sec=300
+            return
+        self.calendar_feed_error=result.get('reason')
+        if result.get('rate_limited'):
+            self._calendar_backoff_sec=1800
+            self.store.event('warning','Forex Factory calendar rate-limited; LIVE keeps last cache',
+                             {'reason':result.get('reason'),'backoff_sec':1800,
+                              'retry_after':result.get('retry_after')})
+        else:
+            self._calendar_backoff_sec=600
+            self.store.event('warning','Forex Factory calendar refresh failed; LIVE not blocked',
+                             {'reason':result.get('reason'),'backoff_sec':600})
 
     def _schedule_calendar_in_background(self):
         """Keep news learning current during an open trade without delaying SL/TP."""
         if self._calendar_task is not None and not self._calendar_task.done():return
-        if self.last_calendar_refresh and time.monotonic()-self.last_calendar_refresh<300:return
+        backoff=float(getattr(self,'_calendar_backoff_sec',300) or 300)
+        if self.last_calendar_refresh and time.monotonic()-self.last_calendar_refresh<backoff:return
         self._calendar_task=asyncio.create_task(self._refresh_calendar_if_due())
 
     def cancel_calendar_refresh(self):

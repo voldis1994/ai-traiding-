@@ -206,7 +206,11 @@ def m1_same_dir_streak(candles, action, *, need=2) -> dict:
 
 
 def ohlc_strong_agrees(action, mtf_analysis=None, *, min_conf: float = 0.50) -> dict:
-    """True when OHLC/MTF stack strongly prefers ``action`` — skip 1m confirm / soft cross."""
+    """True when OHLC/MTF stack strongly prefers ``action`` — skip 1m confirm / soft cross.
+
+    Lone micro ``structure_break`` is not enough (BUY bounce in a dump). Break
+    must agree with preferred/mode, or carry high confidence without opposite side.
+    """
     if action not in ('BUY', 'SELL') or not isinstance(mtf_analysis, dict):
         return {'ok': False, 'reason': 'no_mtf'}
     if not mtf_analysis.get('ready'):
@@ -217,13 +221,25 @@ def ohlc_strong_agrees(action, mtf_analysis=None, *, min_conf: float = 0.50) -> 
         conf = float(mtf_analysis.get('confidence') or 0)
     except (TypeError, ValueError):
         conf = 0.0
+    opposite = 'SELL' if action == 'BUY' else 'BUY'
     br = _structure_break(mtf_analysis)
     if pref == action and conf >= float(min_conf):
         return {'ok': True, 'reason': 'mtf_preferred_strong', 'confidence': conf, 'mode': mode}
     if mode == action and conf >= float(min_conf):
         return {'ok': True, 'reason': 'mtf_mode_strong', 'confidence': conf, 'mode': mode}
     if (action == 'BUY' and br == 'UP') or (action == 'SELL' and br == 'DOWN'):
-        return {'ok': True, 'reason': 'structure_break_strong', 'confidence': conf, 'mode': mode}
+        # Require MTF same-side or high conf without opposite preferred.
+        if pref == opposite or mode == opposite:
+            return {'ok': False, 'reason': 'break_vs_mtf_opposite',
+                    'confidence': conf, 'preferred': pref, 'mode': mode}
+        if pref == action or mode == action:
+            return {'ok': True, 'reason': 'structure_break_strong',
+                    'confidence': conf, 'mode': mode}
+        if conf >= max(float(min_conf), 0.70):
+            return {'ok': True, 'reason': 'structure_break_strong',
+                    'confidence': conf, 'mode': mode}
+        return {'ok': False, 'reason': 'micro_break_not_strong',
+                'confidence': conf, 'preferred': pref, 'mode': mode}
     return {'ok': False, 'reason': 'ohlc_not_strong', 'confidence': conf, 'preferred': pref}
 
 

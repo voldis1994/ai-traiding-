@@ -3020,8 +3020,12 @@ class SingleTradeEngine:
         candles=[]
         if epic:
             try:
-                # 80 M1 so swing BOS/CHoCH memory has enough pivots (not 40).
-                candles=self.store.candles(epic,n=80,historical_only=False) or []
+                # Same completed-M1 window as zone/MTF/SL — never forming QUOTE.
+                candles=self._decision_candles(epic) or []
+                if len(candles)<40:
+                    # Pad history for swing memory, still drop forming minute.
+                    raw=self.store.candles(epic,n=80,historical_only=False) or []
+                    candles=ohlc_entry_zones.drop_forming_minute(raw) or candles
             except Exception:
                 candles=[]
         last=self.store.get('last_trade_outcome') if self.store else None

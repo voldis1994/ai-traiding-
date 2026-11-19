@@ -94,8 +94,8 @@ def test_admin_ohlc_page_route_exists():
         assert b'liveBadge' in body
         assert b'chartWrap' in body
         assert b'btnFullscreen' in body
-        assert b'ohlc-page.js?v=3' in body
-        assert b'ohlc-chart.js?v=3' in body
+        assert b'ohlc-page.js?v=5' in body
+        assert b'ohlc-chart.js?v=5' in body
 
 
 def test_structure_view_never_invents_gold_without_epic():

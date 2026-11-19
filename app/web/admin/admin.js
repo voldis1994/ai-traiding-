@@ -5,8 +5,8 @@ let lastOverview=null;
 let chartRange='1W';
 let overviewInFlight=null;
 let lastSyncAt=null;
-const POLL_IDLE_MS=5000;
-const POLL_LIVE_MS=2000;
+const POLL_IDLE_MS=8000;
+const POLL_LIVE_MS=4000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();
@@ -922,15 +922,35 @@ async function loadOverview(){
     room.dataset.dense=n>=4?'1':'0';
     room.style.setProperty('--cols',String(layoutCols(n)));
     const pick=$('brokerClient');const prev=pick.value;pick.innerHTML='';
-    const frag=document.createDocumentFragment();
+    // In-place card sync — never wipe the whole control room (that flashed UI).
+    const keep=new Map();
+    [...room.children].forEach(el=>{
+      if(el&&el.dataset&&el.dataset.cid)keep.set(String(el.dataset.cid),el);
+    });
+    const seen=new Set();
     clients.forEach(c=>{
-      const card=renderCard(c);
-      card.dataset.cid=String(c.id);
-      frag.appendChild(card);
+      const id=String(c.id);
+      seen.add(id);
+      const next=renderCard(c);
+      next.dataset.cid=id;
+      const old=keep.get(id);
+      if(old){
+        // Preserve wired OHLC panel (canvas + view) so mini-chart does not reload.
+        const oldPanel=old.querySelector('.ohlc-panel');
+        const newPanel=next.querySelector('.ohlc-panel');
+        if(oldPanel&&newPanel){
+          newPanel.replaceWith(oldPanel);
+          queueMicrotask(()=>refreshOhlcPanel(next,c.id).catch(()=>{}));
+        }
+        old.replaceWith(next);
+        keep.delete(id);
+      }else{
+        room.appendChild(next);
+      }
       const opt=document.createElement('option');opt.value=c.id;
       opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);
     });
-    room.replaceChildren(frag);
+    keep.forEach((el,id)=>{if(!seen.has(id))el.remove();});
     if(prev)pick.value=prev;
     schedulePoll(desiredPollMs(data));
   })();

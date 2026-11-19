@@ -815,3 +815,83 @@ def load(store) -> dict | None:
 def min_history_bars(store=None) -> int:
     """Floor for LIVE OHLC fetch so M30/M60 indicators can warm up."""
     return max(61, int(_cfg(store)['min_m1_bars']))
+
+
+def chart_overlays(candles, *, store=None, epic: str | None = None,
+                   display_n: int = 180, spread: float = 0.0) -> dict:
+    """Compact KAMA/EMA/ADX/ATR overlay for Admin OHLC — same stack as LIVE.
+
+    Series are aligned to the last ``display_n`` M1 candles (one value per bar).
+    Scalars come from ``analyze`` when history is warm enough.
+    """
+    rows = _ohlc_tuples_to_dicts(candles) if candles else []
+    n = max(20, min(int(display_n or 180), 240))
+    out = {
+        'ok': False, 'reason': 'no_candles', 'n': 0,
+        'kama': [], 'ema5': [], 'ema13': [],
+        'kama_level': None, 'ema5_level': None, 'ema13_level': None,
+        'atr14': None, 'adx': None, 'di_plus': None, 'di_minus': None,
+        'mode': None, 'preferred': None, 'confidence': None, 'mtf_reason': None,
+        'stop_hint_atr14': None, 'stack': 'kama_adx_atr_pressure',
+    }
+    if len(rows) < 20:
+        return out
+    cfg = _cfg(store)
+    closes = [float(b['close']) for b in rows]
+    kama = kama_series(closes, cfg['kama_er'], cfg['kama_fast'], cfg['kama_slow'])
+    e5 = ema_series(closes, 5)
+    e13 = ema_series(closes, 13)
+    slice_n = min(n, len(rows))
+    out['kama'] = [round(float(v), 6) for v in kama[-slice_n:]]
+    out['ema5'] = [round(float(v), 6) for v in e5[-slice_n:]]
+    out['ema13'] = [round(float(v), 6) for v in e13[-slice_n:]]
+    out['n'] = slice_n
+    out['kama_level'] = out['kama'][-1] if out['kama'] else None
+    out['ema5_level'] = out['ema5'][-1] if out['ema5'] else None
+    out['ema13_level'] = out['ema13'][-1] if out['ema13'] else None
+    out['ok'] = True
+    out['reason'] = 'series_only'
+    analysis = analyze(rows, spread=spread, store=store, epic=epic)
+    if isinstance(analysis, dict) and analysis.get('ready'):
+        tf = analysis.get('tf') or {}
+        m5 = tf.get('m5') or {}
+        m15 = tf.get('m15') or {}
+        out['atr14'] = _finite(m5.get('atr14')) or _finite(analysis.get('stop_hint_atr14'))
+        out['adx'] = _finite(m15.get('adx')) or _finite(m5.get('adx'))
+        out['di_plus'] = _finite(m15.get('di_plus')) or _finite(m5.get('di_plus'))
+        out['di_minus'] = _finite(m15.get('di_minus')) or _finite(m5.get('di_minus'))
+        out['mode'] = analysis.get('mode')
+        out['preferred'] = analysis.get('preferred')
+        out['confidence'] = analysis.get('confidence')
+        out['mtf_reason'] = analysis.get('reason')
+        out['stop_hint_atr14'] = analysis.get('stop_hint_atr14')
+        out['reason'] = 'mtf_ready'
+        out['analysis'] = {
+            'ready': True,
+            'mode': analysis.get('mode'),
+            'preferred': analysis.get('preferred'),
+            'confidence': analysis.get('confidence'),
+            'reason': analysis.get('reason'),
+            'move_ok': analysis.get('move_ok'),
+            'enabled': analysis.get('enabled'),
+            'stop_hint_atr14': analysis.get('stop_hint_atr14'),
+            'tf': {
+                'm1': {'kama': (tf.get('m1') or {}).get('kama')},
+                'm5': {
+                    'kama': m5.get('kama'), 'atr14': m5.get('atr14'),
+                    'adx': m5.get('adx'), 'di_plus': m5.get('di_plus'),
+                    'di_minus': m5.get('di_minus'),
+                },
+                'm15': {
+                    'adx': m15.get('adx'), 'di_plus': m15.get('di_plus'),
+                    'di_minus': m15.get('di_minus'),
+                    'strong': m15.get('strong'),
+                },
+            },
+        }
+    else:
+        out['analysis'] = analysis if isinstance(analysis, dict) else {
+            'ready': False, 'reason': 'analyze_failed'}
+        if isinstance(analysis, dict):
+            out['mtf_reason'] = analysis.get('reason')
+    return out

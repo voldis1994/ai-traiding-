@@ -76,3 +76,35 @@ def test_no_candles_blocks_open():
     gate = oez.entry_allows_open('BUY', candles=[], mid=100., ask=100.1, bid=99.9)
     assert gate['allowed'] is False
     assert 'wait_entry_zone' in gate['reason']
+
+
+def test_atr_widens_band_when_mtf_ready():
+    rows = _swing_candles()
+    base = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.7, 'move_ok': True, 'stop_hint_atr14': 5.0,
+        'tf': {'m5': {'kama': None, 'atr14': 5.0}},
+    }
+    rich = oez.compute_entry_zones(rows, tick=0.1, spread=0.2, mtf=mtf)
+    assert rich['atr14'] == 5.0
+    assert rich['info_stack'] == 'ohlc_swing+kama_adx_atr'
+    assert rich['band'] >= base['band']
+
+
+def test_mtf_conflict_blocks_open_even_in_zone():
+    rows = _swing_candles()
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    inside = (float(buy['lo']) + float(buy['hi'])) / 2
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'SELL', 'preferred': 'SELL',
+        'confidence': 0.8, 'move_ok': True, 'reason': 'kama_down_confirmed_edge_covers_costs',
+        'stop_hint_atr14': 1.0,
+        'tf': {'m5': {'kama': inside, 'atr14': 1.0}},
+    }
+    gate = oez.entry_allows_open(
+        'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
+        tick=0.1, spread=0.2, mtf=mtf)
+    assert gate['allowed'] is False
+    assert 'mtf' in (gate['reason'] or '')

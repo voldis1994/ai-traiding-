@@ -141,12 +141,15 @@ def test_require_swing_still_on_decide_path():
         zone = bracket_learn.zone_at_open(rows, multi_tf=True)
         decided = bracket_learn.decide_brackets_from_ohlc(
             zone, tick=0.1, spread=0.2, min_distance=0.5,
-            entry=entry, action='BUY', candles=rows, require_swing=True)
+            entry=entry, action='BUY', candles=rows, atr=1.0,
+            kama=entry - 2.0, require_swing=True)
         # Either ready with swing source, or blocked waiting swings — never invent.
         if decided.get('ready'):
             src = str(decided.get('source') or '')
             assert 'swing' in src or 'bos' in src or 'ohlc' in src
             assert decided.get('stop_distance') is not None
+            swing = decided.get('swing') or {}
+            assert swing.get('atr_used') == 1.0 or decided.get('stop_distance')
         else:
             reason = str(decided.get('reason') or decided.get('swing_reason') or '')
             assert reason  # explicit unready, not silent invent

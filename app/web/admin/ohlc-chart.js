@@ -5,6 +5,8 @@
  */
 
 function _ohlcFinite(v){
+  // Number(null)===0 — must not paint ADX 0 / ATR 0.00 when MTF is not ready.
+  if(v==null||v==='')return null;
   const n=Number(v);
   return Number.isFinite(n)?n:null;
 }
@@ -291,8 +293,11 @@ function drawOhlcStructure(canvas,view,opts){
     parts.push(`${candles.length} M1`);
   }
   if(mtf.mode||ov.mode)parts.push(`MTF ${mtf.mode||ov.mode}`);
-  if(_ohlcFinite(mtf.adx||ov.adx)!=null)parts.push(`ADX ${Number(mtf.adx||ov.adx).toFixed(0)}`);
-  if(_ohlcFinite(mtf.atr14||ov.atr14)!=null)parts.push(`ATR ${Number(mtf.atr14||ov.atr14).toFixed(2)}`);
+  // Use ?? so a real ADX/ATR of 0 is distinct from missing (null).
+  const adx=_ohlcFinite(mtf.adx??ov.adx);
+  const atr=_ohlcFinite(mtf.atr14??ov.atr14);
+  if(adx!=null)parts.push(`ADX ${adx.toFixed(0)}`);
+  if(atr!=null)parts.push(`ATR ${atr.toFixed(2)}`);
   if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');
   if(view.info_stack)parts.push(String(view.info_stack));
   if(parts.length){

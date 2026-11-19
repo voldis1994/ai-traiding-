@@ -1282,7 +1282,8 @@ class RuntimeHub:
             owns_connect=broker is None
             if owns_connect:
                 broker=create_broker(creds['broker_type'],creds['api_key'],creds['identifier'],
-                                     creds['password'],live=True)
+                                     creds['password'],live=True,
+                                     base_url=creds.get('base_url') or None)
                 try:
                     await broker.connect()
                     accounts=await broker.accounts()

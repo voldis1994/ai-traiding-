@@ -111,13 +111,18 @@ def test_broker_registry_capital_and_slot():
     ids={b['id'] for b in list_brokers()}
     assert 'capital_com' in ids
     assert 'generic_rest' in ids
+    assert 'ig_markets' in ids
     broker=create_broker('capital_com','a','b','c')
     assert broker.__class__.__name__=='CapitalBroker'
+    # generic_rest without base URL still fails clearly
     try:
         create_broker('generic_rest','a','b','c')
-        assert False, 'slot must raise'
+        assert False, 'generic_rest without base_url must raise'
     except ValueError as exc:
-        assert 'slot' in str(exc).lower() or 'adapter' in str(exc).lower()
+        assert 'base url' in str(exc).lower()
+    other=create_broker('generic_rest','a','b','c',
+                        base_url='https://api-capital.backend-capital.com')
+    assert other.__class__.__name__=='CapitalBroker'
 
 
 def test_admin_and_client_portals(monkeypatch,tmp_path):

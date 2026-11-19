@@ -19,14 +19,18 @@ AGGRESSION_MIN = 0.70
 AGGRESSION_MAX = 1.15
 
 # LIVE entry edge in score_edge units (shared with policy MIN_EDGE).
-# Default seed 0.06; the machine may recalibrate from holdout history + spread
-# inside soft rails. Only whole hundredths: 0.06 → 0.07 (never 0.065 / 0.086).
-# £ settle / ΔW do NOT move this gate.
+# Seed 0.06 only until outcomes exist. Floor then moves from:
+#   1) closed broker £ (observe_close) — market P&L teacher
+#   2) holdout/spread calibration — relative to the *learned* floor
+# Soft rails + 0.01 steps keep the gate interpretable (never 0.065).
+# settle() aggression still does NOT bump the floor from streak alone.
 ENTRY_EDGE_DEFAULT = 0.06
 ENTRY_EDGE_MIN = 0.03
 ENTRY_EDGE_MAX = 0.12
 ENTRY_EDGE_STEP = 0.01
+ENTRY_EDGE_PNL_STEP = 0.01
 CALIB_META_KEY = 'entry_edge_calibration_v1'
+EDGE_OUTCOME_HIST_KEY = 'unified_cycle_v1:edge_hist'
 
 
 def _finite(v):
@@ -183,10 +187,10 @@ def perceive_decision(scores, evaluation=None) -> dict:
 
 
 def min_open_margin(state: dict = None) -> float:
-    """LIVE entry floor — calibrated value in state, else default 0.06.
+    """LIVE entry floor — learned/calibrated value in state, else seed 0.06.
 
-    Always a whole 0.01 step. Does not ratchet with £/ΔW — only via
-    ``set_calibrated_floor`` (holdout + spread) inside soft rails.
+    Always a whole 0.01 step. Streak alone does not raise it; market £ via
+    ``observe_close`` and holdout/spread via ``set_calibrated_floor`` do.
     """
     state = state or default_state()
     return quantize_entry_edge(
@@ -198,7 +202,7 @@ _min_open_margin = min_open_margin
 
 
 def set_calibrated_floor(store, value, *, method='holdout', detail=None) -> dict:
-    """Persist holdout/spread-calibrated edge — never from last £ win/loss.
+    """Persist entry floor (holdout/spread or £ observe_close) inside soft rails.
 
     Value is snapped to ENTRY_EDGE_STEP (0.01): 0.06, 0.07, … not 0.065.
     """
@@ -224,11 +228,63 @@ def calibration_meta(store) -> dict:
 
 
 def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
-    """Neural ΔW updates scores; does not move the entry floor.
-
-    Floor changes only through holdout calibration (``set_calibrated_floor``).
-    """
+    """Neural ΔW updates scores; floor moves only via observe_close / calibrate."""
     return load_state(store)
+
+
+def observe_close(store, *, broker_pnl=None, spread=0.0, entry_meta=None):
+    """Adapt entry_edge_floor from closed broker £ (market teacher).
+
+    Loss after costs → raise floor (more selective). Win after costs → ease
+    floor (less selective). Soft rails + 0.01 steps. Scratch pennies ignored.
+    Optional entry_meta.score_edge biases step size when the open was weak.
+    """
+    pnl = _finite(broker_pnl)
+    if pnl is None:
+        return {'adapted': False, 'reason': 'no_pnl'}
+    cost = abs(_finite(spread) or 0.0)
+    useful = pnl > max(0.02, 0.25 * cost)
+    hurt = pnl < -max(0.02, 0.25 * cost)
+    if not useful and not hurt:
+        return {'adapted': False, 'reason': 'scratch_band'}
+    state = load_state(store)
+    before = quantize_entry_edge(
+        state.get('entry_edge_floor') or ENTRY_EDGE_DEFAULT)
+    meta = entry_meta if isinstance(entry_meta, dict) else {}
+    edge_at_open = _finite(meta.get('score_edge'))
+    # One hundredth per settled outcome; weak losing opens still count fully.
+    step = float(ENTRY_EDGE_PNL_STEP)
+    if hurt:
+        after = quantize_entry_edge(before + step)
+        note = 'raise_floor_after_loss'
+    else:
+        after = quantize_entry_edge(before - step)
+        note = 'ease_floor_after_win'
+    if after == before:
+        return {
+            'adapted': False, 'reason': 'at_rail', 'floor': before,
+            'notes': [note],
+        }
+    set_calibrated_floor(
+        store, after, method='broker_pnl_observe',
+        detail={
+            'pnl': pnl, 'spread': cost, 'before': before, 'after': after,
+            'score_edge': edge_at_open, 'note': note,
+        })
+    hist = list((store.get(EDGE_OUTCOME_HIST_KEY) or [])) if store is not None else []
+    hist.append({
+        'pnl': pnl, 'useful': useful, 'hurt': hurt, 'before': before,
+        'after': after, 'score_edge': edge_at_open, 'note': note,
+    })
+    if store is not None:
+        store.set(EDGE_OUTCOME_HIST_KEY, hist[-40:])
+        store.event('unified_cycle', 'Adapted entry_edge_floor from broker £', {
+            'note': note, 'before': before, 'after': after, 'pnl': pnl,
+        })
+    return {
+        'adapted': True, 'notes': [note], 'before': before, 'after': after,
+        'floor': after,
+    }
 
 
 def edge_allows_open(scores, evaluation=None, cycle_state=None) -> dict:
@@ -335,10 +391,11 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
 
 
 def settle(store, *, pnl, action=None, exit_reason=None, scratch_band=None) -> dict:
-    """Fold broker £ into aggression / streaks for exit width — not entry floor.
+    """Fold broker £ into aggression / streaks for exit width.
 
-    Calibrated entry_edge_floor is preserved (clipped to rails). Aggression
-    still shapes κ/sl on the next OPEN so exits improve from £ feedback.
+    Entry floor is *not* moved here (streak alone must not raise MIN_EDGE).
+    Market £ teaches the floor via ``observe_close`` on the same close path.
+    Aggression still shapes κ/sl on the next OPEN so exits improve from £.
 
     Scratch pennies (|£| ≤ scratch_band) must NOT bump loss_streak or tighten
     brackets like a real loss — that cascade manufactured more £≈0 scratches.

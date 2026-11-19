@@ -107,6 +107,21 @@ def test_rails_clip_extreme_calibration():
         assert high['floor'] == pytest.approx(uc.ENTRY_EDGE_MAX)
 
 
+def test_calibrate_uses_learned_floor_not_frozen_seed():
+    """After £ losses raise the floor, empty-history calibrate must not reset to 0.06."""
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        policy = _policy(store, d)
+        for _ in range(3):
+            uc.observe_close(store, broker_pnl=-1.5, spread=0.05)
+        learned = uc.entry_edge_floor(store)
+        assert learned > 0.06
+        floor, detail = policy.calibrate_live_entry_floor(
+            'BUY', history=[], spread_bps=0.0, accuracy=None, samples=0)
+        assert floor == pytest.approx(learned)
+        assert detail['persisted']['detail'].get('learned_base') == pytest.approx(learned)
+
+
 def test_entry_edge_only_whole_hundredths():
     """0.06 → next 0.07; never 0.065 / 0.086."""
     assert uc.quantize_entry_edge(0.06) == pytest.approx(0.06)

@@ -21,6 +21,8 @@ MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 # Peak-to-trough structure may inform SL, but never dominate after a win streak
 # blew the lookback window (live: 3 wins → fantasy SL/TP from full swing).
 STRUCTURE_VS_MEDIAN_CAP=2.0
+# Live Gold bug: SL 2pts while ATR≈4.65 — floor stop to a real volatility width.
+ATR_STOP_FLOOR_FRAC=0.50
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
 MIN_BATCH_SAMPLES=6
 # Exit reasons the adaptation layer understands.
@@ -837,7 +839,14 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
     if atr_v is not None and atr_v > 0:
         buffer = max(buffer, 0.15 * atr_v)
         out['atr_used'] = float(atr_v)
+    # Minimum protective distance: broker min + buffer, OR half ATR —
+    # never place a hairline SL that ATR noise will stop out immediately.
     floor = mn + buffer if (mn + buffer) > 0 else tick_f
+    if atr_v is not None and atr_v > 0:
+        atr_floor = float(ATR_STOP_FLOOR_FRAC) * float(atr_v)
+        if atr_floor > floor:
+            floor = atr_floor
+        out['atr_floor'] = float(atr_floor)
     kama_v = _finite(kama)
 
     path = structure_memory.normalise(candles, limit=80)
@@ -877,8 +886,9 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     swing_hi=picked.get('swing_hi'), swing_lo=picked.get('swing_lo'))
 
     # Prefer a closer protective swing when one exists inside the multi-TF
-    # soft cap — but NEVER rewrite to entry ± median, and NEVER refuse a real
-    # structural swing just because it is wider than the zone median.
+    # soft cap — but NEVER rewrite to entry ± median, NEVER go below ATR floor,
+    # and NEVER refuse a real structural swing just because it is wider than
+    # the zone median.
     z = zone if isinstance(zone, dict) else {}
     zone_sl = _finite(z.get('range_distance')) or _finite(z.get('noise_distance'))
     if zone_sl is not None and zone_sl > 0 and stop_d > STRUCTURE_VS_MEDIAN_CAP * float(zone_sl):
@@ -886,7 +896,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
             cands = [s for s in lows
                      if float(s['price']) <= entry_f - floor
                      and (entry_f - (float(s['price']) - buffer))
-                     <= STRUCTURE_VS_MEDIAN_CAP * float(zone_sl) + 1e-9]
+                     <= STRUCTURE_VS_MEDIAN_CAP * float(zone_sl) + 1e-9
+                     and (entry_f - (float(s['price']) - buffer)) + 1e-9 >= floor]
             if cands:
                 closer = max(cands, key=lambda s: float(s['price']))
                 stop_level = float(closer['price']) - buffer
@@ -897,7 +908,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
             cands = [s for s in highs
                      if float(s['price']) >= entry_f + floor
                      and ((float(s['price']) + buffer) - entry_f)
-                     <= STRUCTURE_VS_MEDIAN_CAP * float(zone_sl) + 1e-9]
+                     <= STRUCTURE_VS_MEDIAN_CAP * float(zone_sl) + 1e-9
+                     and ((float(s['price']) + buffer) - entry_f) + 1e-9 >= floor]
             if cands:
                 closer = min(cands, key=lambda s: float(s['price']))
                 stop_level = float(closer['price']) + buffer

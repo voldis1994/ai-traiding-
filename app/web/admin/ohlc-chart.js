@@ -71,15 +71,21 @@ function drawOhlcStructure(canvas,view,opts){
     low=Math.min(low,v);high=Math.max(high,v);
   };
   const zones=view.zones||{};
-  for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
-    if(!z)continue;
-    expand(z.lo);expand(z.hi);
-  }
   const br=view.swing_brackets||{};
-  for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
-    expand(br[k]);
+  const openEarly=(view.open_levels||[]).filter(p=>p&&(p.entry||p.stop||p.profit));
+  const scaledInTrade=openEarly.length>0;
+  // In a live trade, scale to candles + position levels only — prospective
+  // swing/zone lines were collapsing GOLD into a hairline mess.
+  if(!scaledInTrade){
+    for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
+      if(!z)continue;
+      expand(z.lo);expand(z.hi);
+    }
+    for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
+      expand(br[k]);
+    }
   }
-  for(const p of (view.open_levels||[])){
+  for(const p of openEarly){
     expand(p.entry);expand(p.stop);expand(p.profit);
   }
   const ov=view.overlays||{};
@@ -144,11 +150,19 @@ function drawOhlcStructure(canvas,view,opts){
     }
   };
 
-  band(zones.resistance,'rgba(255,92,122,.12)','rgba(255,92,122,.45)');
-  band(zones.support,'rgba(57,255,136,.10)','rgba(57,255,136,.4)');
+  // Live position = truth. Hide prospective S/R + zones so entry/SL/TP
+  // are not buried under overlapping swing/zone spaghetti.
+  const openLv=(view.open_levels||[]).filter(p=>p&&(p.entry||p.stop||p.profit));
+  const inTrade=openLv.length>0;
+  if(!inTrade){
+    band(zones.resistance,'rgba(255,92,122,.12)','rgba(255,92,122,.45)');
+    band(zones.support,'rgba(57,255,136,.10)','rgba(57,255,136,.4)');
+  }
   const pref=view.preferred;
-  if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.28)',null);
-  if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.26)',null);
+  if(!inTrade){
+    if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.28)',null);
+    if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.26)',null);
+  }
 
   if(atr!=null&&atr>0&&mid!=null&&_ohlcNearTape(mid,anchor,candleSpan)!=null){
     ctx.fillStyle='rgba(120,160,200,.08)';
@@ -218,17 +232,18 @@ function drawOhlcStructure(canvas,view,opts){
     if(showLabels&&label)labels.push({y:yy,color,label,price:p});
   };
 
-  if(br&&br.ready){
+  // Prospective swing brackets only when flat — never stack on live poz. levels.
+  if(!inTrade&&br&&br.ready){
     hline(br.stop_level,'#ff5c7a',[5,4],'swing SL');
     hline(br.profit_level,'#39ff88',[5,4],'swing TP');
   }
   hline(mid,'#f0c14b',[],'mid');
-  for(const p of (view.open_levels||[])){
+  for(const p of openLv){
     hline(p.entry,'#eef6f1',[],'entry');
     hline(p.stop,'#ff5c7a',[5,3],'poz. SL');
     hline(p.profit,'#39ff88',[5,3],'poz. TP');
   }
-  if(showLabels){
+  if(showLabels&&!inTrade){
     if(zones.buy_entry&&(!pref||pref==='BUY')){
       const z=zones.buy_entry;
       const a=_ohlcNearTape(z.lo,anchor,candleSpan);

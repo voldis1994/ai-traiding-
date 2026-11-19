@@ -809,7 +809,8 @@ class RuntimeHub:
         mtf=(overlays.get('analysis') if isinstance(overlays,dict) else None)
         # Same OHLC+MTF entry geometry LIVE waits for before OPEN.
         ez=ohlc_entry_zones.compute_entry_zones(
-            candles_full or candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
+            candles_full or candles,mid=mid,tick=tick,spread=spread,mtf=mtf,
+            store=store)
         live=structure_memory.snapshot_live(
             candles=candles_chart or candles_full or candles,mid=mid) if (
                 candles_chart or candles_full or candles) else {}

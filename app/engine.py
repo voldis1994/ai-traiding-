@@ -4886,11 +4886,12 @@ class SingleTradeEngine:
             path_mfe=struct_ctx.get('path_mfe'),
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
-        # Neural teach from broker £ OR last live UPL — operator: no more
-        # stuck pending/[UPL] without ΔW. Day-book bank stays broker-only.
+        # Neural teach + day-book from broker £ OR last live UPL — operator:
+        # learn from what we have, no pending/[UPL] wait. Late Capital £ only
+        # refines the journal number (bank key already set → no double-count).
         teach_like=(pnl_source in ('broker','upl_estimate')
                     and pnl_value is not None)
-        bank_like=pnl_source=='broker' and pnl_value is not None
+        bank_like=teach_like
         cash_like=teach_like  # downstream teachers / evolve use teach_like
         entry_scores=saved.get('scores') if isinstance(saved.get('scores'),dict) else None
         if teach_like:
@@ -5052,8 +5053,7 @@ class SingleTradeEngine:
             'exit_level':exit_level,
             'structure_at_open':structure_at_open,
             'structure_at_close':structure_at_close})
-        # Joint system: cash/UPL peļņa teaches SL/TP shape; day-book bank is
-        # broker-£ only (avoids double-count when Capital history arrives later).
+        # Joint system: cash/UPL peļņa teaches SL/TP + banks day-book once.
         if teach_like:
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
             if bk is None or bs is None:
@@ -5064,7 +5064,6 @@ class SingleTradeEngine:
                 self.store,kappa=bk,sl_scale=bs,pnl=pnl_value,
                 currency=currency,deal_id=deal_id,**path_ctx)
             if bank_like:
-                # Audit #21 + day book + cycle: once-only bank on verified £.
                 self._bank_broker_cash_side_effects(
                     deal_id,pnl_value,currency=currency,action=direction,
                     exit_reason=path_ctx.get('exit_reason'),

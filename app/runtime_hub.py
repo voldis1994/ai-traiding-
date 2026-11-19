@@ -379,19 +379,35 @@ class RuntimeHub:
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='pending':
-                pending_n+=1
-                if val is None:blank_n+=1
-                # Last live UPL as display hint only — not cash £ (#125).
+                # Last live UPL as display hint — promote into peļņa when the
+                # journal already has a numeric pnl (UPL stamped then source
+                # clobbered) or when last_upl still holds the close figure.
                 snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
                 try:
                     hint=float(snap.get('upl')) if snap.get('upl') is not None else None
                 except (TypeError,ValueError):
                     hint=None
-                if hint is not None and __import__('math').isfinite(hint):
-                    row['upl_hint']=round(hint,4)
-                row['pending_cash']=True
-                if len(recent)<12:
-                    recent.append(row)
+                if hint is not None and not __import__('math').isfinite(hint):
+                    hint=None
+                show=val if val is not None else hint
+                if show is not None:
+                    # Operator: closed at 0.01 must show 0.01, not blank gaida.
+                    cash_n+=1
+                    by_ccy.setdefault(ccy,[]).append(float(show))
+                    if not acct or ccy==acct:
+                        signed.append(float(show))
+                    row={**row,'pnl':round(float(show),4),'pnl_source':'upl_estimate',
+                         'pending_cash':False}
+                    if hint is not None:
+                        row['upl_hint']=round(hint,4)
+                    if len(recent)<12:
+                        recent.append(row)
+                else:
+                    pending_n+=1
+                    blank_n+=1
+                    row['pending_cash']=True
+                    if len(recent)<12:
+                        recent.append(row)
             elif kind=='estimate' and val is not None:
                 estimate_n+=1
                 estimate_sum+=float(val)

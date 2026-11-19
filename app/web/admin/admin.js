@@ -633,14 +633,17 @@ function renderCard(c){
   const mandateSize=(a.mandate&&a.mandate.size)||'—';
   const sb=scoreboard(r);
   const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
-    const p=t.pnl;const cls=pnlClass(p);
+    const p=t.pnl;
     const tCcy=t.pnl_currency||ccy;
     const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
-    const src=pending?' [gaida £]':(t.pnl_source==='upl_estimate'?' [UPL]':
-      (t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:''));
+    const showPnl=p!=null?p:(pending&&t.upl_hint!=null?t.upl_hint:null);
+    const cls=pnlClass(showPnl);
+    // Prefer showing the £ figure (UPL provisional) over a blank "gaida" label.
+    const src=(showPnl!=null&&(t.pnl_source==='upl_estimate'||pending))?' [UPL]':
+      (pending?' [gaida £]':(t.pnl_source==='upl_estimate'?' [UPL]':
+      (t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'')));
     let right;
-    if(p!=null){right=money(p,tCcy);}
-    else if(pending&&t.upl_hint!=null){right=`gaida · UPL ${money(t.upl_hint,tCcy)}`;}
+    if(showPnl!=null){right=money(showPnl,tCcy);}
     else if(pending){right='gaida Capital £';}
     else{right='—';}
     return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${esc(right)}</span></div>`;

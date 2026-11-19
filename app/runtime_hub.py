@@ -931,7 +931,7 @@ class RuntimeHub:
                 swing_brackets=bracket_learn.swing_anchor_brackets(
                     candles=candles_full or candles,entry=entry_px,action=preferred,
                     tick=tick,spread=spread,min_distance=0.,zone=zone,
-                    atr=atr_hint,kama=kama_hint)
+                    atr=atr_hint,kama=kama_hint,store=store)
             except Exception as exc:
                 swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]

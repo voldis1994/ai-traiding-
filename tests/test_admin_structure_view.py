@@ -110,17 +110,17 @@ def test_admin_markets_ohlc_empty_without_running_robots():
         assert out['markets'] == []
 
 
-def test_admin_shared_ohlc_ui_contract():
-    """Main Admin: shared OHLC board, 200ms refresh, no per-client chart."""
+def test_admin_per_client_ohlc_button_contract():
+    """Main Admin: no shared board / no card chart — OHLC opens via per-client button."""
     admin_js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     index = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    ohlc_page = Path('app/web/admin/ohlc-page.js').read_text(encoding='utf-8')
-    assert 'id="sharedOhlc"' in index
-    assert 'OHLC_REFRESH_MS=200' in admin_js
-    assert 'refreshSharedOhlc' in admin_js
-    assert 'admin/markets-ohlc' in admin_js
+    assert 'id="sharedOhlc"' not in index
+    assert 'refreshSharedOhlc' not in admin_js
+    assert 'admin/markets-ohlc' not in admin_js
     assert 'data-ohlc-client' not in admin_js
-    assert 'setInterval(tick,200)' in ohlc_page
+    assert 'data-act="ohlc"' in admin_js
+    assert 'openClientOhlcWindow' in admin_js
+    assert 'OHLC' in admin_js
 
 
 def test_structure_view_never_invents_gold_without_epic():

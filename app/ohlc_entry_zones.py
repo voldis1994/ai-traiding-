@@ -1,9 +1,11 @@
-"""OHLC structural entry zones — shared by Admin chart and LIVE OPEN.
+"""OHLC structural entry — unified intent + trigger for Admin chart and LIVE OPEN.
 
-BUY waits in the discount band above swing/BOS low; SELL waits in the premium
-band below swing/BOS high. Band width uses ATR when MTF is ready; KAMA can
-tighten the wait band when it sits inside the swing range. MTF conflict
-(ADX/KAMA opposite / weak ADX / spread block) holds OPEN. Never invent mid ± κ.
+Intent comes from neural + MTF. Trigger is either:
+  • zone  — pullback into discount (BUY) / premium (SELL) band, or
+  • break — structure / range break in the neural side (do not wait for pullback).
+
+Bands still drive SL/TP geometry. MTF hard conflict (weak ADX / strong opposite)
+holds OPEN. Never invent mid ± κ.
 """
 from __future__ import annotations
 
@@ -177,9 +179,83 @@ def drop_forming_minute(candles, *, now_utc=None):
     return completed_candles(candles, now_utc=now_utc)
 
 
+def _structure_break_side(mtf,zones):
+    """UP/DOWN break from MTF stack or swing event on the zone card."""
+    if isinstance(mtf,dict) and mtf.get('ready'):
+        br=mtf.get('structure_break')
+        if br in ('UP','DOWN'):
+            return br
+        m1=((mtf.get('tf') or {}).get('m1') or {})
+        br=m1.get('structure_break')
+        if br in ('UP','DOWN'):
+            return br
+        event=str(mtf.get('bos_event') or '').upper()
+        if 'UP' in event:
+            return 'UP'
+        if 'DOWN' in event:
+            return 'DOWN'
+    if isinstance(zones,dict):
+        # Only confirmed swing events — live bias alone is not a break trigger
+        # (would OPEN every climb above the discount band).
+        event=str(zones.get('event') or '').upper()
+        if event in ('BOS_UP','CHOCH_UP','BREAKOUT_UP'):
+            return 'UP'
+        if event in ('BOS_DOWN','CHOCH_DOWN','BREAKOUT_DOWN'):
+            return 'DOWN'
+    return None
+
+
+def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01):
+    """True when structure/range break aligns with neural side — skip pullback wait.
+
+    Unified path: intent (BUY/SELL) + break trigger → OPEN without sitting in
+    the discount/premium band. Zones remain for SL/TP geometry.
+    """
+    action=(action or '').upper()
+    out={'ok':False,'reason':'no_break','side':None,'trigger':'break'}
+    if action not in ('BUY','SELL'):
+        out['reason']='bad_action'
+        return out
+    p=_finite(price)
+    if p is None:
+        out['reason']='no_price'
+        return out
+    side=_structure_break_side(mtf,zones)
+    out['side']=side
+    want='UP' if action=='BUY' else 'DOWN'
+    if side==want:
+        out['ok']=True
+        out['reason']='ohlc_break_structure'
+        return out
+    # Range break only with MTF agreeing — price alone at high/low is not enough.
+    if isinstance(zones,dict) and isinstance(mtf,dict) and mtf.get('ready'):
+        hi=_finite(zones.get('range_hi'))
+        lo=_finite(zones.get('range_lo'))
+        try:
+            buf=max(float(tick or 0.01),0.)
+        except (TypeError,ValueError):
+            buf=0.01
+        pref=str(mtf.get('preferred') or '').upper()
+        mode=str(mtf.get('mode') or '').upper()
+        try:
+            conf=float(mtf.get('confidence') or 0)
+        except (TypeError,ValueError):
+            conf=0.
+        aligned=(pref==action) or (mode==action) or (mode=='SHIFT' and conf>=0.55)
+        if action=='BUY' and aligned and hi is not None and p>=(hi-buf):
+            out['ok']=True
+            out['reason']='ohlc_break_range_high'
+            return out
+        if action=='SELL' and aligned and lo is not None and p<=(lo+buf):
+            out['ok']=True
+            out['reason']='ohlc_break_range_low'
+            return out
+    return out
+
+
 def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
                       tick=0.01,spread=0.0,mtf=None):
-    """Gate LIVE OPEN: neural side only when price is in OHLC entry zone + MTF ok.
+    """Gate LIVE OPEN: zone touch OR structure/range break + MTF ok.
 
     BUY uses ask (or mid); SELL uses bid (or mid). Buffer = 1 tick.
     """
@@ -187,7 +263,7 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     meta={
         'allowed':False,'action':action,'reason':'bad_action',
         'zones':None,'price':None,'zone':None,'source':'ohlc_entry_zones',
-        'mtf_ok':None}
+        'mtf_ok':None,'trigger':None,'intent':action if action in ('BUY','SELL') else None}
     if action not in ('BUY','SELL'):
         return meta
     mtf_ok,mtf_reason=_mtf_allows_side(action,mtf)
@@ -205,9 +281,6 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         return meta
     zone=zones.get('buy_entry') if action=='BUY' else zones.get('sell_entry')
     meta['zone']=zone
-    if not zone:
-        meta['reason']=f'wait_entry_zone (no_{action.lower()}_band)'
-        return meta
     if action=='BUY':
         price=_finite(ask)
         if price is None:
@@ -219,6 +292,18 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     meta['price']=price
     if price is None:
         meta['reason']='wait_entry_zone (no_price)'
+        return meta
+    # --- Trigger A: break (catch the move — do not wait for pullback) ---
+    br=break_trigger_allows(
+        action,price=price,zones=zones,mtf=mtf,tick=tick)
+    meta['break']=br
+    if br.get('ok'):
+        meta['allowed']=True
+        meta['trigger']='break'
+        meta['reason']=br.get('reason') or 'ohlc_break_trigger'
+        return meta
+    if not zone:
+        meta['reason']=f'wait_entry_zone (no_{action.lower()}_band)'
         return meta
     try:
         buf=max(float(tick or 0.01),0.)
@@ -234,8 +319,10 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if pref==action and conf>=0.50:
         buf=max(buf,buf*3.0,float(tick or 0.01)*3)
         meta['wide_ohlc_touch']=True
+    # --- Trigger B: pullback zone (cheaper entry) ---
     if price_in_zone(zone,price,buffer=buf):
         meta['allowed']=True
+        meta['trigger']='zone'
         meta['reason']='ohlc_entry_zone_touch'
         return meta
     lo=_finite(zone['lo']);hi=_finite(zone['hi'])

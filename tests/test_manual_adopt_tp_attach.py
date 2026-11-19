@@ -7,6 +7,8 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.autonomy import AutoEvolution
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store, _broker_price_level
 from tests.test_tp_min_distance import _OpenCaptureBroker
@@ -99,6 +101,41 @@ def test_protect_ignores_foreign_unresolved_orders():
             assert store.get('robot_open:andris-lv')
             brief = engine.protection_brief or {}
             assert 'Manual adopt protected' in str(brief.get('status') or '')
+
+    asyncio.run(scenario())
+
+
+def test_manual_both_brackets_claims_trail_no_left_unchanged():
+    """Capital adopt with SL+TP already set must enroll trail — not 'left unchanged'."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(Path(d) / 's.db')
+            brain = AdaptiveBrain(store, data_dir=d)
+            engine = SingleTradeEngine(store, brain)
+            engine.policy = AutoEvolution(store, Path(d) / 'policy.py')
+            broker = _OpenCaptureBroker()
+            broker.price = 3710.0
+            broker.open = [{'position': {
+                'dealId': 'both-on', 'size': '.07', 'direction': 'SELL',
+                'level': 3712.0, 'stopLevel': 3716.0, 'profitLevel': 3705.0, 'upl': 0.02,
+            }, 'market': {'epic': 'GOLD'}}]
+            engine.attach(broker)
+            await engine.sync()
+            engine.market = {
+                'epic': 'GOLD', 'mid': 3710.0, 'bid': 3709.8, 'ask': 3710.2,
+                'spread': 0.4, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
+            }
+            pos = engine.positions[0]
+            assert engine._needs_protect_brackets(pos) is False
+            assert not store.get('robot_open:both-on')
+            await engine.adapt_protection(pos)
+            assert store.get('robot_open:both-on')
+            meta = store.get('adaptive_protection:both-on')
+            assert meta and meta.get('owner') == 'AUTO'
+            brief = str((engine.protection_brief or {}).get('status') or '')
+            # Must not stick on the old "left unchanged" theater — trail owns it.
+            assert 'left unchanged' not in brief.lower()
+            assert meta.get('original_risk') == pytest.approx(4.0)
 
     asyncio.run(scenario())
 

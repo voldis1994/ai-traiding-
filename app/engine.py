@@ -5368,6 +5368,33 @@ class SingleTradeEngine:
              'structure':meta.get('structure')})
         return True
 
+    def _claim_manual_for_trail(self,p):
+        """Adopt with both SL+TP already on broker — enroll trail without a PUT.
+
+        Historically ``_needs_protect_brackets`` returned False when Capital
+        already had stop+profit, so ``protect_position`` never ran, ``robot_open``
+        was never set, and every poll showed ``left unchanged`` (no OHLC trail).
+        """
+        deal=str(p.get('dealId') or '')
+        if not deal:
+            return False
+        if self.store.get('robot_open:'+deal):
+            return bool(self._enroll_adaptive_protection(p))
+        live_sl=_broker_price_level(p.get('stopLevel'))
+        live_tp=_broker_price_level(p.get('profitLevel'))
+        if live_sl is None or live_tp is None:
+            return False
+        self.store.set('robot_open:'+deal,True)
+        ok=self._enroll_adaptive_protection(p,force=True)
+        if ok:
+            self.protection_brief={
+                'status':'Manual adopt — keeping live SL/TP, OHLC trail enrolled',
+                'deal_id':deal}
+            self.store.event('protection',
+                'Manual position claimed for trail (SL/TP already on broker)',
+                {'deal_id':deal,'stop':live_sl,'profit':live_tp})
+        return ok
+
     async def adapt_protection(self,p):
         """Trail SL behind broker extreme — ROBOT only; continues past BE.
 
@@ -5379,6 +5406,9 @@ class SingleTradeEngine:
         # Late enroll if OPEN lacked TP / meta was never written.
         if self.store.get('robot_open:'+str(p.get('dealId'))):
             self._enroll_adaptive_protection(p)
+        else:
+            # Manual Capital adopt that already has both brackets.
+            self._claim_manual_for_trail(p)
         meta=self.store.get(key)
         if not meta or meta.get('owner')!='AUTO':
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
@@ -5604,7 +5634,10 @@ class SingleTradeEngine:
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
         if live_sl is not None and live_tp is not None:
-            self._mark_tp_attach_done(p.get('dealId'));return
+            self._mark_tp_attach_done(p.get('dealId'))
+            # Both already live — still claim trail ownership (no Capital PUT).
+            self._claim_manual_for_trail(p)
+            return
         deal_s=str(p.get('dealId'))
         # Same idea as adapt_protection REJECTED wait — failed/pending protect
         # must not re-PUT every 3s poll (Capital UI jerks SL/TP on one client).

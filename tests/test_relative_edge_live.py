@@ -94,8 +94,8 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
             brain.history.extend(rows)
             brain.labeled=80;brain.correct=60
             brain.mark_prep_ready('test fixture')
-            # In this integration test the *model* emits moderate scores.
-            sample={'BUY':.366,'SELL':.433,'HOLD':.201} if direction=='SELL' else {'BUY':.433,'SELL':.366,'HOLD':.201}
+            # Strong raw edge (≥ raw_strong 0.18) so reentry_confirm allows OPEN.
+            sample={'BUY':.25,'SELL':.55,'HOLD':.20} if direction=='SELL' else {'BUY':.55,'SELL':.25,'HOLD':.20}
             original_tick=brain.tick
             def controlled_tick(mid,spread,tick_size,epic,dt=1.,**kwargs):
                 result=original_tick(mid,spread,tick_size,epic,dt,**kwargs)
@@ -104,6 +104,13 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
                 result['confidence']=max(sample.values())
                 return result
             brain.tick=controlled_tick
+            # Swing OHLC so require_swing OPEN can place SL/TP; mid near last close.
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(s,'SIM',start_px=100.0)
+            mid=float(s.candles('SIM',n=1)[0]['close'])
+            e.market={**(e.market or {}),
+                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
+                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
             for _ in range(5):await e.poll()
             order=[r for r in broker.requests if r[0]=='OPEN']
             assert len(order)==1, (direction,e.snapshot()['entry_block_reason'])

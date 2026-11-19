@@ -8,7 +8,8 @@ from app.engine import Store
 from app.self_params import (DEFAULTS, STORE_KEY, PENDING_KEY, load, save, get,
                              evolve_from_feedback, maybe_commit_long_horizon,
                              snapshot, IMMUTABLE_NOTE, quantize_learn_lr,
-                             LEARN_LR_STEP)
+                             LEARN_LR_STEP, LEARN_LR_SOFT_MAX,
+                             migrate_soft_ceilings)
 from app.feature_discovery import FeatureDiscovery
 from app.feature_validation import validate_feature
 
@@ -19,11 +20,11 @@ def test_self_params_persist_and_robot_can_change():
         p=load(store)
         assert p['bars_between_search']==DEFAULTS['bars_between_search']
         p['bars_between_search']=12
-        p['learn_lr']=0.2
+        p['learn_lr']=0.11
         p['exit_need_streak']=3
         save(store,p,reason='unit test')
         assert get(store,'bars_between_search')==12
-        assert get(store,'learn_lr')==0.2
+        assert get(store,'learn_lr')==pytest.approx(0.11)
         assert get(store,'exit_need_streak')==3
         snap=snapshot(store)
         assert 'immutable' in snap and 'volume' in snap['immutable'].lower()
@@ -41,12 +42,15 @@ def test_evolve_from_feedback_moves_knobs():
 
 
 def test_learn_lr_only_two_decimal_places():
-    """learn_lr on 0.01 steps; default 0.10 with light win/loss repeats."""
+    """learn_lr on 0.01 steps; soft max clamps stale 0.28 Stores."""
     assert LEARN_LR_STEP == 0.01
+    assert LEARN_LR_SOFT_MAX == pytest.approx(0.12)
     assert DEFAULTS['learn_lr'] == pytest.approx(0.10)
     assert DEFAULTS['learn_win_repeats'] == 2
     assert DEFAULTS['learn_loss_repeats'] == 3
-    assert quantize_learn_lr(0.294) == pytest.approx(0.29)
+    # Soft ceiling: 0.28 / 0.29 from older builds must not survive load/save.
+    assert quantize_learn_lr(0.294) == pytest.approx(LEARN_LR_SOFT_MAX)
+    assert quantize_learn_lr(0.28) == pytest.approx(LEARN_LR_SOFT_MAX)
     assert quantize_learn_lr(0.123) == pytest.approx(0.12)
     assert quantize_learn_lr(0.104) == pytest.approx(0.10)
     assert quantize_learn_lr(0.10) == pytest.approx(0.10)
@@ -55,6 +59,18 @@ def test_learn_lr_only_two_decimal_places():
         store=Store(Path(d)/'db.sqlite3')
         save(store,{**DEFAULTS,'learn_lr':0.12345},reason='poison float')
         assert get(store,'learn_lr') == pytest.approx(0.12)
+        # Stale hot LR in Store is clamped on load.
+        store.set(STORE_KEY,{**DEFAULTS,'learn_lr':0.28,
+                             'learn_win_repeats':4,'learn_loss_repeats':5})
+        assert load(store)['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
+        # migrate_soft_ceilings persists the clamp so Store no longer holds 0.28.
+        migrated=migrate_soft_ceilings(store)
+        assert migrated is not None
+        raw=store.get(STORE_KEY)
+        assert raw['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
+        assert raw['learn_win_repeats'] <= 3
+        assert raw['learn_loss_repeats'] <= 3
+        assert migrate_soft_ceilings(store) is None  # idempotent
         # Meaningful loss calms LR by exactly one hundredth (no amplify-mistakes).
         before=get(store,'learn_lr')
         evolve_from_feedback(store,broker_pnl=-1.5)

@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 
 from app.forecast_memory import ForecastMemory, RESOLVED_OK, TABLE
-from app.learn_gate import decide_keep, gate_closed_trade_learn, score_cash_holdout
+from app.learn_gate import (
+    decide_keep, gate_closed_trade_learn, recent_cash_degradation,
+    score_cash_holdout, should_skip_teach)
 from app.self_params import DEFAULTS, load as load_sp
 from app.autonomy import AutoEvolution
 from app.engine import SingleTradeEngine
@@ -33,6 +35,100 @@ def test_decide_keep_cold_start_and_lift():
     after_worse={'ok':True,'n':20,'accuracy':0.39}
     assert decide_keep(before,after_better)['keep'] is True
     assert decide_keep(before,after_worse)['keep'] is False
+
+
+def test_recent_cash_degradation_after_good_then_bad():
+    """First window green, second window red → degrading (post-~10 fade)."""
+    good=[{'actual_pnl':2.0,'mode':'reinforce_win'} for _ in range(5)]
+    bad=[{'actual_pnl':-3.0,'mode':'loss_counterfactual_sell'} for _ in range(5)]
+    deg=recent_cash_degradation(None,history=good+bad,window=5,min_trades=10)
+    assert deg['ok'] is True
+    assert deg['degrading'] is True
+    assert deg['recent_net'] < deg['prior_net']
+    # Still-green soft landing must not freeze teach.
+    stable=recent_cash_degradation(
+        None,history=good+[{'actual_pnl':1.5,'mode':'reinforce_win'} for _ in range(5)],
+        window=5,min_trades=10)
+    assert stable['ok'] is True
+    assert stable['degrading'] is False
+    # Both windows losing but recent worse → degrading.
+    both_bad=[{'actual_pnl':-1.0} for _ in range(5)]+[{'actual_pnl':-3.0} for _ in range(5)]
+    assert recent_cash_degradation(
+        None,history=both_bad,window=5,min_trades=10)['degrading'] is True
+
+
+def test_decide_keep_refuses_thin_holdout_when_cash_degrading():
+    thin={'ok':False,'n':0,'accuracy':None}
+    deg={'ok':True,'degrading':True,'trade_count':12,'recent_net':-10,'prior_net':8}
+    cash={'ok':True,'n':4,'mean':-2.0,'net':-8.0,'trade_count':12}
+    out=decide_keep(thin,thin,cash=cash,degradation=deg)
+    assert out['keep'] is False
+    assert out['reason']=='thin_holdout_cash_degrading'
+
+
+def test_decide_keep_refuses_thin_holdout_after_warmup():
+    thin={'ok':False,'n':0,'accuracy':None}
+    cash={'ok':False,'n':3,'mean':None,'net':None,'trade_count':10}
+    out=decide_keep(thin,thin,cash=cash,
+                    degradation={'ok':False,'degrading':False,'trade_count':10})
+    assert out['keep'] is False
+    assert out['reason']=='thin_holdout_refuse_after_warmup'
+
+
+def test_decide_keep_demands_larger_lift_when_degrading():
+    before={'ok':True,'n':20,'accuracy':0.40}
+    after_tiny={'ok':True,'n':20,'accuracy':0.402}  # +0.002 = margin, not 3×
+    deg={'ok':True,'degrading':True,'trade_count':12}
+    out=decide_keep(before,after_tiny,degradation=deg)
+    assert out['keep'] is False
+    assert 'cash_degrading' in out['reason']
+    after_clear={'ok':True,'n':20,'accuracy':0.41}  # +0.01 ≥ 3×0.002
+    assert decide_keep(before,after_clear,degradation=deg)['keep'] is True
+
+
+def test_decide_keep_refuses_loss_in_red_cash_tiny_lift():
+    """Dump smoking gun: KEEP on −£0.47 with +0.0417 while cash OOS red."""
+    before={'ok':True,'n':24,'accuracy':0.29}
+    after={'ok':True,'n':24,'accuracy':0.333}  # +0.043 < 0.08
+    cash={'ok':True,'n':6,'mean':-0.15,'net':-0.9,'trade_count':12}
+    out=decide_keep(before,after,cash=cash,trade_pnl=-0.47)
+    assert out['keep'] is False
+    assert 'loss_in_red_cash' in out['reason']
+    after_clear={'ok':True,'n':24,'accuracy':0.38}  # +0.09 ≥ 0.08
+    assert decide_keep(before,after_clear,cash=cash,trade_pnl=-0.47)['keep'] is True
+    # Win in red cash still uses normal (slightly raised) margin, not 0.08 floor.
+    assert decide_keep(before,after,cash=cash,trade_pnl=0.40)['keep'] is True
+
+
+def test_should_skip_teach_when_degrading():
+    good=[{'actual_pnl':2.0} for _ in range(5)]
+    bad=[{'actual_pnl':-4.0} for _ in range(5)]
+    skip=should_skip_teach(None,history=good+bad)
+    assert skip['skip'] is True
+    assert skip['reason']=='cash_degrading_skip_teach'
+    ok=should_skip_teach(None,history=good+[{'actual_pnl':1.0} for _ in range(5)])
+    assert ok['skip'] is False
+
+
+def test_gate_skips_teach_when_cash_degrading():
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        brain.tick(100,.05,.01,'GOLD')
+        engine=SingleTradeEngine(store,brain)
+        engine.market={'epic':'GOLD','tick':.01,'spread':.05}
+        good=[{'actual_pnl':2.0,'mode':'reinforce_win'} for _ in range(5)]
+        bad=[{'actual_pnl':-3.0,'mode':'loss_counterfactual_sell'} for _ in range(5)]
+        engine.profit_learning.history=good+bad
+        before=brain.core.P.copy()
+        called={'n':0}
+        def learn():
+            called['n']+=1
+            return {'any_real_dw':True}
+        decision=gate_closed_trade_learn(engine,learn,epic='GOLD',deal_id='deg1')
+        assert decision.get('skipped') is True
+        assert decision['keep'] is False
+        assert called['n']==0
+        assert np.array_equal(before,brain.core.P)
 
 
 def test_score_cash_holdout_needs_min_trades():
@@ -185,17 +281,18 @@ def test_engine_rollback_skips_weight_update_event():
         # Monkeypatch gate to force rollback after a real ΔW.
         import app.learn_gate as lg
         real_gate=lg.gate_closed_trade_learn
-        def force_rollback(eng,learn_fn,*,epic=None,deal_id=None):
+        def force_rollback(eng,learn_fn,*,epic=None,deal_id=None,trade_pnl=None):
             pre=eng.brain._core_snapshot()
             result=learn_fn()
             if result.get('any_real_dw'):
                 eng.brain._apply_core_snapshot(pre)
                 out={'keep':False,'rolled_back':True,'reason':'forced_test_rollback',
                      'learn':result,'before':{'ok':True,'accuracy':0.5},
-                     'after':{'ok':True,'accuracy':0.1}}
+                     'after':{'ok':True,'accuracy':0.1},'trade_pnl':trade_pnl}
                 eng.store.set(lg.STORE_LAST,out)
                 return out
-            return {'keep':True,'rolled_back':False,'reason':'no_dw','learn':result}
+            return {'keep':True,'rolled_back':False,'reason':'no_dw','learn':result,
+                    'trade_pnl':trade_pnl}
         lg.gate_closed_trade_learn=force_rollback
         try:
             engine._learn_closed_trade('lg2',{'level':99.0,'profit':-12.5})

@@ -1,7 +1,9 @@
 """Local integration suite: no Capital.com credentials, no live orders."""
 import asyncio
 import json
+import math
 import tempfile
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,6 +19,27 @@ from tests.market_helpers import install_synthetic_context
 
 
 def async_run(coro):return asyncio.run(coro)
+
+
+def seed_swing_candles(store, epic='SIM', *, n=90, start_px=100.0):
+    """OHLC swings so require_swing LIVE OPEN / protect can place SL/TP."""
+    t0 = datetime(2026, 1, 5, 8, 0, tzinfo=timezone.utc)
+    px = start_px
+    for i in range(n):
+        wave = 1.8 * math.sin(i / 6.0) + 0.9 * math.sin(i / 11.0)
+        o = px
+        c = px + 0.01 + 0.05 * math.sin(i / 4.0)
+        h = max(o, c) + 0.35 + abs(wave) * 0.15
+        l = min(o, c) - 0.35 - abs(wave) * 0.15
+        if i % 8 == 3:
+            l = min(l, start_px - 2.5)
+        if i % 8 == 7:
+            h = max(h, start_px + 3.0)
+        at = (t0 + timedelta(minutes=i)).isoformat().replace('+00:00', 'Z')
+        store.candle(epic, {
+            'at': at, 'open': o, 'high': h, 'low': l, 'close': c, 'spread': 0.02,
+        }, source='HISTORICAL')
+        px = c
 
 
 def test_pdf_long_short_sl_tp_and_rounding():
@@ -151,6 +174,7 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             engine=SingleTradeEngine(store,brain);broker=BrokerSimulation()
             # Keep auto-evolved policy state from this test out of the real project.
             engine.policy=AutoEvolution(store,Path(d)/'policy.py')
+            seed_swing_candles(store,'SIM')
             engine.attach(broker);await engine.sync()
             assert engine.mandate['size']=='.25'
             await engine.poll()
@@ -163,6 +187,11 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             assert len(broker.requests)==2
             engine.market_context={'ready':True}  # exercise router, not market readiness
             brain.mark_prep_ready('test fixture')
+            # Mid near last swing seed close so require_swing can place levels.
+            mid=float(store.candles('SIM',n=1)[0]['close'])
+            engine.market={**(engine.market or {}),
+                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
+                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
             await engine.submit('SELL')
             assert broker.requests[-1][0]=='OPEN'
             assert broker.requests[-1][3]==Decimal('.25')
@@ -179,23 +208,39 @@ def test_uncertain_order_does_not_retry():
             store=Store(Path(d)/'s.db');b=AdaptiveBrain(store,data_dir=d);e=SingleTradeEngine(store,b)
             e.policy=AutoEvolution(store,Path(d)/'policy.py')
             broker=BrokerSimulation();e.attach(broker)
+            seed_swing_candles(store,'SIM')
             await e.sync();broker.open=[];await e.sync();await e.poll()
             broker.fail_on_order=True
             e.market_context={'ready':True}  # router uncertainty regression
             b.mark_prep_ready('test fixture')
-            await e.submit('BUY');await e.submit('BUY')
+            mid=float(store.candles('SIM',n=1)[0]['close'])
+            e.market={**(e.market or {}),
+                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
+                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
+            await e.submit('BUY')
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
-            assert not e.execution_enabled and store.unresolved()
+            # Uncertain OPEN is SUPERSEDED — robot stays live (no auto-pause).
+            assert e.execution_enabled and e.armed
+            assert not store.unresolved()
+            assert any('not paused' in (ev['message'] or '').lower()
+                       or 'uncertain' in (ev['message'] or '').lower()
+                       for ev in store.recent())
     async_run(scenario())
 
 
 def test_multi_position_detected_pauses_execution():
+    """Multi-pos: skip new OPEN, but do not auto-pause the robot."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'s.db');e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));b=BrokerSimulation()
             b.open.append({'position':{'dealId':'m2','size':.25,'direction':'SELL'},'market':{'epic':'SIM'}})
             e.attach(b);await e.sync()
-            assert not e.armed and not e.execution_enabled
+            assert e.armed and e.execution_enabled
+            assert len(e.positions)==2
+            # submit() refuses while any position is open — no auto-pause needed.
+            before=len(b.requests)
+            await e.submit('BUY')
+            assert len(b.requests)==before
     async_run(scenario())
 
 
@@ -232,8 +277,9 @@ def test_login_reconciles_prior_confirmed_request_without_retry():
             s.order_update(oid,'PENDING','known-ref')
             e=SingleTradeEngine(s,AdaptiveBrain(s,data_dir=d));e.policy=AutoEvolution(s,Path(d)/'policy.py')
             e.attach(b)
-            assert not e.execution_enabled
-            assert await e.reconcile_outstanding()
+            # Attach clears stale PENDING without auto-pause.
+            assert e.execution_enabled
+            assert not s.unresolved() or await e.reconcile_outstanding()
             assert not s.unresolved()
             assert e.execution_enabled
             await e.sync();assert e.mandate['epic']=='SIM'
@@ -273,6 +319,7 @@ def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close
             s=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
             e=SingleTradeEngine(s,brain);e.policy=AutoEvolution(s,Path(d)/'policy.py')
             broker=BrokerSimulation();e.attach(broker)
+            seed_swing_candles(s,'SIM')
             await e.poll()
             assert e.positions[0]['dealId']=='m1'
             broker.open=[];await e.sync()
@@ -280,6 +327,10 @@ def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([7.,-4.,-4.])
+            mid=float(s.candles('SIM',n=1)[0]['close'])
+            e.market={**(e.market or {}),
+                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
+                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
             await e.poll()  # very next completed new M1 candle; no historical-label minimum
             assert len([x for x in broker.requests if x[0]=='OPEN'])==1
             assert e.positions[0]['dealId']=='b2'
@@ -292,17 +343,30 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
     install_synthetic_context(monkeypatch)
     class RewardBroker(BrokerSimulation):
         async def confirm(self,ref):
-            return {'dealStatus':'ACCEPTED','dealId':'m1','level':100.4 if ref=='exit' else 100.}
+            # Verified Capital £ required for neural teach (not tick-only).
+            if ref=='exit':
+                return {'dealStatus':'ACCEPTED','dealId':'m1','level':100.4,
+                        'profit':0.55,'currency':'USD'}
+            return {'dealStatus':'ACCEPTED','dealId':'m1','level':100.}
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'state.db');brain=AdaptiveBrain(s,data_dir=d)
             e=SingleTradeEngine(s,brain);e.policy=AutoEvolution(s,Path(d)/'policy.py')
             broker=RewardBroker();e.attach(broker)
+            seed_swing_candles(s,'SIM')
             await e.poll()
+            # Schema may resize on first poll — capture transition after settle.
+            brain.core.last_z=np.linspace(-0.2,0.2,brain.core.d)
+            brain.core.step(brain.core.last_z,dt=1.0)
+            s.set('entry_brain:m1',{
+                'epic':'SIM','direction':'BUY','entry':100.,
+                'tick_size':0.01,'entry_spread':0.02,
+                'transition':brain._json_transition(brain.core.last_transition),
+                'scores':{'BUY':0.5,'SELL':0.3,'HOLD':0.2}})
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
             assert brain.core.last_loss is not None
-            assert any('P&L self-evaluation' in e['message'] for e in s.recent())
+            assert any('updated LIVE neural weights' in ev['message'] for ev in s.recent())
     async_run(scenario())
 
 

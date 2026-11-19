@@ -1056,6 +1056,13 @@ class SingleTradeEngine:
         self.model_validator=ModelValidator(store)
         from .shadow_paper import ShadowPaperJournal
         self.shadow_paper=ShadowPaperJournal(store)
+        # Persist soft LR/repeats ceilings so stale Store 0.28 does not keep teaching hot.
+        try:
+            from .self_params import migrate_soft_ceilings
+            migrate_soft_ceilings(store)
+        except Exception as exc:
+            self.store.event('warning','self_params soft-ceiling migrate deferred',
+                {'type':type(exc).__name__,'detail':str(exc)[:160]})
         if hasattr(self.brain,'apply_registry'):
             try:
                 self.brain.apply_registry(self.feature_registry)
@@ -3451,20 +3458,28 @@ class SingleTradeEngine:
             return None
 
     def _requeue_unsettled_cash_closes(self):
-        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue."""
+        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue.
+
+        ``upl_estimate`` is display-only until Capital history returns real £ —
+        those rows must stay harvestable (neural teach waits for ``broker``).
+        """
         try:
             rows=self.store.db.execute(
                 "SELECT deal_id,exit,opened,closed,pnl_source FROM trades "
                 "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
                 "('pending_broker_pnl','pending_close_sync',"
-                "'ticks_only','price_size','position_disappeared')) "
+                "'ticks_only','price_size','position_disappeared',"
+                "'upl_estimate')) "
                 "ORDER BY closed DESC LIMIT 80").fetchall()
         except Exception:
             return 0
         n=0
         for deal_id,exit_lvl,_opened,_closed,src in rows:
             deal=str(deal_id)
-            if self.store.get('broker_cash_banked:'+deal):
+            # Real broker £ already banked — do not re-harvest.
+            if self.store.get('broker_cash_banked:'+deal) and str(src or '')=='broker':
+                continue
+            if self.store.get('broker_cash_banked:'+deal) and str(src or '')!='upl_estimate':
                 continue
             self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
             n+=1
@@ -3616,10 +3631,11 @@ class SingleTradeEngine:
         return float(upl),self._cash_currency(snap.get('currency'))
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Confirm.profit → history/activity → last live UPL as realized peļņa.
+        """Confirm.profit → history/activity → last live UPL (display only).
 
-        Prefer Capital history/fuzzy cash. When that lags, bank last UPL so
-        Admin is not stuck on [gaida £] forever (operator: UPL = peļņa).
+        Prefer Capital history/fuzzy cash. When that lags, return last UPL so
+        the journal can show provisional peļņa — neural teach still waits for
+        ``pnl_source=broker``.
         """
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
@@ -3817,23 +3833,24 @@ class SingleTradeEngine:
         return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
-        """Neural teach from exit ticks while cash £ is still pending.
+        """Keep journal pending — do NOT neural-teach without verified broker £.
 
-        Keeps journal ``pnl_source=pending_broker_pnl`` (no fake £). Late Capital
-        cash overwrites the row without re-learning (once-only claim).
+        Tick teach used to burn the once-only claim before Capital cash arrived,
+        so real £ only hit the late refine path. Neural ΔW waits for ``broker``.
+        Never clobber ``pending_close_sync`` (CLOSE confirm still in flight).
         """
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
-        if not self.store.get('entry_brain:'+deal):
-            return False
-        conf={'level':exit_level,'source':'pending_ticks_teach'}
-        self._learn_closed_trade(deal,conf)
-        # Ensure source stayed pending (learn path preserves it for this source).
-        self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
-        self.store.event('learning','Pending-cash trade taught from ticks; still waiting for £',
-                         {'deal_id':deal,'exit_level':exit_level})
-        return True
+        row=self.store.db.execute(
+            'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
+        src=str(row[0] or '') if row else ''
+        if src!='pending_close_sync':
+            self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
+        self.store.event('learning',
+            'Pending Capital £ — neural teach deferred (no tick claim)',
+            {'deal_id':deal,'exit_level':exit_level,'pnl_source':src or 'pending_broker_pnl'})
+        return False
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
@@ -3861,27 +3878,36 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','Fuzzy pending P&L failed',
                                      {'deal_id':deal,'type':type(exc).__name__})
-            # Capital lag: bank last live UPL as peļņa so [gaida £] clears.
-            pnl_source='broker'
+            # Capital lag: show last live UPL in the journal so [gaida £] is not
+            # blank — but keep harvesting until verified broker £ arrives.
+            # Neural teach must NOT use upl_estimate (inaccurate feedback).
             if not found:
                 upl_found=self._last_upl_as_realized(deal)
                 if upl_found and attempts>=1:
-                    found=upl_found
-                    pnl_source='upl_estimate'
-                else:
-                    if attempts<=2:
-                        self._teach_pending_ticks(deal,exit_level)
+                    upl_pnl,upl_ccy=upl_found
+                    ccy=self._cash_currency(upl_ccy)
+                    self.store.close_trade(
+                        deal,exit_level,float(upl_pnl),currency=ccy,
+                        source='upl_estimate',overwrite=True)
+                    self.store.event(
+                        'trade','UPL provisional peļņa — waiting for Capital £',
+                        {'deal_id':deal,'upl':float(upl_pnl),'currency':ccy,
+                         'attempts':attempts})
                     nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                    nxt.pop('upl_shown',None)
+                    nxt['upl_shown']=True
                     remaining.append(nxt)
                     continue
+                if attempts<=2:
+                    self._teach_pending_ticks(deal,exit_level)
+                nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                nxt.pop('upl_shown',None)
+                remaining.append(nxt)
+                continue
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
-            # Always through learn path — already_learned banks £ + late teachers once.
+            # Verified Capital £ — learn path (neural + late teachers).
             conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,
-                  'source':('pending_upl_settle' if pnl_source=='upl_estimate'
-                            else 'pending_pnl_retry'),
-                  'pnl_source':pnl_source}
+                  'source':'pending_pnl_retry','pnl_source':'broker'}
             self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
@@ -4081,13 +4107,17 @@ class SingleTradeEngine:
         entry=float(mid)
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
-            entry=entry,action=proposal,candles=candles)
+            entry=entry,action=proposal,candles=candles,require_swing=True)
+        # Same rule as LIVE OPEN — no invented median ±distance for shadow.
+        if (not decided.get('ready') or decided.get('stop_distance') is None
+                or decided.get('profit_distance') is None):
+            return None
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
             'stop_distance':float(decided['stop_distance']),
             'profit_distance':float(decided['profit_distance']),
-            'bracket_source':str(decided.get('source') or 'ohlc_zone'),
+            'bracket_source':str(decided.get('source') or 'swing_anchor'),
             'ohlc_kappa':decided.get('ohlc_kappa'),
             'swing_hi':decided.get('swing_hi'),
             'swing_lo':decided.get('swing_lo'),
@@ -4192,10 +4222,10 @@ class SingleTradeEngine:
         """Immediate self-evaluation from a closed trade's signed outcome.
 
         When the trade is a LOSS, the entry-time neural state is trained toward
-        the opposite action (regret). Wins reinforce. Cash P&L is stored only
-        from broker profit (+ account currency). Without broker profit, learning
-        still uses directional ticks — History cash stays blank rather than fake $.
-        Each deal trains LIVE weights at most once (audit #2).
+        the opposite action (regret). Wins reinforce. Cash P&L + neural teach
+        require verified broker profit (+ account currency). Without broker £,
+        journal stays pending/UPL-provisional and entry_brain is kept until
+        Capital history arrives. Each deal trains LIVE weights at most once.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -4216,6 +4246,16 @@ class SingleTradeEngine:
             if broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or self._account_currency()
                 late_src=pref_src or 'broker'
+                # Only verified Capital £ may bank day_book / late teachers.
+                # UPL after a prior claim must not pretend to be broker cash.
+                if late_src!='broker':
+                    self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
+                                           source='upl_estimate',overwrite=True)
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
+                    self.store.event('learning',
+                        'Late UPL ignored for bank — waiting for broker £',
+                        {'deal_id':deal_id,'pnl':broker_pnl,'pnl_source':late_src})
+                    return
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source=late_src,overwrite=True)
                 action=self._trade_direction(deal_id) or (
@@ -4242,11 +4282,14 @@ class SingleTradeEngine:
                     preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source in ('broker','upl_estimate') and pnl_value is not None:
+                if pnl_source=='broker' and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=row[1],
                         source=pnl_source)
                 else:
+                    if pnl_source=='upl_estimate' and pnl_value is not None:
+                        # Display only — keep harvesting real Capital £.
+                        pass
                     self._queue_pending_pnl(deal_id,exit_level=exit_level)
             elif exit_level is not None or broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or (
@@ -4281,10 +4324,12 @@ class SingleTradeEngine:
                     currency=hint_ccy,preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source in ('broker','upl_estimate'):
+                if pnl_source=='broker' and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=direction,
                         source=pnl_source)
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
@@ -4336,9 +4381,37 @@ class SingleTradeEngine:
             path_mfe=struct_ctx.get('path_mfe'),
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
-        # Profit ledger: broker £ or last UPL peļņa — never ±1 tick fakes.
-        cash_like=pnl_source in ('broker','upl_estimate') and pnl_value is not None
+        # Profit ledger + neural teach: verified broker £ only.
+        # upl_estimate is journal display until Capital history arrives — teaching
+        # from it gave inaccurate feedback (dump: most closes were UPL, not broker).
+        cash_like=pnl_source=='broker' and pnl_value is not None
         entry_scores=saved.get('scores') if isinstance(saved.get('scores'),dict) else None
+        if pnl_source=='upl_estimate' and pnl_value is not None:
+            self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
+                                   source='upl_estimate',overwrite=overwrite)
+            self._queue_pending_pnl(deal_id,exit_level=exit_level)
+            structure_at_open=(saved.get('structure_at_open')
+                               if isinstance(saved,dict) else None)
+            close_frame=(struct_ctx.get('frame')
+                         if isinstance(struct_ctx,dict) else None) or {}
+            close_bos=structure_memory.bos_choch(
+                (struct_ctx.get('pre_bars') or [])[-5:] + (cf.get('bars') or [])
+                if isinstance(struct_ctx,dict) else (cf.get('bars') or []))
+            structure_at_close=structure_memory.snapshot_from_frame(
+                close_frame,mid=exit_level,bos=close_bos)
+            if not structure_at_open:
+                structure_at_open=structure_at_close
+            structure_memory.persist_last(self.store,structure_at_close)
+            self.store.set('last_trade_outcome',{
+                'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
+                'pnl':pnl_value,'mode':'upl_provisional','exit_mid':exit_level,
+                'exit_level':exit_level,
+                'structure_at_open':structure_at_open,
+                'structure_at_close':structure_at_close})
+            self.store.event('learning',
+                'UPL provisional — neural teach deferred until broker £',
+                {'deal_id':deal_id,'pnl':pnl_value,'pnl_source':'upl_estimate'})
+            return
         if cash_like:
             decision=self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,
@@ -4352,28 +4425,16 @@ class SingleTradeEngine:
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
         else:
-            # Tick path must use the SAME loss gate as broker £ (opposite ∪ HOLD
-            # with spread floor). Raw best_action could re-pick the loser / false flip.
-            from .profit_learning import label_from_profit
-            tick_pnl=(1.0 if pnl_sign>0 else (-1.0 if pnl_sign<0 else 0.0))
-            decision=label_from_profit(
-                direction,tick_pnl,flip_after_loss=flip_after_loss,
-                entry=entry,exit_level=exit_level,spread=spread_cost,
-                **cf,**teach_extra)
-            label=decision.get('label')
-            if label is not None:label=int(label)
-            mode=str(decision.get('mode') or 'ticks_no_counterfactual')
-            if mode and not mode.endswith('_ticks'):
-                mode=mode+'_ticks'
-            self.profit_learning.record_closed(
-                deal_id=deal_id,epic=epic,direction=direction,entry=entry,
-                exit_level=exit_level,broker_pnl=None,
-                currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
-                model_version=getattr(self.brain,'model_version',0),
-                feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True,
-                scores=entry_scores,
-                **cf,**teach_extra)
+            # No verified broker £ — do NOT neural-teach from ticks / burn claim.
+            # Journal stays pending; Capital harvest will teach once on real £.
+            # Keep entry_brain so later broker £ can still train.
+            self._queue_pending_pnl(deal_id,exit_level=exit_level)
+            self.store.close_trade(deal_id,exit_level,None,currency=None,
+                                   source='pending_broker_pnl',overwrite=overwrite)
+            self.store.event('learning',
+                'Closed without broker £ — neural teach deferred',
+                {'deal_id':deal_id,'exit_level':exit_level,'pnl_source':pnl_source})
+            return
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
         if label is None:
@@ -4436,7 +4497,8 @@ class SingleTradeEngine:
                 return {'any_real_dw':local_dw,'losses':local_losses,
                         'last_delta':local_delta}
             gate_decision=learn_gate.gate_closed_trade_learn(
-                self,_closed_trade_weight_steps,epic=epic,deal_id=deal_id)
+                self,_closed_trade_weight_steps,epic=epic,deal_id=deal_id,
+                trade_pnl=(pnl_value if cash_like else None))
             learn_meta=(gate_decision or {}).get('learn') or {}
             losses=list(learn_meta.get('losses') or [])
             last_delta=learn_meta.get('last_delta')
@@ -4922,27 +4984,40 @@ class SingleTradeEngine:
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
+        level=float(p['level'] or mid)
+        direction=p.get('direction')
         bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
                                          base_sl=base_sl,max_tp=zone.get('max_tp'),
                                          candles=candles,tick=tick,spread=spread,
-                                         min_distance=min_dist)
-        # Use OHLC-decided distances — do not re-scale range via stop_take×sl_mult
-        # (that re-opened the win-ratchet path after 3 wins).
+                                         min_distance=min_dist,
+                                         entry=level,action=direction)
+        # Prefer swing-anchored levels from propose; never invent fresh ±zone.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
+        stop_lvl=_num(bp.get('stop_level'))
+        profit_lvl=_num(bp.get('profit_level'))
         if decided_sl and decided_tp and decided_sl>0 and decided_tp>0:
-            sign=1 if p.get('direction')=='BUY' else -1
-            level=float(p['level'] or mid)
+            sign=1 if direction=='BUY' else -1
+            if stop_lvl is None:
+                stop_lvl=level-sign*float(decided_sl)
+            if profit_lvl is None:
+                profit_lvl=level+sign*float(decided_tp)
             result={
                 'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
-                'stop_level':level-sign*float(decided_sl),
-                'profit_level':level+sign*float(decided_tp),
+                'stop_level':float(stop_lvl),
+                'profit_level':float(profit_lvl),
                 'kappa':bp.get('kappa'),'sl_scale':1.0,
+                'bracket_source':bp.get('bracket_source'),
             }
         else:
+            # Last resort only when swings unavailable — still log clearly.
             result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
                              kappa=bp['kappa'],sl_scale=1.0,
                              range_distance=float(rng) if rng is not None else 0)
+            result['bracket_source']='protect_fallback_zone'
+            self.store.event('warning','Protection used zone fallback — no swing levels',{
+                'deal_id':p.get('dealId'),'reason':bp.get('reason'),
+                'bracket_source':bp.get('bracket_source')})
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
         if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
             self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
@@ -5077,8 +5152,22 @@ class SingleTradeEngine:
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0),
-                entry=entry,action=action,candles=candles,atr=atr_hint)
-            # Prefer swing-anchored levels when ready; else entry ± zone distance.
+                entry=entry,action=action,candles=candles,atr=atr_hint,
+                require_swing=True)
+            # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
+            if not decided.get('ready') or decided.get('stop_distance') is None \
+                    or decided.get('profit_distance') is None:
+                self.last_entry_reason=(
+                    f"OPEN skipped — no OHLC swing SL/TP "
+                    f"({decided.get('reason') or decided.get('swing_reason') or 'unready'})")
+                self.store.event('entry','OPEN skipped — swing brackets unavailable',{
+                    'reason':self.last_entry_reason,
+                    'source':decided.get('source'),
+                    'swing_reason':decided.get('swing_reason') or decided.get('reason'),
+                    'bos_event':decided.get('bos_event'),
+                    'swing_hi':decided.get('swing_hi'),
+                    'swing_lo':decided.get('swing_lo')})
+                return
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
             stop_level=decided.get('stop_level')
@@ -5087,7 +5176,7 @@ class SingleTradeEngine:
                 stop_level=float(entry)-sign*sd
             if profit_level is None:
                 profit_level=float(entry)+sign*pd
-            bracket_source=str(decided.get('source') or 'ohlc_zone')
+            bracket_source=str(decided.get('source') or 'swing_anchor')
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
                 'stop_level':float(stop_level),
@@ -5144,6 +5233,8 @@ class SingleTradeEngine:
                 'ohlc_sl':decided.get('ohlc_sl'),'ohlc_tp':decided.get('ohlc_tp'),
                 'tighten':decided.get('tighten'),
                 'swing_hi':decided.get('swing_hi'),'swing_lo':decided.get('swing_lo'),
+                'swing_reason':decided.get('swing_reason') or decided.get('reason'),
+                'bos_event':decided.get('bos_event'),
                 'stop_level':brackets['stop_level'],
                 'profit_level':brackets['profit_level'],
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
@@ -5158,7 +5249,7 @@ class SingleTradeEngine:
                 'timeframes':zone.get('timeframes'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
-                'bracket_source':'ohlc_zone_multi_tf',
+                'bracket_source':bracket_source,
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,

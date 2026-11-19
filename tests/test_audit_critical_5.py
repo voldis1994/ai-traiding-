@@ -193,7 +193,7 @@ def test_shadow_weights_persist_across_engine_restart():
 
 
 def test_protect_put_timeout_marks_uncertain_retains_levels():
-    """Pre-test #3: broker timeout on protect PUT → UNCERTAIN, levels unchanged."""
+    """Protect PUT timeout: keep live levels, do NOT freeze execution."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'db.sqlite3')
@@ -223,9 +223,13 @@ def test_protect_put_timeout_marks_uncertain_retains_levels():
             e.broker=Broker()
             await e.protect_position(pos)
             assert e.broker.calls==1
-            assert not e.execution_enabled and not e.armed
-            unresolved=store.unresolved()
-            assert len(unresolved)==1 and unresolved[0]['status']=='UNCERTAIN'
+            # Intentional: protect uncertainty must not pause the robot.
+            assert e.execution_enabled and e.armed
+            assert not store.unresolved()
+            row=store.db.execute(
+                "select status from orders where kind='PROTECT' order by id desc limit 1"
+            ).fetchone()
+            assert row[0]=='SUPERSEDED'
             # Broker book untouched — no false SL/TP applied.
             assert e.broker.open[0]['position']['stopLevel'] is None
             assert e.broker.open[0]['position']['profitLevel'] is None
@@ -233,7 +237,7 @@ def test_protect_put_timeout_marks_uncertain_retains_levels():
 
 
 def test_protect_confirm_disconnect_not_false_confirmed():
-    """Pre-test #3: confirm ConnectionError → UNCERTAIN, not CONFIRMED."""
+    """Protect confirm disconnect: SUPERSEDED (not CONFIRMED), robot stays armed."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'db.sqlite3')
@@ -263,14 +267,13 @@ def test_protect_confirm_disconnect_not_false_confirmed():
 
             e.broker=Broker()
             await e.protect_position(pos)
-            unresolved=store.unresolved()
-            assert len(unresolved)==1
-            assert unresolved[0]['status']=='UNCERTAIN'
-            assert not e.execution_enabled
+            assert e.execution_enabled and e.armed
+            assert not store.unresolved()
             row=store.db.execute(
                 "select status from orders where kind='PROTECT' order by id desc limit 1"
             ).fetchone()
-            assert row[0]=='UNCERTAIN'
+            assert row[0]=='SUPERSEDED'
+            assert row[0]!='CONFIRMED'
     asyncio.run(scenario())
 
 

@@ -42,7 +42,10 @@ def test_without_broker_profit_no_fake_dollar_cash():
         engine._learn_closed_trade('g2',{'level':2660})
         row=store.trades(1)[0]
         assert row['pnl'] is None
-        assert row['pnl_source']=='ticks_only'
+        assert row['pnl_source']=='pending_broker_pnl'
+        # entry_brain kept until verified Capital £ teaches.
+        assert store.get('entry_brain:g2') is not None
+        assert not engine._trade_already_learned('g2')
 
 
 def test_pending_close_sync_does_not_clear_entry_brain():

@@ -11,7 +11,8 @@ from tests.test_broker_pnl_resolve import HistoryBroker
 from tests.test_learning_integrity import new_brain
 
 
-def test_resolve_does_not_promote_upl_to_broker_cash():
+def test_resolve_returns_upl_as_estimate_not_broker():
+    """UPL may fill journal provisionally — source must stay upl_estimate."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -20,8 +21,9 @@ def test_resolve_does_not_promote_upl_to_broker_cash():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
-            assert pnl is None
-            assert src=='pending_broker_pnl'
+            assert pnl==pytest.approx(0.45)
+            assert src=='upl_estimate'
+            assert src!='broker'
     asyncio.run(scenario())
 
 
@@ -74,11 +76,11 @@ def test_vanish_queues_pending_when_history_empty():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row.get('pnl_source')=='pending_broker_pnl' or row.get('pnl') is None
-            assert row.get('pnl') is None  # still no invented £
+            # UPL provisional OR still pending — never ticks-invented £ as broker.
+            assert row.get('pnl_source') in ('pending_broker_pnl','upl_estimate',None)
+            assert row.get('pnl_source')!='broker' or row.get('pnl') is not None
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
-            # Tick teach runs while cash is pending — once-only claim burns so late
-            # Capital £ only refines the journal.
-            assert e._trade_already_learned('gold1')
+            # Neural claim must NOT burn before verified Capital £.
+            assert not e._trade_already_learned('gold1')
     asyncio.run(scenario())

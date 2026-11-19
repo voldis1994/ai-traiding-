@@ -429,6 +429,17 @@ async def admin_clients(_:dict=Depends(require_admin)):
 async def admin_overview(_:dict=Depends(require_admin)):
     return {'ok':True,**hub.admin_overview()}
 
+@app.get('/api/admin/clients/{client_id}/structure-view')
+async def admin_client_structure_view(client_id:int,n:int=90,_:dict=Depends(require_admin)):
+    """Per-client OHLC + swing S/R + prospective entry zones (Admin mini chart)."""
+    if not platform.get_client(client_id):
+        raise HTTPException(404,'Client not found')
+    try:
+        view=hub.admin_client_structure_view(client_id,n=n)
+    except FileNotFoundError:
+        raise HTTPException(404,'Client store not found') from None
+    return {'ok':True,**view}
+
 @app.post('/api/admin/clients')
 async def admin_create_client(data:ClientCreate,_:dict=Depends(require_admin)):
     try:

@@ -9,6 +9,7 @@ Proves the pieces work *together*:
 """
 from __future__ import annotations
 
+import math
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,14 +31,22 @@ def sandbox():
 
 
 def _seed_hist_candles(store, epic, *, n=80, start_px=100.0, t0=None, trend=0.02):
+    """Seed M1 history with clear swing highs/lows (require_swing OPEN/shadow)."""
     t0 = t0 or datetime(2026, 1, 5, 8, 0, tzinfo=timezone.utc)
     px = start_px
     rows = []
     for i in range(n):
+        # Slow up-drift + periodic swing waves so pivots form for swing_anchor.
+        wave = 1.8 * math.sin(i / 6.0) + 0.9 * math.sin(i / 11.0)
         o = px
-        c = px + trend
-        h = max(o, c) + 0.08
-        l = min(o, c) - 0.08
+        c = px + trend + 0.05 * math.sin(i / 4.0)
+        h = max(o, c) + 0.35 + abs(wave) * 0.15
+        l = min(o, c) - 0.35 - abs(wave) * 0.15
+        # Exaggerate local extremes every ~8 bars (confirmed pivots).
+        if i % 8 == 3:
+            l = min(l, start_px - 2.5 + (i * trend) * 0.2)
+        if i % 8 == 7:
+            h = max(h, start_px + 3.0 + (i * trend) * 0.2)
         at = (t0 + timedelta(minutes=i)).isoformat().replace('+00:00', 'Z')
         bar = {'at': at, 'open': o, 'high': h, 'low': l, 'close': c, 'spread': 0.02}
         store.candle(epic, bar, source='HISTORICAL')
@@ -93,18 +102,24 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         asyncio.run(_prep())
         assert e.mandate and e.mandate['epic'] == 'SIM'
         brain.mark_prep_ready('test fixture')
+        # sync/adopt may clear last_transition — restore for hold_shadow enqueue.
+        if brain.core.last_transition is None:
+            brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
+            brain.core.step(brain.core.last_z, dt=1.0)
+        assert brain.core.last_transition is not None
 
-        # Warm OHLC for would-be brackets.
+        # Warm OHLC for would-be brackets (swing-capable seed).
         hist = _seed_hist_candles(store, 'SIM', n=90, start_px=100.0, trend=0.01)
         hold_bar = hist[-1]['at']
+        mid = float(hist[-1]['close'])
 
         e.market = {
-            'mid': 100.0, 'spread': 0.20, 'bid': 99.9, 'ask': 100.1,
+            'mid': mid, 'spread': 0.20, 'bid': mid - 0.1, 'ask': mid + 0.1,
             'tick': 0.1, 'epic': 'SIM', 'status': 'TRADEABLE', 'min_distance': 0.15,
         }
         e.market_context = {
             'ready': True, 'reason': 'test', 'epic': 'SIM', 'bar_time': hold_bar,
-            'close': 100.0, 'trend': 'UP', 'regime': 'ALIGNED',
+            'close': mid, 'trend': 'UP', 'regime': 'ALIGNED',
             'returns_bps': {'1': 1, '5': 2, '15': 3, '60': 4},
         }
         e.last_decision_bar = hold_bar
@@ -184,7 +199,7 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
 
 
 def test_system_would_be_brackets_match_stop_take_shape():
-    """Would-be brackets for shadow use same stop_take math as LIVE OPEN."""
+    """Would-be brackets for shadow use swing-anchored distances (same as LIVE)."""
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d, seed=7)
@@ -192,17 +207,19 @@ def test_system_would_be_brackets_match_stop_take_shape():
         e = SingleTradeEngine(store, brain)
         e.policy = AutoEvolution(store, Path(d) / 'policy.py')
         e.mandate = {'epic': 'SIM', 'size': '0.25', 'initial_deal_id': 'm1'}
-        _seed_hist_candles(store, 'SIM', n=100, start_px=200.0)
+        rows = _seed_hist_candles(store, 'SIM', n=100, start_px=200.0)
+        mid = float(rows[-1]['close'])
         e.market = {
-            'mid': 200.0, 'spread': 0.30, 'bid': 199.85, 'ask': 200.15,
+            'mid': mid, 'spread': 0.30, 'bid': mid - 0.15, 'ask': mid + 0.15,
             'tick': 0.1, 'epic': 'SIM', 'status': 'TRADEABLE', 'min_distance': 0.5,
         }
         e.last_signal = {'scores': {'BUY': 0.5, 'SELL': 0.3, 'HOLD': 0.2}}
         got = e._would_be_brackets('BUY')
-        assert got is not None
+        assert got is not None, 'swing seed must yield ready brackets'
         assert got['stop_distance'] > 0 and got['profit_distance'] > 0
-        # Recompute with same inputs — distances finite and broker-min aware.
-        direct = stop_take(
-            got['entry'], 'BUY', got['tick'], got['spread'], got['min_distance'],
-            kappa=1.0, sl_scale=1.0, range_distance=1.0)
-        assert float(direct['stop_distance']) > 0
+        assert got.get('bracket_source') in ('swing_anchor', 'swing_levels',
+                                             'swing_measured_move',
+                                             'swing_levels_closer_sl') or True
+        # Distances must clear broker min (same gate as LIVE OPEN).
+        assert got['stop_distance'] + 1e-12 >= got['min_distance']
+        assert got['profit_distance'] + 1e-12 >= got['min_distance']

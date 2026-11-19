@@ -624,6 +624,168 @@ class RuntimeHub:
             raise FileNotFoundError(str(db))
         return Store(db)
 
+    def admin_client_structure_view(self,client_id: int,*,n: int=90) -> dict:
+        """OHLC + swing S/R + prospective entry zones for Admin mini chart.
+
+        Not every-candle signals — zone bands from structure so the operator
+        can see where a future BUY/SELL entry would sit relative to swings.
+        """
+        from . import structure_memory, bracket_learn
+        cid=int(client_id)
+        rt=self.get(cid)
+        store=None
+        epic=None
+        mid=None
+        spread=0.0
+        tick=0.01
+        action=None
+        scores={}
+        positions=[]
+        try:
+            store=self._client_store(cid)
+        except FileNotFoundError:
+            return {'ok':False,'reason':'no_store','client_id':cid,
+                    'candles':[],'zones':{},'levels':{}}
+        if rt and rt.started and rt.engine is not None:
+            eng=rt.engine
+            market=getattr(eng,'market',None) or {}
+            epic=(market.get('epic') or (getattr(eng,'mandate',None) or {}).get('epic')
+                  or getattr(eng.brain,'epic',None))
+            mid=market.get('mid')
+            try:
+                spread=float(market.get('spread') or 0)
+            except (TypeError,ValueError):
+                spread=0.0
+            try:
+                tick=float(market.get('tick') or 0.01) or 0.01
+            except (TypeError,ValueError):
+                tick=0.01
+            sig=getattr(eng,'last_signal',None) or {}
+            if isinstance(sig,dict):
+                action=sig.get('action')
+                scores=sig.get('scores') or {}
+            positions=list(getattr(eng,'positions',None) or [])
+        if not epic:
+            epic=store.get('legacy_brain_epic')
+            if isinstance(epic,str):
+                epic=epic.strip('"') or None
+        if not epic:
+            try:
+                row=store.db.execute(
+                    "SELECT epic FROM trades ORDER BY opened DESC LIMIT 1").fetchone()
+                epic=row[0] if row else None
+            except Exception:
+                epic=None
+        epic=epic or 'GOLD'
+        candles=store.candles(epic,n=max(40,min(int(n),180)),historical_only=False) or []
+        live=structure_memory.snapshot_live(candles=candles,mid=mid)
+        bos=structure_memory.bos_choch(candles,left=2,right=2) if candles else {}
+        piv=structure_memory.swing_pivots(candles,left=2,right=2) if candles else {}
+        range_hi=bos.get('range_hi')
+        range_lo=bos.get('range_lo')
+        if mid is None and candles:
+            try:
+                mid=float(candles[-1].get('close'))
+            except (TypeError,ValueError,AttributeError):
+                mid=None
+        # Prospective entry zones — near protective swings, not every bar.
+        buy_zone=None
+        sell_zone=None
+        try:
+            lo=float(range_lo) if range_lo is not None else None
+            hi=float(range_hi) if range_hi is not None else None
+        except (TypeError,ValueError):
+            lo=hi=None
+        if lo is not None and hi is not None and hi>lo:
+            span=hi-lo
+            band=max(span*0.12,float(tick)*8,spread*2)
+            # BUY entry: discount band above swing low (support) — never invert.
+            buy_hi=lo+band
+            if mid is not None:
+                buy_hi=min(buy_hi,max(lo,float(mid)))
+            if buy_hi>lo:
+                buy_zone={'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY'}
+            # SELL entry: premium band below swing high (resistance).
+            sell_lo=hi-band
+            if mid is not None:
+                sell_lo=max(sell_lo,min(hi,float(mid)))
+            if sell_lo<hi:
+                sell_zone={'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL'}
+        preferred=action if action in ('BUY','SELL') else None
+        if not preferred and isinstance(scores,dict):
+            try:
+                preferred=max(('BUY','SELL','HOLD'),
+                              key=lambda a:float(scores.get(a) or 0))
+                if preferred=='HOLD':
+                    preferred=None
+            except (TypeError,ValueError):
+                preferred=None
+        swing_brackets=None
+        if mid is not None and preferred in ('BUY','SELL') and candles:
+            try:
+                zone=bracket_learn.zone_at_open(candles,multi_tf=True)
+                swing_brackets=bracket_learn.swing_anchor_brackets(
+                    candles=candles,entry=mid,action=preferred,tick=tick,
+                    spread=spread,min_distance=0.,zone=zone)
+            except Exception as exc:
+                swing_brackets={'ready':False,'reason':type(exc).__name__}
+        open_levels=[]
+        for p in positions:
+            if not isinstance(p,dict):
+                continue
+            open_levels.append({
+                'deal_id':p.get('dealId'),
+                'direction':p.get('direction'),
+                'entry':p.get('level'),
+                'stop':p.get('stopLevel'),
+                'profit':p.get('profitLevel'),
+            })
+        # Compact candle payload for canvas.
+        bare=[]
+        for c in candles[-max(40,min(int(n),120)):]:
+            if not isinstance(c,dict):
+                continue
+            try:
+                bare.append({
+                    'at':c.get('at'),
+                    'open':float(c['open']),'high':float(c['high']),
+                    'low':float(c['low']),'close':float(c['close']),
+                })
+            except (KeyError,TypeError,ValueError):
+                continue
+        return {
+            'ok':True,
+            'client_id':cid,
+            'epic':epic,
+            'mid':mid,
+            'action':action,
+            'preferred':preferred,
+            'scores':scores,
+            'candles':bare,
+            'structure':{
+                'bias':bos.get('bias') or live.get('live_bias'),
+                'event':bos.get('event') or live.get('live_event'),
+                'range_hi':range_hi,
+                'range_lo':range_lo,
+                'swing_highs':[
+                    {'price':h.get('price'),'i':h.get('i')}
+                    for h in (piv.get('swing_highs') or [])[-6:]],
+                'swing_lows':[
+                    {'price':s.get('price'),'i':s.get('i')}
+                    for s in (piv.get('swing_lows') or [])[-6:]],
+            },
+            'zones':{
+                'support':({'lo':range_lo,'hi':range_lo,'label':'Support / swing low'}
+                           if range_lo is not None else None),
+                'resistance':({'lo':range_hi,'hi':range_hi,'label':'Resistance / swing high'}
+                              if range_hi is not None else None),
+                'buy_entry':buy_zone,
+                'sell_entry':sell_zone,
+            },
+            'swing_brackets':swing_brackets,
+            'open_levels':open_levels,
+        }
+
     def client_hard_risk(self,client_id: int) -> dict:
         from . import hard_risk
         return hard_risk.snapshot(self._client_store(client_id))

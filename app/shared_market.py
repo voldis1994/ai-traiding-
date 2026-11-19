@@ -6,12 +6,16 @@ phase, lots, and £ learning stay private per client.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 
 _lock = threading.RLock()
 # epic -> {analysis, bars_m1, last_at, updated_mono, source}
 _mtf: dict[str, dict] = {}
+# epic -> {side, source, confidence, bias, event, updated_mono}
+# Same-market clients must not invent opposite BUY vs SELL on one tape.
+_side: dict[str, dict] = {}
 
 
 def _finite(v):
@@ -99,13 +103,72 @@ def adopt_mtf(epic, *, local_bars=0, local_last_at=None, max_age_s=90.0) -> dict
         return out
 
 
+def publish_side(epic, side, *, source=None, confidence=None,
+                 bias=None, event=None) -> dict | None:
+    """Publish the market side for this epic (MTF preferred or structure bias)."""
+    if not epic:
+        return None
+    s = str(side or '').upper()
+    if s not in ('BUY', 'SELL'):
+        return None
+    try:
+        conf = float(confidence) if confidence is not None else 0.0
+    except (TypeError, ValueError):
+        conf = 0.0
+    if not math.isfinite(conf):
+        conf = 0.0
+    payload = {
+        'side': s,
+        'source': str(source or 'structure'),
+        'confidence': conf,
+        'bias': str(bias).upper() if bias else None,
+        'event': str(event) if event else None,
+        'updated_mono': time.monotonic(),
+    }
+    with _lock:
+        prev = _side.get(str(epic))
+        # Keep a stronger/fresher same-side vote; only flip when new conf is clear.
+        if prev is not None:
+            prev_side = str(prev.get('side') or '').upper()
+            prev_conf = float(prev.get('confidence') or 0)
+            age = time.monotonic() - float(prev.get('updated_mono') or 0)
+            if prev_side == s:
+                if conf < prev_conf and age < 30.0:
+                    return dict(prev)
+            elif conf < max(0.55, prev_conf) and age < 45.0:
+                # Weak opposite vote must not flip the fleet mid-tape.
+                return dict(prev)
+        _side[str(epic)] = payload
+        return dict(payload)
+
+
+def adopt_side(epic, *, max_age_s=90.0) -> dict | None:
+    """Shared BUY/SELL for this epic — Admin + soft entry alignment."""
+    if not epic:
+        return None
+    now = time.monotonic()
+    with _lock:
+        prev = _side.get(str(epic))
+        if not prev:
+            return None
+        age = now - float(prev.get('updated_mono') or 0)
+        if age > float(max_age_s):
+            return None
+        out = dict(prev)
+        out['shared'] = True
+        out['shared_age_s'] = round(age, 2)
+        return out
+
+
 def clear(epic=None):
     """Test helper — clear one epic or all."""
     with _lock:
         if epic is None:
             _mtf.clear()
+            _side.clear()
         else:
             _mtf.pop(str(epic), None)
+            _side.pop(str(epic), None)
 
 
 def mirror_historical_candles(peers, epic, bars) -> int:

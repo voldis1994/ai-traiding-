@@ -3028,6 +3028,26 @@ class SingleTradeEngine:
                 mtf=self._mtf_momentum_analysis()
             except Exception:
                 mtf=None
+        # Fleet side on this epic — refuse opposite OPEN so two clients
+        # do not invent BUY vs SELL on the same GOLD tape.
+        epic=(self.mandate or {}).get('epic')
+        if epic and action in ('BUY','SELL'):
+            try:
+                shared=shared_market.adopt_side(epic)
+            except Exception:
+                shared=None
+            if isinstance(shared,dict):
+                side=str(shared.get('side') or '').upper()
+                try:
+                    conf=float(shared.get('confidence') or 0)
+                except (TypeError,ValueError):
+                    conf=0.0
+                if side in ('BUY','SELL') and side!=action and conf>=0.45:
+                    return {
+                        'allowed':False,'action':action,
+                        'reason':f'wait_shared_side ({side})',
+                        'shared_side':side,'shared_source':shared.get('source'),
+                        'source':'shared_market'}
         return ohlc_entry_zones.entry_allows_open(
             action,
             candles=candles,
@@ -3157,9 +3177,58 @@ class SingleTradeEngine:
                 source=f'client:{getattr(self,"client_id",None) or "local"}')
             if isinstance(published,dict):
                 analysis=published
+        # Same-epic side vote — MTF preferred first, else structure bias.
+        # Stops one client BUY / peer SELL on one GOLD tape.
+        try:
+            self._publish_shared_market_side(epic,analysis)
+        except Exception:
+            pass
         mtf_momentum.persist(self.store,analysis)
         self._mtf_momentum=analysis
         return analysis
+
+    def _publish_shared_market_side(self,epic,analysis):
+        """Publish fleet side for this epic from MTF / structure (not neural)."""
+        if not epic or not isinstance(analysis,dict):
+            return None
+        side=None
+        source=None
+        conf=0.0
+        pref=str(analysis.get('preferred') or '').upper()
+        mode=str(analysis.get('mode') or '').upper()
+        try:
+            conf=float(analysis.get('confidence') or 0)
+        except (TypeError,ValueError):
+            conf=0.0
+        if pref in ('BUY','SELL') and analysis.get('ready'):
+            side,source=pref,'mtf_preferred'
+        elif mode in ('BUY','SELL') and analysis.get('ready'):
+            side,source=mode,'mtf_mode'
+        else:
+            # Structure bias from live OHLC — shared so Admin zones match.
+            try:
+                candles=self._decision_candles(epic,n=80) or []
+                mid=_num((self.market or {}).get('mid'))
+                ez=ohlc_entry_zones.compute_entry_zones(
+                    candles,mid=mid,mtf=analysis,store=self.store)
+                bias=str(ez.get('bias') or '').upper()
+                if bias in ('BUY','SELL','UP','DOWN'):
+                    # Map UP/DOWN → BUY/SELL for shared side.
+                    if bias in ('UP','BUY'):
+                        side,source='BUY','structure_bias'
+                    elif bias in ('DOWN','SELL'):
+                        side,source='SELL','structure_bias'
+                    conf=max(conf,0.45)
+                    return shared_market.publish_side(
+                        epic,side,source=source,confidence=conf,
+                        bias=ez.get('bias'),event=ez.get('event'))
+            except Exception:
+                return None
+        if side in ('BUY','SELL'):
+            return shared_market.publish_side(
+                epic,side,source=source,confidence=conf,
+                bias=analysis.get('bias'),event=analysis.get('event'))
+        return None
 
     def _mtf_snapshot_for_ui(self):
         """MTF analysis + NeuralCore-learned period weights (one decision source)."""

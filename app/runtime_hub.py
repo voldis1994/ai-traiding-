@@ -17,6 +17,14 @@ from .stream import CapitalQuoteStream
 log=logging.getLogger('runtime_hub')
 
 
+def _finite_num(v):
+    try:
+        n=float(v)
+    except (TypeError,ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
 def _remap_swing_marks(marks,full_n: int,display_n: int,limit: int=6,
                        path_n: int|None=None):
     """Map swing pivot indices onto the displayed candle slice.
@@ -837,7 +845,25 @@ class RuntimeHub:
         range_lo=ez.get('range_lo')
         buy_zone=ez.get('buy_entry')
         sell_zone=ez.get('sell_entry')
-        preferred=action if action in ('BUY','SELL') else None
+        # Same-epic shared side first — do not let two clients paint BUY vs SELL
+        # zones on one GOLD tape just because neural scores differ.
+        preferred=None
+        shared_side=None
+        try:
+            from . import shared_market
+            shared_side=shared_market.adopt_side(epic)
+        except Exception:
+            shared_side=None
+        if isinstance(shared_side,dict):
+            ss=str(shared_side.get('side') or '').upper()
+            if ss in ('BUY','SELL'):
+                preferred=ss
+        if not preferred and isinstance(mtf,dict) and mtf.get('ready'):
+            mp=str(mtf.get('preferred') or '').upper()
+            if mp in ('BUY','SELL'):
+                preferred=mp
+        if not preferred and action in ('BUY','SELL'):
+            preferred=action
         if not preferred and isinstance(scores,dict):
             try:
                 preferred=max(('BUY','SELL','HOLD'),
@@ -846,22 +872,36 @@ class RuntimeHub:
                     preferred=None
             except (TypeError,ValueError):
                 preferred=None
-        # Prefer MTF preferred when neural is quiet — matches LIVE soft stack.
-        if not preferred and isinstance(mtf,dict) and mtf.get('ready'):
-            mp=str(mtf.get('preferred') or '').upper()
-            if mp in ('BUY','SELL'):
-                preferred=mp
+        # Publish from this client's MTF/structure so peers can adopt.
+        if preferred in ('BUY','SELL') and epic:
+            try:
+                from . import shared_market
+                conf=(mtf or {}).get('confidence') if isinstance(mtf,dict) else None
+                shared_market.publish_side(
+                    epic,preferred,
+                    source='admin_structure_view',
+                    confidence=conf,
+                    bias=(ez.get('bias') if isinstance(ez,dict) else None),
+                    event=(ez.get('event') if isinstance(ez,dict) else None))
+            except Exception:
+                pass
         atr_hint=None
         kama_hint=None
-        # LIVE uses M5 KAMA first — Admin must match (not M1 overlay series).
+        # Bracket geometry uses M1 ATR (same as entry zones) — M5 stop_hint
+        # was only for protective width labels and inflated hairline SL floors.
         if isinstance(mtf,dict) and mtf.get('ready'):
-            atr_hint=mtf.get('stop_hint_atr14')
             tf=mtf.get('tf') or {}
+            atr_hint=_finite_num((tf.get('m1') or {}).get('atr14'))
+            if atr_hint is None:
+                atr_hint=_finite_num(mtf.get('stop_hint_atr14'))
             kama_hint=(tf.get('m5') or {}).get('kama')
             if kama_hint is None:
                 kama_hint=(tf.get('m1') or {}).get('kama')
         if atr_hint is None and isinstance(overlays,dict):
-            atr_hint=overlays.get('stop_hint_atr14') or overlays.get('atr14')
+            atr_hint=_finite_num(overlays.get('atr14')) or _finite_num(
+                overlays.get('stop_hint_atr14'))
+        if atr_hint is None and isinstance(ez,dict):
+            atr_hint=_finite_num(ez.get('atr14'))
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
@@ -929,6 +969,10 @@ class RuntimeHub:
             'mid':mid,
             'action':action,
             'preferred':preferred,
+            'shared_side':(shared_side.get('side')
+                           if isinstance(shared_side,dict) else None),
+            'shared_side_source':(shared_side.get('source')
+                                 if isinstance(shared_side,dict) else None),
             'scores':scores,
             'candles':bare,
             'structure':{

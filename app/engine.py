@@ -3013,7 +3013,7 @@ class SingleTradeEngine:
             bid=_num(market.get('bid')),
             tick=_num(market.get('tick')) or 0.01,
             spread=_num(market.get('spread')) or 0.,
-            mtf=mtf)
+            mtf=mtf,store=self.store)
     def _reentry_confirm_gate(self,action,*,scores_raw=None,mtf_analysis=None):
         """Raw neural + post-close move proof before same-dir / medium OPEN."""
         epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
@@ -4922,6 +4922,15 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','Re-entry confirm learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
+            try:
+                ohlc_entry_zones.observe_close(
+                    self.store,
+                    ohlc_meta=(saved.get('ohlc_entry')
+                               if isinstance(saved,dict) else None),
+                    broker_pnl=pnl_value,spread=spread_cost)
+            except Exception as exc:
+                self.store.event('warning','OHLC entry gates learn skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             equity=self._account_equity()
             if equity is not None:
                 hard_risk.check_drawdown_halt(self.store,equity)
@@ -5729,7 +5738,8 @@ class SingleTradeEngine:
             # Defense in depth: never market-chase outside OHLC+MTF entry stack.
             zone_gate=ohlc_entry_zones.entry_allows_open(
                 action,candles=candles,mid=mid,
-                ask=ask,bid=bid,tick=tick,spread=spread,mtf=mtf_live)
+                ask=ask,bid=bid,tick=tick,spread=spread,mtf=mtf_live,
+                store=self.store)
             if not zone_gate.get('allowed'):
                 self.last_entry_reason=zone_gate.get('reason') or 'wait_entry_zone'
                 self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{
@@ -5915,6 +5925,8 @@ class SingleTradeEngine:
                     'champion_context':open_ctx,
                     'reentry_confirm':reentry_confirm.open_meta_from_gate(
                         reentry_gate,action=action),
+                    'ohlc_entry':ohlc_entry_zones.open_meta_from_gate(
+                        zone_gate,action=action),
                     'structure_at_open':structure_at_open,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.

@@ -4,12 +4,204 @@ Intent comes from neural + MTF. Trigger is either:
   • zone  — pullback into discount (BUY) / premium (SELL) band, or
   • break — structure / range break in the neural side (do not wait for pullback).
 
-Bands still drive SL/TP geometry. MTF hard conflict (weak ADX / strong opposite)
-holds OPEN. Never invent mid ± κ.
+Gate knobs (band width, tape need, MTF conf) learn from closed broker £ via
+``observe_close`` — same pattern as reentry_confirm / bracket_learn.
+Never invent mid ± κ.
 """
 from __future__ import annotations
 
 from . import structure_memory
+
+STORE_KEY = 'ohlc_entry_gates_v1'
+
+DEFAULTS = {
+    'enabled': 1,
+    # Band geometry (BUY discount / SELL premium width).
+    'band_span_frac': 0.12,
+    'band_atr_frac': 0.25,
+    'band_span_cap': 0.45,
+    # Break tape / MTF agreement.
+    'tape_need': 2,
+    'break_mtf_conf': 0.55,
+    'mtf_opposite_conf': 0.75,
+    'zone_wide_conf': 0.50,
+    'shift_block_conf': 0.60,
+    # Rails.
+    'band_span_frac_min': 0.08,
+    'band_span_frac_max': 0.22,
+    'band_atr_frac_min': 0.15,
+    'band_atr_frac_max': 0.40,
+    'band_span_cap_min': 0.30,
+    'band_span_cap_max': 0.55,
+    'tape_need_min': 1,
+    'tape_need_max': 3,
+    'break_mtf_conf_min': 0.45,
+    'break_mtf_conf_max': 0.75,
+    'mtf_opposite_conf_min': 0.60,
+    'mtf_opposite_conf_max': 0.90,
+    'zone_wide_conf_min': 0.40,
+    'zone_wide_conf_max': 0.70,
+    'shift_block_conf_min': 0.50,
+    'shift_block_conf_max': 0.75,
+}
+
+
+def _clip(key, value):
+    lo = DEFAULTS.get(f'{key}_min')
+    hi = DEFAULTS.get(f'{key}_max')
+    n = _finite(value)
+    if n is None:
+        return float(DEFAULTS[key])
+    if lo is not None:
+        n = max(float(lo), n)
+    if hi is not None:
+        n = min(float(hi), n)
+    return float(n)
+
+
+def load_params(store=None) -> dict:
+    out = {k: DEFAULTS[k] for k in DEFAULTS if not k.endswith('_min') and not k.endswith('_max')}
+    if store is None:
+        return out
+    try:
+        from .self_params import get as sp_get
+        out['enabled'] = int(sp_get(store, 'ohlc_entry_gates_enabled', 1))
+        for k in ('band_span_frac', 'band_atr_frac', 'band_span_cap',
+                  'break_mtf_conf', 'mtf_opposite_conf', 'zone_wide_conf',
+                  'shift_block_conf'):
+            raw = sp_get(store, f'ohlc_gate_{k}', None)
+            if raw is not None:
+                out[k] = float(raw)
+        tn = sp_get(store, 'ohlc_gate_tape_need', None)
+        if tn is not None:
+            out['tape_need'] = int(tn)
+    except Exception:
+        pass
+    bag = store.get(STORE_KEY) if store is not None else None
+    if isinstance(bag, dict):
+        for k in out:
+            if bag.get(k) is not None:
+                if k == 'tape_need' or k == 'enabled':
+                    out[k] = int(bag[k])
+                else:
+                    out[k] = float(bag[k])
+    # Clamp to rails.
+    for k in ('band_span_frac', 'band_atr_frac', 'band_span_cap',
+              'break_mtf_conf', 'mtf_opposite_conf', 'zone_wide_conf',
+              'shift_block_conf'):
+        out[k] = _clip(k, out[k])
+    out['tape_need'] = int(round(_clip('tape_need', out['tape_need'])))
+    out['enabled'] = int(out.get('enabled') or 0)
+    return out
+
+
+def save_params(store, params: dict):
+    if store is None or not isinstance(params, dict):
+        return
+    clean = load_params(None)
+    for k in clean:
+        if params.get(k) is not None:
+            clean[k] = params[k]
+    for k in ('band_span_frac', 'band_atr_frac', 'band_span_cap',
+              'break_mtf_conf', 'mtf_opposite_conf', 'zone_wide_conf',
+              'shift_block_conf'):
+        clean[k] = _clip(k, clean[k])
+    clean['tape_need'] = int(round(_clip('tape_need', clean['tape_need'])))
+    clean['enabled'] = int(clean.get('enabled') or 0)
+    store.set(STORE_KEY, clean)
+
+
+def open_meta_from_gate(gate: dict, *, action) -> dict:
+    """Persist on entry_brain so close can teach OHLC gate knobs."""
+    if not isinstance(gate, dict):
+        return {}
+    return {
+        'action': action,
+        'trigger': gate.get('trigger'),
+        'reason': gate.get('reason'),
+        'allowed': bool(gate.get('allowed')),
+        'params': gate.get('params'),
+        'break_reason': (gate.get('break') or {}).get('reason')
+                        if isinstance(gate.get('break'), dict) else None,
+    }
+
+
+def observe_close(store, *, ohlc_meta=None, broker_pnl=None, spread=0.0):
+    """Adapt band / break knobs from break|zone OPEN outcomes (after costs)."""
+    meta = ohlc_meta if isinstance(ohlc_meta, dict) else {}
+    if not meta:
+        return {'adapted': False, 'reason': 'no_ohlc_meta'}
+    trigger = str(meta.get('trigger') or '').lower()
+    if trigger not in ('break', 'zone'):
+        return {'adapted': False, 'reason': 'no_trigger'}
+    pnl = _finite(broker_pnl)
+    if pnl is None:
+        return {'adapted': False, 'reason': 'no_pnl'}
+    cost = abs(_finite(spread) or 0.0)
+    useful = pnl > max(0.02, 0.25 * cost)
+    hurt = pnl < -max(0.02, 0.25 * cost)
+    if not useful and not hurt:
+        return {'adapted': False, 'reason': 'scratch_band'}
+    params = load_params(store)
+    if not params.get('enabled'):
+        return {'adapted': False, 'reason': 'disabled'}
+    notes = []
+    if trigger == 'break':
+        if hurt:
+            params['tape_need'] = int(round(_clip(
+                'tape_need', int(params['tape_need']) + 1)))
+            params['break_mtf_conf'] = _clip(
+                'break_mtf_conf', float(params['break_mtf_conf']) + 0.02)
+            params['band_span_frac'] = _clip(
+                'band_span_frac', float(params['band_span_frac']) - 0.01)
+            notes.append('tighten_break_after_loss')
+        elif useful:
+            params['break_mtf_conf'] = _clip(
+                'break_mtf_conf', float(params['break_mtf_conf']) - 0.01)
+            if int(params['tape_need']) > 1:
+                params['tape_need'] = int(round(_clip(
+                    'tape_need', int(params['tape_need']) - 1)))
+            notes.append('ease_break_after_win')
+    elif trigger == 'zone':
+        if hurt:
+            # Narrower band = more selective pullback touch.
+            params['band_span_frac'] = _clip(
+                'band_span_frac', float(params['band_span_frac']) - 0.01)
+            params['band_atr_frac'] = _clip(
+                'band_atr_frac', float(params['band_atr_frac']) - 0.02)
+            params['mtf_opposite_conf'] = _clip(
+                'mtf_opposite_conf', float(params['mtf_opposite_conf']) - 0.02)
+            notes.append('narrow_zone_after_loss')
+        elif useful:
+            params['band_span_frac'] = _clip(
+                'band_span_frac', float(params['band_span_frac']) + 0.005)
+            params['zone_wide_conf'] = _clip(
+                'zone_wide_conf', float(params['zone_wide_conf']) - 0.01)
+            notes.append('widen_zone_after_win')
+    if not notes:
+        return {'adapted': False, 'reason': 'no_rule_hit'}
+    save_params(store, params)
+    hist = list((store.get(STORE_KEY + ':hist') or [])) if store is not None else []
+    hist.append({
+        'pnl': pnl, 'useful': useful, 'hurt': hurt, 'trigger': trigger,
+        'notes': notes, 'params': {
+            'band_span_frac': params['band_span_frac'],
+            'band_atr_frac': params['band_atr_frac'],
+            'tape_need': params['tape_need'],
+            'break_mtf_conf': params['break_mtf_conf'],
+            'mtf_opposite_conf': params['mtf_opposite_conf'],
+        },
+    })
+    if store is not None:
+        store.set(STORE_KEY + ':hist', hist[-40:])
+        store.event('ohlc_gates', 'Adapted OHLC entry gates from outcome', {
+            'notes': notes, 'trigger': trigger, 'pnl': pnl,
+            'band_span_frac': params['band_span_frac'],
+            'tape_need': params['tape_need'],
+            'break_mtf_conf': params['break_mtf_conf'],
+        })
+    return {'adapted': True, 'notes': notes, 'params': params}
+
 
 
 def _finite(v):
@@ -42,12 +234,15 @@ def _mtf_kama(mtf):
     return None
 
 
-def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None):
+def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
+                        store=None,params=None):
     """Return structural BUY/SELL entry bands from OHLC swings / BOS + MTF.
 
     Same geometry Admin draws and LIVE waits for. ATR widens/narrows the band
     from real volatility; KAMA can tighten the wait edge when inside the range.
+    Band fractions come from learned ``params`` (store) when present.
     """
+    cfg=params if isinstance(params,dict) else load_params(store)
     out={
         'ok':False,'reason':'no_candles',
         'support':None,'resistance':None,
@@ -56,6 +251,11 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None):
         'bias':None,'event':None,
         'atr14':None,'kama':None,'mtf_mode':None,'mtf_preferred':None,
         'info_stack':'ohlc_swing',
+        'params':{
+            'band_span_frac':cfg.get('band_span_frac'),
+            'band_atr_frac':cfg.get('band_atr_frac'),
+            'band_span_cap':cfg.get('band_span_cap'),
+        },
     }
     if not candles or len(candles)<20:
         return out
@@ -88,10 +288,14 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None):
         spread_f=0.
     span=hi-lo
     # ATR from the same MTF stack LIVE uses — not an invented mid ± κ.
-    band=max(span*0.12,tick_f*8,spread_f*2)
+    # Fractions learn from closed £ (observe_close).
+    span_frac=float(cfg.get('band_span_frac') or 0.12)
+    atr_frac=float(cfg.get('band_atr_frac') or 0.25)
+    span_cap=float(cfg.get('band_span_cap') or 0.45)
+    band=max(span*span_frac,tick_f*8,spread_f*2)
     if atr is not None:
-        band=max(band,0.25*atr)
-        band=min(band,span*0.45)  # never swallow the whole range
+        band=max(band,atr_frac*atr)
+        band=min(band,span*span_cap)  # never swallow the whole range
     out['band']=band
     out['support']={'lo':lo,'hi':lo,'label':'Support / swing low'}
     out['resistance']={'lo':hi,'hi':hi,'label':'Resistance / swing high'}
@@ -132,13 +336,16 @@ def price_in_zone(zone,price,*,buffer=0.0):
     return (lo-buf)<=p<=(hi+buf)
 
 
-def _mtf_allows_side(action,mtf):
+def _mtf_allows_side(action,mtf,params=None):
     """Hard MTF filter: do not OPEN against a *strongly* opposing KAMA/ADX stack.
 
     Soft HOLD / mild cross no longer freezes entry when OHLC preferred agrees
     with the neural side — only hard ADX/spread blocks and high-confidence
-    opposite preferred (≥0.75) keep the wait.
+    opposite preferred keep the wait. Opposite conf threshold is learned.
     """
+    cfg=params if isinstance(params,dict) else DEFAULTS
+    opp_conf=float(cfg.get('mtf_opposite_conf') or 0.75)
+    shift_conf=float(cfg.get('shift_block_conf') or 0.60)
     if not isinstance(mtf,dict) or not mtf.get('ready'):
         return True,'mtf_not_ready'
     if mtf.get('enabled') is False:
@@ -158,17 +365,16 @@ def _mtf_allows_side(action,mtf):
     # OHLC/MTF already prefers our side — never treat as conflict.
     if preferred==action or mode==action:
         return True,'mtf_aligned'
-    # Only hard-block a *strong* opposite preferred (was 0.55 — froze on mild cross).
-    if (conf>=0.75 and preferred in ('BUY','SELL') and preferred!=action
+    # Only hard-block a *strong* opposite preferred.
+    if (conf>=opp_conf and preferred in ('BUY','SELL') and preferred!=action
             and mode!='SHIFT'):
         return False,f'wait_mtf_conflict ({mode}/{preferred})'
     # Mild cross / soft HOLD — allow zone check (neural+OHLC decide).
     if mode=='HOLD':
         return True,'mtf_hold_soft'
-    # SHIFT preferring the other side = early reverse — do not chase old side
-    # unless confidence is soft (<0.60).
+    # SHIFT preferring the other side = early reverse — do not chase old side.
     if mode=='SHIFT' and preferred in ('BUY','SELL') and preferred!=action:
-        if conf>=0.60:
+        if conf>=shift_conf:
             return False,f'wait_mtf_shift ({preferred})'
         return True,'mtf_shift_soft'
     return True,'mtf_aligned'
@@ -235,15 +441,20 @@ def _last_completed_close(candles):
     return _finite(rows[-1].get('close'))
 
 
-def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
+def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
+                         params=None):
     """True when structure/range break aligns with neural side AND M1 tape.
 
     Unified path: intent + break → OPEN without pullback zone. Micro BOS alone
-    must not BUY into a red dump (or SELL into a green spike) — that was the
-    illogical OHLC chase. Zones remain for SL/TP geometry.
+    must not BUY into a red dump (or SELL into a green spike). ``tape_need`` and
+    ``break_mtf_conf`` learn from closed £.
     """
+    cfg=params if isinstance(params,dict) else DEFAULTS
+    tape_need=max(1,int(cfg.get('tape_need') or 2))
+    break_conf=float(cfg.get('break_mtf_conf') or 0.55)
     action=(action or '').upper()
-    out={'ok':False,'reason':'no_break','side':None,'trigger':'break','tape_streak':0}
+    out={'ok':False,'reason':'no_break','side':None,'trigger':'break','tape_streak':0,
+         'tape_need':tape_need}
     if action not in ('BUY','SELL'):
         out['reason']='bad_action'
         return out
@@ -251,9 +462,9 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
     if p is None:
         out['reason']='no_price'
         return out
-    tape_ok,tape_streak=m1_tape_agrees(action,candles,need=2)
+    tape_ok,tape_streak=m1_tape_agrees(action,candles,need=tape_need)
     opp='SELL' if action=='BUY' else 'BUY'
-    opp_ok,_opp_streak=m1_tape_agrees(opp,candles,need=2)
+    opp_ok,_opp_streak=m1_tape_agrees(opp,candles,need=tape_need)
     out['tape_streak']=tape_streak
     pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
     mode=str((mtf or {}).get('mode') or '').upper() if isinstance(mtf,dict) else ''
@@ -261,7 +472,8 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
         conf=float((mtf or {}).get('confidence') or 0) if isinstance(mtf,dict) else 0.
     except (TypeError,ValueError):
         conf=0.
-    mtf_aligned=(pref==action) or (mode==action) or (mode=='SHIFT' and pref==action and conf>=0.55)
+    mtf_aligned=((pref==action) or (mode==action)
+                 or (mode=='SHIFT' and pref==action and conf>=break_conf))
     # Against a clear opposite M1 dump/spike — never break-chase the bounce.
     if opp_ok and not tape_ok:
         out['reason']='break_against_m1_tape'
@@ -271,7 +483,7 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
     want='UP' if action=='BUY' else 'DOWN'
     if side==want:
         # Micro structure break needs M1 pressure and/or strong MTF same side.
-        if tape_ok or (mtf_aligned and conf>=0.55):
+        if tape_ok or (mtf_aligned and conf>=break_conf):
             out['ok']=True
             out['reason']='ohlc_break_structure'
             return out
@@ -287,14 +499,16 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
             buf=max(float(tick or 0.01),0.)
         except (TypeError,ValueError):
             buf=0.01
-        aligned=mtf_aligned or (mode=='SHIFT' and conf>=0.55)
+        aligned=mtf_aligned or (mode=='SHIFT' and conf>=break_conf)
         if (action=='BUY' and aligned and hi is not None and last_c is not None
-                and last_c>=(hi-buf) and p>=(hi-buf) and (tape_ok or conf>=0.55)):
+                and last_c>=(hi-buf) and p>=(hi-buf)
+                and (tape_ok or conf>=break_conf)):
             out['ok']=True
             out['reason']='ohlc_break_range_high'
             return out
         if (action=='SELL' and aligned and lo is not None and last_c is not None
-                and last_c<=(lo+buf) and p<=(lo+buf) and (tape_ok or conf>=0.55)):
+                and last_c<=(lo+buf) and p<=(lo+buf)
+                and (tape_ok or conf>=break_conf)):
             out['ok']=True
             out['reason']='ohlc_break_range_low'
             return out
@@ -302,27 +516,35 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
 
 
 def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
-                      tick=0.01,spread=0.0,mtf=None):
+                      tick=0.01,spread=0.0,mtf=None,store=None,params=None):
     """Gate LIVE OPEN: zone touch OR structure/range break + MTF ok.
 
     BUY uses ask (or mid); SELL uses bid (or mid). Buffer = 1 tick.
+    Learned knobs from ``store`` / ``params`` (band, tape, MTF conf).
     """
+    cfg=params if isinstance(params,dict) else load_params(store)
     action=(action or '').upper()
     meta={
         'allowed':False,'action':action,'reason':'bad_action',
         'zones':None,'price':None,'zone':None,'source':'ohlc_entry_zones',
-        'mtf_ok':None,'trigger':None,'intent':action if action in ('BUY','SELL') else None}
+        'mtf_ok':None,'trigger':None,'intent':action if action in ('BUY','SELL') else None,
+        'params':{
+            'band_span_frac':cfg.get('band_span_frac'),
+            'tape_need':cfg.get('tape_need'),
+            'break_mtf_conf':cfg.get('break_mtf_conf'),
+            'mtf_opposite_conf':cfg.get('mtf_opposite_conf'),
+        }}
     if action not in ('BUY','SELL'):
         return meta
-    mtf_ok,mtf_reason=_mtf_allows_side(action,mtf)
+    mtf_ok,mtf_reason=_mtf_allows_side(action,mtf,params=cfg)
     meta['mtf_ok']=mtf_ok
     if not mtf_ok:
         meta['reason']=mtf_reason
         meta['zones']=compute_entry_zones(
-            candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
+            candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
         return meta
     zones=compute_entry_zones(
-        candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
+        candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
     meta['zones']=zones
     if not zones.get('ok'):
         meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
@@ -342,9 +564,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         meta['reason']='wait_entry_zone (no_price)'
         return meta
     # --- Trigger A: break (catch the move — do not wait for pullback) ---
-    # Pass completed candles so break cannot fight the M1 tape / forming mid.
     br=break_trigger_allows(
-        action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles)
+        action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles,
+        params=cfg)
     meta['break']=br
     if br.get('ok'):
         meta['allowed']=True
@@ -365,12 +587,11 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     except (TypeError,ValueError):
         conf=0.
     pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
-    if pref==action and conf>=0.50:
+    wide_conf=float(cfg.get('zone_wide_conf') or 0.50)
+    if pref==action and conf>=wide_conf:
         buf=max(buf,buf*3.0,float(tick or 0.01)*3)
         meta['wide_ohlc_touch']=True
     # --- Trigger B: pullback zone (cheaper entry into structure) ---
-    # Zone BUY at discount during a dump is intentional OHLC (support); break
-    # chase into the dump was the illogical path (blocked above).
     if price_in_zone(zone,price,buffer=buf):
         meta['allowed']=True
         meta['trigger']='zone'

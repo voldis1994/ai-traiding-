@@ -280,6 +280,14 @@ table.data tr:last-child td{border-bottom:0}
   font-size:12px;color:var(--muted);margin-top:2px}
 .deal-meta strong{color:var(--text);font-weight:600}
 
+.ohlc-panel{border-top:1px solid var(--line-soft);padding:8px 12px 10px;background:rgba(0,0,0,.18)}
+.ohlc-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline;
+  font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.ohlc-head span{color:var(--text);font-weight:700}
+.ohlc-mini{display:block;width:100%;height:150px;border-radius:10px;
+  border:1px solid var(--line-soft);background:#080c0e}
+.ohlc-legend{margin-top:6px;font-size:11px;line-height:1.35}
+
 .nerve{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line-soft)}
 .nerve > div{padding:12px 14px;border-right:1px solid var(--line-soft);text-align:center}
 .nerve > div:last-child{border-right:0}

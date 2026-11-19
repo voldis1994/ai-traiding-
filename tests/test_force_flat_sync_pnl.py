@@ -96,7 +96,10 @@ def test_flat_sync_retries_pending_and_binds():
 
 
 def test_pending_settles_last_upl_as_realized():
-    """Capital cash lag → bank last live UPL as peļņa and clear [gaida £]."""
+    """Capital cash lag → show UPL in journal but keep harvesting real £.
+
+    Neural teach must wait for verified broker cash (not UPL estimate).
+    """
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -119,8 +122,19 @@ def test_pending_settles_last_upl_as_realized():
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.19)
             assert row['pnl_source']=='upl_estimate'
-            assert not (store.get('pending_broker_pnl_deals') or [])
-            assert store.get('broker_cash_banked:upl1')
+            # Still queued until Capital history returns broker £.
+            pending=store.get('pending_broker_pnl_deals') or []
+            assert any(str((x.get('deal_id') if isinstance(x,dict) else x))=='upl1'
+                       for x in pending)
+            assert not store.get('broker_cash_banked:upl1')
+            assert not e._trade_already_learned('upl1')
+            # Real broker £ later → neural teach once.
+            broker.tx=[{'reference':'upl1','pnl':-0.21,'currency':'GBP'}]
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.21)
+            assert row['pnl_source']=='broker'
+            assert e._trade_already_learned('upl1')
     asyncio.run(scenario())
 
 

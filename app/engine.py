@@ -54,6 +54,7 @@ from . import day_book
 from . import mtf_momentum
 from . import reentry_confirm
 from . import ohlc_entry_zones
+from . import shared_market
 
 DB=DATA/'robot.sqlite3'
 
@@ -2118,6 +2119,16 @@ class SingleTradeEngine:
             'Historical M1 bootstrap from broker' if after>=need
             else 'Historical M1 bootstrap partial — continuing with live bars',
             {'epic':epic,'need':need,'have':after,'gained':after-before,'pages':pages+1})
+        # Same public market: mirror HISTORICAL M1 into peer clients on this epic
+        # so MTF/OHLC do not diverge from uneven Capital polls.
+        if after>before:
+            try:
+                recent=self.store.candles(epic,n=min(after,need),historical_only=True) or []
+                shared_market.mirror_historical_candles(
+                    self._peer_engines(),epic,recent)
+            except Exception as exc:
+                self.store.event('warning','Peer candle mirror skipped',
+                                 {'type':type(exc).__name__,'epic':epic})
         return after
 
     async def _account_and_candles(self):
@@ -3064,6 +3075,17 @@ class SingleTradeEngine:
         structure_edge.persist_advice(self.store,advice)
         return advice
 
+    def _peer_engines(self):
+        """Other live engines (hub) — same-process peers for shared GOLD tape."""
+        fn=getattr(self,'_peer_engines_fn',None)
+        if not callable(fn):
+            return []
+        try:
+            peers=fn() or []
+        except Exception:
+            return []
+        return [e for e in peers if e is not None and e is not self]
+
     def _mtf_momentum_analysis(self):
         """M1→M60 Momentum+Structure+ADX+ATR stack — soft evidence + SHIFT mode.
 
@@ -3071,6 +3093,9 @@ class SingleTradeEngine:
         structure-view and `_decision_candles`. historical_only=True dropped every
         closed minute still tagged QUOTE until broker rewrite, so ADX/ATR flickered
         to missing and Admin showed MTF HOLD · ohlc_swing.
+
+        Same epic across clients: adopt/publish via ``shared_market`` so MTF mode
+        is not invented differently just because polls landed a few seconds apart.
         """
         epic=(self.mandate or {}).get('epic')
         if not epic:
@@ -3081,6 +3106,14 @@ class SingleTradeEngine:
         except Exception:
             candles=[]
         chron=sorted(candles,key=lambda r:r.get('at') or '')
+        bars_n,last_at,_close=shared_market.fingerprint(chron)
+        # Prefer a fresh shared snapshot when peer already evaluated this tape.
+        shared=shared_market.adopt_mtf(
+            epic,local_bars=bars_n,local_last_at=last_at)
+        if shared is not None:
+            mtf_momentum.persist(self.store,shared)
+            self._mtf_momentum=shared
+            return shared
         spr=_num((self.market or {}).get('spread'))
         if spr is None:
             spr=0.0
@@ -3089,6 +3122,13 @@ class SingleTradeEngine:
         # Brief sticky: if this tick is thin but same-epic was ready, keep ADX/ATR
         # visible for signal/UI instead of flashing HOLD/zeros every poll hole.
         if not analysis.get('ready'):
+            # Peer may already have a ready stack for this epic — use it.
+            peer=shared_market.adopt_mtf(
+                epic,local_bars=0,local_last_at=None,max_age_s=120.0)
+            if peer is not None:
+                mtf_momentum.persist(self.store,peer)
+                self._mtf_momentum=peer
+                return peer
             prev=(getattr(self,'_mtf_momentum',None)
                   or mtf_momentum.load(self.store))
             if (isinstance(prev,dict) and prev.get('ready')
@@ -3099,6 +3139,12 @@ class SingleTradeEngine:
                 sticky['bars_m1_now']=analysis.get('bars_m1')
                 self._mtf_momentum=sticky
                 return sticky
+        else:
+            published=shared_market.publish_mtf(
+                epic,analysis,bars_m1=bars_n,last_at=last_at,
+                source=f'client:{getattr(self,"client_id",None) or "local"}')
+            if isinstance(published,dict):
+                analysis=published
         mtf_momentum.persist(self.store,analysis)
         self._mtf_momentum=analysis
         return analysis

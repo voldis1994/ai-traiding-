@@ -380,12 +380,17 @@ def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
     assert swing['swing_lo'] == pytest.approx(103.0, abs=0.05)
     # TP is nearest swing high above entry (reachable), not a far day extreme.
     assert swing['swing_hi'] >= entry
-    # Not symmetric ± around entry (the live Gold bug: ±12.21 both sides).
-    assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
     assert swing['stop_level'] < entry < swing['profit_level']
-    # SL below swing low, TP at a swing high above entry.
-    assert swing['stop_level'] < swing['swing_lo']
+    # Structural TP stays at/above a swing high; SL may be RR-capped toward entry.
     assert swing['profit_level'] >= entry
+    if not swing.get('rr_capped'):
+        assert swing['stop_level'] < swing['swing_lo']
+        # Pre-RR: not the live Gold invent bug (±same distance both sides).
+        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
+    else:
+        # Min RR=1.0 may equalize distances — still not invented median zone.
+        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+        assert '+rr_cap_sl' in str(swing.get('reason') or '')
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
@@ -418,10 +423,12 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     assert swing['ready'] is True, swing.get('reason')
     assert swing['source'] == 'swing_anchor'
     assert swing['stop_level'] < entry < swing['profit_level']
-    # Still structural — not symmetric invented ±zone
-    assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
-    assert swing['reason'] in ('swing_levels', 'swing_measured_move',
-                               'swing_levels_closer_sl')
+    base = str(swing.get('reason') or '').split('+')[0]
+    assert base in ('swing_levels', 'swing_measured_move', 'swing_levels_closer_sl')
+    if swing.get('rr_capped'):
+        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+    else:
+        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
@@ -429,6 +436,64 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     assert decided['ready'] is True
     assert decided['source'] == 'swing_anchor'
     assert decided['source'] != 'ohlc_zone'
+
+
+def test_apply_min_rr_caps_wide_sl_toward_entry():
+    """Gold-style ~21pt SL vs ~3pt TP → SL capped to profit/min_rr (not fantasy TP)."""
+    from app.bracket_learn import apply_min_rr
+    # SELL: entry 2650, SL far above (21), TP only 3 below.
+    entry, stop_d, profit_d = 2650.0, 21.0, 3.0
+    stop_level = entry + stop_d
+    profit_level = entry - profit_d
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=stop_level,
+        profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
+        floor=1.0, min_rr=1.0)
+    assert out['ok'] is True
+    assert out['capped'] is True
+    assert out['stop_distance'] == pytest.approx(3.0, abs=1e-9)
+    assert out['profit_distance'] == pytest.approx(3.0, abs=1e-9)
+    assert out['rr'] == pytest.approx(1.0, abs=1e-9)
+    assert out['stop_level'] == pytest.approx(entry + 3.0, abs=1e-9)
+    assert out['profit_level'] == pytest.approx(profit_level, abs=1e-9)
+
+
+def test_apply_min_rr_refuses_when_floor_blocks_cap():
+    """If SL cannot shrink to hit RR without going below ATR floor → refuse."""
+    from app.bracket_learn import apply_min_rr
+    out = apply_min_rr(
+        action='BUY', entry=100.0, stop_level=90.0, profit_level=101.0,
+        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.0)
+    assert out['ok'] is False
+    assert out['reason'] == 'rr_unachievable_vs_floor'
+
+
+def test_swing_anchor_applies_min_rr_on_wide_sl():
+    """End-to-end: wide protective swing vs tight TP gets RR-capped SL."""
+    from app.bracket_learn import swing_anchor_brackets
+    # Deep swing low far under entry; nearest high only a few pts above.
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        # Deep swing low ~95 then grind up to entry ~112 with tiny upside room.
+        (109, 109.5, 95.0, 96.0), (96.0, 100, 94.8, 99.5), (99.5, 105, 99, 104),
+        (104, 108, 103.5, 107), (107, 111, 106.5, 110), (110, 113, 109.5, 112.5),
+        (112.5, 113.0, 111.8, 112.2), (112.2, 112.5, 111.5, 112.0),
+    ]
+    rows = _swing_rows(seq)
+    entry = 112.0
+    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
+    swing = swing_anchor_brackets(
+        candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
+        min_distance=0.2, atr=2.0, zone=zone)
+    if swing.get('ready'):
+        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+        assert swing['stop_distance'] + 1e-9 <= swing['profit_distance'] / float(
+            swing.get('min_rr') or 1.0) + 1e-6
+    else:
+        assert swing.get('reason') in (
+            'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',
+            'swing_distances_below_floor', 'no_structural_swings_for_entry')
 
 
 def test_live_open_does_not_silently_fall_back_to_ohlc_zone():

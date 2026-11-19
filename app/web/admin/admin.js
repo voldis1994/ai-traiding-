@@ -696,9 +696,16 @@ function renderCard(c){
       })()}
       <div><span>MTF režīms</span><strong>${esc(((a.mtf_momentum||{}).mode)||'—')}${
         (a.mtf_momentum&&a.mtf_momentum.preferred)?(' · '+esc(a.mtf_momentum.preferred)) : ''
-      }${
-        (a.mtf_momentum&&a.mtf_momentum.stop_hint_atr14!=null)
-          ?(' · ATR '+esc(num(a.mtf_momentum.stop_hint_atr14,2))) : ''
+      }${(()=>{
+        const m=a.mtf_momentum||{};
+        const m1=((m.tf||{}).m1||{}).atr14;
+        const m5=m.stop_hint_atr14;
+        const bits=[];
+        if(m1!=null&&Number.isFinite(Number(m1)))bits.push('M1 ATR '+esc(num(m1,2)));
+        if(m5!=null&&Number.isFinite(Number(m5)))bits.push('M5 stop '+esc(num(m5,2)));
+        return bits.length?(' · '+bits.join(' · ')):'';
+      })()}${
+        (a.mtf_momentum&&a.mtf_momentum.shared)?' · shared':''
       }</strong></div>
       ${(()=>{
         const pw=(a.mtf_momentum&&(a.mtf_momentum.neural_period_weights||a.mtf_momentum.period_weights))||null;

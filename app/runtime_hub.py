@@ -1204,10 +1204,17 @@ class RuntimeHub:
             engine=SingleTradeEngine(store,brain,policy_path=data_dir/'policy.py')
             stream=CapitalQuoteStream()
             engine.quote_stream=stream
+            engine.client_id=client_id
+            # Same-epic MTF/OHLC peers — market perception shared, brains private.
+            engine._peer_engines_fn=lambda cid=client_id: [
+                r.engine for r in self.all_runtimes()
+                if r and r.engine is not None and int(r.client_id)!=int(cid)
+            ]
             creds=self.platform.broker_credentials(broker_row)
             store.event('learning','Per-client neural runtime started',
                         {'client_id':client_id,'neural_seed':seed,
-                         'data_dir':str(data_dir)})
+                         'data_dir':str(data_dir),
+                         'shared_epic_market':True})
             broker=connected_broker
             owns_connect=broker is None
             if owns_connect:

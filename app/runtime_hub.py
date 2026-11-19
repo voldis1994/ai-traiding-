@@ -646,11 +646,17 @@ class RuntimeHub:
         except FileNotFoundError:
             return {'ok':False,'reason':'no_store','client_id':cid,
                     'candles':[],'zones':{},'levels':{}}
+        epic_source=None
         if rt and rt.started and rt.engine is not None:
             eng=rt.engine
             market=getattr(eng,'market',None) or {}
-            epic=(market.get('epic') or (getattr(eng,'mandate',None) or {}).get('epic')
-                  or getattr(eng.brain,'epic',None))
+            mandate=(getattr(eng,'mandate',None) or {})
+            if market.get('epic'):
+                epic=market.get('epic');epic_source='live_quote'
+            elif mandate.get('epic'):
+                epic=mandate.get('epic');epic_source='mandate'
+            elif getattr(eng.brain,'epic',None):
+                epic=eng.brain.epic;epic_source='brain'
             mid=market.get('mid')
             try:
                 spread=float(market.get('spread') or 0)
@@ -669,14 +675,35 @@ class RuntimeHub:
             epic=store.get('legacy_brain_epic')
             if isinstance(epic,str):
                 epic=epic.strip('"') or None
+            if epic:
+                epic_source='legacy_brain'
         if not epic:
             try:
                 row=store.db.execute(
                     "SELECT epic FROM trades ORDER BY opened DESC LIMIT 1").fetchone()
                 epic=row[0] if row else None
+                if epic:
+                    epic_source='last_trade'
             except Exception:
                 epic=None
-        epic=epic or 'GOLD'
+        client_name=None
+        username=None
+        try:
+            crow=self.platform.get_client(cid)
+            if isinstance(crow,dict):
+                client_name=crow.get('display_name') or crow.get('name')
+                username=crow.get('username')
+        except Exception:
+            pass
+        # Never invent GOLD — robot trades whatever Capital mandate/epic is live.
+        if not epic:
+            return {
+                'ok':False,'reason':'no_epic','client_id':cid,
+                'client_name':client_name,'display_name':client_name,'username':username,
+                'epic':None,'epic_source':None,'candles':[],'zones':{},
+                'structure':{},'swing_brackets':None,'open_levels':[],
+                'hint':'Atver manuālu darījumu Capital.com jebkurā tirgū — robots adoptē to epic un OHLC.',
+            }
         candles=store.candles(epic,n=max(40,min(int(n),180)),historical_only=False) or []
         live=structure_memory.snapshot_live(candles=candles,mid=mid)
         bos=structure_memory.bos_choch(candles,left=2,right=2) if candles else {}
@@ -753,20 +780,6 @@ class RuntimeHub:
                 })
             except (KeyError,TypeError,ValueError):
                 continue
-        client_name=None
-        username=None
-        try:
-            row=self.platform.get_client(cid) if hasattr(self.platform,'get_client') else None
-            if not row and hasattr(self.platform,'client'):
-                row=self.platform.client(cid)
-            if not row and hasattr(self.platform,'list_clients'):
-                row=next((c for c in (self.platform.list_clients() or [])
-                          if int(c.get('id') or 0)==cid),None)
-            if isinstance(row,dict):
-                client_name=row.get('display_name') or row.get('name')
-                username=row.get('username')
-        except Exception:
-            pass
         return {
             'ok':True,
             'client_id':cid,
@@ -774,6 +787,7 @@ class RuntimeHub:
             'display_name':client_name,
             'username':username,
             'epic':epic,
+            'epic_source':epic_source,
             'mid':mid,
             'action':action,
             'preferred':preferred,
@@ -801,6 +815,28 @@ class RuntimeHub:
             },
             'swing_brackets':swing_brackets,
             'open_levels':open_levels,
+        }
+
+    async def prepare_new_market(self,client_id: int) -> dict:
+        """Clear mandate so the next Capital manual trade adopts ANY epic.
+
+        Neural weights / per-epic learning bags stay parked. OHLC entry+SL/TP
+        will follow the newly adopted instrument's candles — not a GOLD lock.
+        """
+        cid=int(client_id)
+        rt=self.get(cid)
+        if not rt or not rt.started or rt.engine is None:
+            raise RuntimeError('Robots nav palaists')
+        if not rt.engine.broker:
+            raise RuntimeError('Nav brokera sesijas')
+        out=await rt.engine.prepare_new_instrument()
+        return {
+            'ok':True,
+            'client_id':cid,
+            'previous_epic':out.get('previous_epic'),
+            'next_step':out.get('next_step') or (
+                'Aizver veco pozīciju un Capital.com atver pirmo darījumu jaunajā tirgū'),
+            'note':'Robots nav piesaistīts tikai GOLD — adoptē jebkuru Capital epic; OHLC SL/TP no tā tirgus svecēm.',
         }
 
     def client_hard_risk(self,client_id: int) -> dict:

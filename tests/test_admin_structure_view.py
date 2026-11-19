@@ -56,3 +56,48 @@ def test_admin_ohlc_page_route_exists():
         r = c.get('/admin/ohlc')
         assert r.status_code == 200
         assert b'ohlc-full' in r.content or b'OHLC' in r.content
+
+
+def test_structure_view_never_invents_gold_without_epic():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        platform = PlatformStore(root / 'platform.sqlite3')
+        client = platform.create_client('noepic', 'pass1234', 'No Epic', 'lv')
+        cid = int(client['id'])
+        data_dir = platform.account_data_dir(cid)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(data_dir / 'robot.sqlite3')
+        # account_data_dir is global DATA/ — wipe any prior fixture noise.
+        store.set('legacy_brain_epic', None)
+        store.db.execute('DELETE FROM trades')
+        store.db.execute('DELETE FROM candles')
+        store.db.commit()
+        hub = RuntimeHub(platform)
+        view = hub.admin_client_structure_view(cid, n=90)
+        assert view.get('ok') is False
+        assert view.get('reason') == 'no_epic'
+        assert view.get('epic') in (None, '')
+        assert view.get('epic') != 'GOLD'
+
+
+def test_structure_view_uses_us500_not_gold_default():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        platform = PlatformStore(root / 'platform.sqlite3')
+        client = platform.create_client('idx1', 'pass1234', 'Index One', 'lv')
+        cid = int(client['id'])
+        data_dir = platform.account_data_dir(cid)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(data_dir / 'robot.sqlite3')
+        store.db.execute('DELETE FROM trades')
+        store.db.execute('DELETE FROM candles')
+        store.db.commit()
+        store.set('legacy_brain_epic', 'US500')
+        for row in _candles(70):
+            store.candle('US500', row, source='HISTORICAL')
+        hub = RuntimeHub(platform)
+        view = hub.admin_client_structure_view(cid, n=90)
+        assert view['ok'] is True
+        assert view['epic'] == 'US500'
+        assert view['epic'] != 'GOLD'
+        assert view.get('epic_source') == 'legacy_brain'

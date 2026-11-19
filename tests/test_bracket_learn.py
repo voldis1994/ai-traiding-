@@ -351,10 +351,17 @@ def test_decide_brackets_from_ohlc_uses_zone_not_multipliers():
     assert out['ohlc_kappa']==pytest.approx(1.5)
 
 
+def _swing_rows(seq, t0=None):
+    t0 = t0 or datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    return [{
+        'at': (t0 + timedelta(minutes=i)).isoformat(),
+        'open': o, 'high': h, 'low': l, 'close': c,
+    } for i, (o, h, l, c) in enumerate(seq)]
+
+
 def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
     """SL/TP must sit on swing high/low — not random ±κ around entry."""
     from app.bracket_learn import swing_anchor_brackets
-    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
     # Clear swings: SL~103, SH~112, entry mid-range.
     seq = [
         (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
@@ -363,31 +370,79 @@ def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
         (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
         (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
     ]
-    rows = [{
-        'at': (t0 + timedelta(minutes=i)).isoformat(),
-        'open': o, 'high': h, 'low': l, 'close': c,
-    } for i, (o, h, l, c) in enumerate(seq)]
+    rows = _swing_rows(seq)
     entry = 107.0
     zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
     assert swing['ready'] is True
-    assert swing['swing_lo'] == 103.0
-    assert swing['swing_hi'] == 112.0
+    assert swing['swing_lo'] == pytest.approx(103.0, abs=0.05)
+    # TP is nearest swing high above entry (reachable), not a far day extreme.
+    assert swing['swing_hi'] >= entry
     # Not symmetric ± around entry (the live Gold bug: ±12.21 both sides).
     assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
     assert swing['stop_level'] < entry < swing['profit_level']
-    # SL below swing low, TP at swing high.
+    # SL below swing low, TP at a swing high above entry.
     assert swing['stop_level'] < swing['swing_lo']
-    assert swing['profit_level'] == pytest.approx(112.0, abs=0.05)
+    assert swing['profit_level'] >= entry
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
         entry=entry, action='BUY', candles=rows, atr=2.0)
     assert decided['source'] == 'swing_anchor'
-    assert decided['swing_lo'] == 103.0
-    assert decided['swing_hi'] == 112.0
+    assert decided['swing_lo'] == pytest.approx(103.0, abs=0.05)
+    assert decided['profit_level'] > entry
+
+
+def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
+    """2nd OPEN after BOS must stay swing-sourced — not invent median ±distance."""
+    from app.bracket_learn import swing_anchor_brackets
+    # Build clear SL/SH then push close above last SH (continuation / BOS).
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
+        (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
+        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+        # Break above last SH=112
+        (110.5, 114.5, 110.4, 114.0), (114.0, 115.0, 113.5, 114.5),
+        (114.5, 114.8, 113.8, 114.2),
+    ]
+    rows = _swing_rows(seq)
+    entry = 114.2  # above last confirmed SH — old code returned entry_above_swing_high
+    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
+    swing = swing_anchor_brackets(
+        candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
+        min_distance=0.2, atr=2.0, zone=zone)
+    assert swing['ready'] is True, swing.get('reason')
+    assert swing['source'] == 'swing_anchor'
+    assert swing['stop_level'] < entry < swing['profit_level']
+    # Still structural — not symmetric invented ±zone
+    assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
+    assert swing['reason'] in ('swing_levels', 'swing_measured_move',
+                               'swing_levels_closer_sl')
+
+    decided = decide_brackets_from_ohlc(
+        zone, tick=0.01, spread=0.05, min_distance=0.2,
+        entry=entry, action='BUY', candles=rows, atr=2.0, require_swing=True)
+    assert decided['ready'] is True
+    assert decided['source'] == 'swing_anchor'
+    assert decided['source'] != 'ohlc_zone'
+
+
+def test_live_open_does_not_silently_fall_back_to_ohlc_zone():
+    """When swings cannot place levels, refuse — do not invent median ±distance."""
+    zone = {'kappa': 1.5, 'range_distance': 12.0, 'max_tp': 20.0, 'noise_distance': 10.0,
+            'ready': True}
+    # Too few bars → no pivots → require_swing must refuse zone invent.
+    rows = _swing_rows([(100, 100.5, 99.5, 100.2)] * 4)
+    out = decide_brackets_from_ohlc(
+        zone, tick=0.01, spread=0.05, min_distance=0.2,
+        entry=100.0, action='BUY', candles=rows, require_swing=True)
+    assert out['ready'] is False
+    assert out['source'] == 'swing_anchor'
+    assert out.get('stop_distance') is None
 
 
 def test_ohlc_decision_ignores_inflated_learned_multipliers_on_open():

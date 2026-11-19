@@ -53,6 +53,7 @@ DEFAULTS = {
     # Learning — moderate pace for sparse broker £ feedback.
     # High LR (0.28+) + many repeats caused fast forgetfulness / instability.
     # learn_lr is always 0.01 steps (0.10, 0.11, 0.12…) — never 0.104 / 0.123.
+    # Soft ceiling clamps stale Store values that still hold 0.28 from older builds.
     'learn_lr': 0.10,
     'learn_win_repeats': 2,
     'learn_loss_repeats': 3,
@@ -275,6 +276,10 @@ IMMUTABLE_NOTE = (
 
 # learn_lr moves only in whole hundredths — same discipline as entry_edge.
 LEARN_LR_STEP = 0.01
+# Hard rail in BOUNDS is 0.50; soft ceiling stops live Stores from keeping 0.28+.
+LEARN_LR_SOFT_MAX = 0.12
+LEARN_WIN_REPEATS_SOFT_MAX = 3
+LEARN_LOSS_REPEATS_SOFT_MAX = 3
 
 
 def _finite(v):
@@ -286,14 +291,19 @@ def _finite(v):
 
 
 def quantize_learn_lr(v) -> float:
-    """Snap learn_lr to 0.01 steps within rails: 0.10 → 0.11, never 0.104."""
+    """Snap learn_lr to 0.01 steps within rails: 0.10 → 0.11, never 0.104.
+
+    Also clamps to LEARN_LR_SOFT_MAX so older Stores with 0.28 do not keep
+    overwriting good early weights after ~10 sparse trades.
+    """
     n=_finite(v)
     if n is None:
         n=float(DEFAULTS['learn_lr'])
     step=float(LEARN_LR_STEP)
     snapped=round(round(n/step)*step,2)
     lo,hi=BOUNDS['learn_lr']
-    return max(float(lo),min(float(hi),snapped))
+    snapped=max(float(lo),min(float(hi),snapped))
+    return min(float(LEARN_LR_SOFT_MAX),snapped)
 
 
 def _clip(key, value):
@@ -343,12 +353,35 @@ def load(store) -> dict:
         for k,v in raw.items():
             if k in DEFAULTS:
                 out[k]=_clip(k,v)
+    # Soft ceilings — migrate hot LR / heavy repeats left over from older builds.
+    out['learn_lr']=quantize_learn_lr(out.get('learn_lr'))
+    try:
+        out['learn_win_repeats']=min(
+            int(LEARN_WIN_REPEATS_SOFT_MAX),
+            max(1,int(out.get('learn_win_repeats') or DEFAULTS['learn_win_repeats'])))
+        out['learn_loss_repeats']=min(
+            int(LEARN_LOSS_REPEATS_SOFT_MAX),
+            max(1,int(out.get('learn_loss_repeats') or DEFAULTS['learn_loss_repeats'])))
+    except (TypeError,ValueError):
+        out['learn_win_repeats']=int(DEFAULTS['learn_win_repeats'])
+        out['learn_loss_repeats']=int(DEFAULTS['learn_loss_repeats'])
     return out
 
 
 def save(store, params: dict, *, reason=''):
     if store is None:return
     clean={k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS}
+    clean['learn_lr']=quantize_learn_lr(clean.get('learn_lr'))
+    try:
+        clean['learn_win_repeats']=min(
+            int(LEARN_WIN_REPEATS_SOFT_MAX),
+            max(1,int(clean.get('learn_win_repeats') or DEFAULTS['learn_win_repeats'])))
+        clean['learn_loss_repeats']=min(
+            int(LEARN_LOSS_REPEATS_SOFT_MAX),
+            max(1,int(clean.get('learn_loss_repeats') or DEFAULTS['learn_loss_repeats'])))
+    except (TypeError,ValueError):
+        clean['learn_win_repeats']=int(DEFAULTS['learn_win_repeats'])
+        clean['learn_loss_repeats']=int(DEFAULTS['learn_loss_repeats'])
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)

@@ -5238,40 +5238,56 @@ class SingleTradeEngine:
         stop_lvl=_broker_price_level(bp.get('stop_level'))
         profit_lvl=_broker_price_level(bp.get('profit_level'))
         source=bp.get('bracket_source') or 'swing_anchor'
+        sign=1 if direction=='BUY' else -1
         if not (bp.get('ready') and decided_sl and decided_tp
                 and decided_sl>0 and decided_tp>0):
+            tip=float(atr_hint) if atr_hint and atr_hint>0 else float(base_sl)
+            tip=max(float(min_dist)*2.0,tip,float(min_dist)+buffer)
             if live_sl is not None and live_tp is None and direction in ('BUY','SELL'):
                 # Keep live SL; synthesize TP from ATR / broker min × 2.
-                tip=float(atr_hint) if atr_hint and atr_hint>0 else float(base_sl)
-                tip=max(float(min_dist)*2.0,tip,float(min_dist)+buffer)
                 decided_sl=abs(float(live_sl)-level) or tip
                 decided_tp=tip
-                sign=1 if direction=='BUY' else -1
                 profit_lvl=level+sign*float(decided_tp)
                 source='manual_tp_atr_fallback'
                 self.store.event('protection','Manual TP fallback (no swing brackets)',{
                     'deal_id':p.get('dealId'),'profit_distance':decided_tp,
                     'swing_reason':bp.get('reason')})
+            elif live_tp is not None and live_sl is None and direction in ('BUY','SELL'):
+                # Keep live TP; synthesize SL (Capital omit wiped stop).
+                decided_tp=abs(float(live_tp)-level) or tip
+                decided_sl=tip
+                stop_lvl=level-sign*float(decided_sl)
+                source='manual_sl_atr_fallback'
+                self.store.event('protection','Manual SL fallback (TP on, SL Off)',{
+                    'deal_id':p.get('dealId'),'stop_distance':decided_sl,
+                    'swing_reason':bp.get('reason')})
+            elif direction in ('BUY','SELL') and (live_sl is None or live_tp is None):
+                decided_sl=tip;decided_tp=tip
+                stop_lvl=level-sign*float(decided_sl)
+                profit_lvl=level+sign*float(decided_tp)
+                source='manual_both_atr_fallback'
             else:
                 self._protect_defer(p,'no OHLC swing SL/TP',
                                    swing_reason=bp.get('reason'),
                                    bracket_source=bp.get('bracket_source'))
                 return
-        sign=1 if direction=='BUY' else -1
-        if stop_lvl is None and live_sl is None:
+        if stop_lvl is None and live_sl is None and decided_sl:
             stop_lvl=level-sign*float(decided_sl)
-        if profit_lvl is None:
+        if profit_lvl is None and live_tp is None and decided_tp:
             profit_lvl=level+sign*float(decided_tp)
         if live_sl is not None:
             stop_lvl=float(live_sl)
             decided_sl=abs(float(live_sl)-level) or decided_sl
-        # Snap TP onto grid + push past live bid/ask min (Capital rejects otherwise).
-        if profit_lvl is not None:
+        if live_tp is not None:
+            profit_lvl=float(live_tp)
+            decided_tp=abs(float(live_tp)-level) or decided_tp
+        # Snap missing side onto grid + push past live bid/ask min.
+        if profit_lvl is not None and live_tp is None:
             profit_lvl=self._snap_protect_tp(
                 direction,profit_lvl,bid,ask,min_dist,tick)
             decided_tp=abs(float(profit_lvl)-level)
         result={
-            'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
+            'stop_distance':float(decided_sl or 0),'profit_distance':float(decided_tp or 0),
             'stop_level':float(stop_lvl) if stop_lvl is not None else None,
             'profit_level':float(profit_lvl) if profit_lvl is not None else None,
             'kappa':bp.get('kappa'),'sl_scale':1.0,
@@ -5295,41 +5311,80 @@ class SingleTradeEngine:
                                profit_level=profit_lvl,bid=bid,ask=ask,
                                min_distance=float(min_dist))
             return
-        # Missing SL and/or TP (incl. broker 0 = Off) — send only what's still needed.
-        stop=result['stop_level'] if live_sl is None else None
-        profit=result['profit_level'] if live_tp is None else None
-        if stop is None and profit is None:
-            self._mark_tp_attach_done(p.get('dealId'));return
+        # CRITICAL: Capital PUT that omits stopLevel or profitLevel clears that
+        # bracket (same as trail TP Off). Always re-send BOTH in one shot —
+        # never TP-only (wipes SL) or SL-only (wipes TP). Andris: TP ON / SL OFF.
+        if live_sl is not None:
+            stop=float(live_sl)
+        elif result.get('stop_level') is not None:
+            stop=float(result['stop_level'])
+        else:
+            stop=None
+        if live_tp is not None:
+            profit=float(live_tp)
+        elif result.get('profit_level') is not None:
+            profit=float(result['profit_level'])
+        else:
+            profit=None
+        if stop is None or profit is None:
+            self._protect_defer(p,'cannot build both SL and TP for one PUT',
+                               stop=stop,profit=profit)
+            self._mark_protect_runtime(p.get('dealId'),'INCOMPLETE',wait_sec=5.0)
+            return
+        # Snap missing/computed side onto grid + broker min from live quotes.
+        # Keep an already-live level as-is (already accepted by Capital).
+        if bid is not None and ask is not None and tick and min_dist is not None:
+            if live_tp is None:
+                profit=self._snap_protect_tp(direction,profit,bid,ask,min_dist,tick)
+            if live_sl is None:
+                from .protection_ai import _quantize
+                up_sl=direction!='BUY'
+                stop=_quantize(stop,tick,up=up_sl)
+                mn=float(min_dist);q=float(tick)
+                if direction=='BUY':
+                    ceil=float(bid)-mn
+                    while stop-1e-12>ceil:
+                        stop-=q
+                else:
+                    floor=float(ask)+mn
+                    while stop+1e-12<floor:
+                        stop+=q
+                stop=float(stop)
+            profit=float(profit)
         # One PUT per backoff window — blocks same-poll triple call (early /
         # after-candles / mid-manage) from hammering Capital.
         self._mark_protect_runtime(p.get('dealId'),'IN_FLIGHT',wait_sec=8.0)
         manual=not bool(self.store.get('robot_open:'+str(p.get('dealId'))))
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
         try:
-            receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=profit)
+            receipt=await self.broker.update_position(
+                p['dealId'],stop_level=stop,profit_level=profit)
             if await self._confirm_reconcile(receipt,order_id,'PROTECT',p['dealId']):
-                # Only mark done when broker actually shows the TP we asked for.
+                # Refresh so we see what Capital actually kept.
+                try:
+                    await self.sync()
+                except Exception:
+                    pass
                 live_after=next((x for x in (self.positions or [])
                                  if str(x.get('dealId'))==str(p.get('dealId'))),None)
+                attached_sl=_broker_price_level(
+                    (live_after or {}).get('stopLevel') if live_after else None)
                 attached_tp=_broker_price_level(
                     (live_after or {}).get('profitLevel') if live_after else None)
-                if profit is not None and attached_tp is None:
-                    # Accepted but TP still Off — treat as reject + cool down.
-                    self._mark_protect_runtime(p.get('dealId'),'TP_NOT_ON_BROKER',wait_sec=15.0)
-                    self._protect_defer(p,'protect accepted but TP still Off on broker',
-                                       requested_profit=profit)
+                if attached_sl is None or attached_tp is None:
+                    # Accepted but still missing a bracket — cool down then retry both.
+                    self._mark_protect_runtime(
+                        p.get('dealId'),'BRACKETS_INCOMPLETE',wait_sec=5.0)
+                    self._protect_defer(
+                        p,'protect accepted but SL/TP still incomplete on broker',
+                        stop=attached_sl,profit=attached_tp,
+                        requested_stop=stop,requested_profit=profit)
                     return
                 self._mark_tp_attach_done(p.get('dealId'))
                 # Manual adopt: mark robot_open so trail can enroll after SL/TP on.
                 if manual:
                     self.store.set('robot_open:'+str(p['dealId']),True)
-                    # Refresh position from broker so enroll sees new TP when possible.
-                    try:
-                        await self.sync()
-                        live=next((x for x in (self.positions or [])
-                                   if str(x.get('dealId'))==str(p.get('dealId'))),p)
-                    except Exception:
-                        live=p
+                    live=live_after or p
                     self._enroll_adaptive_protection(live,force=True)
                     self.protection_brief={
                         'status':'Manual adopt protected — OHLC SL/TP attached',
@@ -5339,7 +5394,7 @@ class SingleTradeEngine:
                         'source':source})
                 else:
                     self.protection_brief={
-                        'status':'Protection confirmed — brackets on broker',
+                        'status':'Protection confirmed — SL and TP on broker',
                         'deal_id':p.get('dealId')}
             else:
                 if not await self._position_still_open(p.get('dealId')):
@@ -5348,14 +5403,16 @@ class SingleTradeEngine:
                     return
                 # Rejected while still open — keep existing levels, do not pause.
                 self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
-                self._mark_protect_runtime(p.get('dealId'),'REJECTED',wait_sec=15.0)
+                # Missing SL is urgent — shorter cool-down than cosmetic TP retry.
+                wait=5.0 if live_sl is None else 15.0
+                self._mark_protect_runtime(p.get('dealId'),'REJECTED',wait_sec=wait)
                 self._protect_defer(p,'broker rejected protect PUT',
                                    reference=receipt.get('dealReference'),
                                    requested_stop=stop,requested_profit=profit)
                 self.store.event('warning','Protection rejected; kept live levels without pause',
                     {'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),
                      'requested_stop':str(stop),'requested_profit':str(profit),
-                     'backoff_sec':15})
+                     'backoff_sec':wait})
         except Exception as exc:
             if not await self._position_still_open(p.get('dealId')):
                 self.store.order_update(order_id,'SUPERSEDED')
@@ -5364,14 +5421,15 @@ class SingleTradeEngine:
                 self._release_execution_after_flat(p.get('dealId'))
                 return
             self.store.order_update(order_id,'SUPERSEDED')
-            self._mark_protect_runtime(p.get('dealId'),'EXCEPTION',wait_sec=15.0)
+            wait=5.0 if live_sl is None else 15.0
+            self._mark_protect_runtime(p.get('dealId'),'EXCEPTION',wait_sec=wait)
             self._protect_defer(p,'protect exception: '+type(exc).__name__)
             self.store.event('warning','Position protection uncertain; kept live levels without pause',
                 {'type':type(exc).__name__,
                  'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                  'broker_error':_safe_broker_error(exc),'deal_id':p.get('dealId'),
                  'stop_level':str(stop),'take_profit_level':str(profit),
-                 'backoff_sec':15})
+                 'backoff_sec':wait})
     async def exit_position(self,deal_id):
         if self.pending_order or self.pending_close or not self.execution_enabled:return
         self.pending_close=True

@@ -131,7 +131,8 @@ DEFAULTS = {
     'day_profit_target_frac': 0.0,
     'day_loss_budget_frac': 0.10,
     'day_risk_per_trade_frac': 0.005,
-    'day_risk_gates': 1,
+    # Operator: no day risk regimes by default — LIVE must open freely.
+    'day_risk_gates': 0,
     'day_size_full_balance': 1,
     'day_be_band_frac': 0.001,
     'day_max_positions': 5,

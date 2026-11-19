@@ -72,12 +72,11 @@ def test_phase_hunt_protect_defend_done():
     assert db.phase_for(daily=daily, budgets_map=b, open_count=1) == db.PHASE_HUNT
 
 
-def test_risk_gates_off_allows_open_in_defend():
-    """Admin toggle day_risk_gates=0 → DEFEND no longer blocks OPEN."""
-    from app.self_params import load, save
+def test_defend_phase_never_blocks_open():
+    """No day risk regimes — DEFEND/DONE/PROTECT are informational only."""
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        # Seed a day already past the 10% loss stop.
+        # Seed a day already past the 10% loss stop → DEFEND phase.
         db.save_daily(s, {
             'date': db._utc_date(),
             'realized_pnl': -1500.0,
@@ -85,23 +84,13 @@ def test_risk_gates_off_allows_open_in_defend():
             'closes': 3,
             'deal_ids': [],
         })
-        blocked = db.allows_new_open(
-            store=s, equity=10_000.0, positions=[],
-            epic='GOLD', mandate_epic='GOLD', score_edge=0.2)
-        assert blocked['allowed'] is False
-        assert blocked['phase'] == db.PHASE_DEFEND
-        params = load(s)
-        params['day_risk_gates'] = 0
-        save(s, params, reason='test_off')
         opened = db.allows_new_open(
             store=s, equity=10_000.0, positions=[],
             epic='GOLD', mandate_epic='GOLD', score_edge=0.2)
         assert opened['allowed'] is True
         assert opened['phase'] == db.PHASE_DEFEND
         assert opened['risk_gates'] is False
-        assert 'day_risk_gates_off' in opened['reason']
-        snap = db.snapshot(s, equity=10_000.0, positions=[])
-        assert snap['risk_gates'] is False
+        assert 'informational' in opened['reason']
 
 
 def test_allows_multi_when_edge_strong():
@@ -361,11 +350,14 @@ def test_clear_tape_does_not_amplify_sticky_sell_on_up_move():
         'clear_disagrees_skip_amplify', 'clear_tape_dampen_wrong_side')
 
 
-def test_day_phase_protect_tilts_hold():
+def test_day_phase_never_tilts_hold():
+    """No risk regimes — PROTECT/DEFEND must not bias scores toward HOLD."""
     scores = {'BUY': 0.45, 'SELL': 0.35, 'HOLD': 0.20}
-    nudged, meta = db.soft_nudge_day_phase(scores, phase=db.PHASE_PROTECT)
-    assert meta['nudged'] is True
-    assert nudged['HOLD'] > scores['HOLD']
+    for phase in (db.PHASE_PROTECT, db.PHASE_DEFEND, db.PHASE_DONE):
+        nudged, meta = db.soft_nudge_day_phase(scores, phase=phase)
+        assert meta['nudged'] is False
+        assert meta.get('reason') == 'day_phase_tilt_disabled'
+        assert nudged == scores
 
 
 def test_record_close_updates_phase():

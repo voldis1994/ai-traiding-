@@ -126,18 +126,43 @@ def test_no_candles_blocks_open():
     assert 'wait_entry_zone' in gate['reason']
 
 
-def test_atr_widens_band_when_mtf_ready():
+def test_m5_stop_hint_does_not_inflate_entry_band():
+    """Gold bug: M5 stop_hint ATR swallowed the swing → price always in zone."""
     rows = _swing_candles()
     base = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     mtf = {
         'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
-        'confidence': 0.7, 'move_ok': True, 'stop_hint_atr14': 5.0,
-        'tf': {'m5': {'kama': None, 'atr14': 5.0}},
+        'confidence': 0.7, 'move_ok': True, 'stop_hint_atr14': 50.0,
+        'tf': {
+            'm5': {'kama': None, 'atr14': 50.0},
+            'm1': {'atr14': 0.4},
+        },
     }
     rich = oez.compute_entry_zones(rows, tick=0.1, spread=0.2, mtf=mtf)
-    assert rich['atr14'] == 5.0
+    assert rich['atr14'] == 0.4  # M1, not M5 50
     assert rich['info_stack'] == 'ohlc_swing+kama_adx_atr'
-    assert rich['band'] >= base['band']
+    span = float(rich['range_hi']) - float(rich['range_lo'])
+    assert rich['band'] <= span * 0.35 + 1e-9
+    # Must stay near structural fraction — not explode toward half-span.
+    assert rich['band'] <= max(base['band'] * 3.0, span * 0.28) + 1e-9
+
+
+def test_mid_range_is_dead_zone_not_pullback():
+    """Structural mid must not count as BUY discount or SELL premium."""
+    rows = _swing_candles()
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    assert z['ok'] and z['buy_entry'] and z['sell_entry']
+    buy_hi = float(z['buy_entry']['hi'])
+    sell_lo = float(z['sell_entry']['lo'])
+    assert buy_hi < sell_lo  # gap in the middle
+    mid = 0.5 * (float(z['range_lo']) + float(z['range_hi']))
+    assert not oez.price_in_zone(z['buy_entry'], mid)
+    assert not oez.price_in_zone(z['sell_entry'], mid)
+    gate = oez.entry_allows_open(
+        'BUY', candles=rows, mid=mid, ask=mid, bid=mid - 0.1,
+        tick=0.1, spread=0.2)
+    assert gate['allowed'] is False
+    assert 'wait' in (gate['reason'] or '')
 
 
 def test_drop_forming_minute_excludes_current_utc_bucket():

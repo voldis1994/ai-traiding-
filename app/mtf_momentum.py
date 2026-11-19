@@ -629,9 +629,11 @@ def analyze(candles, *, spread: float = 0.0, store=None, epic: str | None = None
         # Soft stop distance suggestion (ATR14) — brackets still own LIVE SL.
         stop_hint = round(float(atr14), 6)
 
+    atr_m1 = atr_wilder(m1, 14) if len(m1) >= 16 else None
     tf_m1 = {
         'kama': kama_m1[-1] if kama_m1 else None,
         'ema5': e5[-1], 'ema13': e13[-1], 'ema_up': m1_up,
+        'atr14': atr_m1,
         'structure_break': br.get('break'),
         'prior_high': br.get('prior_high'), 'prior_low': br.get('prior_low'),
         'bos_event': br.get('bos_event'),

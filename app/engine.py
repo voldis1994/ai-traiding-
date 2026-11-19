@@ -2131,7 +2131,9 @@ class SingleTradeEngine:
         need=recommended_live_history_bars(self.store)
         have=self._historical_candle_count(self.mandate['epic'])
         # Eager: if history is thin, pull broker archive now — do not wait for M1 clock.
-        due=(self.tick_count-self.last_candle_tick>=20) or (have<need)
+        # ~5 polls (~15s) keeps QUOTE→HISTORICAL rewrite tight so MTF ADX/ATR
+        # do not flicker OFF while closed minutes still sit as QUOTE.
+        due=(self.tick_count-self.last_candle_tick>=5) or (have<need)
         if not due:return
         self.last_candle_tick=self.tick_count
         await self._bootstrap_historical_candles(self.mandate['epic'],need=need)
@@ -2825,10 +2827,8 @@ class SingleTradeEngine:
         if not self.mandate:
             return {'advice':None,'reason':'no_mandate'}
         epic=self.mandate.get('epic')
-        try:
-            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
-        except Exception:
-            candles=[]
+        # Same LIVE tape as decision/MTF — HISTORICAL-only punched holes mid-minute.
+        candles=self._decision_candles(epic,n=90) if epic else []
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
         n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))
         n_pre=int(getattr(structure_shadow,'ADVISE_PRE_BARS',40))
@@ -2842,13 +2842,19 @@ class SingleTradeEngine:
         return advice
 
     def _mtf_momentum_analysis(self):
-        """M1→M60 Momentum+Structure+ADX+ATR stack — soft evidence + SHIFT mode."""
+        """M1→M60 Momentum+Structure+ADX+ATR stack — soft evidence + SHIFT mode.
+
+        Use the LIVE tape (QUOTE+HISTORICAL, drop forming minute) — same as Admin
+        structure-view and `_decision_candles`. historical_only=True dropped every
+        closed minute still tagged QUOTE until broker rewrite, so ADX/ATR flickered
+        to missing and Admin showed MTF HOLD · ohlc_swing.
+        """
         epic=(self.mandate or {}).get('epic')
         if not epic:
             return {'ready':False,'mode':'HOLD','reason':'no_mandate'}
         need=mtf_momentum.min_history_bars(self.store)
         try:
-            candles=self.store.candles(epic,n=need,historical_only=True) or []
+            candles=self._decision_candles(epic,n=need) or []
         except Exception:
             candles=[]
         chron=sorted(candles,key=lambda r:r.get('at') or '')
@@ -2857,6 +2863,19 @@ class SingleTradeEngine:
             spr=0.0
         analysis=mtf_momentum.analyze(
             chron,spread=float(spr),store=self.store,epic=epic)
+        # Brief sticky: if this tick is thin but same-epic was ready, keep ADX/ATR
+        # visible for signal/UI instead of flashing HOLD/zeros every poll hole.
+        if not analysis.get('ready'):
+            prev=(getattr(self,'_mtf_momentum',None)
+                  or mtf_momentum.load(self.store))
+            if (isinstance(prev,dict) and prev.get('ready')
+                    and str(prev.get('epic') or epic)==str(epic)):
+                sticky=dict(prev)
+                sticky['sticky']=True
+                sticky['fresh_reason']=analysis.get('reason')
+                sticky['bars_m1_now']=analysis.get('bars_m1')
+                self._mtf_momentum=sticky
+                return sticky
         mtf_momentum.persist(self.store,analysis)
         self._mtf_momentum=analysis
         return analysis
@@ -2906,10 +2925,7 @@ class SingleTradeEngine:
         if not self.mandate:
             return 'CHOP', None
         epic=self.mandate.get('epic')
-        try:
-            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
-        except Exception:
-            candles=[]
+        candles=self._decision_candles(epic,n=90) if epic else []
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
         n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))
         n_pre=int(getattr(structure_shadow,'ADVISE_PRE_BARS',40))
@@ -2949,10 +2965,7 @@ class SingleTradeEngine:
         if proposal not in ('BUY','SELL') or not self.mandate:
             return {'action':None,'reason':'no_proposal'}
         epic=self.mandate.get('epic')
-        try:
-            candles=self.store.candles(epic,n=90,historical_only=True) if epic else []
-        except Exception:
-            candles=[]
+        candles=self._decision_candles(epic,n=90) if epic else []
         chron=sorted(candles or [],key=lambda r:r.get('at') or '')
         # Evidence lookback only (not a closed-trade path): recent path + prior.
         n_path=int(getattr(structure_shadow,'ADVISE_PATH_BARS',30))

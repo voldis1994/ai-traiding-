@@ -894,4 +894,27 @@ def chart_overlays(candles, *, store=None, epic: str | None = None,
             'ready': False, 'reason': 'analyze_failed'}
         if isinstance(analysis, dict):
             out['mtf_reason'] = analysis.get('reason')
+            out['mode'] = analysis.get('mode') or 'HOLD'
+        # Partial ADX/ATR for Admin while full 720-bar MTF warms up — avoids
+        # footer flashing "ADX 0 · ATR 0.00" when analyze is not ready yet.
+        m5 = resample_m1_ohlc(rows, 5)
+        m15 = resample_m1_ohlc(rows, 15)
+        if len(m5) >= 30:
+            atr5 = atr_wilder(m5, 14)
+            a5 = adx_di(m5, 14)
+            if atr5 is not None:
+                out['atr14'] = float(atr5)
+                out['stop_hint_atr14'] = float(atr5)
+            if a5:
+                out['adx'] = _finite(a5.get('adx'))
+                out['di_plus'] = _finite(a5.get('di_plus'))
+                out['di_minus'] = _finite(a5.get('di_minus'))
+        if out.get('adx') is None and len(m15) >= 30:
+            a15 = adx_di(m15, 14)
+            if a15:
+                out['adx'] = _finite(a15.get('adx'))
+                out['di_plus'] = _finite(a15.get('di_plus'))
+                out['di_minus'] = _finite(a15.get('di_minus'))
+        if out.get('atr14') is not None or out.get('adx') is not None:
+            out['reason'] = 'series_atr_adx_partial'
     return out

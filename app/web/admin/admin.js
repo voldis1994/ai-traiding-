@@ -7,7 +7,8 @@ let overviewInFlight=null;
 let lastSyncAt=null;
 const POLL_IDLE_MS=10000;
 const POLL_LIVE_MS=5000;
-const OHLC_REFRESH_MS=15000;
+// Match engine poll (~3s) / OHLC popup (4s) — 15s left MTF/signal lagging the tape.
+const OHLC_REFRESH_MS=4000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();

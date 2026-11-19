@@ -677,13 +677,23 @@ function renderCard(c){
       <div class="sell"><em>SELL</em><b>${pct(sc.SELL)}</b></div>
     </div>
     <div class="facts">
-      <div><span>Signāls</span><strong>${esc((()=>{
+      ${(()=>{
+        const path=a.entry_path||{};
+        const intent=a.entry_intent||path.intent||c.proposal||null;
+        const trigger=a.entry_trigger||path.trigger||null;
+        const wait=a.entry_wait||path.wait||a.entry_block_reason||null;
         const act=c.action||'—';
-        const prop=c.proposal;
-        if(act==='HOLD'&&prop&&prop!=='HOLD'&&prop!==act)return `INTENT ${prop} · gaida trigger`;
-        if(act==='BUY'||act==='SELL')return act;
-        return act;
-      })())}</strong></div>
+        let signal=act;
+        if(act==='HOLD'&&intent&&intent!=='HOLD')signal=`INTENT ${intent}`;
+        else if(act==='BUY'||act==='SELL')signal=act;
+        const trigLabel=trigger||(act==='BUY'||act==='SELL'?'open':'—');
+        const waitLabel=(act==='HOLD'&&wait)?String(wait).slice(0,72):'—';
+        return `
+      <div><span>Intent</span><strong>${esc(intent||'—')}</strong></div>
+      <div><span>Trigger</span><strong>${esc(trigLabel)}</strong></div>
+      <div><span>Wait</span><strong title="${esc(wait||'')}">${esc(waitLabel)}</strong></div>
+      <div><span>Signāls</span><strong>${esc(signal)}</strong></div>`;
+      })()}
       <div><span>MTF režīms</span><strong>${esc(((a.mtf_momentum||{}).mode)||'—')}${
         (a.mtf_momentum&&a.mtf_momentum.preferred)?(' · '+esc(a.mtf_momentum.preferred)) : ''
       }${
@@ -844,6 +854,7 @@ function cardContentKey(c){
   const mtf=a.mtf_momentum||{};
   return [
     c.id,c.robot_running?1:0,c.operator_paused?1:0,c.action||'',c.proposal||'',
+    a.entry_intent||'',a.entry_trigger||'',String(a.entry_wait||'').slice(0,40),
     pos.map(p=>[p.dealId,p.direction,p.size,p.level,p.stopLevel,p.profitLevel,
       p.has_sl,p.has_tp,p.trail_phase,Number(p.upl).toFixed(2),p.epic].join('/')).join('|'),
     (a.day_book&&a.day_book.phase)||'',

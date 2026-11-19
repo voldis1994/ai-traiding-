@@ -19,7 +19,10 @@ from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 # when self_params.policy_live_execute=1 (default ON with policy_evolve_enabled).
 LIVE_DECISION_RULE = 'neural_argmax_then_evolved_policy_gate'
 LIVE_DECISION_BAR = 'completed_broker_M1'
+# Perceive on completed M1; trigger OPEN on WS mid (break|zone) between polls.
+LIVE_ENTRY_PATH = 'intent_then_break_or_zone_trigger'
 POLL_SECONDS = 3
+FAST_ENTRY_TICK_SECONDS = 1
 NEURAL_DT_SECONDS = 60
 DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight steps
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions

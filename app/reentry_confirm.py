@@ -23,7 +23,8 @@ DEFAULTS = {
     # Same-dir re-entry: need this fraction of ATR14 move since last close mid.
     'same_dir_atr_frac': 0.35,
     # Medium tier: consecutive completed M1 closes in action direction.
-    'medium_m1_streak': 2,
+    # 1 = confirm without waiting for the move to finish (unified live path).
+    'medium_m1_streak': 1,
     # Soft learn rails for floors.
     'raw_strong_min': 0.12,
     'raw_strong_max': 0.28,

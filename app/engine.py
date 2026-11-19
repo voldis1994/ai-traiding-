@@ -2163,15 +2163,14 @@ class SingleTradeEngine:
                          'time':now(),'status':snap.get('marketStatus'),'min_distance':self._min_distance(broker_market,mid),
                          'instrument_name':inst.get('name') or inst.get('epic') or self.mandate['epic'],
                          'source':'WEBSOCKET' if streamed else 'REST'}
-            # Broker protection is handled before slow secondary data calls.
-            # Missing SL → install bracket. Missing TP alone is valid (Capital TP Off
-            # after trail) — never invent TP every poll or trail cannot run.
+            # Broker protection before slow secondary data. Missing SL always;
+            # missing TP once for manual adopt / OPEN (not after trail TP Off).
             # IMPORTANT: never return before candle bootstrap — thin hist after
             # market switch must keep growing even while protect waits for swings.
             protect_pending=False
-            if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
+            if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
                 await self.protect_position(self.positions[0])
-                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
+                if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
                     protect_pending=True
 
             if self.positions:
@@ -2191,10 +2190,10 @@ class SingleTradeEngine:
             await self._account_and_candles()
             if protect_pending:
                 # Retry protect once hist may have grown this poll.
-                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
+                if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
                     await self.protect_position(self.positions[0])
-                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
-                    # Still unprotected — skip neural OPEN; trail waits for SL.
+                if len(self.positions)==1 and _broker_price_level(self.positions[0].get('stopLevel')) is None:
+                    # Still no SL — skip neural OPEN; trail waits for stop.
                     return
             # LIVE context: include closed QUOTE minutes too. PK(epic,at) means a
             # minute written as QUOTE during the forming bar is excluded forever by
@@ -2467,9 +2466,8 @@ class SingleTradeEngine:
                                     {'type':type(exc).__name__})
             if len(self.positions)==1:
                 p=self.positions[0]
-                # Missing SL → install bracket. Missing TP alone must NOT reinstall
-                # TP (Capital TP Off after trail is intentional for SL ratchet).
-                if p.get('stopLevel') is None:
+                # Missing SL always; missing TP once for manual/OPEN (not after trail).
+                if self._needs_protect_brackets(p):
                     await self.protect_position(p);return
                 # Reverse exit: evaluate each new M1 from *manage* scores (fresh
                 # perception), not the frozen OPEN vote. Confirmed opposite +
@@ -5053,12 +5051,44 @@ class SingleTradeEngine:
                 'broker_status':getattr(getattr(exc,'response',None),'status_code',None),
                 'broker_error':_safe_broker_error(exc)})
 
+    def _needs_protect_brackets(self,p):
+        """True when SL missing, or TP still Off and we have not one-shot-filled it.
+
+        Manual adopt often lands with SL only (Capital Take Profit Off). Poll used
+        to skip protect whenever stopLevel was set — TP stayed OFF forever and
+        Admin showed TRAIL manual / left unchanged. Robot trail may later clear
+        TP on purpose; after the first trail confirm we stop reinstalling TP.
+        """
+        live_sl=_broker_price_level(p.get('stopLevel'))
+        live_tp=_broker_price_level(p.get('profitLevel'))
+        if live_sl is not None and live_tp is not None:
+            return False
+        deal=str(p.get('dealId') or '')
+        if live_sl is None:
+            return True
+        # TP missing only.
+        if not deal:
+            return True
+        if self.store.get('tp_attach_done:'+deal) or deal in self.protected:
+            return False
+        runtime=self.store.get('adaptive_runtime:'+deal) or {}
+        if isinstance(runtime,dict) and (
+                runtime.get('status')=='CONFIRMED' or
+                runtime.get('phase') in ('trail','ratchet','be_lock')):
+            return False
+        return True
+
+    def _mark_tp_attach_done(self,deal_id):
+        if not deal_id:return
+        self.store.set('tp_attach_done:'+str(deal_id),True)
+        self.protected.add(deal_id)
+
     async def protect_position(self,p):
         if self.pending_order or self.pending_close:return
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
         if live_sl is not None and live_tp is not None:
-            self.protected.add(p['dealId']);return
+            self._mark_tp_attach_done(p.get('dealId'));return
         # Same stale-PROTECT policy as adapt_protection — do not freeze forever.
         deal_s=str(p.get('dealId'))
         blocking=[]
@@ -5134,12 +5164,22 @@ class SingleTradeEngine:
         stop=result['stop_level'] if live_sl is None else None
         profit=result['profit_level'] if live_tp is None else None
         if stop is None and profit is None:
-            self.protected.add(p['dealId']);return
+            self._mark_tp_attach_done(p.get('dealId'));return
+        manual=not bool(self.store.get('robot_open:'+str(p.get('dealId'))))
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=profit)
             if await self._confirm_reconcile(receipt,order_id,'PROTECT',p['dealId']):
-                self.protected.add(p['dealId'])
+                self._mark_tp_attach_done(p.get('dealId'))
+                # Manual adopt: mark robot_open so trail can enroll after SL/TP on.
+                if manual:
+                    self.store.set('robot_open:'+str(p['dealId']),True)
+                    self._enroll_adaptive_protection(p,force=True)
+                    self.protection_brief={
+                        'status':'Manual adopt protected — OHLC SL/TP attached',
+                        'deal_id':p.get('dealId')}
+                    self.store.event('protection','Manual position protected with OHLC brackets',{
+                        'deal_id':p.get('dealId'),'stop':stop,'profit':profit})
             else:
                 if not await self._position_still_open(p.get('dealId')):
                     self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))

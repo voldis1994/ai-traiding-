@@ -9,6 +9,21 @@ function _ohlcFinite(v){
   return Number.isFinite(n)?n:null;
 }
 
+/** Keep Y-scale on the tape — drop unset broker 0 / wild outliers (e.g. poz TP 0). */
+function _ohlcNearTape(v,anchor,span){
+  const n=_ohlcFinite(v);
+  if(n==null)return null;
+  // Broker often sends unset SL/TP as 0 — never a real GOLD/FX level on this chart.
+  if(!(n>0))return null;
+  if(anchor==null||!Number.isFinite(anchor))return n;
+  const band=Math.max(
+    (Number.isFinite(span)&&span>0?span:Math.abs(anchor)*0.002)*10,
+    Math.abs(anchor)*0.015,
+    0.5);
+  if(Math.abs(n-anchor)>band)return null;
+  return n;
+}
+
 function drawOhlcStructure(canvas,view,opts){
   if(!canvas||!view)return;
   opts=opts||{};
@@ -35,25 +50,30 @@ function drawOhlcStructure(canvas,view,opts){
     return;
   }
 
-  let low=Math.min(...candles.map(c=>+c.low));
-  let high=Math.max(...candles.map(c=>+c.high));
+  // Base range = candles only so bars fill the viewport; overlays expand only if near.
+  let candleLow=Math.min(...candles.map(c=>+c.low));
+  let candleHigh=Math.max(...candles.map(c=>+c.high));
+  const mid=_ohlcFinite(view.mid);
+  const anchor=mid!=null?mid:(candleLow+candleHigh)/2;
+  const candleSpan=Math.max(candleHigh-candleLow,Math.abs(anchor)*0.0004,0.01);
+  let low=candleLow;
+  let high=candleHigh;
+  const expand=(raw)=>{
+    const v=_ohlcNearTape(raw,anchor,candleSpan);
+    if(v==null)return;
+    low=Math.min(low,v);high=Math.max(high,v);
+  };
   const zones=view.zones||{};
   for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
     if(!z)continue;
-    const a=_ohlcFinite(z.lo),b=_ohlcFinite(z.hi);
-    if(a!=null)low=Math.min(low,a);
-    if(b!=null)high=Math.max(high,b);
+    expand(z.lo);expand(z.hi);
   }
   const br=view.swing_brackets||{};
   for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
-    const v=_ohlcFinite(br[k]);
-    if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
+    expand(br[k]);
   }
   for(const p of (view.open_levels||[])){
-    for(const k of ['entry','stop','profit']){
-      const v=_ohlcFinite(p[k]);
-      if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
-    }
+    expand(p.entry);expand(p.stop);expand(p.profit);
   }
   const ov=view.overlays||{};
   // Align overlay series to the same candle window we display.
@@ -66,18 +86,16 @@ function drawOhlcStructure(canvas,view,opts){
   const ema5Series=sliceSeries(ov.ema5);
   const ema13Series=sliceSeries(ov.ema13);
   for(const series of [kamaSeries,ema5Series,ema13Series]){
-    for(const v of series){
-      if(Number.isFinite(+v)){low=Math.min(low,+v);high=Math.max(high,+v);}
-    }
+    for(const v of series)expand(v);
   }
-  const mid=_ohlcFinite(view.mid);
-  if(mid!=null){low=Math.min(low,mid);high=Math.max(high,mid);}
+  expand(mid);
   const atr=_ohlcFinite(ov.atr14)||_ohlcFinite((view.mtf||{}).atr14);
-  if(atr!=null&&mid!=null){
-    low=Math.min(low,mid-atr);high=Math.max(high,mid+atr);
+  if(atr!=null&&atr>0&&mid!=null){
+    expand(mid-atr);expand(mid+atr);
   }
 
-  const pad=(high-low||Math.abs(high)*.001||.01)*(showLabels?.12:.18);
+  // Tight pad so candle bodies use most of the canvas height.
+  const pad=(high-low||Math.abs(high)*.001||.01)*(showLabels?.06:.10);
   low-=pad;high+=pad;
   const yPadTop=showLabels?28:16;
   const yPadBot=showLabels?36:28;
@@ -146,17 +164,17 @@ function drawOhlcStructure(canvas,view,opts){
   polyline(ema5Series,'rgba(100,180,220,.7)',1.1);
   polyline(kamaSeries,'rgba(240,193,75,.95)',1.6);
 
-  // Candles — keep readable body width even with many bars.
-  const bodyW=Math.max(2.5,Math.min(14,spacing*(showLabels?.72:.64)));
+  // Candles — fat bodies; Y already fitted to tape so height reads large.
+  const bodyW=Math.max(showLabels?3.5:2.5,Math.min(showLabels?18:14,spacing*(showLabels?.82:.70)));
   candles.forEach((c,i)=>{
     const x=leftPad+(i+.5)*spacing;
     const rising=+c.close>=+c.open;
     ctx.strokeStyle=rising?'#39ff88':'#ff5c7a';
     ctx.fillStyle=ctx.strokeStyle;
-    ctx.lineWidth=Math.max(1,Math.min(2,bodyW*.35));
+    ctx.lineWidth=Math.max(1.25,Math.min(2.5,bodyW*.4));
     ctx.beginPath();ctx.moveTo(x,y(+c.high));ctx.lineTo(x,y(+c.low));ctx.stroke();
     const y1=y(+c.open),y2=y(+c.close);
-    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(1.5,Math.abs(y1-y2)));
+    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(2,Math.abs(y1-y2)));
   });
 
   // Swing pivot markers — remap i when display window is a slice.
@@ -181,7 +199,7 @@ function drawOhlcStructure(canvas,view,opts){
 
   const labels=[];
   const hline=(price,color,dash,label)=>{
-    const p=_ohlcFinite(price);
+    const p=_ohlcNearTape(price,anchor,candleSpan);
     if(p==null)return;
     ctx.strokeStyle=color;ctx.lineWidth=showLabels?1.6:1.25;
     ctx.setLineDash(dash||[]);

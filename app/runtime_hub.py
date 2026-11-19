@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -822,15 +823,24 @@ class RuntimeHub:
             except Exception as exc:
                 swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
+        def _level_or_none(raw):
+            """Broker unset SL/TP often arrives as 0 — omit so the chart Y-scale stays on tape."""
+            try:
+                n=float(raw)
+            except(TypeError,ValueError):
+                return None
+            if not math.isfinite(n) or n<=0:
+                return None
+            return n
         for p in positions:
             if not isinstance(p,dict):
                 continue
             open_levels.append({
                 'deal_id':p.get('dealId'),
                 'direction':p.get('direction'),
-                'entry':p.get('level'),
-                'stop':p.get('stopLevel'),
-                'profit':p.get('profitLevel'),
+                'entry':_level_or_none(p.get('level')),
+                'stop':_level_or_none(p.get('stopLevel')),
+                'profit':_level_or_none(p.get('profitLevel')),
             })
         # Compact candle payload for canvas (popup may ask for more history).
         bare=[]

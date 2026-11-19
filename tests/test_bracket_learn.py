@@ -439,23 +439,25 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
 
 
 def test_apply_min_rr_caps_wide_sl_toward_entry():
-    """Gold-style ~21pt SL vs ~3pt TP → SL capped to profit/min_rr (not fantasy TP)."""
+    """Tight TP + far SL → SL shrinks to profit/min_rr; TP unchanged (not equalized)."""
     from app.bracket_learn import apply_min_rr
-    # SELL: entry 2650, SL far above (21), TP only 3 below.
+    # SELL: entry 2650, SL far above (21), TP only 3 below → SL = 3/1.5 = 2.
     entry, stop_d, profit_d = 2650.0, 21.0, 3.0
     stop_level = entry + stop_d
     profit_level = entry - profit_d
     out = apply_min_rr(
         action='SELL', entry=entry, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=1.0, min_rr=1.0)
+        floor=1.0, min_rr=1.5)
     assert out['ok'] is True
     assert out['capped'] is True
-    assert out['stop_distance'] == pytest.approx(3.0, abs=1e-9)
+    assert out['stop_distance'] == pytest.approx(2.0, abs=1e-9)
     assert out['profit_distance'] == pytest.approx(3.0, abs=1e-9)
-    assert out['rr'] == pytest.approx(1.0, abs=1e-9)
-    assert out['stop_level'] == pytest.approx(entry + 3.0, abs=1e-9)
+    assert out['rr'] == pytest.approx(1.5, abs=1e-9)
+    assert out['stop_level'] == pytest.approx(entry + 2.0, abs=1e-9)
     assert out['profit_level'] == pytest.approx(profit_level, abs=1e-9)
+    # Must NOT mirror TP out to match far SL.
+    assert out['profit_distance'] != pytest.approx(21.0, abs=0.1)
 
 
 def test_apply_min_rr_refuses_when_floor_blocks_cap():
@@ -463,13 +465,38 @@ def test_apply_min_rr_refuses_when_floor_blocks_cap():
     from app.bracket_learn import apply_min_rr
     out = apply_min_rr(
         action='BUY', entry=100.0, stop_level=90.0, profit_level=101.0,
-        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.0)
+        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.5)
     assert out['ok'] is False
     assert out['reason'] == 'rr_unachievable_vs_floor'
 
 
+def test_cap_far_swing_sl_pulls_equal_1to1_toward_entry():
+    """Gold screenshot: equal ~26pt SL+TP with ATR~5 → SL capped, TP stays → RR>1."""
+    from app.bracket_learn import cap_far_swing_sl, apply_min_rr
+    entry = 3628.75
+    stop_d = profit_d = 25.93
+    stop_level = entry + stop_d
+    profit_level = entry - profit_d
+    atr = 5.0
+    far = cap_far_swing_sl(
+        action='SELL', entry=entry, stop_level=stop_level, stop_d=stop_d,
+        floor=2.5, atr=atr, highs=[], lows=[], buffer=0.1, max_atr_mult=2.0)
+    assert far['capped'] is True
+    assert far['stop_distance'] == pytest.approx(10.0, abs=1e-9)  # 2×ATR
+    assert far['stop_level'] == pytest.approx(entry + 10.0, abs=1e-9)
+    # TP untouched — then RR vs kept TP is >1 (not equal SL=TP).
+    rr = apply_min_rr(
+        action='SELL', entry=entry, stop_level=far['stop_level'],
+        profit_level=profit_level, stop_d=far['stop_distance'],
+        profit_d=profit_d, floor=2.5, min_rr=1.5)
+    assert rr['ok'] is True
+    assert rr['profit_distance'] == pytest.approx(25.93, abs=1e-6)
+    assert rr['stop_distance'] < rr['profit_distance']
+    assert rr['rr'] + 1e-9 >= 1.5
+
+
 def test_swing_anchor_applies_min_rr_on_wide_sl():
-    """End-to-end: wide protective swing vs tight TP gets RR-capped SL."""
+    """End-to-end: wide protective swing vs tight TP gets ATR/RR-capped SL."""
     from app.bracket_learn import swing_anchor_brackets
     # Deep swing low far under entry; nearest high only a few pts above.
     seq = [
@@ -487,9 +514,13 @@ def test_swing_anchor_applies_min_rr_on_wide_sl():
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
     if swing.get('ready'):
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.5)
         assert swing['stop_distance'] + 1e-9 <= swing['profit_distance'] / float(
-            swing.get('min_rr') or 1.0) + 1e-6
+            swing.get('min_rr') or 1.5) + 1e-6
+        # Never celebrate equal far SL=TP.
+        if swing.get('atr_capped') or swing.get('rr_capped'):
+            assert swing['stop_distance'] + 1e-6 < swing['profit_distance'] or \
+                swing['rr'] + 1e-9 >= 1.5
     else:
         assert swing.get('reason') in (
             'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',

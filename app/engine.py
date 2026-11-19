@@ -2783,6 +2783,22 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=reentry.get('reason') or 'reentry_confirm_hold',
                             proposal=result.get('proposal') or result['action'])
+            # OHLC regime: chop / low vol / doji / impulse / chaos → do not OPEN.
+            # Replaces eternal M1 colour-confirm HOLD as the candle-quality veto.
+            from . import ohlc_regime_gate
+            candles_rg=self._decision_candles()
+            atr_rg=_num((mtf_analysis or {}).get('stop_hint_atr14'))
+            struct_rg=((edge_advice or {}).get('structure')
+                       or ctx.get('structure'))
+            regime_gate=ohlc_regime_gate.evaluate(
+                candles=candles_rg,mid=_num(self.market.get('mid')),
+                spread=_num(self.market.get('spread')),atr=atr_rg,
+                structure=struct_rg,store=self.store)
+            result=dict(result,ohlc_regime=regime_gate)
+            if not regime_gate.get('allowed',True):
+                return dict(result,action='HOLD',
+                            reason=regime_gate.get('reason') or 'no_trade_ohlc',
+                            proposal=result.get('proposal') or result['action'])
             # OHLC entry zone + MTF (KAMA/ADX/ATR): neural side only fires when
             # price is IN the structural band AND the indicator stack agrees.
             zone_gate=self._ohlc_entry_zone_gate(
@@ -2815,12 +2831,18 @@ class SingleTradeEngine:
         return ohlc_entry_zones.drop_forming_minute(raw)
 
     def _entry_wait_reason_retryable(self,reason):
-        """True when HOLD was only waiting for zone / confirm / soft MTF cross."""
+        """True when HOLD was only waiting for zone / soft MTF — retry mid-bar.
+
+        ``no_trade_*`` OHLC regime vetoes are NOT retryable mid-bar (need new
+        completed candles). Old m1_confirm eternal waits are gone.
+        """
         r=str(reason or '').lower()
+        if r.startswith('no_trade_'):
+            return False
         needles=(
-            'wait_','reentry','m1_confirm','medium_need','strong_wait',
-            'raw_disagrees','mtf_conflict','mtf_hold','entry_zone',
-            'ohlc_entry','price confirm','confirm_hold','gaida trigger','intent')
+            'wait_','reentry','need_new','raw_disagrees','mtf_conflict',
+            'mtf_hold','entry_zone','ohlc_entry','gaida trigger','intent',
+            'chase_extension','same_range')
         return any(n in r for n in needles)
 
     def _apply_stream_quote(self):
@@ -6038,6 +6060,18 @@ class SingleTradeEngine:
             # Completed M1 only — forming QUOTE minute must not move zona/SL/TP.
             candles=self._decision_candles(self.mandate['epic'])
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            from . import ohlc_regime_gate
+            atr_sub=_num((mtf_live or {}).get('stop_hint_atr14'))
+            regime_sub=ohlc_regime_gate.evaluate(
+                candles=candles,mid=mid,spread=spread,atr=atr_sub,
+                structure=(self.market_context or {}).get('structure'),
+                store=self.store)
+            if not regime_sub.get('allowed',True):
+                self.last_entry_reason=regime_sub.get('reason') or 'no_trade_ohlc'
+                self.store.event('entry','OPEN skipped — OHLC regime veto',{
+                    'reason':self.last_entry_reason,'action':action,
+                    'flags':regime_sub.get('flags')})
+                return
             # Defense in depth: OHLC+MTF zona *and* shared fleet side (same as eval).
             zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
             if not zone_gate.get('allowed'):

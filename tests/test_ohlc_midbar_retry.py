@@ -13,9 +13,11 @@ def test_entry_wait_reason_retryable():
         assert engine._entry_wait_reason_retryable(
             'Neural HOLD · wait_buy_entry_zone (price 3720 > zona 3715)') is True
         assert engine._entry_wait_reason_retryable(
-            'medium_need_m1_confirm') is True
-        assert engine._entry_wait_reason_retryable(
             'raw_disagrees_nudged') is True
+        assert engine._entry_wait_reason_retryable(
+            'no_trade_chop') is False
+        assert engine._entry_wait_reason_retryable(
+            'no_trade_doji') is False
         assert engine._entry_wait_reason_retryable(
             'day_book capacity full') is False
 

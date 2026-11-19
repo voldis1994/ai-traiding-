@@ -5,11 +5,23 @@ let lastOverview=null;
 let chartRange='1W';
 let overviewInFlight=null;
 let lastSyncAt=null;
-const POLL_IDLE_MS=8000;
-const POLL_LIVE_MS=4000;
+const POLL_IDLE_MS=10000;
+const POLL_LIVE_MS=5000;
+const OHLC_REFRESH_MS=15000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();
+let currentPollMs=null;
+let lastPerfKey='';
+
+/** Only rewrite DOM when markup actually changed — stops poll flicker. */
+function stableHtml(el,html){
+  if(!el)return false;
+  if(el._stableHtml===html)return false;
+  el._stableHtml=html;
+  el.innerHTML=html;
+  return true;
+}
 
 async function api(path,method='GET',payload){
   const opts={method,credentials:'same-origin',headers:{'Content-Type':'application/json'}};
@@ -274,7 +286,7 @@ function renderSummary(data){
     ? ((uplSum/(Math.abs(pnlNum)+Math.abs(uplSum)||1))*100)
     : null;
 
-  $('summary').innerHTML=`
+  stableHtml($('summary'),`
     <article class="stat">
       <span class="label">Klienti</span>
       <b>${total}</b>
@@ -296,7 +308,7 @@ function renderSummary(data){
       <b class="${pnlClass(pnlNum)}">${esc(pnlLabel)}<small class="stat-sub">${esc(pnlNote)}</small></b>
       <div class="stat-icon">${icon('layers')}</div>
       ${delta!=null?`<span class="delta-pill ${delta<0?'neg':''}">${delta>=0?'+':''}${delta.toFixed(2)}%</span>`:''}
-    </article>`;
+    </article>`);
 
   // Performance header prefers live balances, else honest working P&L.
   const {ccy}=fleetPnl(s,clients);
@@ -353,14 +365,19 @@ function buildEquitySeries(clients,range){
 function drawPerfChart(clients){
   const canvas=$('perfChart');
   if(!canvas)return;
+  const pts=buildEquitySeries(clients,chartRange);
+  const perfKey=chartRange+'|'+pts.map(p=>p.t+':'+p.v).join(',');
   const dpr=window.devicePixelRatio||1;
   const cssW=canvas.clientWidth||800;
   const cssH=220;
-  canvas.width=Math.floor(cssW*dpr);
-  canvas.height=Math.floor(cssH*dpr);
+  const bw=Math.floor(cssW*dpr),bh=Math.floor(cssH*dpr);
+  if(perfKey===lastPerfKey&&canvas.width===bw&&canvas.height===bh)return;
+  lastPerfKey=perfKey;
+  if(canvas.width!==bw||canvas.height!==bh){
+    canvas.width=bw;canvas.height=bh;
+  }
   const ctx=canvas.getContext('2d');
   ctx.setTransform(dpr,0,0,dpr,0,0);
-  const pts=buildEquitySeries(clients,chartRange);
   const pad={l:8,r:8,t:16,b:28};
   const w=cssW-pad.l-pad.r,h=cssH-pad.t-pad.b;
   const vals=pts.map(p=>p.v);
@@ -431,17 +448,17 @@ function renderTopClients(clients){
   }).sort((a,b)=>b.pnl-a.pnl).slice(0,3);
 
   if(!ranked.length){
-    $('topClients').innerHTML=`<div class="empty">Vēl nav klientu</div>`;
+    stableHtml($('topClients'),`<div class="empty">Vēl nav klientu</div>`);
     return;
   }
-  $('topClients').innerHTML=ranked.map((c,i)=>`
+  stableHtml($('topClients'),ranked.map((c,i)=>`
     <div class="rank">
       <span class="medal m${i+1}">${i+1}</span>
       <div class="who">${esc(c.name)}<small>@${esc(c.user)} · ${esc(sourceLabel(c.src))} · W/L ${esc(c.wl)}</small></div>
       <div class="earn ${pnlClass(c.pnl)}">${esc(money(c.pnl,c.ccy))}
         <small>${c.wr==null?'—':((c.wr<=1?c.wr*100:c.wr).toFixed(1)+'% WR')}</small>
       </div>
-    </div>`).join('');
+    </div>`).join(''));
 }
 
 function collectRiskAlerts(clients){
@@ -479,23 +496,23 @@ function collectRiskAlerts(clients){
 function renderRiskAlerts(clients){
   const alerts=collectRiskAlerts(clients);
   if(!alerts.length){
-    $('riskAlerts').innerHTML=`<div class="empty">Nav aktīvu brīdinājumu</div>`;
+    stableHtml($('riskAlerts'),`<div class="empty">Nav aktīvu brīdinājumu</div>`);
     return;
   }
-  $('riskAlerts').innerHTML=alerts.map(a=>`
+  stableHtml($('riskAlerts'),alerts.map(a=>`
     <div class="alert">
       <div><b>${esc(a.title)}</b><span>${esc(a.detail)}</span></div>
       <div class="metric">${esc(a.metric)}</div>
-    </div>`).join('');
+    </div>`).join(''));
 }
 
 function renderRiskBoard(clients){
   const board=$('riskBoard');
   if(!(clients||[]).length){
-    board.innerHTML=`<div class="empty">Nav klientu</div>`;
+    stableHtml(board,`<div class="empty">Nav klientu</div>`);
     return;
   }
-  board.innerHTML=`<p class="muted" style="margin:0 0 12px">LIVE: dienas riska režīmi (DEFEND/DONE/PROTECT) <b>nebloķē</b> OPEN. Hard-risk limitu lauki ir tikai informācija.</p>`+clients.map(c=>{
+  stableHtml(board,`<p class="muted" style="margin:0 0 12px">LIVE: dienas riska režīmi (DEFEND/DONE/PROTECT) <b>nebloķē</b> OPEN. Hard-risk limitu lauki ir tikai informācija.</p>`+clients.map(c=>{
     const hr=c.hard_risk||{};
     const db=c.day_book||{};
     const name=c.display_name||c.username||('#'+c.id);
@@ -513,7 +530,7 @@ function renderRiskBoard(clients){
       <div class="kv"><span>Halt iemesls</span><b>${esc(hr.halt_reason||'—')}</b></div>
       <div class="kv"><span>Entry block</span><b>${esc((c.activity||{}).entry_block_reason||'—')}</b></div>
     </article>`;
-  }).join('');
+  }).join(''));
 }
 
 function renderRecentClosed(clients){
@@ -535,7 +552,7 @@ function renderRecentClosed(clients){
     });
   });
   rows.sort((a,b)=>Math.abs(Number(b.upl)||0)-Math.abs(Number(a.upl)||0));
-  $('recentClosed').innerHTML=renderTradesTable(rows.slice(0,20),{empty:'Nav nesen slēgtu treidu'});
+  stableHtml($('recentClosed'),renderTradesTable(rows.slice(0,20),{empty:'Nav nesen slēgtu treidu'}));
 }
 
 function trailFlag(phase){
@@ -743,6 +760,8 @@ function renderCard(c){
       }catch(err){alert(err.message)}
     };
   });
+  el.dataset.cid=String(c.id);
+  el.dataset.contentKey=cardContentKey(c);
   // Lazy-load OHLC structure chart (not every overview tick payload).
   queueMicrotask(()=>wireOhlcPanel(el,c.id).catch(()=>{}));
   return el;
@@ -805,9 +824,13 @@ async function wireOhlcPanel(cardEl,clientId){
   await refreshOhlcPanel(cardEl,clientId);
 }
 
-async function refreshOhlcPanel(cardEl,clientId){
+async function refreshOhlcPanel(cardEl,clientId,{force=false}={}){
   const panel=cardEl&&cardEl.querySelector(`[data-ohlc-client="${clientId}"]`);
   if(!panel)return;
+  const now=Date.now();
+  if(!force&&panel._ohlcAt&&(now-panel._ohlcAt)<OHLC_REFRESH_MS&&panel._ohlcView){
+    return;
+  }
   const meta=panel.querySelector('.ohlc-meta');
   const legend=panel.querySelector('.ohlc-legend');
   const canvas=panel.querySelector('canvas.ohlc-mini');
@@ -815,6 +838,7 @@ async function refreshOhlcPanel(cardEl,clientId){
     const data=await api(`/api/admin/clients/${clientId}/structure-view?n=90`);
     const view=data||{};
     panel._ohlcView=view;
+    panel._ohlcAt=now;
     if(view.ok===false||view.reason==='no_epic'||!view.epic){
       if(meta)meta.textContent='nav epic — atver Capital manuālu darījumu jebkurā tirgū';
       if(legend)legend.textContent=view.hint
@@ -882,6 +906,8 @@ function desiredPollMs(data){
 }
 
 function schedulePoll(ms){
+  if(currentPollMs===ms&&pollTimer)return;
+  currentPollMs=ms;
   if(pollTimer)clearInterval(pollTimer);
   pollTimer=setInterval(()=>loadOverview().catch(()=>{}),ms);
 }
@@ -897,6 +923,57 @@ async function loadBrokers(){
   });
 }
 
+function cardContentKey(c){
+  const a=c.activity||{},e=c.evolution||{},r=c.results||{};
+  const pos=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
+  const sb=scoreboard(r);
+  return [
+    c.id,c.robot_running?1:0,c.operator_paused?1:0,c.action||'',
+    pos.map(p=>[p.dealId,p.direction,p.size,p.level,p.stopLevel,p.profitLevel,
+      p.has_sl,p.has_tp,p.trail_phase,Number(p.upl).toFixed(2),p.epic].join('/')).join('|'),
+    (a.day_book&&a.day_book.phase)||'',
+    (a.mandate&&a.mandate.size)||'',a.market||'',
+    e.neurons,e.steps,e.learning_generation??e.generation,
+    sb.pnl,sb.wins,sb.losses,sb.src,
+    r.pending_broker_pnl,r.pending_trades,
+    a.entry_block_reason||a.error||c.last_start_error||'',
+    (a.protection&&a.protection.status)||'',
+    JSON.stringify(c.scores||{}),
+  ].join('§');
+}
+
+/** Patch live fields on an existing card — never replace the article (no jerk). */
+function softPatchCard(el,c){
+  const next=renderCard(c);
+  el.className=next.className;
+  // Keep OHLC panel + action buttons (wired once); swap only changing slots.
+  const slots=['.head','.deals','.trail-line','.nerve','.facts','.trades'];
+  slots.forEach(sel=>{
+    const a=el.querySelector(sel);
+    const b=next.querySelector(sel);
+    if(a&&b){
+      if(a.outerHTML!==b.outerHTML)a.replaceWith(b);
+    }else if(!a&&b){
+      const panel=el.querySelector('.ohlc-panel');
+      if(panel)panel.before(b);else el.appendChild(b);
+    }else if(a&&!b){
+      a.remove();
+    }
+  });
+  // Reason / error line is a bare .muted without other class.
+  const oldMuted=[...el.children].find(n=>n.classList&&n.classList.contains('muted')&&!n.classList.contains('ohlc-legend'));
+  const newMuted=[...next.children].find(n=>n.classList&&n.classList.contains('muted')&&!n.classList.contains('ohlc-legend'));
+  if(oldMuted&&newMuted&&oldMuted.outerHTML!==newMuted.outerHTML){
+    oldMuted.replaceWith(newMuted);
+  }else if(!oldMuted&&newMuted){
+    const actions=el.querySelector('.actions');
+    if(actions)actions.before(newMuted);else el.appendChild(newMuted);
+  }else if(oldMuted&&!newMuted){
+    oldMuted.remove();
+  }
+  el.dataset.contentKey=cardContentKey(c);
+}
+
 async function loadOverview(){
   // Coalesce overlapping polls so a slow /overview cannot stack and freeze UI.
   if(overviewInFlight)return overviewInFlight;
@@ -907,8 +984,8 @@ async function loadOverview(){
     renderSummary(data);
     updateSystemStatus(data);
     const open=collectOpenTrades(data.clients||[]);
-    $('openTradesPreview').innerHTML=renderTradesTable(open.slice(0,8));
-    $('openTradesFull').innerHTML=renderTradesTable(open);
+    stableHtml($('openTradesPreview'),renderTradesTable(open.slice(0,8)));
+    stableHtml($('openTradesFull'),renderTradesTable(open));
     renderTopClients(data.clients);
     renderRiskAlerts(data.clients);
     renderRiskBoard(data.clients);
@@ -921,8 +998,13 @@ async function loadOverview(){
     room.dataset.count=String(n);
     room.dataset.dense=n>=4?'1':'0';
     room.style.setProperty('--cols',String(layoutCols(n)));
-    const pick=$('brokerClient');const prev=pick.value;pick.innerHTML='';
-    // In-place card sync — never wipe the whole control room (that flashed UI).
+    const pick=$('brokerClient');const prev=pick.value;
+    // Rebuild broker pick options without thrashing if identical.
+    const pickHtml=(clients||[]).map(c=>
+      `<option value="${esc(c.id)}">#${esc(c.id)} ${esc(c.username)} (${esc(c.display_name)})</option>`
+    ).join('');
+    stableHtml(pick,pickHtml);
+    // Soft card sync — never wipe / replace the whole control-room article.
     const keep=new Map();
     [...room.children].forEach(el=>{
       if(el&&el.dataset&&el.dataset.cid)keep.set(String(el.dataset.cid),el);
@@ -931,24 +1013,20 @@ async function loadOverview(){
     clients.forEach(c=>{
       const id=String(c.id);
       seen.add(id);
-      const next=renderCard(c);
-      next.dataset.cid=id;
+      const key=cardContentKey(c);
       const old=keep.get(id);
       if(old){
-        // Preserve wired OHLC panel (canvas + view) so mini-chart does not reload.
-        const oldPanel=old.querySelector('.ohlc-panel');
-        const newPanel=next.querySelector('.ohlc-panel');
-        if(oldPanel&&newPanel){
-          newPanel.replaceWith(oldPanel);
-          queueMicrotask(()=>refreshOhlcPanel(next,c.id).catch(()=>{}));
+        if(old.dataset.contentKey!==key){
+          softPatchCard(old,c);
         }
-        old.replaceWith(next);
+        queueMicrotask(()=>refreshOhlcPanel(old,c.id).catch(()=>{}));
         keep.delete(id);
       }else{
-        room.appendChild(next);
+        const card=renderCard(c);
+        card.dataset.cid=id;
+        card.dataset.contentKey=key;
+        room.appendChild(card);
       }
-      const opt=document.createElement('option');opt.value=c.id;
-      opt.textContent=`#${c.id} ${c.username} (${c.display_name})`;pick.appendChild(opt);
     });
     keep.forEach((el,id)=>{if(!seen.has(id))el.remove();});
     if(prev)pick.value=prev;
@@ -995,6 +1073,7 @@ $('loginForm').onsubmit=async ev=>{
 };
 $('logoutBtn').onclick=async()=>{
   if(pollTimer)clearInterval(pollTimer);
+  pollTimer=null;currentPollMs=null;
   try{await api('/api/admin/logout','POST')}finally{show(true)}
 };
 $('refreshBtn').onclick=()=>loadOverview().catch(e=>alert(e.message));

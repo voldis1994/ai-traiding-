@@ -17,9 +17,11 @@ STORE_KEY = 'ohlc_entry_gates_v1'
 DEFAULTS = {
     'enabled': 1,
     # Band geometry (BUY discount / SELL premium width).
+    # Cap stays tight so mid-range is NEVER both a BUY and SELL pullback —
+    # inflated M5 ATR used to push band≈45% of span and erase structure.
     'band_span_frac': 0.12,
-    'band_atr_frac': 0.25,
-    'band_span_cap': 0.45,
+    'band_atr_frac': 0.35,
+    'band_span_cap': 0.28,
     # Break tape / MTF agreement.
     'tape_need': 2,
     'break_mtf_conf': 0.55,
@@ -29,10 +31,10 @@ DEFAULTS = {
     # Rails.
     'band_span_frac_min': 0.08,
     'band_span_frac_max': 0.22,
-    'band_atr_frac_min': 0.15,
-    'band_atr_frac_max': 0.40,
-    'band_span_cap_min': 0.30,
-    'band_span_cap_max': 0.55,
+    'band_atr_frac_min': 0.20,
+    'band_atr_frac_max': 0.50,
+    'band_span_cap_min': 0.18,
+    'band_span_cap_max': 0.35,
     'tape_need_min': 1,
     'tape_need_max': 3,
     'break_mtf_conf_min': 0.45,
@@ -212,15 +214,31 @@ def _finite(v):
     return x if x==x and abs(x)!=float('inf') else None
 
 
-def _mtf_atr(mtf):
-    if not isinstance(mtf,dict) or not mtf.get('ready'):
+def _m1_atr_from_candles(candles, period=14):
+    """Wilder ATR on the same completed M1 bars that build swing zones."""
+    rows=list(candles or [])
+    if len(rows)<max(3,int(period)+1):
         return None
-    atr=_finite(mtf.get('stop_hint_atr14'))
-    if atr is not None and atr>0:
-        return atr
-    tf=(mtf.get('tf') or {}).get('m5') or {}
-    atr=_finite(tf.get('atr14'))
+    try:
+        from .mtf_momentum import atr_wilder
+        atr=atr_wilder(rows,int(period))
+    except Exception:
+        return None
     return atr if atr is not None and atr>0 else None
+
+
+def _entry_band_atr(mtf,candles):
+    """ATR for *entry band width* — M1 scale, never M5 stop_hint.
+
+    ``stop_hint_atr14`` is M5 noise for SL distance. Using it here made Gold
+    bands swallow the swing (price always \"in zone\" → looks like OHLC ignored).
+    """
+    if isinstance(mtf,dict) and mtf.get('ready'):
+        tf=(mtf.get('tf') or {}).get('m1') or {}
+        atr=_finite(tf.get('atr14'))
+        if atr is not None and atr>0:
+            return atr
+    return _m1_atr_from_candles(candles)
 
 
 def _mtf_kama(mtf):
@@ -267,7 +285,7 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
     out['event']=bos.get('event') or live.get('live_event')
     out['range_lo']=lo
     out['range_hi']=hi
-    atr=_mtf_atr(mtf)
+    atr=_entry_band_atr(mtf,candles)
     kama=_mtf_kama(mtf)
     out['atr14']=atr
     out['kama']=kama
@@ -287,24 +305,30 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
     except (TypeError,ValueError):
         spread_f=0.
     span=hi-lo
-    # ATR from the same MTF stack LIVE uses — not an invented mid ± κ.
-    # Fractions learn from closed £ (observe_close).
+    # M1 ATR (same candles as swings) — not M5 stop_hint. Fractions learn
+    # from closed £ (observe_close). Cap keeps discount/premium disjoint.
     span_frac=float(cfg.get('band_span_frac') or 0.12)
-    atr_frac=float(cfg.get('band_atr_frac') or 0.25)
-    span_cap=float(cfg.get('band_span_cap') or 0.45)
+    atr_frac=float(cfg.get('band_atr_frac') or 0.35)
+    span_cap=float(cfg.get('band_span_cap') or 0.28)
     band=max(span*span_frac,tick_f*8,spread_f*2)
     if atr is not None:
         band=max(band,atr_frac*atr)
-        band=min(band,span*span_cap)  # never swallow the whole range
+    band=min(band,span*span_cap)  # never swallow the swing mid
     out['band']=band
     out['support']={'lo':lo,'hi':lo,'label':'Support / swing low'}
     out['resistance']={'lo':hi,'hi':hi,'label':'Resistance / swing high'}
     buy_hi=lo+band
     sell_lo=hi-band
+    # Dead mid: structural mid-range is NOT a pullback for either side.
+    mid_r=0.5*(lo+hi)
+    gap=max(tick_f*4,span*0.06)
+    buy_hi=min(buy_hi,mid_r-gap)
+    sell_lo=max(sell_lo,mid_r+gap)
     # KAMA inside range tightens the wait edge toward adaptive trend.
     if kama is not None and lo<kama<hi:
         buy_hi=min(buy_hi,max(lo+tick_f,kama))
         sell_lo=max(sell_lo,min(hi-tick_f,kama))
+    out['mid_dead']={'lo':buy_hi,'hi':sell_lo,'mid':mid_r}
     if buy_hi>lo:
         out['buy_entry']={
             'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY',
@@ -588,8 +612,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         conf=0.
     pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
     wide_conf=float(cfg.get('zone_wide_conf') or 0.50)
+    # Mild widen only — 3× used to erase the wait and look like OHLC ignored.
     if pref==action and conf>=wide_conf:
-        buf=max(buf,buf*3.0,float(tick or 0.01)*3)
+        buf=max(buf,float(tick or 0.01)*1.5)
         meta['wide_ohlc_touch']=True
     # --- Trigger B: pullback zone (cheaper entry into structure) ---
     if price_in_zone(zone,price,buffer=buf):

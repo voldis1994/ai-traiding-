@@ -740,9 +740,9 @@ class RuntimeHub:
                 'stop':p.get('stopLevel'),
                 'profit':p.get('profitLevel'),
             })
-        # Compact candle payload for canvas.
+        # Compact candle payload for canvas (popup may ask for more history).
         bare=[]
-        for c in candles[-max(40,min(int(n),120)):]:
+        for c in candles[-max(40,min(int(n),180)):]:
             if not isinstance(c,dict):
                 continue
             try:
@@ -753,9 +753,26 @@ class RuntimeHub:
                 })
             except (KeyError,TypeError,ValueError):
                 continue
+        client_name=None
+        username=None
+        try:
+            row=self.platform.get_client(cid) if hasattr(self.platform,'get_client') else None
+            if not row and hasattr(self.platform,'client'):
+                row=self.platform.client(cid)
+            if not row and hasattr(self.platform,'list_clients'):
+                row=next((c for c in (self.platform.list_clients() or [])
+                          if int(c.get('id') or 0)==cid),None)
+            if isinstance(row,dict):
+                client_name=row.get('display_name') or row.get('name')
+                username=row.get('username')
+        except Exception:
+            pass
         return {
             'ok':True,
             'client_id':cid,
+            'client_name':client_name,
+            'display_name':client_name,
+            'username':username,
             'epic':epic,
             'mid':mid,
             'action':action,

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OHLC · klientam</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=93">
+  <link rel="stylesheet" href="/admin/static/ohlc-page.css?v=1">
+</head>
+<body class="ohlc-page">
+  <header class="ohlc-page-head">
+    <div>
+      <p class="eyebrow">NEURAL · Komandcentrs</p>
+      <h1 id="title">OHLC</h1>
+      <p id="subtitle" class="muted">Ielādē…</p>
+    </div>
+    <div class="ohlc-page-actions">
+      <button type="button" class="btn tiny btn-ghost" id="btnRefresh">Atjaunot</button>
+      <button type="button" class="btn tiny btn-ghost" id="btnClose">Aizvērt</button>
+    </div>
+  </header>
+  <main class="ohlc-page-main">
+    <canvas id="chart" class="ohlc-full" width="1100" height="560"></canvas>
+    <p id="legend" class="ohlc-legend muted"></p>
+    <p id="error" class="error" hidden></p>
+  </main>
+  <script src="/admin/static/ohlc-chart.js?v=1"></script>
+  <script src="/admin/static/ohlc-page.js?v=1"></script>
+</body>
+</html>

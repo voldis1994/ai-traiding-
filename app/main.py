@@ -257,6 +257,11 @@ async def operator_console():
 @app.get('/admin')
 async def admin_page():return FileResponse(WEB/'admin'/'index.html')
 
+@app.get('/admin/ohlc')
+async def admin_ohlc_page():
+    """Standalone per-client OHLC window (opened from Admin mini chart click)."""
+    return FileResponse(WEB/'admin'/'ohlc.html')
+
 @app.get('/app')
 async def client_page():return FileResponse(WEB/'client'/'index.html')
 

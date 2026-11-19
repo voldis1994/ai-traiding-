@@ -4930,27 +4930,40 @@ class SingleTradeEngine:
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
+        level=float(p['level'] or mid)
+        direction=p.get('direction')
         bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
                                          base_sl=base_sl,max_tp=zone.get('max_tp'),
                                          candles=candles,tick=tick,spread=spread,
-                                         min_distance=min_dist)
-        # Use OHLC-decided distances — do not re-scale range via stop_take×sl_mult
-        # (that re-opened the win-ratchet path after 3 wins).
+                                         min_distance=min_dist,
+                                         entry=level,action=direction)
+        # Prefer swing-anchored levels from propose; never invent fresh ±zone.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
+        stop_lvl=_num(bp.get('stop_level'))
+        profit_lvl=_num(bp.get('profit_level'))
         if decided_sl and decided_tp and decided_sl>0 and decided_tp>0:
-            sign=1 if p.get('direction')=='BUY' else -1
-            level=float(p['level'] or mid)
+            sign=1 if direction=='BUY' else -1
+            if stop_lvl is None:
+                stop_lvl=level-sign*float(decided_sl)
+            if profit_lvl is None:
+                profit_lvl=level+sign*float(decided_tp)
             result={
                 'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
-                'stop_level':level-sign*float(decided_sl),
-                'profit_level':level+sign*float(decided_tp),
+                'stop_level':float(stop_lvl),
+                'profit_level':float(profit_lvl),
                 'kappa':bp.get('kappa'),'sl_scale':1.0,
+                'bracket_source':bp.get('bracket_source'),
             }
         else:
+            # Last resort only when swings unavailable — still log clearly.
             result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
                              kappa=bp['kappa'],sl_scale=1.0,
                              range_distance=float(rng) if rng is not None else 0)
+            result['bracket_source']='protect_fallback_zone'
+            self.store.event('warning','Protection used zone fallback — no swing levels',{
+                'deal_id':p.get('dealId'),'reason':bp.get('reason'),
+                'bracket_source':bp.get('bracket_source')})
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
         if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
             self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
@@ -5085,8 +5098,22 @@ class SingleTradeEngine:
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0),
-                entry=entry,action=action,candles=candles,atr=atr_hint)
-            # Prefer swing-anchored levels when ready; else entry ± zone distance.
+                entry=entry,action=action,candles=candles,atr=atr_hint,
+                require_swing=True)
+            # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
+            if not decided.get('ready') or decided.get('stop_distance') is None \
+                    or decided.get('profit_distance') is None:
+                self.last_entry_reason=(
+                    f"OPEN skipped — no OHLC swing SL/TP "
+                    f"({decided.get('reason') or decided.get('swing_reason') or 'unready'})")
+                self.store.event('entry','OPEN skipped — swing brackets unavailable',{
+                    'reason':self.last_entry_reason,
+                    'source':decided.get('source'),
+                    'swing_reason':decided.get('swing_reason') or decided.get('reason'),
+                    'bos_event':decided.get('bos_event'),
+                    'swing_hi':decided.get('swing_hi'),
+                    'swing_lo':decided.get('swing_lo')})
+                return
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
             stop_level=decided.get('stop_level')
@@ -5095,7 +5122,7 @@ class SingleTradeEngine:
                 stop_level=float(entry)-sign*sd
             if profit_level is None:
                 profit_level=float(entry)+sign*pd
-            bracket_source=str(decided.get('source') or 'ohlc_zone')
+            bracket_source=str(decided.get('source') or 'swing_anchor')
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
                 'stop_level':float(stop_level),
@@ -5152,6 +5179,8 @@ class SingleTradeEngine:
                 'ohlc_sl':decided.get('ohlc_sl'),'ohlc_tp':decided.get('ohlc_tp'),
                 'tighten':decided.get('tighten'),
                 'swing_hi':decided.get('swing_hi'),'swing_lo':decided.get('swing_lo'),
+                'swing_reason':decided.get('swing_reason') or decided.get('reason'),
+                'bos_event':decided.get('bos_event'),
                 'stop_level':brackets['stop_level'],
                 'profit_level':brackets['profit_level'],
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
@@ -5166,7 +5195,7 @@ class SingleTradeEngine:
                 'timeframes':zone.get('timeframes'),
                 'stop_distance':float(brackets['stop_distance']),
                 'profit_distance':float(brackets['profit_distance']),
-                'bracket_source':'ohlc_zone_multi_tf',
+                'bracket_source':bracket_source,
                 'raised_to_broker_min':bool(brackets.get('raised_to_broker_min')),
                 'cash_risk':proposed,
                 'tick_value':float(tick_val) if tick_val is not None else None,

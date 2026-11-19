@@ -630,7 +630,7 @@ class RuntimeHub:
         Not every-candle signals — zone bands from structure so the operator
         can see where a future BUY/SELL entry would sit relative to swings.
         """
-        from . import structure_memory, bracket_learn
+        from . import structure_memory, bracket_learn, ohlc_entry_zones
         cid=int(client_id)
         rt=self.get(cid)
         store=None
@@ -705,39 +705,20 @@ class RuntimeHub:
                 'hint':'Atver manuālu darījumu Capital.com jebkurā tirgū — robots adoptē to epic un OHLC.',
             }
         candles=store.candles(epic,n=max(40,min(int(n),180)),historical_only=False) or []
-        live=structure_memory.snapshot_live(candles=candles,mid=mid)
-        bos=structure_memory.bos_choch(candles,left=2,right=2) if candles else {}
-        piv=structure_memory.swing_pivots(candles,left=2,right=2) if candles else {}
-        range_hi=bos.get('range_hi')
-        range_lo=bos.get('range_lo')
         if mid is None and candles:
             try:
                 mid=float(candles[-1].get('close'))
             except (TypeError,ValueError,AttributeError):
                 mid=None
-        # Prospective entry zones — near protective swings, not every bar.
-        buy_zone=None
-        sell_zone=None
-        try:
-            lo=float(range_lo) if range_lo is not None else None
-            hi=float(range_hi) if range_hi is not None else None
-        except (TypeError,ValueError):
-            lo=hi=None
-        if lo is not None and hi is not None and hi>lo:
-            span=hi-lo
-            band=max(span*0.12,float(tick)*8,spread*2)
-            # BUY entry: discount band above swing low (support) — never invert.
-            buy_hi=lo+band
-            if mid is not None:
-                buy_hi=min(buy_hi,max(lo,float(mid)))
-            if buy_hi>lo:
-                buy_zone={'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY'}
-            # SELL entry: premium band below swing high (resistance).
-            sell_lo=hi-band
-            if mid is not None:
-                sell_lo=max(sell_lo,min(hi,float(mid)))
-            if sell_lo<hi:
-                sell_zone={'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL'}
+        # Same OHLC entry geometry LIVE waits for before OPEN.
+        ez=ohlc_entry_zones.compute_entry_zones(
+            candles,mid=mid,tick=tick,spread=spread)
+        live=structure_memory.snapshot_live(candles=candles,mid=mid) if candles else {}
+        piv=structure_memory.swing_pivots(candles,left=2,right=2) if candles else {}
+        range_hi=ez.get('range_hi')
+        range_lo=ez.get('range_lo')
+        buy_zone=ez.get('buy_entry')
+        sell_zone=ez.get('sell_entry')
         preferred=action if action in ('BUY','SELL') else None
         if not preferred and isinstance(scores,dict):
             try:
@@ -794,8 +775,8 @@ class RuntimeHub:
             'scores':scores,
             'candles':bare,
             'structure':{
-                'bias':bos.get('bias') or live.get('live_bias'),
-                'event':bos.get('event') or live.get('live_event'),
+                'bias':ez.get('bias') or (live or {}).get('live_bias'),
+                'event':ez.get('event') or (live or {}).get('live_event'),
                 'range_hi':range_hi,
                 'range_lo':range_lo,
                 'swing_highs':[
@@ -806,13 +787,12 @@ class RuntimeHub:
                     for s in (piv.get('swing_lows') or [])[-6:]],
             },
             'zones':{
-                'support':({'lo':range_lo,'hi':range_lo,'label':'Support / swing low'}
-                           if range_lo is not None else None),
-                'resistance':({'lo':range_hi,'hi':range_hi,'label':'Resistance / swing high'}
-                              if range_hi is not None else None),
+                'support':ez.get('support'),
+                'resistance':ez.get('resistance'),
                 'buy_entry':buy_zone,
                 'sell_entry':sell_zone,
             },
+            'entry_zone_source':'ohlc_entry_zones',
             'swing_brackets':swing_brackets,
             'open_levels':open_levels,
         }

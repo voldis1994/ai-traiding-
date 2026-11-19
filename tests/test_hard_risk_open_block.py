@@ -1,11 +1,31 @@
 """Hard-risk must NOT gate LIVE OPEN (operator: remove risk entirely)."""
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app import hard_risk
+from app import hard_risk, ohlc_entry_zones
 from app.autonomy import AutoEvolution
 from app.engine import SingleTradeEngine
 from tests.test_learning_integrity import new_brain
+
+
+def _seed_gold_candles(store, n=80):
+    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    px = 2000.0
+    rows = []
+    for i in range(n):
+        o = px
+        c = px + (0.15 if i % 7 else -0.35)
+        h = max(o, c) + 0.8 + (1.5 if i % 11 == 10 else 0.1)
+        l = min(o, c) - 0.8 - (1.5 if i % 11 == 5 else 0.1)
+        row = {
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': h, 'low': l, 'close': c,
+        }
+        store.candle('GOLD', row, source='HISTORICAL')
+        rows.append(row)
+        px = c
+    return rows
 
 
 def test_preflight_allows_when_limits_unset():
@@ -49,9 +69,15 @@ def test_snapshot_does_not_blame_hard_risk_when_unset():
 def test_entry_evaluation_not_held_by_unset_hard_risk():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
+        rows=_seed_gold_candles(store)
+        zones=ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
+        buy=zones['buy_entry']
+        assert buy
+        ask=(float(buy['lo'])+float(buy['hi']))/2
         e=SingleTradeEngine(store,brain)
         e.policy=AutoEvolution(store,Path(d)/'pol.py')
         e.mandate={'epic':'GOLD','size':'0.02'}
+        e.market={'mid':ask,'ask':ask,'bid':ask-0.1,'tick':0.1,'spread':0.2}
         e.market_context={'ready':True,'reason':'','returns_bps':{},'trend':'UP','regime':'ALIGNED'}
         e.latest_fusion_ready=True
         e.last_signal={'action':'BUY','scores':{'BUY':0.6,'SELL':0.25,'HOLD':0.15},
@@ -65,3 +91,4 @@ def test_entry_evaluation_not_held_by_unset_hard_risk():
         out=e._entry_evaluation()
         assert out['action']=='BUY'
         assert 'hard risk' not in (out.get('reason') or '').lower()
+        assert (out.get('ohlc_entry_zone') or {}).get('allowed') is True

@@ -1,0 +1,142 @@
+"""OHLC structural entry zones — shared by Admin chart and LIVE OPEN.
+
+BUY waits in the discount band above swing/BOS low; SELL waits in the premium
+band below swing/BOS high. Zones are geometry from candles — never invented
+mid ± κ. LIVE OPEN must call ``entry_allows_open`` before submitting.
+"""
+from __future__ import annotations
+
+from . import structure_memory
+
+
+def _finite(v):
+    try:
+        x=float(v)
+    except (TypeError,ValueError):
+        return None
+    return x if x==x and abs(x)!=float('inf') else None
+
+
+def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0):
+    """Return structural BUY/SELL entry bands from OHLC swings / BOS range.
+
+    Same geometry Admin draws and LIVE waits for. No median invent.
+    """
+    out={
+        'ok':False,'reason':'no_candles',
+        'support':None,'resistance':None,
+        'buy_entry':None,'sell_entry':None,
+        'range_lo':None,'range_hi':None,'band':None,
+        'bias':None,'event':None,
+    }
+    if not candles or len(candles)<20:
+        return out
+    bos=structure_memory.bos_choch(candles,left=2,right=2) or {}
+    live=structure_memory.snapshot_live(candles=candles,mid=mid) or {}
+    lo=_finite(bos.get('range_lo'))
+    hi=_finite(bos.get('range_hi'))
+    out['bias']=bos.get('bias') or live.get('live_bias')
+    out['event']=bos.get('event') or live.get('live_event')
+    out['range_lo']=lo
+    out['range_hi']=hi
+    if lo is None or hi is None or not (hi>lo):
+        out['reason']='no_swing_range'
+        return out
+    try:
+        tick_f=max(float(tick or 0.01),1e-9)
+    except (TypeError,ValueError):
+        tick_f=0.01
+    try:
+        spread_f=max(float(spread or 0),0.)
+    except (TypeError,ValueError):
+        spread_f=0.
+    span=hi-lo
+    band=max(span*0.12,tick_f*8,spread_f*2)
+    out['band']=band
+    out['support']={'lo':lo,'hi':lo,'label':'Support / swing low'}
+    out['resistance']={'lo':hi,'hi':hi,'label':'Resistance / swing high'}
+    # Structural bands (no mid-cap) — LIVE wait + Admin drawing stay aligned.
+    buy_hi=lo+band
+    if buy_hi>lo:
+        out['buy_entry']={
+            'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY',
+            'source':'ohlc_swing'}
+    sell_lo=hi-band
+    if sell_lo<hi:
+        out['sell_entry']={
+            'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL',
+            'source':'ohlc_swing'}
+    out['ok']=bool(out['buy_entry'] or out['sell_entry'])
+    out['reason']='swing_levels' if out['ok'] else 'empty_bands'
+    return out
+
+
+def price_in_zone(zone,price,*,buffer=0.0):
+    """True when price sits inside [lo−buf, hi+buf]."""
+    if not isinstance(zone,dict):
+        return False
+    lo=_finite(zone.get('lo'))
+    hi=_finite(zone.get('hi'))
+    p=_finite(price)
+    if lo is None or hi is None or p is None:
+        return False
+    if hi<lo:
+        lo,hi=hi,lo
+    try:
+        buf=max(float(buffer or 0),0.)
+    except (TypeError,ValueError):
+        buf=0.
+    return (lo-buf)<=p<=(hi+buf)
+
+
+def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
+                      tick=0.01,spread=0.0):
+    """Gate LIVE OPEN: neural side may fire only when price is in OHLC entry zone.
+
+    BUY uses ask (or mid); SELL uses bid (or mid). Buffer = 1 tick.
+    """
+    action=(action or '').upper()
+    meta={
+        'allowed':False,'action':action,'reason':'bad_action',
+        'zones':None,'price':None,'zone':None,'source':'ohlc_entry_zones'}
+    if action not in ('BUY','SELL'):
+        return meta
+    zones=compute_entry_zones(candles,mid=mid,tick=tick,spread=spread)
+    meta['zones']=zones
+    if not zones.get('ok'):
+        meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
+        return meta
+    zone=zones.get('buy_entry') if action=='BUY' else zones.get('sell_entry')
+    meta['zone']=zone
+    if not zone:
+        meta['reason']=f'wait_entry_zone (no_{action.lower()}_band)'
+        return meta
+    if action=='BUY':
+        price=_finite(ask)
+        if price is None:
+            price=_finite(mid)
+    else:
+        price=_finite(bid)
+        if price is None:
+            price=_finite(mid)
+    meta['price']=price
+    if price is None:
+        meta['reason']='wait_entry_zone (no_price)'
+        return meta
+    try:
+        buf=max(float(tick or 0.01),0.)
+    except (TypeError,ValueError):
+        buf=0.01
+    if price_in_zone(zone,price,buffer=buf):
+        meta['allowed']=True
+        meta['reason']='ohlc_entry_zone_touch'
+        return meta
+    # Directional hint: how far from the band.
+    lo=_finite(zone['lo']);hi=_finite(zone['hi'])
+    if action=='BUY' and price>hi:
+        meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
+    elif action=='SELL' and price<lo:
+        meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
+    else:
+        meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+    return meta

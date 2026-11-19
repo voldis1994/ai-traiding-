@@ -47,6 +47,8 @@ def test_admin_structure_view_builds_zones():
         # At least one structural or entry zone should be present when swings exist.
         assert zones.get('buy_entry') or zones.get('sell_entry') or zones.get('support')
         assert 'structure' in view
+        # Same module LIVE uses before OPEN — Admin drawing == robot wait gate.
+        assert view.get('entry_zone_source') == 'ohlc_entry_zones'
 
 
 def test_admin_ohlc_page_route_exists():

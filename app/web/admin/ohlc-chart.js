@@ -294,10 +294,11 @@ function drawOhlcStructure(canvas,view,opts){
   }
   if(mtf.mode||ov.mode)parts.push(`MTF ${mtf.mode||ov.mode}`);
   // Use ?? so a real ADX/ATR of 0 is distinct from missing (null).
+  // Do not redeclare `atr` — already bound above for the ATR band.
   const adx=_ohlcFinite(mtf.adx??ov.adx);
-  const atr=_ohlcFinite(mtf.atr14??ov.atr14);
+  const atrShow=_ohlcFinite(mtf.atr14??ov.atr14)??atr;
   if(adx!=null)parts.push(`ADX ${adx.toFixed(0)}`);
-  if(atr!=null)parts.push(`ATR ${atr.toFixed(2)}`);
+  if(atrShow!=null)parts.push(`ATR ${atrShow.toFixed(2)}`);
   if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');
   if(view.info_stack)parts.push(String(view.info_stack));
   if(parts.length){

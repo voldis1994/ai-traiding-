@@ -687,7 +687,8 @@ function renderCard(c){
       })()}
       <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
       <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>
-      <div><span>Tirgus</span><strong>${esc(a.market||'—')}</strong></div>
+      <div><span>Tirgus (Capital adopt)</span><strong>${esc(
+        a.market||(a.mandate&&a.mandate.epic)||'gaida manuālu darījumu')}</strong></div>
       <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
       <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
       <div><span>Kopējais P&amp;L</span><strong class="${pnlClass(sb.pnl)}">${
@@ -706,6 +707,7 @@ function renderCard(c){
       <button type="button" class="btn tiny btn-primary" data-act="start" data-id="${c.id}">${icon('play')} Start</button>
       <button type="button" class="btn tiny btn-ghost" data-act="stop" data-id="${c.id}">${icon('stop')} Stop</button>
       <button type="button" class="btn tiny btn-ghost" data-act="resume" data-id="${c.id}">${icon('play')} Resume</button>
+      <button type="button" class="btn tiny btn-ghost" data-act="market" data-id="${c.id}" title="Jebkurš Capital tirgus — ne tikai GOLD">${icon('candles')} Mainīt tirgu</button>
       <button type="button" class="btn tiny btn-ghost" data-act="wipe" data-id="${c.id}">${icon('sync')} Mācīties no jauna</button>
     </div>`;
   el.querySelectorAll('[data-act]').forEach(btn=>{
@@ -720,6 +722,17 @@ function renderCard(c){
           if(typed!=='RESET'){alert('Atcelts.');return}
           await api('/api/admin/reset-learning','POST',{
             confirmation:'RESET',client_id:Number(btn.dataset.id)});
+        }else if(btn.dataset.act==='market'){
+          const ok=confirm(
+            `Mainīt tirgu klientam #${btn.dataset.id}?\n\n`+
+            '1) Aizver visas Capital pozīcijas šim kontam.\n'+
+            '2) Apstiprini — robots noņem veco mandate.\n'+
+            '3) Capital.com atver PIRMO darījumu JAUNAJĀ tirgū (US500, EURUSD, OIL… — jebkurš).\n\n'+
+            'Entry / SL / TP tad seko tā tirgus OHLC svecēm. Robots NAV piesaistīts tikai GOLD.');
+          if(!ok)return;
+          const out=await api(
+            `/api/admin/clients/${btn.dataset.id}/prepare-new-market`,'POST');
+          alert(out.next_step||out.note||'Gaida jaunu manuālu darījumu.');
         }else{
           await api(`/api/admin/clients/${btn.dataset.id}/${btn.dataset.act}`,'POST');
         }
@@ -799,10 +812,19 @@ async function refreshOhlcPanel(cardEl,clientId){
     const data=await api(`/api/admin/clients/${clientId}/structure-view?n=90`);
     const view=data||{};
     panel._ohlcView=view;
+    if(view.ok===false||view.reason==='no_epic'||!view.epic){
+      if(meta)meta.textContent='nav epic — atver Capital manuālu darījumu jebkurā tirgū';
+      if(legend)legend.textContent=view.hint
+        ||'Robots adoptē tirgu no Capital (ne tikai GOLD). Entry/SL/TP no tā OHLC.';
+      if(typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,{candles:[]});
+      return;
+    }
     const st=view.structure||{};
     if(meta){
       meta.textContent=[
         view.epic||'',
+        view.epic_source&&view.epic_source!=='live_quote'&&view.epic_source!=='mandate'
+          ?`(${view.epic_source})`:'',
         st.bias?`bias ${st.bias}`:'',
         st.event||'',
         view.preferred?`zona ${view.preferred}`:'abas zonas',

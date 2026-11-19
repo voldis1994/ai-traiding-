@@ -445,6 +445,18 @@ async def admin_client_structure_view(client_id:int,n:int=90,_:dict=Depends(requ
         raise HTTPException(404,'Client store not found') from None
     return {'ok':True,**view}
 
+@app.post('/api/admin/clients/{client_id}/prepare-new-market')
+async def admin_prepare_new_market(client_id:int,_:dict=Depends(require_admin)):
+    """Drop current mandate — next Capital manual trade may be ANY instrument."""
+    if not platform.get_client(client_id):
+        raise HTTPException(404,'Client not found')
+    try:
+        return await hub.prepare_new_market(client_id)
+    except RuntimeError as exc:
+        raise HTTPException(409,str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from None
+
 @app.post('/api/admin/clients')
 async def admin_create_client(data:ClientCreate,_:dict=Depends(require_admin)):
     try:

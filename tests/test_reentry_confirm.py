@@ -8,17 +8,43 @@ from app import reentry_confirm as rc
 from app.engine import Store
 
 
-def test_raw_disagrees_nudged_holds():
+def test_raw_disagrees_nudged_holds_without_ohlc():
     scores_raw = {'BUY': 0.20, 'SELL': 0.55, 'HOLD': 0.25}
-    # Modules nudged to BUY but neuron still prefers SELL.
+    # Modules nudged to BUY but neuron prefers SELL and OHLC is quiet.
+    out = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        market_context={'trend': 'MIXED'},
+        mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD',
+                      'confidence': 0.2},
+        candles=[{'open': 100, 'close': 99}] * 3)
+    assert out['allowed'] is False
+    assert out['reason'] == 'raw_disagrees_nudged'
+
+
+def test_ohlc_strong_overrides_raw_cross():
+    scores_raw = {'BUY': 0.20, 'SELL': 0.55, 'HOLD': 0.25}
+    # Neuron prefers SELL but OHLC/MTF strongly says BUY — allow entry.
     out = rc.evaluate(
         action='BUY', scores_raw=scores_raw,
         market_context={'trend': 'UP'},
         mtf_analysis={'ready': True, 'structure_break': 'UP',
-                      'stop_hint_atr14': 2.0, 'preferred': 'BUY', 'mode': 'BUY'},
+                      'stop_hint_atr14': 2.0, 'preferred': 'BUY', 'mode': 'BUY',
+                      'confidence': 0.7},
         candles=[{'open': 100, 'close': 101}] * 3)
-    assert out['allowed'] is False
-    assert out['reason'] == 'raw_disagrees_nudged'
+    assert out['allowed'] is True
+    assert out['reason'] == 'ohlc_overrides_raw_cross'
+
+
+def test_medium_ohlc_skips_m1_confirm():
+    scores_raw = {'BUY': 0.42, 'SELL': 0.28, 'HOLD': 0.30}  # edge 0.12
+    out = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        market_context={'trend': 'MIXED'},
+        mtf_analysis={'ready': True, 'preferred': 'BUY', 'mode': 'BUY',
+                      'confidence': 0.65, 'structure_break': 'UP'},
+        candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 100}])
+    assert out['allowed'] is True
+    assert 'ohlc' in out['reason'] or out.get('fast_entry') is True
 
 
 def test_weak_raw_holds():
@@ -97,8 +123,33 @@ def test_observe_close_raises_strong_after_fast_loss():
         assert after > before
 
 
-def test_engine_reentry_gate_blocks_amplified_buy():
-    """Engine helper: raw SELL vs nudged BUY → HOLD."""
+def test_engine_reentry_gate_blocks_amplified_buy_without_ohlc():
+    """Engine helper: raw SELL vs nudged BUY → HOLD when OHLC is quiet."""
+    from app.autonomy import AutoEvolution
+    from app.engine import SingleTradeEngine
+    from tests.test_learning_integrity import new_brain
+
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        brain.tick(100, .05, .01, 'GOLD')
+        e = SingleTradeEngine(store, brain)
+        e.policy = AutoEvolution(store, Path(d) / 'policy.py')
+        e.mandate = {'epic': 'GOLD', 'size': '0.02'}
+        e.market_context = {'trend': 'MIXED', 'close': 2655}
+        e.last_signal = {
+            'scores_raw': {'BUY': 0.22, 'SELL': 0.50, 'HOLD': 0.28},
+        }
+        gate = e._reentry_confirm_gate(
+            'BUY',
+            scores_raw={'BUY': 0.22, 'SELL': 0.50, 'HOLD': 0.28},
+            mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD',
+                          'confidence': 0.2})
+        assert gate['allowed'] is False
+        assert gate['reason'] == 'raw_disagrees_nudged'
+
+
+def test_engine_reentry_gate_ohlc_overrides_cross():
+    """Strong OHLC BUY overrides raw SELL cross — entry allowed."""
     from app.autonomy import AutoEvolution
     from app.engine import SingleTradeEngine
     from tests.test_learning_integrity import new_brain
@@ -110,13 +161,11 @@ def test_engine_reentry_gate_blocks_amplified_buy():
         e.policy = AutoEvolution(store, Path(d) / 'policy.py')
         e.mandate = {'epic': 'GOLD', 'size': '0.02'}
         e.market_context = {'trend': 'UP', 'close': 2655}
-        e.last_signal = {
-            'scores_raw': {'BUY': 0.22, 'SELL': 0.50, 'HOLD': 0.28},
-        }
         gate = e._reentry_confirm_gate(
             'BUY',
             scores_raw={'BUY': 0.22, 'SELL': 0.50, 'HOLD': 0.28},
             mtf_analysis={'ready': True, 'structure_break': 'UP',
-                          'stop_hint_atr14': 2.0, 'preferred': 'BUY', 'mode': 'BUY'})
-        assert gate['allowed'] is False
-        assert gate['reason'] == 'raw_disagrees_nudged'
+                          'stop_hint_atr14': 2.0, 'preferred': 'BUY', 'mode': 'BUY',
+                          'confidence': 0.7})
+        assert gate['allowed'] is True
+        assert gate['reason'] == 'ohlc_overrides_raw_cross'

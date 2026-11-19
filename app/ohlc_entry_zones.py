@@ -131,7 +131,12 @@ def price_in_zone(zone,price,*,buffer=0.0):
 
 
 def _mtf_allows_side(action,mtf):
-    """Hard MTF filter: do not OPEN against ready KAMA/ADX/ATR stack."""
+    """Hard MTF filter: do not OPEN against a *strongly* opposing KAMA/ADX stack.
+
+    Soft HOLD / mild cross no longer freezes entry when OHLC preferred agrees
+    with the neural side — only hard ADX/spread blocks and high-confidence
+    opposite preferred (≥0.75) keep the wait.
+    """
     if not isinstance(mtf,dict) or not mtf.get('ready'):
         return True,'mtf_not_ready'
     if mtf.get('enabled') is False:
@@ -148,15 +153,23 @@ def _mtf_allows_side(action,mtf):
         return False,f'wait_mtf_{reason}'
     if mtf.get('move_ok') is False:
         return False,'wait_mtf_spread_atr'
-    # Strong opposite side (not SHIFT-into-us).
-    if (conf>=0.55 and preferred in ('BUY','SELL') and preferred!=action
+    # OHLC/MTF already prefers our side — never treat as conflict.
+    if preferred==action or mode==action:
+        return True,'mtf_aligned'
+    # Only hard-block a *strong* opposite preferred (was 0.55 — froze on mild cross).
+    if (conf>=0.75 and preferred in ('BUY','SELL') and preferred!=action
             and mode!='SHIFT'):
         return False,f'wait_mtf_conflict ({mode}/{preferred})'
-    # SHIFT preferring the other side = early reverse — do not chase old side.
+    # Mild cross / soft HOLD — allow zone check (neural+OHLC decide).
+    if mode=='HOLD':
+        return True,'mtf_hold_soft'
+    # SHIFT preferring the other side = early reverse — do not chase old side
+    # unless confidence is soft (<0.60).
     if mode=='SHIFT' and preferred in ('BUY','SELL') and preferred!=action:
-        return False,f'wait_mtf_shift ({preferred})'
+        if conf>=0.60:
+            return False,f'wait_mtf_shift ({preferred})'
+        return True,'mtf_shift_soft'
     return True,'mtf_aligned'
-
 
 def drop_forming_minute(candles, *, now_utc=None):
     """Exclude the unfinished UTC minute — same cutoff as market_features."""
@@ -211,6 +224,16 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         buf=max(float(tick or 0.01),0.)
     except (TypeError,ValueError):
         buf=0.01
+    # Strong OHLC/MTF agreement → slightly wider touch so mid-tape "cross" into
+    # the band still fires instead of waiting another closed M1.
+    try:
+        conf=float((mtf or {}).get('confidence') or 0) if isinstance(mtf,dict) else 0.
+    except (TypeError,ValueError):
+        conf=0.
+    pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
+    if pref==action and conf>=0.50:
+        buf=max(buf,buf*3.0,float(tick or 0.01)*3)
+        meta['wide_ohlc_touch']=True
     if price_in_zone(zone,price,buffer=buf):
         meta['allowed']=True
         meta['reason']='ohlc_entry_zone_touch'

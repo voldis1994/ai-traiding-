@@ -762,7 +762,26 @@ class RuntimeHub:
         candles_raw=store.candles(epic,n=hist_n,historical_only=False) or []
         # Same cutoff as LIVE OPEN — forming QUOTE minute must not move zones.
         candles_full=ohlc_entry_zones.drop_forming_minute(candles_raw)
-        candles=candles_full[-display_n:] if candles_full else []
+        # Chart display includes the live forming minute so Admin tracks Capital
+        # tape mid-minute (zones/MTF still use completed bars only).
+        candles_chart=list(candles_full or [])
+        if candles_raw:
+            last_raw=candles_raw[-1]
+            last_full=candles_full[-1] if candles_full else None
+            if (isinstance(last_raw,dict) and (
+                    not last_full or str(last_raw.get('at') or '')!=str(last_full.get('at') or ''))):
+                # Prefer live mid as forming close when engine quote is fresher.
+                row=dict(last_raw)
+                if mid is not None:
+                    try:
+                        m=float(mid)
+                        row['close']=m
+                        row['high']=max(float(row.get('high') or m),m)
+                        row['low']=min(float(row.get('low') or m),m)
+                    except (TypeError,ValueError):
+                        pass
+                candles_chart.append(row)
+        candles=candles_chart[-display_n:] if candles_chart else []
         if mid is None and candles:
             try:
                 mid=float(candles[-1].get('close'))
@@ -776,7 +795,8 @@ class RuntimeHub:
         ez=ohlc_entry_zones.compute_entry_zones(
             candles_full or candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
         live=structure_memory.snapshot_live(
-            candles=candles_full or candles,mid=mid) if (candles_full or candles) else {}
+            candles=candles_chart or candles_full or candles,mid=mid) if (
+                candles_chart or candles_full or candles) else {}
         path=structure_memory.normalise(candles_full or candles,limit=80) \
             if (candles_full or candles) else []
         piv=structure_memory.swing_pivots(path,left=2,right=2) if path else {}

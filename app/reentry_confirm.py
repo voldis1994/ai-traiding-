@@ -3,9 +3,9 @@
 Modules (structure/MTF/day_book) can amplify BUY/SELL. Before a new OPEN:
 
 1. Raw neural edge must be strong enough (scores_raw, not nudged).
-2. Same-direction re-entry after a close needs new tape proof (ATR / structure /
-   consecutive M1 closes).
-3. Strong + price confirm → enter now; medium → extra M1 confirm; weak → HOLD.
+2. Same-direction re-entry after a close needs new tape proof (ATR / structure).
+3. Strong/medium pass without eternal M1 colour-confirm HOLD — candle *quality*
+   is gated by ``ohlc_regime_gate`` (chop/doji/impulse/chaos) instead.
 4. Outcomes of fast / same-dir re-entries nudge the required raw floors.
 """
 from __future__ import annotations
@@ -407,37 +407,22 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
         candles=candles)
     meta['price_confirm'] = confirm
 
+    # Strong / medium: do NOT eternal-HOLD waiting for M1 colour confirm.
+    # Candle *quality* is gated by ``ohlc_regime_gate`` (chop/doji/impulse/…).
+    # Here we only keep raw edge + same-dir / chase / structure-memory proofs.
     if tier == 'strong':
         if confirm.get('ok') or ohlc.get('ok'):
             return dict(meta, allowed=True,
                         reason='strong_immediate' if confirm.get('ok') else 'strong_ohlc_skip_m1',
                         fast_entry=True)
-        # Strong but no tape yet — ask one M1 confirm instead of waiting forever.
-        streak = m1_same_dir_streak(candles, action, need=1)
-        meta['m1_confirm'] = streak
-        if streak.get('ok'):
-            return dict(meta, allowed=True, reason='strong_m1_confirm',
-                        fast_entry=True)
-        return dict(meta, allowed=False, reason='strong_wait_price_confirm',
-                    fast_entry=False)
-
-    # Medium: OHLC/MTF strong agreement skips multi-M1 wait ("1m confirm" freeze).
-    if ohlc.get('ok') or confirm.get('reason') in (
-            'structure_break', 'mtf_preferred', 'ohlc_strong',
-            'mtf_preferred_strong', 'structure_break_strong'):
-        return dict(meta, allowed=True, reason='medium_ohlc_skip_m1',
+        return dict(meta, allowed=True, reason='strong_no_m1_wait',
                     fast_entry=True)
-    if confirm.get('reason') == 'structure_break':
-        return dict(meta, allowed=True, reason='medium_structure_confirm',
-                    fast_entry=False)
-    need = int(params.get('medium_m1_streak') or 2)
-    streak = m1_same_dir_streak(candles, action, need=need)
-    meta['m1_confirm'] = streak
-    if streak.get('ok'):
-        return dict(meta, allowed=True, reason='medium_m1_confirm',
-                    fast_entry=False)
-    return dict(meta, allowed=False, reason='medium_need_m1_confirm',
-                fast_entry=False)
+
+    if ohlc.get('ok') or confirm.get('ok'):
+        return dict(meta, allowed=True, reason='medium_tape_ok',
+                    fast_entry=True)
+    return dict(meta, allowed=True, reason='medium_no_m1_wait',
+                fast_entry=True)
 
 
 def open_meta_from_gate(gate: dict, *, action) -> dict:

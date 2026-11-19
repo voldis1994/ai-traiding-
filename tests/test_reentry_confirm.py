@@ -66,23 +66,17 @@ def test_strong_with_price_confirm_enters_immediately():
     assert out.get('fast_entry') is True
 
 
-def test_medium_needs_one_m1_close():
-    """Unified live path: medium confirm = 1 same-dir M1 (not 2)."""
+def test_medium_no_eternal_m1_confirm_hold():
+    """Medium edge must not eternal-HOLD waiting for M1 colour confirm."""
     scores_raw = {'BUY': 0.42, 'SELL': 0.28, 'HOLD': 0.30}  # edge 0.12
-    zero = rc.evaluate(
+    # Opposite-coloured last M1 — old path froze on medium_need_m1_confirm.
+    out = rc.evaluate(
         action='BUY', scores_raw=scores_raw,
         market_context={'trend': 'MIXED'},
         mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
         candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 98.5}])
-    assert zero['allowed'] is False
-    assert zero['reason'] == 'medium_need_m1_confirm'
-    one = rc.evaluate(
-        action='BUY', scores_raw=scores_raw,
-        market_context={'trend': 'MIXED'},
-        mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
-        candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 100}])
-    assert one['allowed'] is True
-    assert one['reason'] == 'medium_m1_confirm'
+    assert out['allowed'] is True
+    assert 'm1' not in out['reason'] or 'no_m1_wait' in out['reason']
 
 
 def test_same_dir_reentry_needs_new_atr_move():

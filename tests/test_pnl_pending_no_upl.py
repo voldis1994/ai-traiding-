@@ -65,7 +65,7 @@ def test_vanish_queues_pending_when_history_empty():
             e.policy=AutoEvolution(store,Path(d)/'policy.py')
             broker=HistoryBroker()
             broker.open=[{'position':{'dealId':'gold1','size':'.02','direction':'SELL',
-                'level':2651,'upl':-0.02,'currency':'USD'},'market':{'epic':'GOLD'}}]
+                'level':2651,'upl':-0.22,'currency':'USD'},'market':{'epic':'GOLD'}}]
             e.attach(broker)
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             await e.sync()
@@ -76,11 +76,10 @@ def test_vanish_queues_pending_when_history_empty():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # UPL provisional OR still pending — never ticks-invented £ as broker.
-            assert row.get('pnl_source') in ('pending_broker_pnl','upl_estimate',None)
-            assert row.get('pnl_source')!='broker' or row.get('pnl') is not None
+            # UPL peļņa journals + teaches immediately; never invent ticks as broker.
+            assert row.get('pnl_source')=='upl_estimate'
+            assert row.get('pnl')==pytest.approx(-0.22)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
-            # Neural claim must NOT burn before verified Capital £.
-            assert not e._trade_already_learned('gold1')
+            assert e._trade_already_learned('gold1')
     asyncio.run(scenario())

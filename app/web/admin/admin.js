@@ -732,6 +732,14 @@ function renderCard(c){
       }</strong></div>
       <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
       ${(r.pending_broker_pnl||r.pending_trades||r.pending_cash_trades)?`<div><span>Gaida broker £</span><strong>${esc(r.pending_broker_pnl??0)} rindā · ${esc(r.pending_trades??r.pending_cash_trades??0)} žurnālā</strong></div>`:''}
+      ${(()=>{
+        const fl=a.forward_live||{};
+        if(!fl.ok)return '';
+        const tip=(fl.tips&&fl.tips[0])?fl.tips[0]:'';
+        return `<div><span>Forward-live</span><strong>${esc(
+          `n=${fl.n} · false ${(fl.false_signal_rate==null?'—':Math.round(fl.false_signal_rate*100)+'%')} · E ${fl.expectancy==null?'—':fl.expectancy}`
+        )}</strong></div>${tip?`<div><span>Forward tip</span><strong>${esc(tip)}</strong></div>`:''}`;
+      })()}
     </div>
     <div class="muted" style="padding:8px 14px;font-size:12px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)

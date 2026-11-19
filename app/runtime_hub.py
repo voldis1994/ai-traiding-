@@ -116,8 +116,18 @@ class AccountRuntime:
                 phase=cand
             elif 'waiting for adaptive arm' in status:
                 phase='watch'
-            elif 'confirmed trail' in status or runtime.get('status')=='CONFIRMED':
+            elif 'no broker-native trail' in status or 'no trail improvement' in status:
+                # CONFIRMED once, but brief says idle — do not sticky-label trail.
+                phase='armed'
+            elif 'deferred' in status or 'backoff' in status:
+                phase='watch'
+            elif 'confirmed trail' in status:
                 phase='trail'
+            elif runtime.get('status')=='CONFIRMED' and (
+                    'trail' in status or 'ratchet' in status or 'be' in status):
+                phase='trail'
+            elif runtime.get('status')=='CONFIRMED':
+                phase='armed'
             elif 'be' in status and 'lock' in status:
                 phase='be_lock'
             elif 'ratchet' in status:

@@ -3219,7 +3219,13 @@ class SingleTradeEngine:
                         side,source='BUY','structure_bias'
                     elif bias in ('DOWN','SELL'):
                         side,source='SELL','structure_bias'
-                    conf=max(conf,0.45)
+                    # Soft publish only — never inflate to the 0.45 hard-veto
+                    # threshold used by opposite-OPEN blocks.
+                    try:
+                        ez_conf=float(ez.get('confidence') or conf or 0)
+                    except (TypeError,ValueError):
+                        ez_conf=float(conf or 0)
+                    conf=min(max(ez_conf,0.20),0.44)
                     return shared_market.publish_side(
                         epic,side,source=source,confidence=conf,
                         bias=ez.get('bias'),event=ez.get('event'))
@@ -4111,11 +4117,11 @@ class SingleTradeEngine:
         return float(upl),self._cash_currency(snap.get('currency'))
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Confirm.profit → history/activity → last live UPL (display only).
+        """Confirm.profit → history/activity → last live UPL.
 
         Prefer Capital history/fuzzy cash. When that lags, return last UPL so
-        the journal can show provisional peļņa — neural teach still waits for
-        ``pnl_source=broker``.
+        the journal + neural teach can proceed immediately
+        (``pnl_source=upl_estimate``); late Capital £ only refines the number.
         """
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
@@ -4190,11 +4196,11 @@ class SingleTradeEngine:
 
     def _bank_broker_cash_side_effects(self,deal_id,pnl,*,currency=None,action=None,
                                        exit_reason=None,scratch_band=None,source=None):
-        """Once-only day-book / hard-risk / cycle / scratch bank from realized £.
+        """Day-book / hard-risk / cycle bank from realized £ (UPL or broker).
 
-        Must run even when neural already learned (late Capital cash). Keyed by
-        ``broker_cash_banked:{deal}`` so ticks-then-£ and retry paths cannot
-        double-count the same deal. A prior £0 poison bind may be corrected.
+        Keyed by ``broker_cash_banked:{deal}``. First bank wins; a later
+        ``broker`` figure may *refine* a prior ``upl_estimate`` via £ delta
+        (no double close count). £0 poison binds may also be corrected.
         """
         if pnl is None or deal_id is None:
             return False
@@ -4206,15 +4212,35 @@ class SingleTradeEngine:
             return False
         deal=str(deal_id)
         key='broker_cash_banked:'+deal
+        src=str(source or 'broker')
         prev=self.store.get(key)
-        if isinstance(prev,dict):
-            prev_pnl=_num(prev.get('pnl'))
-            if not (prev_pnl is not None and abs(prev_pnl)<1e-12 and abs(val)>=1e-12):
-                return False
-        hard_risk.record_realized_pnl(self.store,val)
         equity=self._account_equity()
         open_n=len([p for p in (self.positions or [])
                     if str(p.get('dealId'))!=deal])
+        if isinstance(prev,dict):
+            prev_pnl=_num(prev.get('pnl'))
+            prev_src=str(prev.get('source') or '')
+            zero_poison=(prev_pnl is not None and abs(prev_pnl)<1e-12
+                         and abs(val)>=1e-12)
+            upl_to_broker=(prev_src in ('upl_estimate','') and src=='broker'
+                          and prev_pnl is not None)
+            if upl_to_broker and not zero_poison:
+                # Refine provisional UPL bank with Capital £ — apply delta only.
+                hard_risk.refine_realized_pnl(self.store,prev_pnl,val)
+                day_book.refine_close(
+                    self.store,deal_id=deal,old_pnl=prev_pnl,new_pnl=val,
+                    equity=equity,open_count=open_n)
+                self.store.set(key,{
+                    'at':now(),'pnl':val,'currency':currency,'action':action,
+                    'source':'broker','refined_from':'upl_estimate',
+                    'prev_pnl':prev_pnl})
+                self.store.event('learning',
+                    'Day-book/hard-risk refined UPL→broker £',
+                    {'deal_id':deal,'prev':prev_pnl,'pnl':val})
+                return True
+            if not zero_poison:
+                return False
+        hard_risk.record_realized_pnl(self.store,val)
         day_book.record_close(
             self.store,pnl=val,equity=equity,open_count=open_n,deal_id=deal)
         self._settle_unified_cycle(
@@ -4223,7 +4249,7 @@ class SingleTradeEngine:
         self._note_scratch_close(val,deal)
         self.store.set(key,{
             'at':now(),'pnl':val,'currency':currency,'action':action,
-            'source':str(source or 'broker')})
+            'source':src})
         return True
 
     def _trade_direction(self,deal_id):
@@ -4313,10 +4339,10 @@ class SingleTradeEngine:
         return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
-        """Keep journal pending — do NOT neural-teach without verified broker £.
+        """Keep journal pending when neither broker £ nor UPL is available.
 
-        Tick teach used to burn the once-only claim before Capital cash arrived,
-        so real £ only hit the late refine path. Neural ΔW waits for ``broker``.
+        Tick-only teach must not burn the once-only claim. Prefer
+        ``_stamp_provisional_from_upl`` / harvest for real peļņa + ΔW.
         Never clobber ``pending_close_sync`` (CLOSE confirm still in flight).
         Never downgrade ``upl_estimate`` (with a numeric peļņa) back to blank gaida.
         """
@@ -4723,10 +4749,11 @@ class SingleTradeEngine:
         """Immediate self-evaluation from a closed trade's signed outcome.
 
         When the trade is a LOSS, the entry-time neural state is trained toward
-        the opposite action (regret). Wins reinforce. Operator: teach from last
-        live UPL immediately when Capital cash lags — do not leave learning
-        stuck on pending/[UPL]. Day-book / hard-risk bank still waits for
-        verified ``broker`` £ (once). Each deal trains LIVE weights at most once.
+        the opposite action (regret). Wins reinforce. Operator: teach + bank from
+        last live UPL immediately when Capital cash lags — do not leave learning
+        stuck on pending/[UPL]. Late verified ``broker`` £ refines journal and
+        day-book/hard-risk via delta (no double close). Each deal trains LIVE
+        weights at most once.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -4737,13 +4764,14 @@ class SingleTradeEngine:
         # Allow overwrite when we finally have broker cash after a vanish guess.
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
         already_learned=self._trade_already_learned(deal_id)
+        # Scratch / UPL may bank teachers without a neural claim — still treat as
+        # settled so broker £ only refines (no double bracket history).
+        teachers_settled=bool(self.store.get('teachers_settled:'+str(deal_id)))
         # Late broker cash may refine the journal without repeating training.
-        # Still bank £ once — neural-once-only must not skip day_book / hard_risk /
-        # profit_learning / bracket_learn teachers.
         pref_src=str(confirmation.get('pnl_source') or '').strip().lower() or None
         if pref_src not in ('broker','upl_estimate'):
             pref_src=None
-        if already_learned:
+        if already_learned or teachers_settled:
             if broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or self._account_currency()
                 late_src=pref_src or 'broker'
@@ -5069,6 +5097,10 @@ class SingleTradeEngine:
                     exit_reason=path_ctx.get('exit_reason'),
                     scratch_band=float(sp.get('scratch_pnl_abs') or 0.05),
                     source=pnl_source)
+            # Teachers ran (bracket/bank) even when scratch skipped neural claim —
+            # stop double record_outcome when Capital £ arrives later.
+            self.store.set('teachers_settled:'+str(deal_id),{
+                'at':now(),'source':pnl_source,'pnl':pnl_value})
             # Learn re-entry floors from fast / same-dir outcomes after costs.
             try:
                 reentry_confirm.observe_close(
@@ -5384,16 +5416,19 @@ class SingleTradeEngine:
         live_tp=_broker_price_level(p.get('profitLevel'))
         if live_sl is None or live_tp is None:
             return False
+        # Enroll requires robot_open — set, then roll back if geometry refuses.
         self.store.set('robot_open:'+deal,True)
         ok=self._enroll_adaptive_protection(p,force=True)
-        if ok:
-            self.protection_brief={
-                'status':'Manual adopt — keeping live SL/TP, OHLC trail enrolled',
-                'deal_id':deal}
-            self.store.event('protection',
-                'Manual position claimed for trail (SL/TP already on broker)',
-                {'deal_id':deal,'stop':live_sl,'profit':live_tp})
-        return ok
+        if not ok:
+            self.store.set('robot_open:'+deal,None)
+            return False
+        self.protection_brief={
+            'status':'Manual adopt — keeping live SL/TP, OHLC trail enrolled',
+            'deal_id':deal}
+        self.store.event('protection',
+            'Manual position claimed for trail (SL/TP already on broker)',
+            {'deal_id':deal,'stop':live_sl,'profit':live_tp})
+        return True
 
     async def adapt_protection(self,p):
         """Trail SL behind broker extreme — ROBOT only; continues past BE.
@@ -5410,13 +5445,17 @@ class SingleTradeEngine:
             # Manual Capital adopt that already has both brackets.
             self._claim_manual_for_trail(p)
         meta=self.store.get(key)
+        deal_s=str(p.get('dealId'))
         if not meta or meta.get('owner')!='AUTO':
-            self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged'}
+            self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged',
+                                   'deal_id':deal_s}
             return
-        if self.pending_order or self.pending_close:return
+        if self.pending_order or self.pending_close:
+            self.protection_brief={'status':'Trail deferred — order in flight',
+                                   'deal_id':deal_s}
+            return
         # Stale PENDING PROTECT for *this* deal must not freeze trail forever —
         # supersede leftovers and continue. Other unresolved kinds still wait.
-        deal_s=str(p.get('dealId'))
         blocking=[]
         for item in (self.store.unresolved() or []):
             kind=item.get('kind')
@@ -5426,9 +5465,20 @@ class SingleTradeEngine:
                     'deal_id':deal_s,'order_id':item.get('id')})
             else:
                 blocking.append(item)
-        if blocking:return
-        if self.market.get('status')!='TRADEABLE':return
-        if self.market.get('tick') is None or self.market.get('min_distance') is None:return
+        if blocking:
+            self.protection_brief={'status':'Trail deferred — unresolved journal',
+                                   'deal_id':deal_s,
+                                   'blocking':len(blocking)}
+            return
+        if self.market.get('status')!='TRADEABLE':
+            self.protection_brief={'status':'Trail deferred — market not TRADEABLE',
+                                   'deal_id':deal_s,
+                                   'market_status':self.market.get('status')}
+            return
+        if self.market.get('tick') is None or self.market.get('min_distance') is None:
+            self.protection_brief={'status':'Trail deferred — missing tick/min distance',
+                                   'deal_id':deal_s}
+            return
         opened=candle_time(meta.get('opened')) if meta.get('opened') else None
         candles=self.store.candles(p['epic'],n=120,historical_only=True)
         zone_range=ohlc_range_distance(candles)  # lookback from data
@@ -5559,10 +5609,16 @@ class SingleTradeEngine:
         elif self.store.get('tp_attach_done:'+deal):
             return False
         runtime=self.store.get('adaptive_runtime:'+deal) or {}
-        if isinstance(runtime,dict) and (
-                runtime.get('status')=='CONFIRMED' or
-                runtime.get('phase') in ('trail','ratchet','be_lock')):
-            return False
+        if isinstance(runtime,dict) and runtime.get('status')=='CONFIRMED':
+            # Trail often clears TP intentionally after BE — skip re-attach only
+            # when we once had a real TP. Never-attached + CONFIRMED was a race
+            # that left Capital Take Profit Off forever.
+            meta=self.store.get('adaptive_protection:'+deal) or {}
+            had_tp=(live_tp is not None
+                    or bool(self.store.get('tp_attach_done:'+deal))
+                    or _num(meta.get('original_profit')) is not None)
+            if had_tp:
+                return False
         return True
 
     def _mark_tp_attach_done(self,deal_id):
@@ -5703,10 +5759,14 @@ class SingleTradeEngine:
         sign=1 if direction=='BUY' else -1
         if not (bp.get('ready') and decided_sl and decided_tp
                 and decided_sl>0 and decided_tp>0):
+            # OPEN path refuses invented median brackets. ATR fallback is only
+            # for *manual* adopt (no robot_open yet) so Capital TP Off is not
+            # stuck forever — robot deals wait for real swing geometry.
+            is_manual=not bool(self.store.get('robot_open:'+str(p.get('dealId') or '')))
             tip=float(atr_hint) if atr_hint and atr_hint>0 else float(base_sl)
             tip=max(float(min_dist)*2.0,tip,float(min_dist)+buffer)
-            if live_sl is not None and live_tp is None and direction in ('BUY','SELL'):
-                # Keep live SL; synthesize TP from ATR / broker min × 2.
+            if (is_manual and live_sl is not None and live_tp is None
+                    and direction in ('BUY','SELL')):
                 decided_sl=abs(float(live_sl)-level) or tip
                 decided_tp=tip
                 profit_lvl=level+sign*float(decided_tp)
@@ -5714,8 +5774,8 @@ class SingleTradeEngine:
                 self.store.event('protection','Manual TP fallback (no swing brackets)',{
                     'deal_id':p.get('dealId'),'profit_distance':decided_tp,
                     'swing_reason':bp.get('reason')})
-            elif live_tp is not None and live_sl is None and direction in ('BUY','SELL'):
-                # Keep live TP; synthesize SL (Capital omit wiped stop).
+            elif (is_manual and live_tp is not None and live_sl is None
+                    and direction in ('BUY','SELL')):
                 decided_tp=abs(float(live_tp)-level) or tip
                 decided_sl=tip
                 stop_lvl=level-sign*float(decided_sl)
@@ -5723,7 +5783,8 @@ class SingleTradeEngine:
                 self.store.event('protection','Manual SL fallback (TP on, SL Off)',{
                     'deal_id':p.get('dealId'),'stop_distance':decided_sl,
                     'swing_reason':bp.get('reason')})
-            elif direction in ('BUY','SELL') and (live_sl is None or live_tp is None):
+            elif (is_manual and direction in ('BUY','SELL')
+                  and (live_sl is None or live_tp is None)):
                 decided_sl=tip;decided_tp=tip
                 stop_lvl=level-sign*float(decided_sl)
                 profit_lvl=level+sign*float(decided_tp)
@@ -5977,18 +6038,17 @@ class SingleTradeEngine:
             # Completed M1 only — forming QUOTE minute must not move zona/SL/TP.
             candles=self._decision_candles(self.mandate['epic'])
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-            # Defense in depth: never market-chase outside OHLC+MTF entry stack.
-            zone_gate=ohlc_entry_zones.entry_allows_open(
-                action,candles=candles,mid=mid,
-                ask=ask,bid=bid,tick=tick,spread=spread,mtf=mtf_live,
-                store=self.store)
+            # Defense in depth: OHLC+MTF zona *and* shared fleet side (same as eval).
+            zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
             if not zone_gate.get('allowed'):
                 self.last_entry_reason=zone_gate.get('reason') or 'wait_entry_zone'
                 self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{
                     'reason':self.last_entry_reason,'action':action,
                     'price':zone_gate.get('price'),'zone':zone_gate.get('zone'),
                     'mtf_ok':zone_gate.get('mtf_ok'),
-                    'trigger':zone_gate.get('trigger')})
+                    'trigger':zone_gate.get('trigger'),
+                    'shared_side':zone_gate.get('shared_side'),
+                    'source':zone_gate.get('source')})
                 return
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)

@@ -227,7 +227,11 @@ def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None,
                    exit_reason=None, direction=None, entry=None, exit_level=None,
                    stop_distance=None, adverse_path=None, volatility=None,
                    costs=None):
-    """Append cash outcome and learn raise/cut from analysed path — not P&L alone."""
+    """Append cash outcome and learn raise/cut from analysed path — not P&L alone.
+
+    Same ``deal_id`` replaces the prior row (UPL→broker refine) instead of
+    double-appending teacher history.
+    """
     pnl_n=_finite(pnl)
     if pnl_n is None:return
     k=_finite(kappa);s=_finite(sl_scale)
@@ -239,6 +243,10 @@ def record_outcome(store, *, kappa, sl_scale, pnl, currency=None, deal_id=None,
         volatility=volatility,costs=costs,pnl=pnl_n,store=store)
     hist=store.get('bracket_outcome_history',[]) or []
     if not isinstance(hist,list):hist=[]
+    deal=str(deal_id) if deal_id is not None else ''
+    if deal:
+        hist=[r for r in hist
+              if not (isinstance(r,dict) and str(r.get('deal_id') or '')==deal)]
     hist.append({
         'kappa':float(k),'sl_scale':float(s),'pnl':float(pnl_n),
         'currency':currency,'deal_id':deal_id,'exit_reason':reason,

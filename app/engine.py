@@ -3631,10 +3631,11 @@ class SingleTradeEngine:
         return float(upl),self._cash_currency(snap.get('currency'))
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Confirm.profit → history/activity → last live UPL as realized peļņa.
+        """Confirm.profit → history/activity → last live UPL (display only).
 
-        Prefer Capital history/fuzzy cash. When that lags, bank last UPL so
-        Admin is not stuck on [gaida £] forever (operator: UPL = peļņa).
+        Prefer Capital history/fuzzy cash. When that lags, return last UPL so
+        the journal can show provisional peļņa — neural teach still waits for
+        ``pnl_source=broker``.
         """
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
@@ -3836,14 +3837,19 @@ class SingleTradeEngine:
 
         Tick teach used to burn the once-only claim before Capital cash arrived,
         so real £ only hit the late refine path. Neural ΔW waits for ``broker``.
+        Never clobber ``pending_close_sync`` (CLOSE confirm still in flight).
         """
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
-        self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
+        row=self.store.db.execute(
+            'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
+        src=str(row[0] or '') if row else ''
+        if src!='pending_close_sync':
+            self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
         self.store.event('learning',
             'Pending Capital £ — neural teach deferred (no tick claim)',
-            {'deal_id':deal,'exit_level':exit_level})
+            {'deal_id':deal,'exit_level':exit_level,'pnl_source':src or 'pending_broker_pnl'})
         return False
 
     async def _retry_pending_broker_pnl(self):
@@ -4101,13 +4107,17 @@ class SingleTradeEngine:
         entry=float(mid)
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
-            entry=entry,action=proposal,candles=candles)
+            entry=entry,action=proposal,candles=candles,require_swing=True)
+        # Same rule as LIVE OPEN — no invented median ±distance for shadow.
+        if (not decided.get('ready') or decided.get('stop_distance') is None
+                or decided.get('profit_distance') is None):
+            return None
         return {
             'entry':entry,'tick':float(tick),'spread':float(spread),
             'min_distance':min_d,
             'stop_distance':float(decided['stop_distance']),
             'profit_distance':float(decided['profit_distance']),
-            'bracket_source':str(decided.get('source') or 'ohlc_zone'),
+            'bracket_source':str(decided.get('source') or 'swing_anchor'),
             'ohlc_kappa':decided.get('ohlc_kappa'),
             'swing_hi':decided.get('swing_hi'),
             'swing_lo':decided.get('swing_lo'),
@@ -4212,10 +4222,10 @@ class SingleTradeEngine:
         """Immediate self-evaluation from a closed trade's signed outcome.
 
         When the trade is a LOSS, the entry-time neural state is trained toward
-        the opposite action (regret). Wins reinforce. Cash P&L is stored only
-        from broker profit (+ account currency). Without broker profit, learning
-        still uses directional ticks — History cash stays blank rather than fake $.
-        Each deal trains LIVE weights at most once (audit #2).
+        the opposite action (regret). Wins reinforce. Cash P&L + neural teach
+        require verified broker profit (+ account currency). Without broker £,
+        journal stays pending/UPL-provisional and entry_brain is kept until
+        Capital history arrives. Each deal trains LIVE weights at most once.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -4236,6 +4246,16 @@ class SingleTradeEngine:
             if broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or self._account_currency()
                 late_src=pref_src or 'broker'
+                # Only verified Capital £ may bank day_book / late teachers.
+                # UPL after a prior claim must not pretend to be broker cash.
+                if late_src!='broker':
+                    self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
+                                           source='upl_estimate',overwrite=True)
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
+                    self.store.event('learning',
+                        'Late UPL ignored for bank — waiting for broker £',
+                        {'deal_id':deal_id,'pnl':broker_pnl,'pnl_source':late_src})
+                    return
                 self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
                                        source=late_src,overwrite=True)
                 action=self._trade_direction(deal_id) or (
@@ -4405,28 +4425,16 @@ class SingleTradeEngine:
             label=decision['label'];mode=decision['mode']
             if label is not None:label=int(label)
         else:
-            # Tick path must use the SAME loss gate as broker £ (opposite ∪ HOLD
-            # with spread floor). Raw best_action could re-pick the loser / false flip.
-            from .profit_learning import label_from_profit
-            tick_pnl=(1.0 if pnl_sign>0 else (-1.0 if pnl_sign<0 else 0.0))
-            decision=label_from_profit(
-                direction,tick_pnl,flip_after_loss=flip_after_loss,
-                entry=entry,exit_level=exit_level,spread=spread_cost,
-                **cf,**teach_extra)
-            label=decision.get('label')
-            if label is not None:label=int(label)
-            mode=str(decision.get('mode') or 'ticks_no_counterfactual')
-            if mode and not mode.endswith('_ticks'):
-                mode=mode+'_ticks'
-            self.profit_learning.record_closed(
-                deal_id=deal_id,epic=epic,direction=direction,entry=entry,
-                exit_level=exit_level,broker_pnl=None,
-                currency=currency,spread=spread_cost,flip_after_loss=flip_after_loss,
-                model_version=getattr(self.brain,'model_version',0),
-                feature_schema=getattr(self.brain,'feature_schema',None),
-                shadow_action=shadow_action,require_broker_pnl=True,
-                scores=entry_scores,
-                **cf,**teach_extra)
+            # No verified broker £ — do NOT neural-teach from ticks / burn claim.
+            # Journal stays pending; Capital harvest will teach once on real £.
+            # Keep entry_brain so later broker £ can still train.
+            self._queue_pending_pnl(deal_id,exit_level=exit_level)
+            self.store.close_trade(deal_id,exit_level,None,currency=None,
+                                   source='pending_broker_pnl',overwrite=overwrite)
+            self.store.event('learning',
+                'Closed without broker £ — neural teach deferred',
+                {'deal_id':deal_id,'exit_level':exit_level,'pnl_source':pnl_source})
+            return
         from .self_params import load as load_self_params, evolve_from_feedback
         sp=load_self_params(self.store)
         if label is None:

@@ -137,6 +137,7 @@ def test_growth_does_not_starve_learning_in_long_session():
 
 
 def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
+    """Without broker £, neural teach is deferred — entry_brain kept for later £."""
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
         brain.tick(100,.05,.01,'GOLD')
@@ -148,20 +149,13 @@ def test_broker_trade_learning_uses_entry_instrument_tick_not_current_market():
             'transition':brain._json_transition(brain.core.last_transition)})
         store.upsert_trade({'dealId':'deal1','epic':'GOLD','size':'0.5','direction':'SELL','level':100})
         engine._learn_closed_trade('deal1',{'level':99.8})
-        last=[e for e in store.recent()
-              if 'updated LIVE neural weights' in e['message']
-              or 'without weight update' in e['message']][0]
-        detail=json.loads(last['details'])
-        assert detail['realized_directional_ticks']==pytest.approx(20.)
-        assert detail['mode']=='reinforce_win_ticks'  # tick path — not fake £ in profit ledger
-        assert detail['target']==1
-        from app.self_params import DEFAULTS as _sp
-        assert detail['learn_repeats']==int(_sp['learn_win_repeats'])
-        assert detail.get('weights_updated') is True
+        assert any('neural teach deferred' in e['message'] for e in store.recent())
         # Without broker profit, cash P&L stays blank (no fake GOLD USD price×size).
         assert store.trades(1)[0]['pnl'] is None
-        assert detail['pnl_source']=='ticks_only'
-        assert store.get('entry_brain:deal1') is None
+        assert store.trades(1)[0]['pnl_source']=='pending_broker_pnl'
+        assert not engine._trade_already_learned('deal1')
+        # entry_brain kept so verified Capital £ can still teach.
+        assert store.get('entry_brain:deal1') is not None
 
 
 def test_losing_trade_regrets_opposite_action_with_stronger_update():

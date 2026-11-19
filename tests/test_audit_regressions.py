@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
-from app.liquidity_feed import LiquidityFeed
+from app import liquidity_feed as liquidity_feed_mod
 from app.model_validation import _equity_curve
 from app.shadow_paper import STATE_KEY as SHADOW_STATE_KEY
 from tests.test_broker_pnl_resolve import HistoryBroker
@@ -18,6 +18,7 @@ from tests.test_learning_integrity import new_brain
 
 
 def test_upl_never_becomes_realized_cash():
+    """UPL may provisional-journal — source must stay upl_estimate, never broker."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -26,7 +27,9 @@ def test_upl_never_becomes_realized_cash():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:reg1',{'upl':1.25,'currency':'GBP'})
             pnl,src,_=await e._resolve_broker_pnl('reg1',{})
-            assert pnl is None and src=='pending_broker_pnl'
+            assert pnl==pytest.approx(1.25)
+            assert src=='upl_estimate'
+            assert src!='broker'
     asyncio.run(scenario())
 
 
@@ -58,18 +61,14 @@ def test_shadow_state_persists_hc_and_steps():
 
 def test_stale_observation_rejected_even_if_snapshot_fresh():
     """Audit #10: observation time — not download time — gates volume freshness."""
-    with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'s.db')
-        feed=LiquidityFeed(store)
-        # Prefer public helpers if present.
-        obs_age=getattr(feed,'observation_too_old',None) or getattr(feed,'_observation_too_old',None)
-        if callable(obs_age):
-            # Very old observation must be rejected.
-            assert obs_age(age_sec=3600*24) is True or obs_age(3600*24) is True
-        else:
-            # Fall back: snapshot builder should mark unavailable when obs stale.
-            build=getattr(feed,'build_snapshot',None) or getattr(feed,'snapshot',None)
-            assert build is not None, 'LiquidityFeed missing observation helpers'
+    from datetime import datetime, timedelta, timezone
+    now=datetime.now(timezone.utc)
+    kind='yahoo_futures'
+    max_age=liquidity_feed_mod.MAX_OBSERVATION_AGE_SEC[kind]
+    fresh=now.timestamp()
+    stale=(now-timedelta(seconds=max_age+30)).timestamp()
+    assert liquidity_feed_mod._observation_age_ok(stale,now,kind=kind) is False
+    assert liquidity_feed_mod._observation_age_ok(fresh,now,kind=kind) is True
 
 
 def test_promote_fingerprint_blocks_repeat():

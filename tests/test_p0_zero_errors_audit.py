@@ -81,14 +81,16 @@ def test_late_broker_banks_day_book_after_ticks_learn():
                 'epic':'GOLD','direction':'SELL','entry':2650,'tick_size':.1,
                 'transition':brain._json_transition(brain.core.last_transition),
                 'entry_spread':.3})
-            # First pass: no broker £ → ticks learn + pending.
+            # First pass: no broker £ → defer neural (keep entry_brain).
             e._learn_closed_trade('late1',{'level':2649})
-            assert e._trade_already_learned('late1')
+            assert not e._trade_already_learned('late1')
+            assert store.get('entry_brain:late1') is not None
             daily_before=db.load_daily(store,equity=10_000.0)
             assert float(daily_before.get('realized_pnl') or 0)==0.0
-            # Late Capital cash — neural skipped, day book must bank once.
+            # Verified Capital cash — first neural teach + day book bank once.
             e._learn_closed_trade('late1',{
                 'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+            assert e._trade_already_learned('late1')
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.18)
             assert store.get('broker_cash_banked:late1')
@@ -415,10 +417,11 @@ def test_late_cash_feeds_profit_learning():
                 'transition':brain._json_transition(brain.core.last_transition),
                 'entry_spread':.3,'bracket_kappa':1.0,'bracket_sl_scale':1.0})
             e._learn_closed_trade('pl1',{'level':2649})
-            assert e._trade_already_learned('pl1')
+            assert not e._trade_already_learned('pl1')
             assert list(e.profit_learning.broker_pnls())==[]
             e._learn_closed_trade('pl1',{
                 'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+            assert e._trade_already_learned('pl1')
             assert float(db.load_daily(store,equity=10_000.0).get('realized_pnl') or 0)==pytest.approx(0.18)
             assert e.profit_learning.broker_pnls()[-1]==pytest.approx(0.18)
     asyncio.run(scenario())

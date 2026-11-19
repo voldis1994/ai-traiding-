@@ -696,13 +696,21 @@ class RuntimeHub:
             hi=float(range_hi) if range_hi is not None else None
         except (TypeError,ValueError):
             lo=hi=None
-        if lo is not None and hi is not None and hi>lo and mid is not None:
+        if lo is not None and hi is not None and hi>lo:
             span=hi-lo
             band=max(span*0.12,float(tick)*8,spread*2)
-            # BUY entry: discount near swing low (support).
-            buy_zone={'lo':lo,'hi':min(lo+band,mid),'label':'BUY entry zona','side':'BUY'}
-            # SELL entry: premium near swing high (resistance).
-            sell_zone={'lo':max(hi-band,mid),'hi':hi,'label':'SELL entry zona','side':'SELL'}
+            # BUY entry: discount band above swing low (support) — never invert.
+            buy_hi=lo+band
+            if mid is not None:
+                buy_hi=min(buy_hi,max(lo,float(mid)))
+            if buy_hi>lo:
+                buy_zone={'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY'}
+            # SELL entry: premium band below swing high (resistance).
+            sell_lo=hi-band
+            if mid is not None:
+                sell_lo=max(sell_lo,min(hi,float(mid)))
+            if sell_lo<hi:
+                sell_zone={'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL'}
         preferred=action if action in ('BUY','SELL') else None
         if not preferred and isinstance(scores,dict):
             try:

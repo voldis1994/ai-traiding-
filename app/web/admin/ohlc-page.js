@@ -16,6 +16,21 @@ let lastView=null;
 let candleN=60;
 let lastOkAt=0;
 let inFlight=false;
+let lastPaintKey='';
+
+function viewPaintKey(view,n){
+  if(!view)return '';
+  const candles=view.candles||[];
+  const last=candles[candles.length-1]||{};
+  const ol=view.open_levels||[];
+  return [
+    n,
+    view.mid,view.preferred,view.epic,
+    candles.length,last.at,last.close,
+    (view.mtf||{}).mode,(view.mtf||{}).adx,
+    ol.map(p=>[p.entry,p.stop,p.profit].join(':')).join('|'),
+  ].join('·');
+}
 
 async function api(path){
   const res=await fetch(path,{credentials:'same-origin',cache:'no-store'});
@@ -45,8 +60,14 @@ function sizeCanvas(){
   canvas.style.height=cssH+'px';
 }
 
-function paint(){
+function paint(force){
   if(!lastView||typeof drawOhlcStructure!=='function')return;
+  const key=viewPaintKey(lastView,candleN);
+  if(!force&&key&&key===lastPaintKey){
+    // Still refresh the LIVE clock; skip full canvas redraw (stops flicker).
+    return;
+  }
+  lastPaintKey=key;
   sizeCanvas();
   drawOhlcStructure(canvas,lastView,{labels:true,maxCandles:candleN});
 }
@@ -126,7 +147,7 @@ async function load(){
     ].filter(Boolean).join(' · ');
     renderChips(view);
     errEl.hidden=true;
-    paint();
+    paint(false);
     setLive(true,`LIVE · ${clock(lastOkAt)}`);
   }catch(err){
     errEl.hidden=false;
@@ -143,7 +164,8 @@ function schedulePoll(){
     if(document.hidden)return;
     load().catch(()=>{});
   };
-  pollTimer=setInterval(tick,2000);
+  // 4s is enough for LIVE clock; avoids constant canvas rebuild flash.
+  pollTimer=setInterval(tick,4000);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});
@@ -164,7 +186,7 @@ document.getElementById('btnFullscreen').onclick=async()=>{
       document.webkitExitFullscreen();
     }
   }catch(_){}
-  requestAnimationFrame(()=>paint());
+  requestAnimationFrame(()=>paint(true));
 };
 
 document.querySelectorAll('.ohlc-range button').forEach(btn=>{
@@ -172,18 +194,18 @@ document.querySelectorAll('.ohlc-range button').forEach(btn=>{
     document.querySelectorAll('.ohlc-range button').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     candleN=Number(btn.dataset.n)||60;
-    paint();
+    paint(true);
     load().catch(()=>{});
   };
 });
 
 if(typeof ResizeObserver!=='undefined'&&chartWrap){
-  const ro=new ResizeObserver(()=>requestAnimationFrame(()=>paint()));
+  const ro=new ResizeObserver(()=>requestAnimationFrame(()=>paint(true)));
   ro.observe(chartWrap);
 }
-window.addEventListener('resize',()=>requestAnimationFrame(()=>paint()));
-document.addEventListener('fullscreenchange',()=>requestAnimationFrame(()=>paint()));
-document.addEventListener('webkitfullscreenchange',()=>requestAnimationFrame(()=>paint()));
+window.addEventListener('resize',()=>requestAnimationFrame(()=>paint(true)));
+document.addEventListener('fullscreenchange',()=>requestAnimationFrame(()=>paint(true)));
+document.addEventListener('webkitfullscreenchange',()=>requestAnimationFrame(()=>paint(true)));
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden)load().catch(()=>{});
 });

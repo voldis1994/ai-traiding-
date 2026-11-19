@@ -1,12 +1,25 @@
 'use strict';
 /** Shared OHLC + entry-zone canvas for Admin mini + popup.
- *  Draws the LIVE info stack: swings, entry zones, KAMA/EMA, ATR, ADX legend,
- *  swing SL/TP. Popup passes {labels:true, maxCandles} for readable denser bars.
+ *  Y-scale is candle-first: KAMA warm-up zeros / broker TP 0 must never
+ *  stretch the axis (that flattened GOLD into a hairline at ~3700).
  */
 
 function _ohlcFinite(v){
   const n=Number(v);
   return Number.isFinite(n)?n:null;
+}
+
+/** Keep Y-scale on the tape — drop unset 0 / warm-up zeros / wild outliers. */
+function _ohlcNearTape(v,anchor,span){
+  const n=_ohlcFinite(v);
+  if(n==null||!(n>0))return null;
+  if(anchor==null||!Number.isFinite(anchor))return n;
+  const band=Math.max(
+    (Number.isFinite(span)&&span>0?span:Math.abs(anchor)*0.002)*6,
+    Math.abs(anchor)*0.012,
+    0.5);
+  if(Math.abs(n-anchor)>band)return null;
+  return n;
 }
 
 function drawOhlcStructure(canvas,view,opts){
@@ -17,15 +30,22 @@ function drawOhlcStructure(canvas,view,opts){
   const rect=canvas.getBoundingClientRect();
   if(rect.width<20||rect.height<20)return;
   const w=rect.width,h=rect.height;
-  canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+  const bw=Math.round(w*dpr),bh=Math.round(h*dpr);
+  // Avoid resetting the bitmap every poll — that flashes the whole chart.
+  if(canvas.width!==bw||canvas.height!==bh){
+    canvas.width=bw;canvas.height=bh;
+  }
   const ctx=canvas.getContext('2d');
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,w,h);
   ctx.fillStyle='rgba(8,12,14,.94)';
   ctx.fillRect(0,0,w,h);
 
-  let candles=(view.candles||[]).filter(c=>
-    ['open','high','low','close'].every(k=>Number.isFinite(Number(c[k]))));
+  let candles=(view.candles||[]).filter(c=>{
+    if(!['open','high','low','close'].every(k=>Number.isFinite(Number(c[k]))))return false;
+    // Drop garbage / zero bars that would collapse the Y scale.
+    return Number(c.low)>0&&Number(c.high)>0&&Number(c.high)>=Number(c.low);
+  });
   const maxN=Math.max(20,Number(opts.maxCandles)||candles.length);
   const slicedOff=candles.length>maxN?candles.length-maxN:0;
   if(slicedOff)candles=candles.slice(-maxN);
@@ -35,28 +55,32 @@ function drawOhlcStructure(canvas,view,opts){
     return;
   }
 
-  let low=Math.min(...candles.map(c=>+c.low));
-  let high=Math.max(...candles.map(c=>+c.high));
+  // Base range = candles only so bars fill the viewport.
+  let candleLow=Math.min(...candles.map(c=>+c.low));
+  let candleHigh=Math.max(...candles.map(c=>+c.high));
+  const mid=_ohlcFinite(view.mid);
+  const anchor=mid!=null&&mid>0?mid:(candleLow+candleHigh)/2;
+  const candleSpan=Math.max(candleHigh-candleLow,Math.abs(anchor)*0.0004,0.01);
+  let low=candleLow;
+  let high=candleHigh;
+  const expand=(raw)=>{
+    const v=_ohlcNearTape(raw,anchor,candleSpan);
+    if(v==null)return;
+    low=Math.min(low,v);high=Math.max(high,v);
+  };
   const zones=view.zones||{};
   for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
     if(!z)continue;
-    const a=_ohlcFinite(z.lo),b=_ohlcFinite(z.hi);
-    if(a!=null)low=Math.min(low,a);
-    if(b!=null)high=Math.max(high,b);
+    expand(z.lo);expand(z.hi);
   }
   const br=view.swing_brackets||{};
   for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
-    const v=_ohlcFinite(br[k]);
-    if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
+    expand(br[k]);
   }
   for(const p of (view.open_levels||[])){
-    for(const k of ['entry','stop','profit']){
-      const v=_ohlcFinite(p[k]);
-      if(v!=null){low=Math.min(low,v);high=Math.max(high,v);}
-    }
+    expand(p.entry);expand(p.stop);expand(p.profit);
   }
   const ov=view.overlays||{};
-  // Align overlay series to the same candle window we display.
   const sliceSeries=(arr)=>{
     if(!Array.isArray(arr)||!arr.length)return [];
     if(arr.length<=candles.length)return arr.slice();
@@ -65,19 +89,23 @@ function drawOhlcStructure(canvas,view,opts){
   const kamaSeries=sliceSeries(ov.kama);
   const ema5Series=sliceSeries(ov.ema5);
   const ema13Series=sliceSeries(ov.ema13);
+  // Overlay series may start with 0 warm-up — only expand near-tape points.
   for(const series of [kamaSeries,ema5Series,ema13Series]){
-    for(const v of series){
-      if(Number.isFinite(+v)){low=Math.min(low,+v);high=Math.max(high,+v);}
-    }
+    for(const v of series)expand(v);
   }
-  const mid=_ohlcFinite(view.mid);
-  if(mid!=null){low=Math.min(low,mid);high=Math.max(high,mid);}
+  expand(mid);
   const atr=_ohlcFinite(ov.atr14)||_ohlcFinite((view.mtf||{}).atr14);
-  if(atr!=null&&mid!=null){
-    low=Math.min(low,mid-atr);high=Math.max(high,mid+atr);
+  if(atr!=null&&atr>0&&mid!=null){
+    expand(mid-atr);expand(mid+atr);
   }
 
-  const pad=(high-low||Math.abs(high)*.001||.01)*(showLabels?.12:.18);
+  // Hard clamp: never let overlays blow range past ~6× candle span from tape.
+  const maxSpan=Math.max(candleSpan*6,Math.abs(anchor)*0.02,1);
+  low=Math.max(low,anchor-maxSpan);
+  high=Math.min(high,anchor+maxSpan);
+  if(!(high>low)){low=anchor-candleSpan;high=anchor+candleSpan;}
+
+  const pad=(high-low)*(showLabels?.05:.08);
   low-=pad;high+=pad;
   const yPadTop=showLabels?28:16;
   const yPadBot=showLabels?36:28;
@@ -86,7 +114,6 @@ function drawOhlcStructure(canvas,view,opts){
   const chartW=Math.max(40,w-leftPad-rightPad);
   const y=p=>yPadTop+(high-p)/(high-low)*(h-yPadTop-yPadBot);
 
-  // Soft grid (popup).
   if(showLabels){
     ctx.strokeStyle='rgba(232,240,236,.06)';
     ctx.lineWidth=1;
@@ -98,8 +125,8 @@ function drawOhlcStructure(canvas,view,opts){
 
   const band=(z,fill,stroke)=>{
     if(!z)return;
-    const a=_ohlcFinite(z.lo);
-    const b=_ohlcFinite(z.hi);
+    const a=_ohlcNearTape(z.lo,anchor,candleSpan);
+    const b=_ohlcNearTape(z.hi,anchor,candleSpan);
     if(a==null)return;
     const hi=b!=null?Math.max(a,b):a;
     const lo=b!=null?Math.min(a,b):a;
@@ -121,7 +148,7 @@ function drawOhlcStructure(canvas,view,opts){
   if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.28)',null);
   if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.26)',null);
 
-  if(atr!=null&&mid!=null){
+  if(atr!=null&&atr>0&&mid!=null&&_ohlcNearTape(mid,anchor,candleSpan)!=null){
     ctx.fillStyle='rgba(120,160,200,.08)';
     ctx.fillRect(leftPad,y(mid+atr),chartW,Math.max(2,y(mid-atr)-y(mid+atr)));
   }
@@ -134,8 +161,8 @@ function drawOhlcStructure(canvas,view,opts){
     ctx.beginPath();
     let started=false;
     for(let i=0;i<series.length;i++){
-      const v=+series[i];
-      if(!Number.isFinite(v))continue;
+      const v=_ohlcNearTape(series[i],anchor,candleSpan);
+      if(v==null){started=false;continue;}
       const x=leftPad+(offset+i+.5)*spacing;
       if(!started){ctx.moveTo(x,y(v));started=true;}
       else ctx.lineTo(x,y(v));
@@ -146,25 +173,23 @@ function drawOhlcStructure(canvas,view,opts){
   polyline(ema5Series,'rgba(100,180,220,.7)',1.1);
   polyline(kamaSeries,'rgba(240,193,75,.95)',1.6);
 
-  // Candles — keep readable body width even with many bars.
-  const bodyW=Math.max(2.5,Math.min(14,spacing*(showLabels?.72:.64)));
+  const bodyW=Math.max(showLabels?3.5:2.5,Math.min(showLabels?18:14,spacing*(showLabels?.82:.70)));
   candles.forEach((c,i)=>{
     const x=leftPad+(i+.5)*spacing;
     const rising=+c.close>=+c.open;
     ctx.strokeStyle=rising?'#39ff88':'#ff5c7a';
     ctx.fillStyle=ctx.strokeStyle;
-    ctx.lineWidth=Math.max(1,Math.min(2,bodyW*.35));
+    ctx.lineWidth=Math.max(1.25,Math.min(2.5,bodyW*.4));
     ctx.beginPath();ctx.moveTo(x,y(+c.high));ctx.lineTo(x,y(+c.low));ctx.stroke();
     const y1=y(+c.open),y2=y(+c.close);
-    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(1.5,Math.abs(y1-y2)));
+    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(2,Math.abs(y1-y2)));
   });
 
-  // Swing pivot markers — remap i when display window is a slice.
   const mark=(list,color)=>{
     if(!Array.isArray(list))return;
     ctx.fillStyle=color;
     for(const s of list){
-      if(!_ohlcFinite(s.price))continue;
+      if(!_ohlcNearTape(s.price,anchor,candleSpan))continue;
       let idx=_ohlcFinite(s.i);
       if(idx!=null)idx=idx-slicedOff;
       const x=(idx!=null&&idx>=0&&idx<candles.length)
@@ -181,7 +206,7 @@ function drawOhlcStructure(canvas,view,opts){
 
   const labels=[];
   const hline=(price,color,dash,label)=>{
-    const p=_ohlcFinite(price);
+    const p=_ohlcNearTape(price,anchor,candleSpan);
     if(p==null)return;
     ctx.strokeStyle=color;ctx.lineWidth=showLabels?1.6:1.25;
     ctx.setLineDash(dash||[]);
@@ -204,13 +229,21 @@ function drawOhlcStructure(canvas,view,opts){
   if(showLabels){
     if(zones.buy_entry&&(!pref||pref==='BUY')){
       const z=zones.buy_entry;
-      const midZ=((_ohlcFinite(z.lo)||0)+(_ohlcFinite(z.hi)||_ohlcFinite(z.lo)||0))/2;
-      labels.push({y:y(midZ),color:'#39ff88',label:'BUY zona',price:midZ});
+      const a=_ohlcNearTape(z.lo,anchor,candleSpan);
+      const b=_ohlcNearTape(z.hi,anchor,candleSpan)||a;
+      if(a!=null){
+        const midZ=(a+(b||a))/2;
+        labels.push({y:y(midZ),color:'#39ff88',label:'BUY zona',price:midZ});
+      }
     }
     if(zones.sell_entry&&(!pref||pref==='SELL')){
       const z=zones.sell_entry;
-      const midZ=((_ohlcFinite(z.lo)||0)+(_ohlcFinite(z.hi)||_ohlcFinite(z.lo)||0))/2;
-      labels.push({y:y(midZ),color:'#ff5c7a',label:'SELL zona',price:midZ});
+      const a=_ohlcNearTape(z.lo,anchor,candleSpan);
+      const b=_ohlcNearTape(z.hi,anchor,candleSpan)||a;
+      if(a!=null){
+        const midZ=(a+(b||a))/2;
+        labels.push({y:y(midZ),color:'#ff5c7a',label:'SELL zona',price:midZ});
+      }
     }
   }
 
@@ -243,7 +276,6 @@ function drawOhlcStructure(canvas,view,opts){
     }
   }
 
-  // Footer: time window (popup) + MTF stack summary.
   const mtf=view.mtf||{};
   const parts=[];
   if(showLabels){

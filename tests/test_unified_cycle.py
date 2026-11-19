@@ -180,4 +180,40 @@ def test_machine_spec_documents_unified_cycle():
     assert 'compose_open' in machine_spec.UNIFIED_CYCLE
     assert 'unified_cycle.settle' in machine_spec.UNIFIED_CYCLE
     assert 'policy_evolve' in machine_spec.UNIFIED_CYCLE
-    assert 'calibrated' in machine_spec.UNIFIED_CYCLE_EDGE_BUS
+    assert 'market_pnl' in machine_spec.UNIFIED_CYCLE_EDGE_BUS
+
+
+def test_observe_close_raises_floor_after_loss_eases_after_win():
+    """Market £ teaches entry_edge_floor; settle streak alone does not."""
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        assert uc.entry_edge_floor(store) == pytest.approx(0.06)
+        lost = uc.observe_close(store, broker_pnl=-1.20, spread=0.10,
+                                entry_meta={'score_edge': 0.07})
+        assert lost['adapted'] is True
+        assert uc.entry_edge_floor(store) == pytest.approx(0.07)
+        # settle must preserve the learned floor (aggression only).
+        uc.settle(store, pnl=-1.20, action='BUY')
+        assert uc.entry_edge_floor(store) == pytest.approx(0.07)
+        won = uc.observe_close(store, broker_pnl=2.00, spread=0.10,
+                               entry_meta={'score_edge': 0.15})
+        assert won['adapted'] is True
+        assert uc.entry_edge_floor(store) == pytest.approx(0.06)
+        # Scratch ignored.
+        scratch = uc.observe_close(store, broker_pnl=-0.01, spread=0.0)
+        assert scratch['adapted'] is False
+        assert uc.entry_edge_floor(store) == pytest.approx(0.06)
+
+
+def test_observe_close_respects_rails():
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        uc.set_calibrated_floor(store, uc.ENTRY_EDGE_MIN, method='test')
+        soft = uc.observe_close(store, broker_pnl=5.0, spread=0.0)
+        assert soft['adapted'] is False
+        assert soft.get('reason') == 'at_rail'
+        assert uc.entry_edge_floor(store) == pytest.approx(uc.ENTRY_EDGE_MIN)
+        uc.set_calibrated_floor(store, uc.ENTRY_EDGE_MAX, method='test')
+        hard = uc.observe_close(store, broker_pnl=-5.0, spread=0.0)
+        assert hard['adapted'] is False
+        assert uc.entry_edge_floor(store) == pytest.approx(uc.ENTRY_EDGE_MAX)

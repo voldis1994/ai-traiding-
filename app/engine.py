@@ -2847,7 +2847,9 @@ class SingleTradeEngine:
         except (TypeError,ValueError):
             return False
         side='BUY' if buy>=sell else 'SELL'
-        return (float(scores.get(side) or 0)-hold)>=0.06
+        # Same learned floor as policy / compose_open — not a frozen 0.06.
+        need=float(unified_cycle.entry_edge_floor(self.store))
+        return (float(scores.get(side) or 0)-hold)>=need
 
     def _entry_path_from_evaluation(self,evaluation):
         """Unified Admin/engine view: intent + trigger + wait (one vocabulary)."""
@@ -4834,8 +4836,8 @@ class SingleTradeEngine:
             any_real_dw=bool(kept and learn_meta.get('any_real_dw'))
             if (gate_decision or {}).get('rolled_back'):
                 losses=[];last_delta=None;any_real_dw=False
-        # ΔW already updated neural scores (entry quality). Entry floor stays
-        # fixed at 0.06 — note_weight_update is a pin/no-op for the gate.
+        # ΔW already updated neural scores (entry quality). Entry floor learns
+        # from broker £ via observe_close below — not from ΔW alone.
         # Skip on ROLLBACK — rejected ΔW must not count as cycle evidence.
         if repeats>0 and label is not None and claimed_neural and any_real_dw:
             unified_cycle.note_weight_update(
@@ -4930,6 +4932,20 @@ class SingleTradeEngine:
                     broker_pnl=pnl_value,spread=spread_cost)
             except Exception as exc:
                 self.store.event('warning','OHLC entry gates learn skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            try:
+                edge_meta=None
+                if isinstance(saved,dict):
+                    edge_meta={'score_edge':saved.get('score_edge')}
+                    if edge_meta['score_edge'] is None:
+                        scores=saved.get('scores')
+                        if isinstance(scores,dict):
+                            edge_meta['score_edge']=AutoEvolution.score_edge(scores)
+                unified_cycle.observe_close(
+                    self.store,broker_pnl=pnl_value,spread=spread_cost,
+                    entry_meta=edge_meta)
+            except Exception as exc:
+                self.store.event('warning','Entry edge floor learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
             equity=self._account_equity()
             if equity is not None:
@@ -5909,12 +5925,20 @@ class SingleTradeEngine:
                 structure_at_open=structure_memory.snapshot_live(
                     candles=open_candles,market_context=self.market_context,
                     mid=entry)
+                open_scores=(self.last_signal or {}).get('scores')
+                open_edge=None
+                if isinstance(open_scores,dict):
+                    try:
+                        open_edge=float(AutoEvolution.score_edge(open_scores))
+                    except (TypeError,ValueError):
+                        open_edge=None
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
                     'transition':self.brain._json_transition(self.brain.core.last_transition),
-                    'scores':(self.last_signal or {}).get('scores'),
+                    'scores':open_scores,
                     'scores_raw':(self.last_signal or {}).get('scores_raw'),
+                    'score_edge':open_edge,
                     'shadow_scores':self._shadow_scores_now(),
                     'bar_time':self.last_decision_bar,'captured':'submit',
                     'bracket_kappa':bp['kappa'],'bracket_sl_scale':bp['sl_scale'],

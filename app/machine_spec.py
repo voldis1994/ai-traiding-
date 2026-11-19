@@ -38,11 +38,11 @@ UNIFIED_CYCLE = (
     'broker_settle',
     'unified_cycle.settle',  # aggression/streaks → exit width only
     'bracket_learn + neural trade_pnl',  # exits + entry score quality
-    'policy_evolve',  # new strategies; MIN_EDGE stays 0.06
+    'policy_evolve',  # strategies; MIN_EDGE from market £ + holdout
 )
-# Entry edge from holdout/spread calibration (rails 0.03–0.12); seed 0.06.
-# £ settle does not move the gate — only calibrate_live_entry_floor does.
-UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor_holdout_calibrated'
+# Entry edge: seed 0.06 → observe_close(£) + holdout/spread on learned base
+# (rails 0.03–0.12). settle() streak alone does not raise the gate.
+UNIFIED_CYCLE_EDGE_BUS = 'entry_edge_floor_market_pnl_holdout'
 UNIFIED_CYCLE_STORE = 'unified_cycle_v1'
 # Audit #17: two objectives, relative weights (trade_pnl is 5× minute_direction).
 LEARN_OBJECTIVES = {

@@ -348,14 +348,16 @@ class AutoEvolution:
 
     def calibrate_live_entry_floor(self,direction,*,history=None,spread_bps=0.0,
                                    accuracy=None,samples=0):
-        """Compute LIVE MIN_EDGE from adaptive base + holdout — not from last £.
+        """Compute LIVE MIN_EDGE from *learned* floor + holdout/spread.
 
-        Returns (floor, calibration_detail). Soft rails are applied when
-        persisted via unified_cycle.set_calibrated_floor.
+        Base is the market-taught entry_edge_floor (observe_close), not a
+        frozen 0.06 seed every bar. Holdout may ease further; spread/accuracy
+        still nudge. Soft rails via unified_cycle.set_calibrated_floor.
         """
         from . import unified_cycle
+        learned=unified_cycle.entry_edge_floor(self.store)
         baseline=self.adaptive_threshold(
-            accuracy,samples,spread_bps,base=unified_cycle.ENTRY_EDGE_DEFAULT)
+            accuracy,samples,spread_bps,base=learned)
         calibration=self.calibrate_entry_margin(
             direction,history or [],baseline)
         selected=float(calibration.get('selected',baseline) or baseline)
@@ -365,6 +367,7 @@ class AutoEvolution:
             self.store,floor,
             method=calibration.get('method') or 'adaptive_threshold',
             detail={
+                'learned_base':learned,
                 'baseline':baseline,
                 'selected':selected,
                 'reason':calibration.get('reason'),

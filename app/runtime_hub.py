@@ -248,6 +248,8 @@ class AccountRuntime:
             'positions':enriched,
             'protection':brief,
             'day_book':day_book,
+            'forward_live':(snap.get('forward_live')
+                            if isinstance(snap.get('forward_live'),dict) else None),
             'mtf_momentum':mtf,
             'scores':{
                 'BUY':float(scores.get('BUY') or 0),
@@ -638,6 +640,7 @@ class RuntimeHub:
                         [view['position']] if view.get('position') else []),
                     'protection':view.get('protection') or snap.get('adaptive_protection'),
                     'day_book':view.get('day_book') or snap.get('day_book'),
+                    'forward_live':view.get('forward_live') or snap.get('forward_live'),
                     'mtf_momentum':view.get('mtf_momentum') or snap.get('mtf_momentum'),
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')

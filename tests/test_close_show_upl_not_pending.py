@@ -48,7 +48,8 @@ def test_vanish_with_upl_journals_zero_one_not_pending():
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(0.01)
             assert row['pnl_source']=='upl_estimate'
-            assert not e._trade_already_learned('g01')
+            # Operator: UPL 0.01 teaches immediately — no pending wait.
+            assert e._trade_already_learned('g01')
             hub=RuntimeHub.__new__(RuntimeHub)
             stats=RuntimeHub._trade_stats(hub,store,'GBP')
             assert stats['working_pnl']==pytest.approx(0.01)

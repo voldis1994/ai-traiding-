@@ -48,8 +48,7 @@ function esc(s){
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
 function sourceLabel(src){
-  if(src==='broker')return 'broker £';
-  if(src==='upl_estimate')return 'UPL peļņa';
+  if(src==='broker'||src==='upl_estimate')return 'peļņa';
   if(src==='open_upl')return 'live UPL';
   if(src==='working')return 'working';
   if(src==='none'||src==='empty')return 'nav skaitļu';
@@ -638,10 +637,11 @@ function renderCard(c){
     const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
     const showPnl=p!=null?p:(pending&&t.upl_hint!=null?t.upl_hint:null);
     const cls=pnlClass(showPnl);
-    // Prefer showing the £ figure (UPL provisional) over a blank "gaida" label.
-    const src=(showPnl!=null&&(t.pnl_source==='upl_estimate'||pending))?' [UPL]':
-      (pending?' [gaida £]':(t.pnl_source==='upl_estimate'?' [UPL]':
-      (t.pnl_source&&t.pnl_source!=='broker'?` [${t.pnl_source}]`:'')));
+    // Operator: peļņa is peļņa — no [UPL] / [gaida £] badges when we have a number.
+    const src=(showPnl!=null)?'':
+      (pending?' [gaida £]':
+      (t.pnl_source&&t.pnl_source!=='broker'&&t.pnl_source!=='upl_estimate'
+        ?` [${t.pnl_source}]`:''));
     let right;
     if(showPnl!=null){right=money(showPnl,tCcy);}
     else if(pending){right='gaida Capital £';}
@@ -731,7 +731,15 @@ function renderCard(c){
         sb.pnl==null?'—':esc(money(sb.pnl,sb.ccy||ccy))
       }</strong></div>
       <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
-      ${(r.pending_broker_pnl||r.pending_trades||r.pending_cash_trades)?`<div><span>Gaida broker £</span><strong>${esc(r.pending_broker_pnl??0)} rindā · ${esc(r.pending_trades??r.pending_cash_trades??0)} žurnālā</strong></div>`:''}
+      ${(r.pending_cash_trades)?`<div><span>Gaida peļņa</span><strong>${esc(r.pending_cash_trades)} bez skaitļa</strong></div>`:''}
+      ${(()=>{
+        const fl=a.forward_live||{};
+        if(!fl.ok)return '';
+        const tip=(fl.tips&&fl.tips[0])?fl.tips[0]:'';
+        return `<div><span>Forward-live</span><strong>${esc(
+          `n=${fl.n} · false ${(fl.false_signal_rate==null?'—':Math.round(fl.false_signal_rate*100)+'%')} · E ${fl.expectancy==null?'—':fl.expectancy}`
+        )}</strong></div>${tip?`<div><span>Forward tip</span><strong>${esc(tip)}</strong></div>`:''}`;
+      })()}
     </div>
     <div class="muted" style="padding:8px 14px;font-size:12px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)

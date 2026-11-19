@@ -86,8 +86,8 @@ def load_params(store):
         'open_slices': max(3, int(sp.get('day_open_slices', 5))),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
         'size_full_balance': int(sp.get('day_size_full_balance', 1)),
-        # Operator Admin toggle — 0 temporarily disables DEFEND/DONE/PROTECT OPEN blocks.
-        'risk_gates': int(sp.get('day_risk_gates', 1)),
+        # Vestigial — OPEN never blocked by day phase (operator: no risk regimes).
+        'risk_gates': 0,
     }
 
 
@@ -620,19 +620,9 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
             'daily': daily, 'budgets': b, 'open_count': open_n,
             'max_positions': max_pos,
         }
-    risk_gates = int(params.get('risk_gates', 1)) == 1
-    if risk_gates and phase in (PHASE_DEFEND, PHASE_DONE):
-        return {
-            'allowed': False, 'reason': f'day_phase_{phase.lower()}',
-            'phase': phase, 'daily': daily, 'budgets': b, 'open_count': open_n,
-            'risk_gates': True,
-        }
-    if risk_gates and phase == PHASE_PROTECT:
-        return {
-            'allowed': False, 'reason': 'day_protect_bank_target',
-            'phase': phase, 'daily': daily, 'budgets': b, 'open_count': open_n,
-            'risk_gates': True,
-        }
+    # Day phase (DEFEND/DONE/PROTECT) is informational + soft nudge only —
+    # never a LIVE OPEN block (operator: no risk regimes).
+    risk_gates = False
     # Adding onto an existing book needs a clearer edge than a flat open —
     # unless the live tape already agrees with the book (clear rebound ADD).
     # Planned multi-lot burst skips this — edge was checked once for the pack.
@@ -654,8 +644,8 @@ def allows_new_open(*, store, equity, positions, epic=None, mandate_epic=None,
                 'trend_aligned': bool(trend_aligned),
             }
     reason = 'day_book_hunt'
-    if not risk_gates and phase in (PHASE_DEFEND, PHASE_DONE, PHASE_PROTECT):
-        reason = f'day_risk_gates_off_phase_{str(phase).lower()}'
+    if phase in (PHASE_DEFEND, PHASE_DONE, PHASE_PROTECT):
+        reason = f'day_phase_{str(phase).lower()}_informational'
     return {
         'allowed': True, 'reason': reason, 'phase': phase,
         'daily': daily, 'budgets': b, 'open_count': open_n,
@@ -1007,30 +997,16 @@ def soft_nudge_conviction(scores, *, phase, store=None, live_trend=None,
 
 
 def soft_nudge_day_phase(scores, *, phase, store=None):
-    """When day target is banked / defending — soft-tilt toward HOLD for new risk."""
+    """No day-phase HOLD tilt — operator: no risk regimes; LIVE keeps trading.
+
+    Phase is still computed for Admin/day-book display; it must not bias scores.
+    """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
-    if phase not in (PHASE_PROTECT, PHASE_DEFEND, PHASE_DONE):
-        return dict(scores), {'nudged': False, 'reason': 'hunt_no_phase_tilt'}
-    out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
-    try:
-        from .self_params import get as sp_get
-        delta = float(sp_get(store, 'day_phase_protect_tilt', 0.10)
-                      if phase == PHASE_PROTECT
-                      else sp_get(store, 'day_phase_defend_tilt', 0.16))
-    except Exception:
-        delta = 0.10 if phase == PHASE_PROTECT else 0.16
-    out['HOLD'] = out['HOLD'] + delta
-    out['BUY'] = max(0.0, out['BUY'] - 0.5 * delta)
-    out['SELL'] = max(0.0, out['SELL'] - 0.5 * delta)
-    total = sum(out.values())
-    if total <= 1e-12:
-        return dict(scores), {'nudged': False, 'reason': 'degenerate'}
-    out = {k: v / total for k, v in out.items()}
-    return out, {
-        'nudged': True, 'target': 'HOLD', 'delta': delta,
-        'reason': f'day_phase_{phase.lower()}', 'phase': phase,
-        'renormalized': True,
+    return dict(scores), {
+        'nudged': False,
+        'reason': 'day_phase_tilt_disabled',
+        'phase': phase,
     }
 
 
@@ -1124,10 +1100,9 @@ def snapshot(store, *, equity=None, positions=None):
         'open_upl': upl,
         'day_mark_pnl': day_mark,
         'last_plan': store.get(LAST_PLAN_KEY) if store is not None else None,
-        'risk_gates': int(params.get('risk_gates', 1)) == 1,
+        # Always OFF for LIVE — phase is informational only (no OPEN block).
+        'risk_gates': False,
         'goal': (
-            'Riski IZSLĒGTI — DEFEND/DONE/PROTECT nebloķē OPEN (Admin poga).'
-            if int(params.get('risk_gates', 1)) != 1 else
-            'No day profit cap; DEFEND at 10% equity loss; OPEN pack uses full account £.'
+            'LIVE: dienas riska režīmi IZSLĒGTI — DEFEND/DONE/PROTECT nebloķē OPEN.'
         ),
     }

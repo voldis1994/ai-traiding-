@@ -928,34 +928,33 @@ class RuntimeHub:
 
 
     def client_day_risk_gates(self,client_id: int) -> dict:
-        """Operator day-book risk gate flag (DEFEND/DONE/PROTECT may block OPEN)."""
+        """Day phase is informational only — never blocks LIVE OPEN."""
         from . import day_book
-        from .self_params import get as sp_get
         store=self._client_store(client_id)
-        enabled=int(sp_get(store,'day_risk_gates',1) or 0)==1
         snap=day_book.snapshot(store)
         return {
-            'risk_gates':enabled,
-            'day_risk_gates':1 if enabled else 0,
+            'risk_gates':False,
+            'day_risk_gates':0,
             'phase':snap.get('phase'),
             'goal':snap.get('goal'),
+            'note':('LIVE: DEFEND/DONE/PROTECT never block OPEN. '
+                    'day_risk_gates flag is ignored by the engine.'),
         }
 
     def set_client_day_risk_gates(self,client_id: int,*,enabled: bool) -> dict:
-        """Admin toggle — temporarily disable day-book OPEN phase blocks."""
-        from . import day_book
+        """Kept for Admin API compat — always forces OFF (no risk regimes)."""
         from .self_params import load as sp_load, save as sp_save
         store=self._client_store(client_id,create=True)
         params=sp_load(store)
-        params['day_risk_gates']=1 if enabled else 0
-        sp_save(store,params,reason='admin_day_risk_gates')
-        store.event('risk','Operator day risk gates '+('ON' if enabled else 'OFF'),{
-            'day_risk_gates':params['day_risk_gates']})
+        params['day_risk_gates']=0
+        sp_save(store,params,reason='admin_day_risk_gates_force_off')
+        store.event('risk','Operator day risk gates forced OFF (LIVE)',{
+            'day_risk_gates':0,'requested_enabled':bool(enabled)})
         return self.client_day_risk_gates(client_id)
 
     def save_client_hard_risk(self,client_id: int,*,max_risk_per_trade,daily_loss_limit,
                               equity_drawdown_limit,clear_halt: bool=False) -> dict:
-        """Operator sets all three monetary limits — required for LIVE OPEN."""
+        """Operator sets optional monetary limits — informational; never required for OPEN."""
         from . import hard_risk
         # Allow configuring before first Start — creates robot.sqlite3 if needed.
         store=self._client_store(client_id,create=True)

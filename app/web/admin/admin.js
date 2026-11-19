@@ -495,8 +495,9 @@ function renderRiskBoard(clients){
     board.innerHTML=`<div class="empty">Nav klientu</div>`;
     return;
   }
-  board.innerHTML=clients.map(c=>{
+  board.innerHTML=`<p class="muted" style="margin:0 0 12px">LIVE: dienas riska režīmi (DEFEND/DONE/PROTECT) <b>nebloķē</b> OPEN. Hard-risk limitu lauki ir tikai informācija.</p>`+clients.map(c=>{
     const hr=c.hard_risk||{};
+    const db=c.day_book||{};
     const name=c.display_name||c.username||('#'+c.id);
     const halted=!!hr.trading_halted;
     return `<article class="card risk-card">
@@ -504,6 +505,8 @@ function renderRiskBoard(clients){
         <h2>${icon('shield')} ${esc(name)}</h2>
         <span class="state-pill ${halted?'pause':(c.robot_running?'on':'off')}">${halted?'HALT':(c.robot_running?'ON':'OFF')}</span>
       </div>
+      <div class="kv"><span>Dienas fāze</span><b>${esc(db.phase||'—')} <small>(info)</small></b></div>
+      <div class="kv"><span>Dienas riska režīmi</span><b>OFF — LIVE strādā</b></div>
       <div class="kv"><span>Max risks / treids</span><b>${esc(hr.max_risk_per_trade??'—')}</b></div>
       <div class="kv"><span>Dienas zaud. limits</span><b>${esc(hr.daily_loss_limit??'—')}</b></div>
       <div class="kv"><span>Drawdown limits</span><b>${esc(hr.equity_drawdown_limit??'—')}</b></div>

@@ -3451,20 +3451,28 @@ class SingleTradeEngine:
             return None
 
     def _requeue_unsettled_cash_closes(self):
-        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue."""
+        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue.
+
+        ``upl_estimate`` is display-only until Capital history returns real £ —
+        those rows must stay harvestable (neural teach waits for ``broker``).
+        """
         try:
             rows=self.store.db.execute(
                 "SELECT deal_id,exit,opened,closed,pnl_source FROM trades "
                 "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
                 "('pending_broker_pnl','pending_close_sync',"
-                "'ticks_only','price_size','position_disappeared')) "
+                "'ticks_only','price_size','position_disappeared',"
+                "'upl_estimate')) "
                 "ORDER BY closed DESC LIMIT 80").fetchall()
         except Exception:
             return 0
         n=0
         for deal_id,exit_lvl,_opened,_closed,src in rows:
             deal=str(deal_id)
-            if self.store.get('broker_cash_banked:'+deal):
+            # Real broker £ already banked — do not re-harvest.
+            if self.store.get('broker_cash_banked:'+deal) and str(src or '')=='broker':
+                continue
+            if self.store.get('broker_cash_banked:'+deal) and str(src or '')!='upl_estimate':
                 continue
             self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
             n+=1
@@ -3817,23 +3825,19 @@ class SingleTradeEngine:
         return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
-        """Neural teach from exit ticks while cash £ is still pending.
+        """Keep journal pending — do NOT neural-teach without verified broker £.
 
-        Keeps journal ``pnl_source=pending_broker_pnl`` (no fake £). Late Capital
-        cash overwrites the row without re-learning (once-only claim).
+        Tick teach used to burn the once-only claim before Capital cash arrived,
+        so real £ only hit the late refine path. Neural ΔW waits for ``broker``.
         """
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
-        if not self.store.get('entry_brain:'+deal):
-            return False
-        conf={'level':exit_level,'source':'pending_ticks_teach'}
-        self._learn_closed_trade(deal,conf)
-        # Ensure source stayed pending (learn path preserves it for this source).
         self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
-        self.store.event('learning','Pending-cash trade taught from ticks; still waiting for £',
-                         {'deal_id':deal,'exit_level':exit_level})
-        return True
+        self.store.event('learning',
+            'Pending Capital £ — neural teach deferred (no tick claim)',
+            {'deal_id':deal,'exit_level':exit_level})
+        return False
 
     async def _retry_pending_broker_pnl(self):
         """Re-request pending cash P&L; refine records; learn at most once (audit #1–2)."""
@@ -3861,27 +3865,36 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','Fuzzy pending P&L failed',
                                      {'deal_id':deal,'type':type(exc).__name__})
-            # Capital lag: bank last live UPL as peļņa so [gaida £] clears.
-            pnl_source='broker'
+            # Capital lag: show last live UPL in the journal so [gaida £] is not
+            # blank — but keep harvesting until verified broker £ arrives.
+            # Neural teach must NOT use upl_estimate (inaccurate feedback).
             if not found:
                 upl_found=self._last_upl_as_realized(deal)
                 if upl_found and attempts>=1:
-                    found=upl_found
-                    pnl_source='upl_estimate'
-                else:
-                    if attempts<=2:
-                        self._teach_pending_ticks(deal,exit_level)
+                    upl_pnl,upl_ccy=upl_found
+                    ccy=self._cash_currency(upl_ccy)
+                    self.store.close_trade(
+                        deal,exit_level,float(upl_pnl),currency=ccy,
+                        source='upl_estimate',overwrite=True)
+                    self.store.event(
+                        'trade','UPL provisional peļņa — waiting for Capital £',
+                        {'deal_id':deal,'upl':float(upl_pnl),'currency':ccy,
+                         'attempts':attempts})
                     nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                    nxt.pop('upl_shown',None)
+                    nxt['upl_shown']=True
                     remaining.append(nxt)
                     continue
+                if attempts<=2:
+                    self._teach_pending_ticks(deal,exit_level)
+                nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                nxt.pop('upl_shown',None)
+                remaining.append(nxt)
+                continue
             pnl,hist_ccy=found
             ccy=self._cash_currency(hist_ccy)
-            # Always through learn path — already_learned banks £ + late teachers once.
+            # Verified Capital £ — learn path (neural + late teachers).
             conf={'level':exit_level,'profit':pnl,'pnl_currency':ccy,
-                  'source':('pending_upl_settle' if pnl_source=='upl_estimate'
-                            else 'pending_pnl_retry'),
-                  'pnl_source':pnl_source}
+                  'source':'pending_pnl_retry','pnl_source':'broker'}
             self._learn_closed_trade(deal,conf)
             self.store.set('last_upl:'+deal,None)
         self.store.set('pending_broker_pnl_deals',remaining)
@@ -4242,11 +4255,14 @@ class SingleTradeEngine:
                     preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source in ('broker','upl_estimate') and pnl_value is not None:
+                if pnl_source=='broker' and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=row[1],
                         source=pnl_source)
                 else:
+                    if pnl_source=='upl_estimate' and pnl_value is not None:
+                        # Display only — keep harvesting real Capital £.
+                        pass
                     self._queue_pending_pnl(deal_id,exit_level=exit_level)
             elif exit_level is not None or broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or (
@@ -4281,10 +4297,12 @@ class SingleTradeEngine:
                     currency=hint_ccy,preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source in ('broker','upl_estimate'):
+                if pnl_source=='broker' and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=direction,
                         source=pnl_source)
+                else:
+                    self._queue_pending_pnl(deal_id,exit_level=exit_level)
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
@@ -4336,9 +4354,37 @@ class SingleTradeEngine:
             path_mfe=struct_ctx.get('path_mfe'),
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
-        # Profit ledger: broker £ or last UPL peļņa — never ±1 tick fakes.
-        cash_like=pnl_source in ('broker','upl_estimate') and pnl_value is not None
+        # Profit ledger + neural teach: verified broker £ only.
+        # upl_estimate is journal display until Capital history arrives — teaching
+        # from it gave inaccurate feedback (dump: most closes were UPL, not broker).
+        cash_like=pnl_source=='broker' and pnl_value is not None
         entry_scores=saved.get('scores') if isinstance(saved.get('scores'),dict) else None
+        if pnl_source=='upl_estimate' and pnl_value is not None:
+            self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
+                                   source='upl_estimate',overwrite=overwrite)
+            self._queue_pending_pnl(deal_id,exit_level=exit_level)
+            structure_at_open=(saved.get('structure_at_open')
+                               if isinstance(saved,dict) else None)
+            close_frame=(struct_ctx.get('frame')
+                         if isinstance(struct_ctx,dict) else None) or {}
+            close_bos=structure_memory.bos_choch(
+                (struct_ctx.get('pre_bars') or [])[-5:] + (cf.get('bars') or [])
+                if isinstance(struct_ctx,dict) else (cf.get('bars') or []))
+            structure_at_close=structure_memory.snapshot_from_frame(
+                close_frame,mid=exit_level,bos=close_bos)
+            if not structure_at_open:
+                structure_at_open=structure_at_close
+            structure_memory.persist_last(self.store,structure_at_close)
+            self.store.set('last_trade_outcome',{
+                'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
+                'pnl':pnl_value,'mode':'upl_provisional','exit_mid':exit_level,
+                'exit_level':exit_level,
+                'structure_at_open':structure_at_open,
+                'structure_at_close':structure_at_close})
+            self.store.event('learning',
+                'UPL provisional — neural teach deferred until broker £',
+                {'deal_id':deal_id,'pnl':pnl_value,'pnl_source':'upl_estimate'})
+            return
         if cash_like:
             decision=self.profit_learning.record_closed(
                 deal_id=deal_id,epic=epic,direction=direction,entry=entry,

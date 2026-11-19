@@ -61,7 +61,14 @@ function sizeCanvas(){
 }
 
 function paint(force){
-  if(!lastView||typeof drawOhlcStructure!=='function')return;
+  if(!lastView)return;
+  if(typeof drawOhlcStructure!=='function'){
+    if(errEl){
+      errEl.hidden=false;
+      errEl.textContent='OHLC chart skripts neielādējās — hard refresh (Ctrl+F5).';
+    }
+    return;
+  }
   const key=viewPaintKey(lastView,candleN);
   if(!force&&key&&key===lastPaintKey){
     // Still refresh the LIVE clock; skip full canvas redraw (stops flicker).

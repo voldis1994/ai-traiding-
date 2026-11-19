@@ -98,6 +98,31 @@ def test_admin_ohlc_page_route_exists():
         assert b'ohlc-chart.js?v=' in body
 
 
+def test_admin_markets_ohlc_empty_without_running_robots():
+    """Shared boards key off live engines — idle clients do not spawn panels."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        platform = PlatformStore(root / 'platform.sqlite3')
+        platform.create_client('idle1', 'pass1234', 'Idle', 'lv')
+        hub = RuntimeHub(platform)
+        out = hub.admin_markets_ohlc(n=90)
+        assert out['count'] == 0
+        assert out['markets'] == []
+
+
+def test_admin_shared_ohlc_ui_contract():
+    """Main Admin: shared OHLC board, 200ms refresh, no per-client chart."""
+    admin_js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    index = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    ohlc_page = Path('app/web/admin/ohlc-page.js').read_text(encoding='utf-8')
+    assert 'id="sharedOhlc"' in index
+    assert 'OHLC_REFRESH_MS=200' in admin_js
+    assert 'refreshSharedOhlc' in admin_js
+    assert 'admin/markets-ohlc' in admin_js
+    assert 'data-ohlc-client' not in admin_js
+    assert 'setInterval(tick,200)' in ohlc_page
+
+
 def test_structure_view_never_invents_gold_without_epic():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)

@@ -744,6 +744,22 @@ def soft_nudge_scores(scores, analysis, *, store=None, live_trend=None):
         out[other] = out.get(other, 0) - 0.45 * delta
         out['HOLD'] = out.get('HOLD', 0) - 0.25 * delta
     elif preferred == 'HOLD' or mode == 'HOLD':
+        # Do not glue perpetual HOLD when neural already leans BUY/SELL —
+        # Admin was stuck HOLD·HOLD while scores showed a clear side.
+        buy = float(scores.get('BUY') or 0)
+        sell = float(scores.get('SELL') or 0)
+        hold = float(scores.get('HOLD') or 0)
+        neural_side = 'BUY' if buy >= sell else 'SELL'
+        neural_edge = float(scores.get(neural_side) or 0) - hold
+        if neural_edge >= 0.05:
+            return dict(scores), {
+                'nudged': False,
+                'reason': 'skip_hold_nudge_clear_neural',
+                'neural_side': neural_side,
+                'mode': mode,
+                'preferred': preferred,
+                'neural_edge': neural_edge,
+            }
         out['HOLD'] = out.get('HOLD', 0) + delta
         out['BUY'] = out.get('BUY', 0) - 0.35 * delta
         out['SELL'] = out.get('SELL', 0) - 0.35 * delta

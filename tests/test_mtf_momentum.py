@@ -107,6 +107,20 @@ def test_soft_nudge_tilts_buy():
     assert abs(sum(out.values()) - 1.0) < 1e-9
 
 
+def test_soft_nudge_skips_hold_when_neural_clear():
+    """MTF HOLD·HOLD must not crush a clear neural BUY into perpetual HOLD."""
+    scores = {'BUY': 0.48, 'HOLD': 0.30, 'SELL': 0.22}
+    analysis = {
+        'ready': True, 'mode': 'HOLD', 'preferred': 'HOLD',
+        'confidence': 0.7, 'reason': 'range',
+    }
+    out, meta = mtf_momentum.soft_nudge_scores(scores, analysis)
+    assert meta['nudged'] is False
+    assert meta['reason'] == 'skip_hold_nudge_clear_neural'
+    assert meta['neural_side'] == 'BUY'
+    assert out == scores
+
+
 def test_shift_lowers_exit_streak():
     assert mtf_momentum.exit_need_streak(
         {'ready': True, 'mode': 'SHIFT'}, default=2) == 1

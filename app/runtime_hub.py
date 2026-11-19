@@ -247,6 +247,11 @@ class AccountRuntime:
                 'SELL':float(scores.get('SELL') or 0),
             },
             'action':signal.get('action') or (manage or {}).get('action'),
+            # Neural side when action is HOLD (blocked / waiting) — Admin shows HOLD → BUY.
+            'proposal':(signal.get('proposal')
+                        or (manage or {}).get('proposal')
+                        or signal.get('action')
+                        or (manage or {}).get('action')),
             # Uncalibrated model score — not calibrated profit probability (audit #24).
             'confidence':signal.get('confidence'),
             'model_score':signal.get('model_score',signal.get('confidence')),
@@ -518,6 +523,7 @@ class RuntimeHub:
             'armed':False,
             'scores':{'BUY':0.,'HOLD':0.,'SELL':0.},
             'action':None,
+            'proposal':None,
             'evolution':{
                 'generation':0,'labeled_samples':0,'neurons':None,'steps':0,
                 'accuracy_proxy':0.,'births':0,'pruned':0,'loss':None,
@@ -557,6 +563,7 @@ class RuntimeHub:
                 'armed':bool(view.get('armed')),
                 'scores':view.get('scores') or card['scores'],
                 'action':view.get('action'),
+                'proposal':view.get('proposal'),
                 # Never fall back to position.currency (GOLD quote USD ≠ account GBP).
                 'account_currency':account_currency,
                 'evolution':{
@@ -935,6 +942,67 @@ class RuntimeHub:
             'swing_brackets':swing_brackets,
             'open_levels':open_levels,
         }
+
+    def admin_markets_ohlc(self,*,n: int=90) -> dict:
+        """One shared OHLC board per open Capital epic across the fleet.
+
+        Admin main screen shows these instead of a chart on every client card.
+        A new epic (client opens another market) gets its own panel.
+        """
+        by_epic={}
+        for client in self.platform.list_clients():
+            cid=int(client['id'])
+            name=client.get('display_name') or client.get('username') or f'#{cid}'
+            epics=set()
+            rt=self.get(cid)
+            if rt and rt.started and rt.engine is not None:
+                eng=rt.engine
+                market=getattr(eng,'market',None) or {}
+                mandate=getattr(eng,'mandate',None) or {}
+                for raw in (market.get('epic'),mandate.get('epic'),
+                            getattr(getattr(eng,'brain',None),'epic',None)):
+                    if raw:
+                        epics.add(str(raw))
+                try:
+                    snap=eng.snapshot()
+                except Exception:
+                    snap={}
+                for p in (snap.get('positions') or []):
+                    if isinstance(p,dict) and p.get('epic'):
+                        epics.add(str(p['epic']))
+            if not epics:
+                continue
+            for epic in epics:
+                row=by_epic.get(epic)
+                if row is None:
+                    by_epic[epic]={
+                        'epic':epic,
+                        'donor_client_id':cid,
+                        'client_ids':[cid],
+                        'client_names':[name],
+                    }
+                else:
+                    row['client_ids'].append(cid)
+                    row['client_names'].append(name)
+        markets=[]
+        for epic in sorted(by_epic.keys()):
+            meta=by_epic[epic]
+            donor=int(meta['donor_client_id'])
+            try:
+                view=self.admin_client_structure_view(donor,n=n)
+            except Exception as exc:
+                view={
+                    'ok':False,'reason':type(exc).__name__,'hint':str(exc),
+                    'candles':[],'zones':{},'client_id':donor,'epic':epic,
+                }
+            # Prefer the requested epic label even if donor mid drifted briefly.
+            if not view.get('epic'):
+                view['epic']=epic
+            view['donor_client_id']=donor
+            view['client_ids']=list(meta['client_ids'])
+            view['client_names']=list(meta['client_names'])
+            markets.append(view)
+        return {'markets':markets,'count':len(markets)}
 
     async def prepare_new_market(self,client_id: int) -> dict:
         """Clear mandate so the next Capital manual trade adopts ANY epic.

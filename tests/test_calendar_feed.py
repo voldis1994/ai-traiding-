@@ -28,3 +28,18 @@ def test_reject_disabled_feed(tmp_path):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await refresh_calendar(tmp_path/'calendar.json',url='https://calendar.example.org/events',client=client)
     assert not asyncio.run(run())['updated']
+
+
+def test_rate_limit_429_keeps_cache_and_flags(tmp_path):
+    from app.calendar_feed import FOREX_FACTORY_JSON
+    cache=tmp_path/'economic_calendar.json'
+    cache.write_text('{"enabled":true,"events":[]}')
+    def handler(req):
+        return httpx.Response(429,headers={'Retry-After':'120'},text='Too Many Requests')
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await refresh_calendar(cache,url=FOREX_FACTORY_JSON,client=client)
+    result=asyncio.run(run())
+    assert not result['updated']
+    assert result.get('rate_limited') is True
+    assert cache.read_text()=='{"enabled":true,"events":[]}'

@@ -4,14 +4,21 @@ const params=new URLSearchParams(location.search);
 const clientId=Number(params.get('client')||params.get('id')||0);
 const titleEl=document.getElementById('title');
 const subEl=document.getElementById('subtitle');
-const legendEl=document.getElementById('legend');
+const chipsEl=document.getElementById('chips');
 const errEl=document.getElementById('error');
 const canvas=document.getElementById('chart');
+const chartWrap=document.getElementById('chartWrap');
+const liveBadge=document.getElementById('liveBadge');
+const liveText=document.getElementById('liveText');
+const pageRoot=document.querySelector('.ohlc-page')||document.documentElement;
 let pollTimer=null;
 let lastView=null;
+let candleN=60;
+let lastOkAt=0;
+let inFlight=false;
 
 async function api(path){
-  const res=await fetch(path,{credentials:'same-origin'});
+  const res=await fetch(path,{credentials:'same-origin',cache:'no-store'});
   let body={};try{body=await res.json()}catch(_){}
   if(res.status===401){
     location.href='/admin';
@@ -21,46 +28,122 @@ async function api(path){
   return body;
 }
 
+function clock(ts){
+  try{
+    return new Date(ts||Date.now()).toLocaleTimeString('lv-LV',{
+      hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  }catch(_){return ''}
+}
+
+/** Ensure canvas CSS box matches wrap — % height often collapses to 0. */
+function sizeCanvas(){
+  if(!canvas||!chartWrap)return;
+  const r=chartWrap.getBoundingClientRect();
+  const cssW=Math.max(40,Math.floor(r.width)||canvas.clientWidth||640);
+  const cssH=Math.max(160,Math.floor(r.height)||canvas.clientHeight||360);
+  canvas.style.width=cssW+'px';
+  canvas.style.height=cssH+'px';
+}
+
 function paint(){
-  if(lastView&&typeof drawOhlcStructure==='function')drawOhlcStructure(canvas,lastView);
+  if(!lastView||typeof drawOhlcStructure!=='function')return;
+  sizeCanvas();
+  drawOhlcStructure(canvas,lastView,{labels:true,maxCandles:candleN});
+}
+
+function setLive(ok,detail){
+  if(!liveBadge||!liveText)return;
+  liveBadge.classList.toggle('stale',!ok);
+  liveText.textContent=detail||(ok?'LIVE':'…');
+}
+
+function renderChips(view){
+  if(!chipsEl)return;
+  const bits=[];
+  if(view.zones&&view.zones.buy_entry)bits.push(['buy','BUY entry zona']);
+  if(view.zones&&view.zones.sell_entry)bits.push(['sell','SELL entry zona']);
+  bits.push(['mid','mid']);
+  if(view.overlays&&(view.overlays.kama||[]).length)bits.push(['kama','KAMA / EMA']);
+  if(view.swing_brackets&&view.swing_brackets.ready){
+    bits.push(['sl','swing SL']);
+    bits.push(['tp','swing TP']);
+  }
+  if((view.open_levels||[]).length)bits.push(['entry','atvērtais entry/SL/TP']);
+  chipsEl.innerHTML=bits.map(([cls,label])=>
+    `<span class="ohlc-chip ${cls}"><i></i>${label}</span>`).join('');
 }
 
 async function load(){
   if(!clientId){
     errEl.hidden=false;
     errEl.textContent='Trūkst klienta ID (?client=…).';
+    setLive(false,'nav klienta');
     return;
   }
+  if(inFlight)return;
+  inFlight=true;
   try{
     await api('/api/admin/me');
-    const view=await api(`/api/admin/clients/${clientId}/structure-view?n=180`);
+    const bust=Date.now();
+    // Fetch a bit more than display window so range toggles stay snappy.
+    const fetchN=Math.max(candleN+20,120);
+    const view=await api(
+      `/api/admin/clients/${clientId}/structure-view?n=${fetchN}&_=${bust}`);
     lastView=view||{};
-    const name=view.client_name||view.display_name||view.username||`#${clientId}`;
+    // API may return 200 with ok:false (no epic / no candles).
+    if(view&&view.ok===false){
+      const name=view.client_name||view.display_name||view.username
+        ||params.get('name')||`#${clientId}`;
+      titleEl.textContent=name;
+      subEl.textContent=[`#${clientId}`,view.reason||'nav OHLC'].filter(Boolean).join(' · ');
+      renderChips(view);
+      errEl.hidden=false;
+      errEl.textContent=view.hint||view.reason||'OHLC nav pieejams šim klientam';
+      paint();
+      setLive(false,view.reason||'nav datu');
+      return;
+    }
+    lastOkAt=Date.now();
+    const name=view.client_name||view.display_name||view.username
+      ||params.get('name')||`#${clientId}`;
     const epic=view.epic||'—';
     document.title=`OHLC · ${name} · ${epic}`;
     titleEl.textContent=`${name}`;
     const st=view.structure||{};
+    const lastCandle=(view.candles||[])[(view.candles||[]).length-1];
+    const candleAt=lastCandle&&lastCandle.at?clock(lastCandle.at):'';
+    const mtf=view.mtf||{};
     subEl.textContent=[
       `#${clientId}`,
       epic,
       st.bias?`bias ${st.bias}`:'',
       st.event||'',
       view.preferred?`zona ${view.preferred}`:'abas entry zonas',
+      mtf.mode?`MTF ${mtf.mode}`:'',
       view.mid!=null?`mid ${Number(view.mid).toFixed(2)}`:'',
+      candleAt?`pēdējā svece ${candleAt}`:'',
+      `${candleN} M1`,
     ].filter(Boolean).join(' · ');
-    const bits=[];
-    if(view.zones&&view.zones.buy_entry)bits.push('zaļa = BUY entry zona');
-    if(view.zones&&view.zones.sell_entry)bits.push('sarkana = SELL entry zona');
-    bits.push('dzeltena = mid');
-    if(view.swing_brackets&&view.swing_brackets.ready)bits.push('punktētas = swing SL/TP');
-    if((view.open_levels||[]).length)bits.push('baltas = atvērtā darījuma līmeņi');
-    legendEl.textContent=bits.join(' · ');
+    renderChips(view);
     errEl.hidden=true;
     paint();
+    setLive(true,`LIVE · ${clock(lastOkAt)}`);
   }catch(err){
     errEl.hidden=false;
     errEl.textContent=String(err.message||err);
+    setLive(false,'offline');
+  }finally{
+    inFlight=false;
   }
+}
+
+function schedulePoll(){
+  if(pollTimer)clearInterval(pollTimer);
+  const tick=()=>{
+    if(document.hidden)return;
+    load().catch(()=>{});
+  };
+  pollTimer=setInterval(tick,2000);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});
@@ -68,7 +151,43 @@ document.getElementById('btnClose').onclick=()=>{
   if(window.opener)window.close();
   else location.href='/admin';
 };
-window.addEventListener('resize',()=>paint());
+document.getElementById('btnFullscreen').onclick=async()=>{
+  // Fullscreen the page root so .ohlc-page:fullscreen CSS applies.
+  const root=pageRoot;
+  try{
+    if(!document.fullscreenElement&&!document.webkitFullscreenElement){
+      if(root.requestFullscreen)await root.requestFullscreen();
+      else if(root.webkitRequestFullscreen)root.webkitRequestFullscreen();
+    }else if(document.exitFullscreen){
+      await document.exitFullscreen();
+    }else if(document.webkitExitFullscreen){
+      document.webkitExitFullscreen();
+    }
+  }catch(_){}
+  requestAnimationFrame(()=>paint());
+};
+
+document.querySelectorAll('.ohlc-range button').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('.ohlc-range button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    candleN=Number(btn.dataset.n)||60;
+    paint();
+    load().catch(()=>{});
+  };
+});
+
+if(typeof ResizeObserver!=='undefined'&&chartWrap){
+  const ro=new ResizeObserver(()=>requestAnimationFrame(()=>paint()));
+  ro.observe(chartWrap);
+}
+window.addEventListener('resize',()=>requestAnimationFrame(()=>paint()));
+document.addEventListener('fullscreenchange',()=>requestAnimationFrame(()=>paint()));
+document.addEventListener('webkitfullscreenchange',()=>requestAnimationFrame(()=>paint()));
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden)load().catch(()=>{});
+});
+
 load().catch(()=>{});
-pollTimer=setInterval(()=>load().catch(()=>{}),8000);
+schedulePoll();
 window.addEventListener('beforeunload',()=>{if(pollTimer)clearInterval(pollTimer);});

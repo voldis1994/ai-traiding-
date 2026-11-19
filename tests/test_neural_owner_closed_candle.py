@@ -90,13 +90,21 @@ def test_second_manual_deal_changes_lot_and_recovers_after_closed():
             assert e.mandate['last_manual_deal_id']=='m2'
             broker.open=[];await e.sync()
             assert e.last_closed_step>=0
-            e.market={'mid':100.01,'spread':.02,'bid':100.,'ask':100.02,'tick':.01,
-                      'epic':'SIM','status':'TRADEABLE','min_distance':.15}
             e.market_context={'ready':True}
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
             # Clear neural edge so shared entry_edge_floor does not invent HOLD.
             e.last_signal={'action':'BUY','scores':{'BUY':0.70,'SELL':0.20,'HOLD':0.10}}
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(store,'SIM')
+            assert put_engine_in_entry_zone(e,store,'SIM','BUY',broker=broker) is not None
+            m=e.market
+            async def _mkt(epic):
+                return {'snapshot':{'bid':m['bid'],'offer':m['ask'],'marketStatus':'TRADEABLE'},
+                        'instrument':{'onePipMeans':0.01},
+                        'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.15}}}
+            broker.market=_mkt
             await e.submit('BUY')
             orders=[r for r in broker.requests if r[0]=='OPEN']
             assert len(orders)==1 and orders[0][3]==Decimal('.5')
@@ -153,16 +161,21 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
             store=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(store,data_dir=d)
             e=SingleTradeEngine(store,brain);broker=BrokerSimulation()
             e.policy=AutoEvolution(store,Path(d)/'policy.py');e.attach(broker)
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(store,'SIM')
             await e.poll()  # manual position adopted and protected
             broker.open=[];await e.sync()  # manually closed
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([8.,-3.,-3.]) # BUY dominant
+            assert put_engine_in_entry_zone(e,store,'SIM','BUY',broker=broker) is not None
             # Same confirmed M1 bar already learned while manual was open.
             for _ in range(6): await e.poll()
             assert not [r for r in broker.requests if r[0]=='OPEN']
             assert e.brain.core.steps==1  # one model step, not six tick steps
             clock[0]+=timedelta(minutes=1)
+            assert put_engine_in_entry_zone(e,store,'SIM','BUY',broker=broker) is not None
             await e.poll()
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
             assert e.mandate['initial_deal_id']=='m1'

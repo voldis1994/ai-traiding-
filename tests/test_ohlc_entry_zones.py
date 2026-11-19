@@ -92,6 +92,19 @@ def test_atr_widens_band_when_mtf_ready():
     assert rich['band'] >= base['band']
 
 
+def test_drop_forming_minute_excludes_current_utc_bucket():
+    from datetime import datetime, timezone
+    now = datetime(2026, 11, 19, 12, 34, 20, tzinfo=timezone.utc)
+    rows = [
+        {'at': '2026-11-19T12:32:00+00:00', 'open': 1, 'high': 2, 'low': 0.5, 'close': 1.5},
+        {'at': '2026-11-19T12:33:00+00:00', 'open': 1.5, 'high': 2, 'low': 1, 'close': 1.8},
+        {'at': '2026-11-19T12:34:00+00:00', 'open': 1.8, 'high': 3, 'low': 1.7, 'close': 2.9},
+    ]
+    done = oez.drop_forming_minute(rows, now_utc=now)
+    assert [c['at'] for c in done] == [
+        '2026-11-19T12:32:00+00:00', '2026-11-19T12:33:00+00:00']
+
+
 def test_mtf_conflict_blocks_open_even_in_zone():
     rows = _swing_candles()
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)

@@ -16,13 +16,29 @@ from .stream import CapitalQuoteStream
 log=logging.getLogger('runtime_hub')
 
 
-def _remap_swing_marks(marks,full_n: int,display_n: int,limit: int=6):
-    """Map swing pivot indices from full history onto the displayed candle slice."""
+def _remap_swing_marks(marks,full_n: int,display_n: int,limit: int=6,
+                       path_n: int|None=None):
+    """Map swing pivot indices onto the displayed candle slice.
+
+    ``structure_memory.normalise`` uses a trailing window (often 80). Pivot ``i``
+    is relative to that path — not ``len(candles_full)``. Pass ``path_n`` so
+    remap uses ``full_n - path_n`` as the path start inside full history, then
+    shift into the display window.
+    """
     out=[]
     try:
-        offset=max(0,int(full_n)-int(display_n))
+        full_n=int(full_n);display_n=int(display_n)
     except (TypeError,ValueError):
-        offset=0
+        return out
+    try:
+        pn=int(path_n) if path_n is not None else None
+    except (TypeError,ValueError):
+        pn=None
+    if pn is None or pn<=0:
+        pn=min(80,full_n) if full_n>0 else 0
+    # Path covers the last pn bars of full history.
+    path_start=max(0,full_n-pn)
+    display_start=max(0,full_n-display_n)
     for m in (marks or [])[-limit:]:
         if not isinstance(m,dict):
             continue
@@ -32,9 +48,11 @@ def _remap_swing_marks(marks,full_n: int,display_n: int,limit: int=6):
         except (TypeError,ValueError):
             i=None
         if i is not None:
-            i=i-offset
-            if i<0 or i>=display_n:
+            abs_i=path_start+i
+            disp_i=abs_i-display_start
+            if disp_i<0 or disp_i>=display_n:
                 continue
+            i=disp_i
         out.append({'price':m.get('price'),'i':i})
     return out
 
@@ -734,7 +752,9 @@ class RuntimeHub:
         except Exception:
             need_mtf=720
         hist_n=max(display_n,need_mtf)
-        candles_full=store.candles(epic,n=hist_n,historical_only=False) or []
+        candles_raw=store.candles(epic,n=hist_n,historical_only=False) or []
+        # Same cutoff as LIVE OPEN — forming QUOTE minute must not move zones.
+        candles_full=ohlc_entry_zones.drop_forming_minute(candles_raw)
         candles=candles_full[-display_n:] if candles_full else []
         if mid is None and candles:
             try:
@@ -750,8 +770,9 @@ class RuntimeHub:
             candles_full or candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
         live=structure_memory.snapshot_live(
             candles=candles_full or candles,mid=mid) if (candles_full or candles) else {}
-        piv=structure_memory.swing_pivots(
-            candles_full or candles,left=2,right=2) if (candles_full or candles) else {}
+        path=structure_memory.normalise(candles_full or candles,limit=80) \
+            if (candles_full or candles) else []
+        piv=structure_memory.swing_pivots(path,left=2,right=2) if path else {}
         range_hi=ez.get('range_hi')
         range_lo=ez.get('range_lo')
         buy_zone=ez.get('buy_entry')
@@ -772,16 +793,30 @@ class RuntimeHub:
                 preferred=mp
         atr_hint=None
         kama_hint=None
-        if isinstance(overlays,dict):
+        # LIVE uses M5 KAMA first — Admin must match (not M1 overlay series).
+        if isinstance(mtf,dict) and mtf.get('ready'):
+            atr_hint=mtf.get('stop_hint_atr14')
+            tf=mtf.get('tf') or {}
+            kama_hint=(tf.get('m5') or {}).get('kama')
+            if kama_hint is None:
+                kama_hint=(tf.get('m1') or {}).get('kama')
+        if atr_hint is None and isinstance(overlays,dict):
             atr_hint=overlays.get('stop_hint_atr14') or overlays.get('atr14')
+        if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
-        if mid is not None and preferred in ('BUY','SELL') and (candles_full or candles):
+        # Preview SL/TP at side price (ask/bid) — same as LIVE OPEN entry.
+        entry_px=mid
+        if preferred=='BUY' and mid is not None:
+            entry_px=mid+(spread/2.0 if spread else 0)
+        elif preferred=='SELL' and mid is not None:
+            entry_px=mid-(spread/2.0 if spread else 0)
+        if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
             try:
                 zone=bracket_learn.zone_at_open(
                     candles_full or candles,multi_tf=True)
                 swing_brackets=bracket_learn.swing_anchor_brackets(
-                    candles=candles_full or candles,entry=mid,action=preferred,
+                    candles=candles_full or candles,entry=entry_px,action=preferred,
                     tick=tick,spread=spread,min_distance=0.,zone=zone,
                     atr=atr_hint,kama=kama_hint)
             except Exception as exc:
@@ -832,11 +867,13 @@ class RuntimeHub:
                 'event':ez.get('event') or (live or {}).get('live_event'),
                 'range_hi':range_hi,
                 'range_lo':range_lo,
-                # Remap pivot i onto the displayed candle window (not full hist).
+                # Remap pivot i (path-relative) onto the displayed candle window.
                 'swing_highs':_remap_swing_marks(
-                    piv.get('swing_highs'),len(candles_full or []),len(bare)),
+                    piv.get('swing_highs'),len(candles_full or []),len(bare),
+                    path_n=len(path or [])),
                 'swing_lows':_remap_swing_marks(
-                    piv.get('swing_lows'),len(candles_full or []),len(bare)),
+                    piv.get('swing_lows'),len(candles_full or []),len(bare),
+                    path_n=len(path or [])),
             },
             'zones':{
                 'support':ez.get('support'),

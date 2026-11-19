@@ -53,6 +53,17 @@ def test_auto_adopt_and_order_cycle():
             await e.poll()
             assert not broker.orders  # no order until fresh decision
             e.market_context={'ready':True}  # direct broker-router unit test
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(store,'TEST')
+            assert put_engine_in_entry_zone(e,store,'TEST','BUY') is not None
+            # FakeBroker.market ignores price — inject snapshot via wrap.
+            _m = e.market
+            async def _mkt(epic):
+                return {'snapshot':{'bid':_m['bid'],'offer':_m['ask'],'marketStatus':'TRADEABLE'},
+                        'instrument':{'onePipMeans':0.01},
+                        'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.2}}}
+            broker.market = _mkt
             await e.submit('BUY')
             assert broker.orders[0][2]==Decimal('0.2')
             assert broker.orders[0][4]>0

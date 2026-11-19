@@ -2131,10 +2131,13 @@ class SingleTradeEngine:
             # Broker protection is handled before slow secondary data calls.
             # Missing SL → install bracket. Missing TP alone is valid (Capital TP Off
             # after trail) — never invent TP every poll or trail cannot run.
+            # IMPORTANT: never return before candle bootstrap — thin hist after
+            # market switch must keep growing even while protect waits for swings.
+            protect_pending=False
             if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
                 await self.protect_position(self.positions[0])
                 if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
-                    return
+                    protect_pending=True
 
             if self.positions:
                 # News/liquidity downloads are background-only while an open
@@ -2151,6 +2154,13 @@ class SingleTradeEngine:
                  'spread':ask-bid}
             self.store.candle(self.mandate['epic'],bar)
             await self._account_and_candles()
+            if protect_pending:
+                # Retry protect once hist may have grown this poll.
+                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
+                    await self.protect_position(self.positions[0])
+                if len(self.positions)==1 and self.positions[0].get('stopLevel') is None:
+                    # Still unprotected — skip neural OPEN; trail waits for SL.
+                    return
             # LIVE context: include closed QUOTE minutes too. PK(epic,at) means a
             # minute written as QUOTE during the forming bar is excluded forever by
             # historical_only=True until Capital rewrite — that punched holes in the
@@ -2718,16 +2728,21 @@ class SingleTradeEngine:
                 unified_cycle.load_state(self.store)))
         return result
 
+    def _decision_candles(self,epic=None,*,n=None):
+        """Completed M1 only — never the forming QUOTE minute for entry/SL/TP."""
+        epic=epic or (self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+        if not epic:
+            return []
+        try:
+            hist_n=int(n) if n is not None else recommended_live_history_bars(self.store)
+            raw=self.store.candles(epic,n=hist_n,historical_only=False) or []
+        except Exception:
+            return []
+        return ohlc_entry_zones.drop_forming_minute(raw)
+
     def _ohlc_entry_zone_gate(self,action,mtf_analysis=None):
         """HOLD until ask/bid sits in OHLC entry zona and MTF stack agrees."""
-        epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
-        candles=[]
-        if epic:
-            try:
-                hist_n=recommended_live_history_bars(self.store)
-                candles=self.store.candles(epic,n=hist_n,historical_only=False) or []
-            except Exception:
-                candles=[]
+        candles=self._decision_candles()
         market=self.market or {}
         mtf=mtf_analysis
         if mtf is None and hasattr(self,'_mtf_momentum_analysis'):
@@ -4112,11 +4127,7 @@ class SingleTradeEngine:
         minimum=self.market.get('min_distance')
         if None in (mid,tick,spread) or not epic:
             return None
-        try:
-            hist_n=recommended_live_history_bars(self.store)
-            candles=self.store.candles(epic,n=hist_n,historical_only=False)
-        except Exception:
-            candles=[]
+        candles=self._decision_candles(epic)
         if len(candles)<20:
             return None
         zone=bracket_learn.zone_at_open(candles,multi_tf=True)
@@ -4376,7 +4387,11 @@ class SingleTradeEngine:
             self.store.event('learning','Trade outcome skipped: missing/mismatched entry units or instrument',
                 {'deal_id':deal_id,'entry_epic':epic,'model_epic':self.brain.epic,
                  'live_epic':live_epic,'broker_pnl':broker_pnl})
-            self.store.set(key,None)
+            # Soft mismatch: keep entry_brain while broker £ is still pending so
+            # a later tick-heal / currency resolve can still teach.
+            pending=self.store.get('pending_broker_pnl') or {}
+            if not (isinstance(pending,dict) and str(deal_id) in pending):
+                self.store.set(key,None)
             return
         sign=1 if direction=='BUY' else -1
         realized_ticks=sign*(exit_level-entry)/tick if exit_level is not None else 0.
@@ -5020,47 +5035,54 @@ class SingleTradeEngine:
             # Skip this tick — do NOT disable execution (that froze OPEN after every close).
             self.store.event('warning','Protection deferred: unsupported broker distance/price rule')
             return
-        candles=self.store.candles(p.get('epic') or self.mandate.get('epic'),n=120,
-                                   historical_only=True)
-        zone=bracket_learn.zone_at_open(candles)
+        # Same completed-bar window as LIVE OPEN — no forming minute, no invent.
+        epic=p.get('epic') or (self.mandate or {}).get('epic')
+        candles=self._decision_candles(epic)
+        if len(candles)<20:
+            self.store.event('warning','Protection deferred: waiting completed OHLC swings',{
+                'deal_id':p.get('dealId'),'bars':len(candles)})
+            return
+        zone=bracket_learn.zone_at_open(candles,multi_tf=True)
         rng=zone['range_distance'] or ohlc_range_distance(candles)
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
         level=float(p['level'] or mid)
         direction=p.get('direction')
-        bp=bracket_learn.propose_for_open(self.store,ohlc_kappa=zone.get('kappa'),
-                                         base_sl=base_sl,max_tp=zone.get('max_tp'),
-                                         candles=candles,tick=tick,spread=spread,
-                                         min_distance=min_dist,
-                                         entry=level,action=direction)
-        # Prefer swing-anchored levels from propose; never invent fresh ±zone.
+        mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+        kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
+        if kama_hint is None:
+            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+        bp=bracket_learn.propose_for_open(
+            self.store,ohlc_kappa=zone.get('kappa'),
+            base_sl=base_sl,max_tp=zone.get('max_tp'),
+            candles=candles,tick=tick,spread=spread,
+            min_distance=min_dist,entry=level,action=direction,
+            atr=atr_hint,kama=kama_hint,require_swing=True)
+        # Prefer swing-anchored levels — NEVER invent median ±zone on protect.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
         stop_lvl=_num(bp.get('stop_level'))
         profit_lvl=_num(bp.get('profit_level'))
-        if decided_sl and decided_tp and decided_sl>0 and decided_tp>0:
-            sign=1 if direction=='BUY' else -1
-            if stop_lvl is None:
-                stop_lvl=level-sign*float(decided_sl)
-            if profit_lvl is None:
-                profit_lvl=level+sign*float(decided_tp)
-            result={
-                'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
-                'stop_level':float(stop_lvl),
-                'profit_level':float(profit_lvl),
-                'kappa':bp.get('kappa'),'sl_scale':1.0,
-                'bracket_source':bp.get('bracket_source'),
-            }
-        else:
-            # Last resort only when swings unavailable — still log clearly.
-            result=stop_take(p['level'] or mid,p['direction'],tick,self.market['spread'],min_dist,
-                             kappa=bp['kappa'],sl_scale=1.0,
-                             range_distance=float(rng) if rng is not None else 0)
-            result['bracket_source']='protect_fallback_zone'
-            self.store.event('warning','Protection used zone fallback — no swing levels',{
+        if not (bp.get('ready') and decided_sl and decided_tp
+                and decided_sl>0 and decided_tp>0):
+            self.store.event('warning','Protection deferred: no OHLC swing SL/TP',{
                 'deal_id':p.get('dealId'),'reason':bp.get('reason'),
                 'bracket_source':bp.get('bracket_source')})
+            return
+        sign=1 if direction=='BUY' else -1
+        if stop_lvl is None:
+            stop_lvl=level-sign*float(decided_sl)
+        if profit_lvl is None:
+            profit_lvl=level+sign*float(decided_tp)
+        result={
+            'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
+            'stop_level':float(stop_lvl),
+            'profit_level':float(profit_lvl),
+            'kappa':bp.get('kappa'),'sl_scale':1.0,
+            'bracket_source':bp.get('bracket_source') or 'swing_anchor',
+        }
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
         if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
             self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
@@ -5158,7 +5180,17 @@ class SingleTradeEngine:
             if self.positions or not self._external_entry_check(action)['entry_allowed']:return
             market=broker_market or await self.broker.market(self.mandate['epic'])
             snap=market.get('snapshot',{});tick=self._tick(market)
-            mid=self.market.get('mid');spread=self.market.get('spread')
+            # Prefer fresh broker/stream prices after sync — not stale self.market.
+            ask=_num(snap.get('offer')) or _num(self.market.get('ask'))
+            bid=_num(snap.get('bid')) or _num(self.market.get('bid'))
+            streamed=getattr(self,'quote_stream',None)
+            streamed=streamed.current(self.mandate['epic']) if streamed else None
+            if streamed:
+                bid=streamed.get('bid',bid);ask=streamed.get('ask',ask)
+            if bid is None or ask is None or ask<bid:
+                bid=_num(self.market.get('bid'));ask=_num(self.market.get('ask'))
+            mid=((bid+ask)/2) if (bid is not None and ask is not None) else _num(self.market.get('mid'))
+            spread=(ask-bid) if (bid is not None and ask is not None) else _num(self.market.get('spread'))
             if snap.get('marketStatus') not in (None,'TRADEABLE') or not tick or mid is None or spread is None:return
             minimum=self._min_distance(market,mid)
             if minimum is None:
@@ -5166,17 +5198,14 @@ class SingleTradeEngine:
                 return
             size=Decimal(self.mandate['size'])
             if size<=0:return
-            entry=self.market.get('ask') if action=='BUY' else self.market.get('bid')
-            # OHLC zone decides SL/TP across M1/M5/M15/H1; cycle only gates edge.
-            # Use the same history need as feature validation (≥260), not a frozen 190.
-            hist_n=recommended_live_history_bars(self.store)
-            candles=self.store.candles(self.mandate['epic'],n=hist_n,historical_only=False)
+            entry=ask if action=='BUY' else bid
+            # Completed M1 only — forming QUOTE minute must not move zona/SL/TP.
+            candles=self._decision_candles(self.mandate['epic'])
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
             # Defense in depth: never market-chase outside OHLC+MTF entry stack.
             zone_gate=ohlc_entry_zones.entry_allows_open(
                 action,candles=candles,mid=mid,
-                ask=_num(self.market.get('ask')),bid=_num(self.market.get('bid')),
-                tick=tick,spread=spread,mtf=mtf_live)
+                ask=ask,bid=bid,tick=tick,spread=spread,mtf=mtf_live)
             if not zone_gate.get('allowed'):
                 self.last_entry_reason=zone_gate.get('reason') or 'wait_entry_zone'
                 self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{

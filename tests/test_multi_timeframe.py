@@ -127,6 +127,8 @@ def test_live_engine_waits_for_ohlc_but_still_protects_manual_position(monkeypat
             store=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(store,data_dir=d)
             engine=SingleTradeEngine(store,brain);engine.policy=AutoEvolution(store,Path(d)/'policy.py')
             broker=BrokerSimulation();engine.attach(broker)
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'SIM')
             await engine.poll()
             assert not engine.market_context['ready']
             assert brain.core.steps==0 and engine.last_signal is None

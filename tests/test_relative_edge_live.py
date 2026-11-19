@@ -106,11 +106,10 @@ def test_medium_buy_or_sell_reaches_broker_after_manual_close_with_validated_lab
             brain.tick=controlled_tick
             # Swing OHLC so require_swing OPEN can place SL/TP; mid near last close.
             from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
             seed_swing_candles(s,'SIM',start_px=100.0)
-            mid=float(s.candles('SIM',n=1)[0]['close'])
-            e.market={**(e.market or {}),
-                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
-                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
+            mid=put_engine_in_entry_zone(e,s,'SIM',direction,broker=broker)
+            assert mid is not None
             for _ in range(5):await e.poll()
             order=[r for r in broker.requests if r[0]=='OPEN']
             assert len(order)==1, (direction,e.snapshot()['entry_block_reason'])

@@ -1154,7 +1154,8 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      base_sl: float|None=None, max_tp: float|None=None,
                      candles=None, tick: float=0.01, spread: float=0.,
                      min_distance: float=0., tighten: float=1.0,
-                     entry=None, action=None, atr=None) -> dict:
+                     entry=None, action=None, atr=None, kama=None,
+                     require_swing=None) -> dict:
     """OHLC swing (or zone) decides κ / SL / TP — learned multipliers do not set width."""
     zone=zone_at_open(candles or []) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
@@ -1172,9 +1173,11 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
         zone['range_distance']=float(base_sl)
     if max_tp is not None:
         zone=dict(zone);zone['max_tp']=max_tp
+    # LIVE protect/OPEN share require_swing default when entry+action+candles given.
     decided=decide_brackets_from_ohlc(
         zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten,
-        entry=entry,action=action,candles=candles,atr=atr)
+        entry=entry,action=action,candles=candles,atr=atr,kama=kama,
+        require_swing=require_swing)
     src=str(decided.get('source') or 'ohlc_zone')
     if decided.get('kappa') is not None:
         save_params(store,decided['kappa'],1.0,

@@ -207,6 +207,8 @@ def test_protect_put_timeout_marks_uncertain_retains_levels():
                  'stopLevel':None,'profitLevel':None,'size':'.25'}
             e.positions=[pos]
             store.set('robot_open:p1',True)
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'GOLD')
 
             class Broker:
                 def __init__(self):
@@ -250,6 +252,8 @@ def test_protect_confirm_disconnect_not_false_confirmed():
             pos={'dealId':'p2','epic':'GOLD','direction':'BUY','level':100.,
                  'stopLevel':None,'profitLevel':None,'size':'.25'}
             e.positions=[pos]
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'GOLD')
             store.set('robot_open:p2',True)
 
             class Broker:

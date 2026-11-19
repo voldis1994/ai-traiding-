@@ -187,11 +187,8 @@ def test_full_mock_broker_protect_close_reenter_cycle():
             assert len(broker.requests)==2
             engine.market_context={'ready':True}  # exercise router, not market readiness
             brain.mark_prep_ready('test fixture')
-            # Mid near last swing seed close so require_swing can place levels.
-            mid=float(store.candles('SIM',n=1)[0]['close'])
-            engine.market={**(engine.market or {}),
-                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
-                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            assert put_engine_in_entry_zone(engine,store,'SIM','SELL',broker=broker) is not None
             await engine.submit('SELL')
             assert broker.requests[-1][0]=='OPEN'
             assert broker.requests[-1][3]==Decimal('.25')
@@ -213,10 +210,8 @@ def test_uncertain_order_does_not_retry():
             broker.fail_on_order=True
             e.market_context={'ready':True}  # router uncertainty regression
             b.mark_prep_ready('test fixture')
-            mid=float(store.candles('SIM',n=1)[0]['close'])
-            e.market={**(e.market or {}),
-                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
-                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            assert put_engine_in_entry_zone(e,store,'SIM','BUY',broker=broker) is not None
             await e.submit('BUY')
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
             # Uncertain OPEN is SUPERSEDED — robot stays live (no auto-pause).
@@ -327,10 +322,8 @@ def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close
             e._external_entry_check=lambda _: {'entry_allowed':True,'status':'TEST'}
             brain.mark_prep_ready('test fixture')
             brain.core.b=np.array([7.,-4.,-4.])
-            mid=float(s.candles('SIM',n=1)[0]['close'])
-            e.market={**(e.market or {}),
-                'mid':mid,'bid':mid-0.01,'ask':mid+0.01,'spread':0.02,
-                'tick':0.01,'epic':'SIM','status':'TRADEABLE','min_distance':0.15}
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            assert put_engine_in_entry_zone(e,s,'SIM','BUY',broker=broker) is not None
             await e.poll()  # very next completed new M1 candle; no historical-label minimum
             assert len([x for x in broker.requests if x[0]=='OPEN'])==1
             assert e.positions[0]['dealId']=='b2'

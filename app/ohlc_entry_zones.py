@@ -143,10 +143,8 @@ def _mtf_allows_side(action,mtf):
         conf=float(mtf.get('confidence') or 0)
     except (TypeError,ValueError):
         conf=0.
-    # Weak trend / cost block — same signals that keep MTF in HOLD.
-    if mode=='HOLD' and reason in (
-            'spread_slip_or_weak_adx','weak_adx','signals_conflict_or_weak',
-            'tf_conflict_or_weak_trend'):
+    # Hard cost/ADX blocks only — soft HOLD reasons stay soft (neural+nudge).
+    if mode=='HOLD' and reason in ('spread_slip_or_weak_adx','weak_adx'):
         return False,f'wait_mtf_{reason}'
     if mtf.get('move_ok') is False:
         return False,'wait_mtf_spread_atr'
@@ -158,6 +156,12 @@ def _mtf_allows_side(action,mtf):
     if mode=='SHIFT' and preferred in ('BUY','SELL') and preferred!=action:
         return False,f'wait_mtf_shift ({preferred})'
     return True,'mtf_aligned'
+
+
+def drop_forming_minute(candles, *, now_utc=None):
+    """Exclude the unfinished UTC minute — same cutoff as market_features."""
+    from .forecast_targets import completed_candles
+    return completed_candles(candles, now_utc=now_utc)
 
 
 def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,

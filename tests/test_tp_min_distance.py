@@ -125,16 +125,22 @@ def test_submit_kappa_half_never_sends_sub_min_tp():
             engine.last_closed_step = 0
             engine._external_entry_check = lambda _: {'entry_allowed': True, 'status': 'TEST'}
             engine.live_open_gates = lambda action=None: {'allowed': True, 'reason': 'TEST'}
-            engine.market = {
-                'epic': 'SIM', 'mid': 100.0, 'bid': 99.99, 'ask': 100.02,
-                'spread': 0.03, 'tick': 0.01, 'min_distance': 0.15, 'status': 'TRADEABLE',
-            }
             engine.market_context = {'ready': True}
-            with patch('app.bracket_learn.propose_for_open', return_value={
-                'kappa': 0.5, 'sl_scale': 1.0, 'kappa_mult': 0.5, 'sl_mult': 1.0,
-                'explored': False, 'nudge_samples': 0,
-            }):
-                await engine.submit('BUY')
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(store, 'SIM')
+            assert put_engine_in_entry_zone(
+                engine, store, 'SIM', 'BUY', tick=0.01, spread=0.03, broker=broker) is not None
+            # Broker market must return the in-zone ask/bid.
+            m = engine.market
+            async def _mkt(epic):
+                return {
+                    'snapshot': {'bid': m['bid'], 'offer': m['ask'], 'marketStatus': 'TRADEABLE'},
+                    'instrument': {'onePipMeans': 0.01, 'valueOfOnePip': '1'},
+                    'dealingRules': {'minNormalStopOrLimitDistance': {'unit': 'POINTS', 'value': 0.15}},
+                }
+            broker.market = _mkt
+            await engine.submit('BUY')
             opens = [r for r in broker.requests if r[0] == 'OPEN']
             assert opens, 'expected OPEN after raising TP to broker min'
             _, _, _, _, stop_d, profit_d = opens[0]
@@ -161,6 +167,8 @@ def test_protect_skips_when_validator_fails():
             }, 'market': {'epic': 'SIM'}}]
             engine.attach(broker)
             await engine.sync()
+            from tests.test_integration import seed_swing_candles
+            seed_swing_candles(store, 'SIM')
             engine.market = {
                 'epic': 'SIM', 'mid': 100.0, 'bid': 99.99, 'ask': 100.02,
                 'spread': 0.03, 'tick': 0.01, 'min_distance': 0.15, 'status': 'TRADEABLE',

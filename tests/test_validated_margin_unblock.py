@@ -89,7 +89,15 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
                 result['action']='SELL'
                 return result
             brain.tick=controlled_tick
-            for _ in range(5):await engine.poll()
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(store,'SIM')
+            assert put_engine_in_entry_zone(
+                engine,store,'SIM','SELL',broker=broker) is not None
+            for _ in range(5):
+                put_engine_in_entry_zone(
+                    engine,store,'SIM','SELL',broker=broker)
+                await engine.poll()
             opens=[r for r in broker.requests if r[0]=='OPEN']
             assert len(opens)==1,engine.snapshot()['entry_block_reason']
             assert opens[0][2]=='SELL'

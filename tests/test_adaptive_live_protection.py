@@ -293,9 +293,17 @@ def test_confirmed_sell_open_registers_persistent_adaptive_rights():
             e=SingleTradeEngine(s,brain);b=CorrectOpeningBroker()
             e.attach(b);await e.sync()
             b.open=[];await e.sync()
-            e.market={'epic':'SIM','mid':100.,'bid':100.,'ask':100.02,'spread':.02,
-                      'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
             e.market_context={'ready':True}
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(s,'SIM')
+            assert put_engine_in_entry_zone(e,s,'SIM','SELL',broker=b) is not None
+            m=e.market
+            async def _mkt(epic):
+                return {'snapshot':{'bid':m['bid'],'offer':m['ask'],'marketStatus':'TRADEABLE'},
+                        'instrument':{'onePipMeans':0.01},
+                        'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.15}}}
+            b.market=_mkt
             await e.submit('SELL')
             meta=s.get('adaptive_protection:b2')
             assert meta and meta['owner']=='AUTO' and meta['epic']=='SIM'
@@ -327,9 +335,17 @@ def test_open_without_tp_still_enrolls_trail():
             s=Store(Path(d)/'state.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
             e=SingleTradeEngine(s,brain);b=OpenWithoutTakeProfitBroker()
             e.attach(b);await e.sync();b.open=[];await e.sync()
-            e.market={'epic':'SIM','mid':100.,'bid':99.99,'ask':100.02,'spread':.03,
-                      'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
             e.market_context={'ready':True}
+            from tests.test_integration import seed_swing_candles
+            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
+            seed_swing_candles(s,'SIM')
+            assert put_engine_in_entry_zone(e,s,'SIM','BUY',broker=b) is not None
+            m=e.market
+            async def _mkt(epic):
+                return {'snapshot':{'bid':m['bid'],'offer':m['ask'],'marketStatus':'TRADEABLE'},
+                        'instrument':{'onePipMeans':0.01},
+                        'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.15}}}
+            b.market=_mkt
             await e.submit('BUY')
             meta=s.get('adaptive_protection:b2')
             assert meta and meta['owner']=='AUTO'
@@ -338,8 +354,9 @@ def test_open_without_tp_still_enrolls_trail():
             # Trail must still propose with TP Off once price runs.
             e.positions=[{'dealId':'b2','epic':'SIM','direction':'BUY','level':100.,
                           'stopLevel':99.2,'profitLevel':None,'size':'1'}]
-            e.market={'epic':'SIM','mid':101.4,'bid':101.35,'ask':101.45,'spread':.1,
-                      'tick':.01,'min_distance':.15,'status':'TRADEABLE'}
+            e.market={**(e.market or {}),
+                'mid':101.2,'bid':101.19,'ask':101.21,'spread':0.02,
+                'tick':0.01,'min_distance':0.15,'epic':'SIM','status':'TRADEABLE'}
             prop=propose_broker_trail(e.positions[0],e.market,meta,extreme=101.35)
             assert prop and prop['stop_level']>99.2
             assert prop['profit_level'] is None

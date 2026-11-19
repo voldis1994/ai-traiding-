@@ -64,17 +64,22 @@ def test_admin_structure_view_builds_zones():
 
 def test_remap_swing_marks_onto_display_window():
     from app.runtime_hub import _remap_swing_marks
+    # Pivots indexed inside normalise path (last 80 of 720).
     marks = [
-        {'price': 10.0, 'i': 5},      # outside after remap
-        {'price': 12.0, 'i': 650},    # → 20 in 90-window
-        {'price': 11.0, 'i': 700},    # → 70
+        {'price': 10.0, 'i': 5},   # abs 645 → display 15
+        {'price': 12.0, 'i': 50},  # abs 690 → display 60
+        {'price': 11.0, 'i': 79},  # abs 719 → display 89
     ]
-    out = _remap_swing_marks(marks, full_n=720, display_n=90)
-    idxs = [m['i'] for m in out]
-    assert all(0 <= i < 90 for i in idxs)
-    assert {'price': 12.0, 'i': 20} in out
-    assert {'price': 11.0, 'i': 70} in out
-    assert all(m['price'] != 10.0 for m in out)
+    out = _remap_swing_marks(marks, full_n=720, display_n=90, path_n=80)
+    assert out == [
+        {'price': 10.0, 'i': 15},
+        {'price': 12.0, 'i': 60},
+        {'price': 11.0, 'i': 89},
+    ]
+    # Path entirely before display window → dropped.
+    early = _remap_swing_marks(
+        [{'price': 9.0, 'i': 0}], full_n=720, display_n=40, path_n=80)
+    assert early == []
 
 
 def test_admin_ohlc_page_route_exists():

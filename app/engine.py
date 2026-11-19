@@ -1640,6 +1640,13 @@ class SingleTradeEngine:
         # If our CLOSE confirm is in flight, do NOT learn yet — sync() runs
         # before confirm profit/level and would train on mid + clear entry_brain.
         if self.pending_close:
+            # Prefer last live UPL immediately so Admin shows 0.01 not blank gaida
+            # while CLOSE confirm is still in flight.
+            if self._stamp_provisional_from_upl(prev_id,exit_guess):
+                self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+                self.store.event('trade','Deal closed pending confirm; UPL provisional peļņa',
+                                 {'dealId':prev_id,'exit_guess':exit_guess})
+                return None,'upl_estimate',None
             self.store.close_trade(prev_id,exit_guess,source='pending_close_sync')
             # Still queue cash binding — confirm may fail after vanish; without
             # this, Admin keeps filtering pending_close_sync (null £) forever.
@@ -1663,10 +1670,13 @@ class SingleTradeEngine:
                 conf['source']='upl_estimate'
             self._learn_closed_trade(prev_id,conf)
         else:
-            # No Capital cash and no last UPL — queue for retry.
-            self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
-            self._queue_pending_pnl(prev_id,exit_level=exit_guess)
-            self._teach_pending_ticks(prev_id,exit_guess)
+            # No Capital cash — stamp last UPL if any, else blank pending.
+            if self._stamp_provisional_from_upl(prev_id,exit_guess):
+                self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+            else:
+                self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
+                self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+                self._teach_pending_ticks(prev_id,exit_guess)
             self.store.event('trade','Deal closed; broker cash P&L pending re-request',
                              {'dealId':prev_id,'exit_guess':exit_guess,'pnl_source':src})
         self.store.event('trade','Previous broker deal no longer open',
@@ -3387,6 +3397,8 @@ class SingleTradeEngine:
             # deal for a NEW manual mandate.
             self.store.set('robot_open:'+str(p['dealId']),True)
             self.store.set('latest_robot_deal_id',p['dealId'])
+            # First UPL snap at OPEN — scratch closes may never see another poll.
+            self._snapshot_open_upl(p)
             # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
             self._enroll_adaptive_protection(p,force=True)
         if kind=='PROTECT' and self.positions:
@@ -3408,9 +3420,13 @@ class SingleTradeEngine:
                 self._learn_closed_trade(deal_id,confirmation)
             else:
                 exit_lvl=_num(confirmation.get('level'))
-                self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
-                self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
-                self._teach_pending_ticks(deal_id,exit_lvl)
+                # Prefer last UPL so Admin shows 0.01 immediately, not blank gaida.
+                if self._stamp_provisional_from_upl(deal_id,exit_lvl):
+                    self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                else:
+                    self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
+                    self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                    self._teach_pending_ticks(deal_id,exit_lvl)
                 self.store.event('warning','Close confirmed; broker cash P&L pending re-request',
                                  {'deal_id':deal_id,'reference':ref,'pnl_source':src})
             # Confirmed close must leave the robot armed for the next OPEN.
@@ -3636,13 +3652,38 @@ class SingleTradeEngine:
     def _snapshot_open_upl(self,position):
         """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
         deal_id=position.get('dealId')
-        upl=_num(position.get('upl'))
+        # Capital sometimes sends UPL as '£0.01' — _num alone yields None.
+        upl=self._parse_cash_num(position.get('upl'))
+        if upl is None:
+            upl=self._parse_cash_num(position.get('profit'))
+        if upl is None:
+            upl=self._parse_cash_num(position.get('uplCurrency'))
         if not deal_id or upl is None or not math.isfinite(upl):return
         # Ignore position.currency when it is the instrument quote (GOLD→USD).
         ccy=self._cash_currency(position.get('currency'))
         self.store.set('last_upl:'+str(deal_id),{
             'upl':float(upl),'currency':ccy,'at':now(),
             'exit_hint':_num(position.get('level')) or _num((self.market or {}).get('mid'))})
+
+    def _stamp_provisional_from_upl(self,deal_id,exit_level=None):
+        """Write last live UPL into the journal so Admin shows £ not blank gaida.
+
+        Neural teach still waits for ``pnl_source=broker``; this is display-only.
+        Returns True when a numeric peļņa was stamped.
+        """
+        deal=str(deal_id)
+        found=self._last_upl_as_realized(deal)
+        if not found:
+            return False
+        upl,upl_ccy=found
+        ccy=self._cash_currency(upl_ccy)
+        self.store.close_trade(
+            deal,exit_level,float(upl),currency=ccy,
+            source='upl_estimate',overwrite=True)
+        self.store.event(
+            'trade','UPL provisional peļņa on close — waiting for Capital £',
+            {'deal_id':deal,'upl':float(upl),'currency':ccy})
+        return True
 
     def _history_lookback(self,deal_id,*,queued_at=None):
         """Prefer trade opened (covers whole life); never use bare close-queue time.
@@ -4207,15 +4248,32 @@ class SingleTradeEngine:
         Tick teach used to burn the once-only claim before Capital cash arrived,
         so real £ only hit the late refine path. Neural ΔW waits for ``broker``.
         Never clobber ``pending_close_sync`` (CLOSE confirm still in flight).
+        Never downgrade ``upl_estimate`` (with a numeric peļņa) back to blank gaida.
         """
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
         row=self.store.db.execute(
-            'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
+            'SELECT pnl_source,pnl FROM trades WHERE deal_id=?',(deal,)).fetchone()
         src=str(row[0] or '') if row else ''
-        if src!='pending_close_sync':
-            self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
+        have_pnl=row is not None and row[1] is not None
+        if src=='pending_close_sync':
+            self.store.event('learning',
+                'Pending Capital £ — neural teach deferred (no tick claim)',
+                {'deal_id':deal,'exit_level':exit_level,'pnl_source':src})
+            return False
+        if src=='upl_estimate' and have_pnl:
+            # Already showing provisional peļņa — do not flip source to gaida.
+            self.store.event('learning',
+                'Pending Capital £ — neural teach deferred (UPL provisional kept)',
+                {'deal_id':deal,'exit_level':exit_level,'pnl_source':src})
+            return False
+        if self._stamp_provisional_from_upl(deal,exit_level):
+            self.store.event('learning',
+                'Pending Capital £ — neural teach deferred (stamped UPL provisional)',
+                {'deal_id':deal,'exit_level':exit_level,'pnl_source':'upl_estimate'})
+            return False
+        self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)
         self.store.event('learning',
             'Pending Capital £ — neural teach deferred (no tick claim)',
             {'deal_id':deal,'exit_level':exit_level,'pnl_source':src or 'pending_broker_pnl'})
@@ -5719,6 +5777,11 @@ class SingleTradeEngine:
                  'backoff_sec':wait})
     async def exit_position(self,deal_id):
         if self.pending_order or self.pending_close or not self.execution_enabled:return
+        # Snapshot UPL before CLOSE so a fast flat still journals provisional peļņa.
+        for p in (self.positions or []):
+            if str(p.get('dealId'))==str(deal_id):
+                self._snapshot_open_upl(p)
+                break
         self.pending_close=True
         oid=self.store.order('CLOSE',deal_id,{'deal_id':deal_id})
         try:

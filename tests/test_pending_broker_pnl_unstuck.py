@@ -101,6 +101,7 @@ def test_activity_scan_without_deal_id_filter_finds_profit():
 
 
 def test_admin_recent_trade_shows_pending_upl_hint():
+    """Pending + last_upl → Admin shows the £ figure (not blank gaida)."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         store.upsert_trade({'dealId':'p1','epic':'GOLD','size':'.02','direction':'BUY','level':100})
@@ -108,8 +109,10 @@ def test_admin_recent_trade_shows_pending_upl_hint():
         store.set('last_upl:p1',{'upl':-0.13,'currency':'GBP'})
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=RuntimeHub._trade_stats(hub,store,'GBP')
-        assert stats['pending_trades']>=1
         recent=stats['recent_trades']
         assert recent
-        assert recent[0].get('pending_cash') is True
-        assert recent[0].get('upl_hint')==pytest.approx(-0.13)
+        assert recent[0].get('pnl')==pytest.approx(-0.13)
+        assert recent[0].get('pnl_source')=='upl_estimate'
+        assert recent[0].get('pending_cash') is False
+        assert stats['working_pnl']==pytest.approx(-0.13)
+        assert stats['pending_trades']==0

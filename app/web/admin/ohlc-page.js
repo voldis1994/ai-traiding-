@@ -141,6 +141,7 @@ async function load(){
     const lastCandle=(view.candles||[])[(view.candles||[]).length-1];
     const candleAt=lastCandle&&lastCandle.at?clock(lastCandle.at):'';
     const mtf=view.mtf||{};
+    const path=view.entry_path||{};
     subEl.textContent=[
       `#${clientId}`,
       epic,
@@ -148,6 +149,8 @@ async function load(){
       st.event||'',
       view.preferred?`zona ${view.preferred}`:'abas entry zonas',
       mtf.mode?`MTF ${mtf.mode}`:'',
+      path.intent?`intent ${path.intent}`:'',
+      path.trigger?`trigger ${path.trigger}`:(path.wait?`wait ${String(path.wait).slice(0,40)}`:''),
       view.mid!=null?`mid ${Number(view.mid).toFixed(2)}`:'',
       candleAt?`pēdējā svece ${candleAt}`:'',
       `${candleN} M1`,

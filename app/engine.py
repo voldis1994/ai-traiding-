@@ -2545,6 +2545,7 @@ class SingleTradeEngine:
                     self.last_entry_processed_bar=self.last_decision_bar
                     # No hardcoded re-entry cooldown — neural argmax decides each M1 bar.
                     evaluation=self._entry_evaluation()
+                    self._publish_entry_path(evaluation)
                     action=evaluation['action']
                     self.last_policy_decision=action
                     self.last_entry_reason=self._signal_reason(action,snap.get('marketStatus'),evaluation)
@@ -2797,26 +2798,189 @@ class SingleTradeEngine:
         needles=(
             'wait_','reentry','m1_confirm','medium_need','strong_wait',
             'raw_disagrees','mtf_conflict','mtf_hold','entry_zone',
-            'ohlc_entry','price confirm','confirm_hold')
+            'ohlc_entry','price confirm','confirm_hold','gaida trigger','intent')
         return any(n in r for n in needles)
+
+    def _apply_stream_quote(self):
+        """Refresh bid/ask/mid from Capital WS without a full REST market call."""
+        if not self.mandate:
+            return False
+        streamed=getattr(self,'quote_stream',None)
+        streamed=streamed.current(self.mandate['epic']) if streamed else None
+        if not streamed:
+            return False
+        bid=streamed.get('bid');ask=streamed.get('ask')
+        try:
+            bid=float(bid);ask=float(ask)
+        except (TypeError,ValueError):
+            return False
+        if bid<=0 or ask<bid:
+            return False
+        mid=(bid+ask)/2
+        tick=(self.market or {}).get('tick') or 0.01
+        prev=dict(self.market or {})
+        self.market={
+            **prev,
+            'epic':self.mandate['epic'],
+            'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
+            'time':now(),'source':'WEBSOCKET',
+        }
+        return True
+
+    def _wants_fast_entry_ticks(self):
+        """Accelerate quote→trigger loop while flat with directional intent."""
+        if self.positions or self.operator_paused or not self.mandate:
+            return False
+        if self._entry_wait_reason_retryable(self.last_entry_reason):
+            return True
+        ls=self.last_signal if isinstance(self.last_signal,dict) else {}
+        prop=ls.get('proposal')
+        if prop in ('BUY','SELL'):
+            return True
+        path=getattr(self,'_entry_path',None) or {}
+        if path.get('intent') in ('BUY','SELL') and path.get('status')=='wait':
+            return True
+        scores=ls.get('scores') or {}
+        try:
+            buy=float(scores.get('BUY') or 0);sell=float(scores.get('SELL') or 0)
+            hold=float(scores.get('HOLD') or 0)
+        except (TypeError,ValueError):
+            return False
+        side='BUY' if buy>=sell else 'SELL'
+        return (float(scores.get(side) or 0)-hold)>=0.06
+
+    def _entry_path_from_evaluation(self,evaluation):
+        """Unified Admin/engine view: intent + trigger + wait (one vocabulary)."""
+        ev=evaluation if isinstance(evaluation,dict) else {}
+        action=(ev.get('action') or 'HOLD')
+        proposal=ev.get('proposal')
+        zone=ev.get('ohlc_entry_zone') if isinstance(ev.get('ohlc_entry_zone'),dict) else {}
+        intent=None
+        if action in ('BUY','SELL'):
+            intent=action
+        elif proposal in ('BUY','SELL'):
+            intent=proposal
+        trigger=zone.get('trigger') if zone.get('allowed') else None
+        wait=None
+        if action=='HOLD':
+            wait=ev.get('reason') or self.last_entry_reason
+        status=('open' if action in ('BUY','SELL')
+                else ('wait' if intent in ('BUY','SELL') else 'idle'))
+        return {
+            'intent':intent,
+            'trigger':trigger,
+            'wait':wait,
+            'status':status,
+            'zone_reason':zone.get('reason'),
+            'reentry':(ev.get('reentry_confirm') or {}).get('reason')
+                      if isinstance(ev.get('reentry_confirm'),dict) else None,
+        }
+
+    def _publish_entry_path(self,evaluation):
+        """Track intent→trigger latency + missed moves; publish for Admin."""
+        path=self._entry_path_from_evaluation(evaluation)
+        prev=getattr(self,'_entry_path',None) or {}
+        now_m=time.monotonic()
+        intent=path.get('intent')
+        # Arm intent once per side.
+        if intent in ('BUY','SELL') and path.get('status')=='wait':
+            if getattr(self,'_intent_side',None)!=intent:
+                self._intent_side=intent
+                self._intent_mono=now_m
+                self._intent_mid=_num((self.market or {}).get('mid'))
+                self.store.event('entry','Intent armed',{
+                    'intent':intent,
+                    'wait':path.get('wait'),
+                    'epic':(self.mandate or {}).get('epic'),
+                    'mid':self._intent_mid})
+            else:
+                # Missed move: price ran away from armed intent by >0.5 ATR.
+                self._maybe_note_missed_move(path)
+        elif path.get('status')=='open' and intent in ('BUY','SELL'):
+            lat=None
+            if getattr(self,'_intent_mono',None) and getattr(self,'_intent_side',None)==intent:
+                lat=max(0.0,now_m-float(self._intent_mono))
+            self.store.event('entry','Trigger fired',{
+                'intent':intent,
+                'trigger':path.get('trigger') or path.get('zone_reason'),
+                'latency_s':round(lat,3) if lat is not None else None,
+                'epic':(self.mandate or {}).get('epic'),
+                'mid':_num((self.market or {}).get('mid'))})
+            self._intent_side=None
+            self._intent_mono=None
+            self._intent_mid=None
+            self._miss_logged_for=None
+        elif path.get('status')=='idle':
+            self._intent_side=None
+            self._intent_mono=None
+            self._intent_mid=None
+            self._miss_logged_for=None
+        self._entry_path=path
+        if isinstance(self.last_signal,dict):
+            self.last_signal=dict(self.last_signal,entry_path=path,
+                                  proposal=path.get('intent') or self.last_signal.get('proposal'))
+        return path
+
+    def _maybe_note_missed_move(self,path):
+        """One missed_move event per intent episode when tape runs away."""
+        intent=path.get('intent')
+        if intent not in ('BUY','SELL'):
+            return
+        if getattr(self,'_miss_logged_for',None)==intent:
+            return
+        mid=_num((self.market or {}).get('mid'))
+        start=_num(getattr(self,'_intent_mid',None))
+        if mid is None or start is None:
+            return
+        atr=None
+        mtf=(self.last_signal or {}).get('mtf_momentum') if isinstance(self.last_signal,dict) else None
+        if isinstance(mtf,dict):
+            atr=_num(mtf.get('stop_hint_atr14'))
+        if atr is None or atr<=0:
+            atr=max(abs(mid)*0.0004,float((self.market or {}).get('tick') or 0.01)*20)
+        moved=mid-start if intent=='BUY' else start-mid
+        if moved < 0.5*atr:
+            return
+        self._miss_logged_for=intent
+        self.store.event('entry','Missed move while waiting trigger',{
+            'intent':intent,
+            'wait':path.get('wait'),
+            'moved':round(float(moved),5),
+            'atr':round(float(atr),5),
+            'intent_mid':start,'mid':mid,
+            'epic':(self.mandate or {}).get('epic')})
+
+    async def quote_entry_tick(self):
+        """Lightweight WS mid refresh + OPEN retry (between heavy polls)."""
+        if self.positions or not self.mandate or not self.last_signal:
+            return
+        if not self._wants_fast_entry_ticks():
+            return
+        self._apply_stream_quote()
+        status=(self.market or {}).get('status') or 'TRADEABLE'
+        await self._retry_entry_when_ohlc_ready(
+            {'snapshot':{'marketStatus':status}})
 
     async def _retry_entry_when_ohlc_ready(self,broker_market):
         """Re-check OPEN mid-minute when last decide waited on OHLC/confirm.
 
-        Capital quotes move every tick; zones/confirm used to re-arm only on the
-        next closed M1 — that felt like OHLC was "too slow" vs the stream.
+        Capital quotes move every tick; refresh WS mid first so break/zone
+        triggers are not stuck on a 3s REST poll mid.
         """
         now_m=time.monotonic()
-        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<2.5:
+        # ~0.8s — catch break/zone without waiting another closed M1 / 3s poll.
+        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<0.8:
             return
         reason=self.last_entry_reason or ''
-        if not self._entry_wait_reason_retryable(reason):
+        if not self._entry_wait_reason_retryable(reason) and not self._wants_fast_entry_ticks():
             return
         self._entry_zone_retry_mono=now_m
+        self._apply_stream_quote()
         try:
             evaluation=self._entry_evaluation()
         except Exception:
             return
+        self._publish_entry_path(evaluation)
         action=evaluation.get('action')
         self.last_policy_decision=action
         status=(broker_market or {}).get('snapshot',{}).get('marketStatus')
@@ -2827,6 +2991,7 @@ class SingleTradeEngine:
                 'epic':(self.mandate or {}).get('epic'),
                 'decision':action,'reason':self.last_entry_reason,
                 'prior_wait':reason,
+                'trigger':(evaluation.get('ohlc_entry_zone') or {}).get('trigger'),
                 'proposal':evaluation.get('proposal')})
             await self.submit(action,broker_market)
 
@@ -2855,8 +3020,12 @@ class SingleTradeEngine:
         candles=[]
         if epic:
             try:
-                # 80 M1 so swing BOS/CHoCH memory has enough pivots (not 40).
-                candles=self.store.candles(epic,n=80,historical_only=False) or []
+                # Same completed-M1 window as zone/MTF/SL — never forming QUOTE.
+                candles=self._decision_candles(epic) or []
+                if len(candles)<40:
+                    # Pad history for swing memory, still drop forming minute.
+                    raw=self.store.candles(epic,n=80,historical_only=False) or []
+                    candles=ohlc_entry_zones.drop_forming_minute(raw) or candles
             except Exception:
                 candles=[]
         last=self.store.get('last_trade_outcome') if self.store else None
@@ -5566,13 +5735,21 @@ class SingleTradeEngine:
                 self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{
                     'reason':self.last_entry_reason,'action':action,
                     'price':zone_gate.get('price'),'zone':zone_gate.get('zone'),
-                    'mtf_ok':zone_gate.get('mtf_ok')})
+                    'mtf_ok':zone_gate.get('mtf_ok'),
+                    'trigger':zone_gate.get('trigger')})
                 return
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             learned=bracket_learn.load_multipliers(self.store)
+            # Break trigger is earlier/more aggressive — keep SL tighter than pullback.
+            if zone_gate.get('trigger')=='break':
+                try:
+                    learned=dict(learned or {})
+                    learned['sl_scale']=min(float(learned.get('sl_scale') or 1.0),0.85)
+                except (TypeError,ValueError):
+                    pass
             cycle_state=unified_cycle.load_state(self.store)
             scores=(self.last_signal or {}).get('scores')
             evaluation={'action':action,'score_edge':(
@@ -5595,9 +5772,11 @@ class SingleTradeEngine:
                     kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
             except (TypeError,AttributeError):
                 kama_hint=None
+            # tighten∈(0,1] shrinks SL/TP toward entry — break needs a closer stop.
+            break_tighten=0.85 if zone_gate.get('trigger')=='break' else 1.0
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0),
+                tighten=float(pkg.get('tighten') or 1.0)*break_tighten,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
                 kama=kama_hint,require_swing=True)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
@@ -5846,6 +6025,8 @@ class SingleTradeEngine:
         account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
         active=next((a for a in account if a.get('preferred') or a.get('accountId')==self.account.get('currentAccountId')),account[0] if account else {})
         evaluation=self._entry_evaluation() if not self.positions else None
+        if evaluation is not None:
+            self._publish_entry_path(evaluation)
         news=self._news_risk()
         intermarket=self.intermarket.state
         readiness=(self.brain.trading_readiness()
@@ -5965,6 +6146,14 @@ class SingleTradeEngine:
                 'fusion_block_reason':self.fusion_block_reason,
                 'entry_block_reason':self._compose_entry_block_reason(
                     readiness=readiness,evaluation=evaluation,decision=decision),
+                # Unified vocabulary for Admin: intent + trigger + wait.
+                'entry_path':(getattr(self,'_entry_path',None)
+                              or self._entry_path_from_evaluation(evaluation)),
+                'entry_intent':((getattr(self,'_entry_path',None) or {}).get('intent')
+                               or (evaluation or {}).get('proposal')),
+                'entry_trigger':(getattr(self,'_entry_path',None) or {}).get('trigger'),
+                'entry_wait':((getattr(self,'_entry_path',None) or {}).get('wait')
+                             or (evaluation or {}).get('reason')),
                 'self_development':{
                     'registry':self.feature_registry.snapshot(),
                     'profit':self.profit_learning.summary(),

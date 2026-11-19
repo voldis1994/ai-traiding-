@@ -279,6 +279,10 @@ class AccountRuntime:
             'market_status':(snap.get('market') or {}).get('status'),
             'entry_block_reason':snap.get('entry_block_reason'),
             'entry_can_submit_now':bool(snap.get('entry_can_submit_now')),
+            'entry_path':snap.get('entry_path'),
+            'entry_intent':snap.get('entry_intent'),
+            'entry_trigger':snap.get('entry_trigger'),
+            'entry_wait':snap.get('entry_wait'),
             'model_readiness':snap.get('model_readiness') or snap.get('prep_eval'),
             'hard_risk':snap.get('hard_risk'),
             'neural_close_diagnostic_only':bool(snap.get('neural_close_diagnostic_only',False)),
@@ -614,6 +618,10 @@ class RuntimeHub:
                     'entry_block_reason':view.get('entry_block_reason') or snap.get('entry_block_reason'),
                     'entry_can_submit_now':bool(view.get('entry_can_submit_now')
                                                or snap.get('entry_can_submit_now')),
+                    'entry_path':view.get('entry_path') or snap.get('entry_path'),
+                    'entry_intent':view.get('entry_intent') or snap.get('entry_intent'),
+                    'entry_trigger':view.get('entry_trigger') or snap.get('entry_trigger'),
+                    'entry_wait':view.get('entry_wait') or snap.get('entry_wait'),
                     'model_readiness':snap.get('model_readiness') or view.get('model_readiness'),
                     'neural_close_diagnostic_only':True,
                     'neural_close_executable':False,
@@ -702,6 +710,7 @@ class RuntimeHub:
             return {'ok':False,'reason':'no_store','client_id':cid,
                     'candles':[],'zones':{},'levels':{}}
         epic_source=None
+        eng=None
         if rt and rt.started and rt.engine is not None:
             eng=rt.engine
             market=getattr(eng,'market',None) or {}
@@ -926,6 +935,7 @@ class RuntimeHub:
             },
             'entry_zone_source':'ohlc_entry_zones',
             'info_stack':ez.get('info_stack') or 'ohlc_swing',
+            'entry_path':(getattr(eng,'_entry_path',None) if eng is not None else None),
             'overlays':overlay_wire,
             'mtf':{
                 'ready':bool(isinstance(mtf,dict) and mtf.get('ready')),
@@ -1328,6 +1338,18 @@ class RuntimeHub:
                         engine.armed=True
                         engine.execution_enabled=True
                         store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
+                    # Fast WS quote ticks while flat + intent — catch break/zone
+                    # without waiting the next heavy 3s poll.
+                    if (not engine.positions and engine.mandate
+                            and hasattr(engine,'quote_entry_tick')
+                            and engine._wants_fast_entry_ticks()):
+                        for _ in range(2):
+                            await asyncio.sleep(1)
+                            try:
+                                await engine.quote_entry_tick()
+                            except Exception:
+                                break
+                        continue
                 await asyncio.sleep(3 if error_count<3 else 10)
             except asyncio.CancelledError:
                 raise

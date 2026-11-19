@@ -190,9 +190,9 @@ def _structure_break_side(mtf,zones):
         if br in ('UP','DOWN'):
             return br
         event=str(mtf.get('bos_event') or '').upper()
-        if 'UP' in event:
+        if event in ('BOS_UP','CHOCH_UP','BREAKOUT_UP'):
             return 'UP'
-        if 'DOWN' in event:
+        if event in ('BOS_DOWN','CHOCH_DOWN','BREAKOUT_DOWN'):
             return 'DOWN'
     if isinstance(zones,dict):
         # Only confirmed swing events — live bias alone is not a break trigger
@@ -205,14 +205,45 @@ def _structure_break_side(mtf,zones):
     return None
 
 
-def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01):
-    """True when structure/range break aligns with neural side — skip pullback wait.
+def m1_tape_agrees(action,candles,*,need=2):
+    """Last ``need`` *completed* M1 bodies agree with action (BUY=green, SELL=red)."""
+    action=(action or '').upper()
+    need=max(1,int(need))
+    rows=list(candles or [])
+    if len(rows)<need:
+        return False,0
+    streak=0
+    for row in reversed(rows[-12:]):
+        o=_finite(row.get('open'));c=_finite(row.get('close'))
+        if o is None or c is None:
+            break
+        if action=='BUY' and c>o:
+            streak+=1
+        elif action=='SELL' and c<o:
+            streak+=1
+        else:
+            break
+        if streak>=need:
+            return True,streak
+    return streak>=need,streak
 
-    Unified path: intent (BUY/SELL) + break trigger → OPEN without sitting in
-    the discount/premium band. Zones remain for SL/TP geometry.
+
+def _last_completed_close(candles):
+    rows=list(candles or [])
+    if not rows:
+        return None
+    return _finite(rows[-1].get('close'))
+
+
+def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None):
+    """True when structure/range break aligns with neural side AND M1 tape.
+
+    Unified path: intent + break → OPEN without pullback zone. Micro BOS alone
+    must not BUY into a red dump (or SELL into a green spike) — that was the
+    illogical OHLC chase. Zones remain for SL/TP geometry.
     """
     action=(action or '').upper()
-    out={'ok':False,'reason':'no_break','side':None,'trigger':'break'}
+    out={'ok':False,'reason':'no_break','side':None,'trigger':'break','tape_streak':0}
     if action not in ('BUY','SELL'):
         out['reason']='bad_action'
         return out
@@ -220,33 +251,50 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01):
     if p is None:
         out['reason']='no_price'
         return out
+    tape_ok,tape_streak=m1_tape_agrees(action,candles,need=2)
+    opp='SELL' if action=='BUY' else 'BUY'
+    opp_ok,_opp_streak=m1_tape_agrees(opp,candles,need=2)
+    out['tape_streak']=tape_streak
+    pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
+    mode=str((mtf or {}).get('mode') or '').upper() if isinstance(mtf,dict) else ''
+    try:
+        conf=float((mtf or {}).get('confidence') or 0) if isinstance(mtf,dict) else 0.
+    except (TypeError,ValueError):
+        conf=0.
+    mtf_aligned=(pref==action) or (mode==action) or (mode=='SHIFT' and pref==action and conf>=0.55)
+    # Against a clear opposite M1 dump/spike — never break-chase the bounce.
+    if opp_ok and not tape_ok:
+        out['reason']='break_against_m1_tape'
+        return out
     side=_structure_break_side(mtf,zones)
     out['side']=side
     want='UP' if action=='BUY' else 'DOWN'
     if side==want:
-        out['ok']=True
-        out['reason']='ohlc_break_structure'
+        # Micro structure break needs M1 pressure and/or strong MTF same side.
+        if tape_ok or (mtf_aligned and conf>=0.55):
+            out['ok']=True
+            out['reason']='ohlc_break_structure'
+            return out
+        out['reason']='break_needs_m1_or_mtf'
         return out
-    # Range break only with MTF agreeing — price alone at high/low is not enough.
+    # Range break: completed close must already clear the swing — live mid alone
+    # is forming-bar chase against finished OHLC.
     if isinstance(zones,dict) and isinstance(mtf,dict) and mtf.get('ready'):
         hi=_finite(zones.get('range_hi'))
         lo=_finite(zones.get('range_lo'))
+        last_c=_last_completed_close(candles)
         try:
             buf=max(float(tick or 0.01),0.)
         except (TypeError,ValueError):
             buf=0.01
-        pref=str(mtf.get('preferred') or '').upper()
-        mode=str(mtf.get('mode') or '').upper()
-        try:
-            conf=float(mtf.get('confidence') or 0)
-        except (TypeError,ValueError):
-            conf=0.
-        aligned=(pref==action) or (mode==action) or (mode=='SHIFT' and conf>=0.55)
-        if action=='BUY' and aligned and hi is not None and p>=(hi-buf):
+        aligned=mtf_aligned or (mode=='SHIFT' and conf>=0.55)
+        if (action=='BUY' and aligned and hi is not None and last_c is not None
+                and last_c>=(hi-buf) and p>=(hi-buf) and (tape_ok or conf>=0.55)):
             out['ok']=True
             out['reason']='ohlc_break_range_high'
             return out
-        if action=='SELL' and aligned and lo is not None and p<=(lo+buf):
+        if (action=='SELL' and aligned and lo is not None and last_c is not None
+                and last_c<=(lo+buf) and p<=(lo+buf) and (tape_ok or conf>=0.55)):
             out['ok']=True
             out['reason']='ohlc_break_range_low'
             return out
@@ -294,8 +342,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         meta['reason']='wait_entry_zone (no_price)'
         return meta
     # --- Trigger A: break (catch the move — do not wait for pullback) ---
+    # Pass completed candles so break cannot fight the M1 tape / forming mid.
     br=break_trigger_allows(
-        action,price=price,zones=zones,mtf=mtf,tick=tick)
+        action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles)
     meta['break']=br
     if br.get('ok'):
         meta['allowed']=True
@@ -319,7 +368,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if pref==action and conf>=0.50:
         buf=max(buf,buf*3.0,float(tick or 0.01)*3)
         meta['wide_ohlc_touch']=True
-    # --- Trigger B: pullback zone (cheaper entry) ---
+    # --- Trigger B: pullback zone (cheaper entry into structure) ---
+    # Zone BUY at discount during a dump is intentional OHLC (support); break
+    # chase into the dump was the illogical path (blocked above).
     if price_in_zone(zone,price,buffer=buf):
         meta['allowed']=True
         meta['trigger']='zone'

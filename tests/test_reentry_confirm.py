@@ -66,26 +66,23 @@ def test_strong_with_price_confirm_enters_immediately():
     assert out.get('fast_entry') is True
 
 
-def test_medium_needs_two_m1_closes():
+def test_medium_needs_one_m1_close():
+    """Unified live path: medium confirm = 1 same-dir M1 (not 2)."""
     scores_raw = {'BUY': 0.42, 'SELL': 0.28, 'HOLD': 0.30}  # edge 0.12
+    zero = rc.evaluate(
+        action='BUY', scores_raw=scores_raw,
+        market_context={'trend': 'MIXED'},
+        mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
+        candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 98.5}])
+    assert zero['allowed'] is False
+    assert zero['reason'] == 'medium_need_m1_confirm'
     one = rc.evaluate(
         action='BUY', scores_raw=scores_raw,
         market_context={'trend': 'MIXED'},
         mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
         candles=[{'open': 100, 'close': 99}, {'open': 99, 'close': 100}])
-    assert one['allowed'] is False
-    assert one['reason'] == 'medium_need_m1_confirm'
-    two = rc.evaluate(
-        action='BUY', scores_raw=scores_raw,
-        market_context={'trend': 'MIXED'},
-        mtf_analysis={'ready': True, 'preferred': 'HOLD', 'mode': 'HOLD'},
-        candles=[
-            {'open': 98, 'close': 99},
-            {'open': 99, 'close': 100},
-            {'open': 100, 'close': 101},
-        ])
-    assert two['allowed'] is True
-    assert two['reason'] == 'medium_m1_confirm'
+    assert one['allowed'] is True
+    assert one['reason'] == 'medium_m1_confirm'
 
 
 def test_same_dir_reentry_needs_new_atr_move():

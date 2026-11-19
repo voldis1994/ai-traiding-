@@ -74,6 +74,35 @@ def test_entry_allows_open_on_structure_break_without_zone():
     assert 'break' in (gate.get('reason') or '')
 
 
+def test_break_refuses_buy_against_m1_dump():
+    """Micro UP break must not BUY into a completed red dump (illogical OHLC)."""
+    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 3712.0
+    for i in range(40):
+        o = px
+        c = px - 0.8  # red dump
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': o + 0.2, 'low': c - 0.2, 'close': c,
+        })
+        px = c
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z.get('buy_entry')
+    # Price above discount band (bounce mid) — old bug would break-BUY here.
+    far = float(buy['hi']) + 3.0 if buy else float(rows[-1]['close']) + 5.0
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'HOLD', 'preferred': 'HOLD',
+        'confidence': 0.4, 'structure_break': 'UP', 'move_ok': True,
+    }
+    gate = oez.entry_allows_open(
+        'BUY', candles=rows, mid=far, ask=far, bid=far - 0.1,
+        tick=0.1, spread=0.2, mtf=mtf)
+    assert gate['allowed'] is False
+    reason = (gate.get('break') or {}).get('reason') or gate.get('reason') or ''
+    assert 'against_m1_tape' in reason or 'wait' in reason
+
+
 def test_entry_allows_open_sell_zone():
     rows = _swing_candles()
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)

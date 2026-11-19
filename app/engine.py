@@ -83,6 +83,18 @@ def _num(value,default=None):
         return result if math.isfinite(result) else default
     except (ValueError,TypeError):return default
 
+
+def _broker_price_level(value,default=None):
+    """Capital stopLevel/profitLevel — unset is often ``0``, not null.
+
+    Treat non-positive as missing so protect can still attach OHLC TP when the
+    broker confirms OPEN with SL set and Take Profit Off (profitLevel=0).
+    """
+    n=_num(value,None)
+    if n is None or n<=0:
+        return default
+    return n
+
 class Store:
     def __init__(self,path=DB):
         self.path=Path(path)
@@ -1371,12 +1383,17 @@ class SingleTradeEngine:
             # Deal-less rows are not open positions — keeping them left Admin stuck
             # on "Existing open position" with last_position_id=None (no close path).
             if deal is None or str(deal).strip()=='':continue
+            # Prefer profitLevel; Capital may also expose limitLevel. 0 = Off.
+            raw_tp=p.get('profitLevel')
+            if raw_tp is None:
+                raw_tp=p.get('limitLevel')
             out.append({'dealId':str(deal).strip(),
                 'epic':epic,
                 'instrument_name':self._extract_instrument_name(p,m),
-                'size':p.get('size'),'direction':direction,'level':p.get('level'),
-                'stopLevel':p.get('stopLevel'),
-                'profitLevel':p.get('profitLevel') if p.get('profitLevel') is not None else p.get('limitLevel'),
+                'size':p.get('size'),'direction':direction,
+                'level':_broker_price_level(p.get('level'),p.get('level')),
+                'stopLevel':_broker_price_level(p.get('stopLevel')),
+                'profitLevel':_broker_price_level(raw_tp),
                 'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
         return out
 
@@ -4855,7 +4872,7 @@ class SingleTradeEngine:
         existing=self.store.get(key)
         if existing and existing.get('owner')=='AUTO' and not force:
             # Refresh missing original_profit if TP appeared later.
-            tp=_num(p.get('profitLevel'));entry=_num(p.get('level'))
+            tp=_broker_price_level(p.get('profitLevel'));entry=_broker_price_level(p.get('level'))
             if tp is not None and entry is not None and not existing.get('original_profit'):
                 sign=1 if p.get('direction')=='BUY' else -1
                 if sign*(tp-entry)>0:
@@ -4868,7 +4885,8 @@ class SingleTradeEngine:
             return True
         if not self.store.get('robot_open:'+str(deal_id)):
             return False
-        entry=_num(p.get('level'));stop=_num(p.get('stopLevel'));tp=_num(p.get('profitLevel'))
+        entry=_broker_price_level(p.get('level'));stop=_broker_price_level(p.get('stopLevel'))
+        tp=_broker_price_level(p.get('profitLevel'))
         direction=p.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
         if entry is None or stop is None or sign is None:return False
         if sign*(entry-stop)<=0:return False
@@ -4965,7 +4983,7 @@ class SingleTradeEngine:
         # Always re-send live TP on trail. Omitting profitLevel on Capital PUT
         # turns Take Profit Off — TP mark can be touched with no fill left.
         tp=proposal.get('profit_level')
-        if tp is None:tp=_num(p.get('profitLevel'))
+        if tp is None:tp=_broker_price_level(p.get('profitLevel'))
         # Trail moves STOP only. TP near market must not freeze SL protection —
         # validate stop vs bid/ask; still re-send TP so Capital keeps it on.
         if not levels_meet_broker_min(p.get('direction'),stop,None,
@@ -5019,7 +5037,9 @@ class SingleTradeEngine:
 
     async def protect_position(self,p):
         if self.pending_order or self.pending_close:return
-        if p.get('stopLevel') is not None and p.get('profitLevel') is not None:
+        live_sl=_broker_price_level(p.get('stopLevel'))
+        live_tp=_broker_price_level(p.get('profitLevel'))
+        if live_sl is not None and live_tp is not None:
             self.protected.add(p['dealId']);return
         # Same stale-PROTECT policy as adapt_protection — do not freeze forever.
         deal_s=str(p.get('dealId'))
@@ -5047,7 +5067,7 @@ class SingleTradeEngine:
         spread=float(self.market.get('spread') or 0)
         buffer=max(2*float(tick),2*spread)
         base_sl=max(float(min_dist)+buffer,float(rng or 0))
-        level=float(p['level'] or mid)
+        level=float(_broker_price_level(p.get('level'),p.get('level')) or mid)
         direction=p.get('direction')
         mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
         atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
@@ -5063,8 +5083,8 @@ class SingleTradeEngine:
         # Prefer swing-anchored levels — NEVER invent median ±zone on protect.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
-        stop_lvl=_num(bp.get('stop_level'))
-        profit_lvl=_num(bp.get('profit_level'))
+        stop_lvl=_broker_price_level(bp.get('stop_level'))
+        profit_lvl=_broker_price_level(bp.get('profit_level'))
         if not (bp.get('ready') and decided_sl and decided_tp
                 and decided_sl>0 and decided_tp>0):
             self.store.event('warning','Protection deferred: no OHLC swing SL/TP',{
@@ -5092,8 +5112,11 @@ class SingleTradeEngine:
                 'min_distance':float(min_dist),'tick':float(tick),
                 'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
             return
-        stop=result['stop_level'] if p.get('stopLevel') is None else None
-        profit=result['profit_level'] if p.get('profitLevel') is None else None
+        # Missing SL and/or TP (incl. broker 0 = Off) — send only what's still needed.
+        stop=result['stop_level'] if live_sl is None else None
+        profit=result['profit_level'] if live_tp is None else None
+        if stop is None and profit is None:
+            self.protected.add(p['dealId']);return
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
         try:
             receipt=await self.broker.update_position(p['dealId'],stop_level=stop,profit_level=profit)

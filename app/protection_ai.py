@@ -137,8 +137,10 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     entry=_finite(position.get('level'))
     stop=_finite(position.get('stopLevel'))
     # Preserve live TP when present. Trail still works if Capital already
-    # shows Take Profit Off (tp is None) — but we never *clear* a live TP.
+    # shows Take Profit Off (tp is None / 0) — but we never *clear* a live TP.
     tp=_finite(position.get('profitLevel'))
+    if tp is not None and tp<=0:
+        tp=None
     tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
     minimum=_finite(market.get('min_distance'))
     gap=_finite(initial.get('original_risk'))

@@ -1048,6 +1048,7 @@ class SingleTradeEngine:
         self._paused_for_multi=False;self._paused_for_mismatch=False;self._paused_for_read=False;self.operator_paused=False
         self.protection_brief={'status':'Awaiting first robot-opened position'}
         self.last_protection_bar=None
+        self._entry_zone_retry_mono=0.0
         self.last_calendar_refresh=0.0
         self._calendar_task=None
         self.calendar_feed_error=None
@@ -2562,6 +2563,14 @@ class SingleTradeEngine:
                         self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
                         snap.get('marketStatus')=='TRADEABLE'):
                         await self.submit(action,broker_market)
+            elif (len(self.positions)==0 and self.last_signal and
+                  self.last_closed_step>=0 and not new_closed_bar and
+                  snap.get('marketStatus')=='TRADEABLE'):
+                # Mid-bar retry: previous M1 said BUY/SELL but waited on zone /
+                # 1m confirm / mild MTF cross — live Capital mid may have entered
+                # the OHLC band already; do not wait another closed minute.
+                await self._retry_entry_when_ohlc_ready(broker_market)
+
     def _spread_bps(self):
         mid=self.market.get('mid') or 0
         return 10000*(self.market.get('spread') or 0)/mid if mid>0 else 0.
@@ -2782,6 +2791,45 @@ class SingleTradeEngine:
             return []
         return ohlc_entry_zones.drop_forming_minute(raw)
 
+    def _entry_wait_reason_retryable(self,reason):
+        """True when HOLD was only waiting for zone / confirm / soft MTF cross."""
+        r=str(reason or '').lower()
+        needles=(
+            'wait_','reentry','m1_confirm','medium_need','strong_wait',
+            'raw_disagrees','mtf_conflict','mtf_hold','entry_zone',
+            'ohlc_entry','price confirm','confirm_hold')
+        return any(n in r for n in needles)
+
+    async def _retry_entry_when_ohlc_ready(self,broker_market):
+        """Re-check OPEN mid-minute when last decide waited on OHLC/confirm.
+
+        Capital quotes move every tick; zones/confirm used to re-arm only on the
+        next closed M1 — that felt like OHLC was "too slow" vs the stream.
+        """
+        now_m=time.monotonic()
+        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<2.5:
+            return
+        reason=self.last_entry_reason or ''
+        if not self._entry_wait_reason_retryable(reason):
+            return
+        self._entry_zone_retry_mono=now_m
+        try:
+            evaluation=self._entry_evaluation()
+        except Exception:
+            return
+        action=evaluation.get('action')
+        self.last_policy_decision=action
+        status=(broker_market or {}).get('snapshot',{}).get('marketStatus')
+        self.last_entry_reason=self._signal_reason(action,status,evaluation)
+        if (action in ('BUY','SELL') and
+                self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step)):
+            self.store.event('entry','Mid-bar OHLC retry approved',{
+                'epic':(self.mandate or {}).get('epic'),
+                'decision':action,'reason':self.last_entry_reason,
+                'prior_wait':reason,
+                'proposal':evaluation.get('proposal')})
+            await self.submit(action,broker_market)
+
     def _ohlc_entry_zone_gate(self,action,mtf_analysis=None):
         """HOLD until ask/bid sits in OHLC entry zona and MTF stack agrees."""
         candles=self._decision_candles()
@@ -2801,7 +2849,6 @@ class SingleTradeEngine:
             tick=_num(market.get('tick')) or 0.01,
             spread=_num(market.get('spread')) or 0.,
             mtf=mtf)
-
     def _reentry_confirm_gate(self,action,*,scores_raw=None,mtf_analysis=None):
         """Raw neural + post-close move proof before same-dir / medium OPEN."""
         epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)

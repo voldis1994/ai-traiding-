@@ -171,8 +171,8 @@ function schedulePoll(){
     if(document.hidden)return;
     load().catch(()=>{});
   };
-  // 4s is enough for LIVE clock; avoids constant canvas rebuild flash.
-  pollTimer=setInterval(tick,4000);
+  // ~2s tracks Capital tape; paint() skips redraw when view unchanged.
+  pollTimer=setInterval(tick,2000);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});

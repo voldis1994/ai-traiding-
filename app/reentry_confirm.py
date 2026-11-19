@@ -204,6 +204,28 @@ def m1_same_dir_streak(candles, action, *, need=2) -> dict:
             'reason': 'm1_streak_ok' if streak >= need else 'm1_streak_short'}
 
 
+def ohlc_strong_agrees(action, mtf_analysis=None, *, min_conf: float = 0.50) -> dict:
+    """True when OHLC/MTF stack strongly prefers ``action`` — skip 1m confirm / soft cross."""
+    if action not in ('BUY', 'SELL') or not isinstance(mtf_analysis, dict):
+        return {'ok': False, 'reason': 'no_mtf'}
+    if not mtf_analysis.get('ready'):
+        return {'ok': False, 'reason': 'mtf_not_ready'}
+    pref = str(mtf_analysis.get('preferred') or '').upper()
+    mode = str(mtf_analysis.get('mode') or '').upper()
+    try:
+        conf = float(mtf_analysis.get('confidence') or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    br = _structure_break(mtf_analysis)
+    if pref == action and conf >= float(min_conf):
+        return {'ok': True, 'reason': 'mtf_preferred_strong', 'confidence': conf, 'mode': mode}
+    if mode == action and conf >= float(min_conf):
+        return {'ok': True, 'reason': 'mtf_mode_strong', 'confidence': conf, 'mode': mode}
+    if (action == 'BUY' and br == 'UP') or (action == 'SELL' and br == 'DOWN'):
+        return {'ok': True, 'reason': 'structure_break_strong', 'confidence': conf, 'mode': mode}
+    return {'ok': False, 'reason': 'ohlc_not_strong', 'confidence': conf, 'preferred': pref}
+
+
 def price_confirms(action, *, mtf_analysis=None, market_context=None,
                    candles=None) -> dict:
     """Tape agrees with action: structure break, live trend, or last M1 close."""
@@ -229,11 +251,14 @@ def price_confirms(action, *, mtf_analysis=None, market_context=None,
     streak = m1_same_dir_streak(candles, action, need=1)
     if streak.get('ok'):
         return {'ok': True, 'reason': 'last_m1_close'}
-    # MTF preferred agrees.
+    # MTF preferred agrees (incl. HOLD mode when preferred still points a side).
     pref = str((mtf_analysis or {}).get('preferred') or '').upper()
     mode = str((mtf_analysis or {}).get('mode') or '').upper()
-    if pref == action and mode in ('BUY', 'SELL', 'SHIFT'):
+    if pref == action and mode in ('BUY', 'SELL', 'SHIFT', 'HOLD'):
         return {'ok': True, 'reason': 'mtf_preferred'}
+    strong = ohlc_strong_agrees(action, mtf_analysis)
+    if strong.get('ok'):
+        return {'ok': True, 'reason': strong.get('reason') or 'ohlc_strong'}
     return {'ok': False, 'reason': 'no_price_confirm'}
 
 
@@ -304,15 +329,29 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
     meta['raw_direction'] = raw_dir
     if edge is None:
         return dict(meta, allowed=False, reason='no_scores_raw', tier='weak')
-    # Modules must not invent a side the neuron disagrees with.
+    ohlc = ohlc_strong_agrees(action, mtf_analysis)
+    meta['ohlc_strong'] = ohlc
+    # Modules nudged vs raw neuron "cross": if OHLC/MTF strongly agrees with the
+    # nudged side, allow — do not freeze on raw_disagrees forever.
     if raw_dir in ('BUY', 'SELL') and raw_dir != action:
+        if ohlc.get('ok'):
+            meta['tier'] = 'strong' if (edge or 0) >= float(params['raw_strong']) else 'medium'
+            return dict(meta, allowed=True, reason='ohlc_overrides_raw_cross',
+                        fast_entry=True)
         return dict(meta, allowed=False, reason='raw_disagrees_nudged',
                     tier='weak')
     if edge < float(params['raw_weak']):
+        # Still allow when OHLC stack is clearly with us (strong structural tape).
+        if ohlc.get('ok') and float(ohlc.get('confidence') or 0) >= 0.60:
+            return dict(meta, allowed=True, reason='ohlc_strong_weak_raw',
+                        tier='medium', fast_entry=True)
         return dict(meta, allowed=False, reason='raw_edge_too_weak', tier='weak')
     tier = tier_for_edge(edge, params)
     meta['tier'] = tier
     if tier == 'weak':
+        if ohlc.get('ok') and float(ohlc.get('confidence') or 0) >= 0.60:
+            return dict(meta, allowed=True, reason='ohlc_strong_weak_raw',
+                        tier='medium', fast_entry=True)
         return dict(meta, allowed=False, reason='weak_raw_hold')
 
     same = same_dir_new_move(
@@ -352,8 +391,9 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
     meta['price_confirm'] = confirm
 
     if tier == 'strong':
-        if confirm.get('ok'):
-            return dict(meta, allowed=True, reason='strong_immediate',
+        if confirm.get('ok') or ohlc.get('ok'):
+            return dict(meta, allowed=True,
+                        reason='strong_immediate' if confirm.get('ok') else 'strong_ohlc_skip_m1',
                         fast_entry=True)
         # Strong but no tape yet — ask one M1 confirm instead of waiting forever.
         streak = m1_same_dir_streak(candles, action, need=1)
@@ -364,11 +404,16 @@ def evaluate(*, action, scores_raw=None, last_outcome=None, mtf_analysis=None,
         return dict(meta, allowed=False, reason='strong_wait_price_confirm',
                     fast_entry=False)
 
-    # Medium: need consecutive M1 closes (or structure break already counted).
-    need = int(params.get('medium_m1_streak') or 2)
+    # Medium: OHLC/MTF strong agreement skips multi-M1 wait ("1m confirm" freeze).
+    if ohlc.get('ok') or confirm.get('reason') in (
+            'structure_break', 'mtf_preferred', 'ohlc_strong',
+            'mtf_preferred_strong', 'structure_break_strong'):
+        return dict(meta, allowed=True, reason='medium_ohlc_skip_m1',
+                    fast_entry=True)
     if confirm.get('reason') == 'structure_break':
         return dict(meta, allowed=True, reason='medium_structure_confirm',
                     fast_entry=False)
+    need = int(params.get('medium_m1_streak') or 2)
     streak = m1_same_dir_streak(candles, action, need=need)
     meta['m1_confirm'] = streak
     if streak.get('ok'):

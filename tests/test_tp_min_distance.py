@@ -177,6 +177,8 @@ def test_protect_skips_when_validator_fails():
                 await engine.protect_position(engine.positions[0])
             assert not any(r[0] == 'PROTECT' for r in broker.requests)
             msgs = [r[0] for r in store.db.execute('SELECT message FROM events').fetchall()]
-            assert any('Protection skipped: SL/TP below broker min' in (m or '') for m in msgs)
+            assert any('SL/TP below broker min' in (m or '') for m in msgs)
+            brief = engine.protection_brief or {}
+            assert 'broker min' in str(brief.get('status') or '').lower()
 
     asyncio.run(scenario())

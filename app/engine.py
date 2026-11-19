@@ -2467,8 +2467,15 @@ class SingleTradeEngine:
             if len(self.positions)==1:
                 p=self.positions[0]
                 # Missing SL always; missing TP once for manual/OPEN (not after trail).
+                # Only hard-stop the poll when SL is still Off — TP-only retry must
+                # keep running so Admin brief / trail enroll can update (andris case).
                 if self._needs_protect_brackets(p):
-                    await self.protect_position(p);return
+                    await self.protect_position(p)
+                    if (len(self.positions)==1 and
+                            _broker_price_level(self.positions[0].get('stopLevel')) is None):
+                        return
+                    if self.positions:
+                        p=self.positions[0]
                 # Reverse exit: evaluate each new M1 from *manage* scores (fresh
                 # perception), not the frozen OPEN vote. Confirmed opposite +
                 # aligned 5/15m returns → market CLOSE so we stop fighting the
@@ -5052,12 +5059,11 @@ class SingleTradeEngine:
                 'broker_error':_safe_broker_error(exc)})
 
     def _needs_protect_brackets(self,p):
-        """True when SL missing, or TP still Off and we have not one-shot-filled it.
+        """True when SL missing, or TP still Off and we should one-shot fill it.
 
-        Manual adopt often lands with SL only (Capital Take Profit Off). Poll used
-        to skip protect whenever stopLevel was set — TP stayed OFF forever and
-        Admin showed TRAIL manual / left unchanged. Robot trail may later clear
-        TP on purpose; after the first trail confirm we stop reinstalling TP.
+        Manual adopt often lands with SL only (Capital Take Profit Off). After a
+        trail confirm, Capital TP Off is intentional — leave it. If a prior flag
+        claimed TP was attached but broker still shows Off, clear and retry.
         """
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
@@ -5069,7 +5075,11 @@ class SingleTradeEngine:
         # TP missing only.
         if not deal:
             return True
-        if self.store.get('tp_attach_done:'+deal) or deal in self.protected:
+        # Stuck recovery: flag said done but broker still Take Profit Off.
+        if self.store.get('tp_attach_done:'+deal) and live_tp is None:
+            self.store.set('tp_attach_done:'+deal,False)
+            self.protected.discard(deal)
+        elif self.store.get('tp_attach_done:'+deal):
             return False
         runtime=self.store.get('adaptive_runtime:'+deal) or {}
         if isinstance(runtime,dict) and (
@@ -5083,32 +5093,70 @@ class SingleTradeEngine:
         self.store.set('tp_attach_done:'+str(deal_id),True)
         self.protected.add(deal_id)
 
+    def _protect_defer(self,p,reason,**extra):
+        """Surface why TP/SL protect is waiting — Admin was stuck on stale brief."""
+        deal=p.get('dealId') if isinstance(p,dict) else None
+        self.protection_brief={
+            'status':'Protect waiting: '+str(reason)[:120],
+            'deal_id':deal,'reason':reason}
+        payload={'deal_id':deal,'reason':reason}
+        payload.update(extra)
+        self.store.event('warning','Protection deferred: '+str(reason)[:100],payload)
+
+    def _snap_protect_tp(self,direction,profit_lvl,bid,ask,min_dist,tick):
+        """Snap TP onto tick grid and push out until Capital min distance clears."""
+        from .protection_ai import _quantize
+        if profit_lvl is None or tick is None or min_dist is None:
+            return profit_lvl
+        if bid is None or ask is None:
+            return profit_lvl
+        # BUY TP above ask; SELL TP below bid.
+        up=direction=='BUY'
+        lvl=_quantize(profit_lvl,tick,up=up)
+        mn=float(min_dist);q=float(tick)
+        if direction=='BUY':
+            floor=float(ask)+mn
+            while lvl+1e-12<floor:
+                lvl+=q
+        else:
+            ceil=float(bid)-mn
+            while lvl-1e-12>ceil:
+                lvl-=q
+        return float(lvl)
+
     async def protect_position(self,p):
         if self.pending_order or self.pending_close:return
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
         if live_sl is not None and live_tp is not None:
             self._mark_tp_attach_done(p.get('dealId'));return
-        # Same stale-PROTECT policy as adapt_protection — do not freeze forever.
+        # Only block on a live OPEN still in flight — stale journal rows used to
+        # freeze manual TP forever on some accounts (andris) while peers worked.
         deal_s=str(p.get('dealId'))
-        blocking=[]
         for item in (self.store.unresolved() or []):
-            if item.get('kind')=='PROTECT' and str(item.get('deal_id'))==deal_s:
+            kind=item.get('kind')
+            if kind=='PROTECT' and str(item.get('deal_id'))==deal_s:
                 self.store.order_update(item['id'],'SUPERSEDED')
-            else:
-                blocking.append(item)
-        if blocking:return
+            elif kind=='OPEN':
+                self._protect_defer(p,'OPEN still unresolved — wait for confirm',
+                                   order_id=item.get('id'))
+                return
+            elif kind in ('CLOSE','PROTECT') and str(item.get('deal_id') or '') not in ('',deal_s):
+                # Foreign leftover — supersede so this deal can protect.
+                self.store.order_update(item['id'],'SUPERSEDED')
+            elif kind=='CLOSE' and str(item.get('deal_id'))==deal_s:
+                self._protect_defer(p,'CLOSE in flight for this deal')
+                return
         min_dist=self.market.get('min_distance');tick=self.market.get('tick');mid=self.market.get('mid')
+        bid=self.market.get('bid');ask=self.market.get('ask')
         if min_dist is None or not tick or not mid:
-            # Skip this tick — do NOT disable execution (that froze OPEN after every close).
-            self.store.event('warning','Protection deferred: unsupported broker distance/price rule')
+            self._protect_defer(p,'unsupported broker distance/price rule')
             return
         # Same completed-bar window as LIVE OPEN — no forming minute, no invent.
         epic=p.get('epic') or (self.mandate or {}).get('epic')
         candles=self._decision_candles(epic)
         if len(candles)<20:
-            self.store.event('warning','Protection deferred: waiting completed OHLC swings',{
-                'deal_id':p.get('dealId'),'bars':len(candles)})
+            self._protect_defer(p,'waiting completed OHLC',bars=len(candles))
             return
         zone=bracket_learn.zone_at_open(candles,multi_tf=True)
         rng=zone['range_distance'] or ohlc_range_distance(candles)
@@ -5128,37 +5176,66 @@ class SingleTradeEngine:
             candles=candles,tick=tick,spread=spread,
             min_distance=min_dist,entry=level,action=direction,
             atr=atr_hint,kama=kama_hint,require_swing=True)
-        # Prefer swing-anchored levels — NEVER invent median ±zone on protect.
+        # Prefer swing-anchored levels. Manual TP-only: fall back to ATR/min so
+        # Capital Take Profit Off does not stick forever when swings are thin.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
         stop_lvl=_broker_price_level(bp.get('stop_level'))
         profit_lvl=_broker_price_level(bp.get('profit_level'))
+        source=bp.get('bracket_source') or 'swing_anchor'
         if not (bp.get('ready') and decided_sl and decided_tp
                 and decided_sl>0 and decided_tp>0):
-            self.store.event('warning','Protection deferred: no OHLC swing SL/TP',{
-                'deal_id':p.get('dealId'),'reason':bp.get('reason'),
-                'bracket_source':bp.get('bracket_source')})
-            return
+            if live_sl is not None and live_tp is None and direction in ('BUY','SELL'):
+                # Keep live SL; synthesize TP from ATR / broker min × 2.
+                tip=float(atr_hint) if atr_hint and atr_hint>0 else float(base_sl)
+                tip=max(float(min_dist)*2.0,tip,float(min_dist)+buffer)
+                decided_sl=abs(float(live_sl)-level) or tip
+                decided_tp=tip
+                sign=1 if direction=='BUY' else -1
+                profit_lvl=level+sign*float(decided_tp)
+                source='manual_tp_atr_fallback'
+                self.store.event('protection','Manual TP fallback (no swing brackets)',{
+                    'deal_id':p.get('dealId'),'profit_distance':decided_tp,
+                    'swing_reason':bp.get('reason')})
+            else:
+                self._protect_defer(p,'no OHLC swing SL/TP',
+                                   swing_reason=bp.get('reason'),
+                                   bracket_source=bp.get('bracket_source'))
+                return
         sign=1 if direction=='BUY' else -1
-        if stop_lvl is None:
+        if stop_lvl is None and live_sl is None:
             stop_lvl=level-sign*float(decided_sl)
         if profit_lvl is None:
             profit_lvl=level+sign*float(decided_tp)
+        if live_sl is not None:
+            stop_lvl=float(live_sl)
+            decided_sl=abs(float(live_sl)-level) or decided_sl
+        # Snap TP onto grid + push past live bid/ask min (Capital rejects otherwise).
+        if profit_lvl is not None:
+            profit_lvl=self._snap_protect_tp(
+                direction,profit_lvl,bid,ask,min_dist,tick)
+            decided_tp=abs(float(profit_lvl)-level)
         result={
             'stop_distance':float(decided_sl),'profit_distance':float(decided_tp),
-            'stop_level':float(stop_lvl),
-            'profit_level':float(profit_lvl),
+            'stop_level':float(stop_lvl) if stop_lvl is not None else None,
+            'profit_level':float(profit_lvl) if profit_lvl is not None else None,
             'kappa':bp.get('kappa'),'sl_scale':1.0,
-            'bracket_source':bp.get('bracket_source') or 'swing_anchor',
+            'bracket_source':source,
         }
         # Audit #9: refuse protect PUT when computed SL/TP still below broker min.
-        if not distances_meet_broker_min(result['stop_distance'],result['profit_distance'],min_dist):
-            self.store.event('warning','Protection skipped: SL/TP below broker min distance',{
-                'deal_id':p.get('dealId'),
-                'stop_distance':float(result['stop_distance']),
-                'profit_distance':float(result['profit_distance']),
-                'min_distance':float(min_dist),'tick':float(tick),
-                'kappa':bp['kappa'],'sl_scale':bp['sl_scale']})
+        if live_sl is None and not distances_meet_broker_min(
+                result['stop_distance'],result['profit_distance'],min_dist):
+            self._protect_defer(p,'SL/TP below broker min distance',
+                               stop_distance=result['stop_distance'],
+                               profit_distance=result['profit_distance'],
+                               min_distance=float(min_dist))
+            return
+        if (live_tp is None and profit_lvl is not None and bid is not None and ask is not None
+                and not levels_meet_broker_min(
+                    direction,live_sl or stop_lvl,profit_lvl,bid,ask,min_dist)):
+            self._protect_defer(p,'TP inside broker min from live quote',
+                               profit_level=profit_lvl,bid=bid,ask=ask,
+                               min_distance=float(min_dist))
             return
         # Missing SL and/or TP (incl. broker 0 = Off) — send only what's still needed.
         stop=result['stop_level'] if live_sl is None else None
@@ -5174,12 +5251,24 @@ class SingleTradeEngine:
                 # Manual adopt: mark robot_open so trail can enroll after SL/TP on.
                 if manual:
                     self.store.set('robot_open:'+str(p['dealId']),True)
-                    self._enroll_adaptive_protection(p,force=True)
+                    # Refresh position from broker so enroll sees new TP when possible.
+                    try:
+                        await self.sync()
+                        live=next((x for x in (self.positions or [])
+                                   if str(x.get('dealId'))==str(p.get('dealId'))),p)
+                    except Exception:
+                        live=p
+                    self._enroll_adaptive_protection(live,force=True)
                     self.protection_brief={
                         'status':'Manual adopt protected — OHLC SL/TP attached',
                         'deal_id':p.get('dealId')}
                     self.store.event('protection','Manual position protected with OHLC brackets',{
-                        'deal_id':p.get('dealId'),'stop':stop,'profit':profit})
+                        'deal_id':p.get('dealId'),'stop':stop,'profit':profit,
+                        'source':source})
+                else:
+                    self.protection_brief={
+                        'status':'Protection confirmed — brackets on broker',
+                        'deal_id':p.get('dealId')}
             else:
                 if not await self._position_still_open(p.get('dealId')):
                     self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
@@ -5187,6 +5276,9 @@ class SingleTradeEngine:
                     return
                 # Rejected while still open — keep existing levels, do not pause.
                 self.store.order_update(order_id,'SUPERSEDED',receipt.get('dealReference'))
+                self._protect_defer(p,'broker rejected protect PUT',
+                                   reference=receipt.get('dealReference'),
+                                   requested_stop=stop,requested_profit=profit)
                 self.store.event('warning','Protection rejected; kept live levels without pause',
                     {'deal_id':p.get('dealId'),'reference':receipt.get('dealReference'),
                      'requested_stop':str(stop),'requested_profit':str(profit)})
@@ -5198,6 +5290,7 @@ class SingleTradeEngine:
                 self._release_execution_after_flat(p.get('dealId'))
                 return
             self.store.order_update(order_id,'SUPERSEDED')
+            self._protect_defer(p,'protect exception: '+type(exc).__name__)
             self.store.event('warning','Position protection uncertain; kept live levels without pause',
                 {'type':type(exc).__name__,
                  'broker_status':getattr(getattr(exc,'response',None),'status_code',None),

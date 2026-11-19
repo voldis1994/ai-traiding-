@@ -797,12 +797,13 @@ def _pick_structural_levels(*, action, entry, highs, lows, floor, buffer):
 
 
 def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
-                          min_distance=0., atr=None, zone=None) -> dict:
+                          min_distance=0., atr=None, zone=None, kama=None) -> dict:
     """Place SL/TP on OHLC swing High/Low — never invent median ±distance.
 
     Uses the full pivot list so post-BOS re-entry (entry outside last SH/SL)
     still anchors to the nearest protective swing and a structural target
-    (next swing or measured move from the broken range).
+    (next swing or measured move from the broken range). When ``kama`` is on
+    the protective side of entry, SL clears both swing and KAMA (ATR buffer).
     """
     from . import structure_memory
     out = {
@@ -810,6 +811,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'stop_distance': None, 'profit_distance': None,
         'stop_level': None, 'profit_level': None,
         'swing_hi': None, 'swing_lo': None,
+        'kama_stop': False, 'atr_used': None,
     }
     if action not in ('BUY', 'SELL'):
         return dict(out, reason='bad_action')
@@ -834,7 +836,9 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
     buffer = max(2.0 * tick_f, 2.0 * sp)
     if atr_v is not None and atr_v > 0:
         buffer = max(buffer, 0.15 * atr_v)
+        out['atr_used'] = float(atr_v)
     floor = mn + buffer if (mn + buffer) > 0 else tick_f
+    kama_v = _finite(kama)
 
     path = structure_memory.normalise(candles, limit=80)
     piv = structure_memory.swing_pivots(path, left=2, right=2)
@@ -901,9 +905,28 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 picked['swing_hi'] = float(closer['price'])
                 picked['reason'] = 'swing_levels_closer_sl'
 
+    # KAMA (adaptive trend from same OHLC) — protective stop beyond swing+KAMA.
+    if kama_v is not None:
+        if action == 'BUY' and kama_v < entry_f:
+            kama_stop = kama_v - buffer
+            if kama_stop < stop_level:
+                stop_level = kama_stop
+                stop_d = entry_f - stop_level
+                out['kama_stop'] = True
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
+        elif action == 'SELL' and kama_v > entry_f:
+            kama_stop = kama_v + buffer
+            if kama_stop > stop_level:
+                stop_level = kama_stop
+                stop_d = stop_level - entry_f
+                out['kama_stop'] = True
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
+
     if stop_d < floor or profit_d < floor:
         return dict(out, reason='swing_distances_below_floor',
-                    stop_distance=stop_d, profit_distance=profit_d)
+                    stop_distance=stop_d, profit_distance=profit_d,
+                    stop_level=stop_level, profit_level=profit_level,
+                    kama_stop=out.get('kama_stop'))
 
     return {
         'ready': True,
@@ -919,12 +942,15 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'bos_event': bos.get('event'),
         'bos_bias': bos.get('bias'),
         'buffer': float(buffer),
+        'kama_stop': bool(out.get('kama_stop')),
+        'atr_used': out.get('atr_used'),
+        'kama': float(kama_v) if kama_v is not None else None,
     }
 
 
 def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                               tighten=1.0, entry=None, action=None,
-                              candles=None, atr=None,
+                              candles=None, atr=None, kama=None,
                               require_swing=None) -> dict:
     """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
@@ -975,7 +1001,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     if live_ctx:
         swing = swing_anchor_brackets(
             candles=candles, entry=entry, action=action, tick=tick_f,
-            spread=sp, min_distance=mn, atr=atr, zone=z)
+            spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama)
         if swing.get('ready'):
             stop_d = float(swing['stop_distance']) * t
             profit_d = float(swing['profit_distance']) * t

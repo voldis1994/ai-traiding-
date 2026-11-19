@@ -47,6 +47,14 @@ def test_admin_structure_view_builds_zones():
         # At least one structural or entry zone should be present when swings exist.
         assert zones.get('buy_entry') or zones.get('sell_entry') or zones.get('support')
         assert 'structure' in view
+        # Same module LIVE uses before OPEN — Admin drawing == robot wait gate.
+        assert view.get('entry_zone_source') == 'ohlc_entry_zones'
+        assert 'overlays' in view
+        ov = view['overlays'] or {}
+        # KAMA/EMA series from the same stack LIVE reads (even before full MTF warm).
+        assert isinstance(ov.get('kama'), list) and len(ov['kama']) >= 20
+        assert isinstance(ov.get('ema5'), list)
+        assert 'mtf' in view
 
 
 def test_admin_ohlc_page_route_exists():

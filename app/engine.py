@@ -53,6 +53,7 @@ from . import structure_memory
 from . import day_book
 from . import mtf_momentum
 from . import reentry_confirm
+from . import ohlc_entry_zones
 
 DB=DATA/'robot.sqlite3'
 
@@ -2698,6 +2699,15 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=reentry.get('reason') or 'reentry_confirm_hold',
                             proposal=result.get('proposal') or result['action'])
+            # OHLC entry zone + MTF (KAMA/ADX/ATR): neural side only fires when
+            # price is IN the structural band AND the indicator stack agrees.
+            zone_gate=self._ohlc_entry_zone_gate(
+                result['action'],mtf_analysis=mtf_analysis)
+            result=dict(result,ohlc_entry_zone=zone_gate)
+            if not zone_gate.get('allowed'):
+                return dict(result,action='HOLD',
+                            reason=zone_gate.get('reason') or 'wait_entry_zone',
+                            proposal=result.get('proposal') or result['action'])
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(
@@ -2707,6 +2717,33 @@ class SingleTradeEngine:
                 nudged_scores,result,
                 unified_cycle.load_state(self.store)))
         return result
+
+    def _ohlc_entry_zone_gate(self,action,mtf_analysis=None):
+        """HOLD until ask/bid sits in OHLC entry zona and MTF stack agrees."""
+        epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+        candles=[]
+        if epic:
+            try:
+                hist_n=recommended_live_history_bars(self.store)
+                candles=self.store.candles(epic,n=hist_n,historical_only=False) or []
+            except Exception:
+                candles=[]
+        market=self.market or {}
+        mtf=mtf_analysis
+        if mtf is None and hasattr(self,'_mtf_momentum_analysis'):
+            try:
+                mtf=self._mtf_momentum_analysis()
+            except Exception:
+                mtf=None
+        return ohlc_entry_zones.entry_allows_open(
+            action,
+            candles=candles,
+            mid=_num(market.get('mid')),
+            ask=_num(market.get('ask')),
+            bid=_num(market.get('bid')),
+            tick=_num(market.get('tick')) or 0.01,
+            spread=_num(market.get('spread')) or 0.,
+            mtf=mtf)
 
     def _reentry_confirm_gate(self,action,*,scores_raw=None,mtf_analysis=None):
         """Raw neural + post-close move proof before same-dir / medium OPEN."""
@@ -4105,9 +4142,15 @@ class SingleTradeEngine:
         tighten=float(pkg.get('tighten') or min(1.0,float(
             (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
+        mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+        kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
+        if kama_hint is None:
+            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
-            entry=entry,action=proposal,candles=candles,require_swing=True)
+            entry=entry,action=proposal,candles=candles,atr=atr_hint,
+            kama=kama_hint,require_swing=True)
         # Same rule as LIVE OPEN — no invented median ±distance for shadow.
         if (not decided.get('ready') or decided.get('stop_distance') is None
                 or decided.get('profit_distance') is None):
@@ -5128,6 +5171,19 @@ class SingleTradeEngine:
             # Use the same history need as feature validation (≥260), not a frozen 190.
             hist_n=recommended_live_history_bars(self.store)
             candles=self.store.candles(self.mandate['epic'],n=hist_n,historical_only=False)
+            mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            # Defense in depth: never market-chase outside OHLC+MTF entry stack.
+            zone_gate=ohlc_entry_zones.entry_allows_open(
+                action,candles=candles,mid=mid,
+                ask=_num(self.market.get('ask')),bid=_num(self.market.get('bid')),
+                tick=tick,spread=spread,mtf=mtf_live)
+            if not zone_gate.get('allowed'):
+                self.last_entry_reason=zone_gate.get('reason') or 'wait_entry_zone'
+                self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{
+                    'reason':self.last_entry_reason,'action':action,
+                    'price':zone_gate.get('price'),'zone':zone_gate.get('zone'),
+                    'mtf_ok':zone_gate.get('mtf_ok')})
+                return
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
@@ -5147,13 +5203,19 @@ class SingleTradeEngine:
                     'reason':self.last_entry_reason,'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
                 return
-            mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
             atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+            kama_hint=None
+            try:
+                kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
+                if kama_hint is None:
+                    kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+            except (TypeError,AttributeError):
+                kama_hint=None
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0),
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                require_swing=True)
+                kama=kama_hint,require_swing=True)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:

@@ -630,7 +630,7 @@ class RuntimeHub:
         Not every-candle signals — zone bands from structure so the operator
         can see where a future BUY/SELL entry would sit relative to swings.
         """
-        from . import structure_memory, bracket_learn
+        from . import structure_memory, bracket_learn, ohlc_entry_zones, mtf_momentum
         cid=int(client_id)
         rt=self.get(cid)
         store=None
@@ -704,40 +704,35 @@ class RuntimeHub:
                 'structure':{},'swing_brackets':None,'open_levels':[],
                 'hint':'Atver manuālu darījumu Capital.com jebkurā tirgū — robots adoptē to epic un OHLC.',
             }
-        candles=store.candles(epic,n=max(40,min(int(n),180)),historical_only=False) or []
-        live=structure_memory.snapshot_live(candles=candles,mid=mid)
-        bos=structure_memory.bos_choch(candles,left=2,right=2) if candles else {}
-        piv=structure_memory.swing_pivots(candles,left=2,right=2) if candles else {}
-        range_hi=bos.get('range_hi')
-        range_lo=bos.get('range_lo')
+        display_n=max(40,min(int(n),180))
+        # Fetch enough M1 for MTF (KAMA/ADX/ATR) — same floor LIVE uses.
+        try:
+            need_mtf=mtf_momentum.min_history_bars(store)
+        except Exception:
+            need_mtf=720
+        hist_n=max(display_n,need_mtf)
+        candles_full=store.candles(epic,n=hist_n,historical_only=False) or []
+        candles=candles_full[-display_n:] if candles_full else []
         if mid is None and candles:
             try:
                 mid=float(candles[-1].get('close'))
             except (TypeError,ValueError,AttributeError):
                 mid=None
-        # Prospective entry zones — near protective swings, not every bar.
-        buy_zone=None
-        sell_zone=None
-        try:
-            lo=float(range_lo) if range_lo is not None else None
-            hi=float(range_hi) if range_hi is not None else None
-        except (TypeError,ValueError):
-            lo=hi=None
-        if lo is not None and hi is not None and hi>lo:
-            span=hi-lo
-            band=max(span*0.12,float(tick)*8,spread*2)
-            # BUY entry: discount band above swing low (support) — never invert.
-            buy_hi=lo+band
-            if mid is not None:
-                buy_hi=min(buy_hi,max(lo,float(mid)))
-            if buy_hi>lo:
-                buy_zone={'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY'}
-            # SELL entry: premium band below swing high (resistance).
-            sell_lo=hi-band
-            if mid is not None:
-                sell_lo=max(sell_lo,min(hi,float(mid)))
-            if sell_lo<hi:
-                sell_zone={'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL'}
+        overlays=mtf_momentum.chart_overlays(
+            candles_full or candles,store=store,epic=epic,
+            display_n=display_n,spread=spread)
+        mtf=(overlays.get('analysis') if isinstance(overlays,dict) else None)
+        # Same OHLC+MTF entry geometry LIVE waits for before OPEN.
+        ez=ohlc_entry_zones.compute_entry_zones(
+            candles_full or candles,mid=mid,tick=tick,spread=spread,mtf=mtf)
+        live=structure_memory.snapshot_live(
+            candles=candles_full or candles,mid=mid) if (candles_full or candles) else {}
+        piv=structure_memory.swing_pivots(
+            candles_full or candles,left=2,right=2) if (candles_full or candles) else {}
+        range_hi=ez.get('range_hi')
+        range_lo=ez.get('range_lo')
+        buy_zone=ez.get('buy_entry')
+        sell_zone=ez.get('sell_entry')
         preferred=action if action in ('BUY','SELL') else None
         if not preferred and isinstance(scores,dict):
             try:
@@ -747,13 +742,25 @@ class RuntimeHub:
                     preferred=None
             except (TypeError,ValueError):
                 preferred=None
+        # Prefer MTF preferred when neural is quiet — matches LIVE soft stack.
+        if not preferred and isinstance(mtf,dict) and mtf.get('ready'):
+            mp=str(mtf.get('preferred') or '').upper()
+            if mp in ('BUY','SELL'):
+                preferred=mp
+        atr_hint=None
+        kama_hint=None
+        if isinstance(overlays,dict):
+            atr_hint=overlays.get('stop_hint_atr14') or overlays.get('atr14')
+            kama_hint=overlays.get('kama_level')
         swing_brackets=None
-        if mid is not None and preferred in ('BUY','SELL') and candles:
+        if mid is not None and preferred in ('BUY','SELL') and (candles_full or candles):
             try:
-                zone=bracket_learn.zone_at_open(candles,multi_tf=True)
+                zone=bracket_learn.zone_at_open(
+                    candles_full or candles,multi_tf=True)
                 swing_brackets=bracket_learn.swing_anchor_brackets(
-                    candles=candles,entry=mid,action=preferred,tick=tick,
-                    spread=spread,min_distance=0.,zone=zone)
+                    candles=candles_full or candles,entry=mid,action=preferred,
+                    tick=tick,spread=spread,min_distance=0.,zone=zone,
+                    atr=atr_hint,kama=kama_hint)
             except Exception as exc:
                 swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
@@ -769,7 +776,7 @@ class RuntimeHub:
             })
         # Compact candle payload for canvas (popup may ask for more history).
         bare=[]
-        for c in candles[-max(40,min(int(n),180)):]:
+        for c in candles:
             if not isinstance(c,dict):
                 continue
             try:
@@ -780,6 +787,10 @@ class RuntimeHub:
                 })
             except (KeyError,TypeError,ValueError):
                 continue
+        # Drop heavy nested analysis from overlays for the wire (keep series+scalars).
+        overlay_wire=None
+        if isinstance(overlays,dict):
+            overlay_wire={k:v for k,v in overlays.items() if k!='analysis'}
         return {
             'ok':True,
             'client_id':cid,
@@ -794,8 +805,8 @@ class RuntimeHub:
             'scores':scores,
             'candles':bare,
             'structure':{
-                'bias':bos.get('bias') or live.get('live_bias'),
-                'event':bos.get('event') or live.get('live_event'),
+                'bias':ez.get('bias') or (live or {}).get('live_bias'),
+                'event':ez.get('event') or (live or {}).get('live_event'),
                 'range_hi':range_hi,
                 'range_lo':range_lo,
                 'swing_highs':[
@@ -806,12 +817,25 @@ class RuntimeHub:
                     for s in (piv.get('swing_lows') or [])[-6:]],
             },
             'zones':{
-                'support':({'lo':range_lo,'hi':range_lo,'label':'Support / swing low'}
-                           if range_lo is not None else None),
-                'resistance':({'lo':range_hi,'hi':range_hi,'label':'Resistance / swing high'}
-                              if range_hi is not None else None),
+                'support':ez.get('support'),
+                'resistance':ez.get('resistance'),
                 'buy_entry':buy_zone,
                 'sell_entry':sell_zone,
+            },
+            'entry_zone_source':'ohlc_entry_zones',
+            'info_stack':ez.get('info_stack') or 'ohlc_swing',
+            'overlays':overlay_wire,
+            'mtf':{
+                'ready':bool(isinstance(mtf,dict) and mtf.get('ready')),
+                'mode':(mtf or {}).get('mode') if isinstance(mtf,dict) else None,
+                'preferred':(mtf or {}).get('preferred') if isinstance(mtf,dict) else None,
+                'confidence':(mtf or {}).get('confidence') if isinstance(mtf,dict) else None,
+                'reason':(mtf or {}).get('reason') if isinstance(mtf,dict) else None,
+                'atr14':atr_hint,
+                'kama':kama_hint,
+                'adx':(overlay_wire or {}).get('adx'),
+                'di_plus':(overlay_wire or {}).get('di_plus'),
+                'di_minus':(overlay_wire or {}).get('di_minus'),
             },
             'swing_brackets':swing_brackets,
             'open_levels':open_levels,

@@ -5873,8 +5873,10 @@ class SingleTradeEngine:
                 lvl-=q
         return float(lvl)
 
-    async def protect_position(self,p):
-        if self.pending_order or self.pending_close:return
+    async def protect_position(self,p,*,force=False):
+        # force=True: post-OPEN repair while pending_order is still set — Capital
+        # often confirms with profitLevel=0; the same-tick PUT must still run.
+        if not force and (self.pending_order or self.pending_close):return
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
         direction_early=p.get('direction')
@@ -6543,11 +6545,13 @@ class SingleTradeEngine:
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
                 # Immediate repair if Capital left SL Off and/or TP Off after OPEN.
+                # Must force=True — pending_order is still True until finally, so a
+                # normal protect_position call was a silent no-op (naked on Capital).
                 naked=next((x for x in (self.positions or [])
                             if str(x.get('dealId'))==str(conf_deal)
                             and self._needs_protect_brackets(x)),None)
                 if naked is not None:
-                    await self.protect_position(naked)
+                    await self.protect_position(naked,force=True)
             except Exception as exc:
                 # Keep UNCERTAIN — never SUPERSEDE a live-risk OPEN on soft failure
                 # (timeout / lag), or the next poll can double-fire a second POST.

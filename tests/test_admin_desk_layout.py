@@ -52,8 +52,8 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=117' in html
-    assert 'admin.js?v=122' in html
+    assert 'admin.css?v=118' in html
+    assert 'admin.js?v=123' in html
     assert 'ohlc-chart.js?v=12' in html
 
 
@@ -83,6 +83,19 @@ def test_desk_chart_footer_and_levels_readable():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'ATR14 M1' in js
     assert "String(t).slice(0,120)" not in js
+
+
+def test_signal_watch_and_open_positions_fit_text():
+    """Signal rows stack epic/reason; OPEN POSITIONS shows Capital SL/TP."""
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    compact = css.replace(' ', '')
+    assert 'grid-template-rows:autoauto' in compact
+    assert 'minmax(280px,1.6fr)' in compact
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert '<span>SL</span><span>TP</span>' in js
+    assert 'stopLevel:p.stopLevel' in js.replace(' ', '')
+    engine = Path('app/engine.py').read_text(encoding='utf-8')
+    assert 'protect_position(naked,force=True)' in engine.replace(' ', '')
 
 
 def test_client_closes_marks_upl_vs_capital():

@@ -1031,21 +1031,22 @@ function renderDeskLiveTrades(openRows){
     stableHtml(el,'<div class="psx-empty">No live prints</div>');
     return;
   }
-  const head=`<div class="psx-trade-row psx-trade-head"><span>EPIC</span><span>SIDE</span><span>PRICE</span><span>SIZE</span><span>VALUE</span></div>`;
+  const head=`<div class="psx-trade-row psx-trade-head"><span>EPIC</span><span>SIDE</span><span>PRICE</span><span>SL</span><span>TP</span></div>`;
   const body=rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const cls=side==='BUY'||side==='LONG'?'buy':'sell';
     const px=t.current??t.open??t.level??t.entry??t.price??t.mid;
-    const sz=t.size??t.dealSize??t.lot;
     const tm=esc(t.epic||'—');
-    const val=(px!=null&&sz!=null&&Number.isFinite(Number(px))&&Number.isFinite(Number(sz)))
-      ?num(Number(px)*Number(sz),0):'—';
+    const slN=t.stopLevel!=null&&Number(t.stopLevel)>0?Number(t.stopLevel):null;
+    const tpN=t.profitLevel!=null&&Number(t.profitLevel)>0?Number(t.profitLevel):null;
+    const slOn=!!(t.has_sl||slN!=null);
+    const tpOn=!!(t.has_tp||tpN!=null);
     return `<div class="psx-trade-row">
       <span title="epic">${tm}</span>
       <span class="${cls}">${esc(side==='LONG'?'BUY':(side==='SHORT'?'SELL':side))}</span>
       <span>${esc(px==null?'—':num(px,2))}</span>
-      <span>${esc(sz==null?'—':num(sz,2))}</span>
-      <span>${esc(val)}</span>
+      <span class="${slOn?'sl-on':'sl-off'}" title="Capital stopLevel">${esc(slOn&&slN!=null?num(slN,2):'OFF')}</span>
+      <span class="${tpOn?'tp-on':'tp-off'}" title="Capital profitLevel">${esc(tpOn&&tpN!=null?num(tpN,2):'OFF')}</span>
     </div>`;
   }).join('');
   stableHtml(el,head+body);
@@ -1252,6 +1253,10 @@ function collectOpenTrades(clients){
         current:positionMid(p,a),
         upl:p.upl,
         currency:p.currency&&p.currency!==ccy?p.currency:ccy,
+        stopLevel:p.stopLevel,
+        profitLevel:p.profitLevel,
+        has_sl:p.has_sl,
+        has_tp:p.has_tp,
       });
     });
   });

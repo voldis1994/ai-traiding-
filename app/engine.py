@@ -1080,13 +1080,13 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','self_params soft-ceiling migrate deferred',
                 {'type':type(exc).__name__,'detail':str(exc)[:160]})
-        # Physical evo boot: audit seeds + strategy cards + shorter trial horizon.
+        # Unified adaptive system boot: samples → library → cards → evo knobs.
         try:
-            from . import evo_boot
+            from . import adaptive_system
             epic0=getattr(brain,'epic',None)
-            evo_boot.ensure_physical_evo(store,epic=epic0)
+            adaptive_system.boot(store,epic=epic0)
         except Exception as exc:
-            self.store.event('warning','Physical evo boot deferred',
+            self.store.event('warning','Adaptive system boot deferred',
                 {'type':type(exc).__name__,'detail':str(exc)[:160]})
         if hasattr(self.brain,'apply_registry'):
             try:
@@ -2698,46 +2698,14 @@ class SingleTradeEngine:
         if not self.last_signal.get('scores_raw'):
             self.last_signal=dict(self.last_signal,scores_raw=dict(base_scores))
         edge_advice=self._structure_edge_advice()
-        nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
-            base_scores,edge_advice,store=self.store,
-            live_trend=ctx.get('trend'))
-        # GOLD: soft teach toward correct OHLC approach (library/BOS) — not a veto.
-        gold_nudge_meta={'nudged':False}
-        try:
-            from . import gold_strategies
-            epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
-            if gold_strategies.applies_to_epic(epic_gs):
-                # Proposal side for soft_reject detect (neural argmax before policy).
-                try:
-                    prop=max(('BUY','SELL','HOLD'),
-                             key=lambda a:float(nudged_scores.get(a,0) or 0))
-                except Exception:
-                    prop='HOLD'
-                gold_gate=gold_strategies.evaluate(
-                    epic=epic_gs,action=prop if prop in ('BUY','SELL') else 'BUY',
-                    candles=self._decision_candles(),
-                    structure=(edge_advice or {}).get('structure') or ctx.get('structure'),
-                    store=self.store)
-                nudged_scores,gold_nudge_meta=gold_strategies.soft_nudge_scores(
-                    nudged_scores,gold_gate,store=self.store)
-                nudge_meta=dict(nudge_meta or {},gold=gold_nudge_meta,
-                                gold_gate={k:gold_gate.get(k) for k in
-                                           ('structure','preferred','soft_reject',
-                                            'reason','allowed')})
-        except Exception as exc:
-            gold_nudge_meta={'nudged':False,'reason':type(exc).__name__}
-        # Strategy gen: soft LIVE cards harvested from library EV (next evo).
-        strat_nudge_meta={'nudged':False}
-        try:
-            from . import strategy_gen
-            epic_sg=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
-            live_struct=((edge_advice or {}).get('structure')
-                         or ctx.get('structure') or 'CHOP')
-            nudged_scores,strat_nudge_meta=strategy_gen.soft_nudge_scores(
-                nudged_scores,structure=live_struct,epic=epic_sg,store=self.store)
-            nudge_meta=dict(nudge_meta or {},strategy_gen=strat_nudge_meta)
-        except Exception as exc:
-            strat_nudge_meta={'nudged':False,'reason':type(exc).__name__}
+        # Unified adaptive system: structure EV → GOLD approach → combo cards.
+        from . import adaptive_system
+        epic_as=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+        nudged_scores,nudge_meta=adaptive_system.nudge_open(
+            self.store,base_scores,epic=epic_as,
+            structure=(edge_advice or {}).get('structure') or ctx.get('structure'),
+            trend=ctx.get('trend'),candles=self._decision_candles(),
+            edge_advice=edge_advice)
         # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
         forecast_meta={'nudged':False}
         try:
@@ -5252,17 +5220,27 @@ class SingleTradeEngine:
         if not structure_at_open:
             structure_at_open=structure_at_close
         structure_memory.persist_last(self.store,structure_at_close)
-        # Bank scene×action £ so situation_memory soft-nudge has live evidence.
+        # Unified adaptive system CLOSE: situation + combo ±£ → flip if −EV.
         try:
+            from . import adaptive_system
             sit=self._situation_fingerprint_now(
                 structure=(close_frame.get('structure')
                            if isinstance(close_frame,dict) else None))
-            if sit and direction in ('BUY','SELL') and pnl_value is not None:
-                situation_memory.record_outcome(
-                    self.store,situation=sit,action=direction,pnl=pnl_value,
-                    epic=epic,deal_id=deal_id)
+            st_live=(struct_ctx.get('structure')
+                     if isinstance(struct_ctx,dict) else None)
+            if not st_live and isinstance(close_frame,dict):
+                st_live=close_frame.get('structure')
+            if not st_live and isinstance(saved,dict):
+                st_live=saved.get('structure')
+            if not st_live:
+                st_live=self._trail_structure_label(
+                    {'epic':epic,'level':entry,'direction':direction})
+            if direction in ('BUY','SELL') and pnl_value is not None:
+                adaptive_system.learn_close(
+                    self.store,structure=st_live or 'CHOP',direction=direction,
+                    broker_pnl=pnl_value,epic=epic,situation=sit,deal_id=deal_id)
         except Exception as exc:
-            self.store.event('warning','Situation memory bank skipped',
+            self.store.event('warning','Adaptive system learn_close skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
         self.store.set('last_trade_outcome',{
             'direction':direction,'pnl_sign':int(pnl_sign),'deal_id':deal_id,
@@ -5308,23 +5286,6 @@ class SingleTradeEngine:
                     broker_pnl=pnl_value,spread=spread_cost)
             except Exception as exc:
                 self.store.event('warning','OHLC entry gates learn skipped',
-                                 {'type':type(exc).__name__,'deal_id':deal_id})
-            # Strategy cards: attribute live £ + re-harvest so new EV can go LIVE.
-            try:
-                from . import strategy_gen
-                st_live=(struct_ctx.get('structure')
-                         if isinstance(struct_ctx,dict) else None)
-                if not st_live and isinstance(saved,dict):
-                    st_live=saved.get('structure')
-                if not st_live:
-                    st_live=self._trail_structure_label(
-                        {'epic':epic,'level':entry,'direction':direction})
-                strategy_gen.observe_close(
-                    self.store,structure=st_live,direction=direction,
-                    broker_pnl=pnl_value,epic=epic)
-                strategy_gen.harvest(self.store,epic=epic)
-            except Exception as exc:
-                self.store.event('warning','Strategy gen observe skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None

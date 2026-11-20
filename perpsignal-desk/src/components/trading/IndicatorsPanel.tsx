@@ -1,16 +1,26 @@
 import { useEffect, useRef } from "react";
-import { CANDLES, macdHist, rsiSeries } from "../../data/mockCandles";
+import { CANDLES, macdHist, rsiSeries, type Candle } from "../../data/mockCandles";
 import { LiveBadge } from "../ui/LiveBadge";
 
-export function IndicatorsPanel() {
+export function IndicatorsPanel({
+  rsi,
+  macd,
+  candles,
+}: {
+  rsi?: number;
+  macd?: number;
+  candles?: Candle[];
+}) {
   const rsiRef = useRef<HTMLCanvasElement>(null);
   const macdRef = useRef<HTMLCanvasElement>(null);
+  const series = candles && candles.length ? candles : CANDLES;
+  const closes = series.map((c) => c.close);
+  const rsiData = rsiSeries(closes);
+  const macdData = macdHist(closes);
+  const rsiNow = rsi ?? rsiData.at(-1) ?? 39.4;
+  const macdNow = macd ?? macdData.at(-1) ?? -30.54;
 
   useEffect(() => {
-    const closes = CANDLES.map((c) => c.close);
-    const rsi = rsiSeries(closes);
-    const macd = macdHist(closes);
-
     const drawRsi = () => {
       const c = rsiRef.current;
       if (!c) return;
@@ -38,8 +48,8 @@ export function IndicatorsPanel() {
       ctx.strokeStyle = "#699bdd";
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      rsi.forEach((v, i) => {
-        const x = (i / (rsi.length - 1)) * w;
+      rsiData.forEach((v, i) => {
+        const x = (i / Math.max(1, rsiData.length - 1)) * w;
         const y = yOf(v);
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
@@ -62,10 +72,10 @@ export function IndicatorsPanel() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = "#060a14";
       ctx.fillRect(0, 0, w, h);
-      const max = Math.max(...macd.map(Math.abs), 1);
+      const max = Math.max(...macdData.map(Math.abs), 1);
       const mid = h / 2;
-      const slot = w / macd.length;
-      macd.forEach((v, i) => {
+      const slot = w / Math.max(1, macdData.length);
+      macdData.forEach((v, i) => {
         const bh = (Math.abs(v) / max) * (h / 2 - 2);
         ctx.fillStyle = v >= 0 ? "#30d69a" : "#f06b78";
         if (v >= 0) ctx.fillRect(i * slot, mid - bh, Math.max(1, slot - 0.5), bh);
@@ -80,11 +90,7 @@ export function IndicatorsPanel() {
 
     drawRsi();
     drawMacd();
-  }, []);
-
-  // Header readouts locked to reference screenshot for visual parity.
-  const rsiNow = 39.4;
-  const macdNow = -30.54;
+  }, [rsiData, macdData]);
 
   return (
     <section className="panel indicators">
@@ -94,10 +100,11 @@ export function IndicatorsPanel() {
       </header>
       <div className="ind-head">
         <span>
-          RSI <b className="num">{rsiNow.toFixed(1)}</b>
+          RSI <b className="num">{Number(rsiNow).toFixed(1)}</b>
         </span>
         <span>
-          MACD HIST <b className={`num ${macdNow < 0 ? "dn" : "up"}`}>{macdNow.toFixed(2)}</b>
+          MACD HIST{" "}
+          <b className={`num ${Number(macdNow) < 0 ? "dn" : "up"}`}>{Number(macdNow).toFixed(2)}</b>
         </span>
       </div>
       <div className="ind-charts">

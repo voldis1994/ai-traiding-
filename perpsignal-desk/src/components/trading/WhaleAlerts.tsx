@@ -3,12 +3,14 @@ import { WHALES } from "../../data/mockMarketData";
 import { LiveBadge } from "../ui/LiveBadge";
 
 type Filter = "BOTH" | "BUY" | "SELL";
+type Whale = { side: "BUY" | "SELL"; price: string; value: string; ago: string };
 
-export function WhaleAlerts() {
+export function WhaleAlerts({ whales }: { whales?: Whale[] }) {
   const [filter, setFilter] = useState<Filter>("BOTH");
+  const source = whales && whales.length ? whales : [...WHALES];
   const rows = useMemo(
-    () => WHALES.filter((w) => (filter === "BOTH" ? true : w.side === filter)),
-    [filter],
+    () => source.filter((w) => (filter === "BOTH" ? true : w.side === filter)),
+    [filter, source],
   );
 
   return (
@@ -37,17 +39,21 @@ export function WhaleAlerts() {
         <span className="wh-min">MIN ANY</span>
       </div>
       <div className="panel-body">
-        {rows.map((w, i) => (
-          <div key={i} className="wh-row">
-            <span className="wh-badge">WHALE</span>
-            <span className="wh-large">Large</span>
-            <span className={w.side === "BUY" ? "up" : "dn"}>
-              {w.side === "BUY" ? "▲" : "▼"} {w.price}
-            </span>
-            <strong className={w.side === "BUY" ? "up" : "dn"}>{w.value}</strong>
-            <span className="wh-ago">{w.ago}</span>
-          </div>
-        ))}
+        {rows.length === 0 ? (
+          <div className="ob-cmp">No closed prints yet</div>
+        ) : (
+          rows.map((w, i) => (
+            <div key={i} className="wh-row">
+              <span className="wh-badge">WHALE</span>
+              <span className="wh-large">Large</span>
+              <span className={w.side === "BUY" ? "up" : "dn"}>
+                {w.side === "BUY" ? "▲" : "▼"} {w.price}
+              </span>
+              <strong className={w.side === "BUY" ? "up" : "dn"}>{w.value}</strong>
+              <span className="wh-ago">{w.ago}</span>
+            </div>
+          ))
+        )}
       </div>
     </section>
   );

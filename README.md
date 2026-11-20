@@ -36,10 +36,22 @@ Deploy detalizētāk: [`DEPLOY_LV.md`](DEPLOY_LV.md). Ceļi `/`, `/app`, `/admin
 
 ## Kā palaist
 
-1. Windows: `run_windows.bat` → `http://127.0.0.1:8765`
-2. Admin: `/admin` → izveido klientu + pieslēdz brokeru API
-3. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
-4. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+**Windows (pilnā sistēma):** dubultklikšķis `PALAIST_PILNO_SISTEMU.bat`
+vai `run_windows.bat` → **`http://127.0.0.1:8765/admin`**
+
+| URL | Kas |
+|-----|-----|
+| `/admin` | Īstā NEURAL Desk (Capital LIVE + neironi) |
+| `/desk` | React PerpSignal Desk — tie paši Admin API (pēc login) |
+| `/app` | Klienta portāls |
+
+> `perpsignal-desk` + `npm run dev` (`:5173`) ir tikai UI izstrādei. **Robots un LIVE dati ir tikai uz 8765.**
+
+1. Admin: `/admin` → izveido klientu + pieslēdz brokeru API
+2. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
+3. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+
+Skat. arī `KĀ_PALAIST_LV.txt`.
 
 Linux:
 

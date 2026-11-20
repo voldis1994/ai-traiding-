@@ -1,25 +1,39 @@
 import { WATCHLIST } from "../../data/mockMarketData";
 import { LiveBadge } from "../ui/LiveBadge";
 
-function Spark({ seed }: { seed: number }) {
-  const pts = Array.from({ length: 16 }, (_, i) => {
-    const y = 14 - ((i * 0.55 + Math.sin((i + seed) * 0.7) * 3 + seed) % 10);
-    return `${i * 4},${y}`;
-  }).join(" ");
+function Spark({ values }: { values?: number[] }) {
+  const pts =
+    values && values.length > 1
+      ? values
+          .map((v, i) => {
+            const lo = Math.min(...values);
+            const hi = Math.max(...values);
+            const span = Math.max(1e-9, hi - lo);
+            const y = 14 - ((v - lo) / span) * 12;
+            return `${(i / (values.length - 1)) * 64},${y}`;
+          })
+          .join(" ")
+      : Array.from({ length: 16 }, (_, i) => `${i * 4},${10 - (i % 5)}`).join(" ");
+  const down = !values || values.length < 2 || values[values.length - 1] <= values[0];
   return (
     <svg width="64" height="16" viewBox="0 0 64 16" className="spark">
-      <polyline fill="none" stroke="#f06b78" strokeWidth="1.2" points={pts} />
+      <polyline fill="none" stroke={down ? "#f06b78" : "#30d69a"} strokeWidth="1.2" points={pts} />
     </svg>
   );
 }
 
+type Row = { symbol: string; price: string; change: number; spark?: number[] };
+
 export function Watchlist({
   selected,
   onSelect,
+  rows,
 }: {
   selected: string;
   onSelect: (s: string) => void;
+  rows?: Row[];
 }) {
+  const list = rows && rows.length ? rows : WATCHLIST.map((w) => ({ ...w, spark: undefined }));
   return (
     <section className="panel watchlist">
       <header className="panel-header">
@@ -27,7 +41,7 @@ export function Watchlist({
         <LiveBadge />
       </header>
       <div className="panel-body">
-        {WATCHLIST.map((w, i) => (
+        {list.map((w) => (
           <button
             key={w.symbol}
             type="button"
@@ -35,11 +49,9 @@ export function Watchlist({
             onClick={() => onSelect(w.symbol)}
           >
             <strong>{w.symbol}</strong>
-            <Spark seed={i + 2} />
+            <Spark values={w.spark} />
             <span className="num">{w.price}</span>
-            <span className={`num ${w.change < 0 ? "dn" : "up"}`}>
-              {w.change.toFixed(2)}%
-            </span>
+            <span className={`num ${w.change < 0 ? "dn" : "up"}`}>{w.change.toFixed(2)}%</span>
           </button>
         ))}
       </div>

@@ -131,6 +131,10 @@ app=FastAPI(title='Neural Trading AI',lifespan=lifespan,docs_url=None,redoc_url=
 app.mount('/static',StaticFiles(directory=str(WEB)),name='static')
 app.mount('/app/static',StaticFiles(directory=str(WEB/'client')),name='client-static')
 app.mount('/admin/static',StaticFiles(directory=str(WEB/'admin')),name='admin-static')
+# React PerpSignal Desk (built into app/web/desk). Assets under /desk/assets.
+_DESK=WEB/'desk'
+if _DESK.is_dir() and (_DESK/'assets').is_dir():
+    app.mount('/desk/assets',StaticFiles(directory=str(_DESK/'assets')),name='desk-assets')
 
 @app.middleware('http')
 async def headers(request:Request,call_next):
@@ -141,7 +145,9 @@ async def headers(request:Request,call_next):
     host=request.headers.get('host') or '127.0.0.1:8765'
     ws=f"ws://{host} wss://{host}"
     response.headers['Content-Security-Policy']=(
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
         f"connect-src 'self' {ws}; img-src 'self' data:")
     return response
 
@@ -264,6 +270,15 @@ async def operator_console():
 
 @app.get('/admin')
 async def admin_page():return FileResponse(WEB/'admin'/'index.html')
+
+@app.get('/desk')
+@app.get('/desk/')
+async def desk_page():
+    """Pixel PerpSignal Desk (React) — live Capital/neural via Admin API cookies."""
+    index=WEB/'desk'/'index.html'
+    if not index.is_file():
+        return RedirectResponse('/admin', status_code=302)
+    return FileResponse(index)
 
 @app.get('/admin/ohlc')
 async def admin_ohlc_page():
@@ -409,7 +424,7 @@ async def logout(_:bool=Depends(require_auth)):
 async def health():
     # Public readiness only — do not leak tenant counts to recon.
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
-            'portals':{'home':'/admin','operator':'/admin','admin':'/admin','client':'/app',
+            'portals':{'home':'/admin','operator':'/admin','admin':'/admin','desk':'/desk','client':'/app',
                        'portal':'/portal'},
             'public_url':public_base_url(),
             'secure_cookies':cookie_secure()}

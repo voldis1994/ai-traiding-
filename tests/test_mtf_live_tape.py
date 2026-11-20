@@ -3,8 +3,10 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
-from app import mtf_momentum
+from app import mtf_momentum, shared_market
 from tests.test_mtf_momentum import _bars
 
 
@@ -48,6 +50,8 @@ def test_mtf_sticky_keeps_last_ready_on_thin_tick():
         first = engine._mtf_momentum_analysis()
         assert first.get('ready') is True
         # Wipe candles so next analyze is not ready — sticky must hold.
+        # Clear shared peer cache so thin-tick path uses engine sticky, not adopt_mtf.
+        shared_market.clear('GOLD')
         store.db.execute('DELETE FROM candles')
         store.db.commit()
         sticky = engine._mtf_momentum_analysis()
@@ -66,3 +70,19 @@ def test_chart_overlays_partial_adx_atr_before_full_warm():
     assert ov.get('atr14') is not None and ov['atr14'] > 0
     assert ov.get('adx') is not None and ov['adx'] > 0
     assert ov.get('reason') == 'series_atr_adx_partial'
+
+
+def test_chart_overlays_atr14_is_m1_not_m5_stop_hint():
+    """Desk ATR14 must match M1 Wilder — M5 stop_hint (~larger) must not lie as ATR14."""
+    bars = _bars(400, trend=0.8)
+    ov = mtf_momentum.chart_overlays(bars, epic='GOLD', display_n=120, spread=0.3)
+    assert ov.get('atr14') is not None and ov['atr14'] > 0
+    m1 = mtf_momentum.atr_wilder(
+        [{'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close']}
+         for b in bars], 14)
+    assert m1 is not None
+    assert ov['atr14'] == pytest.approx(m1, rel=0.02)
+    # If M5 hint exists it must be separate — never equal-forced into atr14 when larger.
+    hint = ov.get('stop_hint_atr14') or ov.get('atr14_m5')
+    if hint is not None and hint > ov['atr14'] * 1.15:
+        assert ov['atr14'] < hint

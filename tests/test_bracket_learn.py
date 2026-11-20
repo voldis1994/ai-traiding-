@@ -362,45 +362,38 @@ def _swing_rows(seq, t0=None):
 def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
     """SL/TP must sit on swing high/low — not random ±κ around entry."""
     from app.bracket_learn import swing_anchor_brackets
-    # Clear swings: SL~103, SH~112, entry mid-range.
+    # Clear swings: SL~103, near SH~109, far SH~116 so RR can extend TP (no soft SL).
     seq = [
         (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
         (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
         (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
         (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
-        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+        (111.5, 116.5, 111.0, 116.0), (116.0, 116.2, 110.5, 111.0),
+        (111.0, 111.5, 110.2, 110.8), (110.8, 111.0, 110.0, 110.5),
     ]
     rows = _swing_rows(seq)
     entry = 107.0
-    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
-    # ATR wide enough that structural SL (~4pts) stays inside the ATR band —
-    # we assert swing anchors, not RR refuse-vs-soft-shrink.
+    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 12.0, 'noise_distance': 3.0}
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=3.0, zone=zone)
     assert swing['ready'] is True, swing.get('reason')
     assert swing['swing_lo'] == pytest.approx(103.0, abs=0.05)
-    # TP is nearest swing high above entry (reachable), not a far day extreme.
     assert swing['swing_hi'] >= entry
     assert swing['stop_level'] < entry < swing['profit_level']
-    # Structural TP stays at/above a swing high; SL may be RR-capped toward entry.
-    assert swing['profit_level'] >= entry
-    if not swing.get('rr_capped'):
-        assert swing['stop_level'] < swing['swing_lo']
-        # Pre-RR: not the live Gold invent bug (±same distance both sides).
-        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
-    else:
-        # Min RR=1.0 may equalize distances — still not invented median zone.
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
-        assert '+rr_cap_sl' in str(swing.get('reason') or '')
+    assert not swing.get('rr_capped')
+    assert '+rr_cap_sl' not in str(swing.get('reason') or '')
+    assert swing['stop_level'] < swing['swing_lo']
+    assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.5)
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
-        entry=entry, action='BUY', candles=rows, atr=3.0)
+        entry=entry, action='BUY', candles=rows, atr=3.0, tighten=0.85)
     assert decided['source'] == 'swing_anchor'
     assert decided['swing_lo'] == pytest.approx(103.0, abs=0.05)
     assert decided.get('ready') is True
     assert decided['profit_level'] > entry
+    assert decided.get('tighten') == pytest.approx(1.0)
 
 
 def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
@@ -487,25 +480,33 @@ def test_decide_brackets_snaps_tick_without_stop_take_rewrite():
         entry + decided['profit_distance'], abs=1e-9)
 
 
-def test_apply_min_rr_caps_wide_sl_toward_entry_when_not_atr_locked():
-    """Without ATR lock: far SL may soft-shrink; TP stays (never mirrored)."""
+def test_apply_min_rr_refuses_soft_shrink_by_default_on_swing_path():
+    """LIVE swing path never invents non-pivot SL — extend TP or refuse."""
+    from app.bracket_learn import apply_min_rr
+    entry, stop_d, profit_d = 2650.0, 21.0, 3.0
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=entry + stop_d,
+        profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
+        floor=1.0, min_rr=1.5, atr_locked=False, allow_soft_shrink=False)
+    assert out['ok'] is False
+    assert out['reason'] == 'rr_need_farther_tp_keep_swing'
+    assert out['stop_distance'] == pytest.approx(21.0, abs=1e-9)
+
+
+def test_apply_min_rr_legacy_soft_shrink_opt_in_only():
+    """Soft-shrink remains available only when explicitly opted in (not LIVE)."""
     from app.bracket_learn import apply_min_rr, levels_correct_side
     entry, stop_d, profit_d = 2650.0, 21.0, 3.0
-    stop_level = entry + stop_d
-    profit_level = entry - profit_d
     out = apply_min_rr(
-        action='SELL', entry=entry, stop_level=stop_level,
-        profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=1.0, min_rr=1.5, atr_locked=False)
+        action='SELL', entry=entry, stop_level=entry + stop_d,
+        profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
+        floor=1.0, min_rr=1.5, atr_locked=False, allow_soft_shrink=True)
     assert out['ok'] is True
     assert out['capped'] is True
     assert out['stop_distance'] == pytest.approx(2.0, abs=1e-9)
-    assert out['profit_distance'] == pytest.approx(3.0, abs=1e-9)
-    assert out['rr'] == pytest.approx(1.5, abs=1e-9)
     assert levels_correct_side(
         action='SELL', entry=entry, stop_level=out['stop_level'],
         profit_level=out['profit_level'])
-    assert out['profit_distance'] != pytest.approx(21.0, abs=0.1)
 
 
 def test_atr_locked_rr_refuses_hairline_sl_instead_of_swap():

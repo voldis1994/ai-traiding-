@@ -474,6 +474,44 @@ function renderDeskReturns(client){ /* sink */ }
 function renderDeskReact(client){ /* sink */ }
 function renderDeskLearn(client){ /* sink — learn msg in intel */ }
 
+/** M1 ATR14 from completed candles — never invent from M5 stop_hint (~7.5 lie). */
+function deskM1Atr14(view,mtf,ov){
+  const mtfUi=(view&&view.mtf)||{};
+  const m1tf=((mtf&&mtf.tf)||{}).m1||{};
+  const direct=mtfUi.atr14??m1tf.atr14??(ov&&ov.atr14);
+  if(direct!=null&&Number.isFinite(Number(direct))&&Number(direct)>0)return Number(direct);
+  const closes=_deskCloses(view);
+  // Need OHLC highs/lows for true ATR — fall back to close-range proxy only if thin.
+  const candles=(view&&view.candles)||[];
+  if(candles.length>=16){
+    let prevC=null;const trs=[];
+    for(const c of candles){
+      const h=Number(c.high??c.h),l=Number(c.low??c.l),cl=Number(c.close??c.c);
+      if(!Number.isFinite(h)||!Number.isFinite(l))continue;
+      if(prevC==null){trs.push(Math.max(0,h-l));}
+      else{
+        const pc=Number.isFinite(prevC)?prevC:cl;
+        trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+      }
+      if(Number.isFinite(cl))prevC=cl;
+    }
+    if(trs.length>=14){
+      let atr=trs.slice(0,14).reduce((a,b)=>a+b,0)/14;
+      for(let i=14;i<trs.length;i++)atr=(atr*13+trs[i])/14;
+      return atr>0?atr:null;
+    }
+  }
+  if(closes.length>=16){
+    // Last resort: mean |Δclose| × scale — better than painting M5 as ATR14.
+    let s=0,n=0;
+    for(let i=Math.max(1,closes.length-14);i<closes.length;i++){
+      s+=Math.abs(closes[i]-closes[i-1]);n++;
+    }
+    return n?s/n:null;
+  }
+  return null;
+}
+
 function renderDeskIndicators(client,view){
   const el=$('deskIndicators');
   if(!el)return;
@@ -482,12 +520,12 @@ function renderDeskIndicators(client,view){
   const mtf=a.mtf_momentum||{};
   const ov=(view&&view.overlays)||{};
   const mtfUi=(view&&view.mtf)||{};
-  // Same ATR the robot uses for brackets (M1 atr14) — not a second stop_hint.
-  const atr=mtfUi.atr14??((mtf.tf||{}).m1||{}).atr14??mtf.stop_hint_atr14??ov.atr14;
+  // ATR14 = M1 only (LIVE brackets). Never fall back to M5 stop_hint (~7.5 on GOLD).
+  const atr=deskM1Atr14(view,mtf,ov);
   const adx=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   const kama=mtfUi.kama??((mtf.tf||{}).m5||{}).kama??ov.kama_level??((mtf.tf||{}).m1||{}).kama;
   stableHtml(el,[
-    deskKv(client.id,'ATR14',atr,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'ATR14 M1',atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
     deskKv(client.id,'KAMA5',kama,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Spread',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
@@ -523,48 +561,72 @@ function renderDeskLean(client,lp,sp){
   if(el)stableHtml(el,'');
 }
 
+/** Signal Watch from OHLC structure + swing RR — never tape-Δ chase after the move. */
+function deskOhlcSignal(m,focusAct,isFocus){
+  const pref=String((m&&m.preferred)||((m&&m.mtf)||{}).preferred||'').toUpperCase();
+  const br=(m&&m.swing_brackets)||{};
+  const ready=!!br.ready;
+  const rr=br.rr!=null&&Number.isFinite(Number(br.rr))?Number(br.rr):null;
+  const bias=String(((m&&m.structure)||{}).bias||((m&&m.structure)||{}).event||'');
+  if(isFocus&&focusAct){
+    const neural=focusAct.act;
+    if((pref==='BUY'||pref==='SELL')&&(neural==='BUY'||neural==='SELL')&&neural!==pref){
+      return {act:'HOLD',label:`neural≠ohlc ${pref} →`};
+    }
+    if(neural==='BUY'||neural==='SELL'){
+      if((pref==='BUY'||pref==='SELL')&&!ready){
+        return {act:'HOLD',label:`ohlc ${pref} wait RR →`};
+      }
+      const s=neural==='SELL'?focusAct.sell:focusAct.buy;
+      const pct=Math.round(Math.max(0,Math.min(1,s))*100);
+      if(ready&&rr!=null)return {act:neural,label:`ohlc RR ${num(rr,2)} ${pct}% →`};
+      if(ready)return {act:neural,label:`ohlc swing ${pct}% →`};
+      return {act:neural,label:`neural ${pct}% →`};
+    }
+    return {act:'HOLD',label:bias?`ohlc ${bias} →`:'neural HOLD →'};
+  }
+  if(pref==='BUY'||pref==='SELL'){
+    if(ready&&rr!=null)return {act:pref,label:`ohlc RR ${num(rr,2)} →`};
+    if(ready)return {act:pref,label:'ohlc swing →'};
+    return {act:'HOLD',label:`ohlc ${pref} wait RR →`};
+  }
+  return {act:'HOLD',label:bias?`ohlc ${bias} →`:'ohlc — →'};
+}
+
 function renderDeskSignal(client,markets){
   const el=$('deskSignal');
   if(!el)return;
   const rows=(markets||[]).slice(0,6);
+  const focusAct=client?deskScoreAction(client):null;
+  const focusEpic=((client&&client.activity)||{}).market
+    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
   if(!rows.length&&client){
-    const {buy,hold,sell,act}=deskScoreAction(client);
-    const strength=act==='SELL'?sell:(act==='BUY'?buy:hold);
-    const agree=Math.round(Math.max(0,Math.min(1,strength))*100);
-    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
-    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
-    const epic=((client.activity||{}).market)||(((client.activity||{}).mandate)||{}).epic||'FOCUS';
+    const epic=focusEpic||'FOCUS';
+    const syn={
+      epic,
+      preferred:(client.activity&&client.activity.mtf_momentum
+        &&client.activity.mtf_momentum.preferred)||null,
+      mtf:(client.activity&&client.activity.mtf_momentum)||null,
+      swing_brackets:null,structure:null,
+    };
+    const sig=deskOhlcSignal(syn,focusAct,true);
+    const side=sig.act==='BUY'?'LONG':(sig.act==='SELL'?'SHORT':'HOLD');
+    const cls=sig.act==='BUY'?'long':(sig.act==='SELL'?'short':'hold');
     stableHtml(el,`<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">neural ${agree}% →</span>
+      <span class="agree">${esc(sig.label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`);
     return;
   }
   if(!rows.length){stableHtml(el,'<div class="psx-empty">No signals</div>');return}
-  const focusAct=client?deskScoreAction(client):null;
-  const focusEpic=((client&&client.activity)||{}).market
-    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
   stableHtml(el,rows.map((m)=>{
     const epic=m.epic||'—';
-    const isFocus=focusAct&&focusEpic&&String(epic).toUpperCase()===String(focusEpic).toUpperCase();
-    let act='HOLD',label='';
-    if(isFocus){
-      act=focusAct.act;
-      const s=act==='SELL'?focusAct.sell:(act==='BUY'?focusAct.buy:focusAct.hold);
-      label=`neural ${Math.round(Math.max(0,Math.min(1,s))*100)}% →`;
-    }else{
-      // Tape Δ only — not neural agreement (never invent "agree %" from candles).
-      const ch=deskCandleChange(m.candles);
-      if(ch!=null){
-        act=ch>0.05?'BUY':(ch<-0.05?'SELL':'HOLD');
-        label=`tape ${ch>=0?'+':''}${num(ch,2)}% →`;
-      }else{
-        label='tape — →';
-      }
-    }
-    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
-    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
+    const isFocus=!!(focusAct&&focusEpic
+      &&String(epic).toUpperCase()===String(focusEpic).toUpperCase());
+    const sig=deskOhlcSignal(m,focusAct,isFocus);
+    const side=sig.act==='BUY'?'LONG':(sig.act==='SELL'?'SHORT':'HOLD');
+    const cls=sig.act==='BUY'?'long':(sig.act==='SELL'?'short':'hold');
     return `<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${esc(label)}</span>
+      <span class="agree">${esc(sig.label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`;
   }).join(''));
 }

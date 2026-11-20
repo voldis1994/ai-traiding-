@@ -1,4 +1,6 @@
 """RR after snap, float tick dust, and trail tip memory past 120 bars."""
+import pytest
+
 from app.math_rules import snap_distance_to_tick
 from app.bracket_learn import apply_min_rr
 from app.protection_ai import trail_extreme_from_broker
@@ -34,8 +36,8 @@ def test_rr_rechecked_after_tick_snap_example():
     assert need_tp / sd + 1e-12 >= min_rr
 
 
-def test_decide_brackets_repairs_rr_after_snap(monkeypatch):
-    """User case: SL 2.5 TP 4.0 ×0.85 snap tick 0.5 → RR 1.40; must repair ≥1.5."""
+def test_decide_brackets_ignores_cosmetic_tighten_on_swing(monkeypatch):
+    """Swing SL/TP stay on pivots — tighten=0.85 must not shrink distances."""
     from app import bracket_learn
 
     fake = {
@@ -55,12 +57,11 @@ def test_decide_brackets_repairs_rr_after_snap(monkeypatch):
         entry=100.0, action='BUY', candles=candles, require_swing=True)
     assert out['ready'] is True
     assert out['source'] == 'swing_anchor'
-    assert out['stop_distance'] > 0 and out['profit_distance'] > 0
+    assert out.get('tighten') == pytest.approx(1.0)
+    # Cosmetic 0.85 would have made 2.125/3.4 → snap 2.5/3.5 (RR 1.4). Blocked.
+    assert out['stop_distance'] == pytest.approx(2.5, abs=1e-12)
+    assert out['profit_distance'] == pytest.approx(4.0, abs=1e-12)
     assert (out['profit_distance'] / out['stop_distance']) + 1e-12 >= 1.5
-    # Without repair, snap alone would leave RR=1.40 (3.5/2.5).
-    assert not (
-        abs(out['stop_distance'] - 2.5) < 1e-12
-        and abs(out['profit_distance'] - 3.5) < 1e-12)
 
 
 def test_trail_prior_extreme_remembers_peak_outside_window():

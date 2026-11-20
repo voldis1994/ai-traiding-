@@ -303,18 +303,20 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
 
 
 def extension_chase(action, *, candles=None, market_context=None, atr=None,
-                    lookback=30, top_frac=0.85, min_atr_mult=2.0) -> dict:
-    """Block only exhaustion chases — not clear trend continuation.
+                    lookback=30, top_frac=0.85, min_atr_mult=2.0,
+                    fresh_extreme_bars=2) -> dict:
+    """Block OPEN when the move is already finished (exhaustion chase).
 
     Block:
-      • BUY at the top of a large impulse while M1 is already rolling (reds)
-      • SELL at the bottom while M1 is bouncing (greens)
+      • BUY stuck at the top of a large impulse
+      • SELL stuck at the bottom of a large dump
 
     Allow:
-      • SELL still printing reds at the low (the live dump that became HOLD)
-      • BUY still printing greens at the high (continuation, not a weak bounce)
+      • Mid-range pressure (early/mid structure — not a chase)
+      • First 1–2 bars into the extreme (fresh break) — structure entry
+        before the move is exhausted
 
-    Earlier “always block at extreme” turned every sustained move into HOLD.
+    Pullback/zone + swing RR gates still place SL/TP on OHLC structure.
     """
     if action not in ('BUY', 'SELL'):
         return {'needed': False, 'ok': True, 'reason': 'not_directional'}
@@ -338,10 +340,6 @@ def extension_chase(action, *, candles=None, market_context=None, atr=None,
             return {'needed': False, 'ok': True, 'reason': 'impulse_not_large',
                     'span': span, 'atr': atr_v}
     pos = (mid - lo) / span  # 0=bottom, 1=top of lookback range
-    last3 = path[-3:]
-    reds = sum(1 for b in last3 if b['close'] < b['open'])
-    greens = sum(1 for b in last3 if b['close'] > b['open'])
-    # Same-dir M1 streak = clear candle pressure — do not HOLD for “weak body”.
     same_dir = 0
     for b in reversed(path[-8:]):
         if action == 'SELL' and b['close'] < b['open']:
@@ -351,43 +349,48 @@ def extension_chase(action, *, candles=None, market_context=None, atr=None,
         else:
             break
     frac = float(top_frac)
+    # How long has price been grinding the extreme? >fresh → move finished.
+    extreme_bars = 0
+    for b in reversed(path):
+        p = (b['close'] - lo) / span
+        if action == 'BUY' and p >= frac:
+            extreme_bars += 1
+        elif action == 'SELL' and p <= (1.0 - frac):
+            extreme_bars += 1
+        else:
+            break
+    fresh_n = max(1, int(fresh_extreme_bars))
+
     if action == 'BUY' and pos >= frac:
-        if same_dir >= 2:
+        if extreme_bars <= fresh_n:
             return {
-                'needed': False, 'ok': True, 'reason': 'continuation_at_high',
+                'needed': False, 'ok': True, 'reason': 'fresh_extreme_high',
                 'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'same_dir_streak': same_dir,
-            }
-        if reds >= 2:
-            return {
-                'needed': True, 'ok': False, 'reason': 'chase_extension_high',
-                'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+                'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
             }
         return {
-            'needed': False, 'ok': True, 'reason': 'top_without_rollover',
-            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'reds': reds,
+            'needed': True, 'ok': False, 'reason': 'chase_extension_high',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo,
+            'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
+            'exhausted': True,
         }
     if action == 'SELL' and pos <= (1.0 - frac):
-        if same_dir >= 2:
-            # Clear dump with consecutive red M1 — OPEN allowed (user screenshot).
+        if extreme_bars <= fresh_n:
             return {
-                'needed': False, 'ok': True, 'reason': 'continuation_at_low',
+                'needed': False, 'ok': True, 'reason': 'fresh_extreme_low',
                 'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'same_dir_streak': same_dir,
-            }
-        if greens >= 2:
-            return {
-                'needed': True, 'ok': False, 'reason': 'chase_extension_low',
-                'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+                'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
             }
         return {
-            'needed': False, 'ok': True, 'reason': 'low_without_bounce',
-            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'greens': greens,
+            'needed': True, 'ok': False, 'reason': 'chase_extension_low',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo,
+            'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
+            'exhausted': True,
         }
     return {'needed': False, 'ok': True, 'reason': 'not_extended',
-            'pos': round(pos, 3), 'span': span}
+            'pos': round(pos, 3), 'span': span, 'same_dir_streak': same_dir}
 
 
 def gate_reentry(*, action, last_outcome=None, candles=None,

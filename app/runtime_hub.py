@@ -668,6 +668,11 @@ class RuntimeHub:
                     'last_start_error':None,
                     'balance':((snap.get('account') or {}).get('balance') or {}),
                     'currency':account_currency,
+                    # Desk intel — real engine soft signals (may be empty).
+                    'economic_news_risk':snap.get('economic_news_risk'),
+                    'intermarket_analysis':snap.get('intermarket_analysis'),
+                    'trail_enabled':bool(
+                        getattr(rt.engine,'TRAIL_ENABLED',False)),
                 },
                 'last_start_error':None,
             })

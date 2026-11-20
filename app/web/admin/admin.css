@@ -308,6 +308,70 @@ table.data tr:last-child td{border-bottom:0}
 .settings-grid .card:last-child{grid-column:1/-1}
 .form-stack .btn{margin-top:16px}
 
+/* —— NEURAL Desk (live Capital control panel) —— */
+.desk-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.desk-focus{display:flex;flex-direction:column;gap:6px;font-size:11px;font-weight:700;
+  letter-spacing:.04em;color:var(--muted);text-transform:uppercase}
+.desk-focus select{
+  min-width:220px;padding:10px 12px;border-radius:10px;border:1px solid var(--line-soft);
+  background:#0a0f12;color:var(--text);font:inherit;font-weight:600;text-transform:none}
+.desk-tape{
+  display:flex;gap:10px;overflow-x:auto;padding:4px 2px 14px;margin:0 0 4px;
+  scrollbar-width:thin}
+.desk-tape-item{
+  flex:0 0 auto;min-width:148px;padding:10px 12px;border-radius:12px;
+  border:1px solid var(--line-soft);background:rgba(12,18,22,.88);cursor:pointer;
+  transition:border-color .15s ease,box-shadow .15s ease}
+.desk-tape-item:hover,.desk-tape-item.active{
+  border-color:var(--line);box-shadow:0 0 0 1px rgba(57,255,136,.18)}
+.desk-tape-item .ep{font-family:var(--display);font-weight:700;font-size:13px}
+.desk-tape-item .md{font-variant-numeric:tabular-nums;font-weight:700;margin-top:4px}
+.desk-tape-item .cl{font-size:11px;color:var(--muted);margin-top:2px}
+.desk-grid{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(280px,.9fr);gap:16px}
+.desk-chart-card canvas{width:100%;height:min(48vh,420px);display:block;border-radius:0 0 12px 12px;
+  background:#080c0e}
+.desk-quote{font-size:13px;margin-top:4px}
+.desk-levels{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
+.desk-lvl{
+  font-size:11px;font-weight:800;letter-spacing:.03em;padding:5px 9px;border-radius:8px;
+  border:1px solid var(--line-soft);font-variant-numeric:tabular-nums}
+.desk-lvl.sl{color:var(--sell);border-color:rgba(255,92,122,.35);background:rgba(255,92,122,.08)}
+.desk-lvl.ent{color:var(--warn);border-color:rgba(245,185,66,.35);background:rgba(245,185,66,.1)}
+.desk-lvl.mid{color:var(--text);border-color:var(--line)}
+.desk-lvl.tp{color:var(--buy);border-color:rgba(57,255,136,.35);background:var(--accent-dim)}
+.desk-engine-body{padding:4px 2px 8px}
+.desk-gauge{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.desk-gauge div{
+  text-align:center;padding:12px 8px;border-radius:12px;border:1px solid var(--line-soft);
+  background:rgba(8,12,14,.65)}
+.desk-gauge em{display:block;font-style:normal;font-size:10px;letter-spacing:.08em;
+  color:var(--muted);font-weight:700}
+.desk-gauge b{display:block;font-family:var(--display);font-size:1.35rem;margin-top:4px}
+.desk-gauge .buy b{color:var(--buy)}.desk-gauge .sell b{color:var(--sell)}
+.desk-regime{
+  font-family:var(--display);font-weight:800;font-size:1.05rem;margin:0 0 8px;
+  letter-spacing:.02em}
+.desk-regime.buy{color:var(--buy)}.desk-regime.sell{color:var(--sell)}
+.desk-regime.hold{color:var(--warn)}
+.desk-meta{display:grid;gap:6px;font-size:12px;color:var(--muted)}
+.desk-meta strong{color:var(--text);font-weight:700}
+.desk-check{display:grid;gap:8px;padding:2px 0 6px}
+.desk-check-row{
+  display:flex;justify-content:space-between;gap:10px;align-items:center;
+  padding:8px 10px;border-radius:10px;border:1px solid var(--line-soft);
+  background:rgba(8,12,14,.5);font-size:12px}
+.desk-check-row b{font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+.desk-check-row .ok{color:var(--buy)}.desk-check-row .bad{color:var(--sell)}
+.desk-check-row .neu{color:var(--warn)}
+.desk-intel{display:grid;gap:8px;padding:2px 0 6px;font-size:12px;color:var(--muted)}
+.desk-intel .chip{
+  padding:8px 10px;border-radius:10px;border:1px solid var(--line-soft);
+  background:rgba(8,12,14,.55);color:var(--text)}
+.desk-intel .chip.bull{border-color:rgba(57,255,136,.28)}
+.desk-intel .chip.bear{border-color:rgba(255,92,122,.28)}
+.desk-empty{padding:18px 8px;color:var(--muted);font-size:13px;text-align:center}
+
 @keyframes fadeUp{
   from{opacity:0;transform:translateY(10px)}
   to{opacity:1;transform:none}
@@ -318,12 +382,13 @@ table.data tr:last-child td{border-bottom:0}
   .sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line-soft)}
   .side-nav{flex-direction:row;flex-wrap:wrap}
   .sidebar-wave{display:none}
-  .overview-grid{grid-template-columns:1fr}
+  .overview-grid,.desk-grid{grid-template-columns:1fr}
   .stat-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:720px){
   .main{padding:14px 12px 28px}
   .stat-grid,.settings-grid,.facts{grid-template-columns:1fr}
+  .desk-chart-card canvas{height:280px}
   .deal{grid-template-columns:1fr;gap:10px}
   .flags{justify-content:flex-start}
   .top-actions .btn span{display:none}

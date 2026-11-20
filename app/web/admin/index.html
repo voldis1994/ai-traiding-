@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=93">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=94">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -145,7 +145,10 @@
         </div>
       </div>
       <nav class="side-nav">
-        <button type="button" class="nav-item active" data-view="overview">
+        <button type="button" class="nav-item active" data-view="desk">
+          <svg class="ico"><use href="#i-candles"></use></svg><span>Desk</span>
+        </button>
+        <button type="button" class="nav-item" data-view="overview">
           <svg class="ico"><use href="#i-grid"></use></svg><span>Pārskats</span>
         </button>
         <button type="button" class="nav-item" data-view="clients">
@@ -185,7 +188,56 @@
         </div>
       </header>
 
-      <section class="view active" data-view="overview">
+      <section class="view active" data-view="desk">
+        <div class="page-head desk-head">
+          <div>
+            <h1>NEURAL Desk</h1>
+            <p>Live OHLC · SL/TP · engine — Capital dati, ne demo tape</p>
+          </div>
+          <label class="desk-focus">
+            Fokuss
+            <select id="deskFocus" aria-label="Desk klienta fokuss"></select>
+          </label>
+        </div>
+        <div id="deskTape" class="desk-tape" aria-label="Tirgu lente"></div>
+        <div class="desk-grid">
+          <div class="desk-main">
+            <article class="card desk-chart-card">
+              <div class="card-head">
+                <div>
+                  <h2 id="deskEpicTitle">Tirgus</h2>
+                  <div id="deskQuote" class="desk-quote muted">Gaida brokeri…</div>
+                </div>
+                <div id="deskLevels" class="desk-levels" aria-label="SL / Entry / TP"></div>
+              </div>
+              <canvas id="deskChart" width="960" height="420" aria-label="Live OHLC ar SL/TP"></canvas>
+            </article>
+            <article class="card">
+              <div class="card-head">
+                <h2>Live darījumi</h2>
+                <button type="button" class="text-link" data-jump="trades">Visi →</button>
+              </div>
+              <div id="deskDeals" class="table-wrap"></div>
+            </article>
+          </div>
+          <aside class="desk-side">
+            <article class="card desk-engine">
+              <div class="card-head"><h2>Engine</h2></div>
+              <div id="deskEngine" class="desk-engine-body"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Checklist</h2></div>
+              <div id="deskCheck" class="desk-check"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Intel</h2></div>
+              <div id="deskIntel" class="desk-intel"></div>
+            </article>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" data-view="overview">
         <div class="page-head">
           <h1>Komandcentrs</h1>
           <p>Visa flote vienā skatā</p>
@@ -242,7 +294,7 @@
       <section class="view" data-view="clients">
         <div class="page-head">
           <h1>Klienti</h1>
-          <p>Live flote — lot · side · TP · trail · OHLC pa pogu</p>
+          <p>Live flote — lot · side · SL/TP (OHLC) · OHLC logs pa pogu</p>
         </div>
         <div id="controlRoom" class="client-list"></div>
       </section>
@@ -335,6 +387,6 @@
     </div>
   </div>
   <script src="/admin/static/ohlc-chart.js?v=7"></script>
-  <script src="/admin/static/admin.js?v=100"></script>
+  <script src="/admin/static/admin.js?v=101"></script>
 </body>
 </html>

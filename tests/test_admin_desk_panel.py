@@ -1,0 +1,30 @@
+"""NEURAL Desk control panel — real Capital feeds, no fake equity/tape."""
+from pathlib import Path
+
+
+def test_desk_html_shell_present():
+    index = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'data-view="desk"' in index
+    assert 'id="deskChart"' in index
+    assert 'id="deskEngine"' in index
+    assert 'id="deskTape"' in index
+    assert 'id="deskFocus"' in index
+
+
+def test_desk_js_uses_live_endpoints_not_fake_curve():
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'function renderDesk' in js
+    assert '/api/admin/markets-ohlc' in js
+    assert 'structure-view' in js
+    assert 'Nav broker cash closes' in js
+    # Placeholder equity seed removed.
+    assert 'seed=[0,12,8,22' not in js
+
+
+def test_admin_card_exposes_desk_intel_fields():
+    from app.runtime_hub import RuntimeHub
+    src = Path('app/runtime_hub.py').read_text(encoding='utf-8')
+    assert 'economic_news_risk' in src
+    assert 'intermarket_analysis' in src
+    assert 'trail_enabled' in src
+    assert RuntimeHub is not None

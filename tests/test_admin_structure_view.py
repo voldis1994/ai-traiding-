@@ -111,12 +111,15 @@ def test_admin_markets_ohlc_empty_without_running_robots():
 
 
 def test_admin_per_client_ohlc_button_contract():
-    """Main Admin: no shared board / no card chart — OHLC opens via per-client button."""
+    """Desk wires markets-ohlc; Klienti cards still open per-client OHLC popup."""
     admin_js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     index = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'id="sharedOhlc"' not in index
     assert 'refreshSharedOhlc' not in admin_js
-    assert 'admin/markets-ohlc' not in admin_js
+    assert 'data-view="desk"' in index
+    assert 'id="deskChart"' in index
+    assert 'admin/markets-ohlc' in admin_js
+    assert 'renderDesk' in admin_js
     assert 'data-ohlc-client' not in admin_js
     assert 'data-act="ohlc"' in admin_js
     assert 'openClientOhlcWindow' in admin_js

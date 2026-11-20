@@ -2853,6 +2853,17 @@ class SingleTradeEngine:
             return []
         return ohlc_entry_zones.drop_forming_minute(raw)
 
+    def _bracket_atr_hint(self,mtf=None,candles=None):
+        """M1 ATR for swing SL/TP — same scale as Admin structure-view / entry zones.
+
+        ``stop_hint_atr14`` is M5 protective width; using it on LIVE brackets
+        inflated floors and disagreed with the Desk chart.
+        """
+        atr=ohlc_entry_zones._entry_band_atr(mtf,candles)
+        if atr is not None and atr>0:
+            return float(atr)
+        return None
+
     def _entry_wait_reason_retryable(self,reason):
         """True when HOLD was only waiting for zone / soft MTF — retry mid-bar.
 
@@ -4734,12 +4745,12 @@ class SingleTradeEngine:
             (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
         mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+        atr_hint=self._bracket_atr_hint(mtf_live,candles)
         kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
         if kama_hint is None:
             kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
         decided=bracket_learn.decide_brackets_from_ohlc(
-            zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
+            zone,tick=tick,spread=spread,min_distance=min_d,tighten=1.0,
             entry=entry,action=proposal,candles=candles,atr=atr_hint,
             kama=kama_hint,require_swing=True,store=self.store)
         # Same rule as LIVE OPEN — no invented median ±distance for shadow.
@@ -5945,7 +5956,7 @@ class SingleTradeEngine:
             buffer=max(2*float(tick),2*spread)
             base_sl=max(float(min_dist)+buffer,float(rng or 0))
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+            atr_hint=self._bracket_atr_hint(mtf_live,candles)
             kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
             if kama_hint is None:
                 kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
@@ -6300,7 +6311,7 @@ class SingleTradeEngine:
                     'reason':self.last_entry_reason,'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
                 return
-            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+            atr_hint=self._bracket_atr_hint(mtf_live,candles)
             kama_hint=None
             try:
                 kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
@@ -6308,11 +6319,10 @@ class SingleTradeEngine:
                     kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
             except (TypeError,AttributeError):
                 kama_hint=None
-            # tighten∈(0,1] shrinks SL/TP toward entry — break needs a closer stop.
-            break_tighten=0.85 if zone_gate.get('trigger')=='break' else 1.0
+            # Swing SL/TP: tighten=1.0 — aggression/break never soft-move pivots.
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0)*break_tighten,
+                tighten=1.0,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
                 kama=kama_hint,require_swing=True,store=self.store)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.

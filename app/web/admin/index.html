@@ -308,10 +308,14 @@
               <label>Brokeris
                 <select name="broker_type" id="brokerType" required></select>
               </label>
-              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
+              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa LIVE"></label>
               <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
               <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
               <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
+              <label id="baseUrlLabel" hidden>API base URL
+                <input name="base_url" id="brokerBaseUrl" maxlength="512" placeholder="https://api-….example.com" autocomplete="off">
+              </label>
+              <p class="muted" id="brokerHint">Capital.com · IG · vai Capital-compatible host ar API key.</p>
               <button class="btn btn-primary" type="submit">
                 <svg class="ico"><use href="#i-play"></use></svg>
                 Saglabāt un palaist
@@ -335,6 +339,6 @@
     </div>
   </div>
   <script src="/admin/static/ohlc-chart.js?v=7"></script>
-  <script src="/admin/static/admin.js?v=100"></script>
+  <script src="/admin/static/admin.js?v=101"></script>
 </body>
 </html>

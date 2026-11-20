@@ -859,10 +859,22 @@ async function loadBrokers(){
   const sel=$('brokerType');sel.innerHTML='';
   (data.brokers||[]).forEach(b=>{
     const o=document.createElement('option');o.value=b.id;
-    o.textContent=b.label+(b.status==='slot'?' (slot)':'');
+    o.textContent=b.label;
+    o.dataset.needsBaseUrl=b.needs_base_url?'1':'0';
     if(b.status==='slot')o.disabled=true;
     sel.appendChild(o);
   });
+  syncBrokerBaseUrl();
+  sel.onchange=syncBrokerBaseUrl;
+}
+function syncBrokerBaseUrl(){
+  const sel=$('brokerType');
+  const opt=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  const need=opt&&opt.dataset.needsBaseUrl==='1';
+  const wrap=$('baseUrlLabel');
+  const input=$('brokerBaseUrl');
+  if(wrap)wrap.hidden=!need;
+  if(input){input.required=!!need;if(!need)input.value='';}
 }
 
 function cardContentKey(c){
@@ -1064,7 +1076,7 @@ $('brokerForm').onsubmit=async ev=>{
   const raw=Object.fromEntries(new FormData(ev.target).entries());
   const client_id=Number(raw.client_id);
   const body={broker_type:raw.broker_type,display_name:raw.display_name,api_key:raw.api_key,
-    identifier:raw.identifier,password:raw.password};
+    identifier:raw.identifier,password:raw.password,base_url:raw.base_url||''};
   try{
     await api('/api/admin/clients/'+client_id+'/broker','POST',body);
     $('brokerMsg').textContent='Brokeris saglabāts, robots palaists.';

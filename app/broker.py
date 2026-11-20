@@ -9,6 +9,7 @@ import httpx
 
 LIVE='https://api-capital.backend-capital.com'
 DEMO='https://demo-api-capital.backend-capital.com'
+STREAM='wss://api-streaming-capital.backend-capital.com/connect'
 
 
 def capital_api_time(value):
@@ -42,16 +43,23 @@ def capital_api_time(value):
 
 
 class CapitalBroker:
-    def __init__(self, api_key, identifier, password, live=True, client=None):
+    """Capital.com Open API. Also hosts Capital-compatible white-labels via base_url."""
+
+    def __init__(self, api_key, identifier, password, live=True, client=None,
+                 base_url=None, api_key_header='X-CAP-API-KEY', streaming_url=None):
         self.api_key=api_key;self.identifier=identifier;self.password=password
-        self.base=LIVE if live else DEMO
+        self.api_key_header=api_key_header or 'X-CAP-API-KEY'
+        self.base=(base_url or (LIVE if live else DEMO)).rstrip('/')
+        self.streaming_url=streaming_url if streaming_url is not None else (
+            STREAM if not base_url else None)
         self.client=client or httpx.AsyncClient(base_url=self.base, timeout=15.0, follow_redirects=False)
         self.cst=None;self.security=None
         self._relogin=asyncio.Lock()
 
     async def connect(self):
         # Non-encrypted password is sent over HTTPS per broker session API.
-        response=await self.client.post('/api/v1/session',headers={'X-CAP-API-KEY':self.api_key},
+        response=await self.client.post('/api/v1/session',
+            headers={self.api_key_header:self.api_key},
             json={'identifier':self.identifier,'password':self.password,'encryptedPassword':False})
         response.raise_for_status()
         self.cst=response.headers.get('CST');self.security=response.headers.get('X-SECURITY-TOKEN')
@@ -60,7 +68,7 @@ class CapitalBroker:
 
     def headers(self):
         if not self.cst or not self.security:raise RuntimeError('Not authenticated')
-        return {'CST':self.cst,'X-SECURITY-TOKEN':self.security,'X-CAP-API-KEY':self.api_key}
+        return {'CST':self.cst,'X-SECURITY-TOKEN':self.security,self.api_key_header:self.api_key}
 
     async def _request(self,method,path,*,params=None,json=None):
         response=await self.client.request(method,path,headers=self.headers(),params=params,json=json)

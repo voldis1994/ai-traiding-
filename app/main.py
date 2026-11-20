@@ -35,19 +35,27 @@ hub=RuntimeHub(platform)
 WEB=Path(__file__).parent/'web'
 
 
+_WEAK_ADMIN_PASSWORDS=frozenset({
+    'admin123','change-me-now','password','admin','changeme',
+    'ChangeMe_LocalOnly_9x!','ChangeMe_LocalOnly_9x','123456','adminadmin',
+})
+
+
 def _bootstrap_admin():
     from .config import env_flag
     user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
     password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
-    if env_flag('NTA_PRODUCTION') and password in ('admin123','change-me-now','password','admin'):
+    if env_flag('NTA_PRODUCTION') and (
+            password in _WEAK_ADMIN_PASSWORDS or len(password)<12):
         logging.error('Refusing weak NTA_ADMIN_PASSWORD in production — set a strong secret')
         raise RuntimeError('Set a strong NTA_ADMIN_PASSWORD before production start')
     if platform.admin_count()==0:
         platform.ensure_admin(user,password)
         logging.warning('Bootstrapped admin user %r — change NTA_ADMIN_PASSWORD if still default',user)
     else:
-        # Ensure configured admin exists (idempotent username).
-        platform.ensure_admin(user,password)
+        # Sync env password onto existing admin so a volume with admin123
+        # cannot outlive a strong NTA_ADMIN_PASSWORD (audit).
+        platform.ensure_admin(user,password,sync_password=True)
 
 
 async def worker():
@@ -271,7 +279,13 @@ async def client_page_slash():return RedirectResponse('/app')
 # ---------- legacy operator Capital.com console ----------
 @app.post('/api/connect')
 async def connect(data:Credentials):
-    global stream_task
+    global stream_task,SESSION
+    from .config import env_flag
+    # Public deploy must use Admin→client broker attach — unauthenticated LIVE
+    # attach is a critical risk when the host is reachable on 0.0.0.0.
+    if env_flag('NTA_PRODUCTION') and not env_flag('NTA_ALLOW_LEGACY_CONNECT'):
+        raise HTTPException(403,
+            'Legacy /api/connect disabled in production — use /admin broker attach')
     # Legacy console must not steal a hub client's Capital LIVE session.
     dupes=platform.find_clients_with_api_key('capital_com',data.api_key.strip())
     if dupes:
@@ -306,6 +320,8 @@ async def connect(data:Credentials):
     store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized',
                 {'data_dir':str(DATA),'sqlite':str(store.path),
                  'mandate_requires_new_manual_trade':engine.mandate is None})
+    # Rotate process session on every connect so a stolen cookie dies.
+    SESSION=secrets.token_urlsafe(48)
     response=JSONResponse({'ok':True,'live':True,'automatic':True,
                            'data_dir':str(DATA),'mandate':engine.mandate})
     _set_session_cookie(response,COOKIE,SESSION)
@@ -366,14 +382,9 @@ async def prepare_new_market(_:bool=Depends(require_auth)):
 
 @app.post('/api/emergency')
 async def emergency(_:bool=Depends(require_auth)):
-    engine.armed=False;engine.operator_paused=True
-    if len(engine.positions)==1:
-        engine.execution_enabled=True
-        async with engine.lock:
-            await engine.exit_position(engine.positions[0]['dealId'])
-    engine.execution_enabled=False
-    store.event('control','Emergency stop requested; future entries disabled')
-    return {'ok':True,'positions':engine.positions}
+    async with engine.lock:
+        result=await engine.emergency_flatten()
+    return {'ok':True,**result}
 
 @app.get('/api/history')
 async def history(_:bool=Depends(require_auth)):
@@ -385,21 +396,23 @@ async def code(_:bool=Depends(require_auth)):
 
 @app.post('/api/logout')
 async def logout(_:bool=Depends(require_auth)):
+    global SESSION
     engine.armed=False;engine.execution_enabled=False
     if engine.broker:await engine.broker.close()
     engine.broker=None;engine.mandate=None
     store.set('mandate',None)
-    response=JSONResponse({'ok':True});response.delete_cookie(COOKIE);return response
+    # Invalidate legacy cookie for everyone after logout.
+    SESSION=secrets.token_urlsafe(48)
+    response=JSONResponse({'ok':True});response.delete_cookie(COOKIE,path='/');return response
 
 @app.get('/api/health')
 async def health():
+    # Public readiness only — do not leak tenant counts to recon.
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
             'portals':{'home':'/admin','operator':'/admin','admin':'/admin','client':'/app',
                        'portal':'/portal'},
             'public_url':public_base_url(),
-            'secure_cookies':cookie_secure(),
-            'clients':len(platform.list_clients()),
-            'running_robots':len(hub.all_runtimes())}
+            'secure_cookies':cookie_secure()}
 
 # ---------- admin portal API ----------
 @app.post('/api/admin/login')
@@ -536,6 +549,14 @@ async def admin_pause_client(client_id:int,_:dict=Depends(require_admin)):
     rt.engine.armed=False;rt.engine.execution_enabled=False;rt.engine.operator_paused=True
     rt.store.event('control','Paused by admin')
     return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+
+@app.post('/api/admin/clients/{client_id}/emergency')
+async def admin_emergency_client(client_id:int,_:dict=Depends(require_admin)):
+    rt=hub.get(client_id)
+    if not rt or not rt.started:raise HTTPException(409,'Robots nav palaists')
+    async with rt.engine.lock:
+        result=await rt.engine.emergency_flatten()
+    return {'ok':True,**result,'card':hub.admin_client_card(platform.get_client(client_id))}
 
 @app.post('/api/admin/clients/{client_id}/resume')
 async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
@@ -737,6 +758,14 @@ async def client_pause(client=Depends(require_client)):
     rt.engine.armed=False;rt.engine.execution_enabled=False;rt.engine.operator_paused=True
     rt.store.event('control','Paused by client')
     return {'ok':True,'view':rt.client_view()}
+
+@app.post('/api/client/emergency')
+async def client_emergency(client=Depends(require_client)):
+    rt=hub.get(client['id'])
+    if not rt or not rt.engine.broker:raise HTTPException(409,'Robot not connected')
+    async with rt.engine.lock:
+        result=await rt.engine.emergency_flatten()
+    return {'ok':True,**result,'view':rt.client_view()}
 
 @app.post('/api/client/resume')
 async def client_resume(client=Depends(require_client)):

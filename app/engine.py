@@ -2193,10 +2193,12 @@ class SingleTradeEngine:
             # IMPORTANT: never return before candle bootstrap — thin hist after
             # market switch must keep growing even while protect waits for swings.
             protect_pending=False
-            if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
-                await self.protect_position(self.positions[0])
-                if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
-                    protect_pending=True
+            # Protect every live deal (multi-pos audit) — never leave a naked add.
+            for pos in list(self.positions or []):
+                if self._needs_protect_brackets(pos):
+                    await self.protect_position(pos)
+            if any(self._needs_protect_brackets(pos) for pos in (self.positions or [])):
+                protect_pending=True
 
             if self.positions:
                 # News/liquidity downloads are background-only while an open
@@ -2215,10 +2217,12 @@ class SingleTradeEngine:
             await self._account_and_candles()
             if protect_pending:
                 # Retry protect once hist may have grown this poll.
-                if len(self.positions)==1 and self._needs_protect_brackets(self.positions[0]):
-                    await self.protect_position(self.positions[0])
-                if len(self.positions)==1 and _broker_price_level(self.positions[0].get('stopLevel')) is None:
-                    # Still no SL — skip neural OPEN; trail waits for stop.
+                for pos in list(self.positions or []):
+                    if self._needs_protect_brackets(pos):
+                        await self.protect_position(pos)
+                if any(_broker_price_level(pos.get('stopLevel')) is None
+                       for pos in (self.positions or [])):
+                    # Still no SL on any deal — skip neural OPEN; trail waits for stop.
                     return
             # LIVE context: include closed QUOTE minutes too. PK(epic,at) means a
             # minute written as QUOTE during the forming bar is excluded forever by
@@ -2489,18 +2493,15 @@ class SingleTradeEngine:
                 except Exception as exc:
                     self.store.event('warning','hold_shadow resolve skipped',
                                     {'type':type(exc).__name__})
-            if len(self.positions)==1:
-                p=self.positions[0]
+            if self.positions:
                 # Missing SL always; missing TP once for manual/OPEN (not after trail).
-                # Only hard-stop the poll when SL is still Off — TP-only retry must
-                # keep running so Admin brief / trail enroll can update (andris case).
-                if self._needs_protect_brackets(p):
-                    await self.protect_position(p)
-                    if (len(self.positions)==1 and
-                            _broker_price_level(self.positions[0].get('stopLevel')) is None):
-                        return
-                    if self.positions:
-                        p=self.positions[0]
+                # Multi-pos: protect every deal — a second fill must not stay naked.
+                for pos in list(self.positions or []):
+                    if self._needs_protect_brackets(pos):
+                        await self.protect_position(pos)
+                if any(_broker_price_level(pos.get('stopLevel')) is None
+                       for pos in (self.positions or [])):
+                    return
                 # Reverse exit: evaluate each new M1 from *manage* scores (fresh
                 # perception), not the frozen OPEN vote. Confirmed opposite +
                 # aligned 5/15m returns → market CLOSE so we stop fighting the
@@ -2519,35 +2520,37 @@ class SingleTradeEngine:
                     self.last_exit_processed_bar!=exit_bar):
                     self.last_exit_processed_bar=exit_bar
                     vote=self.policy.neural_decision(scores)
-                    streak_key='exit_opposite_streak:'+str(p['dealId'])
-                    if vote in ('BUY','SELL') and vote!=p['direction']:
-                        streak=int(self.store.get(streak_key) or 0)+1
-                    else:
-                        streak=0
-                    self.store.set(streak_key,streak)
                     mtf_live=self._mtf_momentum_analysis()
                     from .self_params import get as sp_get
                     base_streak=int(sp_get(self.store,'exit_need_streak',2))
                     need_streak=mtf_momentum.exit_need_streak(
                         mtf_live,store=self.store,default=base_streak)
-                    intent=self.policy.evaluate_neural_exit(
-                        scores,p['direction'],
-                        returns_bps=self.market_context.get('returns_bps'),
-                        opposite_streak=streak,need_streak=need_streak,
-                        store=self.store)
-                    if intent=='CLOSE':
-                        self.store.event('exit',
-                            'Neural CLOSE on confirmed reverse — market exit',
-                            {'deal_id':p['dealId'],'direction':p['direction'],
-                             'vote':vote,'streak':streak,
-                             'need_streak':need_streak,
-                             'mtf_mode':(mtf_live or {}).get('mode'),
-                             'returns_bps':self.market_context.get('returns_bps'),
-                             'manage_bar':manage_bar,
-                             'neural_market_exit':True})
-                        await self.exit_position(p['dealId'])
-                        return
-                await self.adapt_protection(p)
+                    for p in list(self.positions or []):
+                        streak_key='exit_opposite_streak:'+str(p['dealId'])
+                        if vote in ('BUY','SELL') and vote!=p['direction']:
+                            streak=int(self.store.get(streak_key) or 0)+1
+                        else:
+                            streak=0
+                        self.store.set(streak_key,streak)
+                        intent=self.policy.evaluate_neural_exit(
+                            scores,p['direction'],
+                            returns_bps=self.market_context.get('returns_bps'),
+                            opposite_streak=streak,need_streak=need_streak,
+                            store=self.store)
+                        if intent=='CLOSE':
+                            self.store.event('exit',
+                                'Neural CLOSE on confirmed reverse — market exit',
+                                {'deal_id':p['dealId'],'direction':p['direction'],
+                                 'vote':vote,'streak':streak,
+                                 'need_streak':need_streak,
+                                 'mtf_mode':(mtf_live or {}).get('mode'),
+                                 'returns_bps':self.market_context.get('returns_bps'),
+                                 'manage_bar':manage_bar,
+                                 'neural_market_exit':True})
+                            await self.exit_position(p['dealId'])
+                            return
+                for pos in list(self.positions or []):
+                    await self.adapt_protection(pos)
                 # No self-dev / feature search while a LIVE deal is open — that
                 # mutates entry-policy architecture under an active manage MDP.
             elif (len(self.positions)==0 and self.last_signal and
@@ -3489,19 +3492,41 @@ class SingleTradeEngine:
                 return True
             raise RuntimeError('Accepted request not reconciled with broker positions')
         self.store.order_update(order_id,'CONFIRMED',ref)
-        if kind=='OPEN' and self.positions:
-            p=self.positions[0]
-            # Persist origin so a later reconnect does not mistake a robot
-            # deal for a NEW manual mandate.
-            self.store.set('robot_open:'+str(p['dealId']),True)
-            self.store.set('latest_robot_deal_id',p['dealId'])
-            # First UPL snap at OPEN — scratch closes may never see another poll.
-            self._snapshot_open_upl(p)
-            # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
-            self._enroll_adaptive_protection(p,force=True)
-        if kind=='PROTECT' and self.positions:
-            p=self.positions[0]
-            if p.get('dealId')==deal_id and self.store.get('robot_open:'+str(deal_id)):
+        if kind=='OPEN':
+            # Always bind confirm dealId — never assume positions[0] (multi-pos audit).
+            conf_deal=confirmation.get('dealId') or confirmation.get('dealID') or deal_id
+            p=next((x for x in (self.positions or [])
+                    if conf_deal is not None and str(x.get('dealId'))==str(conf_deal)),None)
+            if p is None and len(self.positions or [])==1:
+                p=self.positions[0]
+            if p is not None:
+                deal_s=str(p['dealId'])
+                # Persist origin so a later reconnect does not mistake a robot
+                # deal for a NEW manual mandate.
+                self.store.set('robot_open:'+deal_s,True)
+                self.store.set('latest_robot_deal_id',p['dealId'])
+                # Keep OPEN distances so protect can repair naked Capital fills
+                # without inventing a new ATR/swing search.
+                if isinstance(req,dict):
+                    self.store.set('open_brackets:'+deal_s,{
+                        'stop_distance':req.get('stop_distance'),
+                        'profit_distance':req.get('profit_distance'),
+                        'direction':p.get('direction'),
+                        'entry':p.get('level'),
+                        'at':now(),
+                    })
+                # First UPL snap at OPEN — scratch closes may never see another poll.
+                self._snapshot_open_upl(p)
+                # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
+                self._enroll_adaptive_protection(p,force=True)
+                if _broker_price_level(p.get('stopLevel')) is None:
+                    self.store.event('protection',
+                        'OPEN confirmed without live SL — queueing protect from OPEN snapshot',
+                        {'deal_id':deal_s})
+        if kind=='PROTECT' and deal_id is not None:
+            p=next((x for x in (self.positions or [])
+                    if str(x.get('dealId'))==str(deal_id)),None)
+            if p is not None and self.store.get('robot_open:'+str(deal_id)):
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
@@ -5803,41 +5828,56 @@ class SingleTradeEngine:
         # Same completed-bar window as LIVE OPEN — no forming minute, no invent.
         epic=p.get('epic') or (self.mandate or {}).get('epic')
         candles=self._decision_candles(epic)
-        if len(candles)<20:
-            self._protect_defer(p,'waiting completed OHLC',bars=len(candles))
-            return
-        zone=bracket_learn.zone_at_open(candles,multi_tf=True)
-        rng=zone['range_distance'] or ohlc_range_distance(candles)
-        spread=float(self.market.get('spread') or 0)
-        buffer=max(2*float(tick),2*spread)
-        base_sl=max(float(min_dist)+buffer,float(rng or 0))
         level=float(_broker_price_level(p.get('level'),p.get('level')) or mid)
         direction=p.get('direction')
-        mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
-        kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
-        if kama_hint is None:
-            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
-        bp=bracket_learn.propose_for_open(
-            self.store,ohlc_kappa=zone.get('kappa'),
-            base_sl=base_sl,max_tp=zone.get('max_tp'),
-            candles=candles,tick=tick,spread=spread,
-            min_distance=min_dist,entry=level,action=direction,
-            atr=atr_hint,kama=kama_hint,require_swing=True)
-        # SL/TP only from OHLC swing anchors — never invent ATR/median brackets
-        # (manual or robot). Wait for pivots instead of painting fantasy levels.
-        decided_sl=_num(bp.get('stop_distance'))
-        decided_tp=_num(bp.get('profit_distance'))
-        stop_lvl=_broker_price_level(bp.get('stop_level'))
-        profit_lvl=_broker_price_level(bp.get('profit_level'))
-        source=bp.get('bracket_source') or 'swing_anchor'
         sign=1 if direction=='BUY' else -1
-        if not (bp.get('ready') and decided_sl and decided_tp
-                and decided_sl>0 and decided_tp>0):
-            self._protect_defer(p,'no OHLC swing SL/TP',
-                               swing_reason=bp.get('reason'),
-                               bracket_source=bp.get('bracket_source'))
-            return
+        decided_sl=decided_tp=stop_lvl=profit_lvl=None
+        source='swing_anchor'
+        bp={}
+        # Prefer OHLC swing; if thin/unavailable, repair from OPEN snapshot
+        # (same distances Capital was sent) so a naked fill is never left bare.
+        snap=self.store.get('open_brackets:'+deal_s) or {}
+        snap_sl=_num(snap.get('stop_distance')) if isinstance(snap,dict) else None
+        snap_tp=_num(snap.get('profit_distance')) if isinstance(snap,dict) else None
+        if len(candles)>=20:
+            zone=bracket_learn.zone_at_open(candles,multi_tf=True)
+            rng=zone['range_distance'] or ohlc_range_distance(candles)
+            spread=float(self.market.get('spread') or 0)
+            buffer=max(2*float(tick),2*spread)
+            base_sl=max(float(min_dist)+buffer,float(rng or 0))
+            mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
+            if kama_hint is None:
+                kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+            bp=bracket_learn.propose_for_open(
+                self.store,ohlc_kappa=zone.get('kappa'),
+                base_sl=base_sl,max_tp=zone.get('max_tp'),
+                candles=candles,tick=tick,spread=spread,
+                min_distance=min_dist,entry=level,action=direction,
+                atr=atr_hint,kama=kama_hint,require_swing=True)
+            decided_sl=_num(bp.get('stop_distance'))
+            decided_tp=_num(bp.get('profit_distance'))
+            stop_lvl=_broker_price_level(bp.get('stop_level'))
+            profit_lvl=_broker_price_level(bp.get('profit_level'))
+            source=bp.get('bracket_source') or 'swing_anchor'
+        if not (decided_sl and decided_tp and decided_sl>0 and decided_tp>0):
+            if snap_sl and snap_tp and snap_sl>0 and snap_tp>0 and direction in ('BUY','SELL'):
+                decided_sl=float(snap_sl);decided_tp=float(snap_tp)
+                stop_lvl=level-sign*float(decided_sl)
+                profit_lvl=level+sign*float(decided_tp)
+                source='open_snapshot'
+                self.store.event('protection','Protect from OPEN bracket snapshot',{
+                    'deal_id':deal_s,'stop_distance':decided_sl,
+                    'profit_distance':decided_tp})
+            else:
+                if len(candles)<20:
+                    self._protect_defer(p,'waiting completed OHLC',bars=len(candles))
+                else:
+                    self._protect_defer(p,'no OHLC swing SL/TP',
+                                       swing_reason=(bp or {}).get('reason'),
+                                       bracket_source=(bp or {}).get('bracket_source'))
+                return
         if stop_lvl is None and live_sl is None and decided_sl:
             stop_lvl=level-sign*float(decided_sl)
         if profit_lvl is None and live_tp is None and decided_tp:
@@ -6031,6 +6071,10 @@ class SingleTradeEngine:
     async def submit(self,action,broker_market=None):
         if self.pending_order or self.pending_close or self.positions or not self.armed or not self.execution_enabled or not self.mandate:return
         if action not in ('BUY','SELL') or self.last_closed_step<0:return
+        # Uncertain prior OPEN must block a second POST (audit: no double-fire).
+        if any(op.get('kind')=='OPEN' for op in (self.store.unresolved() or [])):
+            self.last_entry_reason='OPEN still unresolved — waiting broker reconcile'
+            return
         # Never submit when the learned market context is stale/incomplete.
         if not self.market_context.get('ready'):return
         # After fusion transition: never open on a stale signal during EXTERNAL gap.
@@ -6307,23 +6351,67 @@ class SingleTradeEngine:
                     stop_distance=brackets['stop_distance'],profit_distance=brackets['profit_distance'])
                 self.last_order_ref=receipt.get('dealReference')
                 await self._confirm_reconcile(receipt,oid,'OPEN')
-                if self.positions and self._pending_entry_brain:
-                    deal_id=self.positions[0].get('dealId')
-                    key='entry_brain:'+str(deal_id)
-                    if deal_id and self.store.get(key) is None:
+                # Bind entry brain to confirm dealId (not positions[0] under multi-pos).
+                conf_deal=None
+                for pos in (self.positions or []):
+                    if self.store.get('robot_open:'+str(pos.get('dealId'))):
+                        if self.store.get('latest_robot_deal_id')==pos.get('dealId'):
+                            conf_deal=pos.get('dealId')
+                            break
+                if conf_deal is None and self.positions:
+                    conf_deal=self.store.get('latest_robot_deal_id') or self.positions[0].get('dealId')
+                if conf_deal and self._pending_entry_brain:
+                    key='entry_brain:'+str(conf_deal)
+                    if self.store.get(key) is None:
                         pending=self._pending_entry_brain
-                        self.store.set(key,{**pending,
-                            'entry':self.positions[0].get('level') if self.positions[0].get('level') is not None else pending.get('entry')})
+                        live=next((x for x in (self.positions or [])
+                                   if str(x.get('dealId'))==str(conf_deal)),None)
+                        entry=(live or {}).get('level') if live else pending.get('entry')
+                        self.store.set(key,{**pending,'entry':entry if entry is not None else pending.get('entry')})
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
+                # Immediate repair if Capital left SL Off after ACCEPTED OPEN.
+                naked=next((x for x in (self.positions or [])
+                            if str(x.get('dealId'))==str(conf_deal)
+                            and _broker_price_level(x.get('stopLevel')) is None),None)
+                if naked is not None:
+                    await self.protect_position(naked)
             except Exception as exc:
-                self.store.order_update(oid,'SUPERSEDED',self.last_order_ref)
+                # Keep UNCERTAIN — never SUPERSEDE a live-risk OPEN on soft failure
+                # (timeout / lag), or the next poll can double-fire a second POST.
+                self.store.order_update(oid,'UNCERTAIN',self.last_order_ref)
                 self._pending_entry_brain=None
                 self.store.event('error',
-                    'Entry outcome uncertain; no automatic retry (not paused)',
-                    {'type':type(exc).__name__})
-                self._ensure_live_unless_operator_paused()
+                    'Entry outcome UNCERTAIN; blocking new OPEN until reconcile',
+                    {'type':type(exc).__name__,'order_id':oid,
+                     'reference':self.last_order_ref})
         finally:self.pending_order=False
+
+    async def emergency_flatten(self):
+        """Operator emergency: pause entries and close every live deal."""
+        self.armed=False
+        self.operator_paused=True
+        deals=[p.get('dealId') for p in list(self.positions or []) if p.get('dealId')]
+        closed=[]
+        for deal_id in deals:
+            try:
+                # _release_execution_after_flat clears execution under operator_paused —
+                # re-arm for each remaining deal until the batch finishes.
+                self.execution_enabled=True
+                await self.exit_position(deal_id)
+                still=any(str(p.get('dealId'))==str(deal_id)
+                          for p in (self.positions or []))
+                if not still:
+                    closed.append(deal_id)
+            except Exception as exc:
+                self.store.event('error','Emergency flatten failed for deal',{
+                    'deal_id':deal_id,'type':type(exc).__name__})
+        self.execution_enabled=False
+        self.armed=False
+        self.operator_paused=True
+        self.store.event('control','Emergency flatten requested',
+                         {'closed':closed,'remaining':len(self.positions or [])})
+        return {'closed':closed,'positions':list(self.positions or [])}
     def _lock_entry_signal_for_open(self):
         """Pin Admin/UI BUY/HOLD/SELL to the OPEN vote for the whole deal."""
         import copy

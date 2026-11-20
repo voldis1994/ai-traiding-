@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from typing import Any,Optional
 
@@ -69,11 +69,17 @@ class PlatformStore:
         self.db.commit()
 
     # --- admin bootstrap ---
-    def ensure_admin(self,username: str,password: str) -> dict:
-        row=self.db.execute('SELECT id,username FROM admins WHERE username=? COLLATE NOCASE',
-                            (username,)).fetchone()
+    def ensure_admin(self,username: str,password: str,*,sync_password: bool=False) -> dict:
+        row=self.db.execute(
+            'SELECT id,username,password_hash FROM admins WHERE username=? COLLATE NOCASE',
+            (username,)).fetchone()
         if row:
-            return dict(row)
+            if sync_password and password and not verify_password(password,row['password_hash']):
+                self.db.execute('UPDATE admins SET password_hash=? WHERE id=?',
+                                (hash_password(password),row['id']))
+                self.delete_sessions_for('admin',int(row['id']))
+                self.db.commit()
+            return {'id':row['id'],'username':row['username']}
         cur=self.db.execute(
             'INSERT INTO admins(username,password_hash,created) VALUES(?,?,?)',
             (username,hash_password(password),_now()))
@@ -100,22 +106,47 @@ class PlatformStore:
                 'language':row['language'],'role':'client'}
 
     # --- sessions ---
-    def create_session(self,role: str,subject_id: int) -> str:
+    SESSION_TTL_HOURS=12
+
+    def create_session(self,role: str,subject_id: int,*,ttl_hours: int|None=None) -> str:
         token=secrets.token_urlsafe(32)
-        self.db.execute('INSERT INTO sessions(token,role,subject_id,created) VALUES(?,?,?,?)',
-                        (token,role,subject_id,_now()))
+        hours=int(ttl_hours if ttl_hours is not None else self.SESSION_TTL_HOURS)
+        hours=max(1,min(168,hours))
+        created=datetime.now(timezone.utc)
+        expires=(created+timedelta(hours=hours)).isoformat(timespec='seconds')
+        self.db.execute(
+            'INSERT INTO sessions(token,role,subject_id,created,expires) VALUES(?,?,?,?,?)',
+            (token,role,subject_id,created.isoformat(timespec='seconds'),expires))
         self.db.commit()
         return token
 
     def get_session(self,token: str|None) -> Optional[dict]:
         if not token:return None
-        row=self.db.execute('SELECT token,role,subject_id,created FROM sessions WHERE token=?',
-                            (token,)).fetchone()
-        return dict(row) if row else None
+        row=self.db.execute(
+            'SELECT token,role,subject_id,created,expires FROM sessions WHERE token=?',
+            (token,)).fetchone()
+        if not row:return None
+        exp=row['expires']
+        if exp:
+            try:
+                exp_dt=datetime.fromisoformat(str(exp).replace('Z','+00:00'))
+                if exp_dt.tzinfo is None:
+                    exp_dt=exp_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc)>=exp_dt:
+                    self.delete_session(token)
+                    return None
+            except (TypeError,ValueError):
+                pass
+        return dict(row)
 
     def delete_session(self,token: str|None):
         if not token:return
         self.db.execute('DELETE FROM sessions WHERE token=?',(token,))
+        self.db.commit()
+
+    def delete_sessions_for(self,role: str,subject_id: int):
+        self.db.execute('DELETE FROM sessions WHERE role=? AND subject_id=?',
+                        (role,int(subject_id)))
         self.db.commit()
 
     # --- clients ---
@@ -185,6 +216,8 @@ class PlatformStore:
         self.db.execute('UPDATE clients SET password_hash=? WHERE id=?',
                         (hash_password(password),client_id))
         self.db.commit()
+        # Steal-proof: old cookies die when the password changes.
+        self.delete_sessions_for('client',int(client_id))
         return self.get_client(client_id)
 
     def find_clients_with_api_key(self,broker_type: str,api_key: str,

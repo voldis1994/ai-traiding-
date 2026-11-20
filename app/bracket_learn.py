@@ -957,13 +957,15 @@ def cap_far_swing_sl(*, action, entry, stop_level, stop_d, floor, atr=None,
 
 def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
                  floor, min_rr=None, store=None, atr_locked=False, atr=None,
-                 highs=None, lows=None) -> dict:
+                 highs=None, lows=None, allow_soft_shrink=True) -> dict:
     """Enforce ``profit_d / stop_d >= min_rr`` without swapping SL↔TP.
 
     Order (after far-SL ATR cap):
       1. Prefer a farther structural TP that clears RR (correct side only).
       2. Soft-shrink SL toward entry — but if ATR-locked, never below ~1×ATR
-         (no hairline stop that looked like TP/SL swapped).
+         (no hairline stop that looked like TP/SL swapped). When
+         ``allow_soft_shrink=False`` (kept far OHLC swing), skip this step —
+         never invent a non-pivot soft stop that abandons structure.
       3. Else refuse — never invent fantasy TP.
     """
     rr_need = float(min_rr) if min_rr is not None else _min_rr(store)
@@ -1008,6 +1010,11 @@ def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
             'reason': 'rr_extend_tp',
             'swing_hi': ext.get('swing_hi'), 'swing_lo': ext.get('swing_lo'),
         }
+    if not allow_soft_shrink:
+        return dict(out, ok=False,
+                    reason='rr_need_farther_tp_keep_swing',
+                    stop_distance=stop_d, profit_distance=profit_d,
+                    rr=profit_d / stop_d)
     # Soft shrink SL — never below soft_floor (1×ATR when ATR-locked).
     capped = float(profit_d) / rr_need
     if capped + 1e-12 < soft_floor:
@@ -1194,13 +1201,16 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         # Far OHLC swing kept — never rewrite to ATR invent.
         reason = str(reason) + '+keep_far_swing'
 
-    # 2) Min RR — prefer farther TP; never hairline a kept far swing SL.
-    atr_locked = bool(far.get('capped') or far.get('reason') == 'keep_far_swing')
+    # 2) Min RR — prefer farther TP; never soft-shrink a kept far OHLC swing
+    # into an invented ATR stop (that abandoned structure and looked swapped).
+    keep_far = far.get('reason') == 'keep_far_swing'
+    atr_locked = bool(far.get('capped') or keep_far)
     rr = apply_min_rr(
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
         floor=floor, store=store, atr_locked=atr_locked,
-        atr=atr_v, highs=highs, lows=lows)
+        atr=atr_v, highs=highs, lows=lows,
+        allow_soft_shrink=not keep_far)
     if not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
                     stop_distance=float(stop_d), profit_distance=float(profit_d),

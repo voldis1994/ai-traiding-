@@ -85,7 +85,8 @@ def test_validated_reduced_margin_reaches_broker_only_after_manual_close(monkeyp
             original_tick=brain.tick
             def controlled_tick(*args,**kwargs):
                 result=original_tick(*args,**kwargs)
-                result['scores']={'BUY':.32,'SELL':.35,'HOLD':.33}
+                # Clear SELL lead so reentry raw/nudge agreement holds on fixtures.
+                result['scores']={'BUY':.22,'SELL':.55,'HOLD':.23}
                 result['action']='SELL'
                 return result
             brain.tick=controlled_tick

@@ -100,8 +100,19 @@ class AccountRuntime:
         has_sl=_live_lvl(p.get('stopLevel')) is not None
         has_tp=_live_lvl(p.get('profitLevel')) is not None
         enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
+        trail_on=bool(getattr(engine,'TRAIL_ENABLED',False))
         phase='flat'
-        if not deal:
+        # Trail disabled → never advertise armed/ratchet/trail phases (Admin honesty).
+        if not trail_on:
+            if not deal:
+                phase='unknown'
+            elif not has_sl or not has_tp:
+                phase='watch'  # brackets incomplete — protect should attach
+            elif not robot:
+                phase='manual'
+            else:
+                phase='flat'
+        elif not deal:
             phase='unknown'
         elif not robot:
             phase='manual'

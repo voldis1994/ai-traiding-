@@ -1514,11 +1514,15 @@ function renderDeal(p,ccy,activity){
   const dir=String(p.direction||'').toUpperCase();
   const sideCls=dir==='BUY'?'buy':(dir==='SELL'?'sell':'');
   const lot=p.size!=null?String(p.size):'—';
-  const tp=p.has_tp || p.profitLevel!=null;
-  const sl=p.has_sl || p.stopLevel!=null;
-  const phase=p.trail_phase||(p.enrolled?'armed':'flat');
+  // Capital 0 = Off — never treat 0/null as ON.
+  const slOn=!!(p.has_sl||(p.stopLevel!=null&&Number(p.stopLevel)>0));
+  const tpOn=!!(p.has_tp||(p.profitLevel!=null&&Number(p.profitLevel)>0));
+  const trailOn=activity&&activity.trail_enabled===true;
+  const phase=trailOn?(p.trail_phase||(p.enrolled?'armed':'flat')):'flat';
   const uplCcy=p.currency&&p.currency!==ccy?p.currency:ccy;
   const mid=positionMid(p,activity);
+  const slTxt=(p.stopLevel!=null&&Number(p.stopLevel)>0)?esc(num(p.stopLevel,2)):'OFF';
+  const tpTxt=(p.profitLevel!=null&&Number(p.profitLevel)>0)?esc(num(p.profitLevel,2)):'OFF';
   return `<div class="deal">
     <div class="side ${sideCls}">${esc(dir||'—')}</div>
     <div>
@@ -1527,15 +1531,15 @@ function renderDeal(p,ccy,activity){
         <span>Epic <strong>${esc(p.epic||'—')}</strong></span>
         <span>Entry <strong>${esc(num(p.level,2))}</strong></span>
         <span>Mid <strong>${mid==null?'—':esc(num(mid,2))}</strong></span>
-        <span>SL <strong>${p.stopLevel==null?'—':esc(num(p.stopLevel,2))}</strong></span>
-        <span>TP <strong>${p.profitLevel==null?'OFF':esc(num(p.profitLevel,2))}</strong></span>
+        <span>SL <strong>${slTxt}</strong></span>
+        <span>TP <strong>${tpTxt}</strong></span>
         <span>UPL <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
       </div>
     </div>
     <div class="flags">
-      <span class="flag ${sl?'on':'off'}">SL ${sl?'ON':'OFF'}</span>
-      <span class="flag ${tp?'on':'off'}">TP ${tp?'ON':'OFF'}</span>
-      ${trailFlag(phase)}
+      <span class="flag ${slOn?'on':'off'}">SL ${slOn?'ON':'OFF'}</span>
+      <span class="flag ${tpOn?'on':'off'}">TP ${tpOn?'ON':'OFF'}</span>
+      ${trailOn?trailFlag(phase):'<span class="flag trail-flat">TRAIL OFF</span>'}
     </div>
   </div>`;
 }

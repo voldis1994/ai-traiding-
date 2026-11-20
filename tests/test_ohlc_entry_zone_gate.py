@@ -11,14 +11,18 @@ from tests.test_learning_integrity import new_brain
 
 
 def _seed(store, epic='GOLD', n=80, start=2000.0):
+    """Trend+pullback path with real bodies (not wick-doji false positives)."""
     t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
     px = start
     rows = []
     for i in range(n):
         o = px
-        c = px + (0.15 if i % 7 else -0.35)
-        h = max(o, c) + 0.8 + (1.5 if i % 11 == 10 else 0.1)
-        l = min(o, c) - 0.8 - (1.5 if i % 11 == 5 else 0.1)
+        # Meaningful body vs ATR; occasional larger wick for swing pivots.
+        step = 0.55 if i % 7 else -0.75
+        c = px + step
+        wick = 1.5 if i % 11 in (5, 10) else 0.25
+        h = max(o, c) + wick
+        l = min(o, c) - wick
         row = {
             'at': (t0 + timedelta(minutes=i)).isoformat(),
             'open': o, 'high': h, 'low': l, 'close': c,

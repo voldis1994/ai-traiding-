@@ -3,6 +3,26 @@ from datetime import datetime,timedelta,timezone
 from app.market_context import FEATURE_DIM,FEATURE_SCHEMA
 
 
+def pass_ohlc_regime(monkeypatch):
+    """Swing fixtures are often choppy by design — stub candle-quality veto.
+
+    LIVE still runs the real gate; OPEN-path unit tests assert broker/zone/neural
+    wiring, not regime classification of synthetic OHLC.
+    """
+    from app import ohlc_regime_gate
+    monkeypatch.setattr(
+        ohlc_regime_gate, 'evaluate',
+        lambda **kw: {'allowed': True, 'reason': 'test', 'flags': {}})
+
+
+def pass_chase_extension(monkeypatch):
+    """Zone-mid quote on swing fixtures can look 'extended' — stub chase veto."""
+    from app import structure_memory
+    monkeypatch.setattr(
+        structure_memory, 'extension_chase',
+        lambda action, **kw: {'needed': False, 'ok': True, 'reason': 'test'})
+
+
 def install_synthetic_context(monkeypatch, *, direction='BUY'):
     """OHLC zone aligned to direction so entry tests exercise neural+zone, not score alone."""
     from app import engine
@@ -18,6 +38,8 @@ def install_synthetic_context(monkeypatch, *, direction='BUY'):
                 'trend':trend,'regime':'ALIGNED','returns_bps':returns,
                 'feature_schema':FEATURE_SCHEMA}
     monkeypatch.setattr(engine,'market_features',fake_context)
+    pass_ohlc_regime(monkeypatch)
+    pass_chase_extension(monkeypatch)
 
 
 def priced_horizon_history(rows, *, base_price=1000., change=2., append_future=True):

@@ -100,25 +100,38 @@ def test_trail_still_ratchets_when_take_profit_is_off():
 
 
 def test_trail_continues_past_break_even_using_ohlc_zone_gap():
-    """After BE, follow distance from OHLC — never tip±minStop alone (early SL)."""
+    """After BE, follow with SL/TP-aware gap — never tip±minStop alone (early SL)."""
     p=_position(stop=100.05,profit=103.0)
-    buy=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35,
+    meta=_meta(.8)
+    meta['original_profit']=1.6
+    buy=propose_broker_trail(p,_market(101.35,101.45),meta,extreme=101.35,
                              zone_range=0.4)
     assert buy is not None
     assert buy['be_locked'] is True
-    # floor = max(0.3, min(0.8, max(0.6, 0.28))) = 0.6; then max(0.6, min(0.8, 0.4)) = 0.6
+    # floor ≥ open_frac×R (0.55×0.8=0.44) and ≥ gap_vs_tp×TP (0.30×1.6=0.48)
+    # and ≥ min_mult×min (2×0.3=0.6) → 0.6; zone 0.4 must not shrink below floor.
     assert buy['trail_gap']==pytest.approx(0.6)
     assert buy['stop_level']>100.05
     assert buy['stop_level']==pytest.approx(101.35-0.6,abs=0.02)
     assert buy['profit_level']==103.0
-    # Without OHLC yet → half opening risk (not raw minStop).
-    bare=propose_broker_trail(p,_market(101.35,101.45),_meta(.8),extreme=101.35)
+    # Without OHLC yet → fallback fraction, still ≥ floor.
+    bare=propose_broker_trail(p,_market(101.35,101.45),meta,extreme=101.35)
     assert bare and bare['trail_gap']==pytest.approx(0.6)
     sell=_position('SELL',stop=99.95,profit=97.0)
-    out=propose_broker_trail(sell,_market(98.55,98.65),_meta(.8),extreme=98.55,
+    out=propose_broker_trail(sell,_market(98.55,98.65),meta,extreme=98.55,
                              zone_range=0.4)
     assert out and out['be_locked'] is True and out['stop_level']<99.95
     assert out['profit_level']==97.0
+
+
+def test_post_be_trail_gap_respects_tp_share_and_atr():
+    """Trail gap stays even with brackets — not a hairline M1 zone cut."""
+    from app.protection_ai import _post_be_trail_gap
+    # Tiny zone must not collapse below TP-share / ATR floors.
+    g=_post_be_trail_gap(10.0,0.5,zone_range=0.2,original_profit=15.0,atr=4.0)
+    assert g>=4.0  # ≥1×ATR
+    assert g>=0.30*15.0  # ≥ trail_gap_vs_tp_frac × TP
+    assert g<=10.0
 
 
 class Brain:

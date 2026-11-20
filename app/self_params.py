@@ -83,18 +83,21 @@ DEFAULTS = {
     # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
     'scratch_pnl_abs': 0.05,
     # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
+    # Wider than old 0.40 — trail must breathe with SL/TP, not cut at the start.
     'trail_min_mult': 2.0,
-    'trail_open_gap_frac': 0.40,
-    'trail_fallback_frac': 0.55,
+    'trail_open_gap_frac': 0.55,
+    'trail_fallback_frac': 0.65,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.08,
-    # Trail self-arm: wait near ~1R before first lock — early 0.55R BE-locks
-    # were killed by micro bounce-backs and ate the real move.
-    'trail_arm_mfe_frac': 0.90,
+    # Trail self-arm: full 1R + share of TP distance — same geometry as brackets.
+    'trail_arm_mfe_frac': 1.0,
+    'trail_arm_tp_frac': 0.45,
     'trail_arm_min_ev': 0.0,
     # First lock sits BE+ (profit cushion) so a small bounce does not scratch.
     'trail_be_cushion_frac': 0.15,
+    # Post-BE gap also floors vs original TP so trail stays even with RR.
+    'trail_gap_vs_tp_frac': 0.30,
     # Bracket teacher schedule (seeds) — thresholds/steps evolve; mults already Store.
     'bracket_vs_vol_noise': 1.15,
     'bracket_vs_stop_noise': 1.05,
@@ -233,13 +236,15 @@ BOUNDS = {
     'exec_fill_delay_bars': (0, 5),
     'scratch_pnl_abs': (0.01, 0.5),
     'trail_min_mult': (1.0, 4.0),
-    'trail_open_gap_frac': (0.20, 0.75),
-    'trail_fallback_frac': (0.30, 0.85),
+    'trail_open_gap_frac': (0.30, 0.80),
+    'trail_fallback_frac': (0.40, 0.85),
     'structure_edge_min_samples': (3, 30),
     'structure_edge_nudge': (0.02, 0.25),
-    'trail_arm_mfe_frac': (0.55, 1.0),
+    'trail_arm_mfe_frac': (0.70, 1.0),
+    'trail_arm_tp_frac': (0.25, 0.70),
     'trail_arm_min_ev': (-1.0, 2.0),
     'trail_be_cushion_frac': (0.05, 0.35),
+    'trail_gap_vs_tp_frac': (0.15, 0.50),
     'bracket_vs_vol_noise': (0.8, 2.0),
     'bracket_vs_stop_noise': (0.8, 1.5),
     'bracket_shape_wide': (1.1, 2.5),

@@ -149,13 +149,17 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
                 mfe=sign*(float(hi if action=='BUY' else lo)-float(entry))
                 arm=_se.trail_arm_decision(
                     None,epic=None,structure='CHOP',direction=action,
-                    mfe=mfe,original_risk=original_risk,be_locked=sign*(stop-entry)>=-1e-12)
+                    mfe=mfe,original_risk=original_risk,
+                    original_profit=abs(float(profit)-float(entry)) if profit is not None else None,
+                    be_locked=sign*(stop-entry)>=-1e-12)
             except Exception:
                 arm=None
             new_stop=paper_trail_stop(
                 action,entry,stop,profit,high=hi,low=lo,mid=mid,spread=sp_bar,
                 original_risk=original_risk,tick=tick_v,min_distance=min_d,
-                arm_decision=arm)
+                arm_decision=arm,
+                original_profit=(abs(float(profit)-float(entry))
+                                 if profit is not None else None))
             if new_stop is not None:
                 stop=float(new_stop);trailed=True
         hit=hit_sl_tp(action,high=hi,low=lo,stop=stop,profit=profit,
@@ -179,7 +183,7 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
 
 def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
                      original_risk, tick, min_distance, store=None,
-                     arm_decision=None):
+                     arm_decision=None, original_profit=None, atr=None):
     """Mirror LIVE broker trail using bar extremes (bid/ask ≈ mid ± half-spread).
 
     Same BE / post-BE / early-arm gap idea as `propose_broker_trail` — never
@@ -207,9 +211,15 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
         tip=tip+half
     be_locked=sign*(stop-entry)>=-1e-12
     early_arm=bool(isinstance(arm_decision,dict) and arm_decision.get('arm'))
+    orig_tp=_finite(original_profit)
+    if orig_tp is None and profit is not None and entry is not None:
+        cand=sign*(float(profit)-float(entry))
+        if cand is not None and cand>0:orig_tp=cand
     if be_locked:
         from .protection_ai import _post_be_trail_gap
-        trail_gap=_post_be_trail_gap(open_gap,minimum,None,store=store)
+        trail_gap=_post_be_trail_gap(
+            open_gap,minimum,None,store=store,
+            original_profit=orig_tp,atr=atr)
     else:
         trail_gap=open_gap
     tip_fav=sign*(tip-entry)
@@ -219,13 +229,18 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
             from .self_params import load as _sp_load, DEFAULTS as _SP_DEF
             sp=_sp_load(store) or {}
             arm_frac=float(sp.get('trail_arm_mfe_frac',_SP_DEF['trail_arm_mfe_frac']))
+            tp_frac=float(sp.get('trail_arm_tp_frac',
+                                 _SP_DEF.get('trail_arm_tp_frac',0.45)))
             cush_frac=float(sp.get('trail_be_cushion_frac',
                                    _SP_DEF.get('trail_be_cushion_frac',0.15)))
         except Exception:
-            arm_frac=0.90;cush_frac=0.15
-        arm_frac=max(0.55,min(1.0,arm_frac))
+            arm_frac=1.0;tp_frac=0.45;cush_frac=0.15
+        arm_frac=max(0.70,min(1.0,arm_frac))
+        tp_frac=max(0.25,min(0.70,tp_frac))
         cush_frac=max(0.05,min(0.35,cush_frac))
         floor_need=arm_frac*open_gap
+        if orig_tp is not None and orig_tp>0:
+            floor_need=max(floor_need,tp_frac*float(orig_tp))
         if tip_fav<floor_need:
             return None
         cushion=min(tip_fav*0.5,cush_frac*open_gap)
@@ -413,6 +428,7 @@ class ShadowPaperJournal:
                 arm=_se.trail_arm_decision(
                     self.store,epic=None,structure='CHOP',direction=direction,
                     mfe=mfe,original_risk=pos.get('original_risk'),
+                    original_profit=pos.get('original_profit'),
                     be_locked=be_locked)
             except Exception:
                 arm=None
@@ -422,7 +438,8 @@ class ShadowPaperJournal:
                 original_risk=pos.get('original_risk'),
                 tick=pos.get('tick') or tick,
                 min_distance=pos.get('min_distance') or min_distance,
-                store=self.store,arm_decision=arm)
+                store=self.store,arm_decision=arm,
+                original_profit=pos.get('original_profit'))
             if new_stop is not None:
                 pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
                 self.position=pos

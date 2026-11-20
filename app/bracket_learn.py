@@ -1182,57 +1182,36 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     stop_level=stop_level, profit_level=profit_level,
                     kama_stop=out.get('kama_stop'))
 
+    # Restored ba0b471 (2026-11-19 20:44 GMT) — last tip BEFORE #181/#182
+    # "SL too far" soft-cap. Robot SENDS these OHLC swing SL/TP to Capital.
+    # Optional: extend structural TP if a farther pivot clears RR. Never refuse
+    # OPEN / never soft-shrink SL toward entry (that blocked Capital brackets).
     reason = picked.get('reason') or 'swing_levels'
-    # 1) Far swing SL vs ATR → closer swing pivot only (never invent ATR stop).
-    far = cap_far_swing_sl(
-        action=action, entry=entry_f, stop_level=stop_level, stop_d=stop_d,
-        floor=floor, atr=atr_v, highs=highs, lows=lows, buffer=buffer,
-        store=store)
-    if far.get('capped') and far.get('closer_pivot'):
-        stop_d = float(far['stop_distance'])
-        stop_level = float(far['stop_level'])
-        reason = str(reason) + '+' + str(far.get('reason') or 'atr_closer_sl')
-        if far.get('swing_hi') is not None:
-            picked['swing_hi'] = float(far['swing_hi'])
-        if far.get('swing_lo') is not None:
-            picked['swing_lo'] = float(far['swing_lo'])
-    elif far.get('reason') == 'keep_far_swing':
-        # Far OHLC swing kept — never rewrite to ATR invent.
-        reason = str(reason) + '+keep_far_swing'
-
-    # 2) Min RR — farther structural TP only. Never soft-shrink swing SL into
-    # an invented non-pivot stop (abandons OHLC structure / looks swapped).
-    keep_far = far.get('reason') == 'keep_far_swing'
-    atr_locked = bool(far.get('capped') or keep_far)
-    rr = apply_min_rr(
-        action=action, entry=entry_f, stop_level=stop_level,
-        profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=floor, store=store, atr_locked=atr_locked,
-        atr=atr_v, highs=highs, lows=lows,
-        allow_soft_shrink=False)
-    if not rr.get('ok'):
-        return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
-                    stop_distance=float(stop_d), profit_distance=float(profit_d),
-                    stop_level=float(stop_level), profit_level=float(profit_level),
-                    min_rr=rr.get('min_rr'), rr=rr.get('rr'),
-                    atr_capped=bool(far.get('capped')),
-                    kama_stop=out.get('kama_stop'))
-    stop_d = float(rr['stop_distance']); profit_d = float(rr['profit_distance'])
-    stop_level = float(rr['stop_level']); profit_level = float(rr['profit_level'])
-    if rr.get('tp_extended'):
-        reason = str(reason) + '+rr_extend_tp'
-        if rr.get('swing_hi') is not None:
-            picked['swing_hi'] = float(rr['swing_hi'])
-        if rr.get('swing_lo') is not None:
-            picked['swing_lo'] = float(rr['swing_lo'])
-    if rr.get('capped'):
-        reason = str(reason) + '+rr_cap_sl'
-    if not levels_correct_side(action=action, entry=entry_f,
-                               stop_level=stop_level, profit_level=profit_level):
-        return dict(out, ready=False, reason='rr_sides_swapped',
-                    stop_distance=float(stop_d), profit_distance=float(profit_d),
-                    stop_level=float(stop_level), profit_level=float(profit_level),
-                    atr_capped=bool(far.get('capped')))
+    rr_meta = {
+        'min_rr': _min_rr(store), 'rr_capped': False, 'rr_tp_extended': False,
+        'rr': (profit_d / stop_d) if stop_d > 1e-12 else None,
+    }
+    try:
+        rr = apply_min_rr(
+            action=action, entry=entry_f, stop_level=stop_level,
+            profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
+            floor=floor, store=store, atr=atr_v, highs=highs, lows=lows,
+            allow_soft_shrink=False)
+        if rr.get('ok') and rr.get('tp_extended'):
+            profit_d = float(rr['profit_distance'])
+            profit_level = float(rr['profit_level'])
+            reason = str(reason) + '+rr_extend_tp'
+            rr_meta['rr_tp_extended'] = True
+            if rr.get('swing_hi') is not None:
+                picked['swing_hi'] = float(rr['swing_hi'])
+            if rr.get('swing_lo') is not None:
+                picked['swing_lo'] = float(rr['swing_lo'])
+        if rr.get('min_rr') is not None:
+            rr_meta['min_rr'] = float(rr['min_rr'])
+        if stop_d > 1e-12:
+            rr_meta['rr'] = float(profit_d / stop_d)
+    except Exception:
+        pass
 
     return {
         'ready': True,
@@ -1245,12 +1224,12 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'swing_hi': float(picked.get('swing_hi') or out.get('swing_hi') or 0),
         'swing_lo': float(picked.get('swing_lo') or out.get('swing_lo') or 0),
         'kappa': float(profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA,
-        'min_rr': float(rr.get('min_rr') or DEFAULT_MIN_RR),
-        'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
-        'rr_capped': bool(rr.get('capped')),
-        'rr_tp_extended': bool(rr.get('tp_extended')),
-        'atr_capped': bool(far.get('capped')),
-        'sl_max': far.get('sl_max'),
+        'min_rr': float(rr_meta.get('min_rr') or DEFAULT_MIN_RR),
+        'rr': rr_meta.get('rr'),
+        'rr_capped': False,
+        'rr_tp_extended': bool(rr_meta.get('rr_tp_extended')),
+        'atr_capped': False,
+        'sl_max': None,
         'bos_event': bos.get('event'),
         'bos_bias': bos.get('bias'),
         'buffer': float(buffer),

@@ -585,9 +585,9 @@ def test_cap_far_swing_sl_keeps_far_swing_without_atr_invent():
     assert far['stop_level'] == pytest.approx(stop_level, abs=1e-9)
 
 
-def test_swing_anchor_applies_min_rr_on_wide_sl():
-    """End-to-end: wide protective swing vs tight TP gets ATR/RR-capped SL."""
-    from app.bracket_learn import swing_anchor_brackets
+def test_swing_anchor_sends_ohlc_even_when_rr_low_ba0b471():
+    """ba0b471 (pre #181): wide SL vs tight TP still ready — robot must SEND to Capital."""
+    from app.bracket_learn import swing_anchor_brackets, levels_correct_side
     # Deep swing low far under entry; nearest high only a few pts above.
     seq = [
         (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
@@ -603,20 +603,15 @@ def test_swing_anchor_applies_min_rr_on_wide_sl():
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
-    if swing.get('ready'):
-        from app.bracket_learn import levels_correct_side
-        assert levels_correct_side(
-            action='BUY', entry=entry, stop_level=swing['stop_level'],
-            profit_level=swing['profit_level'])
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.5)
-        assert swing['stop_distance'] + 1e-9 <= swing['profit_distance'] / float(
-            swing.get('min_rr') or 1.5) + 1e-6
-    else:
-        assert swing.get('reason') in (
-            'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',
-            'rr_need_farther_tp', 'rr_need_farther_tp_keep_swing',
-            'rr_sides_swapped',
-            'swing_distances_below_floor', 'no_structural_swings_for_entry')
+    assert swing.get('ready') is True, swing.get('reason')
+    assert swing['source'] == 'swing_anchor'
+    assert levels_correct_side(
+        action='BUY', entry=entry, stop_level=swing['stop_level'],
+        profit_level=swing['profit_level'])
+    assert swing['stop_distance'] is not None and swing['profit_distance'] is not None
+    # Must not refuse for RR — Capital needs both distances posted.
+    assert 'rr_need' not in str(swing.get('reason') or '')
+    assert swing.get('rr_capped') is not True
 
 
 def test_keep_far_swing_does_not_soft_shrink_sl():

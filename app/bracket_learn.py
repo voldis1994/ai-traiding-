@@ -839,6 +839,52 @@ def _set_stop_from_distance(*, action, entry, stop_d):
     return entry_f + stop_d
 
 
+def levels_correct_side(*, action, entry, stop_level, profit_level) -> bool:
+    """BUY: SL below entry below TP. SELL: TP below entry below SL. Never swapped."""
+    try:
+        e = float(entry)
+        sl = float(stop_level)
+        tp = float(profit_level)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(e) and math.isfinite(sl) and math.isfinite(tp)):
+        return False
+    if action == 'BUY':
+        return sl < e < tp
+    if action == 'SELL':
+        return tp < e < sl
+    return False
+
+
+def _extend_structural_tp(*, action, entry, need_d, highs=None, lows=None):
+    """Nearest swing TP that still clears ``need_d`` (correct side only)."""
+    entry_f = float(entry)
+    need = float(need_d)
+    if need <= 0:
+        return None
+    if action == 'BUY':
+        cands = [s for s in (highs or [])
+                 if _finite((s or {}).get('price')) is not None
+                 and float(s['price']) >= entry_f + need]
+        if not cands:
+            return None
+        tp = min(cands, key=lambda s: float(s['price']))
+        lvl = float(tp['price'])
+        return {'profit_level': lvl, 'profit_distance': lvl - entry_f,
+                'swing_hi': lvl}
+    if action == 'SELL':
+        cands = [s for s in (lows or [])
+                 if _finite((s or {}).get('price')) is not None
+                 and float(s['price']) <= entry_f - need]
+        if not cands:
+            return None
+        tp = max(cands, key=lambda s: float(s['price']))
+        lvl = float(tp['price'])
+        return {'profit_level': lvl, 'profit_distance': entry_f - lvl,
+                'swing_lo': lvl}
+    return None
+
+
 def cap_far_swing_sl(*, action, entry, stop_level, stop_d, floor, atr=None,
                      highs=None, lows=None, buffer=0., store=None,
                      max_atr_mult=None) -> dict:
@@ -910,11 +956,15 @@ def cap_far_swing_sl(*, action, entry, stop_level, stop_d, floor, atr=None,
 
 
 def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
-                 floor, min_rr=None, store=None) -> dict:
-    """Shrink SL (only) so ``profit_d / stop_d >= min_rr``. Never widens TP.
+                 floor, min_rr=None, store=None, atr_locked=False, atr=None,
+                 highs=None, lows=None) -> dict:
+    """Enforce ``profit_d / stop_d >= min_rr`` without swapping SL↔TP.
 
-    Used after far-SL ATR cap. Seed min_rr is 1.5 so equal SL=TP is not a win.
-    If RR still fails after the cap → ``ok=False`` (caller refuses inventing TP).
+    Order (after far-SL ATR cap):
+      1. Prefer a farther structural TP that clears RR (correct side only).
+      2. Soft-shrink SL toward entry — but if ATR-locked, never below ~1×ATR
+         (no hairline stop that looked like TP/SL swapped).
+      3. Else refuse — never invent fantasy TP.
     """
     rr_need = float(min_rr) if min_rr is not None else _min_rr(store)
     rr_need = max(1.0, min(3.0, rr_need))
@@ -924,8 +974,13 @@ def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
     stop_level = float(stop_level)
     profit_level = float(profit_level)
     floor_f = float(floor) if floor and floor > 0 else 0.0
+    atr_v = _finite(atr)
+    # After far-swing ATR cap, keep at least ~1×ATR of protective width.
+    soft_floor = floor_f
+    if atr_locked and atr_v is not None and atr_v > 0:
+        soft_floor = max(floor_f, float(atr_v))
     out = {
-        'ok': True, 'capped': False, 'min_rr': rr_need,
+        'ok': True, 'capped': False, 'tp_extended': False, 'min_rr': rr_need,
         'stop_distance': stop_d, 'profit_distance': profit_d,
         'stop_level': stop_level, 'profit_level': profit_level,
         'rr': (profit_d / stop_d) if stop_d > 1e-12 else None,
@@ -933,20 +988,44 @@ def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
     }
     if stop_d <= 1e-12 or profit_d <= 1e-12:
         return dict(out, ok=False, reason='rr_bad_distances')
+    if not levels_correct_side(action=action, entry=entry_f,
+                               stop_level=stop_level, profit_level=profit_level):
+        return dict(out, ok=False, reason='rr_sides_swapped')
     if profit_d / stop_d + 1e-12 >= rr_need:
         return out
-    # Cap SL so RR hits min_rr: stop_d' = profit_d / min_rr  (TP unchanged)
+    need_tp = float(stop_d) * rr_need
+    # Prefer farther real TP on the correct side — never move TP onto SL side.
+    ext = _extend_structural_tp(
+        action=action, entry=entry_f, need_d=need_tp, highs=highs, lows=lows)
+    if ext and float(ext['profit_distance']) + 1e-12 >= need_tp:
+        profit_level = float(ext['profit_level'])
+        profit_d = float(ext['profit_distance'])
+        return {
+            'ok': True, 'capped': False, 'tp_extended': True, 'min_rr': rr_need,
+            'stop_distance': float(stop_d), 'profit_distance': float(profit_d),
+            'stop_level': float(stop_level), 'profit_level': float(profit_level),
+            'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
+            'reason': 'rr_extend_tp',
+            'swing_hi': ext.get('swing_hi'), 'swing_lo': ext.get('swing_lo'),
+        }
+    # Soft shrink SL — never below soft_floor (1×ATR when ATR-locked).
     capped = float(profit_d) / rr_need
-    if capped + 1e-12 < floor_f:
-        return dict(out, ok=False, reason='rr_unachievable_vs_floor',
-                    stop_distance=stop_d, rr=profit_d / stop_d)
+    if capped + 1e-12 < soft_floor:
+        return dict(out, ok=False,
+                    reason=('rr_need_farther_tp' if atr_locked
+                            else 'rr_unachievable_vs_floor'),
+                    stop_distance=stop_d, profit_distance=profit_d,
+                    rr=profit_d / stop_d)
     if capped + 1e-12 >= stop_d:
         return dict(out, ok=False, reason='rr_unachievable',
                     rr=profit_d / stop_d)
     stop_d = capped
     stop_level = _set_stop_from_distance(action=action, entry=entry_f, stop_d=stop_d)
+    if not levels_correct_side(action=action, entry=entry_f,
+                               stop_level=stop_level, profit_level=profit_level):
+        return dict(out, ok=False, reason='rr_sides_swapped')
     return {
-        'ok': True, 'capped': True, 'min_rr': rr_need,
+        'ok': True, 'capped': True, 'tp_extended': False, 'min_rr': rr_need,
         'stop_distance': float(stop_d), 'profit_distance': float(profit_d),
         'stop_level': float(stop_level), 'profit_level': float(profit_level),
         'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
@@ -1112,11 +1191,12 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         if far.get('swing_lo') is not None:
             picked['swing_lo'] = float(far['swing_lo'])
 
-    # 2) Min RR: shrink SL further if TP/SL still below seed (1.5) — never grow TP.
+    # 2) Min RR — prefer farther TP; never hairline ATR-locked SL; never swap sides.
     rr = apply_min_rr(
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=floor, store=store)
+        floor=floor, store=store, atr_locked=bool(far.get('capped')),
+        atr=atr_v, highs=highs, lows=lows)
     if not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
                     stop_distance=float(stop_d), profit_distance=float(profit_d),
@@ -1126,8 +1206,20 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     kama_stop=out.get('kama_stop'))
     stop_d = float(rr['stop_distance']); profit_d = float(rr['profit_distance'])
     stop_level = float(rr['stop_level']); profit_level = float(rr['profit_level'])
+    if rr.get('tp_extended'):
+        reason = str(reason) + '+rr_extend_tp'
+        if rr.get('swing_hi') is not None:
+            picked['swing_hi'] = float(rr['swing_hi'])
+        if rr.get('swing_lo') is not None:
+            picked['swing_lo'] = float(rr['swing_lo'])
     if rr.get('capped'):
         reason = str(reason) + '+rr_cap_sl'
+    if not levels_correct_side(action=action, entry=entry_f,
+                               stop_level=stop_level, profit_level=profit_level):
+        return dict(out, ready=False, reason='rr_sides_swapped',
+                    stop_distance=float(stop_d), profit_distance=float(profit_d),
+                    stop_level=float(stop_level), profit_level=float(profit_level),
+                    atr_capped=bool(far.get('capped')))
 
     return {
         'ready': True,
@@ -1143,6 +1235,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'min_rr': float(rr.get('min_rr') or DEFAULT_MIN_RR),
         'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
         'rr_capped': bool(rr.get('capped')),
+        'rr_tp_extended': bool(rr.get('tp_extended')),
         'atr_capped': bool(far.get('capped')),
         'sl_max': far.get('sl_max'),
         'bos_event': bos.get('event'),

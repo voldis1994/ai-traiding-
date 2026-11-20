@@ -438,26 +438,56 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     assert decided['source'] != 'ohlc_zone'
 
 
-def test_apply_min_rr_caps_wide_sl_toward_entry():
-    """Tight TP + far SL → SL shrinks to profit/min_rr; TP unchanged (not equalized)."""
-    from app.bracket_learn import apply_min_rr
-    # SELL: entry 2650, SL far above (21), TP only 3 below → SL = 3/1.5 = 2.
+def test_apply_min_rr_caps_wide_sl_toward_entry_when_not_atr_locked():
+    """Without ATR lock: far SL may soft-shrink; TP stays (never mirrored)."""
+    from app.bracket_learn import apply_min_rr, levels_correct_side
     entry, stop_d, profit_d = 2650.0, 21.0, 3.0
     stop_level = entry + stop_d
     profit_level = entry - profit_d
     out = apply_min_rr(
         action='SELL', entry=entry, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=1.0, min_rr=1.5)
+        floor=1.0, min_rr=1.5, atr_locked=False)
     assert out['ok'] is True
     assert out['capped'] is True
     assert out['stop_distance'] == pytest.approx(2.0, abs=1e-9)
     assert out['profit_distance'] == pytest.approx(3.0, abs=1e-9)
     assert out['rr'] == pytest.approx(1.5, abs=1e-9)
-    assert out['stop_level'] == pytest.approx(entry + 2.0, abs=1e-9)
-    assert out['profit_level'] == pytest.approx(profit_level, abs=1e-9)
-    # Must NOT mirror TP out to match far SL.
+    assert levels_correct_side(
+        action='SELL', entry=entry, stop_level=out['stop_level'],
+        profit_level=out['profit_level'])
     assert out['profit_distance'] != pytest.approx(21.0, abs=0.1)
+
+
+def test_atr_locked_rr_refuses_hairline_sl_instead_of_swap():
+    """After ATR-cap: tiny TP must NOT pull SL below ~1×ATR (looked like swap)."""
+    from app.bracket_learn import apply_min_rr
+    entry = 3628.75
+    stop_d, profit_d = 10.0, 3.0  # ATR-capped SL, still-tight TP
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=entry + stop_d,
+        profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
+        floor=2.5, min_rr=1.5, atr_locked=True, atr=5.0)
+    assert out['ok'] is False
+    assert out['reason'] == 'rr_need_farther_tp'
+    # Would need SL=2 to hit RR — blocked by 1×ATR soft floor.
+    assert out['stop_distance'] == pytest.approx(10.0, abs=1e-9)
+
+
+def test_apply_min_rr_extends_structural_tp_before_shrinking_sl():
+    from app.bracket_learn import apply_min_rr
+    entry = 100.0
+    # Near TP too tight for RR; farther low clears need.
+    lows = [{'price': 98.0, 'i': 1}, {'price': 85.0, 'i': 2}]
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=110.0, profit_level=98.0,
+        stop_d=10.0, profit_d=2.0, floor=1.0, min_rr=1.5,
+        atr_locked=True, highs=[], lows=lows)
+    assert out['ok'] is True
+    assert out['tp_extended'] is True
+    assert out['profit_distance'] + 1e-9 >= 15.0  # 10 * 1.5
+    assert out['stop_distance'] == pytest.approx(10.0, abs=1e-9)
+    assert out['profit_level'] < entry < out['stop_level']
 
 
 def test_apply_min_rr_refuses_when_floor_blocks_cap():
@@ -465,14 +495,14 @@ def test_apply_min_rr_refuses_when_floor_blocks_cap():
     from app.bracket_learn import apply_min_rr
     out = apply_min_rr(
         action='BUY', entry=100.0, stop_level=90.0, profit_level=101.0,
-        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.5)
+        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.5, atr_locked=False)
     assert out['ok'] is False
     assert out['reason'] == 'rr_unachievable_vs_floor'
 
 
 def test_cap_far_swing_sl_pulls_equal_1to1_toward_entry():
     """Gold screenshot: equal ~26pt SL+TP with ATR~5 → SL capped, TP stays → RR>1."""
-    from app.bracket_learn import cap_far_swing_sl, apply_min_rr
+    from app.bracket_learn import cap_far_swing_sl, apply_min_rr, levels_correct_side
     entry = 3628.75
     stop_d = profit_d = 25.93
     stop_level = entry + stop_d
@@ -484,15 +514,17 @@ def test_cap_far_swing_sl_pulls_equal_1to1_toward_entry():
     assert far['capped'] is True
     assert far['stop_distance'] == pytest.approx(10.0, abs=1e-9)  # 2×ATR
     assert far['stop_level'] == pytest.approx(entry + 10.0, abs=1e-9)
-    # TP untouched — then RR vs kept TP is >1 (not equal SL=TP).
     rr = apply_min_rr(
         action='SELL', entry=entry, stop_level=far['stop_level'],
         profit_level=profit_level, stop_d=far['stop_distance'],
-        profit_d=profit_d, floor=2.5, min_rr=1.5)
+        profit_d=profit_d, floor=2.5, min_rr=1.5, atr_locked=True)
     assert rr['ok'] is True
     assert rr['profit_distance'] == pytest.approx(25.93, abs=1e-6)
     assert rr['stop_distance'] < rr['profit_distance']
     assert rr['rr'] + 1e-9 >= 1.5
+    assert levels_correct_side(
+        action='SELL', entry=entry, stop_level=rr['stop_level'],
+        profit_level=rr['profit_level'])
 
 
 def test_swing_anchor_applies_min_rr_on_wide_sl():
@@ -514,16 +546,17 @@ def test_swing_anchor_applies_min_rr_on_wide_sl():
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
     if swing.get('ready'):
+        from app.bracket_learn import levels_correct_side
+        assert levels_correct_side(
+            action='BUY', entry=entry, stop_level=swing['stop_level'],
+            profit_level=swing['profit_level'])
         assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.5)
         assert swing['stop_distance'] + 1e-9 <= swing['profit_distance'] / float(
             swing.get('min_rr') or 1.5) + 1e-6
-        # Never celebrate equal far SL=TP.
-        if swing.get('atr_capped') or swing.get('rr_capped'):
-            assert swing['stop_distance'] + 1e-6 < swing['profit_distance'] or \
-                swing['rr'] + 1e-9 >= 1.5
     else:
         assert swing.get('reason') in (
             'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',
+            'rr_need_farther_tp', 'rr_sides_swapped',
             'swing_distances_below_floor', 'no_structural_swings_for_entry')
 
 

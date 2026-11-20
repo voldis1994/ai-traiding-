@@ -25,7 +25,11 @@ FEATURE_DIM = len(FEATURE_NAMES)
 MIN_BARS = 61
 
 
-def candle_time(value):
+def event_time(value):
+    """Parse an event timestamp keeping seconds — for OPEN/trail cutoffs.
+
+    Do **not** use for M1 candle keys; those go through ``candle_time``.
+    """
     if isinstance(value, datetime):
         dt=value
     elif isinstance(value,str):
@@ -36,7 +40,14 @@ def candle_time(value):
             except ValueError:return None
     else:return None
     if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(second=0,microsecond=0)
+    return dt.astimezone(timezone.utc)
+
+
+def candle_time(value):
+    """M1 bar key — floored to the minute (seconds stripped)."""
+    dt=event_time(value)
+    if dt is None:return None
+    return dt.replace(second=0,microsecond=0)
 
 
 def candle_bucket(value):

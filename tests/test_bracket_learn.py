@@ -438,6 +438,42 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     assert decided['source'] != 'ohlc_zone'
 
 
+def test_decide_brackets_snaps_tick_without_stop_take_rewrite():
+    """Swing → tighten → tick snap → levels; stop_take must not replace SL."""
+    from app.math_rules import snap_distance_to_tick
+    seq = [
+        (100, 101, 99.5, 100.5), (100.5, 102, 100, 101.5), (101.5, 102, 99.8, 100.2),
+        (100.2, 105, 100, 104), (104, 108, 103.5, 107), (107, 110, 106.5, 109),
+        (109, 109.5, 106, 106.5), (106.5, 107, 104.5, 105), (105, 105.5, 103, 103.5),
+        (103.5, 108, 103.2, 107), (107, 111, 106.5, 110), (110, 112, 109.5, 111.5),
+        (111.5, 111.8, 110.5, 111), (111, 111.2, 110.2, 110.5),
+    ]
+    rows = _swing_rows(seq)
+    entry = 107.0
+    zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0,
+            'ready': True}
+    # Tiny tick so snap is visible; broker min small so we do not raise away from swing.
+    decided = decide_brackets_from_ohlc(
+        zone, tick=0.01, spread=0.05, min_distance=0.2, tighten=0.9,
+        entry=entry, action='BUY', candles=rows, atr=2.0, require_swing=True)
+    if not decided.get('ready'):
+        # RR refuse is OK — must not invent stop_take median SL.
+        assert decided.get('source') == 'swing_anchor'
+        assert decided.get('stop_distance') is None or decided.get('reason')
+        return
+    assert decided['source'] == 'swing_anchor'
+    assert decided['stop_level'] < entry < decided['profit_level']
+    # Distances are tick-snapped (ceil).
+    sd, st = snap_distance_to_tick(decided['stop_distance'], 0.01)
+    assert decided['stop_distance'] == pytest.approx(sd, abs=1e-9)
+    assert decided['stop_ticks'] == st
+    # Levels rebuilt from snapped distances (not raw swing then ignored snap).
+    assert decided['stop_level'] == pytest.approx(
+        entry - decided['stop_distance'], abs=1e-9)
+    assert decided['profit_level'] == pytest.approx(
+        entry + decided['profit_distance'], abs=1e-9)
+
+
 def test_apply_min_rr_caps_wide_sl_toward_entry_when_not_atr_locked():
     """Without ATR lock: far SL may soft-shrink; TP stays (never mirrored)."""
     from app.bracket_learn import apply_min_rr, levels_correct_side

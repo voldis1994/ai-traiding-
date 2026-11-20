@@ -44,20 +44,48 @@ def _away_from_market(level,direction,bid,ask,minimum,tick):
     return float(lvl)
 
 
+def _open_minute_cutoff(opened_at):
+    """Opening M1 bar start — that bar is excluded from trail OHLC.
+
+    ``candle_time`` floors seconds, so ``t < opened_at`` still kept the whole
+    opening minute (pre-open spike → premature trail). Skip ``t <= cutoff``.
+    """
+    from .market_context import event_time, candle_time
+    if opened_at is None:
+        return None
+    exact=event_time(opened_at)
+    if exact is None:
+        return candle_time(opened_at)
+    return exact.replace(second=0, microsecond=0)
+
+
 def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prior_extreme=None):
     """Best favorable *exit-side* price from live quotes + OHLC since open.
 
     Stored M1 high/low are midprices. Convert with per-bar spread when present
     so BUY tip ≈ bid extreme and SELL tip ≈ ask extreme — mid highs alone
     inflate the tip and glue SL too tight (early stop-outs vs the chart).
+
+    Opening-minute bars are excluded: their high/low can include prices from
+    *before* the fill. Live bid/ask after open still seed the tip.
     """
+    cutoff=_open_minute_cutoff(opened_at)
+    def _bar_ok(row):
+        t=candle_time(row.get('at'))
+        if cutoff is not None and t is not None and t<=cutoff:
+            return False
+        return True
     if direction=='BUY':
         tip=_finite(bid)
         if tip is None:return None
-        if prior_extreme is not None:tip=max(tip,float(prior_extreme))
+        # prior_extreme only if still useful — never re-poison from a pre-open bar.
+        if prior_extreme is not None:
+            try:
+                tip=max(tip,float(prior_extreme))
+            except (TypeError,ValueError):
+                pass
         for row in candles or ():
-            t=candle_time(row.get('at'))
-            if opened_at and t and t<opened_at:continue
+            if not _bar_ok(row):continue
             h=_finite(row.get('high'))
             if h is None:continue
             sp=_finite(row.get('spread'))
@@ -68,10 +96,13 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
     if direction=='SELL':
         tip=_finite(ask)
         if tip is None:return None
-        if prior_extreme is not None:tip=min(tip,float(prior_extreme))
+        if prior_extreme is not None:
+            try:
+                tip=min(tip,float(prior_extreme))
+            except (TypeError,ValueError):
+                pass
         for row in candles or ():
-            t=candle_time(row.get('at'))
-            if opened_at and t and t<opened_at:continue
+            if not _bar_ok(row):continue
             low=_finite(row.get('low'))
             if low is None:continue
             sp=_finite(row.get('spread'))

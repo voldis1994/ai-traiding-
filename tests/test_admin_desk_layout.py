@@ -52,9 +52,9 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=116' in html
-    assert 'admin.js?v=121' in html
-    assert 'ohlc-chart.js?v=11' in html
+    assert 'admin.css?v=117' in html
+    assert 'admin.js?v=122' in html
+    assert 'ohlc-chart.js?v=12' in html
 
 
 def test_desk_panels_have_readable_spacing():
@@ -64,7 +64,25 @@ def test_desk_panels_have_readable_spacing():
     assert 'min-height:34px' in css.replace(' ', '') or 'min-height:34px' in css
     assert '.psx-score-row' in css
     assert '.psx-ind-kv .desk-kv' in css
-    assert 'min-height:32px' in css.replace(' ', '') or 'min-height:32px' in css
+    # Rail wide enough for TERMINAL / RESEARCH / PRACTICE (44px clipped).
+    assert 'grid-template-columns:78px' in css.replace(' ', '')
+    # Intel reasons wrap — no 4-line clamp ellipsis.
+    assert '-webkit-line-clamp:4' not in css
+    # Indicator labels (ATR14 M1) must not ellipsis into "AUX" junk.
+    assert 'text-overflow:ellipsis' not in css.split('.psx-ind-kv')[1].split('.psx-trades')[0]
+    # Toolbar grows with Bid/Ask — fixed 36px clipped the quote.
+    assert 'min-height:40px' in css.replace(' ', '')
+
+
+def test_desk_chart_footer_and_levels_readable():
+    """Chart ADX/ATR footer + live ENT must not collide with MID."""
+    ohlc = Path('app/web/admin/ohlc-chart.js').read_text(encoding='utf-8')
+    assert 'yPadBot=showLabels?52' in ohlc.replace(' ', '')
+    assert "if(!inTrade)hline(mid" in ohlc.replace(' ', '')
+    assert 'metrics.join' in ohlc
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'ATR14 M1' in js
+    assert "String(t).slice(0,120)" not in js
 
 
 def test_client_closes_marks_upl_vs_capital():

@@ -131,7 +131,8 @@ function drawOhlcStructure(canvas,view,opts){
   const pad=(high-low)*(showLabels?.05:.08);
   low-=pad;high+=pad;
   const yPadTop=showLabels?28:16;
-  const yPadBot=showLabels?36:28;
+  // Two-line footer (ADX/ATR + time) — single 8px line was clipped on laptop.
+  const yPadBot=showLabels?52:28;
   const leftPad=showLabels?18:12;
   const rightPad=showLabels?78:56;
   const chartW=Math.max(40,w-leftPad-rightPad);
@@ -255,7 +256,8 @@ function drawOhlcStructure(canvas,view,opts){
     hline(br.stop_level,'#ef6875',[4,3],'SL');
     hline(br.profit_level,'#31d59a',[4,3],'TP');
   }
-  hline(mid,'#e9bc65',[2,2],'MID');
+  // Live ENT replaces MID when they sit on top of each other.
+  if(!inTrade)hline(mid,'#e9bc65',[2,2],'MID');
   for(const p of openLv){
     hline(p.entry,'#e9bc65',[],'ENT',true);
     hline(p.stop,'#ef6875',[4,3],'SL',true);
@@ -296,27 +298,37 @@ function drawOhlcStructure(canvas,view,opts){
     // Right-side SL / ENT / TP tags (PerpSignal style)
     labels.sort((a,b)=>a.y-b.y);
     let lastY=-999;
-    ctx.font='700 9px "IBM Plex Mono",ui-monospace,monospace';
+    ctx.font='700 10px "IBM Plex Mono",ui-monospace,monospace';
     for(const L of labels){
       let yy=L.y;
-      if(yy-lastY<12)yy=lastY+12;
+      if(yy-lastY<16)yy=lastY+16;
       lastY=yy;
       const text=`${L.label} ${L.price.toFixed(digits)}`;
-      const tw=ctx.measureText(text).width+8;
+      const tw=ctx.measureText(text).width+10;
       const tx=Math.max(leftPad+chartW-tw-2,leftPad+chartW*0.55);
-      ctx.fillStyle='rgba(6,10,20,.88)';
-      ctx.fillRect(tx-3,yy-9,tw,13);
+      ctx.fillStyle='rgba(6,10,20,.92)';
+      ctx.fillRect(tx-3,yy-10,tw,15);
       ctx.strokeStyle=L.color;ctx.lineWidth=1;
-      ctx.strokeRect(tx-3,yy-9,tw,13);
+      ctx.strokeRect(tx-3,yy-10,tw,15);
       ctx.fillStyle=L.color;
       ctx.textAlign='left';
-      ctx.fillText(text,tx,yy+1);
+      ctx.fillText(text,tx,yy+2);
     }
   }
 
   const mtf=view.mtf||{};
-  const parts=[];
-  if(showLabels){
+  // Use ?? so a real ADX/ATR of 0 is distinct from missing (null).
+  // Do not redeclare `atr` — already bound above for the ATR band.
+  const adx=_ohlcFinite(mtf.adx??ov.adx);
+  const atrShow=_ohlcFinite(mtf.atr14)??_ohlcFinite(ov.atr14)??atr;
+  const metrics=[];
+  if(mtf.mode||ov.mode)metrics.push(`MTF ${mtf.mode||ov.mode}`);
+  if(adx!=null)metrics.push(`ADX ${adx.toFixed(0)}`);
+  if(atrShow!=null)metrics.push(`ATR ${atrShow.toFixed(2)}`);
+  if(kamaSeries.length||ov.kama_level!=null)metrics.push('KAMA');
+  if(view.info_stack)metrics.push(String(view.info_stack));
+  const timeBits=[];
+  if(showLabels&&candles.length){
     const last=candles[candles.length-1];
     const first=candles[0];
     const fmt=iso=>{
@@ -325,23 +337,15 @@ function drawOhlcStructure(canvas,view,opts){
         return new Date(iso).toLocaleTimeString('lv-LV',{hour:'2-digit',minute:'2-digit'});
       }catch(_){return ''}
     };
-    parts.push(`${fmt(first.at)}–${fmt(last.at)}`);
-    parts.push(`${candles.length} M1`);
+    timeBits.push(`${fmt(first.at)}–${fmt(last.at)}`);
+    timeBits.push(`${candles.length} M1`);
   }
-  if(mtf.mode||ov.mode)parts.push(`MTF ${mtf.mode||ov.mode}`);
-  // Use ?? so a real ADX/ATR of 0 is distinct from missing (null).
-  // Do not redeclare `atr` — already bound above for the ATR band.
-  const adx=_ohlcFinite(mtf.adx??ov.adx);
-  const atrShow=_ohlcFinite(mtf.atr14)??_ohlcFinite(ov.atr14)??atr;
-  if(adx!=null)parts.push(`ADX ${adx.toFixed(0)}`);
-  if(atrShow!=null)parts.push(`ATR ${atrShow.toFixed(2)}`);
-  if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');
-  if(view.info_stack)parts.push(String(view.info_stack));
-  if(parts.length){
-    ctx.fillStyle='rgba(140,149,166,.9)';
-    ctx.font='8px "IBM Plex Mono",ui-monospace,monospace';
+  if(metrics.length||timeBits.length){
+    ctx.fillStyle='rgba(180,188,204,.95)';
+    ctx.font='10px "IBM Plex Mono",ui-monospace,monospace';
     ctx.textAlign='left';
-    ctx.fillText(parts.join(' · '),leftPad,h-8);
+    if(metrics.length)ctx.fillText(metrics.join(' · '),leftPad,h-24);
+    if(timeBits.length)ctx.fillText(timeBits.join(' · '),leftPad,h-8);
   }
 }
 

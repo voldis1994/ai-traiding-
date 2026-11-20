@@ -5506,15 +5506,32 @@ class SingleTradeEngine:
         opened=_event_time(meta.get('opened')) if meta.get('opened') else None
         candles=self.store.candles(p['epic'],n=120,historical_only=True)
         zone_range=ohlc_range_distance(candles)  # lookback from data
-        # Do NOT feed stored trail_extreme back as prior — a polluted max from
-        # the opening minute would stick forever after the bar leaves the window.
+        # Remember post-open tip across the 120-bar window — but only a
+        # favorable prior (BUY above entry / SELL below). Opening-minute bars
+        # are still excluded inside trail_extreme_from_broker.
+        entry_for_prior=_num(p.get('level'))
+        sign_for_prior={'BUY':1,'SELL':-1}.get(p.get('direction'))
+        prior=_num(meta.get('trail_extreme'))
+        if (prior is not None and entry_for_prior is not None
+                and sign_for_prior is not None
+                and sign_for_prior*(float(prior)-float(entry_for_prior))<=1e-12):
+            prior=None  # not on profit side — drop polluted/irrelevant memory
         extreme=trail_extreme_from_broker(
             p['direction'],self.market.get('bid'),self.market.get('ask'),
-            candles=candles,opened_at=opened,prior_extreme=None)
+            candles=candles,opened_at=opened,prior_extreme=prior)
         if extreme is not None or zone_range is not None:
             meta=dict(meta)
             if extreme is not None:
-                meta['trail_extreme']=extreme
+                # Only advance memory in the favorable direction.
+                old=_num(meta.get('trail_extreme'))
+                if old is None:
+                    meta['trail_extreme']=float(extreme)
+                elif sign_for_prior==1:
+                    meta['trail_extreme']=max(float(old),float(extreme))
+                elif sign_for_prior==-1:
+                    meta['trail_extreme']=min(float(old),float(extreme))
+                else:
+                    meta['trail_extreme']=float(extreme)
             if zone_range is not None:meta['zone_range']=float(zone_range)
             self.store.set(key,meta)
         # Adaptive trail arm: MFE / structure EV / BE lock — not a frozen 1R rule.

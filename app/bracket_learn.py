@@ -1303,13 +1303,14 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
             store=store)
         if swing.get('ready'):
-            # Correct order: swing → tighten → tick-snap distances → levels.
+            # Correct order: swing → tighten → tick-snap → re-check RR → levels.
             # Never replace SL with stop_take() — that rewrites swing structure.
             from .math_rules import (
                 snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
-            from decimal import Decimal as _Dec
-            stop_d = float(swing['stop_distance']) * t
-            profit_d = float(swing['profit_distance']) * t
+            from decimal import Decimal as _Dec, ROUND_FLOOR
+            # Decimal tighten — avoid float dust before snap (0.8*0.9 → 0.73).
+            stop_d = float(_Dec(str(swing['stop_distance'])) * _Dec(str(t)))
+            profit_d = float(_Dec(str(swing['profit_distance'])) * _Dec(str(t)))
             stop_d, stop_ticks = snap_distance_to_tick(stop_d, tick_f)
             profit_d, profit_ticks = snap_distance_to_tick(profit_d, tick_f)
             raised = False
@@ -1322,6 +1323,41 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 profit_ticks = int(floor_ticks)
                 profit_d = float(_Dec(str(tick_f)) * profit_ticks)
                 raised = True
+            # Re-check min RR AFTER snap — ceil can drop 1.60 → 1.40.
+            min_rr_need = float(swing.get('min_rr') or _min_rr(store))
+            min_rr_need = max(1.0, min(3.0, min_rr_need))
+            rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
+            if rr_now + 1e-12 < min_rr_need:
+                # Prefer raise TP onto RR grid; else shrink SL (tick floor).
+                need_tp = float(_Dec(str(stop_d)) * _Dec(str(min_rr_need)))
+                new_tp, new_tp_ticks = snap_distance_to_tick(need_tp, tick_f)
+                if new_tp / stop_d + 1e-12 >= min_rr_need:
+                    profit_d, profit_ticks = float(new_tp), int(new_tp_ticks)
+                else:
+                    max_stop = float(_Dec(str(profit_d)) / _Dec(str(min_rr_need)))
+                    tick_d = _Dec(str(tick_f))
+                    floored = int(
+                        (_Dec(str(max_stop)) / tick_d).to_integral_value(
+                            rounding=ROUND_FLOOR))
+                    if floored < 1:
+                        floored = 0
+                    if floor_ticks and floored < floor_ticks:
+                        floored = 0  # cannot shrink enough
+                    if floored >= 1 and floored < stop_ticks:
+                        stop_ticks = int(floored)
+                        stop_d = float(tick_d * stop_ticks)
+                    if stop_d <= 1e-12 or profit_d / stop_d + 1e-12 < min_rr_need:
+                        return {
+                            'stop_distance': float(stop_d),
+                            'profit_distance': float(profit_d),
+                            'stop_level': None, 'profit_level': None,
+                            'kappa': float(rr_now), 'sl_scale': 1.0,
+                            'tighten': float(t), 'source': 'swing_anchor',
+                            'ready': False, 'reason': 'rr_below_min_after_snap',
+                            'min_rr': min_rr_need, 'rr': float(rr_now),
+                            'swing': swing, 'swing_reason': swing.get('reason'),
+                            'raised_to_broker_min': raised,
+                        }
             sign = 1 if action == 'BUY' else -1
             e = float(entry)
             stop_level = e - sign * stop_d
@@ -1372,7 +1408,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 'swing_hi': swing.get('swing_hi'),
                 'swing_lo': swing.get('swing_lo'),
                 'bos_event': swing.get('bos_event'),
-                'min_rr': swing.get('min_rr'),
+                'min_rr': min_rr_need,
                 'rr': float(eff_kappa),
                 'rr_capped': swing.get('rr_capped'),
                 'stop_ticks': int(stop_ticks),

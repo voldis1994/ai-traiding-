@@ -52,8 +52,8 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=113' in html
-    assert 'admin.js?v=113' in html
+    assert 'admin.css?v=114' in html
+    assert 'admin.js?v=114' in html
     assert 'ohlc-chart.js?v=9' in html
 
 
@@ -63,6 +63,7 @@ def test_client_closes_marks_upl_vs_capital():
     assert 'closePnlSrcBadge' in js
     assert '≈UPL' in js
     assert 'CAPITAL' in js
+    assert 'gaida Capital £' in js
     assert "src==='broker'||src==='upl_estimate'" not in js
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'id="deskClosedSrc"' in html

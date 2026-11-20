@@ -43,7 +43,7 @@ def test_trade_stats_broker_cash_ok():
 
 
 def test_upl_estimate_counts_as_working_not_broker_cash():
-    """UPL shows in working P&L but is NOT Capital cash (Admin honesty)."""
+    """≈UPL is tracked but never becomes Kopējais / working Capital £."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         store.upsert_trade({
@@ -55,13 +55,14 @@ def test_upl_estimate_counts_as_working_not_broker_cash():
         stats = hub._trade_stats(store, 'GBP')
         assert stats['cash_trades'] == 0
         assert stats['estimate_trades'] == 1
+        assert stats['estimate_pnl'] == pytest.approx(-0.09)
         assert stats['realized_pnl'] is None
         assert stats['pnl_status'] == 'upl_estimate_pending'
-        assert stats['working_pnl'] == pytest.approx(-0.09)
+        assert stats['working_pnl'] is None
         assert stats['working_pnl_source'] == 'upl_estimate'
         assert stats['recent_trades'][0]['pnl_source'] == 'upl_estimate'
         assert stats['display_wins'] == 0
-        assert stats['display_losses'] == 1
+        assert stats['display_losses'] == 0
 
 
 def test_working_pnl_and_wl_from_mixed_upl_peļņa():
@@ -77,11 +78,12 @@ def test_working_pnl_and_wl_from_mixed_upl_peļņa():
         stats = hub._trade_stats(store, 'GBP')
         assert stats['cash_trades'] == 0
         assert stats['estimate_trades'] == 4
-        assert stats['working_pnl'] == pytest.approx(-0.28)
+        assert stats['working_pnl'] is None
         assert stats['working_pnl_source'] == 'upl_estimate'
+        assert stats['estimate_pnl'] == pytest.approx(-0.28)
         assert stats['realized_pnl'] is None
-        assert stats['display_wins'] == 2
-        assert stats['display_losses'] == 2
+        assert stats['display_wins'] == 0
+        assert stats['display_losses'] == 0
         assert stats['wins'] == 0
         ledger = stats['pnl_ledger']
         assert len(ledger) == 4

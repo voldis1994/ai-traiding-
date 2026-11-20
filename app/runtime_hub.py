@@ -475,23 +475,23 @@ class RuntimeHub:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
-        # Operator display: prefer broker £; else UPL-estimate sum so Admin is
-        # not stuck on lying 0 / empty while Capital history is pending.
+        # Operator display: Capital £ only. ≈UPL stays in estimate_* — never
+        # invent Kopējais / equity from provisional closes (Admin vs app lie).
         if realized is not None and cash_n>0:
             working_pnl=realized
             working_pnl_source='broker'
         elif estimate_n>0:
-            working_pnl=round(estimate_sum,4)
+            working_pnl=None
             working_pnl_source='upl_estimate'
         else:
             working_pnl=None
             working_pnl_source=('none' if closed_n else 'empty')
         if cash_n>0:
             display_wins,display_losses,wl_source=wins,losses,'broker'
-        elif estimate_n>0:
-            display_wins,display_losses,wl_source=est_wins,est_losses,'upl_estimate'
         else:
-            display_wins,display_losses,wl_source=0,0,'none'
+            # Do not advertise estimate W/L as robot results.
+            display_wins,display_losses,wl_source=0,0,(
+                'upl_estimate' if estimate_n>0 else 'none')
         upl=None
         if open_upl is not None:
             try:
@@ -500,6 +500,7 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
+        # Equity = broker closed £ + live open UPL only (never provisional closes).
         base_for_equity=working_pnl if working_pnl is not None else realized
         if base_for_equity is not None and upl is not None:
             equity=round(float(base_for_equity)+float(upl),4)
@@ -1233,8 +1234,8 @@ class RuntimeHub:
             wp=res.get('working_pnl')
             wsrc=(res.get('working_pnl_source') or '').strip().lower()
             wccy=(res.get('pnl_currency') or c.get('account_currency') or '').strip().upper() or None
-            # Skip empty/none working_pnl placeholders — they used to force fleet 0.00.
-            if wp is not None and wccy and wsrc not in ('none','empty',''):
+            # Skip empty/none/≈UPL placeholders — they used to invent fleet totals.
+            if wp is not None and wccy and wsrc not in ('none','empty','','upl_estimate'):
                 working_by_ccy[wccy]=round(working_by_ccy.get(wccy,0.0)+float(wp),4)
             ou=res.get('open_upl')
             if ou is not None and wccy:

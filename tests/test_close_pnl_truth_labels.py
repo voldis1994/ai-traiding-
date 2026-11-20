@@ -39,6 +39,64 @@ def test_mixed_broker_and_upl_keeps_sources_honest():
         by_src = {t['deal_id']: t['pnl_source'] for t in stats['recent_trades']}
         assert by_src['b1'] == 'broker'
         assert by_src['u1'] == 'upl_estimate'
-        # Admin Capital mismatch: UPL figure must stay visible on the estimate row.
+        # Journal still holds ≈UPL for harvest; Admin UI must not paint it as £.
         est = next(t for t in stats['recent_trades'] if t['deal_id'] == 'u1')
         assert est['pnl'] == pytest.approx(-0.77)
+
+
+def test_fuzzy_accepts_exact_open_level_among_similar_gold():
+    """Many GOLD micros used to leave harvest stuck on ≈UPL forever."""
+    import asyncio
+    from app.engine import SingleTradeEngine
+    from tests.test_broker_pnl_resolve import HistoryBroker
+    from tests.test_learning_integrity import new_brain
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            e.attach(broker)
+            e.account = {'accounts': [{'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'g-exact', 'epic': 'GOLD', 'size': '.02',
+                'direction': 'SELL', 'level': 3570.0,
+            })
+            store.close_trade('g-exact', 3572.0, -0.69, currency='GBP',
+                              source='upl_estimate', overwrite=True)
+            broker.tx = [
+                {'reference': 'other1', 'pnl': -0.77, 'currency': 'GBP',
+                 'instrumentName': 'Gold', 'size': '0.02',
+                 'openLevel': 3571.0, 'closeLevel': 3573.0,
+                 'dateUtc': '2026-11-20T14:00:00'},
+                {'reference': 'hit', 'pnl': -0.87, 'currency': 'GBP',
+                 'instrumentName': 'Gold', 'size': '0.02',
+                 'openLevel': 3570.0, 'closeLevel': 3572.0,
+                 'dateUtc': '2026-11-20T14:10:00'},
+            ]
+            found = await e._pnl_fuzzy_instrument_cash('g-exact')
+            assert found is not None
+            pnl, ccy = found
+            assert pnl == pytest.approx(-0.87)
+            assert ccy == 'GBP'
+    asyncio.run(scenario())
+
+
+def test_zero_broker_poison_is_requeued():
+    from app.engine import SingleTradeEngine
+    from tests.test_learning_integrity import new_brain
+
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        store.upsert_trade({
+            'dealId': 'z0', 'epic': 'GOLD', 'size': '.02',
+            'direction': 'BUY', 'level': 100,
+        })
+        store.close_trade('z0', 100.1, 0.0, currency='GBP', source='broker', overwrite=True)
+        store.set('broker_cash_banked:z0', {'pnl': 0.0, 'source': 'broker'})
+        n = e._requeue_unsettled_cash_closes()
+        assert n >= 1
+        pending = store.get('pending_broker_pnl_deals') or []
+        assert any(str(x.get('deal_id') if isinstance(x, dict) else x) == 'z0'
+                   for x in pending)

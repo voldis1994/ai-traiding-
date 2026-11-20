@@ -2505,7 +2505,7 @@ class SingleTradeEngine:
                 # perception), not the frozen OPEN vote. Confirmed opposite +
                 # aligned 5/15m returns → market CLOSE so we stop fighting the
                 # move and can learn / re-enter the other side next flat bar.
-                # Broker SL/TP/trail still run via adapt_protection below.
+                # Broker SL/TP stay on OHLC brackets; trail is disabled.
                 manage_bar=(self._manage_signal or {}).get('bar_time')
                 exit_bar=manage_bar or self.market_context.get('bar_time')
                 # Prefer fresh manage scores; frozen OPEN last_signal is fallback.
@@ -5379,12 +5379,20 @@ class SingleTradeEngine:
             path,entry=entry,exit_level=None,pre_bars=pre)
         return (frame or {}).get('structure') or 'CHOP'
 
+    # Live trail OFF — SL/TP stay where OHLC brackets put them (no SL ratchet).
+    TRAIL_ENABLED=False
+
     def _enroll_adaptive_protection(self,p,*,force=False):
         """Register robot deal for broker trail. Needs entry+SL; TP optional.
 
         Capital often confirms OPEN with stopLevel set and Take Profit Off —
         requiring TP here used to skip enrollment entirely, so trail never ran.
+
+        Trail is currently disabled (``TRAIL_ENABLED=False``) — enrollment is a
+        no-op so adaptive SL ratchet never arms.
         """
+        if not self.TRAIL_ENABLED:
+            return False
         deal_id=p.get('dealId')
         if not deal_id:return False
         key='adaptive_protection:'+str(deal_id)
@@ -5428,7 +5436,11 @@ class SingleTradeEngine:
         Historically ``_needs_protect_brackets`` returned False when Capital
         already had stop+profit, so ``protect_position`` never ran, ``robot_open``
         was never set, and every poll showed ``left unchanged`` (no OHLC trail).
+
+        Trail disabled — never claim for ratchet.
         """
+        if not self.TRAIL_ENABLED:
+            return False
         deal=str(p.get('dealId') or '')
         if not deal:
             return False
@@ -5458,7 +5470,16 @@ class SingleTradeEngine:
         Pre-BE gap = original_risk; after BE gap = recent M1 median range from
         OHLC (same zone data), not a hardcoded fraction of R.
         Trail self-arms from MFE / structure EV (not a fixed human 1R law).
+
+        Currently disabled: live deals keep the OHLC swing SL/TP fixed — no
+        broker trail PUT that ratchets the stop.
         """
+        deal_s=str(p.get('dealId'))
+        if not self.TRAIL_ENABLED:
+            self.protection_brief={
+                'status':'Trail disabled — fixed OHLC SL/TP only',
+                'deal_id':deal_s}
+            return
         key='adaptive_protection:'+str(p['dealId'])
         # Late enroll if OPEN lacked TP / meta was never written.
         if self.store.get('robot_open:'+str(p.get('dealId'))):
@@ -5467,7 +5488,6 @@ class SingleTradeEngine:
             # Manual Capital adopt that already has both brackets.
             self._claim_manual_for_trail(p)
         meta=self.store.get(key)
-        deal_s=str(p.get('dealId'))
         if not meta or meta.get('owner')!='AUTO':
             self.protection_brief={'status':'Manual position or earlier bot order: existing SL/TP left unchanged',
                                    'deal_id':deal_s}

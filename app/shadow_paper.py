@@ -98,11 +98,12 @@ def _bar_mid_hl(bar, *, default_spread=0.):
 
 def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
                             profit_distance=None, tick=None, min_distance=None,
-                            slip_bps=0., trail=True):
-    """Replay BUY/SELL/HOLD on a full OHLC path with LIVE SL/TP/trail/costs.
+                            slip_bps=0., trail=False):
+    """Replay BUY/SELL/HOLD on a full OHLC path with LIVE SL/TP costs.
 
     Same execution rules as ShadowPaperJournal / LIVE: adverse fills, SL before
-    TP on the same bar, optional trail, never flip-exit on opposite signal.
+    TP on the same bar, optional trail (off by default — matches live fixed
+    OHLC SL/TP), never flip-exit on opposite signal.
     HOLD → pnl 0. Price-unit pnl from fill-to-fill (spread embedded once).
 
     bars: chronological mids after (and including) entry — dicts with

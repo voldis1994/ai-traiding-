@@ -86,13 +86,13 @@ def hypothetical_pnl(direction, entry, exit_level, *, spread=0., slip_bps=0.,
 def best_action_from_counterfactual(entry, exit_level, *, spread=0., slip_bps=0.,
                                     bars=None, stop_distance=None,
                                     profit_distance=None, tick=None,
-                                    min_distance=None, trail=True,
+                                    min_distance=None, trail=False,
                                     spread_exit=None):
     """Which of BUY/SELL/HOLD would have been best after costs (simulation only).
 
     When ``bars`` (full subsequent path) is provided, replay each side with the
-    same SL/TP/trail/cost rules as shadow paper. Otherwise fall back to
-    endpoint mid delta minus one RT spread (legacy, weaker).
+    same SL/TP rules as shadow paper (trail off by default). Otherwise fall back
+    to endpoint mid delta minus one RT spread (legacy, weaker).
     """
     hold=0.
     detail={'method':None,'buy_sim':None,'sell_sim':None}
@@ -128,7 +128,7 @@ def best_action_from_counterfactual(entry, exit_level, *, spread=0., slip_bps=0.
 def label_from_profit(direction, broker_pnl, *, flip_after_loss=False,
                       entry=None, exit_level=None, spread=0., slip_bps=0.,
                       bars=None, stop_distance=None, profit_distance=None,
-                      tick=None, min_distance=None, trail=True, spread_exit=None,
+                      tick=None, min_distance=None, trail=False, spread_exit=None,
                       structure_prefer_hold=False, path_mfe=None, path_mae=None,
                       structure_frame_advice=None):
     """Map £ outcome → BUY/SELL/HOLD from the path itself — no forced HOLD-on-loss.
@@ -287,7 +287,7 @@ class ProfitLearning:
                       flip_after_loss=False, model_version=None, feature_schema=None,
                       shadow_action=None, require_broker_pnl=True,
                       bars=None, stop_distance=None, profit_distance=None,
-                      tick=None, min_distance=None, trail=True, spread_exit=None,
+                      tick=None, min_distance=None, trail=False, spread_exit=None,
                       structure_prefer_hold=False, path_mfe=None, path_mae=None,
                       structure_frame_advice=None, scores=None):
         """Record a closed trade. Fake ±1 cash is refused when require_broker_pnl.

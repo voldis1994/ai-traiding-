@@ -544,13 +544,14 @@ function renderDeskClosed(client){
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
     const badge=closePnlSrcBadge(t.pnl_source,pending&&!broker);
+    const whenShow=when&&when!=='—'?when:'';
     return `<div class="psx-whale-row">
       <span class="tag">TRADE</span>
-      <strong>${esc(epic)}</strong>
+      <strong class="wh-epic">${esc(epic)}</strong>
       <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
-      <strong class="${broker?pnlClass(p):''}">${esc(val)}</strong>
+      <strong class="wh-pnl ${broker?pnlClass(p):''}">${esc(val)}</strong>
       <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(pending?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
-      <span class="wh-ago">${esc(when)}</span>
+      ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:'<span class="wh-ago" aria-hidden="true"></span>'}
     </div>`;
   }).join(''));
 }

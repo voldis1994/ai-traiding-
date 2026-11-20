@@ -52,9 +52,19 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=114' in html
-    assert 'admin.js?v=114' in html
+    assert 'admin.css?v=115' in html
+    assert 'admin.js?v=115' in html
     assert 'ohlc-chart.js?v=9' in html
+
+
+def test_desk_panels_have_readable_spacing():
+    """Laptop Desk must not crush labels into unreadable 8px cells."""
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert '--desk-gap:8px' in css.replace(' ', '')
+    assert 'min-height:34px' in css.replace(' ', '') or 'min-height:34px' in css
+    assert '.psx-score-row' in css
+    assert '.psx-ind-kv .desk-kv' in css
+    assert 'min-height:32px' in css.replace(' ', '') or 'min-height:32px' in css
 
 
 def test_client_closes_marks_upl_vs_capital():

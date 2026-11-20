@@ -471,30 +471,36 @@ function renderDeskSignal(client,markets){
     const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
     const epic=((client.activity||{}).market)||(((client.activity||{}).mandate)||{}).epic||'FOCUS';
     stableHtml(el,`<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${agree}% agree →</span>
+      <span class="agree">neural ${agree}% →</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`);
     return;
   }
   if(!rows.length){stableHtml(el,'<div class="psx-empty">No signals</div>');return}
   const focusAct=client?deskScoreAction(client):null;
-  stableHtml(el,rows.map((m,i)=>{
+  const focusEpic=((client&&client.activity)||{}).market
+    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
+  stableHtml(el,rows.map((m)=>{
     const epic=m.epic||'—';
-    let act='HOLD',agree=50;
-    if(i===0&&focusAct){
+    const isFocus=focusAct&&focusEpic&&String(epic).toUpperCase()===String(focusEpic).toUpperCase();
+    let act='HOLD',label='';
+    if(isFocus){
       act=focusAct.act;
       const s=act==='SELL'?focusAct.sell:(act==='BUY'?focusAct.buy:focusAct.hold);
-      agree=Math.round(Math.max(0,Math.min(1,s))*100);
+      label=`neural ${Math.round(Math.max(0,Math.min(1,s))*100)}% →`;
     }else{
+      // Tape Δ only — not neural agreement (never invent "agree %" from candles).
       const ch=deskCandleChange(m.candles);
       if(ch!=null){
         act=ch>0.05?'BUY':(ch<-0.05?'SELL':'HOLD');
-        agree=Math.min(99,Math.round(50+Math.abs(ch)*8));
+        label=`tape ${ch>=0?'+':''}${num(ch,2)}% →`;
+      }else{
+        label='tape — →';
       }
     }
     const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
     const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
     return `<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${agree}% agree →</span>
+      <span class="agree">${esc(label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`;
   }).join(''));
 }
@@ -617,15 +623,16 @@ function renderDeskCheck(client,view){
   const ready=a.model_readiness||{};
   const lean=sc.act==='BUY'?'BULL':(sc.act==='SELL'?'BEAR':'NEUT');
   const mtfLean=mtf.preferred||mtf.mode||'';
+  // No lean → NEUT (never invent BULL just because MTF is ready).
   const mtfTag=/sell|bear|down/i.test(String(mtfLean))?'BEAR'
-    :(/buy|bull|up/i.test(String(mtfLean))?'BULL':(mtf.ready?'BULL':'NEUT'));
+    :(/buy|bull|up/i.test(String(mtfLean))?'BULL':'NEUT');
   const rows=[
     {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
     {k:'Momentum',v:mtfTag,cls:mtfTag==='NEUT'?'neu':(mtfTag==='BEAR'?'bad':'ok')},
-    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||lean,cls:'neu'},
+    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||'—',cls:'neu'},
     {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':'WAIT',
       cls:a.market_status==='TRADEABLE'?'ok':'neu'},
-    {k:'Liquidity',v:a.spread!=null?(Number(a.spread)<1?'OK':'WIDE'):'—',cls:'neu'},
+    {k:'Spread state',v:a.spread!=null?(Number(a.spread)<1?'TIGHT':'WIDE'):'—',cls:'neu'},
     {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
     {k:'Can OPEN',v:a.entry_can_submit_now?'YES':'NO',cls:a.entry_can_submit_now?'ok':'neu'},
     {k:'SL Bracket',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
@@ -792,8 +799,25 @@ function _deskMacdHist(closes){
   };
   const e12=ema(closes,12),e26=ema(closes,26);
   const macd=closes.map((_,i)=>(e12[i]==null||e26[i]==null)?null:e12[i]-e26[i]);
-  const signal=ema(macd.map(v=>v==null?0:v),9);
-  return macd.map((v,i)=>(v==null||signal[i]==null)?null:v-signal[i]);
+  // Signal EMA only on real MACD points — null→0 poisoned early hist bars.
+  const macdPts=macd.filter(v=>v!=null);
+  if(macdPts.length<9)return null;
+  const sigPts=(()=>{
+    const k=2/(9+1);let prev=null;const o=[];
+    for(let i=0;i<macdPts.length;i++){
+      if(i<8){o.push(null);continue;}
+      if(prev==null)prev=macdPts.slice(i-8,i+1).reduce((a,b)=>a+b,0)/9;
+      else prev=macdPts[i]*k+prev*(1-k);
+      o.push(prev);
+    }
+    return o;
+  })();
+  let j=0;
+  return macd.map(v=>{
+    if(v==null)return null;
+    const s=sigPts[j++];
+    return s==null?null:v-s;
+  });
 }
 function renderDeskIndCharts(client,view){
   const el=$('deskIndCharts');
@@ -1250,10 +1274,13 @@ function buildEquitySeries(clients,range){
   (clients||[]).forEach(c=>{
     const r=c.results||{};
     const ccy=r.pnl_currency||c.account_currency||'';
-    (r.recent_trades||[]).forEach((t,idx)=>{
+    (r.recent_trades||[]).forEach((t)=>{
+      // Capital £ closes only — skip ≈UPL and rows without a real close time.
+      if(String(t.pnl_source||'').toLowerCase()!=='broker')return;
       const pnl=Number(t.pnl);
       if(!Number.isFinite(pnl))return;
-      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'')||(Date.now()-idx*3600e3);
+      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'');
+      if(!Number.isFinite(ts))return;
       trades.push({ts,pnl,ccy:t.pnl_currency||ccy});
     });
   });
@@ -1264,7 +1291,7 @@ function buildEquitySeries(clients,range){
   const use=filtered.length?filtered:trades;
   let cum=0;
   const points=use.map(t=>{cum+=t.pnl;return {t:t.ts,v:cum}});
-  // Empty → real empty (never invent a fake equity curve).
+  // Empty → real empty (never invent timestamps or ≈UPL into the curve).
   return points;
 }
 

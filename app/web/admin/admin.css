@@ -481,8 +481,9 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 
 .psx-grid{
   flex:1;min-height:420px;display:grid;gap:var(--desk-gap);overflow:auto;
-  grid-template-columns:repeat(4,minmax(160px,1fr));
-  grid-template-rows:minmax(220px,1.45fr) minmax(180px,1fr);
+  /* Deals wider so SL/TP columns fit; watch stays but narrower. */
+  grid-template-columns:minmax(150px,1fr) minmax(280px,1.6fr) minmax(140px,.9fr) minmax(150px,1fr);
+  grid-template-rows:minmax(220px,1.45fr) minmax(200px,1fr);
   grid-template-areas:
     "chart chart book engine"
     "ind deals watch whale"}
@@ -528,9 +529,13 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 
 .psx-trades{flex:1;min-height:0;overflow:auto;padding:0 10px 10px}
 .psx-trade-row{
-  display:grid;grid-template-columns:minmax(52px,auto) 52px 1fr 1fr 1fr;gap:8px;padding:8px 0;
-  border-bottom:1px solid var(--desk-grid);font-size:12px;font-variant-numeric:tabular-nums;align-items:center}
+  display:grid;grid-template-columns:minmax(64px,1.1fr) 48px minmax(56px,.9fr) minmax(56px,.9fr) minmax(56px,.9fr);
+  gap:6px 8px;padding:8px 0;border-bottom:1px solid var(--desk-grid);
+  font-size:12px;font-variant-numeric:tabular-nums;align-items:center}
+.psx-trade-row>span{min-width:0;overflow-wrap:anywhere}
 .psx-trade-row .buy{color:var(--g);font-weight:800}.psx-trade-row .sell{color:var(--r);font-weight:800}
+.psx-trade-row .sl-off,.psx-trade-row .tp-off{color:var(--r);font-weight:800}
+.psx-trade-row .sl-on{color:var(--g)}.psx-trade-row .tp-on{color:var(--g)}
 .psx-trade-head{color:var(--mut);font-size:10px;font-weight:800;letter-spacing:.05em;padding-top:6px}
 
 .psx-watch{padding:0 10px 10px;flex:1;min-height:0;overflow:auto}
@@ -607,12 +612,17 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-src.warn{color:var(--gold)}
 
 .psx-sigwatch{padding:8px 10px 12px}
+/* Stack epic + reason — 56px epic column overlapped OIL_CRUDE with ohlc RR. */
 .psx-sig-row{
-  display:grid;grid-template-columns:56px 1fr auto;gap:8px;align-items:center;
-  padding:8px 0;border-bottom:1px solid var(--desk-grid);font-size:12px}
-.psx-sig-row .agree{color:var(--mut);font-size:11px}
+  display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;
+  gap:2px 10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--desk-grid);font-size:12px}
+.psx-sig-row strong{grid-column:1;grid-row:1;min-width:0;overflow-wrap:anywhere;font-size:12px}
+.psx-sig-row .agree{grid-column:1;grid-row:2;color:var(--mut);font-size:11px;line-height:1.35;
+  min-width:0;overflow-wrap:anywhere;white-space:normal}
 .psx-sig-btn{
-  font-size:11px;font-weight:800;letter-spacing:.05em;padding:4px 8px;border-radius:2px;border:0;color:#fff}
+  grid-column:2;grid-row:1 / span 2;align-self:center;justify-self:end;
+  font-size:11px;font-weight:800;letter-spacing:.05em;padding:6px 10px;border-radius:2px;border:0;color:#fff;
+  min-width:58px;text-align:center}
 .psx-sig-btn.long{background:var(--g)}.psx-sig-btn.short{background:var(--r)}.psx-sig-btn.hold{background:#555;color:var(--gold)}
 
 .psx-empty{padding:12px 8px;text-align:center;color:var(--mut);font-size:11px;line-height:1.35}

@@ -256,13 +256,24 @@ def snap_distance_to_tick(distance, tick_size):
 
     Does **not** raise to broker min or rewrite SL from range — callers that
     already chose swing structure must snap distances only, then rebuild levels.
+
+    Float dust (``0.8*0.9 → 0.7200000000000001``) must not push a clean
+    multiple up by one tick — subtract a tiny epsilon before CEILING.
     """
-    d = D(distance); tick = D(tick_size)
+    # Prefer str() so binary float dust becomes an exact Decimal when possible;
+    # still apply epsilon before ceil for residual binary noise.
+    try:
+        d = D(str(distance)) if not isinstance(distance, Decimal) else D(distance)
+    except Exception:
+        d = D(distance)
+    tick = D(str(tick_size)) if not isinstance(tick_size, Decimal) else D(tick_size)
     if tick <= 0:
         raise ValueError('tick must be positive')
     if d <= 0 or not d.is_finite():
         raise ValueError('distance must be positive')
-    ticks = int((d / tick).to_integral_value(rounding=ROUND_CEILING))
+    ratio = d / tick
+    # 1e-9 ticks of slack — kills 0.7200000000000001 → 72.000…001 ceil-to-73.
+    ticks = int((ratio - D('1e-9')).to_integral_value(rounding=ROUND_CEILING))
     if ticks < 1:
         ticks = 1
     return float(tick * ticks), int(ticks)

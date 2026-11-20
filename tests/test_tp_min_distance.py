@@ -103,8 +103,14 @@ class _OpenCaptureBroker:
         return {'dealReference': 'close-9'}
 
 
-def test_submit_kappa_half_never_sends_sub_min_tp():
+def test_submit_kappa_half_never_sends_sub_min_tp(monkeypatch):
     """κ=0.5: distances raised to min → OPEN may send; never below broker min."""
+    from app import ohlc_regime_gate
+    # Regime gate is separate from live_open_gates — stub so this test only
+    # asserts broker-min SL/TP math (not candle-quality veto).
+    monkeypatch.setattr(
+        ohlc_regime_gate, 'evaluate',
+        lambda **kw: {'allowed': True, 'reason': 'TEST', 'flags': {}})
 
     async def scenario():
         with tempfile.TemporaryDirectory() as d:

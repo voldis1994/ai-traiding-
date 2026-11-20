@@ -5824,8 +5824,8 @@ class SingleTradeEngine:
             candles=candles,tick=tick,spread=spread,
             min_distance=min_dist,entry=level,action=direction,
             atr=atr_hint,kama=kama_hint,require_swing=True)
-        # Prefer swing-anchored levels. Manual TP-only: fall back to ATR/min so
-        # Capital Take Profit Off does not stick forever when swings are thin.
+        # SL/TP only from OHLC swing anchors — never invent ATR/median brackets
+        # (manual or robot). Wait for pivots instead of painting fantasy levels.
         decided_sl=_num(bp.get('stop_distance'))
         decided_tp=_num(bp.get('profit_distance'))
         stop_lvl=_broker_price_level(bp.get('stop_level'))
@@ -5834,41 +5834,10 @@ class SingleTradeEngine:
         sign=1 if direction=='BUY' else -1
         if not (bp.get('ready') and decided_sl and decided_tp
                 and decided_sl>0 and decided_tp>0):
-            # OPEN path refuses invented median brackets. ATR fallback is only
-            # for *manual* adopt (no robot_open yet) so Capital TP Off is not
-            # stuck forever — robot deals wait for real swing geometry.
-            is_manual=not bool(self.store.get('robot_open:'+str(p.get('dealId') or '')))
-            tip=float(atr_hint) if atr_hint and atr_hint>0 else float(base_sl)
-            tip=max(float(min_dist)*2.0,tip,float(min_dist)+buffer)
-            if (is_manual and live_sl is not None and live_tp is None
-                    and direction in ('BUY','SELL')):
-                decided_sl=abs(float(live_sl)-level) or tip
-                decided_tp=tip
-                profit_lvl=level+sign*float(decided_tp)
-                source='manual_tp_atr_fallback'
-                self.store.event('protection','Manual TP fallback (no swing brackets)',{
-                    'deal_id':p.get('dealId'),'profit_distance':decided_tp,
-                    'swing_reason':bp.get('reason')})
-            elif (is_manual and live_tp is not None and live_sl is None
-                    and direction in ('BUY','SELL')):
-                decided_tp=abs(float(live_tp)-level) or tip
-                decided_sl=tip
-                stop_lvl=level-sign*float(decided_sl)
-                source='manual_sl_atr_fallback'
-                self.store.event('protection','Manual SL fallback (TP on, SL Off)',{
-                    'deal_id':p.get('dealId'),'stop_distance':decided_sl,
-                    'swing_reason':bp.get('reason')})
-            elif (is_manual and direction in ('BUY','SELL')
-                  and (live_sl is None or live_tp is None)):
-                decided_sl=tip;decided_tp=tip
-                stop_lvl=level-sign*float(decided_sl)
-                profit_lvl=level+sign*float(decided_tp)
-                source='manual_both_atr_fallback'
-            else:
-                self._protect_defer(p,'no OHLC swing SL/TP',
-                                   swing_reason=bp.get('reason'),
-                                   bracket_source=bp.get('bracket_source'))
-                return
+            self._protect_defer(p,'no OHLC swing SL/TP',
+                               swing_reason=bp.get('reason'),
+                               bracket_source=bp.get('bracket_source'))
+            return
         if stop_lvl is None and live_sl is None and decided_sl:
             stop_lvl=level-sign*float(decided_sl)
         if profit_lvl is None and live_tp is None and decided_tp:

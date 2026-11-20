@@ -125,7 +125,21 @@ function hasRealWorkingPnl(r){
   return true;
 }
 
-/** Capital £ + live open UPL only — never invent Kopējais from ≈UPL closes. */
+/** Format P&L for Desk — gaida only when there is literally no number. */
+function formatPnlDisplay(pnl,src,ccy){
+  const s=String(src||'').toLowerCase();
+  if(pnl!=null&&Number.isFinite(Number(pnl))){
+    const m=money(Number(pnl),ccy);
+    if(s==='upl_estimate')return '≈'+m;
+    return m;
+  }
+  if(s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'){
+    return 'gaida Capital £';
+  }
+  return '—';
+}
+
+/** Capital £ → live open UPL → ≈UPL closes. Never wall the desk on blank gaida. */
 function scoreboard(r){
   r=r||{};
   const ccy=r.pnl_currency||'';
@@ -139,11 +153,32 @@ function scoreboard(r){
     pnl=Number(r.working_pnl);src='broker';
   }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
     pnl=Number(r.realized_pnl);src='broker';
-  }else if(wsrc==='upl_estimate' || estN>0){
-    // Waiting for Capital history — do not paint provisional £ as robot result.
-    src='upl_estimate';
   }else if(r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
+    // Live Capital open UPL must win — stuck ≈UPL closes must not hide +£0.31.
     pnl=Number(r.open_upl);src='open_upl';
+  }else if(wsrc==='upl_estimate' || estN>0){
+    const est=r.estimate_pnl!=null?Number(r.estimate_pnl):null;
+    if(est!=null&&Number.isFinite(est)){pnl=est;src='upl_estimate';}
+    else{
+      let sum=0,n=0;
+      for(const row of ledger){
+        const v=Number(row.pnl);
+        if(!Number.isFinite(v))continue;
+        if(String(row.source||'').toLowerCase()!=='upl_estimate')continue;
+        sum+=v;n++;
+      }
+      if(!n){
+        for(const t of recent){
+          const v=Number(t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint));
+          const s=String(t.pnl_source||'').toLowerCase();
+          if(!Number.isFinite(v))continue;
+          if(s!=='upl_estimate'&&s!=='pending_broker_pnl'&&!t.pending_cash)continue;
+          sum+=v;n++;
+        }
+      }
+      src='upl_estimate';
+      if(n)pnl=sum;
+    }
   }
 
   if(src==='broker'){
@@ -570,27 +605,30 @@ function renderDeskClosed(client){
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
     const src=String(t.pnl_source||'').toLowerCase();
-    const raw=t.pnl!=null?t.pnl:t.profit;
+    const raw=t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint);
     const broker=src==='broker';
-    // ≈UPL with a number → show ≈£… (honest). Blank pending only → gaida.
-    const isEst=src==='upl_estimate'&&raw!=null&&Number.isFinite(Number(raw));
-    const blankWait=!!(t.pending_cash||src==='pending_broker_pnl'
-      ||src==='pending_close_sync')&&!(raw!=null&&Number.isFinite(Number(raw)));
-    let val='—';
-    if(broker&&raw!=null)val=money(raw,t.pnl_currency||ccy);
-    else if(isEst)val='≈'+money(raw,t.pnl_currency||ccy);
-    else if(blankWait||src==='upl_estimate')val='gaida Capital £';
+    const hasNum=raw!=null&&Number.isFinite(Number(raw));
+    // Any pending/estimate with a number → ≈£… Blank pending only → gaida.
+    const isEst=!broker&&hasNum&&(
+      src==='upl_estimate'||src==='pending_broker_pnl'||src==='pending_close_sync'
+      ||!!t.pending_cash);
+    const blankWait=!hasNum&&!!(t.pending_cash||src==='pending_broker_pnl'
+      ||src==='pending_close_sync'||src==='upl_estimate');
+    const val=broker&&hasNum?money(raw,t.pnl_currency||ccy)
+      :(isEst?'≈'+money(raw,t.pnl_currency||ccy)
+        :(blankWait?'gaida Capital £':'—'));
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
-    const badge=closePnlSrcBadge(t.pnl_source,blankWait&&!broker);
+    const badge=closePnlSrcBadge(
+      isEst?'upl_estimate':t.pnl_source,blankWait&&!broker);
     const whenShow=when&&when!=='—'?when:'';
-    const pnlCls=broker?pnlClass(raw):(isEst?pnlClass(raw):'');
+    const pnlCls=broker||isEst?pnlClass(raw):'';
     return `<div class="psx-whale-row">
       <span class="tag">TRADE</span>
       <strong class="wh-epic">${esc(epic)}</strong>
       <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
       <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
-      <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(blankWait?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
+      <span class="${badge.cls}" title="${esc(sourceLabel(isEst?'upl_estimate':(t.pnl_source||(blankWait?'pending_broker_pnl':''))))}">${esc(badge.text)}</span>
       ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:'<span class="wh-ago" aria-hidden="true"></span>'}
     </div>`;
   }).join(''));
@@ -1197,27 +1235,34 @@ function fleetPnl(s,clients){
   let wins=s.display_wins_all;
   let losses=s.display_losses_all;
   const ccy=s.pnl_currency||'';
-  // ≈UPL fleet totals are mystical — clear them; Capital £ or live open UPL only.
+  // Clear empty / ≈UPL-as-working placeholders — then prefer live open UPL.
   if(total!=null && (src==='none'||src==='empty'||src==='upl_estimate'))total=null;
-  if(src==='upl_estimate'){/* keep src so label says gaida */}
-  if(total==null && src!=='upl_estimate' && s.open_upl_all!=null
-      && Number.isFinite(Number(s.open_upl_all))){
+  if(src==='open_upl'&&s.open_upl_all!=null&&Number.isFinite(Number(s.open_upl_all))){
+    total=Number(s.open_upl_all);
+  }
+  if(total==null && s.open_upl_all!=null && Number.isFinite(Number(s.open_upl_all))){
     total=Number(s.open_upl_all);src='open_upl';
   }
+  if(total==null && s.estimate_pnl_all!=null && Number.isFinite(Number(s.estimate_pnl_all))){
+    total=Number(s.estimate_pnl_all);src='upl_estimate';
+  }
   if(total==null || wins==null || losses==null){
-    let sum=0,n=0,w=0,l=0,anyEst=false,anyOpen=false;
+    let sum=0,n=0,w=0,l=0,estSum=0,estN=0,anyEst=false;
     for(const c of clients||[]){
       const sb=scoreboard(c.results||{});
+      const res=c.results||{};
       if(sb.src==='upl_estimate')anyEst=true;
-      if(sb.src==='open_upl')anyOpen=true;
       if(sb.pnl!=null && sb.src==='broker'){sum+=sb.pnl;n++}
       if(sb.src==='broker'){w+=sb.wins;l+=sb.losses}
+      if(res.estimate_pnl!=null&&Number.isFinite(Number(res.estimate_pnl))){
+        estSum+=Number(res.estimate_pnl);estN++;
+      }else if(sb.src==='upl_estimate'&&sb.pnl!=null){
+        estSum+=sb.pnl;estN++;
+      }
     }
     if(total==null && n){total=sum;src='broker'}
+    else if(total==null && estN){total=estSum;src='upl_estimate'}
     else if(total==null && anyEst)src='upl_estimate';
-    else if(total==null && anyOpen && s.open_upl_all!=null){
-      total=Number(s.open_upl_all);src='open_upl';
-    }
     if(wins==null)wins=w;
     if(losses==null)losses=l;
   }
@@ -1230,8 +1275,8 @@ function fleetPnl(s,clients){
     pnlLabel=keys.map(k=>`${num(by[k],2)} ${k}`).join(' · ');
     pnlNum=null;
   }else if(pnlNum!=null){
-    pnlLabel=money(pnlNum,ccy);
-  }else if(src==='upl_estimate'){
+    pnlLabel=formatPnlDisplay(pnlNum,src,ccy);
+  }else if(src==='upl_estimate'||Number(s.pending_cash_trades_all)>0){
     pnlLabel='gaida Capital £';
   }else{
     pnlLabel='—';
@@ -1615,21 +1660,18 @@ function renderCard(c){
   const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
     const tCcy=t.pnl_currency||ccy;
     const s=String(t.pnl_source||'').toLowerCase();
-    const raw=t.pnl!=null?t.pnl:t.profit;
+    const raw=t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint);
     const broker=s==='broker';
-    const isEst=s==='upl_estimate'&&raw!=null&&Number.isFinite(Number(raw));
-    const blankWait=!!(t.pending_cash||s==='pending_broker_pnl'||s==='pending_close_sync')
-      &&!(raw!=null&&Number.isFinite(Number(raw)));
-    const pending=blankWait||(s==='upl_estimate'&&!isEst);
-    const showPnl=broker&&raw!=null?raw:(isEst?raw:null);
-    const cls=pnlClass(showPnl);
-    const srcTag=broker?' [Capital]':(isEst?' [≈UPL]':(pending?' [gaida Capital £]':
+    const hasNum=raw!=null&&Number.isFinite(Number(raw));
+    const isEst=!broker&&hasNum&&(
+      s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'||!!t.pending_cash);
+    const blankWait=!hasNum&&!!(t.pending_cash||s==='pending_broker_pnl'
+      ||s==='pending_close_sync'||s==='upl_estimate');
+    const showSrc=broker?'broker':(isEst?'upl_estimate':(blankWait?'pending_broker_pnl':s));
+    const cls=hasNum?pnlClass(raw):'';
+    const srcTag=broker?' [Capital]':(isEst?' [≈UPL]':(blankWait?' [gaida Capital £]':
       (s?` [${s}]`:'')));
-    let right;
-    if(broker&&showPnl!=null){right=money(showPnl,tCcy);}
-    else if(isEst){right='≈'+money(showPnl,tCcy);}
-    else if(pending){right='gaida Capital £';}
-    else{right='—';}
+    const right=formatPnlDisplay(hasNum?raw:null,showSrc,tCcy);
     return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(srcTag)}</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
 
@@ -1715,10 +1757,10 @@ function renderCard(c){
       <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
       <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
       <div><span>Kopējais P&amp;L</span><strong class="${pnlClass(sb.pnl)}">${
-        sb.pnl==null?(sb.src==='upl_estimate'?'gaida Capital £':'—'):esc(money(sb.pnl,sb.ccy||ccy))
+        esc(formatPnlDisplay(sb.pnl,sb.src,sb.ccy||ccy))
       }</strong></div>
       <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
-      ${((r.estimate_trades||0)>0)?`<div><span>Gaida Capital £</span><strong>${esc(r.estimate_trades)} ≈UPL closes</strong></div>`:''}
+      ${((r.estimate_trades||0)>0&&sb.src!=='open_upl')?`<div><span>≈UPL closes</span><strong>${esc(r.estimate_trades)} gaida Capital history</strong></div>`:''}
       ${(r.pending_cash_trades)?`<div><span>Gaida peļņa</span><strong>${esc(r.pending_cash_trades)} bez skaitļa</strong></div>`:''}
       ${(()=>{
         const fl=a.forward_live||{};

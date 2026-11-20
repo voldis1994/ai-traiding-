@@ -4481,6 +4481,12 @@ class SingleTradeEngine:
             except Exception:
                 row=None
             if row and str(row[0] or '')=='pending_close_sync':
+                # Confirm still in flight — stamp last UPL so Desk is not blank gaida.
+                if self._stamp_provisional_from_upl(deal,exit_level):
+                    nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
+                    nxt['upl_shown']=True
+                    remaining.append(nxt)
+                    continue
                 nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
                 remaining.append(nxt)
                 continue

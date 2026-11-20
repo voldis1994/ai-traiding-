@@ -8,6 +8,8 @@ All market data, LIVE badges, clocks, charts, and feeds are **deterministic mock
 
 ## Develop
 
+**Windows:** double-click `start.bat` (installs deps, opens the browser, runs Vite).
+
 ```bash
 cd perpsignal-desk
 npm install

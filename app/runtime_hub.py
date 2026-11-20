@@ -1287,9 +1287,27 @@ class RuntimeHub:
             pnl_status='no_closes'
         wl_source=('broker' if total_cash>0 else
                    ('upl_estimate' if total_estimate>0 else 'none'))
+        # Live open UPL beats stuck ≈UPL closes — Desk must not wall on gaida.
         working_src=('broker' if total_cash>0 else
-                     ('upl_estimate' if total_estimate>0 else
-                      ('open_upl' if open_upl_primary else 'none')))
+                     ('open_upl' if open_upl_primary else
+                      ('upl_estimate' if total_estimate>0 else 'none')))
+        estimate_pnl_all=None
+        if total_estimate>0 and not working_primary and not open_upl_primary:
+            est_sum=0.0
+            est_ccy=None
+            for c in clients:
+                res=c.get('results') or {}
+                ep=res.get('estimate_pnl')
+                if ep is None:
+                    continue
+                try:
+                    est_sum+=float(ep)
+                except (TypeError,ValueError):
+                    continue
+                if est_ccy is None:
+                    est_ccy=((res.get('pnl_currency') or c.get('account_currency') or '')
+                             .strip().upper() or None)
+            estimate_pnl_all=round(est_sum,4)
         return {
             'summary':{
                 'clients':len(clients),
@@ -1301,6 +1319,7 @@ class RuntimeHub:
                 'working_pnl_source':working_src,
                 'open_upl_all':(open_upl_primary['open_upl'] if open_upl_primary else None),
                 'open_upl_by_currency':open_upl_by_ccy,
+                'estimate_pnl_all':estimate_pnl_all,
                 'pnl_currency':(working_primary['currency'] if working_primary
                                 else (open_upl_primary['currency'] if open_upl_primary
                                       else (primary['currency'] if primary else None))),

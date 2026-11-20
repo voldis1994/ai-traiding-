@@ -1761,6 +1761,14 @@ class SingleTradeEngine:
         if not found:
             return False
         pnl,ccy=found
+        # Opening/interim activity often has profit=0 with the live dealId.
+        # Never force-flatten a still-tracked book on blank £0 (fuzzy already
+        # rejects this; exact path must match).
+        if abs(float(pnl))<1e-12:
+            self.store.event('reconcile',
+                'History £0 ignored — not a closing settlement',
+                {'deal_id':deal,'source':source})
+            return False
         exit_guess=_num((self.market or {}).get('mid'))
         if exit_guess is None:
             snap=self.store.get('last_upl:'+deal) or {}
@@ -4454,6 +4462,21 @@ class SingleTradeEngine:
             queued=base.get('queued_at')
             attempts=int(base.get('attempts') or 0)+1
             exit_level=base.get('exit_level')
+            # CLOSE confirm still owns the first teach — harvest must not UPL-teach
+            # (or claim neural) while pending_close / pending_close_sync is active.
+            if self.pending_close:
+                nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
+                remaining.append(nxt)
+                continue
+            try:
+                row=self.store.db.execute(
+                    'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
+            except Exception:
+                row=None
+            if row and str(row[0] or '')=='pending_close_sync':
+                nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
+                remaining.append(nxt)
+                continue
             # Pass queued_at so history lookback is not stuck on last 30 minutes.
             found=await self._pnl_from_broker_history(deal,queued_at=queued)
             # Fuzzy epic/size bind early — Capital tx.reference often ≠ deal UUID.
@@ -4581,13 +4604,14 @@ class SingleTradeEngine:
                     b['spread']=spread
         # No invented 2-point path — without OHLC, profit_learning falls back to
         # endpoint mid delta (still using shared one-RT cost rules).
+        # Match live trail flag — never teach as if SL ratcheted when trail is OFF.
         return {
             'bars':bars or None,
             'stop_distance':stop_d,
             'profit_distance':profit_d,
             'tick':tick,
             'min_distance':min_d,
-            'trail':True,
+            'trail':bool(self.TRAIL_ENABLED),
         }
 
     def _structure_teacher_context(self,deal_id,saved,*,epic,direction,entry,
@@ -5804,11 +5828,25 @@ class SingleTradeEngine:
         if self.pending_order or self.pending_close:return
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
-        if live_sl is not None and live_tp is not None:
+        direction_early=p.get('direction')
+        entry_early=_broker_price_level(p.get('level'))
+        # Both live only counts as protected when sides are correct — otherwise
+        # fall through and rebuild (wrong-side SL must not be left forever).
+        both_live_ok=(
+            live_sl is not None and live_tp is not None and
+            direction_early in ('BUY','SELL') and entry_early is not None and
+            bracket_learn.levels_correct_side(
+                action=direction_early,entry=entry_early,
+                stop_level=live_sl,profit_level=live_tp))
+        if both_live_ok:
             self._mark_tp_attach_done(p.get('dealId'))
             # Both already live — still claim trail ownership (no Capital PUT).
             self._claim_manual_for_trail(p)
             return
+        if live_sl is not None and live_tp is not None and not both_live_ok:
+            # Force rebuild path — clear so snap/swing can replace.
+            live_sl=None
+            live_tp=None
         deal_s=str(p.get('dealId'))
         # Same idea as adapt_protection REJECTED wait — failed/pending protect
         # must not re-PUT every 3s poll (Capital UI jerks SL/TP on one client).
@@ -5845,6 +5883,11 @@ class SingleTradeEngine:
         candles=self._decision_candles(epic)
         level=float(_broker_price_level(p.get('level'),p.get('level')) or mid)
         direction=p.get('direction')
+        # Never default missing direction to SELL (−1) — that invents inverted SL/TP.
+        if direction not in ('BUY','SELL'):
+            self._protect_defer(p,'unknown direction — refuse protect',
+                               direction=direction)
+            return
         sign=1 if direction=='BUY' else -1
         decided_sl=decided_tp=stop_lvl=profit_lvl=None
         source='swing_anchor'
@@ -5897,12 +5940,37 @@ class SingleTradeEngine:
             stop_lvl=level-sign*float(decided_sl)
         if profit_lvl is None and live_tp is None and decided_tp:
             profit_lvl=level+sign*float(decided_tp)
+        # Drop wrong-side live SL — never re-PUT a stop on the profit side.
+        if live_sl is not None:
+            sl_f=float(live_sl)
+            wrong=((direction=='BUY' and sl_f>=level-1e-12) or
+                   (direction=='SELL' and sl_f<=level+1e-12))
+            if wrong:
+                self.store.event('protection','Ignoring wrong-side live SL',{
+                    'deal_id':deal_s,'direction':direction,'entry':level,
+                    'live_sl':sl_f})
+                live_sl=None
         if live_sl is not None:
             stop_lvl=float(live_sl)
             decided_sl=abs(float(live_sl)-level) or decided_sl
         if live_tp is not None:
             profit_lvl=float(live_tp)
             decided_tp=abs(float(live_tp)-level) or decided_tp
+        # If both sides known but swapped, rebuild from decided distances.
+        if (stop_lvl is not None and profit_lvl is not None and
+                not bracket_learn.levels_correct_side(
+                    action=direction,entry=level,
+                    stop_level=stop_lvl,profit_level=profit_lvl)):
+            self.store.event('protection','Rebuilding swapped SL/TP sides',{
+                'deal_id':deal_s,'direction':direction,'entry':level,
+                'stop':stop_lvl,'profit':profit_lvl})
+            if decided_sl and decided_tp:
+                stop_lvl=level-sign*float(decided_sl)
+                profit_lvl=level+sign*float(decided_tp)
+                live_sl=None;live_tp=None
+            else:
+                self._protect_defer(p,'live SL/TP sides swapped — cannot rebuild')
+                return
         # Snap missing side onto grid + push past live bid/ask min.
         if profit_lvl is not None and live_tp is None:
             profit_lvl=self._snap_protect_tp(

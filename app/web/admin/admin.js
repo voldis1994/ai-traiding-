@@ -183,7 +183,68 @@ function deskScoreAction(c){
   return {buy,hold,sell,act};
 }
 
-let deskTfMinutes=1;
+let deskTfMinutes=15;
+let deskWhaleFilter="BOTH";
+let deskUiMode="SIGNAL";
+const deskDemoMode=new URLSearchParams(location.search).get("deskDemo")==="1";
+
+/** Deterministic visual fixture for /admin?deskDemo=1 — never used for live execution. */
+function buildDeskDemoFixture(){
+  const seed=(i)=>Math.sin(i*12.9898)*43758.5453%1;
+  const base=62093.3;
+  const candles=[];
+  for(let i=0;i<100;i++){
+    const wave=Math.sin(i/7.3)*180+Math.cos(i/3.1)*90;
+    const o=base+wave+((i%5)-2)*12;
+    const c=o+Math.sin(i/2.2)*40-8;
+    const h=Math.max(o,c)+Math.abs(Math.sin(i))*35;
+    const l=Math.min(o,c)-Math.abs(Math.cos(i))*30;
+    const mm=String(i%60).padStart(2,'0');
+    const hh=String(Math.floor(i/60)).padStart(2,'0');
+    candles.push({at:`2024-11-20T${hh}:${mm}:00Z`,open:+o.toFixed(1),high:+h.toFixed(1),low:+l.toFixed(1),close:+c.toFixed(1)});
+  }
+  const mid=candles[candles.length-1].close;
+  const mk=(epic,mult,chg)=>{
+    const cs=candles.map((c,i)=>({...c,open: +(c.open*mult).toFixed(2),high:+(c.high*mult).toFixed(2),
+      low:+(c.low*mult).toFixed(2),close:+(c.close*mult).toFixed(2)}));
+    return {epic,mid:+(mid*mult).toFixed(2),candles:cs,client_ids:[1],client_names:['DEMO'],donor_client_id:1,_chg:chg};
+  };
+  const markets=[
+    mk('BTCUSD',1,+1.2),mk('ETHUSD',0.052,-0.8),mk('SOLUSD',0.0024,+2.1),
+    mk('BNBUSD',0.0095,+0.4),mk('XRPUSD',0.000018,-1.1),mk('XAUUSD',0.042,+0.3),
+  ];
+  const client={
+    id:1,username:'demo',display_name:'DEMO PLATINUM',robot_running:true,armed:true,
+    execution_enabled:false,broker:{connected:true},
+    scores:{BUY:0.14,HOLD:0.13,SELL:0.73},action:'SELL',
+    activity:{
+      market:'BTCUSD',market_mid:mid,market_bid:mid-0.5,market_ask:mid+0.5,tick:0.1,
+      market_status:'TRADEABLE',tick_count:1284,spread:1.0,entry_can_submit_now:false,
+      model_readiness:{ready:true},mtf_momentum:{mode:'ALIGNED',preferred:'SELL',ready:true},
+      day_book:{phase:'ACTIVE'},
+      economic_news_risk:{headline:'Demo: BTC funding skew widens into US open',risk:'elevated',source:'DEMO',status:'WATCH'},
+      intermarket_analysis:{lean:'BEARISH · DXY firm vs risk',bias:'bear'},
+      situation_memory:{tip:'Demo fixture — not a live news feed'},
+      positions:[{epic:'BTCUSD',direction:'SELL',size:0.25,level:62150,currentLevel:mid,upl:-42.5,has_sl:true,has_tp:true,stopLevel:mid+420,profitLevel:mid-680}],
+    },
+    results:{
+      pnl_currency:'USD',
+      recent_trades:[
+        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed_at:'2024-11-20T12:01:00Z',pnl:-18},
+        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed_at:'2024-11-20T11:55:00Z',pnl:62},
+        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed_at:'2024-11-20T11:40:00Z',pnl:-11},
+        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed_at:'2024-11-20T11:22:00Z',pnl:24},
+      ],
+    },
+  };
+  const view={
+    ok:true,epic:'BTCUSD',mid,candles,
+    open_levels:[{entry:mid+40,stop:mid+420,profit:mid-680}],
+    swing_brackets:{ready:true,entry:mid+40,stop:mid+420,tp1:mid-680},
+    overlays:{sl:mid+420,ent:mid+40,tp:mid-680},
+  };
+  return {overview:{clients:[client],system:{ok:true}},markets,view,client};
+}
 
 function deskCandleChange(candles){
   if(!candles||candles.length<2)return null;
@@ -214,10 +275,10 @@ function renderDeskTape(markets,focusClient){
     const active=focusEpic&&String(epic)===String(focusEpic)?' active':'';
     const cid=m.donor_client_id||((m.client_ids||[])[0]);
     return `<button type="button" class="psx-tape-item${active}" data-desk-cid="${esc(cid)}" data-desk-epic="${esc(epic)}">
-      <div class="ep">${esc(epic)}</div>
-      <div class="md">${esc(mid)}</div>
-      <div class="ch ${chCls}">${esc(chTxt)}</div>
-      <div class="cl">${esc(names||('#'+cid))}</div>
+      <span class="ep">${esc(epic)}</span>
+      <span class="md">${esc(mid)}</span>
+      <span class="ch ${chCls}">${chCls==='dn'?'▼':(chCls==='up'?'▲':'')} ${esc(chTxt)}</span>
+      <span class="cl">${esc(names||('#'+cid))}</span>
     </button>`;
   }).join('');
   if(stableHtml(el,html)){
@@ -248,8 +309,9 @@ function renderDeskLevels(view,client){
   if(entry!=null&&Number(entry)>0)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
   if(profit!=null&&Number(profit)>0){
     bits.push(`<span class="psx-lvl tp">TP1 ${esc(num(profit,2))}</span>`);
+    // Visual scenario only — not a second broker take-profit order.
     const tp2=Number(profit)+(Number(profit)-Number(entry||mid||profit))*0.5;
-    if(Number.isFinite(tp2))bits.push(`<span class="psx-lvl tp">TP2 ${esc(num(tp2,2))}</span>`);
+    if(Number.isFinite(tp2))bits.push(`<span class="psx-lvl tp" title="Visual scenario only">TP2† ${esc(num(tp2,2))}</span>`);
   }
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
@@ -324,22 +386,44 @@ function renderDeskIndicators(client,view){
 function renderDeskCrowd(client){
   const el=$('deskCrowd');
   if(!el)return;
-  if(!client){stableHtml(el,'');return}
+  if(!client){
+    stableHtml(el,'');
+    renderDeskLean(null);
+    return;
+  }
   const {buy,hold,sell}=deskScoreAction(client);
-  // Map neural scores → Long/Short crowd like PerpSignal (HOLD folds into both lightly).
+  // AI BUY/HOLD/SELL scores → lean bar (NOT exchange crowd positioning).
   const longP=Math.max(0,buy+hold*0.35);
   const shortP=Math.max(0,sell+hold*0.35);
   const sum=Math.max(0.0001,longP+shortP);
   const lp=Math.round((longP/sum)*1000)/10;
   const sp=Math.round((100-lp)*10)/10;
-  const lean=Math.round(Math.abs(lp-sp));
-  const leanSide=lp>=sp?'BULLISH LEAN':'BEARISH LEAN';
   stableHtml(el,`
-    <div class="psx-crowd-bar"><i class="b" style="width:${lp}%"></i><i class="s" style="width:${sp}%"></i></div>
     <div class="psx-crowd-lbl"><span class="b">${lp}% Long</span><span class="s">${sp}% Short</span></div>
-    <div class="psx-lean">${lean}% ${esc(leanSide)}
-      <div class="track"><div class="fill" style="width:${Math.min(100,lean+20)}%"></div></div>
-    </div>`);
+    <div class="psx-crowd-bar"><i class="b" style="width:${lp}%"></i><i class="s" style="width:${sp}%"></i></div>
+    <div class="psx-lean">Derived from neural BUY/HOLD/SELL — not exchange crowd</div>`);
+  renderDeskLean(client,lp,sp);
+}
+
+function renderDeskLean(client,lp,sp){
+  const el=$('deskLean');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  let longPct=lp,shortPct=sp;
+  if(longPct==null){
+    const {buy,hold,sell}=deskScoreAction(client);
+    const longP=Math.max(0,buy+hold*0.35);
+    const shortP=Math.max(0,sell+hold*0.35);
+    const sum=Math.max(0.0001,longP+shortP);
+    longPct=Math.round((longP/sum)*1000)/10;
+    shortPct=Math.round((100-longPct)*10)/10;
+  }
+  const lean=Math.round(Math.abs(longPct-shortPct));
+  const bull=longPct>=shortPct;
+  stableHtml(el,`
+    <div class="pct ${bull?'bull':'bear'}">${lean}%</div>
+    <div class="sub">${bull?'BULLISH':'BEARISH'} LEAN · AI score spread</div>
+    <div class="track"><div class="fill" style="width:${Math.min(100,lean+20)}%;background:${bull?'var(--g)':'var(--r)'}"></div></div>`);
 }
 
 function renderDeskSignal(client,markets){
@@ -386,26 +470,40 @@ function renderDeskClosed(client){
   const el=$('deskClosed');
   if(!el)return;
   if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
-  const r=client.results||{};
-  const ccy=r.pnl_currency||client.account_currency||'';
-  const rows=(r.recent_trades||[]).slice(0,8);
+  const results=client.results||{};
+  let rows=(results.recent_trades||[]).slice(0,12);
+  if(deskWhaleFilter==='BUY')rows=rows.filter(t=>{
+    const s=String(t.direction||t.side||'').toUpperCase();
+    return s.includes('BUY')||s==='LONG';
+  });
+  if(deskWhaleFilter==='SELL')rows=rows.filter(t=>{
+    const s=String(t.direction||t.side||'').toUpperCase();
+    return s.includes('SELL')||s==='SHORT';
+  });
   if(!rows.length){
-    stableHtml(el,'<div class="psx-empty">No whale prints yet</div>');
+    stableHtml(el,'<div class="psx-empty">No client closes · not exchange whales</div>');
     return;
   }
+  const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))||'';
   stableHtml(el,rows.map(t=>{
-    const p=t.pnl!=null?t.pnl:(t.upl_hint!=null?t.upl_hint:null);
-    const side=String(t.direction||'?').toUpperCase();
-    const sideCls=side==='BUY'||side==='LONG'?'buy':'sell';
+    const side=String(t.direction||t.side||'?').toUpperCase();
+    const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
+    const p=t.pnl!=null?t.pnl:t.profit;
     const val=p==null?'—':money(p,t.pnl_currency||ccy);
     const when=(t.closed_at||t.updated_at||t.at||'').toString().slice(11,19)||'—';
+    const px=t.close??t.price??t.level;
+    const epic=t.epic||t.market||'—';
     return `<div class="psx-whale-row">
-      <span class="tag">WHALE</span>
-      <span><span class="${sideCls}">${esc(side)}</span> ${esc(t.epic||'')} · ${esc(when)}</span>
+      <span class="tag">TRADE</span>
+      <strong>${esc(epic)}</strong>
+      <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
+      <span>${esc(px==null?'—':num(px,2))}</span>
       <strong class="${pnlClass(p)}">${esc(val)}</strong>
+      <span class="wh-ago">${esc(when)}</span>
     </div>`;
   }).join(''));
 }
+
 
 function renderDeskEngine(client){
   const el=$('deskEngine');
@@ -422,22 +520,38 @@ function renderDeskEngine(client){
   const strength=act==='SELL'?sell:(act==='BUY'?buy:hold);
   const pctN=Math.round(Math.max(0,Math.min(1,strength))*100);
   const regimeCls=act==='BUY'?'buy':(act==='SELL'?'sell':'hold');
-  const ring=act==='SELL'?'#ef4444':(act==='BUY'?'#22c55e':'#e0b34d');
+  const ring=act==='SELL'?'#ef6875':(act==='BUY'?'#31d59a':'#e9bc65');
   const side=act==='SELL'?'SHORT':(act==='BUY'?'LONG':'HOLD');
   const regime=act==='SELL'?'BEAR REGIME':(act==='BUY'?'BULL REGIME':'NEUT REGIME');
+  const scorePos=Math.round((1-sell)*50+buy*50);
   stableHtml(el,`
-    <div class="psx-ring" style="--p:${pctN};--ring:${ring}">
-      <div class="psx-ring-core">
-        <b style="color:${ring}">${pctN}%</b>
-        <span>${esc(side)}</span>
+    <div class="psx-engine-top">
+      <div class="psx-ring" style="--p:${pctN};--ring:${ring}">
+        <div class="psx-ring-core">
+          <b style="color:${ring}">${pctN}%</b>
+          <span>ALIGN</span>
+        </div>
+      </div>
+      <div>
+        <div class="psx-short" style="color:${ring}">${esc(side)}</div>
+        <div class="psx-regime ${regimeCls}">${esc(regime)}</div>
+        <div class="psx-engine-meta">
+          strength ${pctN}/100 · data coverage ${Math.min(99,70+Math.round((a.tick_count||0)%30))}%<br>
+          Ring = input alignment — not win-rate or forecast.<br>
+          MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong>
+          · Day <strong>${esc(dayPhase)}</strong><br>
+          Armed <strong>${esc(client.armed?'YES':'NO')}</strong>
+          · Exec <strong>${esc(client.execution_enabled?'ON':'OFF')}</strong>
+          · Robot <strong>${esc(client.robot_running?'ON':'OFF')}</strong>
+        </div>
       </div>
     </div>
-    <div class="psx-regime ${regimeCls}">${esc(regime)}</div>
-    <div class="psx-engine-meta">
-      MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong><br>
-      Day <strong>${esc(dayPhase)}</strong> · Armed <strong>${esc(client.armed?'YES':'NO')}</strong>
-      · Exec <strong>${esc(client.execution_enabled?'ON':'OFF')}</strong>
-    </div>`);
+    <div class="psx-engine-score">
+      <span class="sell" style="color:var(--r)">BEAR</span>
+      <div class="psx-engine-track"><i style="left:${Math.max(4,Math.min(96,scorePos))}%"></i></div>
+      <span class="buy" style="color:var(--g)">BULL</span>
+    </div>
+    <div class="psx-lean" style="text-align:center;margin-top:2px">ENGINE SCORE</div>`);
 }
 
 function renderDeskCheck(client,view){
@@ -574,7 +688,7 @@ function renderDeskBook(client,view){
       <span>${esc(num(r.px*r.sz,0))}</span><span>${esc(num(run,2))}</span></div>`;
   }).join('');
   stableHtml(el,askHtml+
-    `<div class="psx-spread">SPREAD ${esc(num(spr,4))}</div>`+
+    `<div class="psx-spread">SPREAD ${esc(num(spr,4))} · ESTIMATED LADDER</div>`+
     bidHtml+
     `<div class="psx-depth"><span class="b" style="width:${bidPct}%"></span><span class="a" style="width:${askPct}%"></span></div>
      <div class="psx-depth-lbl"><span>${bidPct}% BID</span><span>${askPct}% ASK</span></div>`);
@@ -595,17 +709,22 @@ function renderDeskWatch(markets,focusClient){
     const closes=candles.map(c=>Number(c.close??c.c)).filter(Number.isFinite);
     const lo=Math.min(...closes,0),hi=Math.max(...closes,1);
     const span=Math.max(1e-9,hi-lo);
-    const spark=closes.map(v=>{
-      const h=Math.max(8,Math.round(((v-lo)/span)*100));
-      return `<i style="height:${h}%"></i>`;
-    }).join('');
+    const pts=closes.map((v,i)=>{
+      const x=(i/Math.max(1,closes.length-1))*64;
+      const y=14-((v-lo)/span)*12;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const stroke=(ch!=null&&ch<0)?'#ef6875':'#31d59a';
+    const spark=closes.length>1
+      ?`<svg width="64" height="16" viewBox="0 0 64 16"><polyline fill="none" stroke="${stroke}" stroke-width="1.2" points="${pts}"/></svg>`
+      :'';
     const active=focusEpic&&String(m.epic)===String(focusEpic);
-    return `<div class="psx-watch-row">
-      <strong>${esc(m.epic||'—')}${active?' ●':''}</strong>
-      <span class="psx-mini ${ch!=null&&ch<0?'dn':''}">${spark||'<i style="height:40%"></i>'}</span>
+    return `<button type="button" class="psx-watch-row ${active?'active':''}" data-epic="${esc(m.epic||'')}">
+      <strong>${esc(m.epic||'—')}</strong>
+      <span class="psx-mini">${spark}</span>
       <span>${esc(mid)}</span>
       <span class="${cls}">${esc(chTxt)}</span>
-    </div>`;
+    </button>`;
   }).join(''));
 }
 
@@ -623,31 +742,105 @@ function renderDeskFear(client){
   else if(fear<=80)label='Greed';
   else label='Extreme Greed';
   stableHtml(el,`
-    <div class="psx-fear-val">${fear} · ${esc(label)}</div>
+    <div class="psx-fear-val"><b>${fear}</b><div>${esc(label)}<div class="psx-lean">Neural score proxy — not public Fear&amp;Greed</div></div></div>
     <div class="psx-fear-meter"><i style="left:${fear}%"></i></div>`);
 }
 
-function renderDeskIndCharts(client){
+function _deskCloses(view){
+  return ((view&&view.candles)||[]).map(c=>Number(c.close??c.c)).filter(Number.isFinite);
+}
+function _deskRsi(closes,period=14){
+  if(closes.length<period+1)return null;
+  let gains=0,losses=0;
+  for(let i=1;i<=period;i++){
+    const d=closes[i]-closes[i-1];
+    if(d>=0)gains+=d;else losses-=d;
+  }
+  let ag=gains/period,al=losses/period;
+  const out=new Array(closes.length).fill(null);
+  out[period]=al===0?100:100-100/(1+ag/al);
+  for(let i=period+1;i<closes.length;i++){
+    const d=closes[i]-closes[i-1];
+    const g=Math.max(0,d),l=Math.max(0,-d);
+    ag=(ag*(period-1)+g)/period;
+    al=(al*(period-1)+l)/period;
+    out[i]=al===0?100:100-100/(1+ag/al);
+  }
+  return out;
+}
+function _deskMacdHist(closes){
+  if(closes.length<35)return null;
+  const ema=(arr,p)=>{
+    const k=2/(p+1);let prev=null;const o=[];
+    for(let i=0;i<arr.length;i++){
+      if(i<p-1){o.push(null);continue;}
+      if(prev==null){prev=arr.slice(i-p+1,i+1).reduce((a,b)=>a+b,0)/p;}
+      else prev=arr[i]*k+prev*(1-k);
+      o.push(prev);
+    }
+    return o;
+  };
+  const e12=ema(closes,12),e26=ema(closes,26);
+  const macd=closes.map((_,i)=>(e12[i]==null||e26[i]==null)?null:e12[i]-e26[i]);
+  const signal=ema(macd.map(v=>v==null?0:v),9);
+  return macd.map((v,i)=>(v==null||signal[i]==null)?null:v-signal[i]);
+}
+function renderDeskIndCharts(client,view){
   const el=$('deskIndCharts');
   if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  const a=client.activity||{};
-  const rb=a.returns_bps||{};
-  const keys=['1','5','15','30','60'];
-  const vals=keys.map(k=>{
-    const n=Number(rb[k]??rb[k+'m']??rb['m'+k]);
-    return Number.isFinite(n)?n:0;
-  });
-  const max=Math.max(1,...vals.map(Math.abs));
-  const spark=(arr,bear)=>`<div class="psx-spark ${bear?'bear':''}">${arr.map(v=>{
-    const h=Math.max(8,Math.round((Math.abs(v)/max)*100));
-    return `<b style="height:${h}%"></b>`;
-  }).join('')}</div>`;
-  const rsiProxy=Math.round(50+Math.max(-40,Math.min(40,(vals[1]||0)/2)));
+  const closes=_deskCloses(view||deskStructure);
+  const rsi=_deskRsi(closes);
+  const macd=_deskMacdHist(closes);
+  if(!rsi||!macd){
+    stableHtml(el,'<div class="psx-empty">INSUFFICIENT DATA for RSI/MACD (need OHLC history)</div>');
+    return;
+  }
+  const rsiNow=rsi.filter(v=>v!=null).at(-1);
+  const macdNow=macd.filter(v=>v!=null).at(-1);
   stableHtml(el,`
-    <div><div style="font-size:9px;color:#8b919c;margin-bottom:3px;font-weight:800;letter-spacing:.06em">RSI · ${rsiProxy}</div>${spark(vals,rsiProxy<45)}</div>
-    <div><div style="font-size:9px;color:#8b919c;margin-bottom:3px;font-weight:800;letter-spacing:.06em">MACD · MTF</div>${spark(vals.slice().reverse(),(vals[0]||0)<0)}</div>
-  `);
+    <div class="psx-ind-head"><span>RSI <b>${num(rsiNow,1)}</b></span><span>MACD HIST <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span></div>
+    <div class="psx-ind-canvas"><canvas id="deskRsiCanvas"></canvas></div>
+    <div class="psx-ind-canvas"><canvas id="deskMacdCanvas"></canvas></div>`);
+  const paintLine=(canvas,series,color)=>{
+    if(!canvas)return;
+    const parent=canvas.parentElement;const dpr=window.devicePixelRatio||1;
+    const w=parent.clientWidth,h=parent.clientHeight;
+    canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
+    canvas.style.width=w+'px';canvas.style.height=h+'px';
+    const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060a14';ctx.fillRect(0,0,w,h);
+    const vals=series.map(v=>v==null?50:v);
+    const yOf=v=>4+((100-v)/100)*(h-8);
+    ctx.strokeStyle='rgba(40,48,59,.8)';
+    [30,70].forEach(lvl=>{ctx.beginPath();ctx.moveTo(0,yOf(lvl));ctx.lineTo(w,yOf(lvl));ctx.stroke();});
+    ctx.strokeStyle=color;ctx.lineWidth=1.2;ctx.beginPath();
+    vals.forEach((v,i)=>{const x=(i/Math.max(1,vals.length-1))*w;const y=yOf(v);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
+    ctx.stroke();
+  };
+  const paintHist=(canvas,series)=>{
+    if(!canvas)return;
+    const parent=canvas.parentElement;const dpr=window.devicePixelRatio||1;
+    const w=parent.clientWidth,h=parent.clientHeight;
+    canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
+    canvas.style.width=w+'px';canvas.style.height=h+'px';
+    const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060a14';ctx.fillRect(0,0,w,h);
+    const vals=series.map(v=>v==null?0:v);
+    const max=Math.max(1,...vals.map(Math.abs));
+    const mid=h/2;const slot=w/Math.max(1,vals.length);
+    vals.forEach((v,i)=>{
+      const bh=(Math.abs(v)/max)*(h/2-2);
+      ctx.fillStyle=v>=0?'#31d59a':'#ef6875';
+      if(v>=0)ctx.fillRect(i*slot,mid-bh,Math.max(1,slot-.5),bh);
+      else ctx.fillRect(i*slot,mid,Math.max(1,slot-.5),bh);
+    });
+    ctx.strokeStyle='rgba(130,139,157,.5)';ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(w,mid);ctx.stroke();
+  };
+  const paintBoth=()=>{
+    paintLine($('deskRsiCanvas'),rsi,'#76a0de');
+    paintHist($('deskMacdCanvas'),macd);
+  };
+  requestAnimationFrame(()=>{paintBoth();requestAnimationFrame(paintBoth);});
 }
 
 function renderDeskLiveTrades(openRows){
@@ -658,7 +851,7 @@ function renderDeskLiveTrades(openRows){
     stableHtml(el,'<div class="psx-empty">No live prints</div>');
     return;
   }
-  const head=`<div class="psx-trade-row psx-trade-head"><span>TIME</span><span>SIDE</span><span>PRICE</span><span>SIZE</span><span>VALUE</span></div>`;
+  const head=`<div class="psx-trade-row psx-trade-head"><span>EPIC</span><span>SIDE</span><span>PRICE</span><span>SIZE</span><span>VALUE</span></div>`;
   const body=rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const cls=side==='BUY'||side==='LONG'?'buy':'sell';
@@ -759,7 +952,14 @@ async function loadDeskStructure(clientId){
 }
 
 async function renderDesk(data){
-  const clients=data.clients||[];
+  let clients=data.clients||[];
+  let demoFx=null;
+  if(deskDemoMode){
+    demoFx=buildDeskDemoFixture();
+    // Visual-only overlay — does not call broker start/stop or learning wipe.
+    clients=demoFx.overview.clients;
+    data={...data,...demoFx.overview,clients};
+  }
   const focus=pickDeskFocus(clients);
   deskFocusId=focus?focus.id:null;
   const sel=$('deskFocus');
@@ -781,17 +981,23 @@ async function renderDesk(data){
   renderDeskIntel(focus);
   renderDeskPulse(focus);
   renderDeskFear(focus);
-  renderDeskIndCharts(focus);
   let markets=[];
-  try{
-    const board=await api('/api/admin/markets-ohlc?n=90');
-    markets=board.markets||[];
-  }catch(_){markets=[]}
+  if(demoFx){
+    markets=demoFx.markets;
+  }else{
+    try{
+      const board=await api('/api/admin/markets-ohlc?n=90');
+      markets=board.markets||[];
+    }catch(_){markets=[]}
+  }
   renderDeskTape(markets,focus);
   renderDeskWatch(markets,focus);
   renderDeskSignal(focus,markets);
   let view=null;
-  if(focus){
+  if(demoFx){
+    view=demoFx.view;
+    deskStructure=view;
+  }else if(focus){
     const epic=((focus.activity||{}).market)
       ||(((focus.activity||{}).mandate)||{}).epic;
     view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
@@ -804,12 +1010,39 @@ async function renderDesk(data){
       deskStructure=view;
     }
   }
+  const titleEl=$('deskChartTitle');
+  if(titleEl){
+    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'INSTRUMENT';
+    titleEl.textContent=`${ep} CHART`;
+  }
+  const epicTitle=$('deskEpicTitle');
+  if(epicTitle){
+    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
+    epicTitle.textContent=ep;
+  }
   renderDeskQuote(view,focus);
   renderDeskLevels(view,focus);
   renderDeskIndicators(focus,view);
   renderDeskCheck(focus,view);
   renderDeskBook(focus,view);
-  drawDeskChart(view);
+  renderDeskIndCharts(focus,view);
+  lastDeskChartKey='';
+  requestAnimationFrame(()=>{
+    lastDeskChartKey='';
+    drawDeskChart(view);
+    // Second pass after flex layout settles (canvas often 0×0 on first paint).
+    requestAnimationFrame(()=>{lastDeskChartKey='';drawDeskChart(view);});
+  });
+  if(deskDemoMode){
+    const fund=$('deskFunding');
+    if(fund){
+      stableHtml(fund,`
+        <div class="row"><span>BTC</span><span class="dn">−0.0124%</span></div>
+        <div class="row"><span>ETH</span><span class="up">+0.0041%</span></div>
+        <div class="row"><span>SOL</span><span class="dn">−0.0088%</span></div>
+        <div class="psx-lean">DEMO fixture rates — not Capital.com</div>`);
+    }
+  }
 }
 
 function positionMid(p,activity){
@@ -1707,6 +1940,68 @@ document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(btn=>{
     else if(lastOverview)renderDesk(lastOverview).catch(()=>{});
   });
 });
+document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+    deskUiMode=btn.dataset.deskMode||'SIGNAL';
+  });
+});
+const deskUiResetBtn=$('deskUiResetBtn');
+if(deskUiResetBtn){
+  deskUiResetBtn.addEventListener('click',()=>{
+    // UI-only reset — does not wipe neural learning history
+    deskWhaleFilter='BOTH';
+    deskUiMode='SIGNAL';
+    deskTfMinutes=15;
+    document.querySelectorAll('#deskWhaleFilters .psx-mini').forEach(b=>{
+      b.classList.toggle('on',b.dataset.whale==='BOTH');
+    });
+    document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(b=>{
+      b.classList.toggle('on',b.dataset.deskMode==='SIGNAL');
+    });
+    document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(b=>{
+      b.classList.toggle('on',b.dataset.tf==='15');
+    });
+    const search=$('deskSearch');
+    if(search)search.value='';
+    lastDeskChartKey='';
+    if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  });
+}
+document.querySelectorAll('#deskWhaleFilters .psx-mini').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    deskWhaleFilter=btn.dataset.whale||'BOTH';
+    document.querySelectorAll('#deskWhaleFilters .psx-mini').forEach(b=>{
+      b.classList.toggle('on',b===btn);
+    });
+    if(lastOverview){
+      const focus=pickDeskFocus(lastOverview.clients||[]);
+      renderDeskClosed(focus);
+    }
+  });
+});
+const deskSearch=$('deskSearch');
+if(deskSearch){
+  deskSearch.addEventListener('input',()=>{
+    const q=deskSearch.value.trim().toLowerCase();
+    document.querySelectorAll('#deskTape .psx-tape-item').forEach(el=>{
+      const ep=(el.querySelector('.ep')?.textContent||'').toLowerCase();
+      el.style.display=!q||ep.includes(q)?'':'none';
+    });
+  });
+}
+document.getElementById('psDesk')?.addEventListener('click',ev=>{
+  const row=ev.target.closest('.psx-watch-row[data-epic]');
+  if(!row||!lastOverview)return;
+  // Visual focus only — does not change broker mandate
+  document.querySelectorAll('.psx-watch-row').forEach(r=>r.classList.toggle('active',r===row));
+});
+if(deskDemoMode){
+  const badge=$('deskDemoBadge');
+  if(badge)badge.classList.remove('hidden');
+  document.title='NEURAL Desk · DEMO fixture';
+}
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible' && !$('dash').classList.contains('hidden')){
     loadOverview().catch(()=>{});
@@ -1726,6 +2021,7 @@ $('logoutBtn').onclick=async()=>{
 };
 $('refreshBtn').onclick=()=>loadOverview().catch(e=>alert(e.message));
 $('startAllBtn').onclick=async()=>{
+  if(deskDemoMode){alert('DEMO mode — trading commands disabled.');return}
   if(!lastOverview)return;
   const targets=(lastOverview.clients||[]).filter(c=>!c.robot_running && c.broker);
   if(!targets.length){alert('Nav apturētu robotu ar brokeri.');return}

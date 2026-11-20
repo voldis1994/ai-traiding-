@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=95">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=96">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -189,124 +189,124 @@
       </header>
 
       <section class="view active" data-view="desk">
-        <div class="ps-desk" id="psDesk">
-          <div class="ps-topbar">
-            <div class="ps-brand">
-              <span class="ps-brand-mark" aria-hidden="true"></span>
-              <div>
-                <strong>NEURAL Desk</strong>
-                <em>Signal Terminal</em>
-              </div>
+        <div class="psx" id="psDesk">
+          <header class="psx-top">
+            <div class="psx-logo">
+              <span class="psx-p">N</span>
+              <strong>NEURAL Desk</strong>
             </div>
-            <div class="ps-search" aria-hidden="true">
-              <span>Search markets / commands…</span>
-            </div>
-            <div class="ps-top-meta">
-              <div id="deskUtc" class="ps-utc">UTC —</div>
-              <div id="deskPulse" class="desk-pulse" aria-live="polite">Sync —</div>
-              <span class="ps-tier">LIVE</span>
-              <label class="desk-focus ps-focus">
+            <div class="psx-search">Search markets, views, commands…</div>
+            <div class="psx-top-right">
+              <span id="deskUtc" class="psx-utc">UTC —</span>
+              <span id="deskPulse" class="psx-pulse">Sync —</span>
+              <span class="psx-plat">PLATINUM</span>
+              <label class="psx-acct">
                 Account
-                <select id="deskFocus" aria-label="Desk klienta fokuss"></select>
+                <select id="deskFocus" aria-label="Desk account"></select>
               </label>
             </div>
-          </div>
-          <div id="deskTape" class="desk-tape ps-tape" aria-label="Tirgu lente"></div>
-          <div class="ps-layout">
-            <aside class="ps-intel-col">
-              <article class="ps-panel">
-                <header class="ps-panel-h">
-                  <h2>Market Intel</h2>
-                  <span class="ps-live">● LIVE</span>
-                </header>
-                <div id="deskIntel" class="desk-intel ps-intel"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>TF Weights</h2></header>
-                <div id="deskWeights" class="desk-weights"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Returns / MTF</h2></header>
-                <div id="deskReturns" class="desk-returns"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>React</h2></header>
-                <div id="deskReact" class="desk-react"></div>
-              </article>
+          </header>
+          <div id="deskTape" class="psx-tape" aria-label="Market tape"></div>
+          <div class="psx-body">
+            <nav class="psx-rail" aria-label="Desk modules">
+              <button type="button" class="psx-rail-btn" data-jump="desk" title="Desk"><i></i><span>DESK</span></button>
+              <button type="button" class="psx-rail-btn on" title="Terminal"><i></i><span>TERMINAL</span></button>
+              <button type="button" class="psx-rail-btn" data-jump="overview" title="Global"><i></i><span>GLOBAL</span></button>
+              <button type="button" class="psx-rail-btn" data-jump="trades" title="Flow"><i></i><span>FLOW-LIQ</span></button>
+              <button type="button" class="psx-rail-btn" data-jump="risks" title="OI Fund"><i></i><span>OI-FUND</span></button>
+              <button type="button" class="psx-rail-btn" data-jump="clients" title="Research"><i></i><span>RESEARCH</span></button>
+              <button type="button" class="psx-rail-btn" title="News"><i></i><span>NEWS</span></button>
+              <button type="button" class="psx-rail-btn" title="Cipher"><i></i><span>CIPHER</span></button>
+              <button type="button" class="psx-rail-btn" data-jump="settings" title="Practice"><i></i><span>PRACTICE</span></button>
+              <button type="button" class="psx-rail-btn" title="Learn"><i></i><span>LEARN</span></button>
+            </nav>
+
+            <aside class="psx-intel">
+              <div class="psx-h">
+                <h2>MARKET INTEL</h2>
+                <span class="psx-live">● LIVE</span>
+              </div>
+              <div id="deskIntel" class="psx-intel-feed"></div>
+              <!-- hidden sinks so legacy renderers stay safe -->
+              <div id="deskWeights" class="psx-sink" hidden></div>
+              <div id="deskReturns" class="psx-sink" hidden></div>
+              <div id="deskReact" class="psx-sink" hidden></div>
+              <div id="deskLearn" class="psx-sink" hidden></div>
             </aside>
-            <div class="ps-center">
-              <article class="ps-panel ps-chart-panel">
-                <header class="ps-panel-h ps-chart-h">
-                  <div>
-                    <div class="ps-tabs" role="tablist" aria-label="Desk mode">
-                      <button type="button" class="ps-tab active">SIGNAL DESK</button>
-                      <button type="button" class="ps-tab" disabled>DEFAULT</button>
-                      <button type="button" class="ps-tab" disabled>SCALPER</button>
-                    </div>
-                    <h2 id="deskEpicTitle">Market</h2>
-                    <div id="deskQuote" class="desk-quote muted">Waiting for broker…</div>
-                  </div>
-                  <div id="deskLevels" class="desk-levels" aria-label="SL / Entry / TP"></div>
-                </header>
-                <div class="ps-chart-row">
-                  <canvas id="deskChart" width="960" height="420" aria-label="Live OHLC ar SL/TP"></canvas>
-                  <div class="ps-book-wrap">
-                    <header class="ps-panel-h">
-                      <h2>Order Book</h2>
-                      <span class="ps-live">● LIVE</span>
-                    </header>
-                    <div id="deskBook" class="ps-book"></div>
-                  </div>
+
+            <div class="psx-main">
+              <div class="psx-chart-head">
+                <div class="psx-modes">
+                  <button type="button" class="psx-mode">DEFAULT</button>
+                  <button type="button" class="psx-mode on">SIGNAL DESK</button>
+                  <button type="button" class="psx-mode">SCALPER</button>
+                  <button type="button" class="psx-mode">SWING</button>
+                  <button type="button" class="psx-mode">PRACTICE</button>
                 </div>
-              </article>
-              <div class="ps-mid-row">
-                <article class="ps-panel">
-                  <header class="ps-panel-h"><h2>Indicators</h2></header>
-                  <div id="deskIndicators" class="desk-indicators"></div>
-                  <div id="deskIndCharts" class="ps-ind-charts" aria-hidden="true"></div>
-                </article>
-                <article class="ps-panel">
-                  <header class="ps-panel-h"><h2>Live Trades</h2></header>
-                  <div id="deskDeals" class="table-wrap ps-deals"></div>
-                </article>
-                <article class="ps-panel">
-                  <header class="ps-panel-h"><h2>Watchlist</h2></header>
-                  <div id="deskWatch" class="ps-watch"></div>
-                </article>
+                <div class="psx-epic-row">
+                  <div>
+                    <h2 id="deskEpicTitle">—</h2>
+                    <div id="deskQuote" class="psx-quote">Waiting for broker…</div>
+                  </div>
+                  <div id="deskLevels" class="psx-levels"></div>
+                </div>
+                <div class="psx-tf" id="deskTfBar" role="tablist" aria-label="Timeframe">
+                  <button type="button" class="psx-tf-btn on" data-tf="1">1M</button>
+                  <button type="button" class="psx-tf-btn" data-tf="5">5M</button>
+                  <button type="button" class="psx-tf-btn" data-tf="15">15M</button>
+                  <button type="button" class="psx-tf-btn" data-tf="60">1H</button>
+                  <button type="button" class="psx-tf-btn" data-tf="240">4H</button>
+                </div>
+              </div>
+              <div class="psx-chart-row">
+                <div class="psx-chart-wrap">
+                  <canvas id="deskChart" width="960" height="420" aria-label="OHLC chart"></canvas>
+                </div>
+                <div class="psx-book-col">
+                  <div class="psx-h">
+                    <h2>ORDER BOOK</h2>
+                    <span class="psx-live">● LIVE</span>
+                  </div>
+                  <div class="psx-book-cols"><span>PRICE</span><span>SIZE</span><span>VALUE</span><span>TOTAL</span></div>
+                  <div id="deskBook" class="psx-book"></div>
+                </div>
+              </div>
+              <div class="psx-bottom">
+                <div class="psx-cell">
+                  <div class="psx-h"><h2>INDICATORS</h2></div>
+                  <div id="deskIndCharts" class="psx-ind"></div>
+                  <div id="deskIndicators" class="psx-ind-kv"></div>
+                </div>
+                <div class="psx-cell">
+                  <div class="psx-h"><h2>LIVE TRADES</h2><span class="psx-live">● LIVE</span></div>
+                  <div id="deskDeals" class="psx-trades"></div>
+                </div>
+                <div class="psx-cell">
+                  <div class="psx-h"><h2>WATCHLIST</h2></div>
+                  <div id="deskWatch" class="psx-watch"></div>
+                </div>
               </div>
             </div>
-            <aside class="ps-right">
-              <article class="ps-panel desk-engine">
-                <header class="ps-panel-h">
-                  <h2>Neural Engine</h2>
-                  <span class="ps-live">● LIVE</span>
-                </header>
-                <div id="deskEngine" class="desk-engine-body"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Engine Score</h2></header>
-                <div id="deskCheck" class="desk-check"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Crowd Positioning</h2></header>
-                <div id="deskCrowd" class="desk-crowd"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Learn Horizon</h2></header>
-                <div id="deskLearn" class="ps-learn"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Fear &amp; Utility</h2></header>
-                <div id="deskFear" class="ps-fear"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Whale / Closed</h2></header>
-                <div id="deskClosed" class="desk-closed"></div>
-              </article>
-              <article class="ps-panel">
-                <header class="ps-panel-h"><h2>Signal Watch</h2></header>
-                <div id="deskSignal" class="desk-signal"></div>
-              </article>
+
+            <aside class="psx-right">
+              <div class="psx-cell">
+                <div class="psx-h"><h2>NEURAL ENGINE</h2><span class="psx-live">● LIVE</span></div>
+                <div id="deskEngine" class="psx-engine"></div>
+                <div id="deskCheck" class="psx-score"></div>
+              </div>
+              <div class="psx-cell">
+                <div class="psx-h"><h2>CROWD POSITIONING</h2></div>
+                <div id="deskCrowd" class="psx-crowd"></div>
+                <div id="deskFear" class="psx-fear"></div>
+              </div>
+              <div class="psx-cell">
+                <div class="psx-h"><h2>WHALE ALERTS</h2><span class="psx-live">● LIVE</span></div>
+                <div id="deskClosed" class="psx-whale"></div>
+              </div>
+              <div class="psx-cell">
+                <div class="psx-h"><h2>SIGNAL WATCH</h2></div>
+                <div id="deskSignal" class="psx-sigwatch"></div>
+              </div>
             </aside>
           </div>
         </div>
@@ -462,6 +462,6 @@
     </div>
   </div>
   <script src="/admin/static/ohlc-chart.js?v=7"></script>
-  <script src="/admin/static/admin.js?v=102"></script>
+  <script src="/admin/static/admin.js?v=103"></script>
 </body>
 </html>

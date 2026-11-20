@@ -178,12 +178,22 @@ function deskScoreAction(c){
   return {buy,hold,sell,act};
 }
 
+let deskTfMinutes=1;
+
+function deskCandleChange(candles){
+  if(!candles||candles.length<2)return null;
+  const a=Number(candles[candles.length-1].close??candles[candles.length-1].c);
+  const b=Number(candles[0].close??candles[0].c);
+  if(!Number.isFinite(a)||!Number.isFinite(b)||!b)return null;
+  return ((a-b)/b)*100;
+}
+
 function renderDeskTape(markets,focusClient){
   const el=$('deskTape');
   if(!el)return;
   const rows=markets||[];
   if(!rows.length){
-    stableHtml(el,'<div class="desk-empty">Nav atvērtu Capital epic flotē — palaid robotu vai adoptē darījumu.</div>');
+    stableHtml(el,'<div class="psx-empty">No live Capitals in fleet — start a robot.</div>');
     return;
   }
   const focusEpic=((focusClient&&focusClient.activity)||{}).market
@@ -192,12 +202,16 @@ function renderDeskTape(markets,focusClient){
   const html=rows.map(m=>{
     const epic=m.epic||'—';
     const mid=m.mid!=null?num(m.mid,2):'—';
+    const ch=deskCandleChange(m.candles);
+    const chCls=ch==null?'':(ch>=0?'up':'dn');
+    const chTxt=ch==null?'—':((ch>=0?'+':'')+ch.toFixed(2)+'%');
     const names=(m.client_names||[]).slice(0,2).join(', ');
     const active=focusEpic&&String(epic)===String(focusEpic)?' active':'';
     const cid=m.donor_client_id||((m.client_ids||[])[0]);
-    return `<button type="button" class="desk-tape-item${active}" data-desk-cid="${esc(cid)}" data-desk-epic="${esc(epic)}">
+    return `<button type="button" class="psx-tape-item${active}" data-desk-cid="${esc(cid)}" data-desk-epic="${esc(epic)}">
       <div class="ep">${esc(epic)}</div>
       <div class="md">${esc(mid)}</div>
+      <div class="ch ${chCls}">${esc(chTxt)}</div>
       <div class="cl">${esc(names||('#'+cid))}</div>
     </button>`;
   }).join('');
@@ -225,31 +239,36 @@ function renderDeskLevels(view,client){
   const profit=open[0]&&open[0].profit!=null?open[0].profit:(pos&&pos.profitLevel);
   const mid=view&&view.mid!=null?view.mid:a.market_mid;
   const bits=[];
-  if(stop!=null&&Number(stop)>0)bits.push(`<span class="desk-lvl sl">SL ${esc(num(stop,2))}</span>`);
-  if(entry!=null&&Number(entry)>0)bits.push(`<span class="desk-lvl ent">ENT ${esc(num(entry,2))}</span>`);
-  if(mid!=null&&Number(mid)>0)bits.push(`<span class="desk-lvl mid">MID ${esc(num(mid,2))}</span>`);
-  if(profit!=null&&Number(profit)>0)bits.push(`<span class="desk-lvl tp">TP ${esc(num(profit,2))}</span>`);
-  stableHtml(el,bits.join('')||'<span class="muted">Nav live līmeņu</span>');
+  if(stop!=null&&Number(stop)>0)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
+  if(entry!=null&&Number(entry)>0)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
+  if(profit!=null&&Number(profit)>0){
+    bits.push(`<span class="psx-lvl tp">TP1 ${esc(num(profit,2))}</span>`);
+    const tp2=Number(profit)+(Number(profit)-Number(entry||mid||profit))*0.5;
+    if(Number.isFinite(tp2))bits.push(`<span class="psx-lvl tp">TP2 ${esc(num(tp2,2))}</span>`);
+  }
+  if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
+  stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
 }
 
 function renderDeskQuote(view,client){
   const el=$('deskQuote');
   const title=$('deskEpicTitle');
   const a=(client&&client.activity)||{};
-  const epic=(view&&view.epic)||a.market||((a.mandate||{}).epic)||'Tirgus';
-  if(title)title.textContent=epic;
+  const epic=(view&&view.epic)||a.market||((a.mandate||{}).epic)||'MARKET';
+  const mid=a.market_mid!=null?a.market_mid:(view&&view.mid);
+  if(title)title.textContent=mid!=null?`${epic}  ·  LAST ${num(mid,2)}`:epic;
   if(!el)return;
-  const bid=a.market_bid,ask=a.market_ask,mid=a.market_mid!=null?a.market_mid:(view&&view.mid);
+  const bid=a.market_bid,ask=a.market_ask;
   const spread=(bid!=null&&ask!=null&&Number.isFinite(Number(bid))&&Number.isFinite(Number(ask)))
     ?(Number(ask)-Number(bid)):null;
   const status=a.market_status||'—';
   el.textContent=[
     bid!=null?`Bid ${num(bid,2)}`:'Bid —',
     ask!=null?`Ask ${num(ask,2)}`:'Ask —',
-    mid!=null?`Mid ${num(mid,2)}`:'',
     spread!=null?`Spr ${num(spread,3)}`:'',
+    `TF ${deskTfMinutes}M`,
     status,
-  ].filter(Boolean).join(' · ');
+  ].filter(Boolean).join('  ·  ');
 }
 
 function deskTrack(cid,key,val){
@@ -272,57 +291,10 @@ function deskKv(cid,label,val,fmt){
   return `<div class="desk-kv ${cls}"><span>${esc(label)}</span><strong title="${esc(t.was||'')}">${esc(t.now)}</strong></div>`;
 }
 
-function renderDeskWeights(client){
-  const el=$('deskWeights');
-  if(!el)return;
-  if(!client){stableHtml(el,'<div class="desk-empty">—</div>');return}
-  const a=client.activity||{};
-  const mtf=a.mtf_momentum||{};
-  const pw=mtf.neural_period_weights||mtf.period_weights||null;
-  const keys=['m1','m5','m15','m30','m60'];
-  if(!pw||typeof pw!=='object'){
-    stableHtml(el,'<div class="desk-empty">TF svari vēl nav — robots mācās / nav MTF.</div>');
-    return;
-  }
-  const html=keys.map(k=>{
-    const v=Number(pw[k]);
-    const pctV=Number.isFinite(v)?Math.round(v*100):null;
-    const t=deskTrack(client.id,'w_'+k,pctV==null?'—':pctV+'%');
-    const w=pctV==null?0:Math.max(0,Math.min(100,pctV));
-    const cls=(t.lost?'lost ':'')+(t.changed?'flash ':'');
-    return `<div class="desk-bar ${cls}"><span>${esc(k)}</span>
-      <div class="track"><div class="fill" style="width:${w}%"></div></div>
-      <b>${esc(t.now)}</b></div>`;
-  }).join('');
-  stableHtml(el,html);
-}
-
-function renderDeskReturns(client){
-  const el=$('deskReturns');
-  if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  const a=client.activity||{};
-  const rb=a.returns_bps||{};
-  const mtf=a.mtf_momentum||{};
-  const keys=['1','5','15','30','60'];
-  const bars=keys.map(k=>{
-    const raw=rb[k]??rb[k+'m']??rb['m'+k];
-    const n=Number(raw);
-    const t=deskTrack(client.id,'ret_'+k,Number.isFinite(n)?n.toFixed(1):'—');
-    const abs=Number.isFinite(n)?Math.min(100,Math.abs(n)/2):0;
-    const dir=Number.isFinite(n)?(n>0?'up':(n<0?'down':'')):'';
-    return `<div class="desk-bar ${dir} ${t.changed?'flash':''} ${t.lost?'lost':''}">
-      <span>${esc(k)}m</span><div class="track"><div class="fill" style="width:${abs}%"></div></div>
-      <b>${esc(t.now)}</b></div>`;
-  }).join('');
-  const meta=[
-    deskKv(client.id,'MTF mode',mtf.mode),
-    deskKv(client.id,'Preferred',mtf.preferred),
-    deskKv(client.id,'Bar',a.bar_time?String(a.bar_time).slice(11,19):'—'),
-    deskKv(client.id,'Regime',a.market_regime),
-  ].join('');
-  stableHtml(el,bars+meta);
-}
+function renderDeskWeights(client){ /* sink — data folded into engine score */ }
+function renderDeskReturns(client){ /* sink */ }
+function renderDeskReact(client){ /* sink */ }
+function renderDeskLearn(client){ /* sink — learn msg in intel */ }
 
 function renderDeskIndicators(client,view){
   const el=$('deskIndicators');
@@ -334,48 +306,13 @@ function renderDeskIndicators(client,view){
   const mtfUi=(view&&view.mtf)||{};
   const atr=mtf.stop_hint_atr14??((mtf.tf||{}).m1||{}).atr14??mtfUi.atr14??ov.atr14;
   const adx=mtfUi.adx??ov.adx;
-  const dip=mtfUi.di_plus??ov.di_plus;
-  const dim=mtfUi.di_minus??ov.di_minus;
   const kama=mtfUi.kama??ov.kama_level??((mtf.tf||{}).m5||{}).kama;
   stableHtml(el,[
     deskKv(client.id,'ATR14',atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
-    deskKv(client.id,'DI+',dip,v=>v==null?'—':num(v,1)),
-    deskKv(client.id,'DI−',dim,v=>v==null?'—':num(v,1)),
-    deskKv(client.id,'KAMA',kama,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Tick',a.tick,v=>v==null?'—':num(v,4)),
-    deskKv(client.id,'MinDist',a.min_distance,v=>v==null?'—':num(v,3)),
+    deskKv(client.id,'KAMA5',kama,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Spread',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
       v=>v==null?'—':num(v,3)),
-  ].join(''));
-}
-
-function renderDeskReact(client){
-  const el=$('deskReact');
-  if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  const a=client.activity||{};
-  const e=client.evolution||{};
-  const ticks=Number(a.tick_count)||0;
-  const prev=deskPrevTicks.get(String(client.id))||{tick:ticks,at:Date.now()};
-  const dt=Math.max(0.001,(Date.now()-prev.at)/1000);
-  const dTick=ticks-prev.tick;
-  const rate=dTick>0?(dTick/dt):0;
-  deskPrevTicks.set(String(client.id),{tick:ticks,at:Date.now()});
-  const age=a.position_age;
-  const syncAge=lastSyncAt?Math.round((Date.now()-lastSyncAt)/1000):null;
-  stableHtml(el,[
-    deskKv(client.id,'Ticks',ticks),
-    deskKv(client.id,'Tick/s',rate>0?rate.toFixed(2):'0'),
-    deskKv(client.id,'Sync ago',syncAge==null?'—':syncAge+'s'),
-    deskKv(client.id,'Can OPEN now',a.entry_can_submit_now?'JĀ':'NĒ'),
-    deskKv(client.id,'Eligible',a.entry_eligible?'JĀ':'NĒ'),
-    deskKv(client.id,'Pending new bar',a.entry_decision_pending_new_bar?'JĀ':'NĒ'),
-    deskKv(client.id,'Pos age',age==null?'—':(typeof age==='number'?Math.round(age)+'s':age)),
-    deskKv(client.id,'Neurons/steps',`${e.neurons??'—'} / ${e.steps??0}`),
-    deskKv(client.id,'M1 acc',a.minute_direction_accuracy==null?'—':pct(a.minute_direction_accuracy)),
-    deskKv(client.id,'Trade WR',a.trade_win_rate==null?'—':pct(a.trade_win_rate)),
-    deskKv(client.id,'Unresolved',Array.isArray(a.unresolved_orders)?a.unresolved_orders.length:0),
   ].join(''));
 }
 
@@ -383,63 +320,85 @@ function renderDeskCrowd(client){
   const el=$('deskCrowd');
   if(!el)return;
   if(!client){stableHtml(el,'');return}
-  const {buy,hold,sell,act}=deskScoreAction(client);
-  const b=Math.round(buy*100),h=Math.round(hold*100),s=Math.round(sell*100);
-  const sum=Math.max(1,b+h+s);
+  const {buy,hold,sell}=deskScoreAction(client);
+  // Map neural scores → Long/Short crowd like PerpSignal (HOLD folds into both lightly).
+  const longP=Math.max(0,buy+hold*0.35);
+  const shortP=Math.max(0,sell+hold*0.35);
+  const sum=Math.max(0.0001,longP+shortP);
+  const lp=Math.round((longP/sum)*1000)/10;
+  const sp=Math.round((100-lp)*10)/10;
+  const lean=Math.round(Math.abs(lp-sp));
+  const leanSide=lp>=sp?'BULLISH LEAN':'BEARISH LEAN';
   stableHtml(el,`
-    <div class="desk-crowd-bar">
-      <i class="b" style="width:${(b/sum)*100}%"></i>
-      <i class="h" style="width:${(h/sum)*100}%"></i>
-      <i class="s" style="width:${(s/sum)*100}%"></i>
-    </div>
-    <div class="desk-meta">
-      <div>BUY <strong>${b}%</strong> · HOLD <strong>${h}%</strong> · SELL <strong>${s}%</strong></div>
-      <div>Argmax <strong>${esc(act)}</strong></div>
-      <div>Edge <strong>${esc(client.activity&&client.activity.directional_advantage!=null
-        ?num(client.activity.directional_advantage,3):'—')}</strong></div>
-      <div>Utility <strong>${esc(client.activity&&client.activity.economic_utility!=null
-        ?String(client.activity.economic_utility).slice(0,48):'—')}</strong></div>
+    <div class="psx-crowd-bar"><i class="b" style="width:${lp}%"></i><i class="s" style="width:${sp}%"></i></div>
+    <div class="psx-crowd-lbl"><span class="b">${lp}% Long</span><span class="s">${sp}% Short</span></div>
+    <div class="psx-lean">${lean}% ${esc(leanSide)}
+      <div class="track"><div class="fill" style="width:${Math.min(100,lean+20)}%"></div></div>
     </div>`);
 }
 
-function renderDeskSignal(client){
+function renderDeskSignal(client,markets){
   const el=$('deskSignal');
   if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  const a=client.activity||{};
-  const path=a.entry_path||{};
-  const rows=[
-    ['Intent',a.entry_intent||path.intent||'—'],
-    ['Trigger',a.entry_trigger||path.trigger||'—'],
-    ['Wait',a.entry_wait||path.wait||a.entry_block_reason||'—'],
-    ['Policy',a.policy_decision||client.action||'—'],
-    ['Proposal',a.policy_proposal||client.proposal||'—'],
-    ['Fusion block',a.fusion_block_reason||'—'],
-    ['Exit intent',a.neural_exit_intent||'—'],
-    ['Manage bar',(a.manage_signal&&a.manage_signal.bar_time)||'—'],
-    ['Decision bar',a.neural_decision_bar||'—'],
-  ];
-  stableHtml(el,rows.map(([k,v])=>{
-    const t=deskTrack(client.id,'sig_'+k,v);
-    return `<div class="${t.lost?'lost':''}"><span>${esc(k)}</span><strong title="${esc(String(v))}">${esc(String(t.now).slice(0,64))}</strong></div>`;
+  const rows=(markets||[]).slice(0,6);
+  if(!rows.length&&client){
+    const {buy,hold,sell,act}=deskScoreAction(client);
+    const strength=act==='SELL'?sell:(act==='BUY'?buy:hold);
+    const agree=Math.round(Math.max(0,Math.min(1,strength))*100);
+    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
+    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
+    const epic=((client.activity||{}).market)||(((client.activity||{}).mandate)||{}).epic||'FOCUS';
+    stableHtml(el,`<div class="psx-sig-row"><strong>${esc(epic)}</strong>
+      <span class="agree">${agree}% agree →</span>
+      <span class="psx-sig-btn ${cls}">${side}</span></div>`);
+    return;
+  }
+  if(!rows.length){stableHtml(el,'<div class="psx-empty">No signals</div>');return}
+  const focusAct=client?deskScoreAction(client):null;
+  stableHtml(el,rows.map((m,i)=>{
+    const epic=m.epic||'—';
+    let act='HOLD',agree=50;
+    if(i===0&&focusAct){
+      act=focusAct.act;
+      const s=act==='SELL'?focusAct.sell:(act==='BUY'?focusAct.buy:focusAct.hold);
+      agree=Math.round(Math.max(0,Math.min(1,s))*100);
+    }else{
+      const ch=deskCandleChange(m.candles);
+      if(ch!=null){
+        act=ch>0.05?'BUY':(ch<-0.05?'SELL':'HOLD');
+        agree=Math.min(99,Math.round(50+Math.abs(ch)*8));
+      }
+    }
+    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
+    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
+    return `<div class="psx-sig-row"><strong>${esc(epic)}</strong>
+      <span class="agree">${agree}% agree →</span>
+      <span class="psx-sig-btn ${cls}">${side}</span></div>`;
   }).join(''));
 }
 
 function renderDeskClosed(client){
   const el=$('deskClosed');
   if(!el)return;
-  if(!client){stableHtml(el,'');return}
+  if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
   const r=client.results||{};
   const ccy=r.pnl_currency||client.account_currency||'';
-  const rows=(r.recent_trades||[]).slice(0,6);
+  const rows=(r.recent_trades||[]).slice(0,8);
   if(!rows.length){
-    stableHtml(el,'<div class="desk-empty">Nav nesen slēgtu</div>');
+    stableHtml(el,'<div class="psx-empty">No whale prints yet</div>');
     return;
   }
   stableHtml(el,rows.map(t=>{
     const p=t.pnl!=null?t.pnl:(t.upl_hint!=null?t.upl_hint:null);
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}</span>
-      <strong class="${pnlClass(p)}">${esc(p==null?'—':money(p,t.pnl_currency||ccy))}</strong></div>`;
+    const side=String(t.direction||'?').toUpperCase();
+    const sideCls=side==='BUY'||side==='LONG'?'buy':'sell';
+    const val=p==null?'—':money(p,t.pnl_currency||ccy);
+    const when=(t.closed_at||t.updated_at||t.at||'').toString().slice(11,19)||'—';
+    return `<div class="psx-whale-row">
+      <span class="tag">WHALE</span>
+      <span><span class="${sideCls}">${esc(side)}</span> ${esc(t.epic||'')} · ${esc(when)}</span>
+      <strong class="${pnlClass(p)}">${esc(val)}</strong>
+    </div>`;
   }).join(''));
 }
 
@@ -447,7 +406,7 @@ function renderDeskEngine(client){
   const el=$('deskEngine');
   if(!el)return;
   if(!client){
-    stableHtml(el,'<div class="desk-empty">Select account</div>');
+    stableHtml(el,'<div class="psx-empty">Select account</div>');
     return;
   }
   const a=client.activity||{};
@@ -455,29 +414,25 @@ function renderDeskEngine(client){
   const mtf=a.mtf_momentum||{};
   const day=a.day_book||{};
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
-  const trailOn=!!a.trail_enabled;
-  const prot=(a.protection&&a.protection.status)||(trailOn?'Trail —':'Trail OFF · fixed OHLC SL/TP');
   const strength=act==='SELL'?sell:(act==='BUY'?buy:hold);
   const pctN=Math.round(Math.max(0,Math.min(1,strength))*100);
   const regimeCls=act==='BUY'?'buy':(act==='SELL'?'sell':'hold');
-  const ring=act==='SELL'?'#e94c5e':(act==='BUY'?'#3fb68d':'#e3b044');
+  const ring=act==='SELL'?'#ef4444':(act==='BUY'?'#22c55e':'#e0b34d');
+  const side=act==='SELL'?'SHORT':(act==='BUY'?'LONG':'HOLD');
   const regime=act==='SELL'?'BEAR REGIME':(act==='BUY'?'BULL REGIME':'NEUT REGIME');
-  const html=`
-    <div class="ps-ring" style="--p:${pctN};--ring:${ring}">
-      <div class="ps-ring-core">
+  stableHtml(el,`
+    <div class="psx-ring" style="--p:${pctN};--ring:${ring}">
+      <div class="psx-ring-core">
         <b style="color:${ring}">${pctN}%</b>
-        <span>${esc(act)}</span>
+        <span>${esc(side)}</span>
       </div>
     </div>
-    <div class="desk-regime ${regimeCls}">${esc(regime)}</div>
-    <div class="desk-meta">
-      <div>BUY <strong>${pct(buy)}</strong> · HOLD <strong>${pct(hold)}</strong> · SELL <strong>${pct(sell)}</strong></div>
-      <div>MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong></div>
-      <div>Day <strong>${esc(dayPhase)}</strong></div>
-      <div>Protect <strong>${esc(prot)}</strong></div>
-      <div>Armed <strong>${esc(client.armed?'YES':'NO')} · exec ${esc(client.execution_enabled?'ON':'OFF')}</strong></div>
-    </div>`;
-  stableHtml(el,html);
+    <div class="psx-regime ${regimeCls}">${esc(regime)}</div>
+    <div class="psx-engine-meta">
+      MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong><br>
+      Day <strong>${esc(dayPhase)}</strong> · Armed <strong>${esc(client.armed?'YES':'NO')}</strong>
+      · Exec <strong>${esc(client.execution_enabled?'ON':'OFF')}</strong>
+    </div>`);
 }
 
 function renderDeskCheck(client,view){
@@ -492,72 +447,81 @@ function renderDeskCheck(client,view){
   const hasTp=pos&&(pos.has_tp||(pos.profitLevel!=null&&Number(pos.profitLevel)>0));
   const ready=a.model_readiness||{};
   const lean=sc.act==='BUY'?'BULL':(sc.act==='SELL'?'BEAR':'NEUT');
+  const mtfLean=mtf.preferred||mtf.mode||'';
+  const mtfTag=/sell|bear|down/i.test(String(mtfLean))?'BEAR'
+    :(/buy|bull|up/i.test(String(mtfLean))?'BULL':(mtf.ready?'BULL':'NEUT'));
   const rows=[
-    {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':'ok'},
-    {k:'Momentum',v:mtf.ready?(mtf.preferred||mtf.mode||'READY'):'NEUT',
-      cls:mtf.ready?'ok':'neu'},
-    {k:'Flow / Day',v:(a.day_book&& (a.day_book.phase||(a.day_book.daily&&a.day_book.daily.phase)))||'—',
-      cls:'neu'},
-    {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':(a.market_status||'—'),
+    {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
+    {k:'Momentum',v:mtfTag,cls:mtfTag==='NEUT'?'neu':(mtfTag==='BEAR'?'bad':'ok')},
+    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||lean,cls:'neu'},
+    {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':'WAIT',
       cls:a.market_status==='TRADEABLE'?'ok':'neu'},
-    {k:'Model',v:ready.ready?'READY':(ready.reason||ready.status||'WAIT'),
-      cls:ready.ready?'ok':'neu'},
+    {k:'Liquidity',v:a.spread!=null?(Number(a.spread)<1?'OK':'WIDE'):'—',cls:'neu'},
+    {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
     {k:'Can OPEN',v:a.entry_can_submit_now?'YES':'NO',cls:a.entry_can_submit_now?'ok':'neu'},
     {k:'SL Bracket',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
     {k:'TP Bracket',v:hasTp?'ON':'OFF',cls:hasTp?'ok':(pos?'bad':'neu')},
     {k:'Swing Plan',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'READY':'—',
       cls:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ok':'neu'},
-    {k:'Trail',v:a.trail_enabled?'ON':'OFF',cls:a.trail_enabled?'neu':'ok'},
   ];
   stableHtml(el,rows.map(r=>
-    `<div class="desk-check-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(String(r.v).slice(0,40))}</b></div>`
+    `<div class="psx-score-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(String(r.v).slice(0,16))}</b></div>`
   ).join(''));
 }
 
 function renderDeskIntel(client){
   const el=$('deskIntel');
   if(!el)return;
-  if(!client){stableHtml(el,'<div class="desk-empty">—</div>');return}
+  if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
   const a=client.activity||{};
   const news=a.economic_news_risk;
   const im=a.intermarket_analysis;
   const sit=a.situation_memory;
   const fl=a.forward_live||{};
+  const lh=a.learn_horizon||{};
   const chips=[];
-  const push=(tag,t,cls)=>chips.push({tag,t:String(t).slice(0,140),cls});
+  const push=(tag,t,cls,src)=>chips.push({tag,t:String(t).slice(0,120),cls,src:src||'NEURAL'});
   if(news&&typeof news==='object'){
     const risk=news.risk||news.level||news.status||news.summary;
     const label=news.headline||news.event||news.next||news.reason||risk;
     const bear=String(risk||'').toLowerCase().includes('high')||String(news.status||'').includes('BLOCK');
-    if(label)push(bear?'BEARISH':'NEUTRAL',label,bear?'bear':'neu');
+    if(label)push(bear?'BEARISH':'NEUTRAL',label,bear?'bear':'neu',news.source||'NEWS');
   }else if(typeof news==='string'&&news){
-    push('NEWS',news,'neu');
+    push('NEWS',news,'neu','FEED');
   }
   if(im&&typeof im==='object'){
     const lean=im.lean||im.bias||im.regime||im.summary||im.status;
     const cls=String(lean||'').toLowerCase().includes('bull')?'bull'
       :(String(lean||'').toLowerCase().includes('bear')?'bear':'neu');
     if(lean)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
-      'Intermarket · '+String(lean),cls);
+      String(lean),cls,'INTERMARKET');
   }
   if(sit&&typeof sit==='object'){
     const tip=sit.tip||sit.summary||sit.last||sit.note;
-    if(tip)push('MEMORY',tip,'neu');
+    if(tip)push('NEUTRAL',tip,'neu','MEMORY');
   }
   if(fl.ok){
-    push('FORWARD',`n=${fl.n} · false ${fl.false_signal_rate==null?'—':Math.round(fl.false_signal_rate*100)+'%'} · E ${fl.expectancy??'—'}`,'neu');
-    if(fl.tips&&fl.tips[0])push('TIP',fl.tips[0],'bull');
+    push('NEUTRAL',`Forward n=${fl.n} · false ${fl.false_signal_rate==null?'—':Math.round(fl.false_signal_rate*100)+'%'}`,
+      'neu','FORWARD');
   }
-  if(a.entry_block_reason)push('BLOCK',a.entry_block_reason,'bear');
-  if(a.fusion_block_reason)push('FUSION',a.fusion_block_reason,'bear');
-  if(a.error)push('ERROR',a.error,'bear');
-  const lh=a.learn_horizon;
-  if(lh&&lh.message)push('LEARN',lh.message,'neu');
+  if(lh.message)push('NEUTRAL',lh.message,'neu','LEARN');
+  if(a.entry_block_reason)push('BEARISH',a.entry_block_reason,'bear','GATE');
+  if(a.fusion_block_reason)push('BEARISH',a.fusion_block_reason,'bear','FUSION');
+  if(a.error)push('BEARISH',a.error,'bear','ERROR');
   if(!chips.length){
-    stableHtml(el,'<div class="desk-empty">No active news/intermarket — empty feed is also a signal.</div>');
-    return;
+    // Still show structural intel from scores so the column never looks empty/old.
+    const sc=deskScoreAction(client);
+    push(sc.act==='BUY'?'BULLISH':(sc.act==='SELL'?'BEARISH':'NEUTRAL'),
+      `Neural argmax ${sc.act} · edge ${a.directional_advantage!=null?num(a.directional_advantage,3):'—'}`,
+      sc.act==='BUY'?'bull':(sc.act==='SELL'?'bear':'neu'),'ENGINE');
+    push('NEUTRAL',`MTF ${((a.mtf_momentum||{}).mode)||'—'} · bar ${a.bar_time?String(a.bar_time).slice(11,19):'—'}`,
+      'neu','MTF');
   }
-  stableHtml(el,chips.map(c=>`<div class="chip ${esc(c.cls)}"><span class="tag">${esc(c.tag)}</span>${esc(c.t)}</div>`).join(''));
+  stableHtml(el,chips.map(c=>`<article class="psx-intel-card ${esc(c.cls)}">
+    <span class="tag">${esc(c.tag)}</span>
+    <div class="hd">${esc(c.t)}</div>
+    <div class="meta">${esc(c.src)}</div>
+  </article>`).join(''));
 }
 
 function renderDeskBook(client,view){
@@ -569,108 +533,93 @@ function renderDeskBook(client,view){
   const ask=Number(a.market_ask!=null?a.market_ask:a.market_offer);
   const tick=Number(a.tick)||(Number.isFinite(mid)?mid*0.00015:1);
   if(!Number.isFinite(mid)||mid<=0){
-    stableHtml(el,'<div class="desk-empty">No quote ladder</div>');
+    stableHtml(el,'<div class="psx-empty">No quote ladder</div>');
     return;
   }
   const spr=(Number.isFinite(bid)&&Number.isFinite(ask))?Math.max(0,ask-bid):tick;
-  const levels=8;
-  const asks=[];
-  const bids=[];
+  const levels=9;
+  const asks=[],bids=[];
+  let askTot=0,bidTot=0;
   for(let i=levels;i>=1;i--){
     const px=mid+spr/2+i*tick;
-    const sz=Math.max(0.01,+(0.35+((levels-i+1)*0.11)+(Math.abs(Math.sin(px))*0.2)).toFixed(2));
-    asks.push({px,sz});
+    const sz=Math.max(0.01,+(0.28+((levels-i+1)*0.09)+(Math.abs(Math.sin(px*3))*0.18)).toFixed(2));
+    askTot+=sz;asks.push({px,sz,tot:askTot});
   }
   for(let i=1;i<=levels;i++){
     const px=mid-spr/2-i*tick;
-    const sz=Math.max(0.01,+(0.38+(i*0.12)+(Math.abs(Math.cos(px))*0.18)).toFixed(2));
-    bids.push({px,sz});
+    const sz=Math.max(0.01,+(0.30+(i*0.1)+(Math.abs(Math.cos(px*3))*0.16)).toFixed(2));
+    bidTot+=sz;bids.push({px,sz,tot:bidTot});
   }
   const maxSz=Math.max(...asks.map(x=>x.sz),...bids.map(x=>x.sz),0.01);
-  const bidSum=bids.reduce((s,x)=>s+x.sz,0);
-  const askSum=asks.reduce((s,x)=>s+x.sz,0);
-  const tot=bidSum+askSum||1;
-  const bidPct=Math.round((bidSum/tot)*1000)/10;
+  const tot=askTot+bidTot||1;
+  const bidPct=Math.round((bidTot/tot)*1000)/10;
   const askPct=Math.round((100-bidPct)*10)/10;
-  const row=(side,r)=>`<div class="ps-book-row ${side}"><i style="width:${Math.round((r.sz/maxSz)*100)}%"></i>
-    <span>${esc(num(r.px,2))}</span><span>${esc(num(r.sz,2))}</span><span>${esc(num(r.px*r.sz,0))}</span></div>`;
-  stableHtml(el,
-    asks.map(r=>row('ask',r)).join('')+
-    `<div class="spread">Spread ${esc(num(spr,4))} · Mid ${esc(num(mid,2))}</div>`+
-    bids.map(r=>row('bid',r)).join('')+
-    `<div class="depth"><span class="b" style="width:${bidPct}%"></span><span class="a" style="width:${askPct}%"></span></div>
-     <div class="depth-lbl"><span>Bids ${bidPct}%</span><span>Asks ${askPct}%</span></div>`);
+  let run=0;
+  const askHtml=asks.map(r=>{
+    run+=r.sz;
+    return `<div class="psx-book-row ask"><i style="width:${Math.round((r.sz/maxSz)*100)}%"></i>
+      <span>${esc(num(r.px,2))}</span><span>${esc(num(r.sz,2))}</span>
+      <span>${esc(num(r.px*r.sz,0))}</span><span>${esc(num(run,2))}</span></div>`;
+  }).join('');
+  run=0;
+  const bidHtml=bids.map(r=>{
+    run+=r.sz;
+    return `<div class="psx-book-row bid"><i style="width:${Math.round((r.sz/maxSz)*100)}%"></i>
+      <span>${esc(num(r.px,2))}</span><span>${esc(num(r.sz,2))}</span>
+      <span>${esc(num(r.px*r.sz,0))}</span><span>${esc(num(run,2))}</span></div>`;
+  }).join('');
+  stableHtml(el,askHtml+
+    `<div class="psx-spread">SPREAD ${esc(num(spr,4))}</div>`+
+    bidHtml+
+    `<div class="psx-depth"><span class="b" style="width:${bidPct}%"></span><span class="a" style="width:${askPct}%"></span></div>
+     <div class="psx-depth-lbl"><span>${bidPct}% BID</span><span>${askPct}% ASK</span></div>`);
 }
 
 function renderDeskWatch(markets,focusClient){
   const el=$('deskWatch');
   if(!el)return;
-  const rows=(markets||[]).slice(0,6);
-  if(!rows.length){
-    stableHtml(el,'<div class="desk-empty">No markets</div>');
-    return;
-  }
+  const rows=(markets||[]).slice(0,7);
+  if(!rows.length){stableHtml(el,'<div class="psx-empty">No markets</div>');return}
   const focusEpic=((focusClient&&focusClient.activity)||{}).market||null;
   stableHtml(el,rows.map(m=>{
     const mid=m.mid!=null?num(m.mid,2):'—';
-    const candles=m.candles||[];
-    let chg='—',cls='';
-    if(candles.length>=2){
-      const a=Number(candles[candles.length-1].close??candles[candles.length-1].c);
-      const b=Number(candles[0].close??candles[0].c);
-      if(Number.isFinite(a)&&Number.isFinite(b)&&b){
-        const p=((a-b)/b)*100;
-        chg=(p>=0?'+':'')+p.toFixed(2)+'%';
-        cls=p>=0?'up':'dn';
-      }
-    }
-    const active=focusEpic&&String(m.epic)===String(focusEpic)?' · focus':'';
-    return `<div class="ps-watch-row"><span>${esc(m.epic||'—')}${esc(active)}</span>
-      <strong>${esc(mid)}</strong><span class="${cls}">${esc(chg)}</span></div>`;
+    const candles=(m.candles||[]).slice(-16);
+    const ch=deskCandleChange(m.candles);
+    const cls=ch==null?'':(ch>=0?'up':'dn');
+    const chTxt=ch==null?'—':((ch>=0?'+':'')+ch.toFixed(2)+'%');
+    const closes=candles.map(c=>Number(c.close??c.c)).filter(Number.isFinite);
+    const lo=Math.min(...closes,0),hi=Math.max(...closes,1);
+    const span=Math.max(1e-9,hi-lo);
+    const spark=closes.map(v=>{
+      const h=Math.max(8,Math.round(((v-lo)/span)*100));
+      return `<i style="height:${h}%"></i>`;
+    }).join('');
+    const active=focusEpic&&String(m.epic)===String(focusEpic);
+    return `<div class="psx-watch-row">
+      <strong>${esc(m.epic||'—')}${active?' ●':''}</strong>
+      <span class="psx-mini ${ch!=null&&ch<0?'dn':''}">${spark||'<i style="height:40%"></i>'}</span>
+      <span>${esc(mid)}</span>
+      <span class="${cls}">${esc(chTxt)}</span>
+    </div>`;
   }).join(''));
-}
-
-function renderDeskLearn(client){
-  const el=$('deskLearn');
-  if(!el)return;
-  if(!client){stableHtml(el,'<div class="desk-empty">—</div>');return}
-  const a=client.activity||{};
-  const lh=a.learn_horizon||{};
-  const plan=a.last_open_size_plan||{};
-  const uc=a.unified_cycle||{};
-  stableHtml(el,`
-    <div class="msg">${esc(lh.message||'Waiting for £ closes to move edge knobs')}</div>
-    ${deskKv(client.id,'Edge floor',lh.edge_floor!=null?Number(lh.edge_floor).toFixed(2):'—')}
-    ${deskKv(client.id,'£ closes / adapted',`${lh.edge_closes??0} / ${lh.adapted_closes??0}`)}
-    ${deskKv(client.id,'Settlements',lh.settlements??uc.settlements??0)}
-    ${deskKv(client.id,'Last size',plan.size!=null?plan.size:(a.mandate&&a.mandate.size)||'—')}
-    ${deskKv(client.id,'Size reason',plan.reason||'—')}
-    ${deskKv(client.id,'Signal strength',plan.signal_strength!=null?Number(plan.signal_strength).toFixed(2):'—')}
-  `);
 }
 
 function renderDeskFear(client){
   const el=$('deskFear');
   if(!el)return;
   if(!client){stableHtml(el,'');return}
-  const a=client.activity||{};
   const {buy,hold,sell,act}=deskScoreAction(client);
-  // Map HOLD-heavy neural crowd → fear; directional → greed.
-  const fear=Math.round(Math.max(0,Math.min(100,hold*100*0.85+(act==='HOLD'?15:0)-(Math.abs(buy-sell)*40))));
+  const fear=Math.round(Math.max(0,Math.min(100,
+    hold*100*0.85+(act==='HOLD'?12:0)-(Math.abs(buy-sell)*42))));
   let label='Neutral';
   if(fear<=20)label='Extreme Fear';
   else if(fear<=40)label='Fear';
   else if(fear<=60)label='Neutral';
   else if(fear<=80)label='Greed';
   else label='Extreme Greed';
-  const util=a.economic_utility;
-  const utilTxt=util==null?'—':(typeof util==='object'?JSON.stringify(util).slice(0,64):String(util).slice(0,64));
   stableHtml(el,`
-    <div><strong>${fear}</strong> · ${esc(label)}</div>
-    <div class="ps-fear-meter"><i style="left:${fear}%"></i></div>
-    ${deskKv(client.id,'Utility',utilTxt)}
-    ${deskKv(client.id,'Edge',a.directional_advantage!=null?num(a.directional_advantage,3):'—')}
-  `);
+    <div class="psx-fear-val">${fear} · ${esc(label)}</div>
+    <div class="psx-fear-meter"><i style="left:${fear}%"></i></div>`);
 }
 
 function renderDeskIndCharts(client){
@@ -685,56 +634,107 @@ function renderDeskIndCharts(client){
     return Number.isFinite(n)?n:0;
   });
   const max=Math.max(1,...vals.map(Math.abs));
-  const spark=(arr,bear)=>`<div class="ps-spark ${bear?'bear':''}">${arr.map(v=>{
+  const spark=(arr,bear)=>`<div class="psx-spark ${bear?'bear':''}">${arr.map(v=>{
     const h=Math.max(8,Math.round((Math.abs(v)/max)*100));
     return `<b style="height:${h}%"></b>`;
   }).join('')}</div>`;
   const rsiProxy=Math.round(50+Math.max(-40,Math.min(40,(vals[1]||0)/2)));
   stableHtml(el,`
-    <div><div class="muted" style="font-size:10px;margin-bottom:2px">RSI proxy ${rsiProxy}</div>${spark(vals,rsiProxy<45)}</div>
-    <div><div class="muted" style="font-size:10px;margin-bottom:2px">MACD-ish returns</div>${spark(vals.slice().reverse(),(vals[0]||0)<0)}</div>
+    <div><div style="font-size:9px;color:#8b919c;margin-bottom:3px;font-weight:800;letter-spacing:.06em">RSI · ${rsiProxy}</div>${spark(vals,rsiProxy<45)}</div>
+    <div><div style="font-size:9px;color:#8b919c;margin-bottom:3px;font-weight:800;letter-spacing:.06em">MACD · MTF</div>${spark(vals.slice().reverse(),(vals[0]||0)<0)}</div>
   `);
+}
+
+function renderDeskLiveTrades(openRows){
+  const el=$('deskDeals');
+  if(!el)return;
+  const rows=(openRows||[]).slice(0,10);
+  if(!rows.length){
+    stableHtml(el,'<div class="psx-empty">No live prints</div>');
+    return;
+  }
+  const head=`<div class="psx-trade-row psx-trade-head"><span>TIME</span><span>SIDE</span><span>PRICE</span><span>SIZE</span><span>VALUE</span></div>`;
+  const body=rows.map(t=>{
+    const side=String(t.direction||t.side||'?').toUpperCase();
+    const cls=side==='BUY'||side==='LONG'?'buy':'sell';
+    const px=t.current??t.open??t.level??t.entry??t.price??t.mid;
+    const sz=t.size??t.dealSize??t.lot;
+    const tm=esc(t.epic||'—');
+    const val=(px!=null&&sz!=null&&Number.isFinite(Number(px))&&Number.isFinite(Number(sz)))
+      ?num(Number(px)*Number(sz),0):'—';
+    return `<div class="psx-trade-row">
+      <span title="epic">${tm}</span>
+      <span class="${cls}">${esc(side==='LONG'?'BUY':(side==='SHORT'?'SELL':side))}</span>
+      <span>${esc(px==null?'—':num(px,2))}</span>
+      <span>${esc(sz==null?'—':num(sz,2))}</span>
+      <span>${esc(val)}</span>
+    </div>`;
+  }).join('');
+  stableHtml(el,head+body);
 }
 
 function renderDeskUtc(){
   const el=$('deskUtc');
   if(!el)return;
   const d=new Date();
-  el.textContent='UTC '+d.toISOString().slice(11,19);
+  el.textContent=d.toISOString().slice(11,19)+' UTC';
 }
 
 function renderDeskPulse(client){
   const el=$('deskPulse');
   if(!el)return;
-  const sync=formatSyncClock(lastSyncAt)||'—';
   const age=lastSyncAt?Math.round((Date.now()-lastSyncAt)/1000):null;
   const ticks=client&&client.activity?Number(client.activity.tick_count)||0:0;
-  el.textContent=`Sync ${sync} · ${age==null?'—':age+'s'} · ticks ${ticks} · poll ${currentPollMs||'—'}ms`;
+  el.textContent=`${age==null?'—':age+'s'} · ${ticks} ticks`;
   el.classList.toggle('hot',age!=null&&age<=3);
   el.classList.toggle('stale',age!=null&&age>12);
+}
+
+function resampleDeskCandles(candles,tfMin){
+  const rows=(candles||[]).slice().sort((a,b)=>String(a.at||'').localeCompare(String(b.at||'')));
+  if(!tfMin||tfMin<=1)return rows;
+  const buckets=new Map();
+  for(const c of rows){
+    const t=Date.parse(c.at||c.time||'');
+    if(!Number.isFinite(t))continue;
+    const bucket=Math.floor(t/(tfMin*60000))*tfMin*60000;
+    const o=Number(c.open??c.o),h=Number(c.high??c.h),l=Number(c.low??c.l),cl=Number(c.close??c.c);
+    if(![o,h,l,cl].every(Number.isFinite))continue;
+    const prev=buckets.get(bucket);
+    if(!prev){
+      buckets.set(bucket,{at:new Date(bucket).toISOString(),open:o,high:h,low:l,close:cl});
+    }else{
+      prev.high=Math.max(prev.high,h);
+      prev.low=Math.min(prev.low,l);
+      prev.close=cl;
+    }
+  }
+  return [...buckets.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v);
 }
 
 function drawDeskChart(view){
   const canvas=$('deskChart');
   if(!canvas||typeof drawOhlcStructure!=='function')return;
-  if(!view||!(view.candles||[]).length){
+  const candles=resampleDeskCandles((view&&view.candles)||[],deskTfMinutes);
+  if(!view||!candles.length){
     const ctx=canvas.getContext('2d');
     const w=canvas.clientWidth||960,h=canvas.clientHeight||420;
     const dpr=window.devicePixelRatio||1;
     canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
     ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle='rgba(8,12,14,.94)';
+    ctx.fillStyle='#08090c';
     ctx.fillRect(0,0,w,h);
-    ctx.fillStyle='#8a9a92';ctx.font='13px Manrope,sans-serif';ctx.textAlign='center';
-    ctx.fillText('Gaida OHLC sveces no Capital…',w/2,h/2);
+    ctx.fillStyle='#8b919c';ctx.font='12px Manrope,sans-serif';ctx.textAlign='center';
+    ctx.fillText('Waiting for Capital OHLC…',w/2,h/2);
     return;
   }
-  const key=[view.epic,view.mid,view.candles.length,
+  const drawn={...view,candles};
+  const key=[view.epic,view.mid,candles.length,deskTfMinutes,
     JSON.stringify(view.open_levels||[]),
     (view.swing_brackets&&view.swing_brackets.ready)].join('|');
   if(key===lastDeskChartKey)return;
   lastDeskChartKey=key;
-  drawOhlcStructure(canvas,view,{labels:true,maxCandles:120});
+  drawOhlcStructure(canvas,drawn,{labels:true,maxCandles:120});
 }
 
 async function loadDeskStructure(clientId){
@@ -768,21 +768,15 @@ async function renderDesk(data){
     else if(prev)sel.value=prev;
   }
   const open=collectOpenTrades(clients);
-  stableHtml($('deskDeals'),renderTradesTable(open.slice(0,8)));
+  renderDeskLiveTrades(open);
   renderDeskUtc();
   renderDeskClosed(focus);
   renderDeskEngine(focus);
   renderDeskCrowd(focus);
-  renderDeskSignal(focus);
   renderDeskIntel(focus);
-  renderDeskWeights(focus);
-  renderDeskReturns(focus);
-  renderDeskReact(focus);
   renderDeskPulse(focus);
-  renderDeskLearn(focus);
   renderDeskFear(focus);
   renderDeskIndCharts(focus);
-  // Markets tape + structure chart (real Capital OHLC).
   let markets=[];
   try{
     const board=await api('/api/admin/markets-ohlc?n=90');
@@ -790,9 +784,9 @@ async function renderDesk(data){
   }catch(_){markets=[]}
   renderDeskTape(markets,focus);
   renderDeskWatch(markets,focus);
+  renderDeskSignal(focus,markets);
   let view=null;
   if(focus){
-    // Prefer markets-ohlc panel for this epic when available.
     const epic=((focus.activity||{}).market)
       ||(((focus.activity||{}).mandate)||{}).epic;
     view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
@@ -1698,6 +1692,22 @@ if(deskFocusEl){
     if(lastOverview)renderDesk(lastOverview).catch(()=>{});
   });
 }
+document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+    deskTfMinutes=Number(btn.dataset.tf)||1;
+    lastDeskChartKey='';
+    if(deskStructure)drawDeskChart(deskStructure);
+    else if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  });
+});
+document.querySelectorAll('.psx-rail-btn[data-jump]').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    const v=btn.dataset.jump;
+    if(v)setView(v);
+  });
+});
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible' && !$('dash').classList.contains('hidden')){
     loadOverview().catch(()=>{});

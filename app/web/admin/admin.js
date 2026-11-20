@@ -138,8 +138,10 @@ function layoutCols(n){
 }
 
 function setView(name){
-  document.querySelectorAll('.nav-item').forEach(b=>{
-    b.classList.toggle('active',b.dataset.view===name);
+  document.querySelectorAll('.psx-rail-btn[data-view],.nav-item').forEach(b=>{
+    const on=b.dataset.view===name;
+    b.classList.toggle('active',on);
+    b.classList.toggle('on',on);
   });
   document.querySelectorAll('.view').forEach(v=>{
     v.classList.toggle('active',v.dataset.view===name);
@@ -147,6 +149,9 @@ function setView(name){
   if(name==='desk'){
     lastDeskChartKey='';
     if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  }else if(lastOverview){
+    // redraw perf when leaving desk so chart sizes correctly in viewport
+    try{drawPerfChart(lastOverview.clients)}catch(_){}
   }
 }
 
@@ -1666,7 +1671,7 @@ async function enterDash(){
   schedulePoll(desiredPollMs(lastOverview));
 }
 
-document.querySelectorAll('.nav-item').forEach(btn=>{
+document.querySelectorAll('.psx-rail-btn[data-view],.nav-item').forEach(btn=>{
   btn.addEventListener('click',()=>setView(btn.dataset.view));
 });
 document.querySelectorAll('[data-jump]').forEach(btn=>{
@@ -1700,12 +1705,6 @@ document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(btn=>{
     lastDeskChartKey='';
     if(deskStructure)drawDeskChart(deskStructure);
     else if(lastOverview)renderDesk(lastOverview).catch(()=>{});
-  });
-});
-document.querySelectorAll('.psx-rail-btn[data-jump]').forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    const v=btn.dataset.jump;
-    if(v)setView(v);
   });
 });
 document.addEventListener('visibilitychange',()=>{

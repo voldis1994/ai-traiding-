@@ -1,14 +1,15 @@
 """Generate trading strategy cards from evidence — soft LIVE use, no .py invent.
 
-Honest scope:
-  • Harvest structure×side £ buckets (structure_shadow library) into rule cards
-  • Activate cards that clear sample/mean floors (self_params seeds)
-  • Soft-nudge LIVE scores when live OHLC structure matches a card
-  • Track live broker £ per card → demote if the card bleeds
+Operator idea (samples, not programming):
+  • Learn **new samples from profits and from losses**
+  • Understand **combinations** (structure×side) that pay vs that bleed
+    relative to market behaviour
+  • **Change the LIVE decision** when a strategy proves it does not earn
 
-This is **not** LLM code-writing. It is the next evo after audit defaults:
-the robot proposes / activates / retires approach rules from outcomes and
-physically tilts the LIVE vote with them.
+Honest scope:
+  • Harvest structure×side £ buckets + live combo ledger into rule cards
+  • Soft-nudge LIVE when OHLC matches a paying combo
+  • On close: bank +£/−£ into the combo; flip/retire card if live −EV
 """
 from __future__ import annotations
 
@@ -19,6 +20,12 @@ from . import structure_shadow as ss
 
 STORE_KEY = 'strategy_gen_v1'
 LAST_ADVICE_KEY = 'strategy_gen_last_advice_v1'
+
+# Live adapt rails — flip faster than harvest-only demote (was n≥6).
+LIVE_FLIP_MIN_N = 3
+LIVE_FLIP_MEAN = -0.08  # £ mean → flip prefer
+LIVE_RETIRE_MIN_N = 5
+LIVE_RETIRE_MEAN = -0.15
 
 
 def _now():
@@ -38,9 +45,14 @@ def _cfg(store=None):
     return load(store)
 
 
+def combo_key(*, epic, structure, direction):
+    return f'{str(epic or "UNKNOWN").upper()}|{str(structure or "CHOP").upper()}|{str(direction or "HOLD").upper()}'
+
+
 def _empty():
     return {
         'cards': {},
+        'combos': {},  # structure×side £ from wins AND losses
         'active_ids': [],
         'retired_ids': [],
         'updated_at': None,
@@ -57,9 +69,12 @@ def load(store):
     out = _empty()
     cards = raw.get('cards') if isinstance(raw.get('cards'), dict) else {}
     out['cards'] = {str(k): dict(v) for k, v in cards.items() if isinstance(v, dict)}
+    combos = raw.get('combos') if isinstance(raw.get('combos'), dict) else {}
+    out['combos'] = {str(k): dict(v) for k, v in combos.items() if isinstance(v, dict)}
     out['active_ids'] = [str(x) for x in (raw.get('active_ids') or [])]
     out['retired_ids'] = [str(x) for x in (raw.get('retired_ids') or [])]
     out['updated_at'] = raw.get('updated_at')
+    out['audit_seeded'] = bool(raw.get('audit_seeded'))
     try:
         out['harvest_count'] = int(raw.get('harvest_count') or 0)
     except (TypeError, ValueError):
@@ -72,13 +87,42 @@ def save(store, bag):
         return bag
     clean = {
         'cards': bag.get('cards') or {},
+        'combos': bag.get('combos') or {},
         'active_ids': list(bag.get('active_ids') or []),
         'retired_ids': list(bag.get('retired_ids') or []),
         'updated_at': bag.get('updated_at') or _now(),
         'harvest_count': int(bag.get('harvest_count') or 0),
+        'audit_seeded': bool(bag.get('audit_seeded')),
     }
     store.set(STORE_KEY, clean)
     return clean
+
+
+def record_combo(store, *, epic, structure, direction, broker_pnl):
+    """Bank a win OR loss sample into structure×side combination memory."""
+    pnl = _finite(broker_pnl)
+    if pnl is None or store is None:
+        return None
+    st = str(structure or '').upper()
+    side = str(direction or '').upper()
+    if not st or side not in ('BUY', 'SELL'):
+        return None
+    bag = load(store)
+    key = combo_key(epic=epic or 'GOLD', structure=st, direction=side)
+    c = dict((bag.get('combos') or {}).get(key) or {})
+    n = int(c.get('samples') or 0) + 1
+    total = (_finite(c.get('total_pnl')) or 0.0) + pnl
+    wins = int(c.get('wins') or 0) + (1 if pnl > 0 else 0)
+    losses = int(c.get('losses') or 0) + (1 if pnl < 0 else 0)
+    c.update({
+        'samples': n, 'total_pnl': total, 'mean_pnl': total / n,
+        'wins': wins, 'losses': losses,
+        'epic': str(epic or 'GOLD'), 'structure': st, 'direction': side,
+        'updated_at': _now(),
+    })
+    bag.setdefault('combos', {})[key] = c
+    save(store, bag)
+    return c
 
 
 def card_id(*, epic, structure, prefer):
@@ -257,6 +301,7 @@ def seed_audit_cards(store) -> dict:
         reverse=True)[:max_active]
     bag = {
         'cards': cards,
+        'combos': bag.get('combos') or {},
         'active_ids': active_sorted,
         'retired_ids': [c for c, v in cards.items() if v.get('status') == 'retired'],
         'updated_at': _now(),
@@ -314,6 +359,7 @@ def harvest(store, *, epic=None) -> dict:
     retired = [cid for cid, c in cards.items() if c.get('status') == 'retired']
     bag = {
         'cards': cards,
+        'combos': bag.get('combos') or {},
         'active_ids': active_ids,
         'retired_ids': retired,
         'updated_at': _now(),
@@ -352,8 +398,15 @@ def active_for_structure(store, *, structure, epic=None) -> list:
     return out
 
 
+def _live_mean(card):
+    n = int(card.get('live_n') or 0)
+    if n <= 0:
+        return None
+    return (_finite(card.get('live_pnl')) or 0.0) / n
+
+
 def soft_nudge_scores(scores, *, structure, epic=None, store=None):
-    """Tilt LIVE scores using active strategy cards for this OHLC frame."""
+    """Tilt LIVE scores using paying combos — damp/flip when live proves −EV."""
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
     cfg = _cfg(store)
@@ -364,19 +417,33 @@ def soft_nudge_scores(scores, *, structure, epic=None, store=None):
         return dict(scores), {'nudged': False, 'reason': 'zero_strength'}
     cards = active_for_structure(store, structure=structure, epic=epic)
     if not cards:
-        # Lazy harvest once when empty so first LIVE day can still learn.
         harvest(store, epic=epic)
         cards = active_for_structure(store, structure=structure, epic=epic)
-    if not cards:
-        return dict(scores), {'nudged': False, 'reason': 'no_active_cards'}
+    # Also damp toxic combos from live ledger even without a card.
+    bag = load(store)
+    combos = bag.get('combos') or {}
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     applied = []
+    if not cards and not combos:
+        return dict(scores), {'nudged': False, 'reason': 'no_active_cards'}
     for c in cards:
         prefer = str(c.get('prefer') or '').upper()
         avoid = str(c.get('avoid') or '').upper()
-        # Scale by library mean (cap) so strong EV cards teach louder.
         mean = abs(_finite(c.get('mean_pnl')) or 0.0)
         scale = min(2.5, 1.0 + mean / 0.25)
+        # Live proof: shrink or invert when this approach is bleeding.
+        live_m = _live_mean(c)
+        live_n = int(c.get('live_n') or 0)
+        if live_m is not None and live_n >= LIVE_FLIP_MIN_N and live_m < 0:
+            # Bleed → damp prefer, boost avoid/HOLD (change live decision).
+            scale *= max(0.15, 1.0 + live_m)  # live_m negative
+            if live_m <= LIVE_FLIP_MEAN and prefer in ('BUY', 'SELL'):
+                prefer, avoid = ('HOLD' if avoid not in ('BUY', 'SELL')
+                                 else avoid), prefer
+                applied.append({
+                    'id': c.get('id'), 'prefer': prefer, 'avoid': avoid,
+                    'live_flip': True, 'live_mean': live_m,
+                })
         delta = strength * scale
         if prefer in ('BUY', 'SELL'):
             out[prefer] = out.get(prefer, 0) + delta
@@ -389,7 +456,51 @@ def soft_nudge_scores(scores, *, structure, epic=None, store=None):
             out['HOLD'] = out.get('HOLD', 0) + delta
             out['BUY'] = out.get('BUY', 0) - 0.4 * delta
             out['SELL'] = out.get('SELL', 0) - 0.4 * delta
-        applied.append({'id': c.get('id'), 'prefer': prefer, 'delta': delta})
+        applied.append({
+            'id': c.get('id'), 'prefer': prefer, 'delta': delta,
+            'live_mean': live_m, 'live_n': live_n,
+        })
+    # Combo ledger: damp known graves for this structure (wins+losses learned).
+    st = str(structure or '').upper()
+    ep = str(epic or 'GOLD').upper()
+    for side in ('BUY', 'SELL'):
+        key = combo_key(epic=ep, structure=st, direction=side)
+        # Soft match GOLD epic variants.
+        row = combos.get(key)
+        if row is None:
+            for k, v in combos.items():
+                if (str(v.get('structure') or '').upper() == st
+                        and str(v.get('direction') or '').upper() == side):
+                    row = v
+                    break
+        if not isinstance(row, dict):
+            continue
+        n = int(row.get('samples') or 0)
+        mean = _finite(row.get('mean_pnl'))
+        if n < 3 or mean is None:
+            continue
+        if mean < -0.05:
+            damp = strength * min(2.0, 0.8 + abs(mean) / 0.2)
+            out[side] = out.get(side, 0) - damp
+            out['HOLD'] = out.get('HOLD', 0) + 0.35 * damp
+            other = 'SELL' if side == 'BUY' else 'BUY'
+            # If opposite combo pays, tilt toward it.
+            opp_key = combo_key(epic=ep, structure=st, direction=other)
+            opp = combos.get(opp_key)
+            opp_m = _finite((opp or {}).get('mean_pnl')) if isinstance(opp, dict) else None
+            if opp_m is not None and opp_m > 0:
+                out[other] = out.get(other, 0) + 0.7 * damp
+            applied.append({
+                'combo': key, 'damp': side, 'mean': mean, 'samples': n,
+            })
+        elif mean > 0.08 and n >= 3:
+            boost = strength * min(2.0, 0.6 + mean / 0.25)
+            out[side] = out.get(side, 0) + boost
+            other = 'SELL' if side == 'BUY' else 'BUY'
+            out[other] = out.get(other, 0) - 0.4 * boost
+            applied.append({
+                'combo': key, 'boost': side, 'mean': mean, 'samples': n,
+            })
     for k in out:
         out[k] = max(0.0, float(out[k]))
     total = sum(out.values())
@@ -411,44 +522,139 @@ def soft_nudge_scores(scores, *, structure, epic=None, store=None):
     return out, meta
 
 
+def _adapt_card_from_live(card, *, direction, pnl):
+    """Update card from a win or loss; flip/retire when live proves −EV."""
+    c = dict(card)
+    prefer = str(c.get('prefer') or '').upper()
+    avoid = str(c.get('avoid') or '').upper()
+    adapted = False
+    flipped = False
+    retired = False
+    if prefer in ('BUY', 'SELL') and direction in ('BUY', 'SELL'):
+        if direction == prefer:
+            c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) + pnl
+            c['live_n'] = int(c.get('live_n') or 0) + 1
+            if pnl > 0:
+                c['live_wins'] = int(c.get('live_wins') or 0) + 1
+            elif pnl < 0:
+                c['live_losses'] = int(c.get('live_losses') or 0) + 1
+            adapted = True
+        else:
+            # Opposite side taken — score card correctness (loss validates avoid).
+            implicit_avoid = avoid if avoid in ('BUY', 'SELL') else (
+                'SELL' if prefer == 'BUY' else 'BUY')
+            if direction == implicit_avoid:
+                c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) - pnl
+                c['live_n'] = int(c.get('live_n') or 0) + 1
+                adapted = True
+    elif prefer == 'HOLD' and direction in ('BUY', 'SELL'):
+        # Directional P&L in a HOLD frame: losses support HOLD, wins challenge it.
+        c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) + (
+            -pnl if pnl > 0 else abs(pnl))
+        c['live_n'] = int(c.get('live_n') or 0) + 1
+        adapted = True
+    if not adapted:
+        return c, False, False, False
+
+    live_m = _live_mean(c)
+    live_n = int(c.get('live_n') or 0)
+    if (live_m is not None and live_n >= LIVE_FLIP_MIN_N
+            and live_m <= LIVE_FLIP_MEAN and prefer in ('BUY', 'SELL')):
+        new_prefer = avoid if avoid in ('BUY', 'SELL') else (
+            'SELL' if prefer == 'BUY' else 'BUY')
+        c['avoid'] = prefer
+        c['prefer'] = new_prefer
+        c['status'] = 'active'
+        c['flip_reason'] = f'live_mean {live_m:.4f} after {live_n}'
+        c['flipped_at'] = _now()
+        flipped = True
+    live_m = _live_mean(c)
+    live_n = int(c.get('live_n') or 0)
+    if (live_m is not None and live_n >= LIVE_RETIRE_MIN_N
+            and live_m <= LIVE_RETIRE_MEAN):
+        c['status'] = 'retired'
+        c['retire_reason'] = f'live_bleed_mean {live_m:.4f} n={live_n}'
+        retired = True
+    c['updated_at'] = _now()
+    return c, True, flipped, retired
+
+
 def observe_close(store, *, structure, direction, broker_pnl, epic=None):
-    """Attribute live £ to matching active cards (promote/demote later harvest)."""
+    """Learn from profit AND loss: update combos + adapt/flip live cards."""
     pnl = _finite(broker_pnl)
     if pnl is None or store is None:
         return {'ok': False, 'reason': 'no_pnl'}
     st = str(structure or '').upper()
+    side = str(direction or '').upper()
     if not st:
         return {'ok': False, 'reason': 'no_structure'}
+    combo = None
+    if side in ('BUY', 'SELL'):
+        combo = record_combo(
+            store, epic=epic or 'GOLD', structure=st, direction=side,
+            broker_pnl=pnl)
     bag = load(store)
     touched = []
+    flips = []
+    retired = []
+    seen = set()
     for cid in list(bag.get('active_ids') or []):
+        seen.add(cid)
+    for cid, c0 in (bag.get('cards') or {}).items():
+        if c0.get('status') == 'active':
+            seen.add(cid)
+    for cid in seen:
         c = (bag.get('cards') or {}).get(cid)
         if not isinstance(c, dict):
             continue
         if str(c.get('structure') or '').upper() != st:
             continue
-        prefer = str(c.get('prefer') or '').upper()
-        # Credit/debit when the trade sided with (or against) the card.
-        if prefer in ('BUY', 'SELL') and direction in ('BUY', 'SELL'):
-            if direction == prefer:
-                c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) + pnl
-            elif direction == (c.get('avoid') or ''):
-                # Took the avoided side — card was right if we lost.
-                c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) - pnl
-            else:
-                continue
-        elif prefer == 'HOLD':
-            # Directional trade in a HOLD card frame — penalize if loss.
-            if pnl < 0:
-                c['live_pnl'] = (_finite(c.get('live_pnl')) or 0.0) + pnl
-            else:
-                continue
-        else:
+        new_c, adapted, flipped, was_retired = _adapt_card_from_live(
+            c, direction=side, pnl=pnl)
+        if not adapted:
             continue
-        c['live_n'] = int(c.get('live_n') or 0) + 1
-        c['updated_at'] = _now()
-        bag['cards'][cid] = c
+        bag['cards'][cid] = new_c
         touched.append(cid)
-    if touched:
-        save(store, bag)
-    return {'ok': True, 'touched': touched, 'pnl': pnl}
+        if flipped:
+            flips.append({'id': cid, 'prefer': new_c.get('prefer'),
+                          'avoid': new_c.get('avoid')})
+        if was_retired:
+            retired.append(cid)
+    # Refresh active list after flips/retires.
+    active = [i for i, c in (bag.get('cards') or {}).items()
+              if c.get('status') == 'active']
+    cfg = _cfg(store)
+    max_active = max(4, int(cfg.get('strategy_gen_max_active', 12)))
+    active_sorted = sorted(
+        active,
+        key=lambda i: (
+            float((bag['cards'][i].get('mean_pnl') or 0)),
+            int(bag['cards'][i].get('samples') or 0)),
+        reverse=True)[:max_active]
+    bag['active_ids'] = active_sorted
+    bag['retired_ids'] = [
+        i for i, c in bag['cards'].items() if c.get('status') == 'retired']
+    bag['updated_at'] = _now()
+    save(store, bag)
+    # Re-harvest so library + combo EV stay aligned with cards.
+    try:
+        harvest(store, epic=epic)
+    except Exception:
+        pass
+    if flips or retired:
+        try:
+            from .learning_generation import bump
+            bump(store, 'strategy_gen_live_adapt', kind='architecture_changes')
+            store.event('learning', 'Strategy live adapt from P&L samples', {
+                'structure': st, 'direction': side, 'pnl': pnl,
+                'flips': flips, 'retired': retired, 'touched': touched,
+                'combo_mean': (combo or {}).get('mean_pnl'),
+                'combo_n': (combo or {}).get('samples'),
+            })
+        except Exception:
+            pass
+    return {
+        'ok': True, 'touched': touched, 'pnl': pnl,
+        'flips': flips, 'retired': retired,
+        'combo': combo,
+    }

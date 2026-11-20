@@ -118,6 +118,13 @@ def ingest_trades(store, trades, candles, *, epic=None, tick=0.1,
         if not st:
             st = (ss.frame_from_ohlc(path, entry=entry, exit_level=exit_level,
                                      pre_bars=pre) or {}).get('structure')
+        # Wins AND losses → combination memory (what pays vs what bleeds).
+        try:
+            strategy_gen.record_combo(
+                store, epic=ep, structure=st or 'CHOP', direction=direction,
+                broker_pnl=pnl)
+        except Exception:
+            pass
         key = f'{st}|{direction}'
         by_structure[key] = by_structure.get(key, 0) + 1
 

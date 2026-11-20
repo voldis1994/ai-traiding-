@@ -10,3 +10,7 @@ else:
     default=PROJECT_ROOT/'data'
 DATA=Path(os.getenv('NEURAL_AI_DATA_DIR') or default)
 DATA.mkdir(parents=True,exist_ok=True)
+try:
+    DATA.chmod(0o700)
+except OSError:
+    pass

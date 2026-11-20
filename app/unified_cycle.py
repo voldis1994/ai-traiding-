@@ -232,6 +232,39 @@ def note_weight_update(store, *, won: bool, delta_norm=None) -> dict:
     return load_state(store)
 
 
+def learn_horizon(store) -> dict:
+    """Admin-facing progress: how many £ closes moved the entry edge floor.
+
+    Not a freeze gate — operators see when knobs actually moved from market £.
+    """
+    state = load_state(store)
+    floor = entry_edge_floor(store, state)
+    hist = list((store.get(EDGE_OUTCOME_HIST_KEY) or [])) if store is not None else []
+    if not isinstance(hist, list):
+        hist = []
+    adapted = sum(
+        1 for h in hist
+        if isinstance(h, dict) and h.get('after') is not None
+        and h.get('before') is not None
+        and float(h.get('after')) != float(h.get('before')))
+    closes = len([h for h in hist if isinstance(h, dict)])
+    last = hist[-1] if hist and isinstance(hist[-1], dict) else None
+    return {
+        'edge_floor': floor,
+        'edge_closes': closes,
+        'adapted_closes': int(adapted),
+        'settlements': int(state.get('settlements') or 0),
+        'loss_streak': int(state.get('loss_streak') or 0),
+        'win_streak': int(state.get('win_streak') or 0),
+        'last_note': (last or {}).get('note'),
+        'last_pnl': (last or {}).get('pnl'),
+        'message': (
+            f'Edge floor {floor:.2f} · {adapted}/{closes} £ closes moved knobs'
+            if closes else
+            f'Edge floor {floor:.2f} · gaida pirmo useful £ close (ne scratch)'),
+    }
+
+
 def observe_close(store, *, broker_pnl=None, spread=0.0, entry_meta=None):
     """Adapt entry_edge_floor from closed broker £ (market teacher).
 

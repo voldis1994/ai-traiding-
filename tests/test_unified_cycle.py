@@ -217,3 +217,24 @@ def test_observe_close_respects_rails():
         hard = uc.observe_close(store, broker_pnl=-5.0, spread=0.0)
         assert hard['adapted'] is False
         assert uc.entry_edge_floor(store) == pytest.approx(uc.ENTRY_EDGE_MAX)
+
+
+def test_learn_horizon_counts_adapted_closes_not_a_freeze_gate():
+    """Admin progress: N £ closes → knobs moved; never blocks OPEN."""
+    with sandbox() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        bare = uc.learn_horizon(store)
+        assert bare['edge_closes'] == 0
+        assert bare['adapted_closes'] == 0
+        assert bare['edge_floor'] == pytest.approx(0.06)
+        assert 'gaida' in bare['message'].lower() or 'floor' in bare['message'].lower()
+        uc.observe_close(store, broker_pnl=-1.0, spread=0.05)
+        uc.observe_close(store, broker_pnl=1.5, spread=0.05)
+        uc.observe_close(store, broker_pnl=-0.005, spread=0.0)  # scratch
+        hz = uc.learn_horizon(store)
+        assert hz['edge_closes'] == 2  # scratch not stored in hist when not adapted... 
+        # observe_close only appends hist when it returns after scratch early —
+        # scratch returns before hist append, so closes==2, adapted==2.
+        assert hz['adapted_closes'] == 2
+        assert hz['edge_floor'] == pytest.approx(0.06)
+        assert 'moved' in hz['message'].lower() or 'knobs' in hz['message'].lower()

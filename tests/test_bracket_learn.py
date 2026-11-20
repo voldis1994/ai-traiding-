@@ -536,31 +536,39 @@ def test_apply_min_rr_refuses_when_floor_blocks_cap():
     assert out['reason'] == 'rr_unachievable_vs_floor'
 
 
-def test_cap_far_swing_sl_pulls_equal_1to1_toward_entry():
-    """Gold screenshot: equal ~26pt SL+TP with ATR~5 → SL capped, TP stays → RR>1."""
-    from app.bracket_learn import cap_far_swing_sl, apply_min_rr, levels_correct_side
-    entry = 3628.75
-    stop_d = profit_d = 25.93
+def test_cap_far_swing_sl_uses_closer_pivot_not_atr_invent():
+    """Far SELL SL with a closer high inside ATR band → swing pivot, not invent."""
+    from app.bracket_learn import cap_far_swing_sl, levels_correct_side
+    entry = 100.0
+    stop_d = 20.0
     stop_level = entry + stop_d
-    profit_level = entry - profit_d
     atr = 5.0
+    # Closer swing high at 107 → SL = 107.1 (buffer), distance 7.1 ≤ 2×ATR=10.
+    highs = [{'price': 107.0, 'i': 3}, {'price': 120.0, 'i': 1}]
     far = cap_far_swing_sl(
         action='SELL', entry=entry, stop_level=stop_level, stop_d=stop_d,
-        floor=2.5, atr=atr, highs=[], lows=[], buffer=0.1, max_atr_mult=2.0)
-    assert far['capped'] is True
-    assert far['stop_distance'] == pytest.approx(10.0, abs=1e-9)  # 2×ATR
-    assert far['stop_level'] == pytest.approx(entry + 10.0, abs=1e-9)
-    rr = apply_min_rr(
-        action='SELL', entry=entry, stop_level=far['stop_level'],
-        profit_level=profit_level, stop_d=far['stop_distance'],
-        profit_d=profit_d, floor=2.5, min_rr=1.5, atr_locked=True)
-    assert rr['ok'] is True
-    assert rr['profit_distance'] == pytest.approx(25.93, abs=1e-6)
-    assert rr['stop_distance'] < rr['profit_distance']
-    assert rr['rr'] + 1e-9 >= 1.5
+        floor=0.5, atr=atr, highs=highs, lows=[], buffer=0.1, max_atr_mult=2.0)
+    assert far['capped'] is True and far['closer_pivot'] is True
+    assert far.get('refuse') is not True
+    assert far['stop_level'] == pytest.approx(107.1, abs=1e-9)
     assert levels_correct_side(
-        action='SELL', entry=entry, stop_level=rr['stop_level'],
-        profit_level=rr['profit_level'])
+        action='SELL', entry=entry, stop_level=far['stop_level'],
+        profit_level=entry - 15.0)
+
+
+def test_cap_far_swing_sl_keeps_far_swing_without_atr_invent():
+    """No closer swing → keep far OHLC SL; never invent soft ATR stop."""
+    from app.bracket_learn import cap_far_swing_sl
+    entry = 3628.75
+    stop_d = 25.93
+    stop_level = entry + stop_d
+    far = cap_far_swing_sl(
+        action='SELL', entry=entry, stop_level=stop_level, stop_d=stop_d,
+        floor=2.5, atr=5.0, highs=[], lows=[], buffer=0.1, max_atr_mult=2.0)
+    assert far['capped'] is False
+    assert far['reason'] == 'keep_far_swing'
+    assert far['stop_distance'] == pytest.approx(25.93, abs=1e-9)
+    assert far['stop_level'] == pytest.approx(stop_level, abs=1e-9)
 
 
 def test_swing_anchor_applies_min_rr_on_wide_sl():

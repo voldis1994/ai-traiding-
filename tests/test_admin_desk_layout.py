@@ -51,8 +51,9 @@ def test_order_book_marked_estimated():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=101' in html
-    assert 'admin.js?v=108' in html
+    assert 'admin.css?v=110' in html
+    assert 'admin.js?v=110' in html
+    assert 'ohlc-chart.js?v=9' in html
 
 
 def test_demo_fixture_isolated():
@@ -64,3 +65,22 @@ def test_demo_fixture_isolated():
     assert 'id="deskLean"' in html
     assert 'AI SCORE LEAN' in html
     assert 'CRYPTO MARKET LEAN' in html
+
+
+def test_terminal_views_and_fullscreen():
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'data-view="overview"' in html
+    assert 'data-view="trades"' in html
+    assert 'data-view="risks"' in html
+    assert 'data-view="clients"' in html
+    assert 'data-view="settings"' in html
+    assert 'id="fullscreenBtn"' in html
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'enterAdminFullscreen' in js
+    assert 'requestFullscreen' in js
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert 'term-main>.view:not([data-view="desk"])' in css
+    ohlc = Path('app/web/admin/ohlc-chart.js').read_text(encoding='utf-8')
+    assert '#31d59a' in ohlc
+    assert '#ef6875' in ohlc
+    assert 'IBM Plex Mono' in ohlc

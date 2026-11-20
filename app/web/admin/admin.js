@@ -39,6 +39,35 @@ async function api(path,method='GET',payload){
   return body;
 }
 function show(login){$('login').classList.toggle('hidden',!login);$('dash').classList.toggle('hidden',login)}
+
+/** Browser fullscreen for the Admin terminal (desktop). Needs a user gesture. */
+let deskFsArmed=false;
+async function enterAdminFullscreen(){
+  try{
+    const root=document.documentElement;
+    if(document.fullscreenElement)return true;
+    if(root.requestFullscreen){
+      await root.requestFullscreen({navigationUI:'hide'});
+      return true;
+    }
+    if(root.webkitRequestFullscreen){root.webkitRequestFullscreen();return true}
+  }catch(err){
+    console.warn('fullscreen',err);
+  }
+  return false;
+}
+function armFullscreenOnNextGesture(){
+  if(deskFsArmed||document.fullscreenElement)return;
+  deskFsArmed=true;
+  const once=async()=>{
+    document.removeEventListener('pointerdown',once,true);
+    document.removeEventListener('keydown',once,true);
+    deskFsArmed=false;
+    await enterAdminFullscreen();
+  };
+  document.addEventListener('pointerdown',once,true);
+  document.addEventListener('keydown',once,true);
+}
 function pct(v){return Math.round((Number(v)||0)*100)+'%'}
 function num(v,d=2){const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'—'}
 function pnlClass(v){const n=Number(v);if(!Number.isFinite(n)||n===0)return '';return n>0?'pnl-pos':'pnl-neg'}
@@ -1899,6 +1928,9 @@ async function loadOverview(){
 
 async function enterDash(){
   show(false);
+  // Best-effort fullscreen from login click gesture; else arm next click.
+  const ok=await enterAdminFullscreen();
+  if(!ok)armFullscreenOnNextGesture();
   await loadBrokers();
   await loadOverview();
   schedulePoll(desiredPollMs(lastOverview));
@@ -2020,6 +2052,16 @@ $('logoutBtn').onclick=async()=>{
   try{await api('/api/admin/logout','POST')}finally{show(true)}
 };
 $('refreshBtn').onclick=()=>loadOverview().catch(e=>alert(e.message));
+const fsBtn=$('fullscreenBtn');
+if(fsBtn){
+  fsBtn.onclick=async()=>{
+    if(document.fullscreenElement){
+      try{await document.exitFullscreen()}catch(_){}
+    }else{
+      await enterAdminFullscreen();
+    }
+  };
+}
 $('startAllBtn').onclick=async()=>{
   if(deskDemoMode){alert('DEMO mode — trading commands disabled.');return}
   if(!lastOverview)return;

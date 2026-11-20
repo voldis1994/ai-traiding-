@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=101">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=110">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -157,6 +157,7 @@
           <button type="button" id="startAllBtn" class="btn btn-primary tiny" title="Palaist robotus">
             <svg class="ico"><use href="#i-play"></use></svg>
           </button>
+          <button type="button" id="fullscreenBtn" class="btn btn-ghost tiny" title="Pilnekrāns" aria-label="Pilnekrāns">⛶</button>
           <button type="button" id="logoutBtn" class="btn btn-ghost icon-only tiny" title="Iziet" aria-label="Iziet">
             <svg class="ico"><use href="#i-logout"></use></svg>
           </button>
@@ -302,10 +303,9 @@
       <section class="view" data-view="overview">
         <div class="term-view">
           <div class="term-view-head">
-            <div>
-              <h1>GLOBAL</h1>
-              <p>Fleet command · all accounts</p>
-            </div>
+            <h1>GLOBAL</h1>
+            <p>Fleet command · all accounts</p>
+            <span class="psx-live">● LIVE</span>
           </div>
           <div id="summary" class="stat-grid" aria-label="Kopsavilkums"></div>
           <div class="overview-grid">
@@ -356,7 +356,9 @@
       <section class="view" data-view="clients">
         <div class="term-view">
           <div class="term-view-head">
-            <div><h1>RESEARCH</h1><p>Live fleet · lot · side · SL/TP</p></div>
+            <h1>RESEARCH</h1>
+            <p>Live fleet · lot · side · SL/TP</p>
+            <span class="psx-live">● LIVE</span>
           </div>
           <div id="controlRoom" class="client-list fill-scroll"></div>
         </div>
@@ -365,15 +367,17 @@
       <section class="view" data-view="trades">
         <div class="term-view">
           <div class="term-view-head">
-            <div><h1>FLOW-LIQ</h1><p>Open + recently closed</p></div>
+            <h1>FLOW-LIQ</h1>
+            <p>Open + recently closed</p>
+            <span class="psx-live">● LIVE</span>
           </div>
           <div class="term-split">
             <article class="card grow">
-              <div class="card-head"><h2>Atvērtās pozīcijas</h2></div>
+              <div class="card-head"><h2>Atvērtās pozīcijas</h2><span class="psx-live">● LIVE</span></div>
               <div id="openTradesFull" class="table-wrap fill-scroll"></div>
             </article>
             <article class="card grow">
-              <div class="card-head"><h2>Nesen slēgtie</h2></div>
+              <div class="card-head"><h2>Nesen slēgtie</h2><span class="psx-live">● LIVE</span></div>
               <div id="recentClosed" class="table-wrap fill-scroll"></div>
             </article>
           </div>
@@ -383,7 +387,9 @@
       <section class="view" data-view="risks">
         <div class="term-view">
           <div class="term-view-head">
-            <div><h1>OI-FUND</h1><p>Risk info — does not block LIVE OPEN</p></div>
+            <h1>OI-FUND</h1>
+            <p>Risk info — does not block LIVE OPEN</p>
+            <span class="psx-live">● LIVE</span>
           </div>
           <div id="riskBoard" class="risk-board fill-scroll"></div>
         </div>
@@ -392,7 +398,9 @@
       <section class="view" data-view="settings">
         <div class="term-view">
           <div class="term-view-head">
-            <div><h1>PRACTICE</h1><p>Clients · broker · learning reset</p></div>
+            <h1>PRACTICE</h1>
+            <p>Clients · broker · learning reset</p>
+            <span class="psx-src">ADMIN</span>
           </div>
           <div class="settings-grid fill-scroll">
             <article class="card">
@@ -458,7 +466,7 @@
     </div>
   </div>
 
-  <script src="/admin/static/ohlc-chart.js?v=8"></script>
-  <script src="/admin/static/admin.js?v=108"></script>
+  <script src="/admin/static/ohlc-chart.js?v=9"></script>
+  <script src="/admin/static/admin.js?v=110"></script>
 </body>
 </html>

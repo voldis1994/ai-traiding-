@@ -110,17 +110,19 @@ def self_test():
 
 
 def browser_when_ready():
+    # Prefer Admin desk — root redirects there, but open /admin explicitly.
+    admin_url = URL.rstrip('/') + '/admin'
     for _ in range(180):
         try:
             with urllib.request.urlopen(f'http://{HOST}:{PORT}/api/health', timeout=0.8) as response:
                 info = json.load(response)
                 if info.get('app') == 'Neural Trading AI' and info.get('ready'):
-                    webbrowser.open(URL)
-                    logging.info('Browser opened: %s', URL)
+                    webbrowser.open(admin_url)
+                    logging.info('Browser opened: %s', admin_url)
                     return
         except (OSError, ValueError, TimeoutError):
             time.sleep(0.5)
-    logging.error('Web service did not become healthy in 90 seconds; open %s manually', URL)
+    logging.error('Web service did not become healthy in 90 seconds; open %s manually', admin_url)
 
 
 def check_port_available():
@@ -141,8 +143,8 @@ def start_server():
     import uvicorn
     from app.main import app
     logging.info('Neural Trading AI starting on %s (bind %s:%s)', URL, HOST, PORT)
-    print(f'Neural Trading AI starting. Browser address: {URL}', flush=True)
-    print('Portals: /  /app  /admin  /console', flush=True)
+    print(f'Neural Trading AI starting. Browser address: {URL}admin', flush=True)
+    print('Portals: /admin  /desk  /app  /console', flush=True)
     if HOST in ('0.0.0.0', '::') or os.getenv('PORT'):
         # Cloud / LAN: do not force-open a local browser.
         pass

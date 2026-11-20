@@ -12,12 +12,14 @@ KĀ PALAIST PILNO SISTĒMU (nevis vizuālo mock)
      C:\NeuralTradingAI_NEW\
      C:\Users\voldi\ai-traiding-\
 
-2) Dubultklikšķis:
-     PALAIST_PILNO_SISTEMU.bat
-   vai:
-     run_windows.bat
+2) Dubultklikšķis uz:
+     START.bat
+   (vai run_windows.bat / PALAIST_PILNO_SISTEMU.bat)
 
-3) Pārlūkā atver:
+   Pārlūkam jāatveras pats pēc ~8 sekundēm.
+   Ja neatveras — manuāli: http://127.0.0.1:8765/admin
+
+3) URL:
      http://127.0.0.1:8765/admin     ← īstā sistēma (Capital + neironi)
      http://127.0.0.1:8765/desk      ← React PerpSignal Desk ar LIVE API
 

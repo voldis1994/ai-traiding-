@@ -6248,8 +6248,42 @@ class SingleTradeEngine:
                     'min_distance':float(minimum),'kappa':bp['kappa'],
                     'raised_to_broker_min':brackets.get('raised_to_broker_min')})
                 return
-            # Hard-risk is informational only — never block OPEN (operator request).
+            # Soft edge→size: stronger neural margin → larger lot on Capital grid.
+            # NEVER refuse OPEN when size math fails — fall back to mandate seed
+            # (operator: no HOLD freeze while learning).
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
+            open_scores=(self.last_signal or {}).get('scores')
+            open_edge=None
+            if isinstance(open_scores,dict):
+                try:
+                    open_edge=float(AutoEvolution.score_edge(open_scores))
+                except (TypeError,ValueError):
+                    open_edge=None
+            seed_size=Decimal(self.mandate['size'])
+            size=seed_size
+            size_plan=None
+            try:
+                size_plan=day_book.propose_size(
+                    mandate_size=seed_size,
+                    equity=self._account_equity(),
+                    daily=day_book.load_daily(self.store,equity=self._account_equity()),
+                    params=day_book.load_params(self.store),
+                    stop_ticks=brackets.get('stop_ticks'),
+                    tick_value=tick_val,
+                    positions=self.positions,
+                    score_edge=open_edge,
+                    market=market)
+                if (size_plan.get('allowed') and size_plan.get('size') is not None
+                        and Decimal(str(size_plan['size']))>0):
+                    size=Decimal(str(size_plan['size']))
+                self.store.set('last_open_size_plan',{
+                    k:(str(v) if isinstance(v,Decimal) else v)
+                    for k,v in (size_plan or {}).items()})
+            except Exception as exc:
+                self.store.event('warning','Edge size plan skipped — using mandate',
+                    {'type':type(exc).__name__})
+                size=seed_size
+            # Hard-risk is informational only — never block OPEN (operator request).
             proposed=None
             if tick_val is not None:
                 try:
@@ -6259,6 +6293,10 @@ class SingleTradeEngine:
             gate=self._hard_risk_gate(proposed_risk=proposed)
             self.store.event('risk','OPEN cash-risk note (not a gate)',{
                 'proposed_risk':proposed,'size':str(size),
+                'seed_size':str(seed_size),
+                'size_reason':(size_plan or {}).get('reason'),
+                'signal_strength':(size_plan or {}).get('signal_strength'),
+                'score_edge':open_edge,
                 'stop_ticks':int(brackets['stop_ticks']),
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
@@ -6635,7 +6673,9 @@ class SingleTradeEngine:
                 'bracket':bracket_learn.load_params(self.store),
                 'bracket_learn_reason':self.store.get('bracket_learn_reason'),
                 'bracket_outcomes':len(self.store.get('bracket_outcome_history',[]) or []),
-                'unified_cycle':unified_cycle.load_state(self.store)}
+                'unified_cycle':unified_cycle.load_state(self.store),
+                'learn_horizon':unified_cycle.learn_horizon(self.store),
+                'last_open_size_plan':self.store.get('last_open_size_plan')}
 
     def _bars_and_spreads_from_candles(self,candles):
         """Chronological OHLC + per-bar spreads (None when unknown — never invent)."""

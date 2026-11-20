@@ -702,6 +702,10 @@ class RuntimeHub:
                     'spread':(snap.get('market') or {}).get('spread'),
                     'tick':(snap.get('market') or {}).get('tick'),
                     'min_distance':(snap.get('market') or {}).get('min_distance'),
+                    'learn_horizon':snap.get('learn_horizon'),
+                    'last_open_size_plan':snap.get('last_open_size_plan'),
+                    'unified_cycle':snap.get('unified_cycle'),
+                    'hard_risk':snap.get('hard_risk'),
                 },
                 'last_start_error':None,
             })

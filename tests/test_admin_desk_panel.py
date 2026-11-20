@@ -9,11 +9,20 @@ def test_desk_html_shell_present():
     assert 'id="deskEngine"' in index
     assert 'id="deskTape"' in index
     assert 'id="deskFocus"' in index
+    assert 'id="deskWeights"' in index
+    assert 'id="deskReact"' in index
+    assert 'id="deskSignal"' in index
+    assert 'id="deskCrowd"' in index
+    assert 'id="deskPulse"' in index
 
 
 def test_desk_js_uses_live_endpoints_not_fake_curve():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'function renderDesk' in js
+    assert 'renderDeskWeights' in js
+    assert 'renderDeskReact' in js
+    assert 'deskTrack' in js
+    assert 'POLL_DESK_MS' in js
     assert '/api/admin/markets-ohlc' in js
     assert 'structure-view' in js
     assert 'Nav broker cash closes' in js
@@ -27,4 +36,7 @@ def test_admin_card_exposes_desk_intel_fields():
     assert 'economic_news_risk' in src
     assert 'intermarket_analysis' in src
     assert 'trail_enabled' in src
+    assert 'returns_bps' in src
+    assert 'situation_memory' in src
+    assert 'neural_period_weights' in Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert RuntimeHub is not None

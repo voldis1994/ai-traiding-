@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=94">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=95">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -192,15 +192,36 @@
         <div class="page-head desk-head">
           <div>
             <h1>NEURAL Desk</h1>
-            <p>Live OHLC · SL/TP · engine — Capital dati, ne demo tape</p>
+            <p>Visa robota telemetrija vienā ekrānā — svari, reakcija, SL/TP, signāli</p>
           </div>
-          <label class="desk-focus">
-            Fokuss
-            <select id="deskFocus" aria-label="Desk klienta fokuss"></select>
-          </label>
+          <div class="desk-head-right">
+            <div id="deskPulse" class="desk-pulse" aria-live="polite">Sync —</div>
+            <label class="desk-focus">
+              Fokuss
+              <select id="deskFocus" aria-label="Desk klienta fokuss"></select>
+            </label>
+          </div>
         </div>
         <div id="deskTape" class="desk-tape" aria-label="Tirgu lente"></div>
-        <div class="desk-grid">
+        <div class="desk-grid desk-grid-full">
+          <aside class="desk-rail">
+            <article class="card">
+              <div class="card-head"><h2>TF svari</h2></div>
+              <div id="deskWeights" class="desk-weights"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Returns / MTF</h2></div>
+              <div id="deskReturns" class="desk-returns"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Indikatori</h2></div>
+              <div id="deskIndicators" class="desk-indicators"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Reakcija</h2></div>
+              <div id="deskReact" class="desk-react"></div>
+            </article>
+          </aside>
           <div class="desk-main">
             <article class="card desk-chart-card">
               <div class="card-head">
@@ -212,13 +233,16 @@
               </div>
               <canvas id="deskChart" width="960" height="420" aria-label="Live OHLC ar SL/TP"></canvas>
             </article>
-            <article class="card">
-              <div class="card-head">
-                <h2>Live darījumi</h2>
-                <button type="button" class="text-link" data-jump="trades">Visi →</button>
-              </div>
-              <div id="deskDeals" class="table-wrap"></div>
-            </article>
+            <div class="desk-mid-row">
+              <article class="card">
+                <div class="card-head"><h2>Live darījumi</h2></div>
+                <div id="deskDeals" class="table-wrap"></div>
+              </article>
+              <article class="card">
+                <div class="card-head"><h2>Nesen slēgtie</h2></div>
+                <div id="deskClosed" class="desk-closed"></div>
+              </article>
+            </div>
           </div>
           <aside class="desk-side">
             <article class="card desk-engine">
@@ -226,11 +250,19 @@
               <div id="deskEngine" class="desk-engine-body"></div>
             </article>
             <article class="card">
+              <div class="card-head"><h2>Pozicionēšana</h2></div>
+              <div id="deskCrowd" class="desk-crowd"></div>
+            </article>
+            <article class="card">
               <div class="card-head"><h2>Checklist</h2></div>
               <div id="deskCheck" class="desk-check"></div>
             </article>
             <article class="card">
-              <div class="card-head"><h2>Intel</h2></div>
+              <div class="card-head"><h2>Signāla ceļš</h2></div>
+              <div id="deskSignal" class="desk-signal"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><h2>Intel / feed</h2></div>
               <div id="deskIntel" class="desk-intel"></div>
             </article>
           </aside>
@@ -387,6 +419,6 @@
     </div>
   </div>
   <script src="/admin/static/ohlc-chart.js?v=7"></script>
-  <script src="/admin/static/admin.js?v=101"></script>
+  <script src="/admin/static/admin.js?v=102"></script>
 </body>
 </html>

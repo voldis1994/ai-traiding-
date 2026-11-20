@@ -310,6 +310,13 @@ table.data tr:last-child td{border-bottom:0}
 
 /* —— NEURAL Desk (live Capital control panel) —— */
 .desk-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.desk-head-right{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap}
+.desk-pulse{
+  font-size:12px;font-weight:700;padding:10px 12px;border-radius:10px;
+  border:1px solid var(--line-soft);background:rgba(8,12,14,.7);color:var(--muted);
+  font-variant-numeric:tabular-nums}
+.desk-pulse.hot{color:var(--accent);border-color:var(--line)}
+.desk-pulse.stale{color:var(--sell);border-color:rgba(255,92,122,.35)}
 .desk-focus{display:flex;flex-direction:column;gap:6px;font-size:11px;font-weight:700;
   letter-spacing:.04em;color:var(--muted);text-transform:uppercase}
 .desk-focus select{
@@ -328,6 +335,38 @@ table.data tr:last-child td{border-bottom:0}
 .desk-tape-item .md{font-variant-numeric:tabular-nums;font-weight:700;margin-top:4px}
 .desk-tape-item .cl{font-size:11px;color:var(--muted);margin-top:2px}
 .desk-grid{display:grid;grid-template-columns:minmax(0,1.85fr) minmax(280px,.9fr);gap:16px}
+.desk-grid-full{
+  grid-template-columns:minmax(200px,.72fr) minmax(0,1.7fr) minmax(260px,.88fr)}
+.desk-rail,.desk-side{display:flex;flex-direction:column;gap:12px;min-width:0}
+.desk-mid-row{display:grid;grid-template-columns:1.2fr .8fr;gap:12px;margin-top:12px}
+.desk-weights,.desk-returns,.desk-indicators,.desk-react,.desk-crowd,.desk-signal,.desk-closed{
+  display:grid;gap:8px;padding:2px 0 6px;font-size:12px}
+.desk-bar{
+  display:grid;grid-template-columns:42px 1fr 40px;gap:8px;align-items:center}
+.desk-bar span{color:var(--muted);font-weight:700;font-size:11px;letter-spacing:.03em}
+.desk-bar b{text-align:right;font-variant-numeric:tabular-nums}
+.desk-bar .track{height:8px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}
+.desk-bar .fill{height:100%;border-radius:999px;background:var(--accent);width:0%;
+  transition:width .35s ease,background .2s ease}
+.desk-bar.up .fill{background:var(--buy)}.desk-bar.down .fill{background:var(--sell)}
+.desk-bar.flash .fill{box-shadow:0 0 10px var(--accent-glow)}
+.desk-bar.lost b{color:var(--sell)}
+.desk-kv{
+  display:flex;justify-content:space-between;gap:10px;padding:7px 9px;border-radius:10px;
+  border:1px solid var(--line-soft);background:rgba(8,12,14,.45)}
+.desk-kv span{color:var(--muted)}.desk-kv strong{color:var(--text);font-weight:700;
+  font-variant-numeric:tabular-nums;text-align:right}
+.desk-kv.lost strong{color:var(--sell)}
+.desk-kv.changed strong{color:var(--warn)}
+.desk-crowd-bar{
+  display:flex;height:14px;border-radius:999px;overflow:hidden;border:1px solid var(--line-soft);
+  margin:4px 0 8px}
+.desk-crowd-bar i{display:block;height:100%}
+.desk-crowd-bar .b{background:var(--buy)}.desk-crowd-bar .h{background:var(--warn)}
+.desk-crowd-bar .s{background:var(--sell)}
+.desk-closed div,.desk-signal div{
+  display:flex;justify-content:space-between;gap:8px;padding:5px 0;
+  border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}
 .desk-chart-card canvas{width:100%;height:min(48vh,420px);display:block;border-radius:0 0 12px 12px;
   background:#080c0e}
 .desk-quote{font-size:13px;margin-top:4px}
@@ -382,7 +421,7 @@ table.data tr:last-child td{border-bottom:0}
   .sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line-soft)}
   .side-nav{flex-direction:row;flex-wrap:wrap}
   .sidebar-wave{display:none}
-  .overview-grid,.desk-grid{grid-template-columns:1fr}
+  .overview-grid,.desk-grid,.desk-grid-full,.desk-mid-row{grid-template-columns:1fr}
   .stat-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:720px){

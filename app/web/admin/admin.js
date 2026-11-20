@@ -9,8 +9,11 @@ let deskFocusId=null;
 let deskStructure=null;
 let deskStructureInFlight=null;
 let lastDeskChartKey='';
+const deskPrevFields=new Map(); // clientId → {field: previous string}
+const deskPrevTicks=new Map();  // clientId → {tick, at}
 const POLL_IDLE_MS=10000;
 const POLL_LIVE_MS=5000;
+const POLL_DESK_MS=2500;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
 const OHLC_REFRESH_MS=2000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
@@ -249,6 +252,197 @@ function renderDeskQuote(view,client){
   ].filter(Boolean).join(' · ');
 }
 
+function deskTrack(cid,key,val){
+  const id=String(cid||'0');
+  const prev=deskPrevFields.get(id)||{};
+  const now=(val==null||val===''||(typeof val==='number'&&!Number.isFinite(val)))
+    ?'—':String(val);
+  const was=prev[key];
+  const lost=was!=null&&was!=='—'&&now==='—';
+  const changed=was!=null&&was!==now;
+  prev[key]=now;
+  deskPrevFields.set(id,prev);
+  return {now,lost,changed,was};
+}
+
+function deskKv(cid,label,val,fmt){
+  const shown=fmt?fmt(val):val;
+  const t=deskTrack(cid,label,shown);
+  const cls=t.lost?'lost':(t.changed?'changed':'');
+  return `<div class="desk-kv ${cls}"><span>${esc(label)}</span><strong title="${esc(t.was||'')}">${esc(t.now)}</strong></div>`;
+}
+
+function renderDeskWeights(client){
+  const el=$('deskWeights');
+  if(!el)return;
+  if(!client){stableHtml(el,'<div class="desk-empty">—</div>');return}
+  const a=client.activity||{};
+  const mtf=a.mtf_momentum||{};
+  const pw=mtf.neural_period_weights||mtf.period_weights||null;
+  const keys=['m1','m5','m15','m30','m60'];
+  if(!pw||typeof pw!=='object'){
+    stableHtml(el,'<div class="desk-empty">TF svari vēl nav — robots mācās / nav MTF.</div>');
+    return;
+  }
+  const html=keys.map(k=>{
+    const v=Number(pw[k]);
+    const pctV=Number.isFinite(v)?Math.round(v*100):null;
+    const t=deskTrack(client.id,'w_'+k,pctV==null?'—':pctV+'%');
+    const w=pctV==null?0:Math.max(0,Math.min(100,pctV));
+    const cls=(t.lost?'lost ':'')+(t.changed?'flash ':'');
+    return `<div class="desk-bar ${cls}"><span>${esc(k)}</span>
+      <div class="track"><div class="fill" style="width:${w}%"></div></div>
+      <b>${esc(t.now)}</b></div>`;
+  }).join('');
+  stableHtml(el,html);
+}
+
+function renderDeskReturns(client){
+  const el=$('deskReturns');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const a=client.activity||{};
+  const rb=a.returns_bps||{};
+  const mtf=a.mtf_momentum||{};
+  const keys=['1','5','15','30','60'];
+  const bars=keys.map(k=>{
+    const raw=rb[k]??rb[k+'m']??rb['m'+k];
+    const n=Number(raw);
+    const t=deskTrack(client.id,'ret_'+k,Number.isFinite(n)?n.toFixed(1):'—');
+    const abs=Number.isFinite(n)?Math.min(100,Math.abs(n)/2):0;
+    const dir=Number.isFinite(n)?(n>0?'up':(n<0?'down':'')):'';
+    return `<div class="desk-bar ${dir} ${t.changed?'flash':''} ${t.lost?'lost':''}">
+      <span>${esc(k)}m</span><div class="track"><div class="fill" style="width:${abs}%"></div></div>
+      <b>${esc(t.now)}</b></div>`;
+  }).join('');
+  const meta=[
+    deskKv(client.id,'MTF mode',mtf.mode),
+    deskKv(client.id,'Preferred',mtf.preferred),
+    deskKv(client.id,'Bar',a.bar_time?String(a.bar_time).slice(11,19):'—'),
+    deskKv(client.id,'Regime',a.market_regime),
+  ].join('');
+  stableHtml(el,bars+meta);
+}
+
+function renderDeskIndicators(client,view){
+  const el=$('deskIndicators');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const a=client.activity||{};
+  const mtf=a.mtf_momentum||{};
+  const ov=(view&&view.overlays)||{};
+  const mtfUi=(view&&view.mtf)||{};
+  const atr=mtf.stop_hint_atr14??((mtf.tf||{}).m1||{}).atr14??mtfUi.atr14??ov.atr14;
+  const adx=mtfUi.adx??ov.adx;
+  const dip=mtfUi.di_plus??ov.di_plus;
+  const dim=mtfUi.di_minus??ov.di_minus;
+  const kama=mtfUi.kama??ov.kama_level??((mtf.tf||{}).m5||{}).kama;
+  stableHtml(el,[
+    deskKv(client.id,'ATR14',atr,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
+    deskKv(client.id,'DI+',dip,v=>v==null?'—':num(v,1)),
+    deskKv(client.id,'DI−',dim,v=>v==null?'—':num(v,1)),
+    deskKv(client.id,'KAMA',kama,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Tick',a.tick,v=>v==null?'—':num(v,4)),
+    deskKv(client.id,'MinDist',a.min_distance,v=>v==null?'—':num(v,3)),
+    deskKv(client.id,'Spread',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
+      v=>v==null?'—':num(v,3)),
+  ].join(''));
+}
+
+function renderDeskReact(client){
+  const el=$('deskReact');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const a=client.activity||{};
+  const e=client.evolution||{};
+  const ticks=Number(a.tick_count)||0;
+  const prev=deskPrevTicks.get(String(client.id))||{tick:ticks,at:Date.now()};
+  const dt=Math.max(0.001,(Date.now()-prev.at)/1000);
+  const dTick=ticks-prev.tick;
+  const rate=dTick>0?(dTick/dt):0;
+  deskPrevTicks.set(String(client.id),{tick:ticks,at:Date.now()});
+  const age=a.position_age;
+  const syncAge=lastSyncAt?Math.round((Date.now()-lastSyncAt)/1000):null;
+  stableHtml(el,[
+    deskKv(client.id,'Ticks',ticks),
+    deskKv(client.id,'Tick/s',rate>0?rate.toFixed(2):'0'),
+    deskKv(client.id,'Sync ago',syncAge==null?'—':syncAge+'s'),
+    deskKv(client.id,'Can OPEN now',a.entry_can_submit_now?'JĀ':'NĒ'),
+    deskKv(client.id,'Eligible',a.entry_eligible?'JĀ':'NĒ'),
+    deskKv(client.id,'Pending new bar',a.entry_decision_pending_new_bar?'JĀ':'NĒ'),
+    deskKv(client.id,'Pos age',age==null?'—':(typeof age==='number'?Math.round(age)+'s':age)),
+    deskKv(client.id,'Neurons/steps',`${e.neurons??'—'} / ${e.steps??0}`),
+    deskKv(client.id,'M1 acc',a.minute_direction_accuracy==null?'—':pct(a.minute_direction_accuracy)),
+    deskKv(client.id,'Trade WR',a.trade_win_rate==null?'—':pct(a.trade_win_rate)),
+    deskKv(client.id,'Unresolved',Array.isArray(a.unresolved_orders)?a.unresolved_orders.length:0),
+  ].join(''));
+}
+
+function renderDeskCrowd(client){
+  const el=$('deskCrowd');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const {buy,hold,sell,act}=deskScoreAction(client);
+  const b=Math.round(buy*100),h=Math.round(hold*100),s=Math.round(sell*100);
+  const sum=Math.max(1,b+h+s);
+  stableHtml(el,`
+    <div class="desk-crowd-bar">
+      <i class="b" style="width:${(b/sum)*100}%"></i>
+      <i class="h" style="width:${(h/sum)*100}%"></i>
+      <i class="s" style="width:${(s/sum)*100}%"></i>
+    </div>
+    <div class="desk-meta">
+      <div>BUY <strong>${b}%</strong> · HOLD <strong>${h}%</strong> · SELL <strong>${s}%</strong></div>
+      <div>Argmax <strong>${esc(act)}</strong></div>
+      <div>Edge <strong>${esc(client.activity&&client.activity.directional_advantage!=null
+        ?num(client.activity.directional_advantage,3):'—')}</strong></div>
+      <div>Utility <strong>${esc(client.activity&&client.activity.economic_utility!=null
+        ?String(client.activity.economic_utility).slice(0,48):'—')}</strong></div>
+    </div>`);
+}
+
+function renderDeskSignal(client){
+  const el=$('deskSignal');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const a=client.activity||{};
+  const path=a.entry_path||{};
+  const rows=[
+    ['Intent',a.entry_intent||path.intent||'—'],
+    ['Trigger',a.entry_trigger||path.trigger||'—'],
+    ['Wait',a.entry_wait||path.wait||a.entry_block_reason||'—'],
+    ['Policy',a.policy_decision||client.action||'—'],
+    ['Proposal',a.policy_proposal||client.proposal||'—'],
+    ['Fusion block',a.fusion_block_reason||'—'],
+    ['Exit intent',a.neural_exit_intent||'—'],
+    ['Manage bar',(a.manage_signal&&a.manage_signal.bar_time)||'—'],
+    ['Decision bar',a.neural_decision_bar||'—'],
+  ];
+  stableHtml(el,rows.map(([k,v])=>{
+    const t=deskTrack(client.id,'sig_'+k,v);
+    return `<div class="${t.lost?'lost':''}"><span>${esc(k)}</span><strong title="${esc(String(v))}">${esc(String(t.now).slice(0,64))}</strong></div>`;
+  }).join(''));
+}
+
+function renderDeskClosed(client){
+  const el=$('deskClosed');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const r=client.results||{};
+  const ccy=r.pnl_currency||client.account_currency||'';
+  const rows=(r.recent_trades||[]).slice(0,6);
+  if(!rows.length){
+    stableHtml(el,'<div class="desk-empty">Nav nesen slēgtu</div>');
+    return;
+  }
+  stableHtml(el,rows.map(t=>{
+    const p=t.pnl!=null?t.pnl:(t.upl_hint!=null?t.upl_hint:null);
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}</span>
+      <strong class="${pnlClass(p)}">${esc(p==null?'—':money(p,t.pnl_currency||ccy))}</strong></div>`;
+  }).join(''));
+}
+
 function renderDeskEngine(client){
   const el=$('deskEngine');
   if(!el)return;
@@ -272,12 +466,10 @@ function renderDeskEngine(client){
       <div class="sell"><em>SELL</em><b>${pct(sell)}</b></div>
     </div>
     <div class="desk-meta">
-      <div>Intent <strong>${esc(a.entry_intent||(a.entry_path&&a.entry_path.intent)||'—')}</strong></div>
-      <div>Trigger <strong>${esc(a.entry_trigger||(a.entry_path&&a.entry_path.trigger)||'—')}</strong></div>
-      <div>Wait <strong>${esc(String(a.entry_wait||a.entry_block_reason||'—').slice(0,80))}</strong></div>
       <div>MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong></div>
       <div>Day <strong>${esc(dayPhase)}</strong></div>
       <div>Protect <strong>${esc(prot)}</strong></div>
+      <div>Armed <strong>${esc(client.armed?'JĀ':'NĒ')} · exec ${esc(client.execution_enabled?'ON':'OFF')}</strong></div>
     </div>`;
   stableHtml(el,html);
 }
@@ -292,21 +484,25 @@ function renderDeskCheck(client,view){
   const pos=(Array.isArray(a.positions)&&a.positions[0])||a.position;
   const hasSl=pos&&(pos.has_sl||(pos.stopLevel!=null&&Number(pos.stopLevel)>0));
   const hasTp=pos&&(pos.has_tp||(pos.profitLevel!=null&&Number(pos.profitLevel)>0));
+  const ready=a.model_readiness||{};
   const rows=[
     {k:'Robots',v:client.robot_running?(client.operator_paused?'PAUZE':'ON'):'OFF',
       cls:client.robot_running&&!client.operator_paused?'ok':(client.operator_paused?'neu':'bad')},
     {k:'Tirgus',v:a.market_status||'—',cls:(a.market_status==='TRADEABLE'?'ok':'neu')},
+    {k:'Model',v:ready.ready?'ready':(ready.reason||ready.status||'nav'),
+      cls:ready.ready?'ok':'neu'},
     {k:'MTF',v:mtf.ready?((mtf.mode||'ready')+(mtf.preferred?(' · '+mtf.preferred):'')):'nav',
       cls:mtf.ready?'ok':'neu'},
     {k:'Signāls',v:sc.act,cls:sc.act==='HOLD'?'neu':'ok'},
+    {k:'Can OPEN',v:a.entry_can_submit_now?'JĀ':'NĒ',cls:a.entry_can_submit_now?'ok':'neu'},
     {k:'SL',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
     {k:'TP',v:hasTp?'ON':'OFF',cls:hasTp?'ok':(pos?'bad':'neu')},
-    {k:'Swing bracket',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ready':'—',
+    {k:'Swing',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ready':'—',
       cls:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ok':'neu'},
-    {k:'Trail',v:a.trail_enabled?'ON':'OFF (OHLC SL/TP)',cls:a.trail_enabled?'neu':'ok'},
+    {k:'Trail',v:a.trail_enabled?'ON':'OFF',cls:a.trail_enabled?'neu':'ok'},
   ];
   stableHtml(el,rows.map(r=>
-    `<div class="desk-check-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(r.v)}</b></div>`
+    `<div class="desk-check-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(String(r.v).slice(0,40))}</b></div>`
   ).join(''));
 }
 
@@ -317,26 +513,49 @@ function renderDeskIntel(client){
   const a=client.activity||{};
   const news=a.economic_news_risk;
   const im=a.intermarket_analysis;
+  const sit=a.situation_memory;
+  const fl=a.forward_live||{};
   const chips=[];
   if(news&&typeof news==='object'){
     const risk=news.risk||news.level||news.status||news.summary;
-    const label=news.headline||news.event||news.next||risk;
-    if(label)chips.push({t:String(label).slice(0,120),cls:String(risk||'').toLowerCase().includes('high')?'bear':'neu'});
+    const label=news.headline||news.event||news.next||news.reason||risk;
+    if(label)chips.push({t:String(label).slice(0,140),cls:String(risk||'').toLowerCase().includes('high')||String(news.status||'').includes('BLOCK')?'bear':'neu'});
   }else if(typeof news==='string'&&news){
-    chips.push({t:news.slice(0,120),cls:'neu'});
+    chips.push({t:news.slice(0,140),cls:'neu'});
   }
   if(im&&typeof im==='object'){
-    const lean=im.lean||im.bias||im.regime||im.summary;
+    const lean=im.lean||im.bias||im.regime||im.summary||im.status;
     const cls=String(lean||'').toLowerCase().includes('bull')?'bull'
       :(String(lean||'').toLowerCase().includes('bear')?'bear':'neu');
-    if(lean)chips.push({t:'Intermarket · '+String(lean).slice(0,100),cls});
+    if(lean)chips.push({t:'Intermarket · '+String(lean).slice(0,110),cls});
   }
-  if(a.entry_block_reason)chips.push({t:'Block · '+String(a.entry_block_reason).slice(0,100),cls:'bear'});
+  if(sit&&typeof sit==='object'){
+    const tip=sit.tip||sit.summary||sit.last||sit.note;
+    if(tip)chips.push({t:'Memory · '+String(tip).slice(0,110),cls:'neu'});
+  }
+  if(fl.ok){
+    chips.push({t:`Forward n=${fl.n} · false ${fl.false_signal_rate==null?'—':Math.round(fl.false_signal_rate*100)+'%'} · E ${fl.expectancy??'—'}`,cls:'neu'});
+    if(fl.tips&&fl.tips[0])chips.push({t:'Forward tip · '+String(fl.tips[0]).slice(0,100),cls:'bull'});
+  }
+  if(a.entry_block_reason)chips.push({t:'Block · '+String(a.entry_block_reason).slice(0,110),cls:'bear'});
+  if(a.fusion_block_reason)chips.push({t:'Fusion · '+String(a.fusion_block_reason).slice(0,110),cls:'bear'});
+  if(a.error)chips.push({t:'Error · '+String(a.error).slice(0,110),cls:'bear'});
   if(!chips.length){
-    stableHtml(el,'<div class="desk-empty">Nav aktīva news/intermarket signāla — tas ir OK.</div>');
+    stableHtml(el,'<div class="desk-empty">Nav aktīva news/intermarket — tukšums šeit arī ir signāls.</div>');
     return;
   }
   stableHtml(el,chips.map(c=>`<div class="chip ${esc(c.cls)}">${esc(c.t)}</div>`).join(''));
+}
+
+function renderDeskPulse(client){
+  const el=$('deskPulse');
+  if(!el)return;
+  const sync=formatSyncClock(lastSyncAt)||'—';
+  const age=lastSyncAt?Math.round((Date.now()-lastSyncAt)/1000):null;
+  const ticks=client&&client.activity?Number(client.activity.tick_count)||0:0;
+  el.textContent=`Sync ${sync} · ${age==null?'—':age+'s'} · ticks ${ticks} · poll ${currentPollMs||'—'}ms`;
+  el.classList.toggle('hot',age!=null&&age<=3);
+  el.classList.toggle('stale',age!=null&&age>12);
 }
 
 function drawDeskChart(view){
@@ -394,8 +613,15 @@ async function renderDesk(data){
   }
   const open=collectOpenTrades(clients);
   stableHtml($('deskDeals'),renderTradesTable(open.slice(0,8)));
+  renderDeskClosed(focus);
   renderDeskEngine(focus);
+  renderDeskCrowd(focus);
+  renderDeskSignal(focus);
   renderDeskIntel(focus);
+  renderDeskWeights(focus);
+  renderDeskReturns(focus);
+  renderDeskReact(focus);
+  renderDeskPulse(focus);
   // Markets tape + structure chart (real Capital OHLC).
   let markets=[];
   try{
@@ -420,6 +646,7 @@ async function renderDesk(data){
   }
   renderDeskQuote(view,focus);
   renderDeskLevels(view,focus);
+  renderDeskIndicators(focus,view);
   renderDeskCheck(focus,view);
   drawDeskChart(view);
 }
@@ -1133,9 +1360,11 @@ function updateSystemStatus(data){
 }
 
 function desiredPollMs(data){
+  const deskOn=!!document.querySelector('.view.active[data-view="desk"]');
   const s=(data&&data.summary)||{};
   const running=Number(s.running_robots)||0;
   const open=Number(s.open_trades_all)||collectOpenTrades((data&&data.clients)||[]).length;
+  if(deskOn&&(running>0||open>0))return POLL_DESK_MS;
   return (running>0 || open>0)?POLL_LIVE_MS:POLL_IDLE_MS;
 }
 

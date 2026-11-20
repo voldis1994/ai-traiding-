@@ -1,0 +1,96 @@
+"""Kick physical evolution — seed + harvest + soft ceilings so evo is not idle.
+
+Without this, fresh Stores wait for: hot soft-ceilings, empty strategy cards,
+and a 20-trade trial horizon. Call once per engine / runtime start.
+"""
+from __future__ import annotations
+
+STORE_FLAG = 'evo_boot_v1'
+
+
+def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
+    """Idempotent boot so the robot actually starts evolving on day one."""
+    if store is None:
+        return {'ok': False, 'reason': 'no_store'}
+    prev = store.get(STORE_FLAG) or {}
+    if isinstance(prev, dict) and prev.get('done') and not force:
+        # Still re-harvest lightly so new library EV can activate cards.
+        try:
+            from . import strategy_gen
+            h = strategy_gen.harvest(store, epic=epic)
+        except Exception as exc:
+            h = {'ok': False, 'reason': type(exc).__name__}
+        return {'ok': True, 'reason': 'already_booted', 'harvest': h}
+
+    out = {
+        'ok': True,
+        'soft_ceilings': None,
+        'audit_seed': None,
+        'harvest': None,
+        'params': None,
+    }
+    try:
+        from .self_params import migrate_soft_ceilings, load, save, DEFAULTS
+        migrated = migrate_soft_ceilings(store)
+        out['soft_ceilings'] = bool(migrated)
+        # Ensure audit-seeded knobs are present even on old Store bags.
+        p = load(store)
+        touched = False
+        for k in (
+            'self_params_horizon_trades', 'learn_loss_repeats',
+            'trail_live_enabled', 'trail_arm_mfe_frac', 'structure_edge_nudge',
+            'strategy_gen_enabled', 'reentry_same_dir_atr_frac',
+        ):
+            if k not in (store.get('self_params_v1') or {}) and k in DEFAULTS:
+                p[k] = DEFAULTS[k]
+                touched = True
+        # Force horizon down if an old Store still holds 20+ (evo freeze).
+        try:
+            hz = int(p.get('self_params_horizon_trades') or 8)
+        except (TypeError, ValueError):
+            hz = 8
+        if hz > 12:
+            p['self_params_horizon_trades'] = 8
+            touched = True
+        if touched:
+            save(store, p, reason='evo_boot_audit_defaults')
+            out['params'] = 'seeded'
+        else:
+            out['params'] = 'ok'
+    except Exception as exc:
+        out['params'] = type(exc).__name__
+
+    try:
+        from . import strategy_gen
+        out['audit_seed'] = strategy_gen.seed_audit_cards(store)
+        out['harvest'] = strategy_gen.harvest(store, epic=epic)
+        if (out['audit_seed'] or {}).get('added'):
+            try:
+                from .learning_generation import bump
+                bump(store, 'strategy_gen_audit_seed', kind='architecture_changes')
+            except Exception:
+                pass
+    except Exception as exc:
+        out['audit_seed'] = {'ok': False, 'reason': type(exc).__name__}
+
+    store.set(STORE_FLAG, {
+        'done': True,
+        'at': __import__('datetime').datetime.now(
+            __import__('datetime').timezone.utc).isoformat(),
+        'epic': epic,
+        'summary': {
+            'active_cards': len((out.get('harvest') or {}).get('activated') or []),
+            'seed_added': len((out.get('audit_seed') or {}).get('added') or []),
+        },
+    })
+    try:
+        store.event('learning', 'Physical evo boot — seeds + harvest live', {
+            'epic': epic,
+            'soft_ceilings': out.get('soft_ceilings'),
+            'seed_added': (out.get('audit_seed') or {}).get('added'),
+            'activated': (out.get('harvest') or {}).get('activated'),
+            'params': out.get('params'),
+        })
+    except Exception:
+        pass
+    return out

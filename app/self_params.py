@@ -142,7 +142,8 @@ DEFAULTS = {
     'forecast_bridge_min_resolved': 24,
     'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
-    'self_params_horizon_trades': 20,
+    # Faster first trial commit — 20 froze physical evo for days of thin GOLD £.
+    'self_params_horizon_trades': 8,
     # Day book / situation memory (Komandcentrs + Riski)
     'day_profit_target_frac': 0.0,
     'day_loss_budget_frac': 0.10,
@@ -349,7 +350,8 @@ LEARN_LR_STEP = 0.01
 # Hard rail in BOUNDS is 0.50; soft ceiling stops live Stores from keeping 0.28+.
 LEARN_LR_SOFT_MAX = 0.12
 LEARN_WIN_REPEATS_SOFT_MAX = 3
-LEARN_LOSS_REPEATS_SOFT_MAX = 3
+# Audit: against-structure ΔW needs room above win path (engine +1 on graves).
+LEARN_LOSS_REPEATS_SOFT_MAX = 5
 
 
 def _finite(v):
@@ -671,10 +673,15 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 # Calm LR after losses — raising it was "learning bigger mistakes"
                 # and diverged clients (one balloons, peers stay compact).
                 p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
-                # Never let loss repeats exceed win repeats (symmetric teacher).
+                # Keep loss teach strength; raise win path to stay near it.
+                # Old min(win,loss) crushed audit loss_repeats=4 → 2 every close.
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 cur=int(p['learn_loss_repeats'])
-                p['learn_loss_repeats']=min(win_r,cur)
+                p['learn_loss_repeats']=min(
+                    int(LEARN_LOSS_REPEATS_SOFT_MAX), max(1, cur))
+                p['learn_win_repeats']=min(
+                    BOUNDS['learn_win_repeats'][1],
+                    max(win_r, min(int(p['learn_loss_repeats']), win_r + 1)))
                 # Adverse cash → assume more LIVE friction; raise shadow slip estimate.
                 p['exec_slip_bps']=min(BOUNDS['exec_slip_bps'][1],
                     float(p['exec_slip_bps'])*1.05)
@@ -845,11 +852,14 @@ def maybe_commit_long_horizon(store, broker_pnls):
     elif len(prior)<need:
         prior_net=float(sum(prior))
         prior_mean=prior_net/len(prior)
-        beat=trial_mean>0 and trial_mean>prior_mean
+        # Relative improvement is enough — requiring trial_mean>0 rejected
+        # recovery trials (prior −0.5 → trial −0.1) and froze evo (7/8 rejects).
+        beat=trial_mean > prior_mean
         mode='short_prior_mean'
     else:
         prior_net=float(sum(prior[-need:]))
-        beat=trial_net>0 and trial_net>prior_net
+        # Prefer relative beat; still require trial not a pure dump (net≥prior).
+        beat=trial_net > prior_net
         mode='equal_window_net'
     if not beat:
         baseline=pending.get('baseline_params') or DEFAULTS

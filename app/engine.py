@@ -1080,6 +1080,14 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','self_params soft-ceiling migrate deferred',
                 {'type':type(exc).__name__,'detail':str(exc)[:160]})
+        # Physical evo boot: audit seeds + strategy cards + shorter trial horizon.
+        try:
+            from . import evo_boot
+            epic0=getattr(brain,'epic',None)
+            evo_boot.ensure_physical_evo(store,epic=epic0)
+        except Exception as exc:
+            self.store.event('warning','Physical evo boot deferred',
+                {'type':type(exc).__name__,'detail':str(exc)[:160]})
         if hasattr(self.brain,'apply_registry'):
             try:
                 self.brain.apply_registry(self.feature_registry)

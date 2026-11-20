@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=110">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=112">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -140,13 +140,12 @@
       <header class="term-top">
         <div class="term-logo"><span class="term-mark">P</span><strong>PerpSignal Desk</strong><span class="term-sub">NEURAL</span></div>
         <label class="term-search" for="deskSearch">
-          <input id="deskSearch" type="search" placeholder="Search markets, views, commands…" autocomplete="off">
+          <input id="deskSearch" type="search" placeholder="Filter tape…" autocomplete="off">
         </label>
         <div class="term-top-right">
           <div class="status-pill term-status" id="systemStatus"><span class="dot"></span><span>Sistēma aktīva</span></div>
           <span id="deskUtc" class="psx-utc">UTC —</span>
           <span id="deskPulse" class="psx-pulse">Sync —</span>
-          <span class="psx-plat">PLATINUM</span>
           <span id="deskDemoBadge" class="psx-demo-badge hidden" title="Visual fixture only">DEMO</span>
           <label class="psx-acct term-acct">Account
             <select id="deskFocus" aria-label="Desk account"></select>
@@ -200,15 +199,7 @@
                   </div>
                   <div id="deskLevels" class="psx-levels"></div>
                 </div>
-                <div class="psx-modes" role="tablist" aria-label="Desk mode">
-                  <button type="button" class="psx-mode" data-desk-mode="DEFAULT">DEFAULT</button>
-                  <button type="button" class="psx-mode on" data-desk-mode="SIGNAL">SIGNAL DESK</button>
-                  <button type="button" class="psx-mode" data-desk-mode="SCALPER">SCALPER</button>
-                  <button type="button" class="psx-mode" data-desk-mode="SWING">SWING</button>
-                  <button type="button" class="psx-mode" data-desk-mode="PRACTICE">PRACTICE</button>
-                  <button type="button" class="psx-mode" id="deskWidgetBtn" title="UI only">+ WIDGET</button>
-                  <button type="button" class="psx-mode" id="deskUiResetBtn" title="Reset desk UI filters only — does NOT wipe learning">RESET</button>
-                </div>
+                <button type="button" class="psx-mode" id="deskUiResetBtn" title="Reset desk UI filters only — does NOT wipe learning">RESET FILTERS</button>
               </div>
 
               <div class="psx-grid">
@@ -231,11 +222,10 @@
 
                 <div class="psx-book-col">
                   <div class="psx-h">
-                    <h2>ORDER BOOK</h2>
-                    <span class="psx-src" title="Synthetic ladder from mid/spread/tick">ESTIMATED</span>
+                    <h2>QUOTE</h2>
+                    <span class="psx-src">BID / ASK</span>
                     <span class="psx-live">● LIVE</span>
                   </div>
-                  <div class="psx-book-cols"><span>PRICE</span><span>SIZE</span><span>VALUE</span><span>TOTAL</span></div>
                   <div id="deskBook" class="psx-book"></div>
                 </div>
 
@@ -262,7 +252,7 @@
                   <div id="deskWatch" class="psx-watch"></div>
                 </div>
                 <div class="psx-cell">
-                  <div class="psx-h"><h2>LARGE TRADES</h2><span class="psx-src">CLIENT</span><span class="psx-live">● LIVE</span></div>
+                  <div class="psx-h"><h2>CLIENT CLOSES</h2><span class="psx-src">HISTORY</span><span class="psx-live">● LIVE</span></div>
                   <div class="psx-whale-filters" id="deskWhaleFilters">
                     <button type="button" class="psx-mini on" data-whale="BOTH">BOTH</button>
                     <button type="button" class="psx-mini" data-whale="BUY">BUY</button>
@@ -276,25 +266,17 @@
             <aside class="psx-right">
               <div class="psx-h"><h2>SIGNAL WATCH</h2><span class="psx-live">● LIVE</span></div>
               <div class="psx-cell">
-                <div class="psx-h"><h2>ASSET FUNDING</h2><span class="psx-src">N/A</span></div>
-                <div id="deskFunding" class="psx-funding"><div class="psx-empty">Capital CFD — funding N/A</div></div>
-              </div>
-              <div class="psx-cell">
-                <div class="psx-h"><h2>CROWD POSITIONING</h2><span class="psx-src">AI SCORE LEAN</span></div>
+                <div class="psx-h"><h2>AI SCORE LEAN</h2><span class="psx-src">SCORES</span></div>
                 <div id="deskCrowd" class="psx-crowd"></div>
               </div>
-              <div class="psx-cell">
-                <div class="psx-h"><h2>CRYPTO MARKET LEAN</h2><span class="psx-src">SCORES</span></div>
-                <div id="deskLean" class="psx-lean-box"></div>
-              </div>
-              <div class="psx-cell">
-                <div class="psx-h"><h2>GLOBAL SENTIMENT</h2><span class="psx-src">PROXY</span></div>
-                <div id="deskFear" class="psx-fear"></div>
-              </div>
-              <div class="psx-cell">
+              <div class="psx-cell grow">
                 <div class="psx-h"><h2>SIGNALS</h2></div>
                 <div id="deskSignal" class="psx-sigwatch"></div>
               </div>
+              <!-- Kept for JS/id stability — not shown (no real funding / F&G / lean feed) -->
+              <div id="deskFunding" class="psx-sink" hidden></div>
+              <div id="deskLean" class="psx-sink" hidden></div>
+              <div id="deskFear" class="psx-sink" hidden></div>
             </aside>
           </div>
         </div>
@@ -467,6 +449,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=9"></script>
-  <script src="/admin/static/admin.js?v=110"></script>
+  <script src="/admin/static/admin.js?v=112"></script>
 </body>
 </html>

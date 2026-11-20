@@ -11,9 +11,9 @@ def test_desk_four_column_grid_present():
     assert 'id="deskClosed"' in html
     assert 'id="deskFunding"' in html
     assert 'id="deskUiResetBtn"' in html
-    assert 'ESTIMATED' in html
+    assert 'QUOTE' in html
     assert 'OPEN POSITIONS' in html
-    assert 'LARGE TRADES' in html
+    assert 'CLIENT CLOSES' in html
     assert 'AI SCORE LEAN' in html
 
 
@@ -44,15 +44,16 @@ def test_rsi_macd_from_ohlc_or_insufficient():
     assert 'INSUFFICIENT DATA' in js
 
 
-def test_order_book_marked_estimated():
+def test_quote_panel_no_fake_depth():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
-    assert 'ESTIMATED LADDER' in js
+    assert 'Depth/size N/A on Capital CFD' in js
+    assert 'ESTIMATED LADDER' not in js
 
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=110' in html
-    assert 'admin.js?v=110' in html
+    assert 'admin.css?v=112' in html
+    assert 'admin.js?v=112' in html
     assert 'ohlc-chart.js?v=9' in html
 
 
@@ -64,7 +65,6 @@ def test_demo_fixture_isolated():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'id="deskLean"' in html
     assert 'AI SCORE LEAN' in html
-    assert 'CRYPTO MARKET LEAN' in html
 
 
 def test_terminal_views_and_fullscreen():
@@ -84,3 +84,20 @@ def test_terminal_views_and_fullscreen():
     assert '#31d59a' in ohlc
     assert '#ef6875' in ohlc
     assert 'IBM Plex Mono' in ohlc
+
+
+def test_visual_only_chrome_removed():
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'data-desk-mode="SCALPER"' not in html
+    assert 'deskWidgetBtn' not in html
+    assert 'PLATINUM' not in html
+    assert 'ASSET FUNDING' not in html
+    assert 'CRYPTO MARKET LEAN' not in html
+    assert 'GLOBAL SENTIMENT' not in html
+    assert 'Filter tape' in html
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'TP2†' not in js
+    assert 'ESTIMATED LADDER' not in js
+    assert 'Depth/size N/A on Capital CFD' in js
+    assert 'id="deskFunding"' in html
+    assert 'id="deskFear"' in html

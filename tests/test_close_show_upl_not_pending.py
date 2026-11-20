@@ -53,6 +53,9 @@ def test_vanish_with_upl_journals_zero_one_not_pending():
             hub=RuntimeHub.__new__(RuntimeHub)
             stats=RuntimeHub._trade_stats(hub,store,'GBP')
             assert stats['working_pnl']==pytest.approx(0.01)
+            assert stats['working_pnl_source']=='upl_estimate'
+            assert stats['estimate_trades']==1
+            assert stats['cash_trades']==0
             assert stats['pending_cash_trades']==0
     asyncio.run(scenario())
 
@@ -112,5 +115,9 @@ def test_admin_pending_with_numeric_pnl_counts_as_working():
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=RuntimeHub._trade_stats(hub,store,'GBP')
         assert stats['working_pnl']==pytest.approx(0.01)
+        assert stats['working_pnl_source']=='upl_estimate'
+        assert stats['estimate_trades']==1
+        assert stats['cash_trades']==0
         assert stats['pending_cash_trades']==0
         assert stats['recent_trades'][0]['pnl']==pytest.approx(0.01)
+        assert stats['recent_trades'][0]['pnl_source']=='upl_estimate'

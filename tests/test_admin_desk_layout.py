@@ -52,9 +52,22 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=112' in html
-    assert 'admin.js?v=112' in html
+    assert 'admin.css?v=113' in html
+    assert 'admin.js?v=113' in html
     assert 'ohlc-chart.js?v=9' in html
+
+
+def test_client_closes_marks_upl_vs_capital():
+    """CLIENT CLOSES must not present ≈UPL as Capital.com £."""
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'closePnlSrcBadge' in js
+    assert '≈UPL' in js
+    assert 'CAPITAL' in js
+    assert "src==='broker'||src==='upl_estimate'" not in js
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'id="deskClosedSrc"' in html
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert 'psx-pnl-src' in css
 
 
 def test_demo_fixture_isolated():

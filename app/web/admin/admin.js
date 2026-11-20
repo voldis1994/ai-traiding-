@@ -84,11 +84,37 @@ function esc(s){
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
 function sourceLabel(src){
-  if(src==='broker'||src==='upl_estimate')return 'peļņa';
-  if(src==='open_upl')return 'live UPL';
-  if(src==='working')return 'working';
-  if(src==='none'||src==='empty')return 'nav skaitļu';
+  const s=String(src||'').toLowerCase();
+  if(s==='broker')return 'Capital £';
+  if(s==='upl_estimate')return '≈UPL (nav Capital £)';
+  if(s==='open_upl')return 'live UPL';
+  if(s==='working')return 'working';
+  if(s==='none'||s==='empty')return 'nav skaitļu';
+  if(s==='pending_broker_pnl'||s==='pending_close_sync')return 'gaida Capital £';
   return src||'—';
+}
+function closePnlSrcBadge(src,pending){
+  const s=String(src||'').toLowerCase();
+  if(pending||s==='pending_broker_pnl'||s==='pending_close_sync'){
+    return {cls:'psx-pnl-src wait',text:'GAIDA'};
+  }
+  if(s==='upl_estimate')return {cls:'psx-pnl-src est',text:'≈UPL'};
+  if(s==='broker'||s===''||!s)return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  if(s==='ticks_only'||s==='price_size'||s==='position_disappeared'){
+    return {cls:'psx-pnl-src wait',text:'PROXY'};
+  }
+  return {cls:'psx-pnl-src wait',text:String(src).slice(0,8).toUpperCase()};
+}
+function closeTimeLabel(t){
+  const raw=(t&&(t.closed||t.closed_at||t.updated_at||t.at))||'';
+  const s=String(raw);
+  if(!s)return '—';
+  // ISO …T14:10:00… → 14:10
+  const m=s.match(/T(\d{2}:\d{2})/);
+  if(m)return m[1];
+  if(s.length>=19)return s.slice(11,16);
+  if(s.length>=8)return s.slice(11,19)||s;
+  return s;
 }
 
 function hasRealWorkingPnl(r){
@@ -258,10 +284,10 @@ function buildDeskDemoFixture(){
     results:{
       pnl_currency:'USD',
       recent_trades:[
-        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed_at:'2024-11-20T12:01:00Z',pnl:-18},
-        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed_at:'2024-11-20T11:55:00Z',pnl:62},
-        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed_at:'2024-11-20T11:40:00Z',pnl:-11},
-        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed_at:'2024-11-20T11:22:00Z',pnl:24},
+        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed:'2024-11-20T12:01:00Z',pnl:-18,pnl_source:'broker'},
+        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed:'2024-11-20T11:55:00Z',pnl:62,pnl_source:'broker'},
+        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed:'2024-11-20T11:40:00Z',pnl:-11,pnl_source:'upl_estimate'},
+        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed:'2024-11-20T11:22:00Z',pnl:24,pnl_source:'broker'},
       ],
     },
   };
@@ -494,21 +520,36 @@ function renderDeskClosed(client){
     stableHtml(el,'<div class="psx-empty">No client closes · not exchange whales</div>');
     return;
   }
-  const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))||'';
+  const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))
+    ||results.pnl_currency||'';
+  const srcEl=$('deskClosedSrc');
+  const anyEst=rows.some(t=>{
+    const s=String(t.pnl_source||'').toLowerCase();
+    return s==='upl_estimate'||t.pending_cash;
+  });
+  const anyBroker=rows.some(t=>String(t.pnl_source||'').toLowerCase()==='broker');
+  if(srcEl){
+    if(anyEst&&!anyBroker)srcEl.textContent='≈UPL';
+    else if(anyEst)srcEl.textContent='MIXED';
+    else srcEl.textContent='CAPITAL';
+    srcEl.classList.toggle('warn',!!anyEst);
+  }
   stableHtml(el,rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
-    const p=t.pnl!=null?t.pnl:t.profit;
-    const val=p==null?'—':money(p,t.pnl_currency||ccy);
-    const when=(t.closed_at||t.updated_at||t.at||'').toString().slice(11,19)||'—';
-    const px=t.close??t.price??t.level;
+    const pending=!!(t.pending_cash||t.pnl_source==='pending_broker_pnl'
+      ||t.pnl_source==='pending_close_sync');
+    const p=t.pnl!=null?t.pnl:(pending&&t.upl_hint!=null?t.upl_hint:t.profit);
+    const val=p==null?(pending?'gaida £':'—'):money(p,t.pnl_currency||ccy);
+    const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
+    const badge=closePnlSrcBadge(t.pnl_source,pending);
     return `<div class="psx-whale-row">
       <span class="tag">TRADE</span>
       <strong>${esc(epic)}</strong>
       <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
-      <span>${esc(px==null?'—':num(px,2))}</span>
       <strong class="${pnlClass(p)}">${esc(val)}</strong>
+      <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(pending?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
       <span class="wh-ago">${esc(when)}</span>
     </div>`;
   }).join(''));
@@ -1505,16 +1546,21 @@ function renderCard(c){
     const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
     const showPnl=p!=null?p:(pending&&t.upl_hint!=null?t.upl_hint:null);
     const cls=pnlClass(showPnl);
-    // Operator: peļņa is peļņa — no [UPL] / [gaida £] badges when we have a number.
-    const src=(showPnl!=null)?'':
-      (pending?' [gaida £]':
-      (t.pnl_source&&t.pnl_source!=='broker'&&t.pnl_source!=='upl_estimate'
-        ?` [${t.pnl_source}]`:''));
+    // Honest badge: ≈UPL ≠ Capital.com final £ (Admin vs app mismatch).
+    const srcTag=(()=>{
+      const s=String(t.pnl_source||'').toLowerCase();
+      if(pending&&showPnl==null)return ' [gaida £]';
+      if(s==='upl_estimate')return ' [≈UPL]';
+      if(s==='broker')return ' [Capital]';
+      if(pending)return ' [≈UPL]';
+      if(s&&s!=='broker')return ` [${s}]`;
+      return '';
+    })();
     let right;
     if(showPnl!=null){right=money(showPnl,tCcy);}
     else if(pending){right='gaida Capital £';}
     else{right='—';}
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${esc(right)}</span></div>`;
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(srcTag)}</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
 
   const dealsHtml=inTrade

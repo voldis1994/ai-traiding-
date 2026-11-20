@@ -337,9 +337,10 @@ class RuntimeHub:
             return 'proxy'
         if s in ('pending_close_sync','pending_broker_pnl'):
             return 'pending'
-        # Last live UPL settled as peļņa when Capital history lags — count as cash.
+        # Last live UPL is provisional — never count as Capital.com cash.
+        # Admin must label these ESTIMATE until history refines to broker.
         if s in ('upl_estimate',):
-            return 'cash'
+            return 'estimate'
         # Explicit broker, or legacy blank source with a settled pnl figure.
         if s in ('broker','') or not s:
             return 'cash'
@@ -399,9 +400,9 @@ class RuntimeHub:
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='pending':
-                # Last live UPL as display hint — promote into peļņa when the
-                # journal already has a numeric pnl (UPL stamped then source
-                # clobbered) or when last_upl still holds the close figure.
+                # Last live UPL as display hint when journal has a number or
+                # last_upl still holds the close figure — show as ESTIMATE,
+                # never as Capital cash (that lied next to the Capital app).
                 snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
                 try:
                     hint=float(snap.get('upl')) if snap.get('upl') is not None else None
@@ -412,10 +413,9 @@ class RuntimeHub:
                 show=val if val is not None else hint
                 if show is not None:
                     # Operator: closed at 0.01 must show 0.01, not blank gaida.
-                    cash_n+=1
-                    by_ccy.setdefault(ccy,[]).append(float(show))
-                    if not acct or ccy==acct:
-                        signed.append(float(show))
+                    estimate_n+=1
+                    estimate_sum+=float(show)
+                    estimate_signed.append(float(show))
                     row={**row,'pnl':round(float(show),4),'pnl_source':'upl_estimate',
                          'pending_cash':False}
                     if hint is not None:
@@ -462,11 +462,15 @@ class RuntimeHub:
             realized=None
         else:
             realized=0.0
-        # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
-        if closed_n>0 and cash_n==0:
+        # Honest status: UPL-only closes are NOT Capital cash yet.
+        if closed_n>0 and cash_n==0 and estimate_n>0:
+            pnl_status='upl_estimate_pending'
+        elif closed_n>0 and cash_n==0:
             pnl_status='closed_without_broker_cash'
         elif pending_n>0 or blank_n>0:
             pnl_status='broker_cash_pending'
+        elif cash_n>0 and estimate_n>0:
+            pnl_status='broker_cash_partial'
         elif cash_n>0:
             pnl_status='broker_cash_ok'
         else:
@@ -1257,10 +1261,14 @@ class RuntimeHub:
         if len(open_upl_by_ccy)==1:
             ccy,val=next(iter(open_upl_by_ccy.items()))
             open_upl_primary={'currency':ccy,'open_upl':val}
-        if total_closed>0 and total_cash==0:
+        if total_closed>0 and total_cash==0 and total_estimate>0:
+            pnl_status='upl_estimate_pending'
+        elif total_closed>0 and total_cash==0:
             pnl_status='closed_without_broker_cash'
         elif total_pending>0:
             pnl_status='broker_cash_pending'
+        elif total_cash>0 and total_estimate>0:
+            pnl_status='broker_cash_partial'
         elif total_cash>0:
             pnl_status='broker_cash_ok'
         else:

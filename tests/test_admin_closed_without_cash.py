@@ -42,8 +42,8 @@ def test_trade_stats_broker_cash_ok():
         assert stats['pnl_status'] == 'broker_cash_ok'
 
 
-def test_upl_estimate_counts_as_realized_pnl():
-    """Operator: last UPL peļņa counts in Kopējais P&L (not stuck gaida £)."""
+def test_upl_estimate_counts_as_working_not_broker_cash():
+    """UPL shows in working P&L but is NOT Capital cash (Admin honesty)."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         store.upsert_trade({
@@ -53,11 +53,13 @@ def test_upl_estimate_counts_as_realized_pnl():
         store.close_trade('u1', 1998, -0.09, currency='GBP', source='upl_estimate')
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
-        assert stats['cash_trades'] == 1
-        assert stats['estimate_trades'] == 0
-        assert stats['realized_pnl'] == pytest.approx(-0.09)
-        assert stats['pnl_status'] == 'broker_cash_ok'
+        assert stats['cash_trades'] == 0
+        assert stats['estimate_trades'] == 1
+        assert stats['realized_pnl'] is None
+        assert stats['pnl_status'] == 'upl_estimate_pending'
         assert stats['working_pnl'] == pytest.approx(-0.09)
+        assert stats['working_pnl_source'] == 'upl_estimate'
+        assert stats['recent_trades'][0]['pnl_source'] == 'upl_estimate'
         assert stats['display_wins'] == 0
         assert stats['display_losses'] == 1
 
@@ -73,12 +75,15 @@ def test_working_pnl_and_wl_from_mixed_upl_peļņa():
             store.close_trade(f'e{i}', 2001, pnl, currency='GBP', source='upl_estimate')
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
-        assert stats['cash_trades'] == 4
+        assert stats['cash_trades'] == 0
+        assert stats['estimate_trades'] == 4
         assert stats['working_pnl'] == pytest.approx(-0.28)
-        assert stats['realized_pnl'] == pytest.approx(-0.28)
+        assert stats['working_pnl_source'] == 'upl_estimate'
+        assert stats['realized_pnl'] is None
         assert stats['display_wins'] == 2
         assert stats['display_losses'] == 2
-        assert stats['wins'] == 2
+        assert stats['wins'] == 0
         ledger = stats['pnl_ledger']
         assert len(ledger) == 4
+        assert all(row['source'] == 'upl_estimate' for row in ledger)
         assert sum(row['pnl'] for row in ledger) == pytest.approx(-0.28)

@@ -580,12 +580,20 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-mini.on{color:var(--gold);border-color:var(--gold)}
 .psx-whale{padding:0 8px 6px;flex:1;min-height:0;overflow:auto;max-height:none}
 .psx-whale-row{
-  display:grid;grid-template-columns:auto auto 1fr auto auto;gap:6px;align-items:center;
+  display:grid;grid-template-columns:auto auto auto 1fr auto auto;gap:6px;align-items:center;
   padding:6px 0;border-bottom:1px solid var(--desk-grid);font-size:11px}
 .psx-whale-row .tag{
   font-size:8px;font-weight:800;letter-spacing:.06em;padding:1px 4px;border-radius:2px;
   background:transparent;border:1px solid rgba(233,188,101,.4);color:var(--gold)}
 .psx-whale-row .buy{color:var(--g)}.psx-whale-row .sell{color:var(--r)}
+.psx-whale-row .wh-ago{color:var(--mut);font-size:10px;font-variant-numeric:tabular-nums}
+.psx-pnl-src{
+  font-size:8px;font-weight:800;letter-spacing:.04em;padding:1px 4px;border-radius:2px;
+  border:1px solid transparent;justify-self:end;white-space:nowrap}
+.psx-pnl-src.ok{color:#31d59a;border-color:rgba(49,213,154,.35)}
+.psx-pnl-src.est{color:var(--gold);border-color:rgba(233,188,101,.45)}
+.psx-pnl-src.wait{color:var(--mut);border-color:rgba(139,145,156,.35)}
+.psx-src.warn{color:var(--gold)}
 
 .psx-sigwatch{padding:4px 8px 10px}
 .psx-sig-row{

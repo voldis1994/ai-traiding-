@@ -40,7 +40,7 @@ function drawOhlcStructure(canvas,view,opts){
   const ctx=canvas.getContext('2d');
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,w,h);
-  ctx.fillStyle='rgba(8,12,14,.94)';
+  ctx.fillStyle='#060a14';
   ctx.fillRect(0,0,w,h);
 
   let candles=(view.candles||[]).filter(c=>{
@@ -123,7 +123,7 @@ function drawOhlcStructure(canvas,view,opts){
   const y=p=>yPadTop+(high-p)/(high-low)*(h-yPadTop-yPadBot);
 
   if(showLabels){
-    ctx.strokeStyle='rgba(232,240,236,.06)';
+    ctx.strokeStyle='rgba(26,37,52,.95)';
     ctx.lineWidth=1;
     for(let k=0;k<=4;k++){
       const yy=yPadTop+(h-yPadTop-yPadBot)*k/4;
@@ -185,20 +185,22 @@ function drawOhlcStructure(canvas,view,opts){
     }
     if(started)ctx.stroke();
   };
-  polyline(ema13Series,'rgba(140,160,180,.55)',1);
-  polyline(ema5Series,'rgba(100,180,220,.7)',1.1);
-  polyline(kamaSeries,'rgba(240,193,75,.95)',1.6);
+  polyline(ema13Series,'rgba(140,160,180,.45)',1);
+  polyline(ema5Series,'rgba(118,160,222,.75)',1.1);
+  polyline(kamaSeries,'rgba(233,188,101,.95)',1.45);
 
-  const bodyW=Math.max(showLabels?3.5:2.5,Math.min(showLabels?18:14,spacing*(showLabels?.82:.70)));
+  const bodyW=Math.max(showLabels?2.8:2.2,Math.min(showLabels?14:11,spacing*(showLabels?.72:.62)));
   candles.forEach((c,i)=>{
     const x=leftPad+(i+.5)*spacing;
     const rising=+c.close>=+c.open;
-    ctx.strokeStyle=rising?'#39ff88':'#ff5c7a';
-    ctx.fillStyle=ctx.strokeStyle;
-    ctx.lineWidth=Math.max(1.25,Math.min(2.5,bodyW*.4));
+    const col=rising?'#31d59a':'#ef6875';
+    ctx.strokeStyle=col;
+    ctx.fillStyle=col;
+    ctx.lineWidth=Math.max(1,Math.min(1.6,bodyW*.28));
     ctx.beginPath();ctx.moveTo(x,y(+c.high));ctx.lineTo(x,y(+c.low));ctx.stroke();
     const y1=y(+c.open),y2=y(+c.close);
-    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,Math.max(2,Math.abs(y1-y2)));
+    const bh=Math.max(1.5,Math.abs(y1-y2));
+    ctx.fillRect(x-bodyW/2,Math.min(y1,y2),bodyW,bh);
   });
 
   const mark=(list,color)=>{
@@ -234,14 +236,14 @@ function drawOhlcStructure(canvas,view,opts){
 
   // Prospective swing brackets only when flat — never stack on live poz. levels.
   if(!inTrade&&br&&br.ready){
-    hline(br.stop_level,'#ff5c7a',[5,4],'swing SL');
-    hline(br.profit_level,'#39ff88',[5,4],'swing TP');
+    hline(br.stop_level,'#ef6875',[4,3],'SL');
+    hline(br.profit_level,'#31d59a',[4,3],'TP');
   }
-  hline(mid,'#f0c14b',[],'mid');
+  hline(mid,'#e9bc65',[2,2],'MID');
   for(const p of openLv){
-    hline(p.entry,'#eef6f1',[],'entry');
-    hline(p.stop,'#ff5c7a',[5,3],'poz. SL');
-    hline(p.profit,'#39ff88',[5,3],'poz. TP');
+    hline(p.entry,'#e9bc65',[],'ENT');
+    hline(p.stop,'#ef6875',[4,3],'SL');
+    hline(p.profit,'#31d59a',[4,3],'TP');
   }
   if(showLabels&&!inTrade){
     if(zones.buy_entry&&(!pref||pref==='BUY')){
@@ -265,28 +267,31 @@ function drawOhlcStructure(canvas,view,opts){
   }
 
   const digits=Math.abs(high)<50?2:(Math.abs(high)<500?1:0);
-  ctx.fillStyle='#8a9a92';
-  ctx.font=(showLabels?'11px':'10px')+' Manrope,sans-serif';
+  ctx.fillStyle='#8c95a6';
+  ctx.font=(showLabels?'10px':'9px')+' "IBM Plex Mono",ui-monospace,monospace';
   ctx.textAlign='left';
   for(let k=0;k<=4;k++){
     const price=high-(high-low)*k/4;
     const yy=yPadTop+(h-yPadTop-yPadBot)*k/4;
-    ctx.fillText(price.toFixed(digits),w-rightPad+8,yy+4);
+    ctx.fillText(price.toFixed(digits),w-rightPad+6,yy+3);
   }
 
   if(showLabels&&labels.length){
+    // Right-side SL / ENT / TP tags (PerpSignal style)
     labels.sort((a,b)=>a.y-b.y);
     let lastY=-999;
-    ctx.font='600 11px Manrope,sans-serif';
+    ctx.font='700 9px "IBM Plex Mono",ui-monospace,monospace';
     for(const L of labels){
       let yy=L.y;
-      if(yy-lastY<14)yy=lastY+14;
+      if(yy-lastY<12)yy=lastY+12;
       lastY=yy;
       const text=`${L.label} ${L.price.toFixed(digits)}`;
-      const tw=ctx.measureText(text).width+10;
-      const tx=leftPad+10;
-      ctx.fillStyle='rgba(8,12,14,.82)';
-      ctx.fillRect(tx-4,yy-11,tw,16);
+      const tw=ctx.measureText(text).width+8;
+      const tx=Math.max(leftPad+chartW-tw-2,leftPad+chartW*0.55);
+      ctx.fillStyle='rgba(6,10,20,.88)';
+      ctx.fillRect(tx-3,yy-9,tw,13);
+      ctx.strokeStyle=L.color;ctx.lineWidth=1;
+      ctx.strokeRect(tx-3,yy-9,tw,13);
       ctx.fillStyle=L.color;
       ctx.textAlign='left';
       ctx.fillText(text,tx,yy+1);
@@ -317,10 +322,10 @@ function drawOhlcStructure(canvas,view,opts){
   if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');
   if(view.info_stack)parts.push(String(view.info_stack));
   if(parts.length){
-    ctx.fillStyle='rgba(180,200,190,.85)';
-    ctx.font='9px Manrope,sans-serif';
+    ctx.fillStyle='rgba(140,149,166,.9)';
+    ctx.font='8px "IBM Plex Mono",ui-monospace,monospace';
     ctx.textAlign='left';
-    ctx.fillText(parts.join(' · '),leftPad,h-10);
+    ctx.fillText(parts.join(' · '),leftPad,h-8);
   }
 }
 

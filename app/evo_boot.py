@@ -62,16 +62,24 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
 
     try:
         from . import strategy_gen
+        from . import sample_strategies
+        # Samples first (backups + store trades) → library → cards.
+        # No programming — market closes are the strategy material.
+        out['samples'] = sample_strategies.build_strategies_from_samples(
+            store, backup_root=None, use_store_trades=True)
         out['audit_seed'] = strategy_gen.seed_audit_cards(store)
         out['harvest'] = strategy_gen.harvest(store, epic=epic)
-        if (out['audit_seed'] or {}).get('added'):
+        if (out['audit_seed'] or {}).get('added') or (
+                out.get('samples') or {}).get('ok'):
             try:
                 from .learning_generation import bump
-                bump(store, 'strategy_gen_audit_seed', kind='architecture_changes')
+                bump(store, 'sample_strategies_evo_boot',
+                     kind='architecture_changes')
             except Exception:
                 pass
     except Exception as exc:
         out['audit_seed'] = {'ok': False, 'reason': type(exc).__name__}
+        out['samples'] = {'ok': False, 'reason': type(exc).__name__}
 
     store.set(STORE_FLAG, {
         'done': True,

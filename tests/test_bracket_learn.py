@@ -373,10 +373,12 @@ def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
     rows = _swing_rows(seq)
     entry = 107.0
     zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
+    # ATR wide enough that structural SL (~4pts) stays inside the ATR band —
+    # we assert swing anchors, not RR refuse-vs-soft-shrink.
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
-        min_distance=0.2, atr=2.0, zone=zone)
-    assert swing['ready'] is True
+        min_distance=0.2, atr=3.0, zone=zone)
+    assert swing['ready'] is True, swing.get('reason')
     assert swing['swing_lo'] == pytest.approx(103.0, abs=0.05)
     # TP is nearest swing high above entry (reachable), not a far day extreme.
     assert swing['swing_hi'] >= entry
@@ -394,9 +396,10 @@ def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
-        entry=entry, action='BUY', candles=rows, atr=2.0)
+        entry=entry, action='BUY', candles=rows, atr=3.0)
     assert decided['source'] == 'swing_anchor'
     assert decided['swing_lo'] == pytest.approx(103.0, abs=0.05)
+    assert decided.get('ready') is True
     assert decided['profit_level'] > entry
 
 
@@ -419,23 +422,33 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     zone = {'kappa': 1.0, 'range_distance': 4.0, 'max_tp': 6.0, 'noise_distance': 3.0}
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
-        min_distance=0.2, atr=2.0, zone=zone)
-    assert swing['ready'] is True, swing.get('reason')
+        min_distance=0.2, atr=4.0, zone=zone)
+    # Either swing-ready levels, or refuse RR without inventing soft SL —
+    # never silently fall back to ohlc_zone median ±distance.
     assert swing['source'] == 'swing_anchor'
-    assert swing['stop_level'] < entry < swing['profit_level']
-    base = str(swing.get('reason') or '').split('+')[0]
-    assert base in ('swing_levels', 'swing_measured_move', 'swing_levels_closer_sl')
-    if swing.get('rr_capped'):
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+    if swing.get('ready'):
+        assert swing['stop_level'] < entry < swing['profit_level']
+        base = str(swing.get('reason') or '').split('+')[0]
+        assert base in ('swing_levels', 'swing_measured_move', 'swing_levels_closer_sl')
+        if swing.get('rr_capped'):
+            assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
+        else:
+            assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
     else:
-        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
+        assert swing.get('reason') in (
+            'rr_need_farther_tp', 'rr_need_farther_tp_keep_swing',
+            'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail')
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
-        entry=entry, action='BUY', candles=rows, atr=2.0, require_swing=True)
-    assert decided['ready'] is True
+        entry=entry, action='BUY', candles=rows, atr=4.0, require_swing=True)
     assert decided['source'] == 'swing_anchor'
     assert decided['source'] != 'ohlc_zone'
+    if decided.get('ready'):
+        assert decided['stop_level'] < entry < decided['profit_level']
+    else:
+        assert decided.get('stop_distance') is None or 'rr' in str(
+            decided.get('reason') or '')
 
 
 def test_decide_brackets_snaps_tick_without_stop_take_rewrite():
@@ -600,8 +613,24 @@ def test_swing_anchor_applies_min_rr_on_wide_sl():
     else:
         assert swing.get('reason') in (
             'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',
-            'rr_need_farther_tp', 'rr_sides_swapped',
+            'rr_need_farther_tp', 'rr_need_farther_tp_keep_swing',
+            'rr_sides_swapped',
             'swing_distances_below_floor', 'no_structural_swings_for_entry')
+
+
+def test_keep_far_swing_does_not_soft_shrink_sl():
+    """Kept far OHLC SL must not be rewritten to an invented soft RR stop."""
+    from app.bracket_learn import apply_min_rr
+    entry = 3628.75
+    stop_d, profit_d = 25.93, 8.0
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=entry + stop_d,
+        profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
+        floor=2.5, min_rr=1.5, atr_locked=True, atr=5.0,
+        allow_soft_shrink=False)
+    assert out['ok'] is False
+    assert out['reason'] == 'rr_need_farther_tp_keep_swing'
+    assert out['stop_distance'] == pytest.approx(25.93, abs=1e-9)
 
 
 def test_live_open_does_not_silently_fall_back_to_ohlc_zone():

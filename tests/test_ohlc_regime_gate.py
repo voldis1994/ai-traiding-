@@ -36,6 +36,23 @@ def test_doji_blocks():
     assert out['reason'] == 'no_trade_doji'
 
 
+def test_wick_structure_with_atr_body_is_not_doji():
+    """Swing-structure bar: body ~0.3×ATR with wicks must not count as doji."""
+    # ATR≈1.0 from ranges; body 0.35 > 0.18×ATR → not doji despite body/range≈0.17.
+    candles = []
+    px = 100.0
+    for i in range(16):
+        o = px
+        c = px + 0.35
+        candles.append(_bar(o, max(o, c) + 0.85, min(o, c) - 0.85, c))
+        px = c
+    assert rg._is_doji(candles[-1], 0.18, atr=1.0) is False
+    out = rg.evaluate(candles=candles, mid=px, spread=0.05, atr=1.0)
+    assert out['allowed'] is True
+    assert out['reason'] == 'pass'
+    assert (out.get('flags') or {}).get('doji_share', 1) < 0.55
+
+
 def test_impulse_blocks():
     candles = [_bar(100 + i * 0.1, 100.3 + i * 0.1, 99.9 + i * 0.1, 100.1 + i * 0.1)
                for i in range(15)]

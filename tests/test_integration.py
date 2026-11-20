@@ -22,19 +22,30 @@ def async_run(coro):return asyncio.run(coro)
 
 
 def seed_swing_candles(store, epic='SIM', *, n=90, start_px=100.0):
-    """OHLC swings so require_swing LIVE OPEN / protect can place SL/TP."""
+    """OHLC swings so require_swing LIVE OPEN / protect can place SL/TP.
+
+    Oscillates around start_px so protect at entry=start_px still finds
+    swing lows/highs on the correct side. Meaningful bodies avoid ATR-aware
+    doji false-positives. OPEN-path tests stub the regime gate when needed
+    (swing OHLC is choppy by design).
+    """
     t0 = datetime(2026, 1, 5, 8, 0, tzinfo=timezone.utc)
     px = start_px
     for i in range(n):
         wave = 1.8 * math.sin(i / 6.0) + 0.9 * math.sin(i / 11.0)
+        target = start_px + wave
         o = px
-        c = px + 0.01 + 0.05 * math.sin(i / 4.0)
-        h = max(o, c) + 0.35 + abs(wave) * 0.15
-        l = min(o, c) - 0.35 - abs(wave) * 0.15
+        delta = target - o
+        # Body toward anchor — keep |body| ≥ 0.35 so doji gate stays clear.
+        sign = 1.0 if delta >= 0 else -1.0
+        body = sign * max(0.35, min(0.55, abs(delta) if abs(delta) >= 0.35 else 0.4))
+        c = o + body
+        h = max(o, c) + 0.2 + abs(wave) * 0.05
+        l = min(o, c) - 0.2 - abs(wave) * 0.05
         if i % 8 == 3:
-            l = min(l, start_px - 2.5)
+            l = min(l, min(o, c) - 1.8)
         if i % 8 == 7:
-            h = max(h, start_px + 3.0)
+            h = max(h, max(o, c) + 2.0)
         at = (t0 + timedelta(minutes=i)).isoformat().replace('+00:00', 'Z')
         store.candle(epic, {
             'at': at, 'open': o, 'high': h, 'low': l, 'close': c, 'spread': 0.02,
@@ -167,7 +178,9 @@ class BrokerSimulation:
         return {'dealReference':'exit'}
 
 
-def test_full_mock_broker_protect_close_reenter_cycle():
+def test_full_mock_broker_protect_close_reenter_cycle(monkeypatch):
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'s.db');brain=AdaptiveBrain(store,data_dir=d)
@@ -199,7 +212,9 @@ def test_full_mock_broker_protect_close_reenter_cycle():
     async_run(scenario())
 
 
-def test_uncertain_order_does_not_retry():
+def test_uncertain_order_does_not_retry(monkeypatch):
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d)/'s.db');b=AdaptiveBrain(store,data_dir=d);e=SingleTradeEngine(store,b)
@@ -214,11 +229,16 @@ def test_uncertain_order_does_not_retry():
             assert put_engine_in_entry_zone(e,store,'SIM','BUY',broker=broker) is not None
             await e.submit('BUY')
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
-            # Uncertain OPEN is SUPERSEDED — robot stays live (no auto-pause).
+            # Soft failure keeps OPEN UNCERTAIN (not SUPERSEDED) so the next
+            # poll cannot double-POST; robot stays live (no auto-pause).
             assert e.execution_enabled and e.armed
-            assert not store.unresolved()
-            assert any('not paused' in (ev['message'] or '').lower()
-                       or 'uncertain' in (ev['message'] or '').lower()
+            unresolved = store.unresolved()
+            assert len(unresolved) == 1 and unresolved[0]['kind'] == 'OPEN'
+            assert unresolved[0]['status'] == 'UNCERTAIN'
+            # Second submit must not fire another broker OPEN while unresolved.
+            await e.submit('BUY')
+            assert len([r for r in broker.requests if r[0]=='OPEN'])==1
+            assert any('uncertain' in (ev['message'] or '').lower()
                        for ev in store.recent())
     async_run(scenario())
 
@@ -308,7 +328,7 @@ def test_live_login_cookie_and_automatic_mobile_adoption_without_extra_toggle(mo
         assert client.get('/api/status').status_code==401
 
 def test_ai_signal_opens_second_trade_automatically_after_broker_confirmed_close(monkeypatch):
-    install_synthetic_context(monkeypatch)
+    install_synthetic_context(monkeypatch)  # includes pass_ohlc_regime
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/'db.sqlite3');brain=AdaptiveBrain(s,data_dir=d)

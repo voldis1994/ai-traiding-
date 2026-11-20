@@ -21,8 +21,8 @@ DEFAULTS = {
     'chop_progress_max': 0.28,   # |net| / sum(range) → chop
     'low_atr_frac': 0.00035,     # ATR/mid below this → too quiet (GOLD ~1.3/3700)
     'low_range_vs_spread': 1.2,  # median range < spread * this
-    'doji_body_frac': 0.18,      # |c-o|/(h-l)
-    'doji_share_min': 0.45,      # fraction of bars that are dojis
+    'doji_body_frac': 0.18,      # |c-o|/(h-l) AND |c-o|/ATR when ATR known
+    'doji_share_min': 0.55,      # fraction of bars that are dojis
     'impulse_atr_mult': 2.2,     # last range > mult * ATR14
     'chaos_swing_min': 4,        # need this many local swings to judge
 }
@@ -87,12 +87,25 @@ def _body_dir(row) -> int:
     return 1 if c > o else -1
 
 
-def _is_doji(row, body_frac: float) -> bool:
+def _is_doji(row, body_frac: float, atr: float | None = None) -> bool:
+    """Indecision body — not every wick-heavy structural bar.
+
+    Classic body/range alone false-positives on swing-structure candles
+    (small body, long wicks) that GOLD M1 uses for SL pivots. When ATR is
+    known, also require the body to be tiny vs ATR so a meaningful move
+    with wicks is not treated as a doji.
+    """
     o = _finite(row.get('open')); c = _finite(row.get('close'))
     h = _finite(row.get('high')); l = _finite(row.get('low'))
     if None in (o, c, h, l) or h <= l:
         return False
-    return abs(c - o) / max(h - l, 1e-12) <= float(body_frac)
+    body = abs(c - o)
+    rng = max(h - l, 1e-12)
+    if body / rng > float(body_frac):
+        return False
+    if atr is not None and atr > 0:
+        return body <= float(atr) * float(body_frac)
+    return True
 
 
 def _local_swings(candles, n: int = 3):
@@ -167,7 +180,9 @@ def evaluate(*, candles, mid=None, spread=None, atr=None, structure=None,
                     flags={'median_range': med_range, 'spread': spread_v})
 
     # --- 3. Many dojis ---
-    dojis = sum(1 for r in window if _is_doji(r, float(p['doji_body_frac'])))
+    dojis = sum(
+        1 for r in window
+        if _is_doji(r, float(p['doji_body_frac']), atr=atr_v))
     doji_share = dojis / max(1, len(window))
     meta['flags']['doji_share'] = doji_share
     if doji_share >= float(p['doji_share_min']):

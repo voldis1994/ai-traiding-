@@ -68,7 +68,9 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
             score,'BUY',returns_bps={'5':1,'15':2},opposite_streak=5)=='HOLD'
 
 
-def test_second_manual_deal_changes_lot_and_recovers_after_closed():
+def test_second_manual_deal_changes_lot_and_recovers_after_closed(monkeypatch):
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     async def scenario():
         with sandbox() as d:
             store=Store(Path(d)/'db.sqlite3')
@@ -149,6 +151,8 @@ def test_new_manual_market_adopted_without_switch_button():
 
 def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     from app import engine as module
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     clock=[datetime(2026,10,14,16,30,tzinfo=timezone.utc)]
     def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
@@ -184,8 +188,11 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
             assert e.last_decision_bar==bar
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
             assert e.brain.core.steps==2
-            count=store.db.execute("SELECT COUNT(*) FROM events WHERE kind='entry'").fetchone()[0]
-            assert count==1
+            # kind=entry also logs "Trigger fired" — count OPEN approvals only.
+            approved=store.db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='entry' "
+                "AND message LIKE 'Neural entry approved%'").fetchone()[0]
+            assert approved==1
             assert e.snapshot()['neural_decision_bar']==bar
     asyncio.run(scenario())
 

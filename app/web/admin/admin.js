@@ -214,7 +214,6 @@ function deskScoreAction(c){
 
 let deskTfMinutes=15;
 let deskWhaleFilter="BOTH";
-let deskUiMode="SIGNAL";
 const deskDemoMode=new URLSearchParams(location.search).get("deskDemo")==="1";
 
 /** Deterministic visual fixture for /admin?deskDemo=1 — never used for live execution. */
@@ -337,10 +336,7 @@ function renderDeskLevels(view,client){
   if(stop!=null&&Number(stop)>0)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
   if(entry!=null&&Number(entry)>0)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
   if(profit!=null&&Number(profit)>0){
-    bits.push(`<span class="psx-lvl tp">TP1 ${esc(num(profit,2))}</span>`);
-    // Visual scenario only — not a second broker take-profit order.
-    const tp2=Number(profit)+(Number(profit)-Number(entry||mid||profit))*0.5;
-    if(Number.isFinite(tp2))bits.push(`<span class="psx-lvl tp" title="Visual scenario only">TP2† ${esc(num(tp2,2))}</span>`);
+    bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
   }
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
@@ -435,24 +431,9 @@ function renderDeskCrowd(client){
 }
 
 function renderDeskLean(client,lp,sp){
+  // Duplicate lean panel removed — crowd bar already shows AI score lean.
   const el=$('deskLean');
-  if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  let longPct=lp,shortPct=sp;
-  if(longPct==null){
-    const {buy,hold,sell}=deskScoreAction(client);
-    const longP=Math.max(0,buy+hold*0.35);
-    const shortP=Math.max(0,sell+hold*0.35);
-    const sum=Math.max(0.0001,longP+shortP);
-    longPct=Math.round((longP/sum)*1000)/10;
-    shortPct=Math.round((100-longPct)*10)/10;
-  }
-  const lean=Math.round(Math.abs(longPct-shortPct));
-  const bull=longPct>=shortPct;
-  stableHtml(el,`
-    <div class="pct ${bull?'bull':'bear'}">${lean}%</div>
-    <div class="sub">${bull?'BULLISH':'BEARISH'} LEAN · AI score spread</div>
-    <div class="track"><div class="fill" style="width:${Math.min(100,lean+20)}%;background:${bull?'var(--g)':'var(--r)'}"></div></div>`);
+  if(el)stableHtml(el,'');
 }
 
 function renderDeskSignal(client,markets){
@@ -565,8 +546,7 @@ function renderDeskEngine(client){
         <div class="psx-short" style="color:${ring}">${esc(side)}</div>
         <div class="psx-regime ${regimeCls}">${esc(regime)}</div>
         <div class="psx-engine-meta">
-          strength ${pctN}/100 · data coverage ${Math.min(99,70+Math.round((a.tick_count||0)%30))}%<br>
-          Ring = input alignment — not win-rate or forecast.<br>
+          Score = neural alignment (not win-rate)<br>
           MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong>
           · Day <strong>${esc(dayPhase)}</strong><br>
           Armed <strong>${esc(client.armed?'YES':'NO')}</strong>
@@ -579,8 +559,7 @@ function renderDeskEngine(client){
       <span class="sell" style="color:var(--r)">BEAR</span>
       <div class="psx-engine-track"><i style="left:${Math.max(4,Math.min(96,scorePos))}%"></i></div>
       <span class="buy" style="color:var(--g)">BULL</span>
-    </div>
-    <div class="psx-lean" style="text-align:center;margin-top:2px">ENGINE SCORE</div>`);
+    </div>`);
 }
 
 function renderDeskCheck(client,view){
@@ -679,48 +658,20 @@ function renderDeskBook(client,view){
   const mid=Number(a.market_mid!=null?a.market_mid:(view&&view.mid));
   const bid=Number(a.market_bid);
   const ask=Number(a.market_ask!=null?a.market_ask:a.market_offer);
-  const tick=Number(a.tick)||(Number.isFinite(mid)?mid*0.00015:1);
   if(!Number.isFinite(mid)||mid<=0){
-    stableHtml(el,'<div class="psx-empty">No quote ladder</div>');
+    stableHtml(el,'<div class="psx-empty">No live quote</div>');
     return;
   }
-  const spr=(Number.isFinite(bid)&&Number.isFinite(ask))?Math.max(0,ask-bid):tick;
-  const levels=9;
-  const asks=[],bids=[];
-  let askTot=0,bidTot=0;
-  for(let i=levels;i>=1;i--){
-    const px=mid+spr/2+i*tick;
-    const sz=Math.max(0.01,+(0.28+((levels-i+1)*0.09)+(Math.abs(Math.sin(px*3))*0.18)).toFixed(2));
-    askTot+=sz;asks.push({px,sz,tot:askTot});
-  }
-  for(let i=1;i<=levels;i++){
-    const px=mid-spr/2-i*tick;
-    const sz=Math.max(0.01,+(0.30+(i*0.1)+(Math.abs(Math.cos(px*3))*0.16)).toFixed(2));
-    bidTot+=sz;bids.push({px,sz,tot:bidTot});
-  }
-  const maxSz=Math.max(...asks.map(x=>x.sz),...bids.map(x=>x.sz),0.01);
-  const tot=askTot+bidTot||1;
-  const bidPct=Math.round((bidTot/tot)*1000)/10;
-  const askPct=Math.round((100-bidPct)*10)/10;
-  let run=0;
-  const askHtml=asks.map(r=>{
-    run+=r.sz;
-    return `<div class="psx-book-row ask"><i style="width:${Math.round((r.sz/maxSz)*100)}%"></i>
-      <span>${esc(num(r.px,2))}</span><span>${esc(num(r.sz,2))}</span>
-      <span>${esc(num(r.px*r.sz,0))}</span><span>${esc(num(run,2))}</span></div>`;
-  }).join('');
-  run=0;
-  const bidHtml=bids.map(r=>{
-    run+=r.sz;
-    return `<div class="psx-book-row bid"><i style="width:${Math.round((r.sz/maxSz)*100)}%"></i>
-      <span>${esc(num(r.px,2))}</span><span>${esc(num(r.sz,2))}</span>
-      <span>${esc(num(r.px*r.sz,0))}</span><span>${esc(num(run,2))}</span></div>`;
-  }).join('');
-  stableHtml(el,askHtml+
-    `<div class="psx-spread">SPREAD ${esc(num(spr,4))} · ESTIMATED LADDER</div>`+
-    bidHtml+
-    `<div class="psx-depth"><span class="b" style="width:${bidPct}%"></span><span class="a" style="width:${askPct}%"></span></div>
-     <div class="psx-depth-lbl"><span>${bidPct}% BID</span><span>${askPct}% ASK</span></div>`);
+  const hasBa=Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0;
+  const spr=hasBa?Math.max(0,ask-bid):null;
+  // Capital CFD has no exchange depth — show real bid/ask only (no fake SIZE ladder).
+  stableHtml(el,`
+    <div class="psx-quote-box">
+      <div class="psx-quote-row ask"><span>ASK</span><strong>${hasBa?esc(num(ask,2)):'—'}</strong></div>
+      <div class="psx-spread">MID ${esc(num(mid,2))}${spr==null?'':(' · SPREAD '+esc(num(spr,4)))}</div>
+      <div class="psx-quote-row bid"><span>BID</span><strong>${hasBa?esc(num(bid,2)):'—'}</strong></div>
+    </div>
+    <div class="psx-empty">Depth/size N/A on Capital CFD — not a live order book</div>`);
 }
 
 function renderDeskWatch(markets,focusClient){
@@ -758,21 +709,9 @@ function renderDeskWatch(markets,focusClient){
 }
 
 function renderDeskFear(client){
+  // Panel removed from UI (proxy F&G was decorative). Keep id sink stable.
   const el=$('deskFear');
-  if(!el)return;
-  if(!client){stableHtml(el,'');return}
-  const {buy,hold,sell,act}=deskScoreAction(client);
-  const fear=Math.round(Math.max(0,Math.min(100,
-    hold*100*0.85+(act==='HOLD'?12:0)-(Math.abs(buy-sell)*42))));
-  let label='Neutral';
-  if(fear<=20)label='Extreme Fear';
-  else if(fear<=40)label='Fear';
-  else if(fear<=60)label='Neutral';
-  else if(fear<=80)label='Greed';
-  else label='Extreme Greed';
-  stableHtml(el,`
-    <div class="psx-fear-val"><b>${fear}</b><div>${esc(label)}<div class="psx-lean">Neural score proxy — not public Fear&amp;Greed</div></div></div>
-    <div class="psx-fear-meter"><i style="left:${fear}%"></i></div>`);
+  if(el)stableHtml(el,'');
 }
 
 function _deskCloses(view){
@@ -1062,16 +1001,6 @@ async function renderDesk(data){
     // Second pass after flex layout settles (canvas often 0×0 on first paint).
     requestAnimationFrame(()=>{lastDeskChartKey='';drawDeskChart(view);});
   });
-  if(deskDemoMode){
-    const fund=$('deskFunding');
-    if(fund){
-      stableHtml(fund,`
-        <div class="row"><span>BTC</span><span class="dn">−0.0124%</span></div>
-        <div class="row"><span>ETH</span><span class="up">+0.0041%</span></div>
-        <div class="row"><span>SOL</span><span class="dn">−0.0088%</span></div>
-        <div class="psx-lean">DEMO fixture rates — not Capital.com</div>`);
-    }
-  }
 }
 
 function positionMid(p,activity){
@@ -1972,25 +1901,14 @@ document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(btn=>{
     else if(lastOverview)renderDesk(lastOverview).catch(()=>{});
   });
 });
-document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(b=>b.classList.remove('on'));
-    btn.classList.add('on');
-    deskUiMode=btn.dataset.deskMode||'SIGNAL';
-  });
-});
 const deskUiResetBtn=$('deskUiResetBtn');
 if(deskUiResetBtn){
   deskUiResetBtn.addEventListener('click',()=>{
     // UI-only reset — does not wipe neural learning history
     deskWhaleFilter='BOTH';
-    deskUiMode='SIGNAL';
     deskTfMinutes=15;
     document.querySelectorAll('#deskWhaleFilters .psx-mini').forEach(b=>{
       b.classList.toggle('on',b.dataset.whale==='BOTH');
-    });
-    document.querySelectorAll('.psx-mode[data-desk-mode]').forEach(b=>{
-      b.classList.toggle('on',b.dataset.deskMode==='SIGNAL');
     });
     document.querySelectorAll('#deskTfBar .psx-tf-btn').forEach(b=>{
       b.classList.toggle('on',b.dataset.tf==='15');

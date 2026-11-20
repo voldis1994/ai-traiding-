@@ -84,11 +84,37 @@ function esc(s){
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
 function sourceLabel(src){
-  if(src==='broker'||src==='upl_estimate')return 'peļņa';
-  if(src==='open_upl')return 'live UPL';
-  if(src==='working')return 'working';
-  if(src==='none'||src==='empty')return 'nav skaitļu';
+  const s=String(src||'').toLowerCase();
+  if(s==='broker')return 'Capital £';
+  if(s==='upl_estimate')return '≈UPL (nav Capital £)';
+  if(s==='open_upl')return 'live UPL';
+  if(s==='working')return 'working';
+  if(s==='none'||s==='empty')return 'nav skaitļu';
+  if(s==='pending_broker_pnl'||s==='pending_close_sync')return 'gaida Capital £';
   return src||'—';
+}
+function closePnlSrcBadge(src,pending){
+  const s=String(src||'').toLowerCase();
+  if(pending||s==='pending_broker_pnl'||s==='pending_close_sync'){
+    return {cls:'psx-pnl-src wait',text:'GAIDA'};
+  }
+  if(s==='upl_estimate')return {cls:'psx-pnl-src est',text:'≈UPL'};
+  if(s==='broker'||s===''||!s)return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  if(s==='ticks_only'||s==='price_size'||s==='position_disappeared'){
+    return {cls:'psx-pnl-src wait',text:'PROXY'};
+  }
+  return {cls:'psx-pnl-src wait',text:String(src).slice(0,8).toUpperCase()};
+}
+function closeTimeLabel(t){
+  const raw=(t&&(t.closed||t.closed_at||t.updated_at||t.at))||'';
+  const s=String(raw);
+  if(!s)return '—';
+  // ISO …T14:10:00… → 14:10
+  const m=s.match(/T(\d{2}:\d{2})/);
+  if(m)return m[1];
+  if(s.length>=19)return s.slice(11,16);
+  if(s.length>=8)return s.slice(11,19)||s;
+  return s;
 }
 
 function hasRealWorkingPnl(r){
@@ -99,63 +125,59 @@ function hasRealWorkingPnl(r){
   return true;
 }
 
-/** Prefer working/estimate P&L + W/L — never show a lying 0 when estimates exist (from main #89). */
+/** Capital £ + live open UPL only — never invent Kopējais from ≈UPL closes. */
 function scoreboard(r){
   r=r||{};
   const ccy=r.pnl_currency||'';
   const ledger=Array.isArray(r.pnl_ledger)?r.pnl_ledger:[];
   const recent=Array.isArray(r.recent_trades)?r.recent_trades:[];
   let pnl=null,src='none',wins=0,losses=0;
+  const wsrc=String(r.working_pnl_source||'').toLowerCase();
+  const estN=Number(r.estimate_trades)||0;
 
-  if(hasRealWorkingPnl(r)){
-    pnl=Number(r.working_pnl);src=r.working_pnl_source||'working';
+  if(hasRealWorkingPnl(r) && wsrc==='broker'){
+    pnl=Number(r.working_pnl);src='broker';
   }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
     pnl=Number(r.realized_pnl);src='broker';
-  }else if(r.estimate_pnl!=null && Number.isFinite(Number(r.estimate_pnl))){
-    pnl=Number(r.estimate_pnl);src='upl_estimate';
+  }else if(wsrc==='upl_estimate' || estN>0){
+    // Waiting for Capital history — do not paint provisional £ as robot result.
+    src='upl_estimate';
   }else if(r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
     pnl=Number(r.open_upl);src='open_upl';
   }
 
-  if(r.display_wins!=null || r.display_losses!=null){
-    wins=Number(r.display_wins)||0;losses=Number(r.display_losses)||0;
-    if(r.wl_source)src=src==='none'?r.wl_source:src;
-  }else if(r.estimate_wins!=null || r.estimate_losses!=null){
-    wins=Number(r.estimate_wins)||0;losses=Number(r.estimate_losses)||0;
-    if(wins+losses>0 && src==='none')src='upl_estimate';
-  }else if((r.cash_trades||0)>0){
-    wins=Number(r.wins)||0;losses=Number(r.losses)||0;
+  if(src==='broker'){
+    if(r.display_wins!=null || r.display_losses!=null){
+      wins=Number(r.display_wins)||0;losses=Number(r.display_losses)||0;
+    }else{
+      wins=Number(r.wins)||0;losses=Number(r.losses)||0;
+    }
   }
 
-  if((pnl==null || wins+losses===0) && ledger.length){
-    let sum=0,w=0,l=0;
+  if(pnl==null && src!=='upl_estimate' && ledger.length){
+    let sum=0,w=0,l=0,nBroker=0;
     for(const row of ledger){
       const v=Number(row.pnl);
       if(!Number.isFinite(v))continue;
-      sum+=v;if(v>0)w++;else if(v<0)l++;
+      if(String(row.source||'').toLowerCase()!=='broker')continue;
+      sum+=v;nBroker++;if(v>0)w++;else if(v<0)l++;
     }
-    if(pnl==null && ledger.length){
-      pnl=sum;
-      src=ledger.some(x=>x.source==='broker')&&(r.cash_trades||0)>0?'broker':'upl_estimate';
-    }
-    if(wins+losses===0){wins=w;losses=l}
+    if(nBroker){pnl=sum;src='broker';if(wins+losses===0){wins=w;losses=l}}
   }
 
-  if((pnl==null || wins+losses===0) && recent.length){
+  if(pnl==null && src!=='upl_estimate' && recent.length){
     let sum=0,n=0,w=0,l=0;
     for(const t of recent){
       const v=Number(t.pnl);
       if(!Number.isFinite(v))continue;
-      const s=String(t.pnl_source||'').toLowerCase();
-      if(s==='ticks_only'||s==='price_size'||s==='position_disappeared')continue;
+      if(String(t.pnl_source||'').toLowerCase()!=='broker')continue;
       sum+=v;n++;if(v>0)w++;else if(v<0)l++;
     }
-    if(pnl==null && n){pnl=sum;src='upl_estimate'}
-    if(wins+losses===0 && n){wins=w;losses=l;if(src==='none')src='upl_estimate'}
+    if(n){pnl=sum;src='broker';if(wins+losses===0){wins=w;losses=l}}
   }
 
   return {pnl,src,wins,losses,ccy,closed:Number(r.closed_trades)||0,
-    cash:Number(r.cash_trades)||0,estimate:Number(r.estimate_trades)||0};
+    cash:Number(r.cash_trades)||0,estimate:estN};
 }
 
 function layoutCols(n){
@@ -258,10 +280,10 @@ function buildDeskDemoFixture(){
     results:{
       pnl_currency:'USD',
       recent_trades:[
-        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed_at:'2024-11-20T12:01:00Z',pnl:-18},
-        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed_at:'2024-11-20T11:55:00Z',pnl:62},
-        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed_at:'2024-11-20T11:40:00Z',pnl:-11},
-        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed_at:'2024-11-20T11:22:00Z',pnl:24},
+        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed:'2024-11-20T12:01:00Z',pnl:-18,pnl_source:'broker'},
+        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed:'2024-11-20T11:55:00Z',pnl:62,pnl_source:'broker'},
+        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed:'2024-11-20T11:40:00Z',pnl:-11,pnl_source:'upl_estimate'},
+        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed:'2024-11-20T11:22:00Z',pnl:24,pnl_source:'broker'},
       ],
     },
   };
@@ -396,9 +418,10 @@ function renderDeskIndicators(client,view){
   const mtf=a.mtf_momentum||{};
   const ov=(view&&view.overlays)||{};
   const mtfUi=(view&&view.mtf)||{};
-  const atr=mtf.stop_hint_atr14??((mtf.tf||{}).m1||{}).atr14??mtfUi.atr14??ov.atr14;
-  const adx=mtfUi.adx??ov.adx;
-  const kama=mtfUi.kama??ov.kama_level??((mtf.tf||{}).m5||{}).kama;
+  // Same ATR the robot uses for brackets (M1 atr14) — not a second stop_hint.
+  const atr=mtfUi.atr14??((mtf.tf||{}).m1||{}).atr14??mtf.stop_hint_atr14??ov.atr14;
+  const adx=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
+  const kama=mtfUi.kama??((mtf.tf||{}).m5||{}).kama??ov.kama_level??((mtf.tf||{}).m1||{}).kama;
   stableHtml(el,[
     deskKv(client.id,'ATR14',atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
@@ -448,30 +471,36 @@ function renderDeskSignal(client,markets){
     const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
     const epic=((client.activity||{}).market)||(((client.activity||{}).mandate)||{}).epic||'FOCUS';
     stableHtml(el,`<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${agree}% agree →</span>
+      <span class="agree">neural ${agree}% →</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`);
     return;
   }
   if(!rows.length){stableHtml(el,'<div class="psx-empty">No signals</div>');return}
   const focusAct=client?deskScoreAction(client):null;
-  stableHtml(el,rows.map((m,i)=>{
+  const focusEpic=((client&&client.activity)||{}).market
+    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
+  stableHtml(el,rows.map((m)=>{
     const epic=m.epic||'—';
-    let act='HOLD',agree=50;
-    if(i===0&&focusAct){
+    const isFocus=focusAct&&focusEpic&&String(epic).toUpperCase()===String(focusEpic).toUpperCase();
+    let act='HOLD',label='';
+    if(isFocus){
       act=focusAct.act;
       const s=act==='SELL'?focusAct.sell:(act==='BUY'?focusAct.buy:focusAct.hold);
-      agree=Math.round(Math.max(0,Math.min(1,s))*100);
+      label=`neural ${Math.round(Math.max(0,Math.min(1,s))*100)}% →`;
     }else{
+      // Tape Δ only — not neural agreement (never invent "agree %" from candles).
       const ch=deskCandleChange(m.candles);
       if(ch!=null){
         act=ch>0.05?'BUY':(ch<-0.05?'SELL':'HOLD');
-        agree=Math.min(99,Math.round(50+Math.abs(ch)*8));
+        label=`tape ${ch>=0?'+':''}${num(ch,2)}% →`;
+      }else{
+        label='tape — →';
       }
     }
     const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
     const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
     return `<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${agree}% agree →</span>
+      <span class="agree">${esc(label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`;
   }).join(''));
 }
@@ -494,22 +523,41 @@ function renderDeskClosed(client){
     stableHtml(el,'<div class="psx-empty">No client closes · not exchange whales</div>');
     return;
   }
-  const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))||'';
+  const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))
+    ||results.pnl_currency||'';
+  const srcEl=$('deskClosedSrc');
+  const anyEst=rows.some(t=>{
+    const s=String(t.pnl_source||'').toLowerCase();
+    return s==='upl_estimate'||t.pending_cash;
+  });
+  const anyBroker=rows.some(t=>String(t.pnl_source||'').toLowerCase()==='broker');
+  if(srcEl){
+    if(anyEst&&!anyBroker)srcEl.textContent='≈UPL';
+    else if(anyEst)srcEl.textContent='MIXED';
+    else srcEl.textContent='CAPITAL';
+    srcEl.classList.toggle('warn',!!anyEst);
+  }
   stableHtml(el,rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
-    const p=t.pnl!=null?t.pnl:t.profit;
-    const val=p==null?'—':money(p,t.pnl_currency||ccy);
-    const when=(t.closed_at||t.updated_at||t.at||'').toString().slice(11,19)||'—';
-    const px=t.close??t.price??t.level;
+    const src=String(t.pnl_source||'').toLowerCase();
+    const pending=!!(t.pending_cash||src==='pending_broker_pnl'
+      ||src==='pending_close_sync'||src==='upl_estimate');
+    const broker=src==='broker';
+    const p=broker?(t.pnl!=null?t.pnl:t.profit):null;
+    // ≈UPL / pending → gaida (no mystical £ that disagree with Capital app).
+    const val=broker&&p!=null?money(p,t.pnl_currency||ccy):(pending?'gaida Capital £':'—');
+    const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
+    const badge=closePnlSrcBadge(t.pnl_source,pending&&!broker);
+    const whenShow=when&&when!=='—'?when:'';
     return `<div class="psx-whale-row">
       <span class="tag">TRADE</span>
-      <strong>${esc(epic)}</strong>
+      <strong class="wh-epic">${esc(epic)}</strong>
       <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
-      <span>${esc(px==null?'—':num(px,2))}</span>
-      <strong class="${pnlClass(p)}">${esc(val)}</strong>
-      <span class="wh-ago">${esc(when)}</span>
+      <strong class="wh-pnl ${broker?pnlClass(p):''}">${esc(val)}</strong>
+      <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(pending?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
+      ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:'<span class="wh-ago" aria-hidden="true"></span>'}
     </div>`;
   }).join(''));
 }
@@ -575,15 +623,16 @@ function renderDeskCheck(client,view){
   const ready=a.model_readiness||{};
   const lean=sc.act==='BUY'?'BULL':(sc.act==='SELL'?'BEAR':'NEUT');
   const mtfLean=mtf.preferred||mtf.mode||'';
+  // No lean → NEUT (never invent BULL just because MTF is ready).
   const mtfTag=/sell|bear|down/i.test(String(mtfLean))?'BEAR'
-    :(/buy|bull|up/i.test(String(mtfLean))?'BULL':(mtf.ready?'BULL':'NEUT'));
+    :(/buy|bull|up/i.test(String(mtfLean))?'BULL':'NEUT');
   const rows=[
     {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
     {k:'Momentum',v:mtfTag,cls:mtfTag==='NEUT'?'neu':(mtfTag==='BEAR'?'bad':'ok')},
-    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||lean,cls:'neu'},
+    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||'—',cls:'neu'},
     {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':'WAIT',
       cls:a.market_status==='TRADEABLE'?'ok':'neu'},
-    {k:'Liquidity',v:a.spread!=null?(Number(a.spread)<1?'OK':'WIDE'):'—',cls:'neu'},
+    {k:'Spread state',v:a.spread!=null?(Number(a.spread)<1?'TIGHT':'WIDE'):'—',cls:'neu'},
     {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
     {k:'Can OPEN',v:a.entry_can_submit_now?'YES':'NO',cls:a.entry_can_submit_now?'ok':'neu'},
     {k:'SL Bracket',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
@@ -750,8 +799,25 @@ function _deskMacdHist(closes){
   };
   const e12=ema(closes,12),e26=ema(closes,26);
   const macd=closes.map((_,i)=>(e12[i]==null||e26[i]==null)?null:e12[i]-e26[i]);
-  const signal=ema(macd.map(v=>v==null?0:v),9);
-  return macd.map((v,i)=>(v==null||signal[i]==null)?null:v-signal[i]);
+  // Signal EMA only on real MACD points — null→0 poisoned early hist bars.
+  const macdPts=macd.filter(v=>v!=null);
+  if(macdPts.length<9)return null;
+  const sigPts=(()=>{
+    const k=2/(9+1);let prev=null;const o=[];
+    for(let i=0;i<macdPts.length;i++){
+      if(i<8){o.push(null);continue;}
+      if(prev==null)prev=macdPts.slice(i-8,i+1).reduce((a,b)=>a+b,0)/9;
+      else prev=macdPts[i]*k+prev*(1-k);
+      o.push(prev);
+    }
+    return o;
+  })();
+  let j=0;
+  return macd.map(v=>{
+    if(v==null)return null;
+    const s=sigPts[j++];
+    return s==null?null:v-s;
+  });
 }
 function renderDeskIndCharts(client,view){
   const el=$('deskIndCharts');
@@ -1095,28 +1161,30 @@ function fleetPnl(s,clients){
   let wins=s.display_wins_all;
   let losses=s.display_losses_all;
   const ccy=s.pnl_currency||'';
-  // Treat empty/none fleet totals as missing so live open UPL can surface.
-  if(total!=null && (src==='none'||src==='empty'))total=null;
-  if(total==null && s.open_upl_all!=null && Number.isFinite(Number(s.open_upl_all))){
+  // ≈UPL fleet totals are mystical — clear them; Capital £ or live open UPL only.
+  if(total!=null && (src==='none'||src==='empty'||src==='upl_estimate'))total=null;
+  if(src==='upl_estimate'){/* keep src so label says gaida */}
+  if(total==null && src!=='upl_estimate' && s.open_upl_all!=null
+      && Number.isFinite(Number(s.open_upl_all))){
     total=Number(s.open_upl_all);src='open_upl';
   }
   if(total==null || wins==null || losses==null){
     let sum=0,n=0,w=0,l=0,anyEst=false,anyOpen=false;
     for(const c of clients||[]){
       const sb=scoreboard(c.results||{});
-      if(sb.pnl!=null){sum+=sb.pnl;n++}
-      w+=sb.wins;l+=sb.losses;
       if(sb.src==='upl_estimate')anyEst=true;
       if(sb.src==='open_upl')anyOpen=true;
+      if(sb.pnl!=null && sb.src==='broker'){sum+=sb.pnl;n++}
+      if(sb.src==='broker'){w+=sb.wins;l+=sb.losses}
     }
-    if(total==null && n){
-      total=sum;
-      src=anyEst?'upl_estimate':(anyOpen?'open_upl':src);
+    if(total==null && n){total=sum;src='broker'}
+    else if(total==null && anyEst)src='upl_estimate';
+    else if(total==null && anyOpen && s.open_upl_all!=null){
+      total=Number(s.open_upl_all);src='open_upl';
     }
     if(wins==null)wins=w;
     if(losses==null)losses=l;
   }
-  // Multi-currency: never invent one number from mixed books.
   const by=(src==='open_upl'
     ?(s.open_upl_by_currency||{})
     :(s.working_pnl_by_currency||s.pnl_by_currency||{}));
@@ -1127,6 +1195,8 @@ function fleetPnl(s,clients){
     pnlNum=null;
   }else if(pnlNum!=null){
     pnlLabel=money(pnlNum,ccy);
+  }else if(src==='upl_estimate'){
+    pnlLabel='gaida Capital £';
   }else{
     pnlLabel='—';
   }
@@ -1204,10 +1274,13 @@ function buildEquitySeries(clients,range){
   (clients||[]).forEach(c=>{
     const r=c.results||{};
     const ccy=r.pnl_currency||c.account_currency||'';
-    (r.recent_trades||[]).forEach((t,idx)=>{
+    (r.recent_trades||[]).forEach((t)=>{
+      // Capital £ closes only — skip ≈UPL and rows without a real close time.
+      if(String(t.pnl_source||'').toLowerCase()!=='broker')return;
       const pnl=Number(t.pnl);
       if(!Number.isFinite(pnl))return;
-      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'')||(Date.now()-idx*3600e3);
+      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'');
+      if(!Number.isFinite(ts))return;
       trades.push({ts,pnl,ccy:t.pnl_currency||ccy});
     });
   });
@@ -1218,7 +1291,7 @@ function buildEquitySeries(clients,range){
   const use=filtered.length?filtered:trades;
   let cum=0;
   const points=use.map(t=>{cum+=t.pnl;return {t:t.ts,v:cum}});
-  // Empty → real empty (never invent a fake equity curve).
+  // Empty → real empty (never invent timestamps or ≈UPL into the curve).
   return points;
 }
 
@@ -1500,21 +1573,20 @@ function renderCard(c){
   const mandateSize=(a.mandate&&a.mandate.size)||'—';
   const sb=scoreboard(r);
   const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
-    const p=t.pnl;
     const tCcy=t.pnl_currency||ccy;
-    const pending=t.pending_cash||t.pnl_source==='pending_broker_pnl'||t.pnl_source==='pending_close_sync';
-    const showPnl=p!=null?p:(pending&&t.upl_hint!=null?t.upl_hint:null);
+    const s=String(t.pnl_source||'').toLowerCase();
+    const pending=t.pending_cash||s==='pending_broker_pnl'||s==='pending_close_sync'
+      ||s==='upl_estimate';
+    const broker=s==='broker';
+    const showPnl=broker&&t.pnl!=null?t.pnl:null;
     const cls=pnlClass(showPnl);
-    // Operator: peļņa is peļņa — no [UPL] / [gaida £] badges when we have a number.
-    const src=(showPnl!=null)?'':
-      (pending?' [gaida £]':
-      (t.pnl_source&&t.pnl_source!=='broker'&&t.pnl_source!=='upl_estimate'
-        ?` [${t.pnl_source}]`:''));
+    const srcTag=broker?' [Capital]':(pending?' [gaida Capital £]':
+      (s?` [${s}]`:''));
     let right;
     if(showPnl!=null){right=money(showPnl,tCcy);}
     else if(pending){right='gaida Capital £';}
     else{right='—';}
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${esc(right)}</span></div>`;
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(srcTag)}</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
 
   const dealsHtml=inTrade
@@ -1599,9 +1671,10 @@ function renderCard(c){
       <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
       <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
       <div><span>Kopējais P&amp;L</span><strong class="${pnlClass(sb.pnl)}">${
-        sb.pnl==null?'—':esc(money(sb.pnl,sb.ccy||ccy))
+        sb.pnl==null?(sb.src==='upl_estimate'?'gaida Capital £':'—'):esc(money(sb.pnl,sb.ccy||ccy))
       }</strong></div>
       <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
+      ${((r.estimate_trades||0)>0)?`<div><span>Gaida Capital £</span><strong>${esc(r.estimate_trades)} ≈UPL closes</strong></div>`:''}
       ${(r.pending_cash_trades)?`<div><span>Gaida peļņa</span><strong>${esc(r.pending_cash_trades)} bez skaitļa</strong></div>`:''}
       ${(()=>{
         const fl=a.forward_live||{};

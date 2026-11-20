@@ -3875,8 +3875,10 @@ class SingleTradeEngine:
 
     def _row_cash_pnl(self,row,details=None):
         details=details if isinstance(details,dict) else {}
-        for key in ('profit','pnl','profitAndLoss','pl','guaranteedStopProfit',
-                    'realizedPnl','cash','netAmount'):
+        # Prefer total realized £. Skip limitDistance-style fields — those are
+        # not closed P&L (Capital app "Limit +0.17" ≠ trade result).
+        for key in ('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
+                    'netAmount','netProfit','grossProfit','amount','profitLoss'):
             val=self._parse_cash_num(details.get(key))
             if val is None:val=self._parse_cash_num(row.get(key))
             if val is not None and math.isfinite(val):
@@ -3995,24 +3997,34 @@ class SingleTradeEngine:
 
         ``upl_estimate`` is display-only until Capital history returns real £ —
         those rows must stay harvestable (neural teach waits for ``broker``).
+        Also re-arm £0 ``broker`` binds — Capital often journals 0 before the
+        real close £ lands (poison that used to freeze Admin forever).
         """
         try:
             rows=self.store.db.execute(
-                "SELECT deal_id,exit,opened,closed,pnl_source FROM trades "
+                "SELECT deal_id,exit,opened,closed,pnl_source,pnl FROM trades "
                 "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
                 "('pending_broker_pnl','pending_close_sync',"
                 "'ticks_only','price_size','position_disappeared',"
-                "'upl_estimate')) "
+                "'upl_estimate','broker')) "
                 "ORDER BY closed DESC LIMIT 80").fetchall()
         except Exception:
             return 0
         n=0
-        for deal_id,exit_lvl,_opened,_closed,src in rows:
+        for deal_id,exit_lvl,_opened,_closed,src,pnl in rows:
             deal=str(deal_id)
-            # Real broker £ already banked — do not re-harvest.
-            if self.store.get('broker_cash_banked:'+deal) and str(src or '')=='broker':
+            src_s=str(src or '')
+            pnl_n=_num(pnl)
+            zero_broker=(src_s=='broker' and (
+                pnl_n is None or abs(float(pnl_n))<1e-12))
+            if src_s=='broker' and not zero_broker:
                 continue
-            if self.store.get('broker_cash_banked:'+deal) and str(src or '')!='upl_estimate':
+            banked=self.store.get('broker_cash_banked:'+deal)
+            if isinstance(banked,dict) and str(banked.get('source') or '')=='broker':
+                banked_pnl=_num(banked.get('pnl'))
+                if banked_pnl is not None and abs(float(banked_pnl))>=1e-12 and not zero_broker:
+                    continue
+            elif banked and src_s!='upl_estimate' and not zero_broker:
                 continue
             self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
             n+=1
@@ -4146,10 +4158,13 @@ class SingleTradeEngine:
         hits.sort(key=lambda h:h[0])
         best=hits[0]
         if len(hits)>1 and (hits[1][0]-best[0])<0.5:
-            self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
-                             {'deal_id':deal,'candidates':len(hits),
-                              'best_score':best[0],'second_score':hits[1][0]})
-            return None
+            # Exact openLevel≈entry is decisive even among many GOLD micros.
+            # Without this, harvest stayed on ≈UPL forever (Admin ≠ Capital app).
+            if best[0] > -900.0:
+                self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
+                                 {'deal_id':deal,'candidates':len(hits),
+                                  'best_score':best[0],'second_score':hits[1][0]})
+                return None
         _score,pnl,ccy,fp,_ts=best
         if fp:
             self._mark_fuzzy_tx_consumed(fp,deal_id=deal)

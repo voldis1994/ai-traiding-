@@ -52,9 +52,39 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=112' in html
-    assert 'admin.js?v=112' in html
-    assert 'ohlc-chart.js?v=9' in html
+    assert 'admin.css?v=116' in html
+    assert 'admin.js?v=116' in html
+    assert 'ohlc-chart.js?v=10' in html
+
+
+def test_desk_panels_have_readable_spacing():
+    """Laptop Desk must not crush labels into unreadable 8px cells."""
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert '--desk-gap:8px' in css.replace(' ', '')
+    assert 'min-height:34px' in css.replace(' ', '') or 'min-height:34px' in css
+    assert '.psx-score-row' in css
+    assert '.psx-ind-kv .desk-kv' in css
+    assert 'min-height:32px' in css.replace(' ', '') or 'min-height:32px' in css
+
+
+def test_client_closes_marks_upl_vs_capital():
+    """CLIENT CLOSES must not present ≈UPL as Capital.com £."""
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'closePnlSrcBadge' in js
+    assert '≈UPL' in js
+    assert 'CAPITAL' in js
+    assert 'gaida Capital £' in js
+    assert "src==='broker'||src==='upl_estimate'" not in js
+    assert "mtf.ready?'BULL':'NEUT'" not in js
+    assert 'neural ${' in js or 'neural ' in js
+    assert 'tape ' in js
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'id="deskClosedSrc"' in html
+    assert 'id="deskClosedSrc">CAPITAL<' not in html.replace(' ','')
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert 'psx-pnl-src' in css
+    ohlc = Path('app/web/admin/ohlc-chart.js').read_text(encoding='utf-8')
+    assert 'view.mtf||{}).atr14' in ohlc.replace(' ','') or '(view.mtf||{}).atr14' in ohlc
 
 
 def test_demo_fixture_isolated():

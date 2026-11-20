@@ -114,5 +114,9 @@ def test_admin_recent_trade_shows_pending_upl_hint():
         assert recent[0].get('pnl')==pytest.approx(-0.13)
         assert recent[0].get('pnl_source')=='upl_estimate'
         assert recent[0].get('pending_cash') is False
-        assert stats['working_pnl']==pytest.approx(-0.13)
+        assert stats['working_pnl'] is None
+        assert stats['working_pnl_source']=='upl_estimate'
+        assert stats['estimate_pnl']==pytest.approx(-0.13)
+        assert stats['estimate_trades']==1
+        assert stats['cash_trades']==0
         assert stats['pending_trades']==0

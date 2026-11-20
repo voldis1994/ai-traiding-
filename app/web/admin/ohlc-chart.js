@@ -102,7 +102,8 @@ function drawOhlcStructure(canvas,view,opts){
     for(const v of series)expand(v);
   }
   expand(mid);
-  const atr=_ohlcFinite(ov.atr14)||_ohlcFinite((view.mtf||{}).atr14);
+  // Prefer M1 bracket ATR (view.mtf.atr14) — same as Desk Indicators / LIVE SL.
+  const atr=_ohlcFinite((view.mtf||{}).atr14)||_ohlcFinite(ov.atr14);
   if(atr!=null&&atr>0&&mid!=null){
     expand(mid-atr);expand(mid+atr);
   }
@@ -316,7 +317,7 @@ function drawOhlcStructure(canvas,view,opts){
   // Use ?? so a real ADX/ATR of 0 is distinct from missing (null).
   // Do not redeclare `atr` — already bound above for the ATR band.
   const adx=_ohlcFinite(mtf.adx??ov.adx);
-  const atrShow=_ohlcFinite(mtf.atr14??ov.atr14)??atr;
+  const atrShow=_ohlcFinite(mtf.atr14)??_ohlcFinite(ov.atr14)??atr;
   if(adx!=null)parts.push(`ADX ${adx.toFixed(0)}`);
   if(atrShow!=null)parts.push(`ATR ${atrShow.toFixed(2)}`);
   if(kamaSeries.length||ov.kama_level!=null)parts.push('KAMA');

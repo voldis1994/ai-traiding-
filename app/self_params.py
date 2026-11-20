@@ -173,6 +173,17 @@ DEFAULTS = {
     'mtf_kama_slow': 30,
     'mtf_semivar_bars': 30,
     'mtf_mode_preset': 'trend_follow',  # trend_follow | fast_shift | noise_hold
+    # GOLD audit strategies (structure align / min RR / BUY-strict in DOWN).
+    # Distilled from labeled history — OPEN gates for GOLD/XAU only.
+    'gold_strat_enabled': 1,
+    'gold_strat_structure_align': 1,
+    # Hard RR gate off — teach still labels RR<1; see gold_strategies DEFAULTS.
+    'gold_strat_min_rr': 0,
+    'gold_strat_buy_strict_down': 1,
+    'gold_strat_min_rr_floor': 1.0,
+    'gold_strat_buy_down_min_edge': 0.12,
+    'gold_strat_chop_hold': 0,
+    'gold_strat_chop_min_edge': 0.18,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -283,6 +294,14 @@ BOUNDS = {
     'mtf_kama_fast': (2, 5),
     'mtf_kama_slow': (20, 40),
     'mtf_semivar_bars': (10, 120),
+    'gold_strat_enabled': (0, 1),
+    'gold_strat_structure_align': (0, 1),
+    'gold_strat_min_rr': (0, 1),
+    'gold_strat_buy_strict_down': (0, 1),
+    'gold_strat_min_rr_floor': (1.0, 2.5),
+    'gold_strat_buy_down_min_edge': (0.02, 0.45),
+    'gold_strat_chop_hold': (0, 1),
+    'gold_strat_chop_min_edge': (0.05, 0.50),
 }
 
 IMMUTABLE_NOTE = (

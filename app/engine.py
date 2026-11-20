@@ -2831,6 +2831,23 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason='wait_ohlc_swing_rr',
                             proposal=result.get('proposal') or result['action'])
+            # GOLD audit strategies: structure align / min RR / BUY-strict in DOWN.
+            # Distilled from labeled history — GOLD/XAU only; other epics pass.
+            from . import gold_strategies
+            epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+            score_edge=result.get('score_edge')
+            if score_edge is None and hasattr(self.policy,'score_edge'):
+                try:score_edge=self.policy.score_edge(nudged_scores)
+                except Exception:score_edge=None
+            gold_gate=gold_strategies.evaluate(
+                epic=epic_gs,action=result['action'],candles=candles_rg,
+                structure=struct_rg,score_edge=score_edge,store=self.store,
+                brackets=swing_br if isinstance(swing_br,dict) else None)
+            result=dict(result,gold_strategies=gold_gate)
+            if gold_gate.get('applies') and not gold_gate.get('allowed',True):
+                return dict(result,action='HOLD',
+                            reason=gold_gate.get('reason') or 'gold_strategy_hold',
+                            proposal=result.get('proposal') or result['action'])
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(
@@ -5402,6 +5419,21 @@ class SingleTradeEngine:
                             'direction':direction,'pnl':pnl_value,
                             'exit_reason':exit_reason_tag,
                             'bars':len((win_rec.get('snapshot') or {}).get('bars') or [])})
+            # GOLD audit teach hint — reinforces known good/bad frames for learning.
+            try:
+                from . import gold_strategies
+                if gold_strategies.applies_to_epic(epic):
+                    snap_src = locals().get('rec') or locals().get('win_rec') or {}
+                    st=((snap_src.get('snapshot') or {}).get('frame') or {}).get('structure')
+                    br_meta=(saved.get('bracket_meta') if isinstance(saved,dict) else None) or {}
+                    hint=gold_strategies.teach_label_from_outcome(
+                        action=direction,structure=st,pnl=pnl_value,
+                        stop_distance=br_meta.get('stop_distance'),
+                        profit_distance=br_meta.get('profit_distance'))
+                    self.store.event('learning','GOLD audit teach hint',{
+                        'deal_id':deal_id,'epic':epic,**hint})
+            except Exception:
+                pass
         except Exception as exc:
             self.store.event('warning','Structure shadow record skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=96">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=97">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -136,98 +136,51 @@
   </div>
 
   <div id="dash" class="shell hidden">
-    <aside class="sidebar" aria-label="Navigācija">
-      <div class="sidebar-brand">
-        <span class="brand-icon"><svg class="ico"><use href="#i-logo"></use></svg></span>
-        <div>
-          <strong>NEURAL</strong>
-          <span>Trading AI</span>
-        </div>
-      </div>
-      <nav class="side-nav">
-        <button type="button" class="nav-item active" data-view="desk">
-          <svg class="ico"><use href="#i-candles"></use></svg><span>Desk</span>
-        </button>
-        <button type="button" class="nav-item" data-view="overview">
-          <svg class="ico"><use href="#i-grid"></use></svg><span>Pārskats</span>
-        </button>
-        <button type="button" class="nav-item" data-view="clients">
-          <svg class="ico"><use href="#i-user"></use></svg><span>Klienti</span>
-        </button>
-        <button type="button" class="nav-item" data-view="trades">
-          <svg class="ico"><use href="#i-candles"></use></svg><span>Treidi</span>
-        </button>
-        <button type="button" class="nav-item" data-view="risks">
-          <svg class="ico"><use href="#i-shield"></use></svg><span>Riski</span>
-        </button>
-        <button type="button" class="nav-item" data-view="settings">
-          <svg class="ico"><use href="#i-settings"></use></svg><span>Iestatījumi</span>
-        </button>
-      </nav>
-      <div class="sidebar-wave" aria-hidden="true"></div>
-    </aside>
-
-    <div class="main">
-      <header class="topbar">
-        <div class="status-pill" id="systemStatus">
-          <span class="dot"></span>
-          <span>Sistēma aktīva</span>
-        </div>
-        <div class="top-actions">
-          <button type="button" id="refreshBtn" class="btn btn-ghost">
+    <div class="term" id="termShell">
+      <header class="term-top">
+        <div class="term-logo"><span class="term-mark">N</span><strong>NEURAL Desk</strong></div>
+        <div class="term-search" aria-hidden="true">Search markets, views, commands…</div>
+        <div class="term-top-right">
+          <div class="status-pill" id="systemStatus"><span class="dot"></span><span>Sistēma aktīva</span></div>
+          <span id="deskUtc" class="psx-utc">UTC —</span>
+          <span id="deskPulse" class="psx-pulse">Sync —</span>
+          <span class="psx-plat">PLATINUM</span>
+          <label class="psx-acct term-acct">Account
+            <select id="deskFocus" aria-label="Desk account"></select>
+          </label>
+          <button type="button" id="refreshBtn" class="btn btn-ghost tiny" title="Sinhronizēt">
             <svg class="ico"><use href="#i-sync"></use></svg>
-            Sinhronizēt
           </button>
-          <button type="button" id="startAllBtn" class="btn btn-primary">
+          <button type="button" id="startAllBtn" class="btn btn-primary tiny" title="Palaist robotus">
             <svg class="ico"><use href="#i-play"></use></svg>
-            Palaist robotus
           </button>
-          <button type="button" id="logoutBtn" class="btn btn-ghost icon-only" title="Iziet" aria-label="Iziet">
+          <button type="button" id="logoutBtn" class="btn btn-ghost icon-only tiny" title="Iziet" aria-label="Iziet">
             <svg class="ico"><use href="#i-logout"></use></svg>
           </button>
         </div>
       </header>
 
+      <div class="term-body">
+        <nav class="psx-rail term-rail" aria-label="Modules">
+          <button type="button" class="psx-rail-btn on" data-view="desk" title="Terminal"><i></i><span>TERMINAL</span></button>
+          <button type="button" class="psx-rail-btn" data-view="overview" title="Global"><i></i><span>GLOBAL</span></button>
+          <button type="button" class="psx-rail-btn" data-view="trades" title="Flow"><i></i><span>FLOW-LIQ</span></button>
+          <button type="button" class="psx-rail-btn" data-view="risks" title="OI Fund"><i></i><span>OI-FUND</span></button>
+          <button type="button" class="psx-rail-btn" data-view="clients" title="Research"><i></i><span>RESEARCH</span></button>
+          <button type="button" class="psx-rail-btn" data-view="settings" title="Practice"><i></i><span>PRACTICE</span></button>
+        </nav>
+
+        <div class="term-main">
       <section class="view active" data-view="desk">
         <div class="psx" id="psDesk">
-          <header class="psx-top">
-            <div class="psx-logo">
-              <span class="psx-p">N</span>
-              <strong>NEURAL Desk</strong>
-            </div>
-            <div class="psx-search">Search markets, views, commands…</div>
-            <div class="psx-top-right">
-              <span id="deskUtc" class="psx-utc">UTC —</span>
-              <span id="deskPulse" class="psx-pulse">Sync —</span>
-              <span class="psx-plat">PLATINUM</span>
-              <label class="psx-acct">
-                Account
-                <select id="deskFocus" aria-label="Desk account"></select>
-              </label>
-            </div>
-          </header>
           <div id="deskTape" class="psx-tape" aria-label="Market tape"></div>
           <div class="psx-body">
-            <nav class="psx-rail" aria-label="Desk modules">
-              <button type="button" class="psx-rail-btn" data-jump="desk" title="Desk"><i></i><span>DESK</span></button>
-              <button type="button" class="psx-rail-btn on" title="Terminal"><i></i><span>TERMINAL</span></button>
-              <button type="button" class="psx-rail-btn" data-jump="overview" title="Global"><i></i><span>GLOBAL</span></button>
-              <button type="button" class="psx-rail-btn" data-jump="trades" title="Flow"><i></i><span>FLOW-LIQ</span></button>
-              <button type="button" class="psx-rail-btn" data-jump="risks" title="OI Fund"><i></i><span>OI-FUND</span></button>
-              <button type="button" class="psx-rail-btn" data-jump="clients" title="Research"><i></i><span>RESEARCH</span></button>
-              <button type="button" class="psx-rail-btn" title="News"><i></i><span>NEWS</span></button>
-              <button type="button" class="psx-rail-btn" title="Cipher"><i></i><span>CIPHER</span></button>
-              <button type="button" class="psx-rail-btn" data-jump="settings" title="Practice"><i></i><span>PRACTICE</span></button>
-              <button type="button" class="psx-rail-btn" title="Learn"><i></i><span>LEARN</span></button>
-            </nav>
-
             <aside class="psx-intel">
               <div class="psx-h">
                 <h2>MARKET INTEL</h2>
                 <span class="psx-live">● LIVE</span>
               </div>
               <div id="deskIntel" class="psx-intel-feed"></div>
-              <!-- hidden sinks so legacy renderers stay safe -->
               <div id="deskWeights" class="psx-sink" hidden></div>
               <div id="deskReturns" class="psx-sink" hidden></div>
               <div id="deskReact" class="psx-sink" hidden></div>
@@ -241,7 +194,6 @@
                   <button type="button" class="psx-mode on">SIGNAL DESK</button>
                   <button type="button" class="psx-mode">SCALPER</button>
                   <button type="button" class="psx-mode">SWING</button>
-                  <button type="button" class="psx-mode">PRACTICE</button>
                 </div>
                 <div class="psx-epic-row">
                   <div>
@@ -313,155 +265,165 @@
       </section>
 
       <section class="view" data-view="overview">
-        <div class="page-head">
-          <h1>Komandcentrs</h1>
-          <p>Visa flote vienā skatā</p>
-        </div>
-
-        <div id="summary" class="stat-grid" aria-label="Kopsavilkums"></div>
-
-        <div class="overview-grid">
-          <div class="overview-main">
-            <article class="card chart-card">
-              <div class="card-head">
-                <div>
-                  <h2>Kopējā veiktspēja</h2>
-                  <div class="perf-row">
-                    <strong id="perfValue">—</strong>
-                    <span id="perfDelta" class="trend-pill">—</span>
+        <div class="term-view">
+          <div class="term-view-head">
+            <div>
+              <h1>GLOBAL</h1>
+              <p>Fleet command · all accounts</p>
+            </div>
+          </div>
+          <div id="summary" class="stat-grid" aria-label="Kopsavilkums"></div>
+          <div class="overview-grid">
+            <div class="overview-main">
+              <article class="card chart-card">
+                <div class="card-head">
+                  <div>
+                    <h2>Kopējā veiktspēja</h2>
+                    <div class="perf-row">
+                      <strong id="perfValue">—</strong>
+                      <span id="perfDelta" class="trend-pill">—</span>
+                    </div>
+                  </div>
+                  <div class="range-tabs" role="tablist" aria-label="Laika periods">
+                    <button type="button" class="range-tab" data-range="1D">1D</button>
+                    <button type="button" class="range-tab active" data-range="1W">1N</button>
+                    <button type="button" class="range-tab" data-range="1M">1M</button>
+                    <button type="button" class="range-tab" data-range="ALL">Visi</button>
                   </div>
                 </div>
-                <div class="range-tabs" role="tablist" aria-label="Laika periods">
-                  <button type="button" class="range-tab" data-range="1D">1D</button>
-                  <button type="button" class="range-tab active" data-range="1W">1N</button>
-                  <button type="button" class="range-tab" data-range="1M">1M</button>
-                  <button type="button" class="range-tab" data-range="ALL">Visi</button>
+                <canvas id="perfChart" width="800" height="180" aria-label="Veiktspējas grafiks"></canvas>
+              </article>
+              <article class="card grow">
+                <div class="card-head">
+                  <h2>Atvērtie treidi</h2>
+                  <button type="button" class="text-link" data-jump="trades">Skatīt visus →</button>
                 </div>
-              </div>
-              <canvas id="perfChart" width="800" height="220" aria-label="Veiktspējas grafiks"></canvas>
-            </article>
-
-            <article class="card">
-              <div class="card-head">
-                <h2>Atvērtie treidi</h2>
-                <button type="button" class="text-link" data-jump="trades">Skatīt visus →</button>
-              </div>
-              <div id="openTradesPreview" class="table-wrap"></div>
-            </article>
+                <div id="openTradesPreview" class="table-wrap fill-scroll"></div>
+              </article>
+            </div>
+            <aside class="overview-side">
+              <article class="card grow">
+                <div class="card-head"><h2>Top klienti</h2></div>
+                <div id="topClients" class="rank-list fill-scroll"></div>
+              </article>
+              <article class="card grow">
+                <div class="card-head">
+                  <h2>Riska brīdinājumi</h2>
+                  <svg class="ico warn"><use href="#i-warn"></use></svg>
+                </div>
+                <div id="riskAlerts" class="alert-list fill-scroll"></div>
+              </article>
+            </aside>
           </div>
-
-          <aside class="overview-side">
-            <article class="card">
-              <div class="card-head"><h2>Top klienti</h2></div>
-              <div id="topClients" class="rank-list"></div>
-            </article>
-            <article class="card">
-              <div class="card-head">
-                <h2>Riska brīdinājumi</h2>
-                <svg class="ico warn"><use href="#i-warn"></use></svg>
-              </div>
-              <div id="riskAlerts" class="alert-list"></div>
-            </article>
-          </aside>
         </div>
       </section>
 
       <section class="view" data-view="clients">
-        <div class="page-head">
-          <h1>Klienti</h1>
-          <p>Live flote — lot · side · SL/TP (OHLC) · OHLC logs pa pogu</p>
+        <div class="term-view">
+          <div class="term-view-head">
+            <div><h1>RESEARCH</h1><p>Live fleet · lot · side · SL/TP</p></div>
+          </div>
+          <div id="controlRoom" class="client-list fill-scroll"></div>
         </div>
-        <div id="controlRoom" class="client-list"></div>
       </section>
 
       <section class="view" data-view="trades">
-        <div class="page-head">
-          <h1>Treidi</h1>
-          <p>Visas atvērtās pozīcijas flotē</p>
+        <div class="term-view">
+          <div class="term-view-head">
+            <div><h1>FLOW-LIQ</h1><p>Open + recently closed</p></div>
+          </div>
+          <div class="term-split">
+            <article class="card grow">
+              <div class="card-head"><h2>Atvērtās pozīcijas</h2></div>
+              <div id="openTradesFull" class="table-wrap fill-scroll"></div>
+            </article>
+            <article class="card grow">
+              <div class="card-head"><h2>Nesen slēgtie</h2></div>
+              <div id="recentClosed" class="table-wrap fill-scroll"></div>
+            </article>
+          </div>
         </div>
-        <article class="card">
-          <div id="openTradesFull" class="table-wrap"></div>
-        </article>
-        <article class="card" style="margin-top:16px">
-          <div class="card-head"><h2>Nesen slēgtie</h2></div>
-          <div id="recentClosed" class="table-wrap"></div>
-        </article>
       </section>
 
       <section class="view" data-view="risks">
-        <div class="page-head">
-          <h1>Riski</h1>
-          <p>Informācija — dienas riska režīmi nebloķē LIVE OPEN</p>
+        <div class="term-view">
+          <div class="term-view-head">
+            <div><h1>OI-FUND</h1><p>Risk info — does not block LIVE OPEN</p></div>
+          </div>
+          <div id="riskBoard" class="risk-board fill-scroll"></div>
         </div>
-        <div id="riskBoard" class="risk-board"></div>
       </section>
 
       <section class="view" data-view="settings">
-        <div class="page-head">
-          <h1>Iestatījumi</h1>
-          <p>Reģistrācija, brokeris, mācīšanās</p>
-        </div>
-        <div class="settings-grid">
-          <article class="card">
-            <div class="card-head">
-              <h2><svg class="ico accent"><use href="#i-plus"></use></svg> Jauns klients</h2>
-            </div>
-            <form id="createForm" class="form-stack">
-              <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
-              <label>Parole<input name="password" required minlength="4" maxlength="256" placeholder="••••••••"></label>
-              <label>Vārds / nosaukums<input name="display_name" maxlength="120" placeholder="Jānis"></label>
-              <label>Valoda
-                <select name="language">
-                  <option value="lv">Latviešu</option>
-                  <option value="en">English</option>
-                  <option value="ru">Русский</option>
-                </select>
-              </label>
-              <button class="btn btn-primary" type="submit">
-                <svg class="ico"><use href="#i-plus"></use></svg>
-                Izveidot klientu
+        <div class="term-view">
+          <div class="term-view-head">
+            <div><h1>PRACTICE</h1><p>Clients · broker · learning reset</p></div>
+          </div>
+          <div class="settings-grid fill-scroll">
+            <article class="card">
+              <div class="card-head">
+                <h2><svg class="ico accent"><use href="#i-plus"></use></svg> Jauns klients</h2>
+              </div>
+              <form id="createForm" class="form-stack">
+                <label>Login<input name="username" required maxlength="64" placeholder="janis"></label>
+                <label>Parole<input name="password" required minlength="4" maxlength="256" placeholder="••••••••"></label>
+                <label>Vārds / nosaukums<input name="display_name" maxlength="120" placeholder="Jānis"></label>
+                <label>Valoda
+                  <select name="language">
+                    <option value="lv">Latviešu</option>
+                    <option value="en">English</option>
+                    <option value="ru">Русский</option>
+                  </select>
+                </label>
+                <button class="btn btn-primary" type="submit">
+                  <svg class="ico"><use href="#i-plus"></use></svg>
+                  Izveidot klientu
+                </button>
+                <p id="createMsg" class="muted"></p>
+              </form>
+            </article>
+            <article class="card">
+              <div class="card-head">
+                <h2><svg class="ico accent"><use href="#i-link"></use></svg> Pieslēgt brokeri</h2>
+              </div>
+              <form id="brokerForm" class="form-stack">
+                <label>Klients
+                  <select name="client_id" id="brokerClient" required></select>
+                </label>
+                <label>Brokeris
+                  <select name="broker_type" id="brokerType" required></select>
+                </label>
+                <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
+                <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
+                <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
+                <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
+                <button class="btn btn-primary" type="submit">
+                  <svg class="ico"><use href="#i-play"></use></svg>
+                  Saglabāt un palaist
+                </button>
+                <p id="brokerMsg" class="muted"></p>
+              </form>
+            </article>
+            <article class="card">
+              <div class="card-head">
+                <h2><svg class="ico accent"><use href="#i-sync"></use></svg> Mācīšanās</h2>
+              </div>
+              <p class="muted">Izdzēš neironu/treidu/signālu vēsturi. Klienti un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.</p>
+              <button type="button" id="resetLearningBtn" class="btn btn-ghost">
+                <svg class="ico"><use href="#i-sync"></use></svg>
+                Mācīties no jauna (viss)
               </button>
-              <p id="createMsg" class="muted"></p>
-            </form>
-          </article>
-          <article class="card">
-            <div class="card-head">
-              <h2><svg class="ico accent"><use href="#i-link"></use></svg> Pieslēgt brokeri</h2>
-            </div>
-            <form id="brokerForm" class="form-stack">
-              <label>Klients
-                <select name="client_id" id="brokerClient" required></select>
-              </label>
-              <label>Brokeris
-                <select name="broker_type" id="brokerType" required></select>
-              </label>
-              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
-              <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
-              <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
-              <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
-              <button class="btn btn-primary" type="submit">
-                <svg class="ico"><use href="#i-play"></use></svg>
-                Saglabāt un palaist
-              </button>
-              <p id="brokerMsg" class="muted"></p>
-            </form>
-          </article>
-          <article class="card">
-            <div class="card-head">
-              <h2><svg class="ico accent"><use href="#i-sync"></use></svg> Mācīšanās</h2>
-            </div>
-            <p class="muted">Izdzēš neironu/treidu/signālu vēsturi. Klienti un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.</p>
-            <button type="button" id="resetLearningBtn" class="btn btn-ghost">
-              <svg class="ico"><use href="#i-sync"></use></svg>
-              Mācīties no jauna (viss)
-            </button>
-            <p class="muted" style="margin-top:12px">Klienta portāls: <a href="/app" target="_blank" rel="noopener">/app</a></p>
-          </article>
+              <p class="muted" style="margin-top:12px">Klienta portāls: <a href="/app" target="_blank" rel="noopener">/app</a></p>
+            </article>
+          </div>
         </div>
       </section>
+        </div>
+      </div>
     </div>
   </div>
+
   <script src="/admin/static/ohlc-chart.js?v=7"></script>
-  <script src="/admin/static/admin.js?v=103"></script>
+  <script src="/admin/static/admin.js?v=104"></script>
 </body>
 </html>

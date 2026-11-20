@@ -79,6 +79,23 @@ def test_map_positions_drops_deal_less_rows():
         assert mapped==[]
 
 
+def test_map_positions_reads_stop_alias_when_stopLevel_missing():
+    """Capital amount-mode payloads may expose SL under ``stop`` only."""
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        mapped=e._map_positions([{
+            'position':{
+                'dealId':'d1','direction':'SELL','size':'0.08','level':3531.38,
+                'stop':3547.64,'profitLevel':3503.67,'upl':0.31,
+            },
+            'market':{'epic':'GOLD'},
+        }])
+        assert len(mapped)==1
+        assert mapped[0]['stopLevel']==3547.64
+        assert mapped[0]['profitLevel']==3503.67
+
+
 def test_pending_close_sync_queues_broker_pnl_retry():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:

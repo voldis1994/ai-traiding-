@@ -1408,12 +1408,16 @@ class SingleTradeEngine:
             raw_tp=p.get('profitLevel')
             if raw_tp is None:
                 raw_tp=p.get('limitLevel')
+            # Amount-mode / alias fields — never drop a live Capital SL.
+            raw_sl=p.get('stopLevel')
+            if raw_sl is None:
+                raw_sl=p.get('stop')
             out.append({'dealId':str(deal).strip(),
                 'epic':epic,
                 'instrument_name':self._extract_instrument_name(p,m),
                 'size':p.get('size'),'direction':direction,
                 'level':_broker_price_level(p.get('level'),p.get('level')),
-                'stopLevel':_broker_price_level(p.get('stopLevel')),
+                'stopLevel':_broker_price_level(raw_sl),
                 'profitLevel':_broker_price_level(raw_tp),
                 'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
         return out

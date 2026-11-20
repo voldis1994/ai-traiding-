@@ -85,8 +85,13 @@ function drawOhlcStructure(canvas,view,opts){
       expand(br[k]);
     }
   }
+  // Live SL/TP must always stretch the axis — near-tape filter used to drop
+  // far protective stops (e.g. SELL SL above tape) so Desk showed TP only.
   for(const p of openEarly){
-    expand(p.entry);expand(p.stop);expand(p.profit);
+    for(const raw of [p.entry,p.stop,p.profit]){
+      const n=_ohlcFinite(raw);
+      if(n!=null&&n>0){low=Math.min(low,n);high=Math.max(high,n);}
+    }
   }
   const ov=view.overlays||{};
   const sliceSeries=(arr)=>{
@@ -112,6 +117,15 @@ function drawOhlcStructure(canvas,view,opts){
   const maxSpan=Math.max(candleSpan*6,Math.abs(anchor)*0.02,1);
   low=Math.max(low,anchor-maxSpan);
   high=Math.min(high,anchor+maxSpan);
+  // After clamp, re-include live SL/TP — clamp must not hide Capital brackets.
+  if(scaledInTrade){
+    for(const p of openEarly){
+      for(const raw of [p.entry,p.stop,p.profit]){
+        const n=_ohlcFinite(raw);
+        if(n!=null&&n>0){low=Math.min(low,n);high=Math.max(high,n);}
+      }
+    }
+  }
   if(!(high>low)){low=anchor-candleSpan;high=anchor+candleSpan;}
 
   const pad=(high-low)*(showLabels?.05:.08);
@@ -224,9 +238,10 @@ function drawOhlcStructure(canvas,view,opts){
   mark(st.swing_lows,'rgba(57,255,136,.85)');
 
   const labels=[];
-  const hline=(price,color,dash,label)=>{
-    const p=_ohlcNearTape(price,anchor,candleSpan);
-    if(p==null)return;
+  const hline=(price,color,dash,label,force)=>{
+    // Live open brackets bypass near-tape — SL/TP must paint even when far.
+    const p=force?_ohlcFinite(price):_ohlcNearTape(price,anchor,candleSpan);
+    if(p==null||!(p>0))return;
     ctx.strokeStyle=color;ctx.lineWidth=showLabels?1.6:1.25;
     ctx.setLineDash(dash||[]);
     const yy=y(p);
@@ -242,9 +257,9 @@ function drawOhlcStructure(canvas,view,opts){
   }
   hline(mid,'#e9bc65',[2,2],'MID');
   for(const p of openLv){
-    hline(p.entry,'#e9bc65',[],'ENT');
-    hline(p.stop,'#ef6875',[4,3],'SL');
-    hline(p.profit,'#31d59a',[4,3],'TP');
+    hline(p.entry,'#e9bc65',[],'ENT',true);
+    hline(p.stop,'#ef6875',[4,3],'SL',true);
+    hline(p.profit,'#31d59a',[4,3],'TP',true);
   }
   if(showLabels&&!inTrade){
     if(zones.buy_entry&&(!pref||pref==='BUY')){

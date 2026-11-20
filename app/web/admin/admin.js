@@ -344,22 +344,51 @@ function renderDeskTape(markets,focusClient){
   }
 }
 
+/** Prefer live activity.positions brackets over structure-view open_levels. */
+function enrichViewOpenLevels(view,client){
+  if(!view)return view;
+  const a=(client&&client.activity)||{};
+  const positions=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
+  if(!positions.length)return view;
+  const posLevels=[];
+  for(const p of positions){
+    if(!p||typeof p!=='object')continue;
+    const n=v=>v!=null&&Number(v)>0?Number(v):null;
+    const entry=n(p.level),stop=n(p.stopLevel),profit=n(p.profitLevel);
+    if(entry==null&&stop==null&&profit==null)continue;
+    posLevels.push({
+      deal_id:p.dealId||p.deal_id,
+      direction:p.direction,
+      entry,stop,profit,
+    });
+  }
+  if(!posLevels.length)return view;
+  return {...view,open_levels:posLevels};
+}
+
 function renderDeskLevels(view,client){
   const el=$('deskLevels');
   if(!el)return;
   const open=(view&&view.open_levels)||[];
   const a=(client&&client.activity)||{};
   const pos=(Array.isArray(a.positions)&&a.positions[0])||a.position||null;
-  const entry=open[0]&&open[0].entry!=null?open[0].entry:(pos&&pos.level);
-  const stop=open[0]&&open[0].stop!=null?open[0].stop:(pos&&pos.stopLevel);
-  const profit=open[0]&&open[0].profit!=null?open[0].profit:(pos&&pos.profitLevel);
+  // Live broker position wins — never hide SL because open_levels.stop is null.
+  const lvl=(a,b)=>{
+    const x=a!=null&&Number(a)>0?Number(a):null;
+    const y=b!=null&&Number(b)>0?Number(b):null;
+    return x!=null?x:y;
+  };
+  const entry=lvl(pos&&pos.level,open[0]&&open[0].entry);
+  const stop=lvl(pos&&pos.stopLevel,open[0]&&open[0].stop);
+  const profit=lvl(pos&&pos.profitLevel,open[0]&&open[0].profit);
   const mid=view&&view.mid!=null?view.mid:a.market_mid;
+  const upl=pos&&pos.upl!=null&&Number.isFinite(Number(pos.upl))?Number(pos.upl):null;
+  const ccy=(a.balance&&a.balance.currency)||a.currency||'';
   const bits=[];
-  if(stop!=null&&Number(stop)>0)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
-  if(entry!=null&&Number(entry)>0)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
-  if(profit!=null&&Number(profit)>0){
-    bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
-  }
+  if(stop!=null)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
+  if(entry!=null)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
+  if(profit!=null)bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
+  if(upl!=null)bits.push(`<span class="psx-lvl mid">UPL ${esc(money(upl,ccy))}</span>`);
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
 }
@@ -541,22 +570,27 @@ function renderDeskClosed(client){
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
     const src=String(t.pnl_source||'').toLowerCase();
-    const pending=!!(t.pending_cash||src==='pending_broker_pnl'
-      ||src==='pending_close_sync'||src==='upl_estimate');
+    const raw=t.pnl!=null?t.pnl:t.profit;
     const broker=src==='broker';
-    const p=broker?(t.pnl!=null?t.pnl:t.profit):null;
-    // ≈UPL / pending → gaida (no mystical £ that disagree with Capital app).
-    const val=broker&&p!=null?money(p,t.pnl_currency||ccy):(pending?'gaida Capital £':'—');
+    // ≈UPL with a number → show ≈£… (honest). Blank pending only → gaida.
+    const isEst=src==='upl_estimate'&&raw!=null&&Number.isFinite(Number(raw));
+    const blankWait=!!(t.pending_cash||src==='pending_broker_pnl'
+      ||src==='pending_close_sync')&&!(raw!=null&&Number.isFinite(Number(raw)));
+    let val='—';
+    if(broker&&raw!=null)val=money(raw,t.pnl_currency||ccy);
+    else if(isEst)val='≈'+money(raw,t.pnl_currency||ccy);
+    else if(blankWait||src==='upl_estimate')val='gaida Capital £';
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
-    const badge=closePnlSrcBadge(t.pnl_source,pending&&!broker);
+    const badge=closePnlSrcBadge(t.pnl_source,blankWait&&!broker);
     const whenShow=when&&when!=='—'?when:'';
+    const pnlCls=broker?pnlClass(raw):(isEst?pnlClass(raw):'');
     return `<div class="psx-whale-row">
       <span class="tag">TRADE</span>
       <strong class="wh-epic">${esc(epic)}</strong>
       <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
-      <strong class="wh-pnl ${broker?pnlClass(p):''}">${esc(val)}</strong>
-      <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(pending?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
+      <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
+      <span class="${badge.cls}" title="${esc(sourceLabel(t.pnl_source||(blankWait?'pending_broker_pnl':'')))}">${esc(badge.text)}</span>
       ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:'<span class="wh-ago" aria-hidden="true"></span>'}
     </div>`;
   }).join(''));
@@ -1054,6 +1088,8 @@ async function renderDesk(data){
     const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
     epicTitle.textContent=ep;
   }
+  view=enrichViewOpenLevels(view,focus);
+  if(view)deskStructure=view;
   renderDeskQuote(view,focus);
   renderDeskLevels(view,focus);
   renderDeskIndicators(focus,view);
@@ -1579,15 +1615,19 @@ function renderCard(c){
   const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
     const tCcy=t.pnl_currency||ccy;
     const s=String(t.pnl_source||'').toLowerCase();
-    const pending=t.pending_cash||s==='pending_broker_pnl'||s==='pending_close_sync'
-      ||s==='upl_estimate';
+    const raw=t.pnl!=null?t.pnl:t.profit;
     const broker=s==='broker';
-    const showPnl=broker&&t.pnl!=null?t.pnl:null;
+    const isEst=s==='upl_estimate'&&raw!=null&&Number.isFinite(Number(raw));
+    const blankWait=!!(t.pending_cash||s==='pending_broker_pnl'||s==='pending_close_sync')
+      &&!(raw!=null&&Number.isFinite(Number(raw)));
+    const pending=blankWait||(s==='upl_estimate'&&!isEst);
+    const showPnl=broker&&raw!=null?raw:(isEst?raw:null);
     const cls=pnlClass(showPnl);
-    const srcTag=broker?' [Capital]':(pending?' [gaida Capital £]':
-      (s?` [${s}]`:''));
+    const srcTag=broker?' [Capital]':(isEst?' [≈UPL]':(pending?' [gaida Capital £]':
+      (s?` [${s}]`:'')));
     let right;
-    if(showPnl!=null){right=money(showPnl,tCcy);}
+    if(broker&&showPnl!=null){right=money(showPnl,tCcy);}
+    else if(isEst){right='≈'+money(showPnl,tCcy);}
     else if(pending){right='gaida Capital £';}
     else{right='—';}
     return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(srcTag)}</span><span class="${cls}">${esc(right)}</span></div>`;

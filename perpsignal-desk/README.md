@@ -1,14 +1,26 @@
-# PerpSignal Desk
+# PerpSignal Desk (React)
 
-Pixel-faithful recreation of the PerpSignal Desk trading terminal (reference viewport **1290 × 515**).
+Pixel UI for the trading terminal. **Live data comes from the FastAPI Admin API**
+(Capital.com + neural) when served at `http://127.0.0.1:8765/desk` after Admin login.
 
-## Demo data notice
+## Full system (recommended)
 
-All market data, LIVE badges, clocks, charts, and feeds are **deterministic mock/demo data** — not a live exchange stream. No real order execution is implemented.
+From the **repo root** (where `launcher.py` lives):
 
-## Develop
+```bat
+PALAIST_PILNO_SISTEMU.bat
+```
 
-**Windows:** double-click `start.bat` (installs deps, opens the browser, runs Vite).
+Then open:
+
+- `http://127.0.0.1:8765/admin` — full NEURAL Desk
+- `http://127.0.0.1:8765/desk` — this React Desk (same cookies / live feeds)
+
+`start.bat` in this folder now redirects to that full launcher (it does **not** start a mock-only Vite server).
+
+## Dev-only (UI work)
+
+Requires the Python backend already running on `8765`:
 
 ```bash
 cd perpsignal-desk
@@ -16,17 +28,16 @@ npm install
 npm run dev
 ```
 
-## Build & preview
+Vite proxies `/api` → `127.0.0.1:8765`. Without Admin login you see the offline banner + demo fallback panels.
+
+## Build into FastAPI
 
 ```bash
 npm run build
-npm run preview -- --host 127.0.0.1 --port 5173
 ```
 
-## Screenshot validation
+Outputs to `app/web/desk/` (served at `/desk`).
 
-```bash
-node scripts/screenshot.mjs
-```
+## Demo notice
 
-Captures `/opt/cursor/artifacts/perpsignal-desk-1290x515.png` at the reference viewport.
+If Admin is not logged in or broker is offline, panels fall back to deterministic demo shapes. LIVE badges mean “wired to Admin poll”, not a separate exchange websocket.

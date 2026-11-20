@@ -1,25 +1,28 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
-where npm >nul 2>&1
-if errorlevel 1 (
-  echo [ERROR] npm not found. Install Node.js from https://nodejs.org then try again.
-  pause
-  exit /b 1
-)
-
-echo Installing dependencies if needed...
-call npm install
-if errorlevel 1 (
-  echo [ERROR] npm install failed.
-  pause
-  exit /b 1
-)
-
-echo Starting PerpSignal Desk...
-start "" "http://localhost:5173/"
-call npm run dev
-
+echo ============================================================
+echo  PerpSignal Desk - novirza uz PILNO SISTEMU
+echo ============================================================
 echo.
+echo  :5173 Vite mock VAIROS - tas nav robots / Capital LIVE.
+echo  Palaizu parent mapes PALAIST_PILNO_SISTEMU.bat / run_windows.bat
+echo  Pareizie URL:
+echo    http://127.0.0.1:8765/admin
+echo    http://127.0.0.1:8765/desk
+echo.
+
+if exist "%~dp0..\PALAIST_PILNO_SISTEMU.bat" (
+  call "%~dp0..\PALAIST_PILNO_SISTEMU.bat"
+  exit /b %ERRORLEVEL%
+)
+if exist "%~dp0..\run_windows.bat" (
+  call "%~dp0..\run_windows.bat"
+  exit /b %ERRORLEVEL%
+)
+
+echo [ERROR] Nav atrasts run_windows.bat parent mapee.
+echo Palaid no repo saknes: PALAIST_PILNO_SISTEMU.bat
 pause
+exit /b 1

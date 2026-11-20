@@ -416,6 +416,12 @@
   color: var(--bear);
   letter-spacing: 0.04em;
 }
+.eng-short.up {
+  color: var(--bull);
+}
+.gh-acct {
+  text-decoration: none;
+}
 .eng-regime {
   font-size: 10px;
   font-weight: 700;

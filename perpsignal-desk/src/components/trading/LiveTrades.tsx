@@ -1,25 +1,29 @@
 import { LIVE_TRADES } from "../../data/mockMarketData";
 import { LiveBadge } from "../ui/LiveBadge";
 
-export function LiveTrades() {
+type Trade = { t: string; side: "BUY" | "SELL"; price: string; size: string; value: string };
+
+export function LiveTrades({ trades, epic }: { trades?: Trade[]; epic?: string }) {
+  const rows = trades && trades.length ? trades : [...LIVE_TRADES];
+  const label = (epic || "BTC").split(/[./]/)[0];
   return (
     <section className="panel live-trades">
       <header className="panel-header">
-        <span>LIVE TRADES BTC</span>
+        <span>LIVE TRADES {label}</span>
         <LiveBadge />
       </header>
       <div className="lt-flow">
-        FLOW 1s $0 / $0 +$0 · 5s $45.2K / $9.62K <span className="up">+$35.6K</span>
+        OPEN POSITIONS · {rows.length} prints · Capital feed
       </div>
       <div className="lt-cols">
         <span>TIME-UTC</span>
         <span>SIDE</span>
         <span>PRICE</span>
-        <span>SIZE-BTC</span>
+        <span>SIZE</span>
         <span>VALUE</span>
       </div>
       <div className="panel-body">
-        {LIVE_TRADES.map((t, i) => (
+        {rows.map((t, i) => (
           <div key={i} className={`lt-row ${t.side === "BUY" ? "buy" : "sell"}`}>
             <span className="num">{t.t}</span>
             <span className={t.side === "BUY" ? "up" : "dn"}>

@@ -1,16 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CANDLES, ema } from "../../data/mockCandles";
+import { CANDLES, ema, type Candle } from "../../data/mockCandles";
 import { LEVELS } from "../../data/mockMarketData";
 import { LiveBadge } from "../ui/LiveBadge";
 
 const TFS = ["1M", "5M", "15M", "1H", "4H"] as const;
+type Level = { label: string; price: number; color: string };
 
-export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (typeof TFS)[number]) => void }) {
+export function BTCChart({
+  tf,
+  onTf,
+  candles,
+  levels,
+  epic,
+}: {
+  tf: (typeof TFS)[number];
+  onTf: (t: (typeof TFS)[number]) => void;
+  candles?: Candle[];
+  levels?: Level[];
+  epic?: string;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [cross, setCross] = useState<{ x: number; y: number } | null>(null);
+  const series = candles && candles.length ? candles : CANDLES;
+  const lvl = levels && levels.length ? levels : LEVELS;
 
-  const closes = useMemo(() => CANDLES.map((c) => c.close), []);
+  const closes = useMemo(() => series.map((c) => c.close), [series]);
   const ema20 = useMemo(() => ema(closes, 20), [closes]);
   const ema50 = useMemo(() => ema(closes, 50), [closes]);
 
@@ -47,11 +62,11 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       ctx.fillText("PerpSignalDesk", padL + 8, padT + 22);
 
       // Scale primarily to candle range so bodies stay visible; levels may sit near edges.
-      const candlePrices = CANDLES.flatMap((c) => [c.high, c.low]);
+      const candlePrices = series.flatMap((c) => [c.high, c.low]);
       let minP = Math.min(...candlePrices);
       let maxP = Math.max(...candlePrices);
       // Pull in nearby levels so SL/ENT/TP remain on-canvas when close.
-      LEVELS.forEach((l) => {
+      lvl.forEach((l) => {
         if (l.price > maxP && l.price < maxP + 400) maxP = l.price;
         if (l.price < minP && l.price > minP - 400) minP = l.price;
       });
@@ -59,7 +74,7 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       minP -= padPx;
       maxP += padPx;
       const yOf = (p: number) => padT + ((maxP - p) / (maxP - minP)) * chartH;
-      const slot = (w - padL - padR) / CANDLES.length;
+      const slot = (w - padL - padR) / series.length;
 
       // grid
       ctx.strokeStyle = "rgba(40,48,59,0.65)";
@@ -82,7 +97,7 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       // volume profile (right of plot, left of labels)
       const buckets = 24;
       const counts = new Array(buckets).fill(0);
-      CANDLES.forEach((c) => {
+      series.forEach((c) => {
         const mid = (c.high + c.low) / 2;
         const b = Math.min(
           buckets - 1,
@@ -101,7 +116,7 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       });
 
       // candles — thick enough to read as OHLC sticks at ~100 bars
-      CANDLES.forEach((c, i) => {
+      series.forEach((c, i) => {
         const x = padL + i * slot + slot / 2;
         const up = c.close >= c.open;
         const col = up ? "#30d69a" : "#f06b78";
@@ -140,8 +155,8 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       drawEma(ema50, "#c9b28a");
 
       // volume histogram
-      const maxV = Math.max(...CANDLES.map((c) => c.volume));
-      CANDLES.forEach((c, i) => {
+      const maxV = Math.max(...series.map((c) => c.volume));
+      series.forEach((c, i) => {
         const x = padL + i * slot;
         const vh = (c.volume / maxV) * (volH - 4);
         const up = c.close >= c.open;
@@ -152,7 +167,7 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       // signal levels + price tags
       const fmt = (n: number) =>
         n.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-      LEVELS.forEach((l) => {
+      lvl.forEach((l) => {
         const y = yOf(l.price);
         ctx.strokeStyle = l.color;
         ctx.lineWidth = 1;
@@ -188,9 +203,9 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
 
       // time labels
       for (let i = 0; i < 5; i++) {
-        const idx = Math.floor((CANDLES.length - 1) * (i / 4));
+        const idx = Math.floor((series.length - 1) * (i / 4));
         const x = padL + idx * slot;
-        const d = new Date(CANDLES[idx].time * 1000);
+        const d = new Date(series[idx].time * 1000);
         const hh = d.getUTCHours();
         const ampm = hh >= 12 ? "PM" : "AM";
         const h12 = ((hh + 11) % 12) + 1;
@@ -210,7 +225,7 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
       ctx.fillStyle = "#c9b28a";
       ctx.fillText("EMA50", padL + 58, padT - 3);
       ctx.fillStyle = "#828b9d";
-      ctx.fillText(` · ${CANDLES.length} bars`, padL + 88, padT - 3);
+      ctx.fillText(` · ${series.length} bars`, padL + 88, padT - 3);
 
       if (cross) {
         ctx.strokeStyle = "rgba(203,208,218,0.35)";
@@ -229,12 +244,12 @@ export function BTCChart({ tf, onTf }: { tf: (typeof TFS)[number]; onTf: (t: (ty
     const ro = new ResizeObserver(paint);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [ema20, ema50, tf, cross]);
+  }, [ema20, ema50, tf, cross, series, lvl]);
 
   return (
     <section className="panel btc-chart">
       <header className="panel-header">
-        <span>BTC/USDT</span>
+        <span>{(epic || "BTC/USDT").replace(".", "/")}</span>
         <span className="chart-tools">
           <button type="button" className="mini-tab">
             VP

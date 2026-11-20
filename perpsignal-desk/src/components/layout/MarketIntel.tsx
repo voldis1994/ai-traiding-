@@ -1,14 +1,22 @@
 import { INTEL } from "../../data/mockMarketData";
 import { StatusBadge } from "../ui/StatusBadge";
 
-export function MarketIntel() {
+type Item = {
+  tag: "BULLISH" | "BEARISH" | "NEUTRAL";
+  title: string;
+  source: string;
+  ago: string;
+};
+
+export function MarketIntel({ items }: { items?: Item[] }) {
+  const rows = items && items.length ? items : [...INTEL];
   return (
     <aside className="market-intel panel">
       <header className="panel-header">
         <span>MARKET INTEL</span>
       </header>
       <div className="panel-body intel-feed">
-        {INTEL.map((n, i) => (
+        {rows.map((n, i) => (
           <article key={i} className="intel-card">
             <div className="intel-top">
               <StatusBadge kind={n.tag} />

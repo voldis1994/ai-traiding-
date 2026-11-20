@@ -37,7 +37,8 @@ def test_needs_protect_when_manual_tp_off():
         assert engine._needs_protect_brackets(p) is False
 
 
-def test_needs_protect_skips_after_trail_runtime():
+def test_needs_protect_skips_after_trail_runtime_only_when_trail_on():
+    """Trail TP Off is intentional only while TRAIL_ENABLED; otherwise re-attach."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 's.db')
         brain = AdaptiveBrain(store, data_dir=d)
@@ -51,6 +52,10 @@ def test_needs_protect_skips_after_trail_runtime():
             'dealId': 'r1', 'direction': 'BUY', 'level': 100.,
             'stopLevel': 99.2, 'profitLevel': None, 'epic': 'SIM', 'size': '1',
         }
+        # Live product: trail OFF → missing TP must still need protect.
+        assert engine.TRAIL_ENABLED is False
+        assert engine._needs_protect_brackets(p) is True
+        engine.TRAIL_ENABLED = True
         assert engine._needs_protect_brackets(p) is False
 
 

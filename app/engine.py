@@ -2228,9 +2228,9 @@ class SingleTradeEngine:
                 for pos in list(self.positions or []):
                     if self._needs_protect_brackets(pos):
                         await self.protect_position(pos)
-                if any(_broker_price_level(pos.get('stopLevel')) is None
+                # Still missing SL or TP on any deal — skip manage/entry until both on.
+                if any(self._needs_protect_brackets(pos)
                        for pos in (self.positions or [])):
-                    # Still no SL on any deal — skip neural OPEN; trail waits for stop.
                     return
             # LIVE context: include closed QUOTE minutes too. PK(epic,at) means a
             # minute written as QUOTE during the forming bar is excluded forever by
@@ -2502,12 +2502,12 @@ class SingleTradeEngine:
                     self.store.event('warning','hold_shadow resolve skipped',
                                     {'type':type(exc).__name__})
             if self.positions:
-                # Missing SL always; missing TP once for manual/OPEN (not after trail).
+                # Missing SL or TP — every live long/short must have both brackets.
                 # Multi-pos: protect every deal — a second fill must not stay naked.
                 for pos in list(self.positions or []):
                     if self._needs_protect_brackets(pos):
                         await self.protect_position(pos)
-                if any(_broker_price_level(pos.get('stopLevel')) is None
+                if any(self._needs_protect_brackets(pos)
                        for pos in (self.positions or [])):
                     return
                 # Reverse exit: evaluate each new M1 from *manage* scores (fresh
@@ -3527,10 +3527,13 @@ class SingleTradeEngine:
                 self._snapshot_open_upl(p)
                 # Trail enroll needs entry+SL; TP is optional (Capital often TP Off).
                 self._enroll_adaptive_protection(p,force=True)
-                if _broker_price_level(p.get('stopLevel')) is None:
+                missing_sl=_broker_price_level(p.get('stopLevel')) is None
+                missing_tp=_broker_price_level(p.get('profitLevel')) is None
+                if missing_sl or missing_tp:
                     self.store.event('protection',
-                        'OPEN confirmed without live SL — queueing protect from OPEN snapshot',
-                        {'deal_id':deal_s})
+                        'OPEN confirmed with incomplete brackets — queueing protect',
+                        {'deal_id':deal_s,'missing_sl':missing_sl,
+                         'missing_tp':missing_tp})
         if kind=='PROTECT' and deal_id is not None:
             p=next((x for x in (self.positions or [])
                     if str(x.get('dealId'))==str(deal_id)),None)
@@ -5720,21 +5723,38 @@ class SingleTradeEngine:
                 'broker_error':_safe_broker_error(exc)})
 
     def _needs_protect_brackets(self,p):
-        """True when SL missing, or TP still Off and we should one-shot fill it.
+        """True when SL or TP missing, wrong-side, or stale trail skipped TP.
 
-        Manual adopt often lands with SL only (Capital Take Profit Off). After a
-        trail confirm, Capital TP Off is intentional — leave it. If a prior flag
-        claimed TP was attached but broker still shows Off, clear and retry.
+        Functional rule: every live long/short must have BOTH working broker
+        brackets. Trail TP Off is intentional only while ``TRAIL_ENABLED``.
         """
         live_sl=_broker_price_level(p.get('stopLevel'))
         live_tp=_broker_price_level(p.get('profitLevel'))
-        if live_sl is not None and live_tp is not None:
+        direction=p.get('direction')
+        entry=_broker_price_level(p.get('level'))
+        if (live_sl is not None and live_tp is not None and
+                direction in ('BUY','SELL') and entry is not None and
+                bracket_learn.levels_correct_side(
+                    action=direction,entry=entry,
+                    stop_level=live_sl,profit_level=live_tp)):
             return False
+        # Both present but swapped / wrong side → rebuild.
+        if live_sl is not None and live_tp is not None:
+            return True
         deal=str(p.get('dealId') or '')
         if live_sl is None:
             return True
         # TP missing only.
         if not deal:
+            return True
+        # Trail OFF: never treat missing TP as intentional — always re-attach.
+        if not self.TRAIL_ENABLED:
+            if self.store.get('tp_attach_done:'+deal) and live_tp is None:
+                if self._protect_in_backoff(deal):
+                    return True
+                self.store.set('tp_attach_done:'+deal,False)
+                self.protected.discard(deal)
+                self._mark_protect_runtime(deal,'RETRY_TP',wait_sec=15.0)
             return True
         # Stuck recovery: flag said done but broker still Take Profit Off.
         # Do not clear during protect backoff — that re-armed a 3s PUT hammer.
@@ -5857,16 +5877,19 @@ class SingleTradeEngine:
                 'deal_id':p.get('dealId'),'wait_sec':rt.get('wait_sec'),
                 'reason':rt.get('status')}
             return
-        # Only block on a live OPEN still in flight — stale journal rows used to
-        # freeze manual TP forever on some accounts (andris) while peers worked.
+        # Protect a live deal even if a journal OPEN is UNCERTAIN — Capital may
+        # already have filled; blocking PUT left SL/TP Off forever. Only defer
+        # when this deal itself has CLOSE in flight (or stale PROTECT row).
         for item in (self.store.unresolved() or []):
             kind=item.get('kind')
             if kind=='PROTECT' and str(item.get('deal_id'))==deal_s:
                 self.store.order_update(item['id'],'SUPERSEDED')
             elif kind=='OPEN':
-                self._protect_defer(p,'OPEN still unresolved — wait for confirm',
-                                   order_id=item.get('id'))
-                return
+                # Live position present → supersede stale OPEN so brackets attach.
+                self.store.order_update(item['id'],'SUPERSEDED')
+                self.store.event('reconcile',
+                    'Superseded unresolved OPEN so live deal can protect',
+                    {'deal_id':deal_s,'order_id':item.get('id')})
             elif kind in ('CLOSE','PROTECT') and str(item.get('deal_id') or '') not in ('',deal_s):
                 # Foreign leftover — supersede so this deal can protect.
                 self.store.order_update(item['id'],'SUPERSEDED')
@@ -6491,10 +6514,10 @@ class SingleTradeEngine:
                         self.store.set(key,{**pending,'entry':entry if entry is not None else pending.get('entry')})
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
-                # Immediate repair if Capital left SL Off after ACCEPTED OPEN.
+                # Immediate repair if Capital left SL Off and/or TP Off after OPEN.
                 naked=next((x for x in (self.positions or [])
                             if str(x.get('dealId'))==str(conf_deal)
-                            and _broker_price_level(x.get('stopLevel')) is None),None)
+                            and self._needs_protect_brackets(x)),None)
                 if naked is not None:
                     await self.protect_position(naked)
             except Exception as exc:

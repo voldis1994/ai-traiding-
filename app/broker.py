@@ -108,21 +108,26 @@ class CapitalBroker:
         return await self._request('GET','/api/v1/history/activity',params=params)
     async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None,limit_distance=None):
         if direction not in ('BUY','SELL') or Decimal(str(size))<=0:raise ValueError('Invalid trade')
-        payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False}
-        if stop_distance is not None:payload['stopDistance']=float(stop_distance)
+        # Functional invariant: every long/short must open with both SL and TP
+        # distances — never a naked size-only POST.
         distance=profit_distance if profit_distance is not None else limit_distance
-        if distance is not None:payload['profitDistance']=float(distance)
+        if stop_distance is None or distance is None:
+            raise ValueError('OPEN requires both stopDistance and profitDistance')
+        if float(stop_distance)<=0 or float(distance)<=0:
+            raise ValueError('OPEN stop/profit distances must be positive')
+        payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False,
+                 'stopDistance':float(stop_distance),'profitDistance':float(distance)}
         return await self._request('POST','/api/v1/positions',json=payload)
     async def close_position(self,deal_id):
         return await self._request('DELETE','/api/v1/positions/'+quote(str(deal_id),safe=''))
     async def update_position(self,deal_id,stop_level=None,profit_level=None,limit_level=None):
-        payload={}
+        # Capital PUT that omits a bracket clears it — always require BOTH levels.
+        profit=profit_level if profit_level is not None else limit_level
+        if stop_level is None or profit is None:
+            raise ValueError('PROTECT requires both stopLevel and profitLevel')
         # Capital rejects stopLevel/profitLevel that are not on the price grid
         # (e.g. 4006.075). Pass through floats already snapped by protection_ai.
-        if stop_level is not None:payload['stopLevel']=float(stop_level)
-        if profit_level is not None or limit_level is not None:
-            payload['profitLevel']=float(profit_level if profit_level is not None else limit_level)
-        if not payload:raise ValueError('No changes supplied')
+        payload={'stopLevel':float(stop_level),'profitLevel':float(profit)}
         return await self._request('PUT','/api/v1/positions/'+quote(str(deal_id),safe=''),json=payload)
     async def close(self, *, end_session: bool=True):
         # Free Capital.com session slot so a second connect (or another client) is not blocked.

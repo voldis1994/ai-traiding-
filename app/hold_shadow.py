@@ -110,7 +110,7 @@ def save_pending(store, rows: list) -> list:
 
 def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
                    profit_distance=None, tick=None, min_distance=None,
-                   trail=True, slip_bps=0.):
+                   trail=False, slip_bps=0.):
     """Replay proposal + opposite under identical bracket/cost rules.
 
     ``slip_bps`` must match LIVE/shadow_paper friction — zero-slip sims were
@@ -158,7 +158,7 @@ def evaluate_sides(*, proposal, bars, spread=0., stop_distance=None,
 
 def enqueue(store, *, proposal, reason, bar_time, epic, entry, spread,
             stop_distance, profit_distance, tick, min_distance, transition,
-            scores=None, trail=True, slip_bps=0.):
+            scores=None, trail=False, slip_bps=0.):
     """Queue a HOLD abstention for later opposite-path shadow."""
     if proposal not in ('BUY', 'SELL'):
         return None

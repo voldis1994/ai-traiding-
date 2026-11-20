@@ -174,71 +174,23 @@ def engine_fixture(tmp):
     return eng,broker,store
 
 
-def test_live_update_protects_with_confirmation_and_throttle():
+def test_adapt_protection_disabled_never_puts_trail():
+    """Live trail OFF — fixed OHLC SL/TP; adapt_protection must not ratchet SL."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             e,b,s=engine_fixture(d)
+            assert e.TRAIL_ENABLED is False
             await e.sync()
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            assert b.open[0]['position']['stopLevel']>99.2
-            # Trail PUT must include profitLevel so Capital keeps TP.
-            assert b.requests[0][3]==101.6
-            assert b.open[0]['position']['profitLevel']==101.6
-            assert not s.unresolved()
-            assert s.get('adaptive_runtime:auto1')['status']=='CONFIRMED'
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-    asyncio.run(scenario())
-
-
-def test_trail_put_never_clears_existing_take_profit():
-    """Regression: TP touched but never filled because trail wiped profitLevel."""
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d)
-            await e.sync()
+            live_sl=e.positions[0]['stopLevel']
             live_tp=e.positions[0]['profitLevel']
             await e.adapt_protection(e.positions[0])
-            assert b.requests and b.requests[0][3]==live_tp
+            assert not b.requests
+            assert e.positions[0]['stopLevel']==live_sl
             assert e.positions[0]['profitLevel']==live_tp
-    asyncio.run(scenario())
-
-
-def test_stale_broker_levels_are_not_false_confirmed():
-    """Stale broker echo must not mark trail CONFIRMED — and must not pause LIVE.
-
-    Trail validates stop-only vs minStop (TP near market must not block SL).
-    When Capital keeps the old stop, reconcile fails → SUPERSEDED, levels kept,
-    robot stays armed (trail glitch must not freeze OPEN).
-    """
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d);b.return_old=True
-            await e.sync()
+            brief=(e.protection_brief or {}).get('status','')
+            assert 'disabled' in brief.lower() and 'ohlc' in brief.lower()
             await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            assert e.armed and e.execution_enabled
-            assert not s.unresolved()  # SUPERSEDED, not left hanging
-            assert b.open[0]['position']['stopLevel']==99.2  # old level kept
-            status=(e.protection_brief or {}).get('status','')
-            assert 'uncertain' in status.lower() or 'kept' in status.lower()
-            runtime=s.get('adaptive_runtime:auto1') or {}
-            assert runtime.get('status')!='CONFIRMED'
-    asyncio.run(scenario())
-
-
-def test_broker_rejection_does_not_remove_old_stop_or_retry():
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d);b.reject=True
-            await e.sync()
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            assert not s.unresolved()
-            assert e.armed and e.execution_enabled
-            assert b.open[0]['position']['stopLevel']==99.2
-            await e.adapt_protection(e.positions[0]);assert len(b.requests)==1
+            assert not b.requests
     asyncio.run(scenario())
 
 
@@ -270,60 +222,17 @@ def test_crossed_tp_or_poor_broker_rules_do_not_trigger_put():
     assert propose_broker_trail(p,dict(_market(101.35,101.45),min_distance=None),_meta()) is None
 
 
-def test_broker_rejection_backoff_then_retries():
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            e,b,s=engine_fixture(d);b.reject=True
-            await e.sync();await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==1
-            rt=s.get('adaptive_runtime:auto1')
-            rt['mono']=time.monotonic()-20
-            s.set('adaptive_runtime:auto1',rt)
-            b.reject=False
-            await e.adapt_protection(e.positions[0])
-            assert len(b.requests)==2
-    asyncio.run(scenario())
-
-
-class CorrectOpeningBroker(BrokerSimulation):
-    async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None):
-        self.requests.append(('OPEN',epic,direction,size,stop_distance,profit_distance))
-        sign=1 if direction=='BUY' else -1
-        entry=self.price
-        self.open=[{'position':{'dealId':'b2','size':str(size),'direction':direction,'level':entry,
-              'stopLevel':entry-sign*float(stop_distance),
-              'profitLevel':entry+sign*float(profit_distance)},'market':{'epic':epic}}]
-        return {'dealReference':'auto-open-2'}
-
-
-def test_confirmed_sell_open_registers_persistent_adaptive_rights():
-    async def scenario():
-        with tempfile.TemporaryDirectory() as d:
-            from app.engine import AdaptiveBrain
-            s=Store(Path(d)/'state.sqlite3');brain=AdaptiveBrain(s,data_dir=d)
-            e=SingleTradeEngine(s,brain);b=CorrectOpeningBroker()
-            e.attach(b);await e.sync()
-            b.open=[];await e.sync()
-            e.market_context={'ready':True}
-            from tests.test_integration import seed_swing_candles
-            from tests.ohlc_zone_fixtures import put_engine_in_entry_zone
-            seed_swing_candles(s,'SIM')
-            assert put_engine_in_entry_zone(e,s,'SIM','SELL',broker=b) is not None
-            m=e.market
-            async def _mkt(epic):
-                return {'snapshot':{'bid':m['bid'],'offer':m['ask'],'marketStatus':'TRADEABLE'},
-                        'instrument':{'onePipMeans':0.01},
-                        'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.15}}}
-            b.market=_mkt
-            await e.submit('SELL')
-            meta=s.get('adaptive_protection:b2')
-            assert meta and meta['owner']=='AUTO' and meta['epic']=='SIM'
-            assert meta['original_risk']>0 and meta['original_profit']>0
-            assert len([x for x in b.requests if x[0]=='OPEN'])==1
-            assert not s.unresolved()
-    asyncio.run(scenario())
+def test_robot_open_does_not_enroll_adaptive_trail_when_disabled():
+    """Confirmed OPEN used to write adaptive_protection — trail off = no enroll."""
+    with tempfile.TemporaryDirectory() as d:
+        s=Store(Path(d)/'state.sqlite3')
+        e=SingleTradeEngine(s,Brain())
+        assert e.TRAIL_ENABLED is False
+        s.set('robot_open:b2',True)
+        p={'dealId':'b2','epic':'SIM','direction':'SELL','level':100.,
+           'stopLevel':100.8,'profitLevel':98.5,'size':'.25'}
+        assert e._enroll_adaptive_protection(p,force=True) is False
+        assert not s.get('adaptive_protection:b2')
 
 
 class OpenWithoutTakeProfitBroker(BrokerSimulation):
@@ -341,7 +250,7 @@ class OpenWithoutTakeProfitBroker(BrokerSimulation):
         return {'dealReference':'open-no-tp'}
 
 
-def test_open_without_tp_still_enrolls_trail():
+def test_open_without_tp_does_not_enroll_trail_when_disabled():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             from app.engine import AdaptiveBrain
@@ -360,33 +269,23 @@ def test_open_without_tp_still_enrolls_trail():
                         'dealingRules':{'minNormalStopOrLimitDistance':{'unit':'POINTS','value':0.15}}}
             b.market=_mkt
             await e.submit('BUY')
-            meta=s.get('adaptive_protection:b2')
-            assert meta and meta['owner']=='AUTO'
-            assert meta['original_risk']>0
-            assert meta.get('original_profit') in (None,0) or meta['original_profit'] is None
-            # Trail must still propose with TP Off once price runs.
-            e.positions=[{'dealId':'b2','epic':'SIM','direction':'BUY','level':100.,
-                          'stopLevel':99.2,'profitLevel':None,'size':'1'}]
-            e.market={**(e.market or {}),
-                'mid':101.2,'bid':101.19,'ask':101.21,'spread':0.02,
-                'tick':0.01,'min_distance':0.15,'epic':'SIM','status':'TRADEABLE'}
-            prop=propose_broker_trail(e.positions[0],e.market,meta,extreme=101.35)
-            assert prop and prop['stop_level']>99.2
-            assert prop['profit_level'] is None
+            assert s.get('adaptive_protection:b2') in (None, False, {})
+            await e.adapt_protection({
+                'dealId':'b2','epic':'SIM','direction':'BUY','level':100.,
+                'stopLevel':99.2,'profitLevel':None,'size':'1'})
+            assert not [r for r in b.requests if r[0]=='PROTECT']
     asyncio.run(scenario())
 
 
-def test_late_enroll_from_robot_open_when_meta_missing():
+def test_late_enroll_disabled_when_trail_off():
     with tempfile.TemporaryDirectory() as d:
         s=Store(Path(d)/'t.sqlite3')
         e=SingleTradeEngine(s,Brain())
         s.set('robot_open:late1',True)
         p={'dealId':'late1','epic':'GOLD','direction':'SELL','level':4015.,
            'stopLevel':4020.,'profitLevel':None,'size':'.1'}
-        assert e._enroll_adaptive_protection(p)
-        meta=s.get('adaptive_protection:late1')
-        assert meta['owner']=='AUTO' and meta['original_risk']==pytest.approx(5.0)
-        assert meta['original_profit'] is None
+        assert e._enroll_adaptive_protection(p) is False
+        assert s.get('adaptive_protection:late1') in (None, False, {})
 
 
 def test_tick_prefers_decimal_places_over_one_pip_means():

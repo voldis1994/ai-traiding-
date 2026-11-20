@@ -125,8 +125,8 @@ def test_protect_ignores_foreign_unresolved_orders():
     asyncio.run(scenario())
 
 
-def test_manual_both_brackets_claims_trail_no_left_unchanged():
-    """Capital adopt with SL+TP already set must enroll trail — not 'left unchanged'."""
+def test_manual_both_brackets_keeps_fixed_ohlc_sl_tp_no_trail():
+    """With trail off, adopt with SL+TP already set must not enroll or ratchet."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store = Store(Path(d) / 's.db')
@@ -147,15 +147,14 @@ def test_manual_both_brackets_claims_trail_no_left_unchanged():
             }
             pos = engine.positions[0]
             assert engine._needs_protect_brackets(pos) is False
-            assert not store.get('robot_open:both-on')
+            live_sl, live_tp = pos['stopLevel'], pos['profitLevel']
             await engine.adapt_protection(pos)
-            assert store.get('robot_open:both-on')
-            meta = store.get('adaptive_protection:both-on')
-            assert meta and meta.get('owner') == 'AUTO'
+            assert not store.get('adaptive_protection:both-on')
+            assert not [r for r in broker.requests if r[0] == 'PROTECT']
+            assert engine.positions[0]['stopLevel'] == live_sl
+            assert engine.positions[0]['profitLevel'] == live_tp
             brief = str((engine.protection_brief or {}).get('status') or '')
-            # Must not stick on the old "left unchanged" theater — trail owns it.
-            assert 'left unchanged' not in brief.lower()
-            assert meta.get('original_risk') == pytest.approx(4.0)
+            assert 'disabled' in brief.lower()
 
     asyncio.run(scenario())
 
@@ -214,8 +213,8 @@ def test_protect_attaches_tp_on_manual_sl_only_position():
             assert profit is not None and float(profit) < 100.0  # SELL TP below entry
             assert store.get('tp_attach_done:manual-tp')
             assert store.get('robot_open:manual-tp')
-            meta = store.get('adaptive_protection:manual-tp')
-            assert meta and meta.get('owner') == 'AUTO'
+            # Trail off — OHLC TP attach must not enroll adaptive ratchet.
+            assert not store.get('adaptive_protection:manual-tp')
 
     asyncio.run(scenario())
 

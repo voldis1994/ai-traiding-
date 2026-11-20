@@ -56,7 +56,8 @@ DEFAULTS = {
     # Soft ceiling clamps stale Store values that still hold 0.28 from older builds.
     'learn_lr': 0.10,
     'learn_win_repeats': 2,
-    'learn_loss_repeats': 3,
+    # Audit: against-structure losses need stronger ΔW to stick the correct side.
+    'learn_loss_repeats': 4,
     # Closed-trade KEEP/ROLLBACK — ΔW sticks only if holdout accuracy improves.
     'learn_gate_enabled': 1,
     'learn_gate_min_rows': 12,
@@ -91,10 +92,13 @@ DEFAULTS = {
     # Louder seed so library graves (e.g. TREND_DOWN×BUY) actually move the vote.
     'structure_edge_min_samples': 5,
     'structure_edge_nudge': 0.12,
-    # Trail self-arm: full 1R + share of TP distance — same geometry as brackets.
-    'trail_arm_mfe_frac': 1.0,
-    'trail_arm_tp_frac': 0.45,
+    # Trail self-arm — audit: 19 GOLD trades hit ≥0.8×TP then full SL (−£9.46).
+    # Arm earlier so winners can lock; still require both R and TP progress.
+    'trail_arm_mfe_frac': 0.80,
+    'trail_arm_tp_frac': 0.40,
     'trail_arm_min_ev': 0.0,
+    # LIVE broker trail — on by default after GOLD near-miss audit (was hard-off).
+    'trail_live_enabled': 1,
     # First lock sits BE+ (profit cushion) so a small bounce does not scratch.
     'trail_be_cushion_frac': 0.15,
     # Post-BE gap also floors vs original TP so trail stays even with RR.
@@ -187,6 +191,19 @@ DEFAULTS = {
     'gold_strat_chop_hold': 0,
     'gold_strat_chop_min_edge': 0.18,
     'gold_strat_soft_nudge': 0.18,
+    # Re-entry confirm — audit: <1min same-dir re-open after loss −£14.24 / 176.
+    'reentry_confirm_enabled': 1,
+    'reentry_raw_strong': 0.20,
+    'reentry_raw_medium': 0.12,
+    'reentry_raw_weak': 0.07,
+    'reentry_same_dir_atr_frac': 0.55,
+    'reentry_medium_m1_streak': 2,
+    # Strategy generator — harvest library EV → soft LIVE cards (not .py files).
+    'strategy_gen_enabled': 1,
+    'strategy_gen_min_samples': 8,
+    'strategy_gen_min_mean': 0.08,
+    'strategy_gen_nudge': 0.14,
+    'strategy_gen_max_active': 12,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -257,6 +274,7 @@ BOUNDS = {
     'trail_arm_mfe_frac': (0.70, 1.0),
     'trail_arm_tp_frac': (0.25, 0.70),
     'trail_arm_min_ev': (-1.0, 2.0),
+    'trail_live_enabled': (0, 1),
     'trail_be_cushion_frac': (0.05, 0.35),
     'trail_gap_vs_tp_frac': (0.15, 0.50),
     'bracket_vs_vol_noise': (0.8, 2.0),
@@ -307,6 +325,17 @@ BOUNDS = {
     'gold_strat_chop_hold': (0, 1),
     'gold_strat_chop_min_edge': (0.05, 0.50),
     'gold_strat_soft_nudge': (0.0, 0.40),
+    'reentry_confirm_enabled': (0, 1),
+    'reentry_raw_strong': (0.12, 0.28),
+    'reentry_raw_medium': (0.06, 0.18),
+    'reentry_raw_weak': (0.03, 0.12),
+    'reentry_same_dir_atr_frac': (0.25, 1.0),
+    'reentry_medium_m1_streak': (1, 4),
+    'strategy_gen_enabled': (0, 1),
+    'strategy_gen_min_samples': (4, 40),
+    'strategy_gen_min_mean': (0.02, 0.50),
+    'strategy_gen_nudge': (0.04, 0.35),
+    'strategy_gen_max_active': (4, 24),
 }
 
 IMMUTABLE_NOTE = (

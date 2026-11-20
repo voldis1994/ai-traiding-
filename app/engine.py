@@ -2718,6 +2718,18 @@ class SingleTradeEngine:
                                             'reason','allowed')})
         except Exception as exc:
             gold_nudge_meta={'nudged':False,'reason':type(exc).__name__}
+        # Strategy gen: soft LIVE cards harvested from library EV (next evo).
+        strat_nudge_meta={'nudged':False}
+        try:
+            from . import strategy_gen
+            epic_sg=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+            live_struct=((edge_advice or {}).get('structure')
+                         or ctx.get('structure') or 'CHOP')
+            nudged_scores,strat_nudge_meta=strategy_gen.soft_nudge_scores(
+                nudged_scores,structure=live_struct,epic=epic_sg,store=self.store)
+            nudge_meta=dict(nudge_meta or {},strategy_gen=strat_nudge_meta)
+        except Exception as exc:
+            strat_nudge_meta={'nudged':False,'reason':type(exc).__name__}
         # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
         forecast_meta={'nudged':False}
         try:
@@ -4687,7 +4699,7 @@ class SingleTradeEngine:
             'profit_distance':profit_d,
             'tick':tick,
             'min_distance':min_d,
-            'trail':bool(self.TRAIL_ENABLED),
+            'trail':bool(self._trail_is_enabled()),
         }
 
     def _structure_teacher_context(self,deal_id,saved,*,epic,direction,entry,
@@ -4717,6 +4729,7 @@ class SingleTradeEngine:
             self.store,epic=epic,structure=frame.get('structure') or 'CHOP')
         return {
             'frame':frame,
+            'structure':(frame or {}).get('structure'),
             'structure_prefer_hold':bool(prefer.get('prefer_hold')),
             'structure_key':prefer.get('key'),
             'structure_reason':prefer.get('reason'),
@@ -5288,6 +5301,23 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','OHLC entry gates learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
+            # Strategy cards: attribute live £ + re-harvest so new EV can go LIVE.
+            try:
+                from . import strategy_gen
+                st_live=(struct_ctx.get('structure')
+                         if isinstance(struct_ctx,dict) else None)
+                if not st_live and isinstance(saved,dict):
+                    st_live=saved.get('structure')
+                if not st_live:
+                    st_live=self._trail_structure_label(
+                        {'epic':epic,'level':entry,'direction':direction})
+                strategy_gen.observe_close(
+                    self.store,structure=st_live,direction=direction,
+                    broker_pnl=pnl_value,epic=epic)
+                strategy_gen.harvest(self.store,epic=epic)
+            except Exception as exc:
+                self.store.event('warning','Strategy gen observe skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None
                 if isinstance(saved,dict):
@@ -5540,8 +5570,16 @@ class SingleTradeEngine:
             path,entry=entry,exit_level=None,pre_bars=pre)
         return (frame or {}).get('structure') or 'CHOP'
 
-    # Live trail OFF — SL/TP stay where OHLC brackets put them (no SL ratchet).
-    TRAIL_ENABLED=False
+    # Class fallback — LIVE reads ``trail_live_enabled`` from self_params (audit ON).
+    TRAIL_ENABLED=True
+
+    def _trail_is_enabled(self):
+        """Broker trail ON/OFF — seed from GOLD near-miss audit; evolvable."""
+        try:
+            from .self_params import get as sp_get
+            return bool(int(sp_get(self.store,'trail_live_enabled',1)))
+        except Exception:
+            return bool(getattr(self,'TRAIL_ENABLED',True))
 
     def _enroll_adaptive_protection(self,p,*,force=False):
         """Register robot deal for broker trail. Needs entry+SL; TP optional.
@@ -5549,10 +5587,10 @@ class SingleTradeEngine:
         Capital often confirms OPEN with stopLevel set and Take Profit Off —
         requiring TP here used to skip enrollment entirely, so trail never ran.
 
-        Trail is currently disabled (``TRAIL_ENABLED=False``) — enrollment is a
-        no-op so adaptive SL ratchet never arms.
+        Gated by ``trail_live_enabled`` (self_params) — audit default ON so
+        ≥0.8×TP winners can lock instead of reversing to full SL.
         """
-        if not self.TRAIL_ENABLED:
+        if not self._trail_is_enabled():
             return False
         deal_id=p.get('dealId')
         if not deal_id:return False
@@ -5598,9 +5636,9 @@ class SingleTradeEngine:
         already had stop+profit, so ``protect_position`` never ran, ``robot_open``
         was never set, and every poll showed ``left unchanged`` (no OHLC trail).
 
-        Trail disabled — never claim for ratchet.
+        Trail gated by ``_trail_is_enabled`` (self_params trail_live_enabled).
         """
-        if not self.TRAIL_ENABLED:
+        if not self._trail_is_enabled():
             return False
         deal=str(p.get('dealId') or '')
         if not deal:
@@ -5632,11 +5670,10 @@ class SingleTradeEngine:
         OHLC (same zone data), not a hardcoded fraction of R.
         Trail self-arms from MFE / structure EV (not a fixed human 1R law).
 
-        Currently disabled: live deals keep the OHLC swing SL/TP fixed — no
-        broker trail PUT that ratchets the stop.
+        Gated by ``trail_live_enabled`` — when off, fixed OHLC SL/TP only.
         """
         deal_s=str(p.get('dealId'))
-        if not self.TRAIL_ENABLED:
+        if not self._trail_is_enabled():
             self.protection_brief={
                 'status':'Trail disabled — fixed OHLC SL/TP only',
                 'deal_id':deal_s}
@@ -5842,7 +5879,7 @@ class SingleTradeEngine:
         if not deal:
             return True
         # Trail OFF: never treat missing TP as intentional — always re-attach.
-        if not self.TRAIL_ENABLED:
+        if not self._trail_is_enabled():
             if self.store.get('tp_attach_done:'+deal) and live_tp is None:
                 if self._protect_in_backoff(deal):
                     return True

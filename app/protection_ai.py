@@ -163,6 +163,10 @@ def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
     return max(floor,min(open_gap,knobs['fallback_frac']*open_gap))
 
 
+# Live Capital trail PUTs are gated in ``SingleTradeEngine.TRAIL_ENABLED``.
+# This helper still computes proposals for unit tests / offline sims.
+
+
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
                          zone_range=None,store=None,arm_decision=None,atr=None):
     """Trail SL behind broker extreme — past break-even, even with SL/TP.
@@ -176,6 +180,8 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     TP mark twice with no order left to fill.
 
     BUY:  stop = peak − gap.  SELL: stop = trough + gap.
+
+    Live engine must not call this while ``TRAIL_ENABLED`` is False.
     """
     if market.get('status')!='TRADEABLE':return None
     direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)

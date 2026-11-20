@@ -945,13 +945,13 @@ def cap_far_swing_sl(*, action, entry, stop_level, stop_d, floor, atr=None,
                 'sl_max': float(sl_max), 'swing_hi': float(closer['price']),
                 'reason': 'atr_closer_sl',
             }
-    # No closer pivot — hard-cap distance (TP stays where structure put it).
-    stop_d = float(sl_max)
-    stop_level = _set_stop_from_distance(action=action, entry=entry_f, stop_d=stop_d)
+    # No closer swing inside the ATR band — keep the real far swing.
+    # Never invent a soft ATR stop that is not an OHLC pivot.
     return {
-        'capped': True, 'closer_pivot': False, 'max_atr_mult': mult,
+        'capped': False, 'closer_pivot': False, 'refuse': False,
+        'max_atr_mult': mult,
         'stop_distance': float(stop_d), 'stop_level': float(stop_level),
-        'sl_max': float(sl_max), 'reason': 'atr_cap_sl',
+        'sl_max': float(sl_max), 'reason': 'keep_far_swing',
     }
 
 
@@ -1177,25 +1177,29 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     kama_stop=out.get('kama_stop'))
 
     reason = picked.get('reason') or 'swing_levels'
-    # 1) Far swing SL vs ATR → closer pivot or ATR-cap (TP untouched).
+    # 1) Far swing SL vs ATR → closer swing pivot only (never invent ATR stop).
     far = cap_far_swing_sl(
         action=action, entry=entry_f, stop_level=stop_level, stop_d=stop_d,
         floor=floor, atr=atr_v, highs=highs, lows=lows, buffer=buffer,
         store=store)
-    if far.get('capped'):
+    if far.get('capped') and far.get('closer_pivot'):
         stop_d = float(far['stop_distance'])
         stop_level = float(far['stop_level'])
-        reason = str(reason) + '+' + str(far.get('reason') or 'atr_cap_sl')
+        reason = str(reason) + '+' + str(far.get('reason') or 'atr_closer_sl')
         if far.get('swing_hi') is not None:
             picked['swing_hi'] = float(far['swing_hi'])
         if far.get('swing_lo') is not None:
             picked['swing_lo'] = float(far['swing_lo'])
+    elif far.get('reason') == 'keep_far_swing':
+        # Far OHLC swing kept — never rewrite to ATR invent.
+        reason = str(reason) + '+keep_far_swing'
 
-    # 2) Min RR — prefer farther TP; never hairline ATR-locked SL; never swap sides.
+    # 2) Min RR — prefer farther TP; never hairline a kept far swing SL.
+    atr_locked = bool(far.get('capped') or far.get('reason') == 'keep_far_swing')
     rr = apply_min_rr(
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-        floor=floor, store=store, atr_locked=bool(far.get('capped')),
+        floor=floor, store=store, atr_locked=atr_locked,
         atr=atr_v, highs=highs, lows=lows)
     if not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',

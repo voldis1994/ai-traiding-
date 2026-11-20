@@ -523,48 +523,72 @@ function renderDeskLean(client,lp,sp){
   if(el)stableHtml(el,'');
 }
 
+/** Signal Watch from OHLC structure + swing RR — never tape-Δ chase after the move. */
+function deskOhlcSignal(m,focusAct,isFocus){
+  const pref=String((m&&m.preferred)||((m&&m.mtf)||{}).preferred||'').toUpperCase();
+  const br=(m&&m.swing_brackets)||{};
+  const ready=!!br.ready;
+  const rr=br.rr!=null&&Number.isFinite(Number(br.rr))?Number(br.rr):null;
+  const bias=String(((m&&m.structure)||{}).bias||((m&&m.structure)||{}).event||'');
+  if(isFocus&&focusAct){
+    const neural=focusAct.act;
+    if((pref==='BUY'||pref==='SELL')&&(neural==='BUY'||neural==='SELL')&&neural!==pref){
+      return {act:'HOLD',label:`neural≠ohlc ${pref} →`};
+    }
+    if(neural==='BUY'||neural==='SELL'){
+      if((pref==='BUY'||pref==='SELL')&&!ready){
+        return {act:'HOLD',label:`ohlc ${pref} wait RR →`};
+      }
+      const s=neural==='SELL'?focusAct.sell:focusAct.buy;
+      const pct=Math.round(Math.max(0,Math.min(1,s))*100);
+      if(ready&&rr!=null)return {act:neural,label:`ohlc RR ${num(rr,2)} ${pct}% →`};
+      if(ready)return {act:neural,label:`ohlc swing ${pct}% →`};
+      return {act:neural,label:`neural ${pct}% →`};
+    }
+    return {act:'HOLD',label:bias?`ohlc ${bias} →`:'neural HOLD →'};
+  }
+  if(pref==='BUY'||pref==='SELL'){
+    if(ready&&rr!=null)return {act:pref,label:`ohlc RR ${num(rr,2)} →`};
+    if(ready)return {act:pref,label:'ohlc swing →'};
+    return {act:'HOLD',label:`ohlc ${pref} wait RR →`};
+  }
+  return {act:'HOLD',label:bias?`ohlc ${bias} →`:'ohlc — →'};
+}
+
 function renderDeskSignal(client,markets){
   const el=$('deskSignal');
   if(!el)return;
   const rows=(markets||[]).slice(0,6);
+  const focusAct=client?deskScoreAction(client):null;
+  const focusEpic=((client&&client.activity)||{}).market
+    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
   if(!rows.length&&client){
-    const {buy,hold,sell,act}=deskScoreAction(client);
-    const strength=act==='SELL'?sell:(act==='BUY'?buy:hold);
-    const agree=Math.round(Math.max(0,Math.min(1,strength))*100);
-    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
-    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
-    const epic=((client.activity||{}).market)||(((client.activity||{}).mandate)||{}).epic||'FOCUS';
+    const epic=focusEpic||'FOCUS';
+    const syn={
+      epic,
+      preferred:(client.activity&&client.activity.mtf_momentum
+        &&client.activity.mtf_momentum.preferred)||null,
+      mtf:(client.activity&&client.activity.mtf_momentum)||null,
+      swing_brackets:null,structure:null,
+    };
+    const sig=deskOhlcSignal(syn,focusAct,true);
+    const side=sig.act==='BUY'?'LONG':(sig.act==='SELL'?'SHORT':'HOLD');
+    const cls=sig.act==='BUY'?'long':(sig.act==='SELL'?'short':'hold');
     stableHtml(el,`<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">neural ${agree}% →</span>
+      <span class="agree">${esc(sig.label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`);
     return;
   }
   if(!rows.length){stableHtml(el,'<div class="psx-empty">No signals</div>');return}
-  const focusAct=client?deskScoreAction(client):null;
-  const focusEpic=((client&&client.activity)||{}).market
-    ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
   stableHtml(el,rows.map((m)=>{
     const epic=m.epic||'—';
-    const isFocus=focusAct&&focusEpic&&String(epic).toUpperCase()===String(focusEpic).toUpperCase();
-    let act='HOLD',label='';
-    if(isFocus){
-      act=focusAct.act;
-      const s=act==='SELL'?focusAct.sell:(act==='BUY'?focusAct.buy:focusAct.hold);
-      label=`neural ${Math.round(Math.max(0,Math.min(1,s))*100)}% →`;
-    }else{
-      // Tape Δ only — not neural agreement (never invent "agree %" from candles).
-      const ch=deskCandleChange(m.candles);
-      if(ch!=null){
-        act=ch>0.05?'BUY':(ch<-0.05?'SELL':'HOLD');
-        label=`tape ${ch>=0?'+':''}${num(ch,2)}% →`;
-      }else{
-        label='tape — →';
-      }
-    }
-    const side=act==='BUY'?'LONG':(act==='SELL'?'SHORT':'HOLD');
-    const cls=act==='BUY'?'long':(act==='SELL'?'short':'hold');
+    const isFocus=!!(focusAct&&focusEpic
+      &&String(epic).toUpperCase()===String(focusEpic).toUpperCase());
+    const sig=deskOhlcSignal(m,focusAct,isFocus);
+    const side=sig.act==='BUY'?'LONG':(sig.act==='SELL'?'SHORT':'HOLD');
+    const cls=sig.act==='BUY'?'long':(sig.act==='SELL'?'short':'hold');
     return `<div class="psx-sig-row"><strong>${esc(epic)}</strong>
-      <span class="agree">${esc(label)}</span>
+      <span class="agree">${esc(sig.label)}</span>
       <span class="psx-sig-btn ${cls}">${side}</span></div>`;
   }).join(''));
 }

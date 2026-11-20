@@ -2823,6 +2823,14 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=zone_gate.get('reason') or 'wait_entry_zone',
                             proposal=result.get('proposal') or result['action'])
+            # Signal must match OHLC swing + min RR — same brackets LIVE OPEN uses.
+            # Never advertise BUY/SELL when structure cannot place SL/TP yet.
+            swing_br=self._would_be_brackets(result['action'])
+            result=dict(result,ohlc_swing_brackets=swing_br)
+            if not swing_br:
+                return dict(result,action='HOLD',
+                            reason='wait_ohlc_swing_rr',
+                            proposal=result.get('proposal') or result['action'])
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(

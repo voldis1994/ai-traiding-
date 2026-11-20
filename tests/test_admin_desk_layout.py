@@ -53,7 +53,7 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=116' in html
-    assert 'admin.js?v=119' in html
+    assert 'admin.js?v=120' in html
     assert 'ohlc-chart.js?v=11' in html
 
 
@@ -76,8 +76,9 @@ def test_client_closes_marks_upl_vs_capital():
     assert 'gaida Capital £' in js
     assert "src==='broker'||src==='upl_estimate'" not in js
     assert "mtf.ready?'BULL':'NEUT'" not in js
-    assert 'neural ${' in js or 'neural ' in js
-    assert 'tape ' in js
+    assert 'deskOhlcSignal' in js
+    assert 'ohlc RR' in js or 'wait RR' in js
+    assert "tape ${ch" not in js
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'id="deskClosedSrc"' in html
     assert 'id="deskClosedSrc">CAPITAL<' not in html.replace(' ','')

@@ -36,8 +36,8 @@ Deploy detalizētāk: [`DEPLOY_LV.md`](DEPLOY_LV.md). Ceļi `/`, `/app`, `/admin
 
 ## Kā palaist
 
-**Windows (pilnā sistēma):** dubultklikšķis `PALAIST_PILNO_SISTEMU.bat`
-vai `run_windows.bat` → **`http://127.0.0.1:8765/admin`**
+**Windows (pilnā sistēma):** dubultklikšķis **`START.bat`**
+(vai `run_windows.bat`) → **`http://127.0.0.1:8765/admin`**
 
 | URL | Kas |
 |-----|-----|

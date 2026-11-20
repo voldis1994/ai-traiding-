@@ -5,6 +5,10 @@ let lastOverview=null;
 let chartRange='1W';
 let overviewInFlight=null;
 let lastSyncAt=null;
+let deskFocusId=null;
+let deskStructure=null;
+let deskStructureInFlight=null;
+let lastDeskChartKey='';
 const POLL_IDLE_MS=10000;
 const POLL_LIVE_MS=5000;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
@@ -137,6 +141,287 @@ function setView(name){
   document.querySelectorAll('.view').forEach(v=>{
     v.classList.toggle('active',v.dataset.view===name);
   });
+  if(name==='desk'){
+    lastDeskChartKey='';
+    if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  }
+}
+
+function pickDeskFocus(clients){
+  const list=clients||[];
+  if(deskFocusId!=null){
+    const keep=list.find(c=>String(c.id)===String(deskFocusId));
+    if(keep)return keep;
+  }
+  const open=list.find(c=>{
+    const a=c.activity||{};
+    const pos=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
+    return pos.length>0;
+  });
+  if(open)return open;
+  const run=list.find(c=>c.robot_running);
+  return run||list[0]||null;
+}
+
+function deskScoreAction(c){
+  const sc=c.scores||{};
+  const buy=Number(sc.BUY)||0,hold=Number(sc.HOLD)||0,sell=Number(sc.SELL)||0;
+  let act=c.action||'HOLD';
+  if(!act||act==='—'){
+    if(buy>=hold&&buy>=sell)act='BUY';
+    else if(sell>=hold&&sell>=buy)act='SELL';
+    else act='HOLD';
+  }
+  return {buy,hold,sell,act};
+}
+
+function renderDeskTape(markets,focusClient){
+  const el=$('deskTape');
+  if(!el)return;
+  const rows=markets||[];
+  if(!rows.length){
+    stableHtml(el,'<div class="desk-empty">Nav atvērtu Capital epic flotē — palaid robotu vai adoptē darījumu.</div>');
+    return;
+  }
+  const focusEpic=((focusClient&&focusClient.activity)||{}).market
+    ||((focusClient&&focusClient.activity&&focusClient.activity.mandate)||{}).epic
+    ||null;
+  const html=rows.map(m=>{
+    const epic=m.epic||'—';
+    const mid=m.mid!=null?num(m.mid,2):'—';
+    const names=(m.client_names||[]).slice(0,2).join(', ');
+    const active=focusEpic&&String(epic)===String(focusEpic)?' active':'';
+    const cid=m.donor_client_id||((m.client_ids||[])[0]);
+    return `<button type="button" class="desk-tape-item${active}" data-desk-cid="${esc(cid)}" data-desk-epic="${esc(epic)}">
+      <div class="ep">${esc(epic)}</div>
+      <div class="md">${esc(mid)}</div>
+      <div class="cl">${esc(names||('#'+cid))}</div>
+    </button>`;
+  }).join('');
+  if(stableHtml(el,html)){
+    el.querySelectorAll('[data-desk-cid]').forEach(btn=>{
+      btn.onclick=()=>{
+        deskFocusId=Number(btn.dataset.deskCid);
+        const sel=$('deskFocus');
+        if(sel)sel.value=String(deskFocusId);
+        lastDeskChartKey='';
+        if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+      };
+    });
+  }
+}
+
+function renderDeskLevels(view,client){
+  const el=$('deskLevels');
+  if(!el)return;
+  const open=(view&&view.open_levels)||[];
+  const a=(client&&client.activity)||{};
+  const pos=(Array.isArray(a.positions)&&a.positions[0])||a.position||null;
+  const entry=open[0]&&open[0].entry!=null?open[0].entry:(pos&&pos.level);
+  const stop=open[0]&&open[0].stop!=null?open[0].stop:(pos&&pos.stopLevel);
+  const profit=open[0]&&open[0].profit!=null?open[0].profit:(pos&&pos.profitLevel);
+  const mid=view&&view.mid!=null?view.mid:a.market_mid;
+  const bits=[];
+  if(stop!=null&&Number(stop)>0)bits.push(`<span class="desk-lvl sl">SL ${esc(num(stop,2))}</span>`);
+  if(entry!=null&&Number(entry)>0)bits.push(`<span class="desk-lvl ent">ENT ${esc(num(entry,2))}</span>`);
+  if(mid!=null&&Number(mid)>0)bits.push(`<span class="desk-lvl mid">MID ${esc(num(mid,2))}</span>`);
+  if(profit!=null&&Number(profit)>0)bits.push(`<span class="desk-lvl tp">TP ${esc(num(profit,2))}</span>`);
+  stableHtml(el,bits.join('')||'<span class="muted">Nav live līmeņu</span>');
+}
+
+function renderDeskQuote(view,client){
+  const el=$('deskQuote');
+  const title=$('deskEpicTitle');
+  const a=(client&&client.activity)||{};
+  const epic=(view&&view.epic)||a.market||((a.mandate||{}).epic)||'Tirgus';
+  if(title)title.textContent=epic;
+  if(!el)return;
+  const bid=a.market_bid,ask=a.market_ask,mid=a.market_mid!=null?a.market_mid:(view&&view.mid);
+  const spread=(bid!=null&&ask!=null&&Number.isFinite(Number(bid))&&Number.isFinite(Number(ask)))
+    ?(Number(ask)-Number(bid)):null;
+  const status=a.market_status||'—';
+  el.textContent=[
+    bid!=null?`Bid ${num(bid,2)}`:'Bid —',
+    ask!=null?`Ask ${num(ask,2)}`:'Ask —',
+    mid!=null?`Mid ${num(mid,2)}`:'',
+    spread!=null?`Spr ${num(spread,3)}`:'',
+    status,
+  ].filter(Boolean).join(' · ');
+}
+
+function renderDeskEngine(client){
+  const el=$('deskEngine');
+  if(!el)return;
+  if(!client){
+    stableHtml(el,'<div class="desk-empty">Izvēlies klientu</div>');
+    return;
+  }
+  const a=client.activity||{};
+  const {buy,hold,sell,act}=deskScoreAction(client);
+  const mtf=a.mtf_momentum||{};
+  const day=a.day_book||{};
+  const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
+  const trailOn=!!a.trail_enabled;
+  const prot=(a.protection&&a.protection.status)||(trailOn?'Trail status —':'Trail OFF — fiksēts OHLC SL/TP');
+  const regimeCls=act==='BUY'?'buy':(act==='SELL'?'sell':'hold');
+  const html=`
+    <div class="desk-regime ${regimeCls}">${esc(act)} · ${esc(pct(act==='SELL'?sell:(act==='BUY'?buy:hold)))} strength</div>
+    <div class="desk-gauge">
+      <div class="buy"><em>BUY</em><b>${pct(buy)}</b></div>
+      <div><em>HOLD</em><b>${pct(hold)}</b></div>
+      <div class="sell"><em>SELL</em><b>${pct(sell)}</b></div>
+    </div>
+    <div class="desk-meta">
+      <div>Intent <strong>${esc(a.entry_intent||(a.entry_path&&a.entry_path.intent)||'—')}</strong></div>
+      <div>Trigger <strong>${esc(a.entry_trigger||(a.entry_path&&a.entry_path.trigger)||'—')}</strong></div>
+      <div>Wait <strong>${esc(String(a.entry_wait||a.entry_block_reason||'—').slice(0,80))}</strong></div>
+      <div>MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong></div>
+      <div>Day <strong>${esc(dayPhase)}</strong></div>
+      <div>Protect <strong>${esc(prot)}</strong></div>
+    </div>`;
+  stableHtml(el,html);
+}
+
+function renderDeskCheck(client,view){
+  const el=$('deskCheck');
+  if(!el)return;
+  if(!client){stableHtml(el,'');return}
+  const a=client.activity||{};
+  const mtf=a.mtf_momentum||{};
+  const sc=deskScoreAction(client);
+  const pos=(Array.isArray(a.positions)&&a.positions[0])||a.position;
+  const hasSl=pos&&(pos.has_sl||(pos.stopLevel!=null&&Number(pos.stopLevel)>0));
+  const hasTp=pos&&(pos.has_tp||(pos.profitLevel!=null&&Number(pos.profitLevel)>0));
+  const rows=[
+    {k:'Robots',v:client.robot_running?(client.operator_paused?'PAUZE':'ON'):'OFF',
+      cls:client.robot_running&&!client.operator_paused?'ok':(client.operator_paused?'neu':'bad')},
+    {k:'Tirgus',v:a.market_status||'—',cls:(a.market_status==='TRADEABLE'?'ok':'neu')},
+    {k:'MTF',v:mtf.ready?((mtf.mode||'ready')+(mtf.preferred?(' · '+mtf.preferred):'')):'nav',
+      cls:mtf.ready?'ok':'neu'},
+    {k:'Signāls',v:sc.act,cls:sc.act==='HOLD'?'neu':'ok'},
+    {k:'SL',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
+    {k:'TP',v:hasTp?'ON':'OFF',cls:hasTp?'ok':(pos?'bad':'neu')},
+    {k:'Swing bracket',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ready':'—',
+      cls:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ok':'neu'},
+    {k:'Trail',v:a.trail_enabled?'ON':'OFF (OHLC SL/TP)',cls:a.trail_enabled?'neu':'ok'},
+  ];
+  stableHtml(el,rows.map(r=>
+    `<div class="desk-check-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(r.v)}</b></div>`
+  ).join(''));
+}
+
+function renderDeskIntel(client){
+  const el=$('deskIntel');
+  if(!el)return;
+  if(!client){stableHtml(el,'<div class="desk-empty">—</div>');return}
+  const a=client.activity||{};
+  const news=a.economic_news_risk;
+  const im=a.intermarket_analysis;
+  const chips=[];
+  if(news&&typeof news==='object'){
+    const risk=news.risk||news.level||news.status||news.summary;
+    const label=news.headline||news.event||news.next||risk;
+    if(label)chips.push({t:String(label).slice(0,120),cls:String(risk||'').toLowerCase().includes('high')?'bear':'neu'});
+  }else if(typeof news==='string'&&news){
+    chips.push({t:news.slice(0,120),cls:'neu'});
+  }
+  if(im&&typeof im==='object'){
+    const lean=im.lean||im.bias||im.regime||im.summary;
+    const cls=String(lean||'').toLowerCase().includes('bull')?'bull'
+      :(String(lean||'').toLowerCase().includes('bear')?'bear':'neu');
+    if(lean)chips.push({t:'Intermarket · '+String(lean).slice(0,100),cls});
+  }
+  if(a.entry_block_reason)chips.push({t:'Block · '+String(a.entry_block_reason).slice(0,100),cls:'bear'});
+  if(!chips.length){
+    stableHtml(el,'<div class="desk-empty">Nav aktīva news/intermarket signāla — tas ir OK.</div>');
+    return;
+  }
+  stableHtml(el,chips.map(c=>`<div class="chip ${esc(c.cls)}">${esc(c.t)}</div>`).join(''));
+}
+
+function drawDeskChart(view){
+  const canvas=$('deskChart');
+  if(!canvas||typeof drawOhlcStructure!=='function')return;
+  if(!view||!(view.candles||[]).length){
+    const ctx=canvas.getContext('2d');
+    const w=canvas.clientWidth||960,h=canvas.clientHeight||420;
+    const dpr=window.devicePixelRatio||1;
+    canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='rgba(8,12,14,.94)';
+    ctx.fillRect(0,0,w,h);
+    ctx.fillStyle='#8a9a92';ctx.font='13px Manrope,sans-serif';ctx.textAlign='center';
+    ctx.fillText('Gaida OHLC sveces no Capital…',w/2,h/2);
+    return;
+  }
+  const key=[view.epic,view.mid,view.candles.length,
+    JSON.stringify(view.open_levels||[]),
+    (view.swing_brackets&&view.swing_brackets.ready)].join('|');
+  if(key===lastDeskChartKey)return;
+  lastDeskChartKey=key;
+  drawOhlcStructure(canvas,view,{labels:true,maxCandles:120});
+}
+
+async function loadDeskStructure(clientId){
+  if(!clientId){deskStructure=null;return null}
+  if(deskStructureInFlight)return deskStructureInFlight;
+  deskStructureInFlight=(async()=>{
+    try{
+      const view=await api(`/api/admin/clients/${clientId}/structure-view?n=120`);
+      deskStructure=view;
+      return view;
+    }catch(e){
+      deskStructure={ok:false,reason:e.message,candles:[],open_levels:[]};
+      return deskStructure;
+    }finally{deskStructureInFlight=null}
+  })();
+  return deskStructureInFlight;
+}
+
+async function renderDesk(data){
+  const clients=data.clients||[];
+  const focus=pickDeskFocus(clients);
+  deskFocusId=focus?focus.id:null;
+  const sel=$('deskFocus');
+  if(sel){
+    const html=clients.map(c=>
+      `<option value="${esc(c.id)}">#${esc(c.id)} ${esc(c.display_name||c.username)}${c.robot_running?' · ON':''}</option>`
+    ).join('')||'<option value="">—</option>';
+    const prev=sel.value;
+    stableHtml(sel,html);
+    if(deskFocusId!=null)sel.value=String(deskFocusId);
+    else if(prev)sel.value=prev;
+  }
+  const open=collectOpenTrades(clients);
+  stableHtml($('deskDeals'),renderTradesTable(open.slice(0,8)));
+  renderDeskEngine(focus);
+  renderDeskIntel(focus);
+  // Markets tape + structure chart (real Capital OHLC).
+  let markets=[];
+  try{
+    const board=await api('/api/admin/markets-ohlc?n=90');
+    markets=board.markets||[];
+  }catch(_){markets=[]}
+  renderDeskTape(markets,focus);
+  let view=null;
+  if(focus){
+    // Prefer markets-ohlc panel for this epic when available.
+    const epic=((focus.activity||{}).market)
+      ||(((focus.activity||{}).mandate)||{}).epic;
+    view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
+      &&(m.client_ids||[]).map(String).includes(String(focus.id)))
+      ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
+      ||null;
+    if(!view||!(view.candles||[]).length){
+      view=await loadDeskStructure(focus.id);
+    }else{
+      deskStructure=view;
+    }
+  }
+  renderDeskQuote(view,focus);
+  renderDeskLevels(view,focus);
+  renderDeskCheck(focus,view);
+  drawDeskChart(view);
 }
 
 function positionMid(p,activity){
@@ -354,11 +639,7 @@ function buildEquitySeries(clients,range){
   const use=filtered.length?filtered:trades;
   let cum=0;
   const points=use.map(t=>{cum+=t.pnl;return {t:t.ts,v:cum}});
-  if(!points.length){
-    // Soft placeholder curve so the glass chart never looks empty.
-    const seed=[0,12,8,22,18,34,41,38,52,61];
-    return seed.map((v,i)=>({t:now-(seed.length-i)*864e5,v}));
-  }
+  // Empty → real empty (never invent a fake equity curve).
   return points;
 }
 
@@ -380,13 +661,21 @@ function drawPerfChart(clients){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   const pad={l:8,r:8,t:16,b:28};
   const w=cssW-pad.l-pad.r,h=cssH-pad.t-pad.b;
+  ctx.clearRect(0,0,cssW,cssH);
+  if(!pts.length){
+    ctx.fillStyle='#8a9a92';
+    ctx.font='13px Manrope,sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('Nav broker cash closes šajā periodā',cssW/2,cssH/2);
+    ctx.textAlign='left';
+    return;
+  }
   const vals=pts.map(p=>p.v);
   let min=Math.min(...vals),max=Math.max(...vals);
   if(min===max){min-=1;max+=1}
   const x=i=>pad.l+(pts.length===1?w/2:(i/(pts.length-1))*w);
   const y=v=>pad.t+h-((v-min)/(max-min))*h;
 
-  ctx.clearRect(0,0,cssW,cssH);
   // grid
   ctx.strokeStyle='rgba(57,255,136,.08)';
   ctx.lineWidth=1;
@@ -654,10 +943,13 @@ function renderCard(c){
     :renderDeal(null,ccy,a);
 
   const trailNote=(()=>{
+    if(!inTrade)return '';
+    if(a.trail_enabled===false||a.trail_enabled==null){
+      return `<div class="trail-line">Trail OFF — fiksēts OHLC SL/TP</div>`;
+    }
     const live=positions.find(p=>p.trail_status)||positions[0];
     const st=live&&live.trail_status;
     const prot=(a.protection&&a.protection.status)||st;
-    if(!inTrade)return '';
     const active=['armed','ratchet','be_lock','trail'].includes(String((live&&live.trail_phase)||'').toLowerCase());
     return `<div class="trail-line ${active?'active':''}">${esc(prot||'Trail status nav ziņots')}</div>`;
   })();
@@ -936,6 +1228,8 @@ async function loadOverview(){
     renderRiskBoard(data.clients);
     renderRecentClosed(data.clients);
     drawPerfChart(data.clients);
+    // Desk uses overview + markets-ohlc / structure-view (real Capital tape).
+    try{await renderDesk(data)}catch(err){console.warn('desk',err)}
 
     const room=$('controlRoom');
     const clients=data.clients||[];
@@ -1002,7 +1296,17 @@ document.querySelectorAll('.range-tab').forEach(btn=>{
 });
 window.addEventListener('resize',()=>{
   if(lastOverview)drawPerfChart(lastOverview.clients);
+  lastDeskChartKey='';
+  if(deskStructure)drawDeskChart(deskStructure);
 });
+const deskFocusEl=$('deskFocus');
+if(deskFocusEl){
+  deskFocusEl.addEventListener('change',()=>{
+    deskFocusId=Number(deskFocusEl.value)||null;
+    lastDeskChartKey='';
+    if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  });
+}
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible' && !$('dash').classList.contains('hidden')){
     loadOverview().catch(()=>{});

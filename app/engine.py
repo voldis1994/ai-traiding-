@@ -2693,6 +2693,31 @@ class SingleTradeEngine:
         nudged_scores,nudge_meta=structure_edge.soft_nudge_scores(
             base_scores,edge_advice,store=self.store,
             live_trend=ctx.get('trend'))
+        # GOLD: soft teach toward correct OHLC approach (library/BOS) — not a veto.
+        gold_nudge_meta={'nudged':False}
+        try:
+            from . import gold_strategies
+            epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+            if gold_strategies.applies_to_epic(epic_gs):
+                # Proposal side for soft_reject detect (neural argmax before policy).
+                try:
+                    prop=max(('BUY','SELL','HOLD'),
+                             key=lambda a:float(nudged_scores.get(a,0) or 0))
+                except Exception:
+                    prop='HOLD'
+                gold_gate=gold_strategies.evaluate(
+                    epic=epic_gs,action=prop if prop in ('BUY','SELL') else 'BUY',
+                    candles=self._decision_candles(),
+                    structure=(edge_advice or {}).get('structure') or ctx.get('structure'),
+                    store=self.store)
+                nudged_scores,gold_nudge_meta=gold_strategies.soft_nudge_scores(
+                    nudged_scores,gold_gate,store=self.store)
+                nudge_meta=dict(nudge_meta or {},gold=gold_nudge_meta,
+                                gold_gate={k:gold_gate.get(k) for k in
+                                           ('structure','preferred','soft_reject',
+                                            'reason','allowed')})
+        except Exception as exc:
+            gold_nudge_meta={'nudged':False,'reason':type(exc).__name__}
         # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
         forecast_meta={'nudged':False}
         try:
@@ -2831,8 +2856,8 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason='wait_ohlc_swing_rr',
                             proposal=result.get('proposal') or result['action'])
-            # GOLD audit strategies: structure align / min RR / BUY-strict in DOWN.
-            # Distilled from labeled history — GOLD/XAU only; other epics pass.
+            # GOLD audit strategies: soft teach by default (hard_block optional).
+            # Correct approach = BOS/library preferred side — neurons still vote.
             from . import gold_strategies
             epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
             score_edge=result.get('score_edge')
@@ -2844,7 +2869,9 @@ class SingleTradeEngine:
                 structure=struct_rg,score_edge=score_edge,store=self.store,
                 brackets=swing_br if isinstance(swing_br,dict) else None)
             result=dict(result,gold_strategies=gold_gate)
-            if gold_gate.get('applies') and not gold_gate.get('allowed',True):
+            # Hard veto only when operator enables gold_strat_hard_block.
+            if (gold_gate.get('applies') and gold_gate.get('hard_block')
+                    and not gold_gate.get('allowed',True)):
                 return dict(result,action='HOLD',
                             reason=gold_gate.get('reason') or 'gold_strategy_hold',
                             proposal=result.get('proposal') or result['action'])
@@ -5092,6 +5119,12 @@ class SingleTradeEngine:
             repeats=1
         else:
             repeats=int(sp['learn_loss_repeats'])
+            # Against-structure / library grave: teach the correct approach harder.
+            if struct_ctx.get('structure_prefer_hold') or (
+                    isinstance(struct_ctx.get('structure_frame_advice'),dict)
+                    and struct_ctx['structure_frame_advice'].get('toxic_opposite')
+                    == direction):
+                repeats=int(repeats)+1
         # Penny losses used to skip entirely (repeats=0) while still claiming the
         # deal — same bad entry repeated with no ΔW. Teach light HOLD instead.
         scratch_band=float(sp['scratch_pnl_abs'])

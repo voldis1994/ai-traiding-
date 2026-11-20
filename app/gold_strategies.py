@@ -1,20 +1,16 @@
-"""GOLD audit strategies — policies distilled from labeled history mistakes.
+"""GOLD audit strategies — teach the correct OHLC approach (soft by default).
 
 Evidence (client_1 GOLD backup audit, ~293 closed trades, sum £ −19.90):
-  * Against-structure entries (BUY on *_DOWN / SELL on *_UP) → 71 trades,
-    WR ~18%, £ −24.58 — **hard-block** (structure_align)
-  * Counterfactual: keep only aligned/unknown → 222 trades, £ **+4.68**
-  * RR < 1.0 skips were net £ +3.94 on the same set — do **not** hard-block
-    by default; teach still labels weak RR; live brackets already extend TP
-  * BUY underperformed in DOWN frames → buy_strict_down as belt-and-braces
+  * Against-structure entries → WR ~18%, £ −24.58
+  * Library already knows graves (TREND_DOWN×BUY ≪ 0) vs paying sides
+  * Hard veto freezes learning; soft tilt + teach lets the robot develop
 
-Strategies (OPEN gates when enabled — not a new neural architecture):
-  1. ``structure_align`` — block side that fights live BOS/CHoCH structure
-  2. ``min_rr`` — optional; off by default (see evidence above)
-  3. ``buy_strict_down`` — BUY in DOWN frames needs clearer score edge
+Default path (``hard_block=0``):
+  1. Classify live BOS/CHoCH → preferred BUY/SELL/HOLD
+  2. If action fights structure → ``soft_reject`` + ``soft_nudge_scores``
+  3. ``teach_label_from_outcome`` on close reinforces the correct approach
 
-Applies to GOLD / XAU only. ``teach_label_from_outcome`` turns closed trades
-into learning hints so the same machine develops from known failure modes.
+Optional ``gold_strat_hard_block=1`` restores audit hard OPEN HOLD.
 """
 from __future__ import annotations
 
@@ -24,7 +20,10 @@ import re
 STORE_LAST_KEY = 'gold_strategies_last_v1'
 
 DEFAULTS = {
+    # Teach the correct approach — soft tilt by default, not hard OPEN veto.
+    # Operator can set gold_strat_hard_block=1 to restore audit hard gates.
     'enabled': 1,
+    'hard_block': 0,
     'structure_align': 1,
     # min_rr hard gate OFF by default: on real GOLD closes, RR<1 skips were
     # net *positive* (+£3.94) while against-structure skips were −£24.58.
@@ -37,6 +36,8 @@ DEFAULTS = {
     # Soft: CHOP/RANGE → prefer HOLD unless edge is strong (optional gate).
     'chop_hold': 0,
     'chop_min_edge': 0.18,
+    # Soft score tilt when action fights live BOS/CHoCH structure.
+    'soft_nudge': 0.18,
 }
 
 UP_STRUCTURES = frozenset({'TREND_UP', 'BREAKOUT_UP'})
@@ -75,6 +76,8 @@ def _params(store=None) -> dict:
     try:
         from .self_params import get as sp_get
         out['enabled'] = int(sp_get(store, 'gold_strat_enabled', DEFAULTS['enabled']))
+        out['hard_block'] = int(
+            sp_get(store, 'gold_strat_hard_block', DEFAULTS['hard_block']))
         out['structure_align'] = int(
             sp_get(store, 'gold_strat_structure_align', DEFAULTS['structure_align']))
         out['min_rr'] = int(sp_get(store, 'gold_strat_min_rr', DEFAULTS['min_rr']))
@@ -87,11 +90,14 @@ def _params(store=None) -> dict:
         out['chop_hold'] = int(sp_get(store, 'gold_strat_chop_hold', DEFAULTS['chop_hold']))
         out['chop_min_edge'] = float(
             sp_get(store, 'gold_strat_chop_min_edge', DEFAULTS['chop_min_edge']))
+        out['soft_nudge'] = float(
+            sp_get(store, 'gold_strat_soft_nudge', DEFAULTS['soft_nudge']))
     except Exception:
         pass
     out['min_rr_floor'] = max(1.0, min(3.0, float(out['min_rr_floor'])))
     out['buy_down_min_edge'] = max(0.02, min(0.45, float(out['buy_down_min_edge'])))
     out['chop_min_edge'] = max(0.05, min(0.50, float(out['chop_min_edge'])))
+    out['soft_nudge'] = max(0.0, min(0.40, float(out.get('soft_nudge') or 0)))
     return out
 
 
@@ -254,9 +260,11 @@ def evaluate(
         'applies': False,
         'structure': None,
         'checks': [],
+        'hard_block': bool(int(cfg.get('hard_block') or 0)),
+        'preferred': None,
         'cfg': {k: cfg[k] for k in (
-            'enabled', 'structure_align', 'min_rr', 'buy_strict_down',
-            'min_rr_floor', 'buy_down_min_edge', 'chop_hold')},
+            'enabled', 'hard_block', 'structure_align', 'min_rr', 'buy_strict_down',
+            'min_rr_floor', 'buy_down_min_edge', 'chop_hold', 'soft_nudge')},
     }
     if not applies_to_epic(epic):
         out['reason'] = 'not_gold'
@@ -276,6 +284,13 @@ def evaluate(
         st = str((frame or {}).get('structure') or 'CHOP').upper()
         out['frame'] = frame
     out['structure'] = st
+    # Correct approach from live BOS/CHoCH (teach target — not a veto).
+    if st in UP_STRUCTURES:
+        out['preferred'] = 'BUY'
+    elif st in DOWN_STRUCTURES:
+        out['preferred'] = 'SELL'
+    elif st in CHOPPY:
+        out['preferred'] = 'HOLD'
 
     br = brackets if isinstance(brackets, dict) else {}
     sd = stop_distance if stop_distance is not None else br.get('stop_distance')
@@ -287,8 +302,6 @@ def evaluate(
     if int(cfg.get('min_rr') or 0):
         checks.append(rr_allows(sd, pd, floor=cfg['min_rr_floor']))
     if int(cfg.get('buy_strict_down') or 0):
-        # Only meaningful when structure_align is off; with align on, BUY+DOWN
-        # is already blocked. Keep as belt-and-braces + score threshold if align off.
         checks.append(buy_strict_allows(
             action, st, score_edge=score_edge, min_edge=cfg['buy_down_min_edge']))
     if int(cfg.get('chop_hold') or 0):
@@ -296,16 +309,73 @@ def evaluate(
             action, st, score_edge=score_edge, min_edge=cfg['chop_min_edge']))
 
     out['checks'] = checks
-    for ch in checks:
-        if not ch.get('ok', True):
+    failed = [ch for ch in checks if not ch.get('ok', True)]
+    if failed:
+        out['blocked_by'] = failed[0].get('strategy')
+        out['reason'] = failed[0].get('reason') or 'gold_strategy_soft'
+        # Soft by default: still allowed — caller soft-nudges toward preferred.
+        if out['hard_block']:
             out['allowed'] = False
-            out['reason'] = ch.get('reason') or 'gold_strategy_block'
-            out['blocked_by'] = ch.get('strategy')
-            _persist_last(store, out)
-            return out
+            out['reason'] = failed[0].get('reason') or 'gold_strategy_block'
+        else:
+            out['allowed'] = True
+            out['soft_reject'] = True
+        _persist_last(store, out)
+        return out
     out['reason'] = 'pass'
     _persist_last(store, out)
     return out
+
+
+def soft_nudge_scores(scores, gate, *, store=None):
+    """Tilt GOLD scores toward the correct OHLC approach — never a hard veto.
+
+    Used when ``evaluate`` finds a soft_reject (action fights structure) or when
+    preferred side is known. Renormalizes to sum≈1 for autonomy safety.
+    """
+    if not isinstance(scores, dict):
+        return scores, {'nudged': False, 'reason': 'no_scores'}
+    if not isinstance(gate, dict) or not gate.get('applies'):
+        return dict(scores), {'nudged': False, 'reason': 'not_gold'}
+    cfg = _params(store)
+    if not int(cfg.get('enabled') or 0):
+        return dict(scores), {'nudged': False, 'reason': 'disabled'}
+    strength = float(cfg.get('soft_nudge') or 0)
+    if strength <= 0:
+        return dict(scores), {'nudged': False, 'reason': 'zero_strength'}
+    preferred = gate.get('preferred')
+    action = str(gate.get('action') or '').upper()
+    # Only teach when fighting structure or choppy with a preferred HOLD.
+    if not gate.get('soft_reject') and preferred in (None, action):
+        return dict(scores), {'nudged': False, 'reason': 'aligned'}
+    target = preferred if preferred in ('BUY', 'SELL', 'HOLD') else 'HOLD'
+    # Fighting structure → teach louder so wrong-side neural argmax can flip.
+    amp = 1.75 if gate.get('soft_reject') else 1.0
+    delta = strength * amp
+    out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+    if target in ('BUY', 'SELL'):
+        out[target] = out.get(target, 0) + delta
+        other = 'SELL' if target == 'BUY' else 'BUY'
+        out[other] = out.get(other, 0) - 0.9 * delta
+        if action == other:
+            out[action] = out.get(action, 0) - 0.45 * delta
+    else:
+        out['HOLD'] = out.get('HOLD', 0) + delta
+        out['BUY'] = out.get('BUY', 0) - 0.4 * delta
+        out['SELL'] = out.get('SELL', 0) - 0.4 * delta
+    for k in out:
+        out[k] = max(0.0, float(out[k]))
+    total = sum(out.values())
+    if total <= 1e-12:
+        return dict(scores), {'nudged': False, 'reason': 'degenerate'}
+    out = {k: v / total for k, v in out.items()}
+    return out, {
+        'nudged': True, 'target': target, 'strength': strength,
+        'soft_reject': bool(gate.get('soft_reject')),
+        'structure': gate.get('structure'),
+        'reason': gate.get('reason'),
+        'renormalized': True, 'sum': sum(out.values()),
+    }
 
 
 def _persist_last(store, payload: dict) -> None:

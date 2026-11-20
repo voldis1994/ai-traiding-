@@ -37,13 +37,47 @@ def test_buy_strict_down():
     assert ok['ok'] is True
 
 
-def test_evaluate_blocks_gold_against_structure():
+def test_evaluate_soft_rejects_against_structure_by_default():
+    """Default: teach correct approach — still allowed, soft_reject + preferred."""
     out = gs.evaluate(
         epic='GOLD', action='BUY', structure='BREAKOUT_DOWN',
         stop_distance=4.0, profit_distance=8.0, score_edge=0.3)
     assert out['applies'] is True
-    assert out['allowed'] is False
+    assert out['allowed'] is True
+    assert out.get('soft_reject') is True
+    assert out['preferred'] == 'SELL'
     assert out['blocked_by'] == 'structure_align'
+
+
+def test_evaluate_hard_block_when_enabled(tmp_path):
+    from app.engine import Store
+    from app import self_params
+    store = Store(tmp_path / 's.db')
+    self_params.save(store, {
+        **{k: self_params.DEFAULTS[k] for k in self_params.DEFAULTS},
+        'gold_strat_enabled': 1,
+        'gold_strat_hard_block': 1,
+        'gold_strat_structure_align': 1,
+        'gold_strat_min_rr': 0,
+        'gold_strat_buy_strict_down': 0,
+    }, reason='test')
+    out = gs.evaluate(
+        epic='GOLD', action='BUY', structure='BREAKOUT_DOWN',
+        stop_distance=4.0, profit_distance=8.0, score_edge=0.3, store=store)
+    assert out['allowed'] is False
+    assert out['hard_block'] is True
+
+
+def test_soft_nudge_teaches_sell_on_breakdown():
+    gate = gs.evaluate(
+        epic='GOLD', action='BUY', structure='TREND_DOWN',
+        stop_distance=3.0, profit_distance=6.0, score_edge=0.3)
+    scores = {'BUY': 0.65, 'SELL': 0.25, 'HOLD': 0.10}
+    nudged, meta = gs.soft_nudge_scores(scores, gate)
+    assert meta['nudged'] is True
+    assert meta['target'] == 'SELL'
+    assert nudged['SELL'] > nudged['BUY']
+    assert abs(sum(nudged.values()) - 1.0) < 1e-9
 
 
 def test_evaluate_blocks_weak_rr_when_enabled(tmp_path):
@@ -53,6 +87,7 @@ def test_evaluate_blocks_weak_rr_when_enabled(tmp_path):
     self_params.save(store, {
         **{k: self_params.DEFAULTS[k] for k in self_params.DEFAULTS},
         'gold_strat_enabled': 1,
+        'gold_strat_hard_block': 1,
         'gold_strat_structure_align': 0,
         'gold_strat_min_rr': 1,
         'gold_strat_buy_strict_down': 0,

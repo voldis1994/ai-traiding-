@@ -99,10 +99,17 @@ def compare_frame(store, *, epic, structure):
                 f'(n={best_n}); opposite unproven — prefer {best_side}')
             out['confidence'] = min(0.85, 0.35 + 0.05 * best_n)
         elif other[1] < 0:
+            # Clear correct approach: one side pays, the other is a grave.
+            gap = float(best_ev) - float(other[1])
+            out['toxic_opposite'] = other[0]
+            out['evidence_gap'] = gap
             out['reason'] = (
                 f'{structure}: {best_side} +EV ({best_ev:.4f}) vs '
                 f'{other[0]} −EV ({other[1]:.4f}) — prefer {best_side}')
-            out['confidence'] = min(0.95, 0.45 + 0.04 * (best_n + other[2]))
+            # More samples + larger £ gap → louder soft teach (still not a veto).
+            out['confidence'] = min(
+                0.98, 0.50 + 0.04 * (best_n + other[2]) + min(0.2, 0.05 * gap))
+            out['nudge_scale'] = min(4.0, 1.5 + min(2.5, gap / 0.25))
         else:
             # Both positive — keep the stronger, mild confidence.
             out['reason'] = (
@@ -118,60 +125,88 @@ def compare_frame(store, *, epic, structure):
             f'{structure}: BUY mean={buy_m} (n={buy_n}), '
             f'SELL mean={sell_m} (n={sell_n}) — both ≤0; HOLD until edge appears')
         out['confidence'] = min(0.9, 0.4 + 0.03 * (buy_n + sell_n))
+        out['nudge_scale'] = 1.8
         return out
 
     # Only one side known and it is ≤0 — do NOT auto-HOLD forever; leave room
     # for the opposite (unproven) to be tried by neurons / CF teacher.
+    # Still mark the known grave so soft_nudge can damp that side.
     out['advice'] = None
+    out['toxic_opposite'] = best_side
     out['reason'] = (
         f'{structure}: known side {best_side} mean £={best_ev:.4f}≤0 '
-        f'(n={best_n}); opposite still unproven — no forced HOLD')
-    out['confidence'] = min(0.55, 0.2 + 0.03 * best_n)
+        f'(n={best_n}); opposite still unproven — damp grave, no forced HOLD')
+    out['confidence'] = min(0.7, 0.35 + 0.03 * best_n)
+    out['nudge_scale'] = 1.4
     return out
 
 
 def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
-    """Gently tilt softmax-ish scores toward adaptive advice — never a hard veto.
+    """Tilt scores toward the library's correct approach — never a hard veto.
 
-    Returns (new_scores, meta). If advice is None/weak, scores unchanged.
+    When one structure×side is a proven £ grave and the other pays, nudge louder
+    so neurons learn to pick the paying side. Still renormalizes to a simplex.
 
-    After tilt, scores are clipped to [0, 1] and renormalized to sum exactly 1
-    so ``autonomy._safe_scores`` (sum≈1) does not reject → false HOLD.
-
-    When live multi-TF ``trend`` fights historical frame advice (e.g. advice=BUY
-    but trend=DOWN), skip the nudge — do not keep the robot glued to the old side.
+    ``live_trend_disagrees`` no longer cancels a *protective* damp of a toxic
+    opposite — only skips when advice would push *into* a fight with live trend
+    without toxic evidence.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
-    if not isinstance(advice, dict) or not advice.get('advice'):
+    if not isinstance(advice, dict):
         return dict(scores), {'nudged': False, 'reason': 'no_advice'}
     cfg = _cfg(store)
     strength = float(cfg.get('structure_edge_nudge', 0.08))
     conf = float(advice.get('confidence') or 0)
+    target = advice.get('advice')
+    toxic = advice.get('toxic_opposite')
+    # Grave-only advice (no positive side yet): damp toxic side toward HOLD.
+    if not target and toxic in ('BUY', 'SELL') and conf >= 0.35 and strength > 0:
+        scale = float(advice.get('nudge_scale') or 1.4)
+        delta = strength * conf * scale
+        out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        out[toxic] = out.get(toxic, 0) - delta
+        out['HOLD'] = out.get('HOLD', 0) + 0.6 * delta
+        for k in out:
+            out[k] = max(0.0, float(out[k]))
+        total = sum(out.values())
+        if total <= 1e-12:
+            return dict(scores), {'nudged': False, 'reason': 'degenerate_after_nudge'}
+        out = {k: v / total for k, v in out.items()}
+        return out, {
+            'nudged': True, 'delta': delta, 'target': 'HOLD',
+            'toxic_opposite': toxic, 'reason': advice.get('reason'),
+            'confidence': conf, 'nudge_scale': scale,
+            'renormalized': True, 'sum': sum(out.values()),
+        }
+    if not target:
+        return dict(scores), {'nudged': False, 'reason': 'no_advice'}
     if conf < 0.35 or strength <= 0:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence'}
-    target = advice['advice']
-    # Live regime flip: historical EV must not fight the current move.
+    scale = float(advice.get('nudge_scale') or 1.0)
+    scale = max(1.0, min(4.0, scale))
     trend = (live_trend or '').upper() if isinstance(live_trend, str) else None
     if target in ('BUY', 'SELL') and trend in ('UP', 'DOWN'):
-        if (target == 'BUY' and trend == 'DOWN') or (target == 'SELL' and trend == 'UP'):
+        fights = (target == 'BUY' and trend == 'DOWN') or (
+            target == 'SELL' and trend == 'UP')
+        # Only skip when we lack a toxic grave — protective teach must stay on.
+        if fights and not toxic and scale < 1.5:
             return dict(scores), {
                 'nudged': False, 'reason': 'live_trend_disagrees',
                 'target': target, 'live_trend': trend,
             }
-    delta = strength * conf
+    delta = strength * conf * scale
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     if target in ('BUY', 'SELL'):
         out[target] = out.get(target, 0) + delta
-        # Slightly damp the weaker directional side only — HOLD untouched unless
-        # advice is HOLD.
         other = 'SELL' if target == 'BUY' else 'BUY'
-        out[other] = out.get(other, 0) - 0.5 * delta
+        # Louder damp on the grave side when library marked it toxic.
+        damp = 0.85 * delta if toxic == other else 0.5 * delta
+        out[other] = out.get(other, 0) - damp
     elif target == 'HOLD':
         out['HOLD'] = out.get('HOLD', 0) + delta
         out['BUY'] = out.get('BUY', 0) - 0.35 * delta
         out['SELL'] = out.get('SELL', 0) - 0.35 * delta
-    # Clip negatives from dampening, then renormalize to a valid simplex.
     for k in out:
         out[k] = max(0.0, float(out[k]))
     total = sum(out.values())
@@ -180,6 +215,7 @@ def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
     out = {k: v / total for k, v in out.items()}
     return out, {
         'nudged': True, 'delta': delta, 'target': target,
+        'toxic_opposite': toxic, 'nudge_scale': scale,
         'reason': advice.get('reason'), 'confidence': conf,
         'renormalized': True, 'sum': sum(out.values()),
     }

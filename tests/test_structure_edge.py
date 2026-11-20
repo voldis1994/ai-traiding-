@@ -67,6 +67,45 @@ def test_soft_nudge_tilts_scores_without_veto():
         assert meta.get('renormalized') is True
 
 
+def test_toxic_library_louder_nudge_teaches_correct_side():
+    """TREND_DOWN×BUY grave + SELL pays → soft nudge must move vote toward SELL."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='TREND_DOWN', direction='BUY',
+                   total_pnl=-40.0, samples=50, wins=0, losses=50)
+        _seed_side(s, structure='TREND_DOWN', direction='SELL',
+                   total_pnl=20.0, samples=40, wins=35, losses=5)
+        advice = se.compare_frame(s, epic='GOLD', structure='TREND_DOWN')
+        assert advice['advice'] == 'SELL'
+        assert advice.get('toxic_opposite') == 'BUY'
+        assert float(advice.get('nudge_scale') or 1) > 1.5
+        # Strong neural BUY (wrong approach) — loud soft teach should flip argmax.
+        scores = {'BUY': 0.70, 'SELL': 0.20, 'HOLD': 0.10}
+        nudged, meta = se.soft_nudge_scores(scores, advice, store=s)
+        assert meta['nudged'] is True
+        assert nudged['SELL'] > nudged['BUY']
+        # live_trend must NOT cancel protective teach against a toxic grave.
+        nudged2, meta2 = se.soft_nudge_scores(
+            scores, advice, store=s, live_trend='UP')
+        assert meta2['nudged'] is True
+        assert nudged2['SELL'] > nudged2['BUY']
+
+
+def test_grave_only_side_damps_without_forced_hold_advice():
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='BREAKOUT_DOWN', direction='BUY',
+                   total_pnl=-12.0, samples=20, wins=2, losses=18)
+        advice = se.compare_frame(s, epic='GOLD', structure='BREAKOUT_DOWN')
+        assert advice.get('advice') is None
+        assert advice.get('toxic_opposite') == 'BUY'
+        scores = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
+        nudged, meta = se.soft_nudge_scores(scores, advice, store=s)
+        assert meta['nudged'] is True
+        assert nudged['BUY'] < scores['BUY']
+        assert nudged['HOLD'] > scores['HOLD']
+
+
 def test_soft_nudge_keeps_safe_scores_for_autonomy():
     """Regression: raw tilt sum>1 used to force neural HOLD via _safe_scores."""
     from app.autonomy import AutoEvolution

@@ -954,21 +954,25 @@ class RuntimeHub:
                 pass
         atr_hint=None
         kama_hint=None
-        # Bracket geometry uses M1 ATR (same as entry zones) — M5 stop_hint
-        # was only for protective width labels and inflated hairline SL floors.
+        # Bracket + Desk ATR14 = M1 only. Never fall back to M5 stop_hint
+        # (GOLD M5 ~7.5 used to paint as "ATR14" and disagree with the tape).
         if isinstance(mtf,dict) and mtf.get('ready'):
             tf=mtf.get('tf') or {}
             atr_hint=_finite_num((tf.get('m1') or {}).get('atr14'))
-            if atr_hint is None:
-                atr_hint=_finite_num(mtf.get('stop_hint_atr14'))
             kama_hint=(tf.get('m5') or {}).get('kama')
             if kama_hint is None:
                 kama_hint=(tf.get('m1') or {}).get('kama')
         if atr_hint is None and isinstance(overlays,dict):
-            atr_hint=_finite_num(overlays.get('atr14')) or _finite_num(
-                overlays.get('stop_hint_atr14'))
+            # overlays.atr14 is M1 after chart_overlays fix — still refuse stop_hint.
+            atr_hint=_finite_num(overlays.get('atr14'))
         if atr_hint is None and isinstance(ez,dict):
             atr_hint=_finite_num(ez.get('atr14'))
+        if atr_hint is None and (candles_full or candles):
+            try:
+                from .ohlc_entry_zones import _m1_atr_from_candles
+                atr_hint=_finite_num(_m1_atr_from_candles(candles_full or candles))
+            except Exception:
+                atr_hint=None
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None

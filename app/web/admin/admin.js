@@ -474,6 +474,44 @@ function renderDeskReturns(client){ /* sink */ }
 function renderDeskReact(client){ /* sink */ }
 function renderDeskLearn(client){ /* sink — learn msg in intel */ }
 
+/** M1 ATR14 from completed candles — never invent from M5 stop_hint (~7.5 lie). */
+function deskM1Atr14(view,mtf,ov){
+  const mtfUi=(view&&view.mtf)||{};
+  const m1tf=((mtf&&mtf.tf)||{}).m1||{};
+  const direct=mtfUi.atr14??m1tf.atr14??(ov&&ov.atr14);
+  if(direct!=null&&Number.isFinite(Number(direct))&&Number(direct)>0)return Number(direct);
+  const closes=_deskCloses(view);
+  // Need OHLC highs/lows for true ATR — fall back to close-range proxy only if thin.
+  const candles=(view&&view.candles)||[];
+  if(candles.length>=16){
+    let prevC=null;const trs=[];
+    for(const c of candles){
+      const h=Number(c.high??c.h),l=Number(c.low??c.l),cl=Number(c.close??c.c);
+      if(!Number.isFinite(h)||!Number.isFinite(l))continue;
+      if(prevC==null){trs.push(Math.max(0,h-l));}
+      else{
+        const pc=Number.isFinite(prevC)?prevC:cl;
+        trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+      }
+      if(Number.isFinite(cl))prevC=cl;
+    }
+    if(trs.length>=14){
+      let atr=trs.slice(0,14).reduce((a,b)=>a+b,0)/14;
+      for(let i=14;i<trs.length;i++)atr=(atr*13+trs[i])/14;
+      return atr>0?atr:null;
+    }
+  }
+  if(closes.length>=16){
+    // Last resort: mean |Δclose| × scale — better than painting M5 as ATR14.
+    let s=0,n=0;
+    for(let i=Math.max(1,closes.length-14);i<closes.length;i++){
+      s+=Math.abs(closes[i]-closes[i-1]);n++;
+    }
+    return n?s/n:null;
+  }
+  return null;
+}
+
 function renderDeskIndicators(client,view){
   const el=$('deskIndicators');
   if(!el)return;
@@ -482,12 +520,12 @@ function renderDeskIndicators(client,view){
   const mtf=a.mtf_momentum||{};
   const ov=(view&&view.overlays)||{};
   const mtfUi=(view&&view.mtf)||{};
-  // Same ATR the robot uses for brackets (M1 atr14) — not a second stop_hint.
-  const atr=mtfUi.atr14??((mtf.tf||{}).m1||{}).atr14??mtf.stop_hint_atr14??ov.atr14;
+  // ATR14 = M1 only (LIVE brackets). Never fall back to M5 stop_hint (~7.5 on GOLD).
+  const atr=deskM1Atr14(view,mtf,ov);
   const adx=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   const kama=mtfUi.kama??((mtf.tf||{}).m5||{}).kama??ov.kama_level??((mtf.tf||{}).m1||{}).kama;
   stableHtml(el,[
-    deskKv(client.id,'ATR14',atr,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'ATR14 M1',atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
     deskKv(client.id,'KAMA5',kama,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Spread',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),

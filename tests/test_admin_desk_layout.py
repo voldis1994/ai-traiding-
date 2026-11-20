@@ -53,7 +53,7 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=116' in html
-    assert 'admin.js?v=120' in html
+    assert 'admin.js?v=121' in html
     assert 'ohlc-chart.js?v=11' in html
 
 

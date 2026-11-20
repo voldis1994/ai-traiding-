@@ -1,0 +1,21 @@
+:root {
+  --bg-primary: #050914;
+  --bg-secondary: #080e1b;
+  --bg-panel: #090f1d;
+  --bg-panel-header: #080d19;
+  --bg-hover: #152036;
+  --border-primary: #514b4b;
+  --border-subtle: #28303b;
+  --text-primary: #cbd0da;
+  --text-secondary: #828b9d;
+  --text-muted: #626d80;
+  --bull: #30d69a;
+  --bear: #f06b78;
+  --accent-gold: #eec36d;
+  --accent-blue: #699bdd;
+  --ask-background: rgba(240, 85, 105, 0.14);
+  --bid-background: rgba(35, 207, 147, 0.14);
+  --font-mono: "IBM Plex Mono", "JetBrains Mono", ui-monospace, monospace;
+  --ref-w: 1290px;
+  --ref-h: 515px;
+}

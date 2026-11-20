@@ -5501,14 +5501,20 @@ class SingleTradeEngine:
             self.protection_brief={'status':'Trail deferred — missing tick/min distance',
                                    'deal_id':deal_s}
             return
-        opened=candle_time(meta.get('opened')) if meta.get('opened') else None
+        # Keep open seconds — floor-to-minute was including pre-fill spikes.
+        from .market_context import event_time as _event_time
+        opened=_event_time(meta.get('opened')) if meta.get('opened') else None
         candles=self.store.candles(p['epic'],n=120,historical_only=True)
         zone_range=ohlc_range_distance(candles)  # lookback from data
+        # Do NOT feed stored trail_extreme back as prior — a polluted max from
+        # the opening minute would stick forever after the bar leaves the window.
         extreme=trail_extreme_from_broker(
             p['direction'],self.market.get('bid'),self.market.get('ask'),
-            candles=candles,opened_at=opened,prior_extreme=meta.get('trail_extreme'))
+            candles=candles,opened_at=opened,prior_extreme=None)
         if extreme is not None or zone_range is not None:
-            meta=dict(meta);meta['trail_extreme']=extreme
+            meta=dict(meta)
+            if extreme is not None:
+                meta['trail_extreme']=extreme
             if zone_range is not None:meta['zone_range']=float(zone_range)
             self.store.set(key,meta)
         # Adaptive trail arm: MFE / structure EV / BE lock — not a frozen 1R rule.

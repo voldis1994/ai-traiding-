@@ -1303,31 +1303,60 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
             store=store)
         if swing.get('ready'):
+            # Correct order: swing → tighten → tick-snap distances → levels.
+            # Never replace SL with stop_take() — that rewrites swing structure.
+            from .math_rules import (
+                snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
+            from decimal import Decimal as _Dec
             stop_d = float(swing['stop_distance']) * t
             profit_d = float(swing['profit_distance']) * t
-            eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
-            snapped = stop_take(
-                float(entry), action, tick_f, sp, mn,
-                kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
-                range_distance=stop_d)
-            # Keep swing price levels; only snap distances onto broker tick grid.
+            stop_d, stop_ticks = snap_distance_to_tick(stop_d, tick_f)
+            profit_d, profit_ticks = snap_distance_to_tick(profit_d, tick_f)
+            raised = False
+            floor_ticks = _min_ticks(_Dec(str(mn)), _Dec(str(tick_f)))
+            if floor_ticks and stop_ticks < floor_ticks:
+                stop_ticks = int(floor_ticks)
+                stop_d = float(_Dec(str(tick_f)) * stop_ticks)
+                raised = True
+            if floor_ticks and profit_ticks < floor_ticks:
+                profit_ticks = int(floor_ticks)
+                profit_d = float(_Dec(str(tick_f)) * profit_ticks)
+                raised = True
             sign = 1 if action == 'BUY' else -1
             e = float(entry)
-            # Prefer the structural levels; re-align if snap shifted them.
-            stop_level = float(swing['stop_level'])
-            profit_level = float(swing['profit_level'])
-            # If tighten shrunk distances, move levels toward entry proportionally.
-            if abs(t - 1.0) > 1e-9:
-                stop_level = e - sign * stop_d
-                profit_level = e + sign * profit_d
+            stop_level = e - sign * stop_d
+            profit_level = e + sign * profit_d
+            if not levels_correct_side(
+                    action=action, entry=e, stop_level=stop_level,
+                    profit_level=profit_level):
+                return {
+                    'stop_distance': None, 'profit_distance': None,
+                    'stop_level': None, 'profit_level': None,
+                    'kappa': None, 'sl_scale': 1.0,
+                    'tighten': float(t), 'source': 'swing_anchor',
+                    'ready': False, 'reason': 'rr_sides_swapped',
+                    'swing': swing, 'swing_reason': swing.get('reason'),
+                }
+            if not distances_meet_broker_min(stop_d, profit_d, mn):
+                return {
+                    'stop_distance': float(stop_d),
+                    'profit_distance': float(profit_d),
+                    'stop_level': float(stop_level),
+                    'profit_level': float(profit_level),
+                    'kappa': float(profit_d / stop_d) if stop_d > 1e-12 else None,
+                    'sl_scale': 1.0, 'tighten': float(t),
+                    'source': 'swing_anchor', 'ready': False,
+                    'reason': 'below_broker_min_after_snap',
+                    'swing': swing, 'swing_reason': swing.get('reason'),
+                    'raised_to_broker_min': raised,
+                }
+            eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
             return {
-                'stop_distance': abs(e - stop_level),
-                'profit_distance': abs(profit_level - e),
+                'stop_distance': float(stop_d),
+                'profit_distance': float(profit_d),
                 'stop_level': float(stop_level),
                 'profit_level': float(profit_level),
-                'kappa': float(
-                    abs(profit_level - e) / abs(e - stop_level)
-                    if abs(e - stop_level) > 1e-12 else eff_kappa),
+                'kappa': float(eff_kappa),
                 'sl_scale': 1.0,
                 'ohlc_kappa': float(swing.get('kappa') or eff_kappa),
                 'ohlc_sl': float(swing['stop_distance']),
@@ -1344,11 +1373,11 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 'swing_lo': swing.get('swing_lo'),
                 'bos_event': swing.get('bos_event'),
                 'min_rr': swing.get('min_rr'),
-                'rr': swing.get('rr'),
+                'rr': float(eff_kappa),
                 'rr_capped': swing.get('rr_capped'),
-                'stop_ticks': snapped.get('stop_ticks'),
-                'profit_ticks': snapped.get('profit_ticks'),
-                'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
+                'stop_ticks': int(stop_ticks),
+                'profit_ticks': int(profit_ticks),
+                'raised_to_broker_min': raised,
                 'swing': swing,
                 'swing_reason': swing.get('reason'),
             }

@@ -251,6 +251,23 @@ def _min_ticks(minimum, tick):
     return n if n >= 1 else 1
 
 
+def snap_distance_to_tick(distance, tick_size):
+    """Ceil a price distance onto the broker tick grid.
+
+    Does **not** raise to broker min or rewrite SL from range — callers that
+    already chose swing structure must snap distances only, then rebuild levels.
+    """
+    d = D(distance); tick = D(tick_size)
+    if tick <= 0:
+        raise ValueError('tick must be positive')
+    if d <= 0 or not d.is_finite():
+        raise ValueError('distance must be positive')
+    ticks = int((d / tick).to_integral_value(rounding=ROUND_CEILING))
+    if ticks < 1:
+        ticks = 1
+    return float(tick * ticks), int(ticks)
+
+
 def distances_meet_broker_min(stop_distance, profit_distance, min_distance, eps=None):
     """True iff both SL and TP distances meet broker min after all rounding.
 

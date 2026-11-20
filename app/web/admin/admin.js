@@ -790,7 +790,8 @@ function renderDeskIntel(client){
   const fl=a.forward_live||{};
   const lh=a.learn_horizon||{};
   const chips=[];
-  const push=(tag,t,cls,src)=>chips.push({tag,t:String(t).slice(0,120),cls,src:src||'NEURAL'});
+  // Full reason text — CSS wraps; do not hard-truncate GATE/NEWS to ellipsis junk.
+  const push=(tag,t,cls,src)=>chips.push({tag,t:String(t),cls,src:src||'NEURAL'});
   if(news&&typeof news==='object'){
     const risk=news.risk||news.level||news.status||news.summary;
     const label=news.headline||news.event||news.next||news.reason||risk;
@@ -965,8 +966,19 @@ function renderDeskIndCharts(client,view){
   }
   const rsiNow=rsi.filter(v=>v!=null).at(-1);
   const macdNow=macd.filter(v=>v!=null).at(-1);
+  const a=(client&&client.activity)||{};
+  const mtf=a.mtf_momentum||{};
+  const ov=(view&&view.overlays)||{};
+  const mtfUi=(view&&view.mtf)||{};
+  const atrHead=deskM1Atr14(view,mtf,ov);
+  const adxHead=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   stableHtml(el,`
-    <div class="psx-ind-head"><span>RSI <b>${num(rsiNow,1)}</b></span><span>MACD HIST <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span></div>
+    <div class="psx-ind-head">
+      <span>RSI <b>${num(rsiNow,1)}</b></span>
+      <span>MACD <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span>
+      <span>ADX <b>${adxHead==null?'—':num(adxHead,1)}</b></span>
+      <span>ATR14 M1 <b>${atrHead==null?'—':num(atrHead,2)}</b></span>
+    </div>
     <div class="psx-ind-canvas"><canvas id="deskRsiCanvas"></canvas></div>
     <div class="psx-ind-canvas"><canvas id="deskMacdCanvas"></canvas></div>`);
   const paintLine=(canvas,series,color)=>{

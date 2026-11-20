@@ -673,6 +673,35 @@ class RuntimeHub:
                     'intermarket_analysis':snap.get('intermarket_analysis'),
                     'trail_enabled':bool(
                         getattr(rt.engine,'TRAIL_ENABLED',False)),
+                    # Full robot telemetry for the Desk control panel.
+                    'returns_bps':((snap.get('market_context') or {}).get('returns_bps')
+                                   if isinstance(snap.get('market_context'),dict) else None),
+                    'bar_time':((snap.get('market_context') or {}).get('bar_time')
+                                if isinstance(snap.get('market_context'),dict) else None),
+                    'market_regime':snap.get('market_regime'),
+                    'fusion_block_reason':snap.get('fusion_block_reason'),
+                    'directional_advantage':snap.get('directional_advantage'),
+                    'economic_utility':snap.get('economic_utility'),
+                    'neural_decision_bar':snap.get('neural_decision_bar'),
+                    'manage_signal':snap.get('manage_signal'),
+                    'situation_memory':snap.get('situation_memory'),
+                    'entry_eligible':snap.get('entry_eligible'),
+                    'policy_decision':snap.get('policy_decision'),
+                    'policy_proposal':snap.get('policy_proposal'),
+                    'unresolved_orders':snap.get('unresolved_orders'),
+                    'position_age':snap.get('position_age'),
+                    'instrument_profile':snap.get('instrument_profile'),
+                    'minute_direction_accuracy':snap.get('minute_direction_accuracy'),
+                    'trade_win_rate':snap.get('trade_win_rate'),
+                    'trade_wins':snap.get('trade_wins'),
+                    'trade_losses':snap.get('trade_losses'),
+                    'labeled_samples':snap.get('labeled_samples'),
+                    'entry_decision_pending_new_bar':snap.get(
+                        'entry_decision_pending_new_bar'),
+                    'neural_market_exit':snap.get('neural_market_exit'),
+                    'spread':(snap.get('market') or {}).get('spread'),
+                    'tick':(snap.get('market') or {}).get('tick'),
+                    'min_distance':(snap.get('market') or {}).get('min_distance'),
                 },
                 'last_start_error':None,
             })

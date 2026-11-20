@@ -5524,10 +5524,20 @@ class SingleTradeEngine:
         be_locked=(entry is not None and stop_now is not None and sign is not None
                    and sign*(float(stop_now)-float(entry))>=-1e-12)
         structure=meta.get('structure') or self._trail_structure_label(p,candles)
+        atr_hint=None
+        try:
+            mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
+            if atr_hint is None:
+                atr_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('atr14'))
+        except Exception:
+            atr_hint=_num(meta.get('atr'))
         arm=structure_edge.trail_arm_decision(
             self.store,epic=p.get('epic'),structure=structure,
             direction=p.get('direction'),mfe=mfe,
-            original_risk=meta.get('original_risk'),be_locked=be_locked)
+            original_risk=meta.get('original_risk'),
+            original_profit=meta.get('original_profit'),
+            be_locked=be_locked)
         if not arm.get('arm'):
             self.protection_brief={
                 'status':'Trail waiting for adaptive arm evidence',
@@ -5536,7 +5546,7 @@ class SingleTradeEngine:
         mark=self.market.get('time') or self.market_context.get('bar_time')
         proposal=propose_broker_trail(p,self.market,meta,extreme=extreme,mark_time=mark,
                                       zone_range=float(zone_range) if zone_range is not None else None,
-                                      store=self.store,arm_decision=arm)
+                                      store=self.store,arm_decision=arm,atr=atr_hint)
         self.protection_brief={'status':'Broker trail proposal' if proposal else 'No broker-native trail improvement',
                                'deal_id':p['dealId'],'extreme':extreme,'proposal':proposal,
                                'trail_arm':arm}

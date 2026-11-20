@@ -247,19 +247,21 @@ def teach_after_loss(*, direction, cf_best, structure_prefer_hold=False,
 
 
 def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
-                       original_risk=None, be_locked=False):
+                       original_risk=None, original_profit=None,
+                       be_locked=False):
     """Whether the robot should enable broker trail now.
 
-    Adaptive evidence (any one is enough once past noise):
+    Same geometry as SL/TP brackets — do not arm on micro R alone:
       • stop already at/through BE → always arm (lock gains)
-      • MFE ≥ trail_arm_mfe_frac × opening risk (~0.9R seed — not micro bounce)
-      • structure×side mean £ > trail_arm_min_ev AND MFE ≥ same arm frac
-        (no 0.35R shortcut — that BE-locked into bounce scratches)
+      • MFE ≥ trail_arm_mfe_frac × opening risk (seed 1.0R)
+        AND MFE ≥ trail_arm_tp_frac × opening TP (seed 0.45 of TP)
+      • structure×side mean £ > trail_arm_min_ev with the same MFE bars
     """
     cfg = _cfg(store)
     out = {
         'arm': False, 'reason': 'waiting_for_evidence',
         'mfe': _finite(mfe), 'original_risk': _finite(original_risk),
+        'original_profit': _finite(original_profit),
         'structure': structure, 'direction': direction,
     }
     if be_locked:
@@ -267,31 +269,41 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
         out['reason'] = 'be_locked — trail to protect open gains'
         return out
     risk = _finite(original_risk)
+    profit = _finite(original_profit)
     mfe_n = _finite(mfe)
-    frac = float(cfg.get('trail_arm_mfe_frac', 0.90))
-    frac = max(0.55, min(1.0, frac))
-    if risk is not None and risk > 0 and mfe_n is not None and mfe_n >= frac * risk:
+    frac = float(cfg.get('trail_arm_mfe_frac', 1.0))
+    frac = max(0.70, min(1.0, frac))
+    tp_frac = float(cfg.get('trail_arm_tp_frac', 0.45))
+    tp_frac = max(0.25, min(0.70, tp_frac))
+    need_r = (frac * risk) if risk is not None and risk > 0 else None
+    need_tp = (tp_frac * profit) if profit is not None and profit > 0 else None
+    # Require both R and TP-progress floors when available — even SL/TP/trail.
+    enough_r = (need_r is None) or (mfe_n is not None and mfe_n + 1e-12 >= need_r)
+    enough_tp = (need_tp is None) or (mfe_n is not None and mfe_n + 1e-12 >= need_tp)
+    if risk is not None and risk > 0 and mfe_n is not None and enough_r and enough_tp:
         out['arm'] = True
         out['reason'] = (
-            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk {risk:.4f} — arm trail')
+            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk'
+            + (f' and ≥ {tp_frac:.2f}×tp' if need_tp is not None else '')
+            + ' — arm trail')
         return out
     need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
     st = side_stats(store, epic, structure, direction)
     min_ev = float(cfg.get('trail_arm_min_ev', 0.0))
-    # Same MFE bar as the primary path — structure EV must not re-open the
-    # 0.35R early-arm hole that bounced trades out of a real move.
     if (st['samples'] >= need and st['mean_pnl'] is not None
             and float(st['mean_pnl']) > min_ev
             and mfe_n is not None and risk is not None and risk > 0
-            and mfe_n >= frac * risk):
+            and enough_r and enough_tp):
         out['arm'] = True
         out['reason'] = (
             f'structure {structure}/{direction} mean £={st["mean_pnl"]:.4f} '
-            f'+ mfe≥{frac:.2f}R — arm trail')
+            f'+ mfe≥{frac:.2f}R/TP — arm trail')
         return out
     out['reason'] = (
-        f'waiting: mfe={mfe_n} risk={risk} need≥{frac:.2f}R structure_mean='
-        f'{st.get("mean_pnl")} n={st.get("samples")}')
+        f'waiting: mfe={mfe_n} risk={risk} tp={profit} '
+        f'need≥{frac:.2f}R'
+        + (f'+{tp_frac:.2f}TP' if need_tp is not None else '')
+        + f' structure_mean={st.get("mean_pnl")} n={st.get("samples")}')
     return out
 
 

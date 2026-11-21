@@ -873,13 +873,11 @@ function renderDeskBook(client,view){
       <strong>${esc(tag)}</strong>
     </div>`;
   }).join(''):'<div class="psx-empty">Waiting for M1 multi-source votes</div>';
-  const activeProv=providers.filter(p=>p&&p.status==='active').slice(0,4)
-    .map(p=>esc(p.label||p.id)).join(' · ')||'—';
-  const paidProv=providers.filter(p=>p&&p.status==='inactive').slice(0,2)
-    .map(p=>esc(p.label||p.id)).join(' · ');
+  const activeProv=providers.filter(p=>!p||p.status!=='inactive').slice(0,5)
+    .map(p=>esc((p&&p.label)||(p&&p.id)||'')).filter(Boolean).join(' · ')||'—';
   const conf=fc.confidence!=null&&Number.isFinite(Number(fc.confidence))
     ?Math.round(Number(fc.confidence)*100)+'%':'—';
-  // Capital CFD has no exchange depth — BID/ASK real; consensus = external M1 feeds.
+  // Capital CFD has no exchange depth — BID/ASK real; consensus = fused free M1 feeds.
   stableHtml(el,`
     <div class="psx-quote-box">
       <div class="psx-quote-row ask"><span>ASK</span><strong>${hasBa?esc(num(ask,2)):'—'}</strong></div>
@@ -893,9 +891,8 @@ function renderDeskBook(client,view){
         <span class="psx-flow-meta">conf ${esc(conf)}</span>
       </div>
       ${pillarRows}
-      <div class="psx-flow-src">Sources: ${activeProv}</div>
-      ${paidProv?`<div class="psx-flow-src mut">Paid slots idle: ${paidProv}</div>`:''}
-      <div class="psx-flow-note">Capital = fill only · no CFD depth/size ladder</div>
+      <div class="psx-flow-src">Free sources fused: ${activeProv}</div>
+      <div class="psx-flow-note">Capital = fill only · multi-source proxy, not CFD depth</div>
     </div>`);
 }
 

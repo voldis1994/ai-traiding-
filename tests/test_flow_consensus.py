@@ -52,10 +52,10 @@ def test_buy_consensus_from_three_pillars():
     assert votes['order_flow'] == 'BUY'
     assert votes['liquidity'] == 'BUY'
     assert votes['short_term_impact'] == 'BUY'
-    statuses = {p['id']: p['status'] for p in out['providers']}
-    assert statuses.get('cme_comex_gc') == 'inactive'
-    assert statuses.get('dxfeed') == 'inactive'
-    assert any(p['status'] == 'active' for p in out['providers'])
+    assert out['providers']
+    assert all(p.get('status') == 'active' for p in out['providers'])
+    assert not any('dxfeed' in str(p.get('id') or '').lower() for p in out['providers'])
+    assert not any('cme_comex' in str(p.get('id') or '').lower() for p in out['providers'])
 
 
 def test_soft_nudge_damps_fight_against_consensus():

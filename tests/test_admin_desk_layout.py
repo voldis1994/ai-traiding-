@@ -47,14 +47,16 @@ def test_rsi_macd_from_ohlc_or_insufficient():
 def test_quote_panel_no_fake_depth():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'M1 CONSENSUS' in js
+    assert 'Free sources fused' in js
     assert 'Capital = fill only' in js
+    assert 'Paid slots idle' not in js
     assert 'ESTIMATED LADDER' not in js
 
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=119' in html
-    assert 'admin.js?v=124' in html
+    assert 'admin.css?v=120' in html
+    assert 'admin.js?v=125' in html
     assert 'ohlc-chart.js?v=12' in html
 
 
@@ -162,6 +164,8 @@ def test_visual_only_chrome_removed():
     assert 'TP2†' not in js
     assert 'ESTIMATED LADDER' not in js
     assert 'M1 CONSENSUS' in js
+    assert 'Free sources fused' in js
     assert 'Capital = fill only' in js
+    assert 'Paid slots idle' not in js
     assert 'id="deskFunding"' in html
     assert 'id="deskFear"' in html

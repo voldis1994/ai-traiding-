@@ -1,14 +1,11 @@
 """M1 multi-source consensus: Order Flow + Liquidity + Short-term Impact.
 
-Implements the desk concept at the robot's real tempo (completed M1), not
-millisecond HFT DOM. Data comes from ``liquidity_feed`` public routes:
+Free-only stack at the robot's real tempo (completed M1). Several public
+feeds are fused into one consensus — no paid CME/dxFeed path planned.
 
   • Yahoo ``GC=F`` / ETF volume (delayed futures tape — free proxy)
   • Coinbase / OKX ``PAXG`` volume + L2 book (gold substitute, labeled)
   • Capital BID/ASK + OHLC structure remain execution / swing truth
-
-Paid providers the operator researched (dxFeed, CME direct / Databento) are
-declared as inactive slots — same vote schema, no silent fake fill.
 
 Never invents Capital CFD depth. Soft-nudge only; never hard-vetoes OPEN.
 """
@@ -31,24 +28,6 @@ FLOW_IMPULSE = 0.12
 FLOW_VOL_Z = 0.20
 LIQ_IMBALANCE = 0.18
 IMPACT_MICRO = 0.15
-
-# Future paid slots — same interface, inactive until licensed.
-PAID_PROVIDER_SLOTS = (
-    {
-        'id': 'cme_comex_gc',
-        'label': 'CME/COMEX GC L2',
-        'status': 'inactive',
-        'reason': 'requires exchange license / futures account',
-        'examples': ('Databento', 'broker COMEX depth', 'Sierra Denali'),
-    },
-    {
-        'id': 'dxfeed',
-        'label': 'dxFeed Market Depth',
-        'status': 'inactive',
-        'reason': 'paid retail/API feed — not wired',
-        'examples': ('dxLink', 'ATAS/dxFeed COMEX depth'),
-    },
-)
 
 
 def _finite(x):
@@ -76,7 +55,7 @@ def _cfg_nudge(store) -> float:
 
 
 def provider_catalog(*, snapshot=None) -> list[dict]:
-    """Active free sources from snapshot + inactive paid slots (operator map)."""
+    """Free public sources fused into one M1 consensus (no paid providers)."""
     active = []
     if isinstance(snapshot, dict):
         routes = snapshot.get('routes') if isinstance(snapshot.get('routes'), dict) else {}
@@ -114,7 +93,7 @@ def provider_catalog(*, snapshot=None) -> list[dict]:
                     'role': 'feed',
                     'relation': 'external',
                 })
-    return active + [dict(p) for p in PAID_PROVIDER_SLOTS]
+    return active
 
 
 def _pillar_order_flow(obs: dict) -> dict:

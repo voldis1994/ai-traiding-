@@ -1058,6 +1058,7 @@ class SingleTradeEngine:
         self.last_liquidity_refresh=0.0
         self._liquidity_task=None
         self.liquidity_feed_error=None
+        self._flow_consensus=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
         self.intermarket=IntermarketMonitor()
         self._peer_refresh_task=None
@@ -2203,6 +2204,10 @@ class SingleTradeEngine:
             if bid is None or ask is None or tick is None or ask<bid or bid<=0:return
             mid=(bid+ask)/2;moment=time.monotonic();dt=moment-self.last_time if self.last_time else 1
             self.last_time=moment;self.tick_count+=1
+            # Every ~10 polls: resolve blocked-OPEN shadows → flow learn/adapt.
+            if self.tick_count%10==0:
+                try:self._resolve_flow_blocks()
+                except Exception:pass
             self.instrument_profile=instrument_profile(self.mandate['epic'],inst)
             self.market={'epic':self.mandate['epic'],'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
                          'time':now(),'status':snap.get('marketStatus'),'min_distance':self._min_distance(broker_market,mid),
@@ -2705,7 +2710,11 @@ class SingleTradeEngine:
             self.store,base_scores,epic=epic_as,
             structure=(edge_advice or {}).get('structure') or ctx.get('structure'),
             trend=ctx.get('trend'),candles=self._decision_candles(),
-            edge_advice=edge_advice)
+            edge_advice=edge_advice,
+            liquidity_path=getattr(self,'liquidity_path',None),
+            bar_time=ctx.get('bar_time'))
+        # Keep last M1 flow consensus for desk even when later nudges run.
+        self._flow_consensus=(nudge_meta or {}).get('flow_consensus')
         # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
         forecast_meta={'nudged':False}
         try:
@@ -2775,6 +2784,72 @@ class SingleTradeEngine:
                     day_book=db_snap,day_conviction=conv_meta,
                     day_phase_nudge=phase_meta,scores=nudged_scores,
                     mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
+        # Last word: free multi-source M1 consensus must affect the LIVE decision
+        # (nudge scores; HOLD when majority fights the proposed side).
+        try:
+            from . import flow_consensus
+            flow_dec=flow_consensus.apply_to_decision(
+                nudged_scores,
+                action=result.get('action'),
+                path=getattr(self,'liquidity_path',None),
+                bar_time=ctx.get('bar_time'),
+                epic=epic_as,
+                structure=live_structure,
+                trend=ctx.get('trend'),
+                store=self.store)
+            nudged_scores=flow_dec.get('scores') or nudged_scores
+            self._flow_consensus=flow_dec.get('desk') or self._flow_consensus
+            result=dict(
+                result,
+                scores=dict(nudged_scores),
+                flow_consensus=flow_dec.get('desk'),
+                flow_decision= {
+                    'effect': flow_dec.get('effect'),
+                    'blocked': flow_dec.get('blocked'),
+                    'reason': flow_dec.get('reason'),
+                    'nudged': flow_dec.get('nudged'),
+                    'action': flow_dec.get('action'),
+                })
+            if isinstance(self.last_signal,dict) and not self.positions:
+                self.last_signal=dict(
+                    self.last_signal,scores=dict(nudged_scores),
+                    flow_consensus=flow_dec.get('desk'),
+                    flow_decision=result.get('flow_decision'))
+            if flow_dec.get('blocked'):
+                try:
+                    from . import flow_consensus as _fc_block
+                    mid_now=_num((self.market or {}).get('mid'))
+                    cons_side=((flow_dec.get('desk') or {}).get('consensus')
+                               or ((flow_dec.get('consensus') or {}).get('consensus')))
+                    _fc_block.observe_block(
+                        self.store,
+                        proposed=result.get('proposal') or result.get('action'),
+                        consensus_side=cons_side,
+                        agree=(flow_dec.get('desk') or {}).get('agree'),
+                        mid=mid_now,
+                        bar_time=ctx.get('bar_time'),
+                        epic=epic_as,
+                        reason=flow_dec.get('reason'))
+                    self.store.event(
+                        'gate','M1 flow consensus blocked OPEN',
+                        result.get('flow_decision'))
+                except Exception:
+                    pass
+                return dict(
+                    result,action='HOLD',
+                    proposal=result.get('proposal') or result.get('action'),
+                    reason=flow_dec.get('reason') or 'flow_consensus_blocked',
+                    flow_blocked=True)
+            # Score flip to consensus side is still a directional OPEN candidate.
+            if (flow_dec.get('action') in ('BUY','SELL')
+                    and flow_dec.get('action') != result.get('action')
+                    and flow_dec.get('effect') == 'flipped_to_consensus'):
+                result=dict(result,action=flow_dec['action'],
+                            proposal=flow_dec['action'],
+                            reason=flow_dec.get('reason'))
+        except Exception as exc:
+            result=dict(result,flow_decision={
+                'effect': 'error', 'reason': type(exc).__name__})
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -3342,6 +3417,67 @@ class SingleTradeEngine:
             out['period_weights']=nw
             out['period_weights_source']='neural_core'
         return out
+
+    def _flow_consensus_for_ui(self):
+        """M1 multi-source Order Flow + Liquidity + Impact panel for the desk."""
+        try:
+            from . import flow_consensus
+            learn=flow_consensus.learn_snapshot(self.store)
+        except Exception:
+            learn=None
+        cached=getattr(self,'_flow_consensus',None)
+        if isinstance(cached,dict) and cached.get('ok') is not None:
+            out=dict(cached)
+            if learn:
+                out['learn']=learn
+            return out
+        try:
+            from . import flow_consensus
+            ctx=self.market_context if isinstance(self.market_context,dict) else {}
+            bar=ctx.get('bar_time')
+            path=getattr(self,'liquidity_path',None)
+            if not bar or path is None:
+                payload=flow_consensus.desk_payload({
+                    'ok': False, 'reason': 'waiting_for_m1_liquidity',
+                    'pillars': [], 'providers': flow_consensus.provider_catalog(),
+                    'capital_note': (
+                        'Capital = execution BID/ASK + OHLC only; '
+                        'depth/size never from Capital CFD'),
+                    'learn': learn,
+                })
+                if learn:
+                    payload['learn']=learn
+                return payload
+            epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+            scores=(self.last_signal or {}).get('scores') or {}
+            try:
+                prop=max(('BUY','SELL','HOLD'),
+                         key=lambda a: float(scores.get(a,0) or 0))
+            except Exception:
+                prop=None
+            cons=flow_consensus.evaluate_from_path(
+                path,bar,epic=epic,
+                proposed=prop if prop in ('BUY','SELL') else None,
+                structure=ctx.get('structure'),trend=ctx.get('trend'))
+            payload=flow_consensus.desk_payload(cons)
+            if learn:
+                payload['learn']=learn
+            self._flow_consensus=payload
+            return payload
+        except Exception as exc:
+            return {'ok': False, 'reason': type(exc).__name__}
+
+    def _resolve_flow_blocks(self):
+        """Counterfactual: blocked OPEN vs later Capital mid — adapts system knobs."""
+        try:
+            from . import flow_consensus
+            epic=(self.mandate or {}).get('epic')
+            candles=self.store.candles(epic,n=30,historical_only=False) if epic else []
+            mid=_num((self.market or {}).get('mid'))
+            return flow_consensus.maybe_resolve_blocks(
+                self.store,candles=candles,mid=mid,epic=epic)
+        except Exception as exc:
+            return {'ok': False, 'reason': type(exc).__name__}
 
 
     def _entry_vote_scores(self):
@@ -5238,7 +5374,9 @@ class SingleTradeEngine:
             if direction in ('BUY','SELL') and pnl_value is not None:
                 adaptive_system.learn_close(
                     self.store,structure=st_live or 'CHOP',direction=direction,
-                    broker_pnl=pnl_value,epic=epic,situation=sit,deal_id=deal_id)
+                    broker_pnl=pnl_value,epic=epic,situation=sit,deal_id=deal_id,
+                    flow_at_open=(saved.get('flow_at_open')
+                                  if isinstance(saved,dict) else None))
         except Exception as exc:
             self.store.event('warning','Adaptive system learn_close skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
@@ -6563,6 +6701,16 @@ class SingleTradeEngine:
                         open_edge=float(AutoEvolution.score_edge(open_scores))
                     except (TypeError,ValueError):
                         open_edge=None
+                flow_dec_open=((self.last_signal or {}).get('flow_decision')
+                               if isinstance(self.last_signal,dict) else None)
+                flow_desk_open=((self.last_signal or {}).get('flow_consensus')
+                                if isinstance(self.last_signal,dict) else None)
+                try:
+                    from . import flow_consensus as _fc_stamp
+                    flow_at_open=_fc_stamp.open_stamp(flow_dec_open,flow_desk_open)
+                except Exception:
+                    flow_at_open={'effect':(flow_dec_open or {}).get('effect'),
+                                  'at':now()}
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -6583,6 +6731,7 @@ class SingleTradeEngine:
                     'ohlc_entry':ohlc_entry_zones.open_meta_from_gate(
                         zone_gate,action=action),
                     'structure_at_open':structure_at_open,
+                    'flow_at_open':flow_at_open,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
@@ -6719,6 +6868,10 @@ class SingleTradeEngine:
                 self.fusion_block_reason or 'aligned external neural inputs unavailable'))
         if not readiness.get('ready'):
             return 'Model prep/eval not ready: '+(readiness.get('reason') or '')
+        if isinstance(evaluation,dict) and evaluation.get('flow_blocked'):
+            return (evaluation.get('reason')
+                    or ((evaluation.get('flow_decision') or {}).get('reason'))
+                    or 'M1 flow consensus blocked OPEN')
         bar_done=(self.last_entry_processed_bar==self.last_decision_bar
                   and self.last_decision_bar is not None)
         reason=self.last_entry_reason
@@ -6843,6 +6996,7 @@ class SingleTradeEngine:
                 'hard_risk':hr_snap,'day_book':db_snap,
                 'forward_live':forward_live.snapshot(self.store),
                 'situation_memory':situation_memory.snapshot(self.store),
+                'flow_consensus':self._flow_consensus_for_ui(),
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),

@@ -91,6 +91,14 @@ SELF_DEV_CYCLE = (
 DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
 EXTERNAL_LIQUIDITY = ('yahoo_futures_etf_volume','coinbase_spot_volume_l2',
                       'okx_spot_volume_backup','per_instrument_route_resolver')
+# M1 consensus: fuse free public feeds only (Order Flow + Liquidity + Impact).
+# Gates OPEN, then learns from £ / blocked counterfactuals → adapts nudge/block.
+FLOW_CONSENSUS = (
+    'm1_multi_source_soft_nudge',
+    'free_public_feeds_only',
+    'learn_close_and_blocked_shadows',
+    'adapt_nudge_block_from_ledger',
+)
 # Tunable knobs live in Store via app.self_params — not frozen magic in modules.
 SELF_TUNABLE = 'self_params_v1'
 IMMUTABLE = (

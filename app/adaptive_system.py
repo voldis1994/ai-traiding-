@@ -5,7 +5,8 @@ audit → teach → strategy_gen → sample ingest → combo adapt:
 
   BOOT   samples (store + backups) → library → strategy cards
   OPEN   neural scores soft-tilted by: structure EV → GOLD approach →
-         strategy cards/combos (what pays / what bleeds)
+         strategy cards/combos → M1 multi-source flow consensus
+         (Order Flow + Liquidity + Impact from public feeds)
   CLOSE  bank +£/−£ into situation + combo ledger → flip/retire cards →
          next OPEN already changed
 
@@ -43,8 +44,9 @@ def boot(store, *, epic=None, force=False) -> dict:
 
 
 def nudge_open(store, scores, *, epic=None, structure=None, trend=None,
-               candles=None, edge_advice=None) -> tuple:
-    """Unified OPEN soft-nudge: structure EV → GOLD → strategy combos.
+               candles=None, edge_advice=None, liquidity_path=None,
+               bar_time=None, proposed=None) -> tuple:
+    """Unified OPEN soft-nudge: structure EV → GOLD → combos → M1 flow consensus.
 
     Returns (scores, meta). Never hard-vetoes — only tilts the simplex.
     """
@@ -128,19 +130,50 @@ def nudge_open(store, scores, *, epic=None, structure=None, trend=None,
         meta['stages']['strategy_gen'] = {
             'nudged': False, 'reason': type(exc).__name__}
 
+    # 4) M1 multi-source Order Flow + Liquidity + Impact consensus (soft).
+    try:
+        from . import flow_consensus
+        try:
+            prop = (proposed or '').upper()
+            if prop not in ('BUY', 'SELL'):
+                prop = max(('BUY', 'SELL', 'HOLD'),
+                           key=lambda a: float(out.get(a, 0) or 0))
+        except Exception:
+            prop = 'HOLD'
+        if liquidity_path is not None and bar_time is not None:
+            consensus = flow_consensus.evaluate_from_path(
+                liquidity_path, bar_time, epic=epic,
+                proposed=prop if prop in ('BUY', 'SELL') else None,
+                structure=structure, trend=trend)
+        else:
+            consensus = {
+                'ok': False, 'reason': 'liquidity_path_or_bar_missing',
+                'pillars': [], 'providers': flow_consensus.provider_catalog(),
+            }
+        out, m = flow_consensus.soft_nudge_scores(
+            out, consensus, store=store)
+        meta['stages']['flow_consensus'] = m
+        meta['flow_consensus'] = flow_consensus.desk_payload(consensus)
+        if m.get('nudged'):
+            nudged_any = True
+    except Exception as exc:
+        meta['stages']['flow_consensus'] = {
+            'nudged': False, 'reason': type(exc).__name__}
+
     meta['nudged'] = nudged_any
     meta['scores'] = {k: out.get(k) for k in ('BUY', 'SELL', 'HOLD')}
     return out, meta
 
 
 def learn_close(store, *, structure, direction, broker_pnl, epic=None,
-                situation=None, deal_id=None) -> dict:
-    """Unified CLOSE learn: bank ±£ into situation + combos; flip dead strategies."""
+                situation=None, deal_id=None, flow_at_open=None) -> dict:
+    """Unified CLOSE learn: situation + combos + flow consensus £ feedback."""
     out = {
         'ok': True,
         'system': 'adaptive_system',
         'situation': None,
         'strategy': None,
+        'flow': None,
     }
     pnl = broker_pnl
     # Situation scene×action £.
@@ -162,6 +195,15 @@ def learn_close(store, *, structure, direction, broker_pnl, epic=None,
     except Exception as exc:
         out['strategy'] = {'ok': False, 'reason': type(exc).__name__}
 
+    # Multi-source flow: did consensus help this fill? Adapt nudge/block knobs.
+    try:
+        from . import flow_consensus
+        out['flow'] = flow_consensus.observe_close(
+            store, flow_at_open=flow_at_open, broker_pnl=pnl,
+            direction=direction, epic=epic, deal_id=deal_id)
+    except Exception as exc:
+        out['flow'] = {'ok': False, 'reason': type(exc).__name__}
+
     if store is not None:
         try:
             prev = store.get(STORE_STATUS_KEY) or {}
@@ -173,6 +215,8 @@ def learn_close(store, *, structure, direction, broker_pnl, epic=None,
                 'pnl': pnl, 'flips': flips,
                 'combo': ((out.get('strategy') or {}).get('combo') or {}).get(
                     'mean_pnl'),
+                'flow_helpful': ((out.get('flow') or {}).get('sample') or {}).get(
+                    'helpful'),
             }
             store.set(STORE_STATUS_KEY, prev)
         except Exception:
@@ -219,6 +263,12 @@ def snapshot(store) -> dict:
             'live_pnl': c.get('live_pnl'),
             'status': c.get('status'),
         })
+    flow = {}
+    try:
+        from . import flow_consensus
+        flow = flow_consensus.learn_snapshot(store)
+    except Exception:
+        flow = {'ok': False}
     return {
         'system': 'adaptive_system',
         'library_samples': sample_strategies.library_sample_count(store),
@@ -228,4 +278,5 @@ def snapshot(store) -> dict:
         'active_cards': active,
         'retired_n': len(bag.get('retired_ids') or []),
         'status': status if isinstance(status, dict) else {},
+        'flow_learn': flow,
     }

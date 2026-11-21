@@ -701,6 +701,7 @@ class RuntimeHub:
                     'neural_decision_bar':snap.get('neural_decision_bar'),
                     'manage_signal':snap.get('manage_signal'),
                     'situation_memory':snap.get('situation_memory'),
+                    'flow_consensus':snap.get('flow_consensus'),
                     'entry_eligible':snap.get('entry_eligible'),
                     'policy_decision':snap.get('policy_decision'),
                     'policy_proposal':snap.get('policy_proposal'),

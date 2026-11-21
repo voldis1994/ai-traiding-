@@ -505,6 +505,25 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-quote-row.ask{color:var(--r);border-bottom:1px solid var(--desk-grid)}
 .psx-quote-row.bid{color:var(--g);border-top:1px solid var(--desk-grid)}
 .psx-quote-row strong{font-size:16px;font-weight:800}
+.psx-flow{border:1px solid var(--desk-grid);background:#060a14;padding:8px 10px 10px}
+.psx-flow-head{display:flex;align-items:baseline;gap:8px;font-size:11px;color:var(--mut);
+  text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.psx-flow-head strong{font-size:14px;font-weight:800;letter-spacing:.02em}
+.psx-flow-head strong.bull{color:var(--g)}
+.psx-flow-head strong.bear{color:var(--r)}
+.psx-flow-head strong.neu{color:var(--mut)}
+.psx-flow-meta{margin-left:auto;font-variant-numeric:tabular-nums;opacity:.85}
+.psx-flow-row{display:flex;justify-content:space-between;gap:8px;padding:5px 0;
+  border-top:1px solid rgba(255,255,255,.04);font-size:12px}
+.psx-flow-name{color:var(--mut);flex:1;min-width:0}
+.psx-flow-row strong{font-weight:800;font-size:11px;letter-spacing:.03em}
+.psx-flow-row.bull strong{color:var(--g)}
+.psx-flow-row.bear strong{color:var(--r)}
+.psx-flow-row.neu strong,.psx-flow-row.off strong{color:var(--mut)}
+.psx-flow-src{margin-top:8px;font-size:10px;color:var(--mut);line-height:1.35}
+.psx-flow-src.mut{opacity:.75;margin-top:2px}
+.psx-flow-src.bear{color:var(--r);font-weight:700}
+.psx-flow-note{margin-top:6px;font-size:10px;color:var(--mut);opacity:.8;line-height:1.3}
 .psx-spread{
   text-align:center;padding:8px 6px;margin:0;color:var(--txt);font-weight:800;font-size:11px;background:#0a101c}
 

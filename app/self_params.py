@@ -192,6 +192,11 @@ DEFAULTS = {
     'gold_strat_chop_hold': 0,
     'gold_strat_chop_min_edge': 0.18,
     'gold_strat_soft_nudge': 0.18,
+    # M1 multi-source Order Flow + Liquidity + Impact — affects LIVE OPEN.
+    'flow_consensus_nudge': 0.18,
+    # 1 = HOLD when ≥N free sources agree against the proposed side.
+    'flow_consensus_block_fights': 1,
+    'flow_consensus_block_min_agree': 2,
     # Re-entry confirm — audit: <1min same-dir re-open after loss −£14.24 / 176.
     'reentry_confirm_enabled': 1,
     'reentry_raw_strong': 0.20,
@@ -326,6 +331,9 @@ BOUNDS = {
     'gold_strat_chop_hold': (0, 1),
     'gold_strat_chop_min_edge': (0.05, 0.50),
     'gold_strat_soft_nudge': (0.0, 0.40),
+    'flow_consensus_nudge': (0.0, 0.35),
+    'flow_consensus_block_fights': (0, 1),
+    'flow_consensus_block_min_agree': (2, 3),
     'reentry_confirm_enabled': (0, 1),
     'reentry_raw_strong': (0.12, 0.28),
     'reentry_raw_medium': (0.06, 0.18),

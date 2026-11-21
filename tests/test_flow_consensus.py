@@ -84,3 +84,38 @@ def test_adaptive_system_includes_flow_stage():
         None, scores, epic='GOLD', structure='TREND_UP', trend='UP')
     assert 'flow_consensus' in meta['stages']
     assert abs(sum(nudged.values()) - 1.0) < 1e-9
+
+
+def test_apply_to_decision_blocks_fight_with_majority():
+    cons = fc.evaluate(
+        _obs(imbalance=-0.4, micro=-0.4, impulse=-0.35, vol_z=-0.4),
+        proposed='BUY', epic='GOLD')
+    assert cons['agree'] >= 2
+    scores = {'BUY': 0.70, 'SELL': 0.20, 'HOLD': 0.10}
+    dec = fc.apply_to_decision(
+        scores, action='BUY', consensus=cons, store=None)
+    assert dec['blocked'] is True
+    assert dec['action'] == 'HOLD'
+    assert dec['effect'] == 'blocked_fight'
+    assert 'blocks BUY' in (dec['reason'] or '')
+    assert dec['desk'].get('blocked') is True
+
+
+def test_apply_to_decision_aligned_does_not_block():
+    cons = fc.evaluate(_obs(), proposed='BUY', epic='GOLD')
+    scores = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
+    dec = fc.apply_to_decision(
+        scores, action='BUY', consensus=cons, store=None)
+    assert dec['blocked'] is False
+    assert dec['action'] == 'BUY'
+    assert dec['effect'] in ('aligned_boost', 'nudged')
+    assert dec['nudged'] is True
+
+
+def test_apply_to_decision_missing_feed_does_not_freeze():
+    scores = {'BUY': 0.6, 'SELL': 0.3, 'HOLD': 0.1}
+    dec = fc.apply_to_decision(
+        scores, action='BUY', path=None, bar_time=None)
+    assert dec['blocked'] is False
+    assert dec['action'] == 'BUY'
+    assert dec['effect'] == 'feed_unavailable'

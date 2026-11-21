@@ -2780,6 +2780,59 @@ class SingleTradeEngine:
                     day_book=db_snap,day_conviction=conv_meta,
                     day_phase_nudge=phase_meta,scores=nudged_scores,
                     mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
+        # Last word: free multi-source M1 consensus must affect the LIVE decision
+        # (nudge scores; HOLD when majority fights the proposed side).
+        try:
+            from . import flow_consensus
+            flow_dec=flow_consensus.apply_to_decision(
+                nudged_scores,
+                action=result.get('action'),
+                path=getattr(self,'liquidity_path',None),
+                bar_time=ctx.get('bar_time'),
+                epic=epic_as,
+                structure=live_structure,
+                trend=ctx.get('trend'),
+                store=self.store)
+            nudged_scores=flow_dec.get('scores') or nudged_scores
+            self._flow_consensus=flow_dec.get('desk') or self._flow_consensus
+            result=dict(
+                result,
+                scores=dict(nudged_scores),
+                flow_consensus=flow_dec.get('desk'),
+                flow_decision= {
+                    'effect': flow_dec.get('effect'),
+                    'blocked': flow_dec.get('blocked'),
+                    'reason': flow_dec.get('reason'),
+                    'nudged': flow_dec.get('nudged'),
+                    'action': flow_dec.get('action'),
+                })
+            if isinstance(self.last_signal,dict) and not self.positions:
+                self.last_signal=dict(
+                    self.last_signal,scores=dict(nudged_scores),
+                    flow_consensus=flow_dec.get('desk'),
+                    flow_decision=result.get('flow_decision'))
+            if flow_dec.get('blocked'):
+                try:
+                    self.store.event(
+                        'gate','M1 flow consensus blocked OPEN',
+                        result.get('flow_decision'))
+                except Exception:
+                    pass
+                return dict(
+                    result,action='HOLD',
+                    proposal=result.get('proposal') or result.get('action'),
+                    reason=flow_dec.get('reason') or 'flow_consensus_blocked',
+                    flow_blocked=True)
+            # Score flip to consensus side is still a directional OPEN candidate.
+            if (flow_dec.get('action') in ('BUY','SELL')
+                    and flow_dec.get('action') != result.get('action')
+                    and flow_dec.get('effect') == 'flipped_to_consensus'):
+                result=dict(result,action=flow_dec['action'],
+                            proposal=flow_dec['action'],
+                            reason=flow_dec.get('reason'))
+        except Exception as exc:
+            result=dict(result,flow_decision={
+                'effect': 'error', 'reason': type(exc).__name__})
         if result['action'] in ('BUY','SELL'):
             gates=self.live_open_gates(result['action'])
             if not gates['allowed']:
@@ -6759,6 +6812,10 @@ class SingleTradeEngine:
                 self.fusion_block_reason or 'aligned external neural inputs unavailable'))
         if not readiness.get('ready'):
             return 'Model prep/eval not ready: '+(readiness.get('reason') or '')
+        if isinstance(evaluation,dict) and evaluation.get('flow_blocked'):
+            return (evaluation.get('reason')
+                    or ((evaluation.get('flow_decision') or {}).get('reason'))
+                    or 'M1 flow consensus blocked OPEN')
         bar_done=(self.last_entry_processed_bar==self.last_decision_bar
                   and self.last_decision_bar is not None)
         reason=self.last_entry_reason

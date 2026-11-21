@@ -21,7 +21,11 @@ from .liquidity_feed import (
 )
 
 STORE_NUDGE_KEY = 'flow_consensus_nudge'
-DEFAULT_NUDGE = 0.12
+STORE_BLOCK_KEY = 'flow_consensus_block_fights'
+DEFAULT_NUDGE = 0.18
+DEFAULT_BLOCK_FIGHTS = 1
+# Block OPEN only when this many pillars agree against the proposed side.
+BLOCK_MIN_AGREE = 2
 
 # Pillar thresholds on already-bounded liquidity features [-1, 1].
 FLOW_IMPULSE = 0.12
@@ -52,6 +56,17 @@ def _cfg_nudge(store) -> float:
         return max(0.0, min(0.35, float(v)))
     except Exception:
         return DEFAULT_NUDGE
+
+
+def _cfg_block_fights(store) -> bool:
+    if store is None:
+        return bool(DEFAULT_BLOCK_FIGHTS)
+    try:
+        from . import self_params
+        v = self_params.sp_get(store, STORE_BLOCK_KEY, DEFAULT_BLOCK_FIGHTS)
+        return int(v) != 0
+    except Exception:
+        return bool(DEFAULT_BLOCK_FIGHTS)
 
 
 def provider_catalog(*, snapshot=None) -> list[dict]:
@@ -408,6 +423,119 @@ def soft_nudge_scores(scores, consensus, *, store=None):
     }
 
 
+def apply_to_decision(
+    scores,
+    *,
+    action,
+    path=None,
+    bar_time=None,
+    epic=None,
+    structure=None,
+    trend=None,
+    store=None,
+    consensus=None,
+) -> dict:
+    """Last-word M1 consensus on LIVE OPEN — nudge scores and may HOLD a fight.
+
+    Missing / weak feeds → no-op (never freeze the robot). Strong majority
+    against the proposed side → action forced to HOLD when block_fights is on.
+    """
+    prop = (action or '').upper()
+    out = {
+        'scores': dict(scores) if isinstance(scores, dict) else scores,
+        'action': prop if prop in ('BUY', 'SELL', 'HOLD') else 'HOLD',
+        'proposal': prop if prop in ('BUY', 'SELL', 'HOLD') else 'HOLD',
+        'blocked': False,
+        'nudged': False,
+        'effect': 'skipped',
+        'reason': None,
+        'consensus': None,
+        'nudge': {'nudged': False},
+        'desk': desk_payload(None),
+    }
+    if prop not in ('BUY', 'SELL'):
+        out['effect'] = 'no_directional_action'
+        out['desk'] = desk_payload(consensus if isinstance(consensus, dict) else None)
+        return out
+
+    cons = consensus
+    if not isinstance(cons, dict) or not cons.get('ok'):
+        if path is not None and bar_time is not None:
+            cons = evaluate_from_path(
+                path, bar_time, epic=epic, proposed=prop,
+                structure=structure, trend=trend)
+        else:
+            cons = {'ok': False, 'reason': 'liquidity_path_or_bar_missing'}
+    else:
+        # Re-bind proposed to the final policy action.
+        cons = dict(cons)
+        cons['proposed'] = prop
+        if cons.get('consensus') in ('BUY', 'SELL'):
+            cons['accept'] = (prop == cons.get('consensus'))
+            if not cons['accept']:
+                cons['fight_reason'] = (
+                    f"proposed {prop} fights M1 consensus {cons.get('consensus')}")
+
+    out['consensus'] = cons
+    out['desk'] = desk_payload(cons)
+    if not cons.get('ok'):
+        out['effect'] = 'feed_unavailable'
+        out['reason'] = cons.get('reason')
+        return out
+
+    nudged, meta = soft_nudge_scores(out['scores'], cons, store=store)
+    out['scores'] = nudged
+    out['nudge'] = meta
+    out['nudged'] = bool(meta.get('nudged'))
+
+    agree = int(cons.get('agree') or 0)
+    fight = cons.get('accept') is False and cons.get('consensus') in ('BUY', 'SELL')
+    block_on = _cfg_block_fights(store)
+    if fight and block_on and agree >= BLOCK_MIN_AGREE:
+        out['action'] = 'HOLD'
+        out['blocked'] = True
+        out['effect'] = 'blocked_fight'
+        out['reason'] = (
+            f"M1 multi-source consensus {cons.get('consensus')} "
+            f"(agree={agree}) blocks {prop}")
+        out['desk'] = desk_payload({
+            **cons,
+            'decision_effect': out['effect'],
+            'decision_reason': out['reason'],
+            'blocked': True,
+        })
+        return out
+
+    # After nudge, if argmax flipped to consensus side, surface that as the action.
+    try:
+        argmax = max(('BUY', 'SELL', 'HOLD'),
+                     key=lambda a: float(nudged.get(a, 0) or 0))
+    except Exception:
+        argmax = prop
+    if argmax in ('BUY', 'SELL') and argmax != prop and cons.get('advice') == argmax:
+        out['action'] = argmax
+        out['effect'] = 'flipped_to_consensus'
+        out['reason'] = f'scores flipped {prop}→{argmax} by M1 consensus'
+    elif out['nudged'] and cons.get('accept') is True:
+        out['effect'] = 'aligned_boost'
+        out['reason'] = f'M1 consensus confirms {prop}'
+    elif out['nudged']:
+        out['effect'] = 'nudged'
+        out['reason'] = meta.get('reason') or 'soft_nudge'
+    else:
+        out['effect'] = 'neutral'
+        out['reason'] = meta.get('reason') or cons.get('reason')
+
+    out['desk'] = desk_payload({
+        **cons,
+        'decision_effect': out['effect'],
+        'decision_reason': out['reason'],
+        'blocked': False,
+        'final_action': out['action'],
+    })
+    return out
+
+
 def desk_payload(consensus: dict | None) -> dict:
     """Compact UI payload for the control-panel book column."""
     if not isinstance(consensus, dict):
@@ -438,10 +566,15 @@ def desk_payload(consensus: dict | None) -> dict:
         'advice': consensus.get('advice'),
         'accept': consensus.get('accept'),
         'confidence': consensus.get('confidence'),
+        'agree': consensus.get('agree'),
         'reason': consensus.get('reason'),
         'capital_note': consensus.get('capital_note'),
         'pillars': pillars,
         'providers': providers,
         'target_bar': consensus.get('target_bar'),
         'coverage': consensus.get('coverage'),
+        'decision_effect': consensus.get('decision_effect'),
+        'decision_reason': consensus.get('decision_reason'),
+        'blocked': bool(consensus.get('blocked')),
+        'final_action': consensus.get('final_action'),
     }

@@ -821,9 +821,12 @@ function renderDeskIntel(client){
   if(a.flow_consensus&&typeof a.flow_consensus==='object'){
     const fc=a.flow_consensus;
     const c=String(fc.consensus||'').toUpperCase();
-    if(c==='BUY'||c==='SELL'){
+    if(fc.blocked||fc.decision_effect==='blocked_fight'){
+      push('BEARISH',fc.decision_reason||fc.reason||'M1 flow blocked OPEN','bear','FLOW');
+    }else if(c==='BUY'||c==='SELL'){
+      const fx=fc.decision_effect?` · ${fc.decision_effect}`:'';
       push(c==='BUY'?'BULLISH':'BEARISH',
-        `M1 flow ${c} · conf ${fc.confidence==null?'—':Math.round(Number(fc.confidence)*100)+'%'}`,
+        `M1 flow ${c} · conf ${fc.confidence==null?'—':Math.round(Number(fc.confidence)*100)+'%'}${fx}`,
         c==='BUY'?'bull':'bear','FLOW');
     }else if(fc.reason){
       push('NEUTRAL',`M1 flow ${fc.reason}`, 'neu','FLOW');
@@ -864,6 +867,10 @@ function renderDeskBook(client,view){
   const providers=Array.isArray(fc.providers)?fc.providers:[];
   const cons=String(fc.consensus||'NEUTRAL').toUpperCase();
   const consCls=cons==='BUY'?'bull':(cons==='SELL'?'bear':'neu');
+  const effect=String(fc.decision_effect||'');
+  const effectTxt=fc.blocked||effect==='blocked_fight'
+    ?('BLOCKED '+(fc.decision_reason||''))
+    :(effect?effect.replace(/_/g,' '):'');
   const pillarRows=pillars.length?pillars.map(p=>{
     const v=String((p&&p.vote)||'NEUTRAL').toUpperCase();
     const cls=!p||!p.ok?'off':(v==='BUY'?'bull':(v==='SELL'?'bear':'neu'));
@@ -891,8 +898,9 @@ function renderDeskBook(client,view){
         <span class="psx-flow-meta">conf ${esc(conf)}</span>
       </div>
       ${pillarRows}
+      ${effectTxt?`<div class="psx-flow-src ${fc.blocked?'bear':''}">Decision: ${esc(effectTxt)}</div>`:''}
       <div class="psx-flow-src">Free sources fused: ${activeProv}</div>
-      <div class="psx-flow-note">Capital = fill only · multi-source proxy, not CFD depth</div>
+      <div class="psx-flow-note">Affects OPEN · Capital = fill only</div>
     </div>`);
 }
 

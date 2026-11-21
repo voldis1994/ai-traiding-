@@ -91,6 +91,9 @@ SELF_DEV_CYCLE = (
 DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
 EXTERNAL_LIQUIDITY = ('yahoo_futures_etf_volume','coinbase_spot_volume_l2',
                       'okx_spot_volume_backup','per_instrument_route_resolver')
+# M1 consensus over those feeds (Order Flow + Liquidity + Impact). Paid CME/dxFeed
+# slots stay inactive until licensed — never fake Capital CFD DOM.
+FLOW_CONSENSUS = ('m1_multi_source_soft_nudge','paid_cme_dxfeed_slots_inactive')
 # Tunable knobs live in Store via app.self_params — not frozen magic in modules.
 SELF_TUNABLE = 'self_params_v1'
 IMMUTABLE = (

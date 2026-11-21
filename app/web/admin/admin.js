@@ -818,6 +818,17 @@ function renderDeskIntel(client){
   if(lh.message)push('NEUTRAL',lh.message,'neu','LEARN');
   if(a.entry_block_reason)push('BEARISH',a.entry_block_reason,'bear','GATE');
   if(a.fusion_block_reason)push('BEARISH',a.fusion_block_reason,'bear','FUSION');
+  if(a.flow_consensus&&typeof a.flow_consensus==='object'){
+    const fc=a.flow_consensus;
+    const c=String(fc.consensus||'').toUpperCase();
+    if(c==='BUY'||c==='SELL'){
+      push(c==='BUY'?'BULLISH':'BEARISH',
+        `M1 flow ${c} · conf ${fc.confidence==null?'—':Math.round(Number(fc.confidence)*100)+'%'}`,
+        c==='BUY'?'bull':'bear','FLOW');
+    }else if(fc.reason){
+      push('NEUTRAL',`M1 flow ${fc.reason}`, 'neu','FLOW');
+    }
+  }
   if(a.error)push('BEARISH',a.error,'bear','ERROR');
   if(!chips.length){
     // Still show structural intel from scores so the column never looks empty/old.
@@ -848,14 +859,44 @@ function renderDeskBook(client,view){
   }
   const hasBa=Number.isFinite(bid)&&Number.isFinite(ask)&&bid>0&&ask>0;
   const spr=hasBa?Math.max(0,ask-bid):null;
-  // Capital CFD has no exchange depth — show real bid/ask only (no fake SIZE ladder).
+  const fc=a.flow_consensus||{};
+  const pillars=Array.isArray(fc.pillars)?fc.pillars:[];
+  const providers=Array.isArray(fc.providers)?fc.providers:[];
+  const cons=String(fc.consensus||'NEUTRAL').toUpperCase();
+  const consCls=cons==='BUY'?'bull':(cons==='SELL'?'bear':'neu');
+  const pillarRows=pillars.length?pillars.map(p=>{
+    const v=String((p&&p.vote)||'NEUTRAL').toUpperCase();
+    const cls=!p||!p.ok?'off':(v==='BUY'?'bull':(v==='SELL'?'bear':'neu'));
+    const tag=!p||!p.ok?'—':v;
+    return `<div class="psx-flow-row ${cls}">
+      <span class="psx-flow-name">${esc((p&&p.label)||(p&&p.id)||'—')}</span>
+      <strong>${esc(tag)}</strong>
+    </div>`;
+  }).join(''):'<div class="psx-empty">Waiting for M1 multi-source votes</div>';
+  const activeProv=providers.filter(p=>p&&p.status==='active').slice(0,4)
+    .map(p=>esc(p.label||p.id)).join(' · ')||'—';
+  const paidProv=providers.filter(p=>p&&p.status==='inactive').slice(0,2)
+    .map(p=>esc(p.label||p.id)).join(' · ');
+  const conf=fc.confidence!=null&&Number.isFinite(Number(fc.confidence))
+    ?Math.round(Number(fc.confidence)*100)+'%':'—';
+  // Capital CFD has no exchange depth — BID/ASK real; consensus = external M1 feeds.
   stableHtml(el,`
     <div class="psx-quote-box">
       <div class="psx-quote-row ask"><span>ASK</span><strong>${hasBa?esc(num(ask,2)):'—'}</strong></div>
       <div class="psx-spread">MID ${esc(num(mid,2))}${spr==null?'':(' · SPREAD '+esc(num(spr,4)))}</div>
       <div class="psx-quote-row bid"><span>BID</span><strong>${hasBa?esc(num(bid,2)):'—'}</strong></div>
     </div>
-    <div class="psx-empty">Depth/size N/A on Capital CFD — not a live order book</div>`);
+    <div class="psx-flow">
+      <div class="psx-flow-head">
+        <span>M1 CONSENSUS</span>
+        <strong class="${consCls}">${esc(cons)}</strong>
+        <span class="psx-flow-meta">conf ${esc(conf)}</span>
+      </div>
+      ${pillarRows}
+      <div class="psx-flow-src">Sources: ${activeProv}</div>
+      ${paidProv?`<div class="psx-flow-src mut">Paid slots idle: ${paidProv}</div>`:''}
+      <div class="psx-flow-note">Capital = fill only · no CFD depth/size ladder</div>
+    </div>`);
 }
 
 function renderDeskWatch(markets,focusClient){

@@ -1058,6 +1058,7 @@ class SingleTradeEngine:
         self.last_liquidity_refresh=0.0
         self._liquidity_task=None
         self.liquidity_feed_error=None
+        self._flow_consensus=None
         self.instrument_profile={'mapped':False,'currencies':[],'kind':'UNKNOWN'}
         self.intermarket=IntermarketMonitor()
         self._peer_refresh_task=None
@@ -2705,7 +2706,11 @@ class SingleTradeEngine:
             self.store,base_scores,epic=epic_as,
             structure=(edge_advice or {}).get('structure') or ctx.get('structure'),
             trend=ctx.get('trend'),candles=self._decision_candles(),
-            edge_advice=edge_advice)
+            edge_advice=edge_advice,
+            liquidity_path=getattr(self,'liquidity_path',None),
+            bar_time=ctx.get('bar_time'))
+        # Keep last M1 flow consensus for desk even when later nudges run.
+        self._flow_consensus=(nudge_meta or {}).get('flow_consensus')
         # Forecast bridge: soft h=1 tilt from fitted quality head (not LIVE replace).
         forecast_meta={'nudged':False}
         try:
@@ -3342,6 +3347,41 @@ class SingleTradeEngine:
             out['period_weights']=nw
             out['period_weights_source']='neural_core'
         return out
+
+    def _flow_consensus_for_ui(self):
+        """M1 multi-source Order Flow + Liquidity + Impact panel for the desk."""
+        cached=getattr(self,'_flow_consensus',None)
+        if isinstance(cached,dict) and cached.get('ok') is not None:
+            return cached
+        try:
+            from . import flow_consensus
+            ctx=self.market_context if isinstance(self.market_context,dict) else {}
+            bar=ctx.get('bar_time')
+            path=getattr(self,'liquidity_path',None)
+            if not bar or path is None:
+                return flow_consensus.desk_payload({
+                    'ok': False, 'reason': 'waiting_for_m1_liquidity',
+                    'pillars': [], 'providers': flow_consensus.provider_catalog(),
+                    'capital_note': (
+                        'Capital = execution BID/ASK + OHLC only; '
+                        'depth/size never from Capital CFD'),
+                })
+            epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+            scores=(self.last_signal or {}).get('scores') or {}
+            try:
+                prop=max(('BUY','SELL','HOLD'),
+                         key=lambda a: float(scores.get(a,0) or 0))
+            except Exception:
+                prop=None
+            cons=flow_consensus.evaluate_from_path(
+                path,bar,epic=epic,
+                proposed=prop if prop in ('BUY','SELL') else None,
+                structure=ctx.get('structure'),trend=ctx.get('trend'))
+            payload=flow_consensus.desk_payload(cons)
+            self._flow_consensus=payload
+            return payload
+        except Exception as exc:
+            return {'ok': False, 'reason': type(exc).__name__}
 
 
     def _entry_vote_scores(self):
@@ -6843,6 +6883,7 @@ class SingleTradeEngine:
                 'hard_risk':hr_snap,'day_book':db_snap,
                 'forward_live':forward_live.snapshot(self.store),
                 'situation_memory':situation_memory.snapshot(self.store),
+                'flow_consensus':self._flow_consensus_for_ui(),
                 'entry_eligible':bool(self.market_context.get('ready') and self.mandate and not self.positions and self.last_closed_step>=0 and self.armed and self.execution_enabled and not self.store.unresolved() and readiness.get('ready')),
                 'entry_signal_validated':bool(evaluation and evaluation.get('action') in ('BUY','SELL')),
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),

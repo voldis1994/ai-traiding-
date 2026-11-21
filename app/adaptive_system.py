@@ -5,7 +5,8 @@ audit → teach → strategy_gen → sample ingest → combo adapt:
 
   BOOT   samples (store + backups) → library → strategy cards
   OPEN   neural scores soft-tilted by: structure EV → GOLD approach →
-         strategy cards/combos (what pays / what bleeds)
+         strategy cards/combos → M1 multi-source flow consensus
+         (Order Flow + Liquidity + Impact from public feeds)
   CLOSE  bank +£/−£ into situation + combo ledger → flip/retire cards →
          next OPEN already changed
 
@@ -43,8 +44,9 @@ def boot(store, *, epic=None, force=False) -> dict:
 
 
 def nudge_open(store, scores, *, epic=None, structure=None, trend=None,
-               candles=None, edge_advice=None) -> tuple:
-    """Unified OPEN soft-nudge: structure EV → GOLD → strategy combos.
+               candles=None, edge_advice=None, liquidity_path=None,
+               bar_time=None, proposed=None) -> tuple:
+    """Unified OPEN soft-nudge: structure EV → GOLD → combos → M1 flow consensus.
 
     Returns (scores, meta). Never hard-vetoes — only tilts the simplex.
     """
@@ -126,6 +128,36 @@ def nudge_open(store, scores, *, epic=None, structure=None, trend=None,
             nudged_any = True
     except Exception as exc:
         meta['stages']['strategy_gen'] = {
+            'nudged': False, 'reason': type(exc).__name__}
+
+    # 4) M1 multi-source Order Flow + Liquidity + Impact consensus (soft).
+    try:
+        from . import flow_consensus
+        try:
+            prop = (proposed or '').upper()
+            if prop not in ('BUY', 'SELL'):
+                prop = max(('BUY', 'SELL', 'HOLD'),
+                           key=lambda a: float(out.get(a, 0) or 0))
+        except Exception:
+            prop = 'HOLD'
+        if liquidity_path is not None and bar_time is not None:
+            consensus = flow_consensus.evaluate_from_path(
+                liquidity_path, bar_time, epic=epic,
+                proposed=prop if prop in ('BUY', 'SELL') else None,
+                structure=structure, trend=trend)
+        else:
+            consensus = {
+                'ok': False, 'reason': 'liquidity_path_or_bar_missing',
+                'pillars': [], 'providers': flow_consensus.provider_catalog(),
+            }
+        out, m = flow_consensus.soft_nudge_scores(
+            out, consensus, store=store)
+        meta['stages']['flow_consensus'] = m
+        meta['flow_consensus'] = flow_consensus.desk_payload(consensus)
+        if m.get('nudged'):
+            nudged_any = True
+    except Exception as exc:
+        meta['stages']['flow_consensus'] = {
             'nudged': False, 'reason': type(exc).__name__}
 
     meta['nudged'] = nudged_any

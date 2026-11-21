@@ -166,13 +166,14 @@ def nudge_open(store, scores, *, epic=None, structure=None, trend=None,
 
 
 def learn_close(store, *, structure, direction, broker_pnl, epic=None,
-                situation=None, deal_id=None) -> dict:
-    """Unified CLOSE learn: bank ±£ into situation + combos; flip dead strategies."""
+                situation=None, deal_id=None, flow_at_open=None) -> dict:
+    """Unified CLOSE learn: situation + combos + flow consensus £ feedback."""
     out = {
         'ok': True,
         'system': 'adaptive_system',
         'situation': None,
         'strategy': None,
+        'flow': None,
     }
     pnl = broker_pnl
     # Situation scene×action £.
@@ -194,6 +195,15 @@ def learn_close(store, *, structure, direction, broker_pnl, epic=None,
     except Exception as exc:
         out['strategy'] = {'ok': False, 'reason': type(exc).__name__}
 
+    # Multi-source flow: did consensus help this fill? Adapt nudge/block knobs.
+    try:
+        from . import flow_consensus
+        out['flow'] = flow_consensus.observe_close(
+            store, flow_at_open=flow_at_open, broker_pnl=pnl,
+            direction=direction, epic=epic, deal_id=deal_id)
+    except Exception as exc:
+        out['flow'] = {'ok': False, 'reason': type(exc).__name__}
+
     if store is not None:
         try:
             prev = store.get(STORE_STATUS_KEY) or {}
@@ -205,6 +215,8 @@ def learn_close(store, *, structure, direction, broker_pnl, epic=None,
                 'pnl': pnl, 'flips': flips,
                 'combo': ((out.get('strategy') or {}).get('combo') or {}).get(
                     'mean_pnl'),
+                'flow_helpful': ((out.get('flow') or {}).get('sample') or {}).get(
+                    'helpful'),
             }
             store.set(STORE_STATUS_KEY, prev)
         except Exception:
@@ -251,6 +263,12 @@ def snapshot(store) -> dict:
             'live_pnl': c.get('live_pnl'),
             'status': c.get('status'),
         })
+    flow = {}
+    try:
+        from . import flow_consensus
+        flow = flow_consensus.learn_snapshot(store)
+    except Exception:
+        flow = {'ok': False}
     return {
         'system': 'adaptive_system',
         'library_samples': sample_strategies.library_sample_count(store),
@@ -260,4 +278,5 @@ def snapshot(store) -> dict:
         'active_cards': active,
         'retired_n': len(bag.get('retired_ids') or []),
         'status': status if isinstance(status, dict) else {},
+        'flow_learn': flow,
     }

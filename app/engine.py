@@ -2204,6 +2204,10 @@ class SingleTradeEngine:
             if bid is None or ask is None or tick is None or ask<bid or bid<=0:return
             mid=(bid+ask)/2;moment=time.monotonic();dt=moment-self.last_time if self.last_time else 1
             self.last_time=moment;self.tick_count+=1
+            # Every ~10 polls: resolve blocked-OPEN shadows → flow learn/adapt.
+            if self.tick_count%10==0:
+                try:self._resolve_flow_blocks()
+                except Exception:pass
             self.instrument_profile=instrument_profile(self.mandate['epic'],inst)
             self.market={'epic':self.mandate['epic'],'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
                          'time':now(),'status':snap.get('marketStatus'),'min_distance':self._min_distance(broker_market,mid),
@@ -2813,6 +2817,19 @@ class SingleTradeEngine:
                     flow_decision=result.get('flow_decision'))
             if flow_dec.get('blocked'):
                 try:
+                    from . import flow_consensus as _fc_block
+                    mid_now=_num((self.market or {}).get('mid'))
+                    cons_side=((flow_dec.get('desk') or {}).get('consensus')
+                               or ((flow_dec.get('consensus') or {}).get('consensus')))
+                    _fc_block.observe_block(
+                        self.store,
+                        proposed=result.get('proposal') or result.get('action'),
+                        consensus_side=cons_side,
+                        agree=(flow_dec.get('desk') or {}).get('agree'),
+                        mid=mid_now,
+                        bar_time=ctx.get('bar_time'),
+                        epic=epic_as,
+                        reason=flow_dec.get('reason'))
                     self.store.event(
                         'gate','M1 flow consensus blocked OPEN',
                         result.get('flow_decision'))
@@ -3403,22 +3420,34 @@ class SingleTradeEngine:
 
     def _flow_consensus_for_ui(self):
         """M1 multi-source Order Flow + Liquidity + Impact panel for the desk."""
+        try:
+            from . import flow_consensus
+            learn=flow_consensus.learn_snapshot(self.store)
+        except Exception:
+            learn=None
         cached=getattr(self,'_flow_consensus',None)
         if isinstance(cached,dict) and cached.get('ok') is not None:
-            return cached
+            out=dict(cached)
+            if learn:
+                out['learn']=learn
+            return out
         try:
             from . import flow_consensus
             ctx=self.market_context if isinstance(self.market_context,dict) else {}
             bar=ctx.get('bar_time')
             path=getattr(self,'liquidity_path',None)
             if not bar or path is None:
-                return flow_consensus.desk_payload({
+                payload=flow_consensus.desk_payload({
                     'ok': False, 'reason': 'waiting_for_m1_liquidity',
                     'pillars': [], 'providers': flow_consensus.provider_catalog(),
                     'capital_note': (
                         'Capital = execution BID/ASK + OHLC only; '
                         'depth/size never from Capital CFD'),
+                    'learn': learn,
                 })
+                if learn:
+                    payload['learn']=learn
+                return payload
             epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
             scores=(self.last_signal or {}).get('scores') or {}
             try:
@@ -3431,8 +3460,22 @@ class SingleTradeEngine:
                 proposed=prop if prop in ('BUY','SELL') else None,
                 structure=ctx.get('structure'),trend=ctx.get('trend'))
             payload=flow_consensus.desk_payload(cons)
+            if learn:
+                payload['learn']=learn
             self._flow_consensus=payload
             return payload
+        except Exception as exc:
+            return {'ok': False, 'reason': type(exc).__name__}
+
+    def _resolve_flow_blocks(self):
+        """Counterfactual: blocked OPEN vs later Capital mid — adapts system knobs."""
+        try:
+            from . import flow_consensus
+            epic=(self.mandate or {}).get('epic')
+            candles=self.store.candles(epic,n=30,historical_only=False) if epic else []
+            mid=_num((self.market or {}).get('mid'))
+            return flow_consensus.maybe_resolve_blocks(
+                self.store,candles=candles,mid=mid,epic=epic)
         except Exception as exc:
             return {'ok': False, 'reason': type(exc).__name__}
 
@@ -5331,7 +5374,9 @@ class SingleTradeEngine:
             if direction in ('BUY','SELL') and pnl_value is not None:
                 adaptive_system.learn_close(
                     self.store,structure=st_live or 'CHOP',direction=direction,
-                    broker_pnl=pnl_value,epic=epic,situation=sit,deal_id=deal_id)
+                    broker_pnl=pnl_value,epic=epic,situation=sit,deal_id=deal_id,
+                    flow_at_open=(saved.get('flow_at_open')
+                                  if isinstance(saved,dict) else None))
         except Exception as exc:
             self.store.event('warning','Adaptive system learn_close skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
@@ -6656,6 +6701,16 @@ class SingleTradeEngine:
                         open_edge=float(AutoEvolution.score_edge(open_scores))
                     except (TypeError,ValueError):
                         open_edge=None
+                flow_dec_open=((self.last_signal or {}).get('flow_decision')
+                               if isinstance(self.last_signal,dict) else None)
+                flow_desk_open=((self.last_signal or {}).get('flow_consensus')
+                                if isinstance(self.last_signal,dict) else None)
+                try:
+                    from . import flow_consensus as _fc_stamp
+                    flow_at_open=_fc_stamp.open_stamp(flow_dec_open,flow_desk_open)
+                except Exception:
+                    flow_at_open={'effect':(flow_dec_open or {}).get('effect'),
+                                  'at':now()}
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -6676,6 +6731,7 @@ class SingleTradeEngine:
                     'ohlc_entry':ohlc_entry_zones.open_meta_from_gate(
                         zone_gate,action=action),
                     'structure_at_open':structure_at_open,
+                    'flow_at_open':flow_at_open,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),

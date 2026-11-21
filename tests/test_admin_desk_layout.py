@@ -49,6 +49,7 @@ def test_quote_panel_no_fake_depth():
     assert 'M1 CONSENSUS' in js
     assert 'Free sources fused' in js
     assert 'Affects OPEN' in js
+    assert 'learns from' in js
     assert 'Paid slots idle' not in js
     assert 'ESTIMATED LADDER' not in js
 
@@ -56,7 +57,7 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=121' in html
-    assert 'admin.js?v=126' in html
+    assert 'admin.js?v=127' in html
     assert 'ohlc-chart.js?v=12' in html
 
 
@@ -166,6 +167,7 @@ def test_visual_only_chrome_removed():
     assert 'M1 CONSENSUS' in js
     assert 'Free sources fused' in js
     assert 'Affects OPEN' in js
+    assert 'learns from' in js
     assert 'Paid slots idle' not in js
     assert 'id="deskFunding"' in html
     assert 'id="deskFear"' in html

@@ -900,7 +900,16 @@ function renderDeskBook(client,view){
       ${pillarRows}
       ${effectTxt?`<div class="psx-flow-src ${fc.blocked?'bear':''}">Decision: ${esc(effectTxt)}</div>`:''}
       <div class="psx-flow-src">Free sources fused: ${activeProv}</div>
-      <div class="psx-flow-note">Affects OPEN · Capital = fill only</div>
+      ${(()=>{
+        const L=fc.learn||{};
+        if(!L||(!L.n&&L.n!==0))return '';
+        const help=L.helpful!=null?L.helpful:'—';
+        const harm=L.harmful!=null?L.harmful:'—';
+        const nud=L.nudge!=null?Number(L.nudge).toFixed(2):'—';
+        const blk=L.block_fights?'on':'off';
+        return `<div class="psx-flow-src">Learn n=${esc(String(L.n||0))} · help ${esc(String(help))}/${esc(String(harm))} · nudge ${esc(nud)} · block ${esc(blk)}</div>`;
+      })()}
+      <div class="psx-flow-note">Affects OPEN + learns from £ · Capital = fill only</div>
     </div>`);
 }
 

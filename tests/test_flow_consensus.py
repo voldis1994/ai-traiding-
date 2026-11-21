@@ -119,3 +119,40 @@ def test_apply_to_decision_missing_feed_does_not_freeze():
     assert dec['blocked'] is False
     assert dec['action'] == 'BUY'
     assert dec['effect'] == 'feed_unavailable'
+
+
+def test_observe_close_marks_aligned_win_helpful_and_can_adapt():
+    import tempfile
+    from pathlib import Path
+    from app.engine import Store
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        stamp = fc.open_stamp(
+            {'effect': 'aligned_boost', 'nudged': True, 'blocked': False},
+            {'consensus': 'BUY', 'accept': True, 'agree': 3, 'confidence': 0.7})
+        for _ in range(4):
+            out = fc.observe_close(
+                store, flow_at_open=stamp, broker_pnl=0.4,
+                direction='BUY', epic='GOLD')
+            assert out['ok']
+            assert out['sample']['helpful'] is True
+        snap = fc.learn_snapshot(store)
+        assert snap['helpful'] >= 4
+        assert snap['nudge'] >= 0.18  # may strengthen after helpful edge
+
+
+def test_block_resolve_marks_saved_loser():
+    import tempfile
+    from pathlib import Path
+    from app.engine import Store
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        fc.observe_block(
+            store, proposed='BUY', consensus_side='SELL', agree=3,
+            mid=100.0, bar_time='2020-01-01T00:00:00+00:00', epic='GOLD')
+        # Price fell → blocking BUY saved a loser.
+        out = fc.maybe_resolve_blocks(
+            store, candles=[{'close': 99.0}] * 8, mid=99.0, epic='GOLD')
+        assert out['resolved'] == 1
+        assert out['samples'][0]['saved'] is True
+        assert out['samples'][0]['helpful'] is True

@@ -7,11 +7,13 @@ feeds are fused into one consensus — no paid CME/dxFeed path planned.
   • Coinbase / OKX ``PAXG`` volume + L2 book (gold substitute, labeled)
   • Capital BID/ASK + OHLC structure remain execution / swing truth
 
-Never invents Capital CFD depth. Soft-nudge only; never hard-vetoes OPEN.
+Affects LIVE OPEN (nudge / block). After closes and resolved blocks, the
+ledger scores whether consensus helped £ and adapts nudge/block strength.
 """
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Any
 
 from .liquidity_feed import (
@@ -22,10 +24,16 @@ from .liquidity_feed import (
 
 STORE_NUDGE_KEY = 'flow_consensus_nudge'
 STORE_BLOCK_KEY = 'flow_consensus_block_fights'
+STORE_BLOCK_MIN_KEY = 'flow_consensus_block_min_agree'
+STORE_LEDGER_KEY = 'flow_consensus_ledger_v1'
 DEFAULT_NUDGE = 0.18
 DEFAULT_BLOCK_FIGHTS = 1
+DEFAULT_BLOCK_MIN_AGREE = 2
 # Block OPEN only when this many pillars agree against the proposed side.
 BLOCK_MIN_AGREE = 2
+LEDGER_MAX = 80
+BLOCK_HORIZON_BARS = 5  # M1 bars to judge a blocked OPEN
+ADAPT_MIN_N = 4
 
 # Pillar thresholds on already-bounded liquidity features [-1, 1].
 FLOW_IMPULSE = 0.12
@@ -52,7 +60,7 @@ def _cfg_nudge(store) -> float:
         return DEFAULT_NUDGE
     try:
         from . import self_params
-        v = self_params.sp_get(store, STORE_NUDGE_KEY, DEFAULT_NUDGE)
+        v = self_params.get(store, STORE_NUDGE_KEY, DEFAULT_NUDGE)
         return max(0.0, min(0.35, float(v)))
     except Exception:
         return DEFAULT_NUDGE
@@ -63,10 +71,70 @@ def _cfg_block_fights(store) -> bool:
         return bool(DEFAULT_BLOCK_FIGHTS)
     try:
         from . import self_params
-        v = self_params.sp_get(store, STORE_BLOCK_KEY, DEFAULT_BLOCK_FIGHTS)
+        v = self_params.get(store, STORE_BLOCK_KEY, DEFAULT_BLOCK_FIGHTS)
         return int(v) != 0
     except Exception:
         return bool(DEFAULT_BLOCK_FIGHTS)
+
+
+def _cfg_block_min_agree(store) -> int:
+    if store is None:
+        return int(DEFAULT_BLOCK_MIN_AGREE)
+    try:
+        from . import self_params
+        v = self_params.get(
+            store, STORE_BLOCK_MIN_KEY, DEFAULT_BLOCK_MIN_AGREE)
+        return max(2, min(3, int(v)))
+    except Exception:
+        return int(DEFAULT_BLOCK_MIN_AGREE)
+
+
+def _utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_ledger(store) -> dict:
+    if store is None:
+        return {'samples': [], 'pending_blocks': [], 'stats': {}, 'adapt': {}}
+    raw = store.get(STORE_LEDGER_KEY)
+    if not isinstance(raw, dict):
+        return {'samples': [], 'pending_blocks': [], 'stats': {}, 'adapt': {}}
+    return {
+        'samples': list(raw.get('samples') or [])[-LEDGER_MAX:],
+        'pending_blocks': list(raw.get('pending_blocks') or [])[-40:],
+        'stats': dict(raw.get('stats') or {}),
+        'adapt': dict(raw.get('adapt') or {}),
+    }
+
+
+def save_ledger(store, bag: dict):
+    if store is None:
+        return
+    store.set(STORE_LEDGER_KEY, {
+        'samples': list(bag.get('samples') or [])[-LEDGER_MAX:],
+        'pending_blocks': list(bag.get('pending_blocks') or [])[-40:],
+        'stats': dict(bag.get('stats') or {}),
+        'adapt': dict(bag.get('adapt') or {}),
+    })
+
+
+def open_stamp(flow_decision: dict | None, desk: dict | None = None) -> dict:
+    """Compact stamp frozen into entry_brain at OPEN."""
+    fd = flow_decision if isinstance(flow_decision, dict) else {}
+    dk = desk if isinstance(desk, dict) else {}
+    return {
+        'effect': fd.get('effect') or dk.get('decision_effect'),
+        'blocked': bool(fd.get('blocked') or dk.get('blocked')),
+        'nudged': bool(fd.get('nudged')),
+        'reason': fd.get('reason') or dk.get('decision_reason'),
+        'consensus': dk.get('consensus') or fd.get('action'),
+        'accept': dk.get('accept'),
+        'agree': dk.get('agree'),
+        'confidence': dk.get('confidence'),
+        'proposed': dk.get('proposed') or fd.get('proposal'),
+        'final_action': dk.get('final_action') or fd.get('action'),
+        'at': _utc_now_iso(),
+    }
 
 
 def provider_catalog(*, snapshot=None) -> list[dict]:
@@ -491,7 +559,8 @@ def apply_to_decision(
     agree = int(cons.get('agree') or 0)
     fight = cons.get('accept') is False and cons.get('consensus') in ('BUY', 'SELL')
     block_on = _cfg_block_fights(store)
-    if fight and block_on and agree >= BLOCK_MIN_AGREE:
+    block_need = _cfg_block_min_agree(store)
+    if fight and block_on and agree >= block_need:
         out['action'] = 'HOLD'
         out['blocked'] = True
         out['effect'] = 'blocked_fight'
@@ -577,4 +646,362 @@ def desk_payload(consensus: dict | None) -> dict:
         'decision_reason': consensus.get('decision_reason'),
         'blocked': bool(consensus.get('blocked')),
         'final_action': consensus.get('final_action'),
+        'learn': consensus.get('learn'),
+    }
+
+
+def _recompute_stats(samples: list) -> dict:
+    stats = {
+        'n': 0,
+        'aligned_wins': 0,
+        'aligned_losses': 0,
+        'aligned_pnl_sum': 0.0,
+        'fight_wins': 0,
+        'fight_losses': 0,
+        'block_saved': 0,
+        'block_missed': 0,
+        'helpful': 0,
+        'harmful': 0,
+        'mean_aligned_pnl': None,
+    }
+    aligned_pnls = []
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        kind = s.get('kind')
+        helpful = s.get('helpful')
+        if helpful is True:
+            stats['helpful'] += 1
+        elif helpful is False:
+            stats['harmful'] += 1
+        stats['n'] += 1
+        pnl = _finite(s.get('pnl'))
+        if kind == 'aligned_open' and pnl is not None:
+            aligned_pnls.append(pnl)
+            stats['aligned_pnl_sum'] += pnl
+            if pnl > 0:
+                stats['aligned_wins'] += 1
+            elif pnl < 0:
+                stats['aligned_losses'] += 1
+        elif kind == 'fight_open' and pnl is not None:
+            if pnl > 0:
+                stats['fight_wins'] += 1
+            elif pnl < 0:
+                stats['fight_losses'] += 1
+        elif kind == 'block_resolved':
+            if s.get('saved'):
+                stats['block_saved'] += 1
+            elif s.get('missed'):
+                stats['block_missed'] += 1
+    if aligned_pnls:
+        stats['mean_aligned_pnl'] = sum(aligned_pnls) / len(aligned_pnls)
+    return stats
+
+
+def observe_close(
+    store,
+    *,
+    flow_at_open,
+    broker_pnl,
+    direction=None,
+    epic=None,
+    deal_id=None,
+) -> dict:
+    """Score executed OPEN against frozen flow stamp; adapt system knobs."""
+    if store is None:
+        return {'ok': False, 'reason': 'no_store'}
+    pnl = _finite(broker_pnl)
+    if pnl is None:
+        return {'ok': False, 'reason': 'no_pnl'}
+    stamp = flow_at_open if isinstance(flow_at_open, dict) else {}
+    cons = (stamp.get('consensus') or '').upper()
+    effect = stamp.get('effect')
+    accept = stamp.get('accept')
+    prop = (stamp.get('proposed') or direction or '').upper()
+    # Aligned = consensus confirmed the side we traded (or boost/flip to it).
+    aligned = (
+        accept is True
+        or effect in ('aligned_boost', 'flipped_to_consensus')
+        or (cons in ('BUY', 'SELL') and prop == cons)
+    )
+    fought = accept is False or effect == 'blocked_fight'
+    # Did flow help the £ result?
+    # aligned + win / fight + loss → helpful; aligned + loss / fight + win → harmful
+    helpful = None
+    if aligned:
+        helpful = pnl > 0
+        kind = 'aligned_open'
+    elif fought:
+        helpful = pnl < 0  # fighting consensus and losing means consensus was right
+        kind = 'fight_open'
+    else:
+        kind = 'neutral_open'
+        helpful = None
+
+    sample = {
+        'kind': kind,
+        'helpful': helpful,
+        'pnl': pnl,
+        'direction': (direction or prop or '').upper() or None,
+        'consensus': cons or None,
+        'effect': effect,
+        'accept': accept,
+        'epic': epic,
+        'deal_id': deal_id,
+        'at': _utc_now_iso(),
+    }
+    bag = load_ledger(store)
+    bag['samples'] = (bag.get('samples') or []) + [sample]
+    bag['stats'] = _recompute_stats(bag['samples'])
+    adapt = adapt_from_ledger(store, bag)
+    bag['adapt'] = adapt
+    save_ledger(store, bag)
+    try:
+        store.event('learning', 'Flow consensus observed close', {
+            'kind': kind, 'helpful': helpful, 'pnl': pnl,
+            'adapt': adapt.get('changed'), 'deal_id': deal_id,
+        })
+    except Exception:
+        pass
+    return {'ok': True, 'sample': sample, 'stats': bag['stats'], 'adapt': adapt}
+
+
+def observe_block(
+    store,
+    *,
+    proposed,
+    consensus_side,
+    agree=None,
+    mid=None,
+    bar_time=None,
+    epic=None,
+    reason=None,
+) -> dict:
+    """Queue a blocked OPEN for later Capital OHLC counterfactual."""
+    if store is None:
+        return {'ok': False, 'reason': 'no_store'}
+    prop = (proposed or '').upper()
+    cons = (consensus_side or '').upper()
+    if prop not in ('BUY', 'SELL') or cons not in ('BUY', 'SELL'):
+        return {'ok': False, 'reason': 'need_sides'}
+    mid_v = _finite(mid)
+    if mid_v is None or mid_v <= 0:
+        return {'ok': False, 'reason': 'no_mid'}
+    bag = load_ledger(store)
+    pending = {
+        'proposed': prop,
+        'consensus': cons,
+        'agree': agree,
+        'mid': mid_v,
+        'bar_time': bar_time,
+        'epic': epic,
+        'reason': reason,
+        'at': _utc_now_iso(),
+        'horizon_bars': BLOCK_HORIZON_BARS,
+    }
+    bag['pending_blocks'] = (bag.get('pending_blocks') or []) + [pending]
+    save_ledger(store, bag)
+    return {'ok': True, 'pending': pending}
+
+
+def maybe_resolve_blocks(store, *, candles=None, mid=None, epic=None) -> dict:
+    """Resolve blocked OPEN shadows from later Capital mid / M1 closes."""
+    if store is None:
+        return {'ok': False, 'resolved': 0}
+    bag = load_ledger(store)
+    pending = list(bag.get('pending_blocks') or [])
+    if not pending:
+        return {'ok': True, 'resolved': 0}
+    now_mid = _finite(mid)
+    closes = []
+    for c in candles or []:
+        if isinstance(c, dict):
+            v = _finite(c.get('close') if 'close' in c else c.get('c'))
+        elif isinstance(c, (list, tuple)) and len(c) >= 5:
+            v = _finite(c[4])
+        else:
+            v = None
+        if v is not None:
+            closes.append(v)
+    still = []
+    resolved = []
+    for p in pending:
+        if epic and p.get('epic') and str(p.get('epic')) != str(epic):
+            still.append(p)
+            continue
+        entry = _finite(p.get('mid'))
+        if entry is None:
+            continue
+        # Prefer horizon close from candle tape; else live mid after enough age.
+        exit_px = None
+        need = int(p.get('horizon_bars') or BLOCK_HORIZON_BARS)
+        if len(closes) >= need + 1:
+            exit_px = closes[-1]
+        elif now_mid is not None:
+            # Age gate: only if bar_time is at least ~need minutes old.
+            bt = p.get('bar_time')
+            try:
+                from .market_context import candle_time
+                t0 = candle_time(bt)
+                age_min = (datetime.now(timezone.utc) - t0).total_seconds() / 60.0 if t0 else 0
+            except Exception:
+                age_min = need + 1
+            if age_min >= need:
+                exit_px = now_mid
+        if exit_px is None:
+            still.append(p)
+            continue
+        prop = p.get('proposed')
+        move = exit_px - entry
+        # If proposed BUY and price rose → we missed a winner (harmful block).
+        proposed_pnl_proxy = move if prop == 'BUY' else -move
+        missed = proposed_pnl_proxy > 0
+        saved = proposed_pnl_proxy < 0
+        sample = {
+            'kind': 'block_resolved',
+            'helpful': saved,  # blocking a loser = helpful
+            'missed': missed,
+            'saved': saved,
+            'pnl': proposed_pnl_proxy,  # counterfactual £ proxy (price units)
+            'direction': prop,
+            'consensus': p.get('consensus'),
+            'epic': p.get('epic') or epic,
+            'at': _utc_now_iso(),
+            'entry_mid': entry,
+            'exit_mid': exit_px,
+        }
+        resolved.append(sample)
+    if not resolved:
+        return {'ok': True, 'resolved': 0}
+    bag['pending_blocks'] = still
+    bag['samples'] = (bag.get('samples') or []) + resolved
+    bag['stats'] = _recompute_stats(bag['samples'])
+    adapt = adapt_from_ledger(store, bag)
+    bag['adapt'] = adapt
+    save_ledger(store, bag)
+    try:
+        store.event('learning', 'Flow consensus resolved blocked opens', {
+            'resolved': len(resolved), 'adapt': adapt.get('changed'),
+        })
+    except Exception:
+        pass
+    return {'ok': True, 'resolved': len(resolved), 'samples': resolved, 'adapt': adapt}
+
+
+def adapt_from_ledger(store, bag=None) -> dict:
+    """Tighten/loosen flow influence from evidence — affects future OPEN + system knobs."""
+    from . import self_params
+    bag = bag if isinstance(bag, dict) else load_ledger(store)
+    stats = bag.get('stats') or _recompute_stats(bag.get('samples') or [])
+    out = {
+        'changed': False,
+        'reason': 'insufficient_samples',
+        'nudge': None,
+        'block_fights': None,
+        'block_min_agree': None,
+        'stats': stats,
+    }
+    n = int(stats.get('n') or 0)
+    if store is None or n < ADAPT_MIN_N:
+        return out
+    params = self_params.load(store)
+    nudge = float(params.get(STORE_NUDGE_KEY, DEFAULT_NUDGE))
+    block = int(params.get(STORE_BLOCK_KEY, DEFAULT_BLOCK_FIGHTS))
+    block_min = int(params.get(STORE_BLOCK_MIN_KEY, DEFAULT_BLOCK_MIN_AGREE))
+    before = (nudge, block, block_min)
+    helpful = int(stats.get('helpful') or 0)
+    harmful = int(stats.get('harmful') or 0)
+    mean_a = stats.get('mean_aligned_pnl')
+    saved = int(stats.get('block_saved') or 0)
+    missed = int(stats.get('block_missed') or 0)
+
+    reasons = []
+    # Consensus helping £ → stronger voice on OPEN.
+    if helpful >= harmful + 2 and helpful + harmful >= ADAPT_MIN_N:
+        nudge = min(0.35, nudge + 0.02)
+        reasons.append('helpful_edge')
+    elif harmful >= helpful + 2 and helpful + harmful >= ADAPT_MIN_N:
+        nudge = max(0.05, nudge - 0.03)
+        reasons.append('harmful_edge')
+    if mean_a is not None and mean_a > 0 and int(stats.get('aligned_wins') or 0) >= 3:
+        nudge = min(0.35, nudge + 0.01)
+        reasons.append('aligned_mean_pos')
+    elif mean_a is not None and mean_a < 0 and int(stats.get('aligned_losses') or 0) >= 3:
+        nudge = max(0.05, nudge - 0.02)
+        reasons.append('aligned_mean_neg')
+
+    # Block quality → keep / relax / require more agree.
+    if saved + missed >= ADAPT_MIN_N:
+        if saved > missed + 1:
+            block = 1
+            block_min = max(2, block_min - 0)  # keep at least 2
+            reasons.append('blocks_saving')
+        elif missed > saved + 1:
+            block_min = min(3, block_min + 1)
+            reasons.append('blocks_missing_winners')
+            if missed >= saved * 2 and missed >= 4:
+                # Too many missed winners → stop hard blocks, keep soft nudge.
+                block = 0
+                reasons.append('disable_hard_block')
+
+    after = (round(nudge, 4), int(block), int(block_min))
+    if after == (round(before[0], 4), int(before[1]), int(before[2])):
+        out['reason'] = 'no_change:' + (','.join(reasons) or 'stable')
+        out['nudge'] = after[0]
+        out['block_fights'] = after[1]
+        out['block_min_agree'] = after[2]
+        return out
+
+    params[STORE_NUDGE_KEY] = after[0]
+    params[STORE_BLOCK_KEY] = after[1]
+    params[STORE_BLOCK_MIN_KEY] = after[2]
+    self_params.save(
+        store, params,
+        reason='flow_consensus_adapt:' + ','.join(reasons) or 'flow_adapt')
+    out.update({
+        'changed': True,
+        'reason': ','.join(reasons) or 'adapted',
+        'nudge': after[0],
+        'block_fights': after[1],
+        'block_min_agree': after[2],
+        'before': {
+            'nudge': before[0], 'block_fights': before[1],
+            'block_min_agree': before[2],
+        },
+    })
+    try:
+        store.event('learning', 'Flow consensus adapted system knobs', out)
+    except Exception:
+        pass
+    return out
+
+
+def learn_snapshot(store) -> dict:
+    """Operator / desk view of flow learning state."""
+    bag = load_ledger(store)
+    stats = bag.get('stats') or {}
+    adapt = bag.get('adapt') or {}
+    try:
+        from . import self_params
+        nudge = self_params.get(store, STORE_NUDGE_KEY, DEFAULT_NUDGE)
+        block = self_params.get(store, STORE_BLOCK_KEY, DEFAULT_BLOCK_FIGHTS)
+        block_min = self_params.get(
+            store, STORE_BLOCK_MIN_KEY, DEFAULT_BLOCK_MIN_AGREE)
+    except Exception:
+        nudge, block, block_min = DEFAULT_NUDGE, DEFAULT_BLOCK_FIGHTS, DEFAULT_BLOCK_MIN_AGREE
+    return {
+        'ok': True,
+        'n': int(stats.get('n') or 0),
+        'helpful': int(stats.get('helpful') or 0),
+        'harmful': int(stats.get('harmful') or 0),
+        'aligned_wins': int(stats.get('aligned_wins') or 0),
+        'aligned_losses': int(stats.get('aligned_losses') or 0),
+        'block_saved': int(stats.get('block_saved') or 0),
+        'block_missed': int(stats.get('block_missed') or 0),
+        'mean_aligned_pnl': stats.get('mean_aligned_pnl'),
+        'pending_blocks': len(bag.get('pending_blocks') or []),
+        'nudge': nudge,
+        'block_fights': int(block),
+        'block_min_agree': int(block_min),
+        'last_adapt': adapt,
     }

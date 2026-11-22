@@ -56,9 +56,27 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=121' in html
-    assert 'admin.js?v=127' in html
+    assert 'admin.css?v=122' in html
+    assert 'admin.js?v=128' in html
     assert 'ohlc-chart.js?v=12' in html
+
+
+def test_status_board_visible_at_once():
+    """Operator must see OPEN/CLOSE/flow/cards/shadow without nested scroll hunt."""
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'id="deskStatusBoard"' in html
+    assert 'SYSTEM LEARN' in html
+    assert 'id="deskLearn"' in html
+    assert 'hidden' not in html.split('id="deskLearn"')[0][-80:]
+    css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
+    assert '.psx-status-board' in css
+    assert 'grid-template-columns:repeat(7' in css.replace(' ', '')
+    js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
+    assert 'renderDeskStatusBoard' in js
+    assert 'CAN OPEN' in js
+    assert 'NEURAL CLOSE' in js
+    assert 'STRATEGY CARDS' in js
+    assert 'SHADOW £' in js
 
 
 def test_desk_panels_have_readable_spacing():
@@ -94,7 +112,8 @@ def test_signal_watch_and_open_positions_fit_text():
     css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
     compact = css.replace(' ', '')
     assert 'grid-template-rows:autoauto' in compact
-    assert 'minmax(280px,1.6fr)' in compact
+    assert 'minmax(280px,1.5fr)' in compact
+    assert 'minmax(200px,1.1fr)' in compact  # SYSTEM LEARN column readable
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert '<span>SL</span><span>TP</span>' in js
     assert 'stopLevel:p.stopLevel' in js.replace(' ', '')

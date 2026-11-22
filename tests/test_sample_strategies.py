@@ -48,6 +48,40 @@ def test_ingest_trades_builds_library_and_cards():
         assert h.get('activated')
 
 
+def test_pathless_trade_still_banks_combo():
+    """Even without OHLC path, ±£ must teach strategy_gen combos."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        trades = [{
+            'deal_id': 'lonely', 'epic': 'GOLD', 'direction': 'BUY',
+            'opened': '2020-01-01T00:00:00+00:00',
+            'closed': '2020-01-01T00:05:00+00:00',
+            'entry': 100.0, 'exit': 101.5, 'pnl': 0.7,
+        }]
+        out = sm.ingest_trades(store, trades, [], epic='GOLD')
+        assert out['ok'] is True
+        assert out['ingested'] == 1
+        bag = sg.load(store)
+        assert bag.get('combos')
+
+
+def test_merged_backup_candles_cover_trade_span():
+    root = Path('/tmp/visi-dati')
+    if not root.is_dir():
+        return
+    bag = sm.collect_gold_samples_from_backups(root)
+    if not bag.get('ok'):
+        return
+    ats = sorted(str(c.get('at') or '') for c in bag['candles'] if c.get('at'))
+    if not ats:
+        return
+    inside = sum(
+        1 for t in bag['trades']
+        if ats[0] <= str(t.get('opened') or '') <= ats[-1])
+    # Merged tapes must cover nearly all sample trades (was ~818/2324).
+    assert inside >= int(0.9 * bag['n_trades'])
+
+
 def test_build_from_visi_dati_backups_if_present():
     root = Path('/tmp/visi-dati')
     if not root.is_dir():

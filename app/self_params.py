@@ -197,6 +197,11 @@ DEFAULTS = {
     # 1 = HOLD when ≥N free sources agree against the proposed side.
     'flow_consensus_block_fights': 1,
     'flow_consensus_block_min_agree': 2,
+    # Pillar vote thresholds (bounded liquidity features) — tunable, not frozen.
+    'flow_pillar_impulse': 0.12,
+    'flow_pillar_vol_z': 0.20,
+    'flow_pillar_imbalance': 0.18,
+    'flow_pillar_impact': 0.15,
     # Re-entry confirm — audit: <1min same-dir re-open after loss −£14.24 / 176.
     'reentry_confirm_enabled': 1,
     'reentry_raw_strong': 0.20,
@@ -334,6 +339,10 @@ BOUNDS = {
     'flow_consensus_nudge': (0.0, 0.35),
     'flow_consensus_block_fights': (0, 1),
     'flow_consensus_block_min_agree': (2, 3),
+    'flow_pillar_impulse': (0.04, 0.40),
+    'flow_pillar_vol_z': (0.05, 0.50),
+    'flow_pillar_imbalance': (0.05, 0.45),
+    'flow_pillar_impact': (0.04, 0.40),
     'reentry_confirm_enabled': (0, 1),
     'reentry_raw_strong': (0.12, 0.28),
     'reentry_raw_medium': (0.06, 0.18),

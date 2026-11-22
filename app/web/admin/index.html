@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=121">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=122">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -177,6 +177,8 @@
       <section class="view active" data-view="desk">
         <div class="psx" id="psDesk">
           <div id="deskTape" class="psx-tape" aria-label="Market tape"></div>
+          <!-- Full-width status board — everything visible at once, no nested scroll hunt -->
+          <div id="deskStatusBoard" class="psx-status-board" aria-label="System status board"></div>
           <div class="psx-body">
             <aside class="psx-intel">
               <div class="psx-h">
@@ -187,7 +189,6 @@
               <div id="deskWeights" class="psx-sink" hidden></div>
               <div id="deskReturns" class="psx-sink" hidden></div>
               <div id="deskReact" class="psx-sink" hidden></div>
-              <div id="deskLearn" class="psx-sink" hidden></div>
             </aside>
 
             <div class="psx-main">
@@ -222,7 +223,7 @@
 
                 <div class="psx-book-col">
                   <div class="psx-h">
-                    <h2>QUOTE</h2>
+                    <h2>QUOTE + M1 FLOW</h2>
                     <span class="psx-src">BID / ASK</span>
                     <span class="psx-live">● LIVE</span>
                   </div>
@@ -239,7 +240,7 @@
                 </div>
 
                 <div class="psx-cell psx-ind-cell">
-                  <div class="psx-h"><h2>INDICATORS — RSI / MACD</h2><span class="psx-src">UI ONLY</span><span class="psx-live">● LIVE</span></div>
+                  <div class="psx-h"><h2>INDICATORS</h2><span class="psx-src">M1 ATR</span><span class="psx-live">● LIVE</span></div>
                   <div id="deskIndCharts" class="psx-ind"></div>
                   <div id="deskIndicators" class="psx-ind-kv"></div>
                 </div>
@@ -248,8 +249,8 @@
                   <div id="deskDeals" class="psx-trades"></div>
                 </div>
                 <div class="psx-cell">
-                  <div class="psx-h"><h2>WATCHLIST</h2><span class="psx-live">● LIVE</span></div>
-                  <div id="deskWatch" class="psx-watch"></div>
+                  <div class="psx-h"><h2>SYSTEM LEARN</h2><span class="psx-src">CARDS · SHADOW · PARAMS</span><span class="psx-live">● LIVE</span></div>
+                  <div id="deskLearn" class="psx-learn-board"></div>
                 </div>
                 <div class="psx-cell">
                   <div class="psx-h"><h2>CLIENT CLOSES</h2><span class="psx-src" id="deskClosedSrc">—</span><span class="psx-live">● LIVE</span></div>
@@ -264,13 +265,14 @@
             </div>
 
             <aside class="psx-right">
-              <div class="psx-h"><h2>SIGNAL WATCH</h2><span class="psx-live">● LIVE</span></div>
+              <div class="psx-h"><h2>AI + SIGNALS</h2><span class="psx-live">● LIVE</span></div>
               <div class="psx-cell">
                 <div class="psx-h"><h2>AI SCORE LEAN</h2><span class="psx-src">SCORES</span></div>
                 <div id="deskCrowd" class="psx-crowd"></div>
               </div>
               <div class="psx-cell grow">
-                <div class="psx-h"><h2>SIGNALS</h2></div>
+                <div class="psx-h"><h2>WATCH / SIGNALS</h2></div>
+                <div id="deskWatch" class="psx-watch"></div>
                 <div id="deskSignal" class="psx-sigwatch"></div>
               </div>
               <!-- Kept for JS/id stability — not shown (no real funding / F&G / lean feed) -->
@@ -449,6 +451,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=12"></script>
-  <script src="/admin/static/admin.js?v=127"></script>
+  <script src="/admin/static/admin.js?v=128"></script>
 </body>
 </html>

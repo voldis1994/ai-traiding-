@@ -405,10 +405,33 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-tape-item .ch.up{color:var(--g)}.psx-tape-item .ch.dn{color:var(--r)}
 .psx-tape-item .cl{display:none}
 
+/* Full-width status board — read every gate at once (no nested scroll hunt). */
+.psx-status-board{
+  flex:0 0 auto;display:grid;gap:6px;padding:6px 8px 0;
+  grid-template-columns:repeat(7,minmax(0,1fr));
+  min-height:78px}
+.psx-status-empty{
+  grid-column:1/-1;padding:12px;border:1px dashed var(--desk-border);
+  color:var(--mut);font-size:12px;text-align:center;background:var(--panel)}
+.psx-status-tile{
+  border:1px solid var(--desk-border);background:var(--panel);border-radius:2px;
+  padding:8px 10px;display:flex;flex-direction:column;gap:3px;min-width:0;
+  min-height:72px}
+.psx-status-tile .k{
+  font-size:10px;font-weight:800;letter-spacing:.06em;color:var(--mut);text-transform:uppercase}
+.psx-status-tile .v{
+  font-size:18px;font-weight:800;line-height:1.15;color:var(--txt);
+  white-space:normal;overflow-wrap:anywhere}
+.psx-status-tile .s{
+  font-size:11px;color:var(--mut);line-height:1.35;white-space:normal;overflow-wrap:anywhere}
+.psx-status-tile.ok .v{color:var(--g)}
+.psx-status-tile.bad .v{color:var(--r)}
+.psx-status-tile.neu .v{color:var(--desk-blue)}
+
 .psx-body{
   flex:1;min-height:0;display:grid;gap:var(--desk-gap);padding:0 var(--desk-gap) var(--desk-gap);
-  /* Intel was 120px — GATE/NEWS reasons died behind ellipsis. */
-  grid-template-columns:minmax(200px,240px) minmax(0,1fr) minmax(220px,260px);overflow:auto}
+  /* Wider intel + system column so reasons stay readable. */
+  grid-template-columns:minmax(240px,280px) minmax(0,1fr) minmax(240px,280px);overflow:auto}
 
 .psx-rail{display:flex;flex-direction:column;gap:0;padding:4px 0;background:#060b16}
 .psx-rail-btn{
@@ -480,10 +503,10 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-chart-col .psx-h{gap:6px}
 
 .psx-grid{
-  flex:1;min-height:420px;display:grid;gap:var(--desk-gap);overflow:auto;
-  /* Deals wider so SL/TP columns fit; watch stays but narrower. */
-  grid-template-columns:minmax(150px,1fr) minmax(280px,1.6fr) minmax(140px,.9fr) minmax(150px,1fr);
-  grid-template-rows:minmax(220px,1.45fr) minmax(200px,1fr);
+  flex:1;min-height:420px;display:grid;gap:var(--desk-gap);overflow:visible;
+  /* Deals + learn readable; no squeeze into tiny scroll boxes. */
+  grid-template-columns:minmax(160px,1fr) minmax(280px,1.5fr) minmax(200px,1.1fr) minmax(160px,1fr);
+  grid-template-rows:minmax(220px,1.35fr) minmax(220px,1fr);
   grid-template-areas:
     "chart chart book engine"
     "ind deals watch whale"}
@@ -527,7 +550,18 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-spread{
   text-align:center;padding:8px 6px;margin:0;color:var(--txt);font-weight:800;font-size:11px;background:#0a101c}
 
-.psx-cell{background:var(--panel);min-width:0;border:1px solid var(--line);border-radius:var(--desk-radius);overflow:hidden;display:flex;flex-direction:column;min-height:140px}
+.psx-cell{background:var(--panel);min-width:0;border:1px solid var(--line);border-radius:var(--desk-radius);overflow:visible;display:flex;flex-direction:column;min-height:160px}
+.psx-learn-board{padding:8px 10px 10px;flex:1;min-height:0;overflow:visible;display:flex;flex-direction:column;gap:6px}
+.psx-learn-kv{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.psx-learn-kv .desk-kv{padding:8px 10px;border:1px solid var(--desk-grid);background:#080d19;border-radius:2px;
+  display:flex;justify-content:space-between;gap:8px;align-items:flex-start;min-height:36px}
+.psx-learn-kv .desk-kv span{color:var(--mut);font-size:11px;white-space:normal;overflow-wrap:anywhere}
+.psx-learn-kv .desk-kv strong{font-size:13px;font-weight:800;white-space:normal;overflow-wrap:anywhere;text-align:right}
+.psx-learn-line{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;border:1px solid var(--desk-grid);background:#060a14;font-size:11px}
+.psx-learn-line span{flex:0 0 64px;color:var(--mut);font-weight:800;letter-spacing:.04em}
+.psx-learn-line b{flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;font-weight:600;line-height:1.35}
+.psx-learn-line.ok b{color:var(--g)}
+.psx-learn-line.bad b{color:var(--r)}
 .psx-ind{padding:8px 10px;display:flex;flex-direction:column;gap:6px;flex:1;min-height:0}
 .psx-ind-canvas{flex:1;min-height:56px;border:1px solid var(--desk-grid);background:#060a14;position:relative}
 .psx-ind-canvas canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
@@ -598,7 +632,7 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
   display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;
   border-bottom:1px solid var(--desk-grid);border-right:1px solid var(--desk-grid);font-size:11px;min-height:34px}
 .psx-score-row span{color:var(--mut);flex:1;min-width:0;overflow:visible;white-space:normal;overflow-wrap:anywhere}
-.psx-score-row b{font-size:12px;letter-spacing:.03em;flex:0 0 auto;white-space:nowrap}
+.psx-score-row b{font-size:12px;letter-spacing:.03em;flex:0 1 auto;max-width:62%;white-space:normal;overflow-wrap:anywhere;text-align:right}
 .psx-score-row .ok{color:var(--g)}.psx-score-row .bad{color:var(--r)}.psx-score-row .neu{color:var(--mut)}
 
 .psx-crowd{padding:12px}
@@ -656,16 +690,19 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 
 @media(max-width:1600px){
   .psx-ind-kv{grid-template-columns:1fr}
-  .psx-body{grid-template-columns:minmax(180px,220px) minmax(0,1fr) minmax(200px,240px)}
+  .psx-status-board{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .psx-body{grid-template-columns:minmax(220px,260px) minmax(0,1fr) minmax(220px,260px)}
 }
 @media(max-width:1280px){
-  .psx-body{grid-template-columns:minmax(170px,200px) minmax(0,1fr) minmax(190px,220px)}
+  .psx-status-board{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .psx-body{grid-template-columns:minmax(200px,240px) minmax(0,1fr) minmax(200px,240px)}
   .psx-grid{grid-template-columns:repeat(4,minmax(140px,1fr))}
   .psx-score{grid-template-columns:1fr}
   .psx-ind-kv{grid-template-columns:1fr}
 }
 @media(max-width:1100px){
   .term-body{grid-template-columns:78px 1fr}
+  .psx-status-board{grid-template-columns:repeat(2,minmax(0,1fr))}
   .psx-body{grid-template-columns:1fr}
   .psx-grid{grid-template-columns:1fr;grid-template-areas:none;grid-auto-rows:minmax(160px,auto);min-height:0}
   .psx-chart-col,.psx-book-col,.psx-engine-col,.psx-grid>.psx-cell{grid-area:auto;min-height:160px}

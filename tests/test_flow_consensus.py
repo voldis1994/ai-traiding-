@@ -141,6 +141,36 @@ def test_observe_close_marks_aligned_win_helpful_and_can_adapt():
         assert snap['nudge'] >= 0.18  # may strengthen after helpful edge
 
 
+def test_pillar_thresholds_come_from_self_params():
+    import tempfile
+    from pathlib import Path
+    from app.engine import Store
+    from app import self_params
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        # Defaults would vote BUY on mild features; raise rails so they go quiet.
+        p = self_params.load(store)
+        p['flow_pillar_impulse'] = 0.35
+        p['flow_pillar_vol_z'] = 0.45
+        p['flow_pillar_imbalance'] = 0.40
+        p['flow_pillar_impact'] = 0.35
+        self_params.save(store, p, reason='test_pillar')
+        mild = _obs(vol_z=0.22, impulse=0.20, imbalance=0.22, micro=0.20)
+        out = fc.evaluate(mild, proposed='BUY', epic='GOLD', store=store)
+        thr = out.get('pillar_thresholds') or {}
+        assert thr.get('impulse') == 0.35
+        assert thr.get('imbalance') == 0.40
+        votes = {x['id']: x['vote'] for x in out['pillars'] if x['ok']}
+        assert all(v == 'NEUTRAL' for v in votes.values()), votes
+        # Same mild obs with default rails would still allow liquidity/impact votes.
+        raw = fc.evaluate(mild, proposed='BUY', epic='GOLD', store=None)
+        raw_votes = {x['id']: x['vote'] for x in raw['pillars'] if x['ok']}
+        assert raw_votes['liquidity'] == 'BUY'
+        assert raw_votes['short_term_impact'] == 'BUY'
+        snap = fc.learn_snapshot(store)
+        assert snap['pillar_thresholds']['impulse'] == 0.35
+
+
 def test_block_resolve_marks_saved_loser():
     import tempfile
     from pathlib import Path

@@ -35,11 +35,16 @@ LEDGER_MAX = 80
 BLOCK_HORIZON_BARS = 5  # M1 bars to judge a blocked OPEN
 ADAPT_MIN_N = 4
 
-# Pillar thresholds on already-bounded liquidity features [-1, 1].
+# Default pillar thresholds on already-bounded liquidity features [-1, 1].
+# Live values live in self_params (flow_pillar_*); these are seed/fallback only.
 FLOW_IMPULSE = 0.12
 FLOW_VOL_Z = 0.20
 LIQ_IMBALANCE = 0.18
 IMPACT_MICRO = 0.15
+STORE_PILLAR_IMPULSE = 'flow_pillar_impulse'
+STORE_PILLAR_VOL_Z = 'flow_pillar_vol_z'
+STORE_PILLAR_IMBALANCE = 'flow_pillar_imbalance'
+STORE_PILLAR_IMPACT = 'flow_pillar_impact'
 
 
 def _finite(x):
@@ -87,6 +92,32 @@ def _cfg_block_min_agree(store) -> int:
         return max(2, min(3, int(v)))
     except Exception:
         return int(DEFAULT_BLOCK_MIN_AGREE)
+
+
+def _cfg_pillar_thresholds(store=None) -> dict:
+    """Order-flow / liquidity / impact vote thresholds from self_params."""
+    defaults = {
+        'impulse': FLOW_IMPULSE,
+        'vol_z': FLOW_VOL_Z,
+        'imbalance': LIQ_IMBALANCE,
+        'impact': IMPACT_MICRO,
+    }
+    if store is None:
+        return defaults
+    try:
+        from . import self_params
+        return {
+            'impulse': max(0.04, min(0.40, float(self_params.get(
+                store, STORE_PILLAR_IMPULSE, FLOW_IMPULSE)))),
+            'vol_z': max(0.05, min(0.50, float(self_params.get(
+                store, STORE_PILLAR_VOL_Z, FLOW_VOL_Z)))),
+            'imbalance': max(0.05, min(0.45, float(self_params.get(
+                store, STORE_PILLAR_IMBALANCE, LIQ_IMBALANCE)))),
+            'impact': max(0.04, min(0.40, float(self_params.get(
+                store, STORE_PILLAR_IMPACT, IMPACT_MICRO)))),
+        }
+    except Exception:
+        return defaults
 
 
 def _utc_now_iso():
@@ -179,8 +210,11 @@ def provider_catalog(*, snapshot=None) -> list[dict]:
     return active
 
 
-def _pillar_order_flow(obs: dict) -> dict:
+def _pillar_order_flow(obs: dict, thr: dict | None = None) -> dict:
     """Tape / volume impulse on completed M1 (not tick race)."""
+    thr = thr or _cfg_pillar_thresholds(None)
+    flow_impulse = float(thr.get('impulse', FLOW_IMPULSE))
+    flow_vol_z = float(thr.get('vol_z', FLOW_VOL_Z))
     avail = (obs.get('availability') or {}) if isinstance(obs, dict) else {}
     feats = obs.get('features') if isinstance(obs, dict) else None
     if not avail.get('primary_volume') or not isinstance(feats, (list, tuple)) or len(feats) < 3:
@@ -196,14 +230,14 @@ def _pillar_order_flow(obs: dict) -> dict:
     series = (obs.get('series_used') or [{}])[0]
     vote = 'NEUTRAL'
     reason = 'quiet'
-    if impulse is not None and abs(impulse) >= FLOW_IMPULSE and abs(vol_z) >= FLOW_VOL_Z * 0.5:
-        if impulse > 0 and vol_z >= -FLOW_VOL_Z:
+    if impulse is not None and abs(impulse) >= flow_impulse and abs(vol_z) >= flow_vol_z * 0.5:
+        if impulse > 0 and vol_z >= -flow_vol_z:
             vote = 'BUY'
             reason = f'impulse={impulse:.2f} vol_z={vol_z:.2f}'
-        elif impulse < 0 and vol_z <= FLOW_VOL_Z:
+        elif impulse < 0 and vol_z <= flow_vol_z:
             vote = 'SELL'
             reason = f'impulse={impulse:.2f} vol_z={vol_z:.2f}'
-    elif abs(vol_z) >= FLOW_VOL_Z * 1.5:
+    elif abs(vol_z) >= flow_vol_z * 1.5:
         vote = 'BUY' if vol_z > 0 else 'SELL'
         reason = f'vol_z={vol_z:.2f}'
     return {
@@ -220,8 +254,10 @@ def _pillar_order_flow(obs: dict) -> dict:
     }
 
 
-def _pillar_liquidity(obs: dict) -> dict:
+def _pillar_liquidity(obs: dict, thr: dict | None = None) -> dict:
     """External L2 imbalance (PAXG etc.) — labeled substitute, never Capital DOM."""
+    thr = thr or _cfg_pillar_thresholds(None)
+    liq_imbalance = float(thr.get('imbalance', LIQ_IMBALANCE))
     book = (obs.get('book') or {}) if isinstance(obs, dict) else {}
     if not book.get('available'):
         return {
@@ -234,9 +270,9 @@ def _pillar_liquidity(obs: dict) -> dict:
     imb = _finite(book.get('imbalance')) or 0.0
     vote = 'NEUTRAL'
     reason = f'imbalance={imb:.2f}'
-    if imb >= LIQ_IMBALANCE:
+    if imb >= liq_imbalance:
         vote = 'BUY'
-    elif imb <= -LIQ_IMBALANCE:
+    elif imb <= -liq_imbalance:
         vote = 'SELL'
     return {
         'id': 'liquidity',
@@ -252,8 +288,10 @@ def _pillar_liquidity(obs: dict) -> dict:
     }
 
 
-def _pillar_impact(obs: dict) -> dict:
+def _pillar_impact(obs: dict, thr: dict | None = None) -> dict:
     """Short-term price-impact proxy from microprice vs mid (bounded)."""
+    thr = thr or _cfg_pillar_thresholds(None)
+    impact_micro = float(thr.get('impact', IMPACT_MICRO))
     book = (obs.get('book') or {}) if isinstance(obs, dict) else {}
     if not book.get('available'):
         return {
@@ -266,9 +304,9 @@ def _pillar_impact(obs: dict) -> dict:
     micro = _finite(book.get('micro_bps')) or 0.0
     vote = 'NEUTRAL'
     reason = f'micro={micro:.2f}'
-    if micro >= IMPACT_MICRO:
+    if micro >= impact_micro:
         vote = 'BUY'
-    elif micro <= -IMPACT_MICRO:
+    elif micro <= -impact_micro:
         vote = 'SELL'
     return {
         'id': 'short_term_impact',
@@ -345,8 +383,10 @@ def evaluate(
     trend: str | None = None,
     snapshot: dict | None = None,
     epic: str | None = None,
+    store=None,
 ) -> dict:
     """Build M1 consensus panel + soft advice from one liquidity observation."""
+    thr = _cfg_pillar_thresholds(store)
     out: dict[str, Any] = {
         'ok': False,
         'system': 'flow_consensus',
@@ -362,6 +402,7 @@ def evaluate(
         'accept': None,
         'providers': provider_catalog(snapshot=snapshot),
         'reason': None,
+        'pillar_thresholds': thr,
         'capital_note': (
             'Capital = execution BID/ASK + OHLC only; '
             'depth/size never from Capital CFD'),
@@ -369,16 +410,16 @@ def evaluate(
     if not isinstance(obs, dict) or not obs.get('ok'):
         out['reason'] = (obs or {}).get('reason') if isinstance(obs, dict) else 'no_observation'
         out['pillars'] = [
-            _pillar_order_flow(obs or {}),
-            _pillar_liquidity(obs or {}),
-            _pillar_impact(obs or {}),
+            _pillar_order_flow(obs or {}, thr),
+            _pillar_liquidity(obs or {}, thr),
+            _pillar_impact(obs or {}, thr),
         ]
         return out
 
     pillars = [
-        _pillar_order_flow(obs),
-        _pillar_liquidity(obs),
-        _pillar_impact(obs),
+        _pillar_order_flow(obs, thr),
+        _pillar_liquidity(obs, thr),
+        _pillar_impact(obs, thr),
     ]
     out['pillars'] = pillars
     tally = _tally(pillars)
@@ -421,6 +462,7 @@ def evaluate_from_path(
     proposed=None,
     structure=None,
     trend=None,
+    store=None,
 ) -> dict:
     snap = load_liquidity_snapshot(path) if path is not None else None
     obs = liquidity_observation_from_path(
@@ -428,7 +470,7 @@ def evaluate_from_path(
             {'ok': False}, bar_time, now=now, epic=epic)
     return evaluate(
         obs, proposed=proposed, structure=structure, trend=trend,
-        snapshot=snap, epic=epic)
+        snapshot=snap, epic=epic, store=store)
 
 
 def soft_nudge_scores(scores, consensus, *, store=None):
@@ -531,7 +573,7 @@ def apply_to_decision(
         if path is not None and bar_time is not None:
             cons = evaluate_from_path(
                 path, bar_time, epic=epic, proposed=prop,
-                structure=structure, trend=trend)
+                structure=structure, trend=trend, store=store)
         else:
             cons = {'ok': False, 'reason': 'liquidity_path_or_bar_missing'}
     else:
@@ -989,6 +1031,7 @@ def learn_snapshot(store) -> dict:
             store, STORE_BLOCK_MIN_KEY, DEFAULT_BLOCK_MIN_AGREE)
     except Exception:
         nudge, block, block_min = DEFAULT_NUDGE, DEFAULT_BLOCK_FIGHTS, DEFAULT_BLOCK_MIN_AGREE
+    thr = _cfg_pillar_thresholds(store)
     return {
         'ok': True,
         'n': int(stats.get('n') or 0),
@@ -1003,5 +1046,6 @@ def learn_snapshot(store) -> dict:
         'nudge': nudge,
         'block_fights': int(block),
         'block_min_agree': int(block_min),
+        'pillar_thresholds': thr,
         'last_adapt': adapt,
     }

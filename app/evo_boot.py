@@ -14,13 +14,16 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
         return {'ok': False, 'reason': 'no_store'}
     prev = store.get(STORE_FLAG) or {}
     if isinstance(prev, dict) and prev.get('done') and not force:
-        # Still re-harvest lightly so new library EV can activate cards.
+        # Still try samples (idempotent) + harvest so visi_dati upgrades land.
+        out = {'ok': True, 'reason': 'already_booted'}
         try:
-            from . import strategy_gen
-            h = strategy_gen.harvest(store, epic=epic)
+            from . import sample_strategies, strategy_gen
+            out['samples'] = sample_strategies.build_strategies_from_samples(
+                store, backup_root=None, use_store_trades=True, force=False)
+            out['harvest'] = strategy_gen.harvest(store, epic=epic)
         except Exception as exc:
-            h = {'ok': False, 'reason': type(exc).__name__}
-        return {'ok': True, 'reason': 'already_booted', 'harvest': h}
+            out['harvest'] = {'ok': False, 'reason': type(exc).__name__}
+        return out
 
     out = {
         'ok': True,
@@ -40,6 +43,10 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
             'self_params_horizon_trades', 'learn_loss_repeats',
             'trail_live_enabled', 'trail_arm_mfe_frac', 'structure_edge_nudge',
             'strategy_gen_enabled', 'reentry_same_dir_atr_frac',
+            'flow_consensus_nudge', 'flow_consensus_block_fights',
+            'flow_consensus_block_min_agree',
+            'flow_pillar_impulse', 'flow_pillar_vol_z',
+            'flow_pillar_imbalance', 'flow_pillar_impact',
         ):
             if k not in (store.get('self_params_v1') or {}) and k in DEFAULTS:
                 p[k] = DEFAULTS[k]
@@ -65,8 +72,10 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
         from . import sample_strategies
         # Samples first (backups + store trades) → library → cards.
         # No programming — market closes are the strategy material.
+        # Always try /tmp/visi-dati (or VISI_DATI) so uploaded market samples
+        # become strategy cards on day-one boot — not only thin local store.
         out['samples'] = sample_strategies.build_strategies_from_samples(
-            store, backup_root=None, use_store_trades=True)
+            store, backup_root=None, use_store_trades=True, force=False)
         out['audit_seed'] = strategy_gen.seed_audit_cards(store)
         out['harvest'] = strategy_gen.harvest(store, epic=epic)
         if (out['audit_seed'] or {}).get('added') or (

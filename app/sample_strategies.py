@@ -54,8 +54,9 @@ def ingest_trades(store, trades, candles, *, epic=None, tick=0.1,
     if not trades:
         return {'ok': False, 'reason': 'no_trades', 'ingested': 0}
     chron = sorted(candles or [], key=lambda r: str(r.get('at') or ''))
-    if len(chron) < 40:
-        return {'ok': False, 'reason': 'too_few_candles', 'candles': len(chron)}
+    # Thin / empty candle tape still banks ±£ into combo memory (path-less).
+    # Full OHLC framing needs ≥40 bars; below that we only do combo evidence.
+    frame_ohlc = len(chron) >= 40
 
     ingested = 0
     skipped = 0
@@ -72,12 +73,15 @@ def ingest_trades(store, trades, candles, *, epic=None, tick=0.1,
             skipped += 1
             continue
         ep = epic or tr.get('epic') or 'GOLD'
-        path = ss.trim_path_entry_to_exit(
-            hr.path_between(chron, tr.get('opened'), tr.get('closed')),
-            direction=direction, entry=entry, exit_level=exit_level,
-            entry_bar_time=hr._iso(tr.get('opened')),
-            exit_bar_time=hr._iso(tr.get('closed')))
-        pre = hr.pre_bars_before(chron, tr.get('opened'), limit=ss.MAX_PRE_BARS)
+        if frame_ohlc:
+            path = ss.trim_path_entry_to_exit(
+                hr.path_between(chron, tr.get('opened'), tr.get('closed')),
+                direction=direction, entry=entry, exit_level=exit_level,
+                entry_bar_time=hr._iso(tr.get('opened')),
+                exit_bar_time=hr._iso(tr.get('closed')))
+            pre = hr.pre_bars_before(chron, tr.get('opened'), limit=ss.MAX_PRE_BARS)
+        else:
+            path, pre = [], []
         stop_d = profit_d = None
         if path:
             ranges = [float(b['high']) - float(b['low']) for b in path
@@ -95,30 +99,45 @@ def ingest_trades(store, trades, candles, *, epic=None, tick=0.1,
         except Exception:
             exit_reason = 'loss' if pnl < 0 else 'tp'
         spread = _finite(tr.get('spread')) or float(default_spread)
-        if pnl < 0:
-            rec = ss.record_loss(
-                store, epic=ep, direction=direction, entry=entry,
-                exit_level=exit_level, exit_reason=exit_reason or 'loss',
-                broker_pnl=pnl, bars=path, pre_bars=pre,
-                deal_id=tr.get('deal_id'), spread=spread)
-        elif pnl > 0:
-            rec = ss.record_win(
-                store, epic=ep, direction=direction, entry=entry,
-                exit_level=exit_level, exit_reason=exit_reason or 'tp',
-                broker_pnl=pnl, bars=path, pre_bars=pre,
-                deal_id=tr.get('deal_id'), spread=spread)
+        rec = None
+        if path and len(path) >= 3:
+            if pnl < 0:
+                rec = ss.record_loss(
+                    store, epic=ep, direction=direction, entry=entry,
+                    exit_level=exit_level, exit_reason=exit_reason or 'loss',
+                    broker_pnl=pnl, bars=path, pre_bars=pre,
+                    deal_id=tr.get('deal_id'), spread=spread)
+            elif pnl > 0:
+                rec = ss.record_win(
+                    store, epic=ep, direction=direction, entry=entry,
+                    exit_level=exit_level, exit_reason=exit_reason or 'tp',
+                    broker_pnl=pnl, bars=path, pre_bars=pre,
+                    deal_id=tr.get('deal_id'), spread=spread)
+            else:
+                skipped += 1
+                continue
+        elif pnl == 0:
+            skipped += 1
+            continue
+        # Even without a full OHLC path, bank ±£ into combo memory so samples
+        # still teach prefer/avoid (structure fallback from price move).
+        st = None
+        if rec:
+            ingested += 1
+            st = ((rec.get('snapshot') or {}).get('frame') or {}).get('structure')
+            if not st:
+                st = (ss.frame_from_ohlc(path, entry=entry, exit_level=exit_level,
+                                         pre_bars=pre) or {}).get('structure')
         else:
-            skipped += 1
-            continue
-        if not rec:
-            skipped += 1
-            continue
-        ingested += 1
-        st = ((rec.get('snapshot') or {}).get('frame') or {}).get('structure')
-        if not st:
-            st = (ss.frame_from_ohlc(path, entry=entry, exit_level=exit_level,
-                                     pre_bars=pre) or {}).get('structure')
-        # Wins AND losses → combination memory (what pays vs what bleeds).
+            # Path-less sample — still usable as combo evidence.
+            move = exit_level - entry
+            if direction == 'BUY':
+                st = 'TREND_UP' if move > 0 else 'TREND_DOWN'
+            else:
+                st = 'TREND_DOWN' if move < 0 else 'TREND_UP'
+            if abs(move) < max(float(tick) * 5, abs(spread) * 2):
+                st = 'CHOP'
+            ingested += 1
         try:
             strategy_gen.record_combo(
                 store, epic=ep, structure=st or 'CHOP', direction=direction,
@@ -147,7 +166,9 @@ def collect_gold_samples_from_backups(root: Path | None = None) -> dict:
         return {'ok': False, 'reason': 'no_dumps', 'root': str(root)}
 
     trades_by_key = {}
-    candles = []
+    # Merge candles from EVERY dump — one "richest" tape left most trades
+    # outside the OHLC span (no_raw_path skips).
+    candles_by_key = {}
     candle_epic = 'GOLD'
     sources = []
     for db_path in dumps:
@@ -167,22 +188,31 @@ def collect_gold_samples_from_backups(root: Path | None = None) -> dict:
             if prev is None or hr._trade_quality(r) > hr._trade_quality(prev):
                 trades_by_key[key] = r
                 added += 1
-        # Prefer the dump with the most GOLD candles for framing paths.
         try:
             from app.engine import Store
             src = Store(Path(db_path))
-            # Guess epic from first gold trade.
             ep = gold[0].get('epic') or 'GOLD'
             c = hr.load_candles(src, ep)
-            if len(c) > len(candles):
-                candles = c
-                candle_epic = ep
+            n_c = 0
+            for bar in c or []:
+                at = str(bar.get('at') or '')
+                if not at:
+                    continue
+                k = f"{ep}|{at}"
+                if k not in candles_by_key:
+                    candles_by_key[k] = dict(bar)
+                    n_c += 1
+            candle_epic = ep or candle_epic
             sources.append({'path': str(db_path), 'gold_trades': len(gold),
-                            'added': added, 'candles': len(c)})
+                            'added': added, 'candles': len(c),
+                            'candles_new': n_c})
         except Exception as exc:
             sources.append({'path': str(db_path), 'gold_trades': len(gold),
                             'error': type(exc).__name__})
 
+    candles = sorted(
+        candles_by_key.values(),
+        key=lambda r: str(r.get('at') or ''))
     trades = sorted(
         trades_by_key.values(),
         key=lambda r: str(r.get('opened') or ''))
@@ -198,6 +228,20 @@ def collect_gold_samples_from_backups(root: Path | None = None) -> dict:
     }
 
 
+def _merge_candles(primary, secondary) -> list:
+    """Union candle bars by ``at`` so multi-backup spans cover more trades."""
+    by_at = {}
+    for bar in list(primary or []) + list(secondary or []):
+        if not isinstance(bar, dict):
+            continue
+        at = str(bar.get('at') or '')
+        if not at:
+            continue
+        if at not in by_at:
+            by_at[at] = dict(bar)
+    return sorted(by_at.values(), key=lambda r: str(r.get('at') or ''))
+
+
 def build_strategies_from_samples(
         store, *, backup_root=None, use_store_trades=True,
         clear_library=False, force=False) -> dict:
@@ -206,9 +250,13 @@ def build_strategies_from_samples(
         return {'ok': False, 'reason': 'no_store'}
     prev = store.get(STORE_FLAG) or {}
     lib_n = library_sample_count(store)
+    # Re-ingest when backups are present and library is still thin vs school.
+    root = Path(backup_root or os.environ.get('VISI_DATI') or DEFAULT_BACKUP_ROOT)
+    backups_ready = root.is_dir()
     if (isinstance(prev, dict) and prev.get('done') and not force
             and lib_n >= int(prev.get('library_samples') or 0)
-            and lib_n >= 30):
+            and lib_n >= 200
+            and (not backups_ready or lib_n >= 400)):
         # Still harvest so cards track library.
         h = strategy_gen.harvest(store)
         return {
@@ -233,23 +281,19 @@ def build_strategies_from_samples(
         except Exception:
             pass
 
-    # Backups fill / enlarge the school when local store is thin.
-    need_backup = len(trades) < 40 or force
-    if need_backup or not trades:
-        bag = collect_gold_samples_from_backups(backup_root)
-        if bag.get('ok'):
-            # Merge: prefer union by deal_id.
-            by_key = {hr._trade_merge_key(t): t for t in trades
-                      if hr._trade_merge_key(t)}
-            for t in bag['trades']:
-                k = hr._trade_merge_key(t)
-                if k and k not in by_key:
-                    by_key[k] = t
-            trades = sorted(by_key.values(), key=lambda r: str(r.get('opened') or ''))
-            if len(bag.get('candles') or []) > len(candles):
-                candles = bag['candles']
-            epic = bag.get('epic') or epic
-            source = 'store+backups' if source == 'store' else 'backups'
+    # Always merge visi_dati / backups when present — local store alone is thin.
+    bag = collect_gold_samples_from_backups(backup_root)
+    if bag.get('ok'):
+        by_key = {hr._trade_merge_key(t): t for t in trades
+                  if hr._trade_merge_key(t)}
+        for t in bag['trades']:
+            k = hr._trade_merge_key(t)
+            if k and k not in by_key:
+                by_key[k] = t
+        trades = sorted(by_key.values(), key=lambda r: str(r.get('opened') or ''))
+        candles = _merge_candles(candles, bag.get('candles'))
+        epic = bag.get('epic') or epic
+        source = 'store+backups' if source == 'store' else 'backups'
 
     if not trades:
         # Fall back: audit seed cards only (no sample paths).

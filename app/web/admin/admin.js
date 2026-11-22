@@ -472,7 +472,98 @@ function deskKv(cid,label,val,fmt){
 function renderDeskWeights(client){ /* sink — data folded into engine score */ }
 function renderDeskReturns(client){ /* sink */ }
 function renderDeskReact(client){ /* sink */ }
-function renderDeskLearn(client){ /* sink — learn msg in intel */ }
+
+function deskSystem(client){
+  const a=(client&&client.activity)||{};
+  return (a.desk_system&&typeof a.desk_system==='object')?a.desk_system:{};
+}
+
+function renderDeskStatusBoard(client){
+  const el=$('deskStatusBoard');
+  if(!el)return;
+  if(!client){
+    stableHtml(el,'<div class="psx-status-empty">Select account — board waits for LIVE card</div>');
+    return;
+  }
+  const a=client.activity||{};
+  const ds=deskSystem(client);
+  const fc=a.flow_consensus||{};
+  const fl=ds.flow_learn||fc.learn||{};
+  const cards=ds.cards||{};
+  const shadow=ds.shadow||{};
+  const samples=ds.samples||{};
+  const knobs=ds.knobs||{};
+  const can=!!(ds.can_open||a.entry_can_submit_now);
+  const block=ds.entry_block||a.entry_block_reason||'—';
+  const intent=ds.entry_intent||a.entry_intent||a.policy_proposal||'—';
+  const closeExec=ds.neural_close_executable!==false&&a.neural_close_executable!==false;
+  const exitIntent=ds.neural_exit_intent||a.neural_exit_intent||'—';
+  const cons=String((ds.flow_consensus&&ds.flow_consensus.consensus)||fc.consensus||'NEUTRAL').toUpperCase();
+  const consCls=cons==='BUY'?'ok':(cons==='SELL'?'bad':'neu');
+  const shadowNet=shadow.paper_net!=null?Number(shadow.paper_net):null;
+  const shadowTxt=shadowNet==null?'—':((shadowNet>=0?'+':'')+num(shadowNet,2));
+  const tiles=[
+    {k:'CAN OPEN',v:can?'YES':'NO',cls:can?'ok':'bad',
+      s:can?('Intent '+String(intent).slice(0,18)):String(block).slice(0,48)},
+    {k:'NEURAL CLOSE',v:closeExec?'LIVE':'DIAG',cls:closeExec?'ok':'neu',
+      s:'Intent '+String(exitIntent).slice(0,24)},
+    {k:'M1 FLOW',v:cons,cls:consCls,
+      s:(fc.blocked?'BLOCKED · ':'')+(fl.n!=null?('learn n='+fl.n+' help '+(fl.helpful||0)+'/'+(fl.harmful||0)):'—')},
+    {k:'STRATEGY CARDS',v:String(cards.n!=null?cards.n:0),cls:(cards.n>0)?'ok':'neu',
+      s:(cards.active&&cards.active.length)?cards.active.slice(0,3).join(', '):'none active'},
+    {k:'SHADOW £',v:shadowTxt,cls:shadowNet==null?'neu':(shadowNet>=0?'ok':'bad'),
+      s:'trades '+(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0))
+        +' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)},
+    {k:'SAMPLES',v:String(samples.library_samples!=null?samples.library_samples:'—'),cls:'neu',
+      s:(samples.source||'—')+' · cards '+(samples.active_n!=null?samples.active_n:'—')},
+    {k:'SELF PARAMS',v:knobs.horizon!=null?('hz '+knobs.horizon):'—',cls:'neu',
+      s:'nudge '+(knobs.flow_nudge!=null?Number(knobs.flow_nudge).toFixed(2):'—')
+        +' · block '+(knobs.flow_block!=null?(Number(knobs.flow_block)?'on':'off'):'—')
+        +' · impulse '+(knobs.flow_impulse!=null?Number(knobs.flow_impulse).toFixed(2):'—')},
+  ];
+  stableHtml(el,tiles.map(t=>`<article class="psx-status-tile ${esc(t.cls)}">
+    <span class="k">${esc(t.k)}</span>
+    <strong class="v">${esc(t.v)}</strong>
+    <span class="s">${esc(t.s)}</span>
+  </article>`).join(''));
+}
+
+function renderDeskLearn(client){
+  const el=$('deskLearn');
+  if(!el)return;
+  if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
+  const ds=deskSystem(client);
+  const cards=ds.cards||{};
+  const shadow=ds.shadow||{};
+  const samples=ds.samples||{};
+  const adapt=ds.adaptive||{};
+  const knobs=ds.knobs||{};
+  const paying=(adapt.paying||[]).slice(0,4);
+  const bleeding=(adapt.bleeding||[]).slice(0,4);
+  const rows=[
+    deskKv(client.id,'Active cards',cards.n),
+    deskKv(client.id,'Library samples',samples.library_samples),
+    deskKv(client.id,'Sample source',samples.source||'—'),
+    deskKv(client.id,'Shadow paper £',shadow.paper_net,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Shadow W/L',
+      (shadow.wins!=null||shadow.losses!=null)
+        ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
+    deskKv(client.id,'Flow nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Pillar impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Strategy nudge',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),
+  ];
+  const comboBits=[];
+  if(paying.length){
+    comboBits.push(`<div class="psx-learn-line ok"><span>PAYING</span><b>${esc(paying.map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
+  }
+  if(bleeding.length){
+    comboBits.push(`<div class="psx-learn-line bad"><span>BLEEDING</span><b>${esc(bleeding.map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
+  }
+  if(cards.active&&cards.active.length){
+    comboBits.push(`<div class="psx-learn-line"><span>CARDS</span><b>${esc(cards.active.slice(0,8).join(' · '))}</b></div>`);
+  }
+  stableHtml(el,`<div class="psx-learn-kv">${rows.join('')}</div>${comboBits.join('')}`);
+}
 
 /** M1 ATR14 from completed candles — never invent from M5 stop_hint (~7.5 lie). */
 function deskM1Atr14(view,mtf,ov){
@@ -760,22 +851,29 @@ function renderDeskCheck(client,view){
   // No lean → NEUT (never invent BULL just because MTF is ready).
   const mtfTag=/sell|bear|down/i.test(String(mtfLean))?'BEAR'
     :(/buy|bull|up/i.test(String(mtfLean))?'BULL':'NEUT');
+  const canOpen=!!a.entry_can_submit_now;
+  const closeLive=a.neural_close_executable!==false&&!a.neural_close_diagnostic_only;
   const rows=[
     {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
     {k:'Momentum',v:mtfTag,cls:mtfTag==='NEUT'?'neu':(mtfTag==='BEAR'?'bad':'ok')},
-    {k:'Flow',v:(a.day_book&&(a.day_book.phase||''))||'—',cls:'neu'},
+    {k:'M1 Flow',v:(()=>{const fc=a.flow_consensus||{};const c=String(fc.consensus||'—').toUpperCase();
+      return fc.blocked?('BLOCK '+c):c;})(),
+      cls:(()=>{const fc=a.flow_consensus||{};const c=String(fc.consensus||'').toUpperCase();
+        return fc.blocked?'bad':(c==='BUY'?'ok':(c==='SELL'?'bad':'neu'));})()},
     {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':'WAIT',
       cls:a.market_status==='TRADEABLE'?'ok':'neu'},
     {k:'Spread state',v:a.spread!=null?(Number(a.spread)<1?'TIGHT':'WIDE'):'—',cls:'neu'},
     {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
-    {k:'Can OPEN',v:a.entry_can_submit_now?'YES':'NO',cls:a.entry_can_submit_now?'ok':'neu'},
+    {k:'Can OPEN',v:canOpen?'YES':(a.entry_block_reason||'NO'),cls:canOpen?'ok':'bad'},
+    {k:'Neural CLOSE',v:closeLive?('LIVE '+(a.neural_exit_intent||'—')):'DIAG ONLY',
+      cls:closeLive?'ok':'neu'},
     {k:'SL Bracket',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
     {k:'TP Bracket',v:hasTp?'ON':'OFF',cls:hasTp?'ok':(pos?'bad':'neu')},
     {k:'Swing Plan',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'READY':'—',
       cls:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ok':'neu'},
   ];
   stableHtml(el,rows.map(r=>
-    `<div class="psx-score-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(String(r.v).slice(0,16))}</b></div>`
+    `<div class="psx-score-row"><span>${esc(r.k)}</span><b class="${esc(r.cls)}">${esc(String(r.v))}</b></div>`
   ).join(''));
 }
 
@@ -1211,6 +1309,8 @@ async function renderDesk(data){
   const open=collectOpenTrades(clients);
   renderDeskLiveTrades(open);
   renderDeskUtc();
+  renderDeskStatusBoard(focus);
+  renderDeskLearn(focus);
   renderDeskClosed(focus);
   renderDeskEngine(focus);
   renderDeskCrowd(focus);

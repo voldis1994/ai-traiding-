@@ -3458,7 +3458,8 @@ class SingleTradeEngine:
             cons=flow_consensus.evaluate_from_path(
                 path,bar,epic=epic,
                 proposed=prop if prop in ('BUY','SELL') else None,
-                structure=ctx.get('structure'),trend=ctx.get('trend'))
+                structure=ctx.get('structure'),trend=ctx.get('trend'),
+                store=self.store)
             payload=flow_consensus.desk_payload(cons)
             if learn:
                 payload['learn']=learn

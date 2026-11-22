@@ -565,6 +565,108 @@ class RuntimeHub:
             ],
         }
 
+    def _desk_system_payload(self, rt, snap: dict | None = None) -> dict:
+        """At-a-glance A–F board for Desk — cards, shadow, params, samples, flow."""
+        snap = snap if isinstance(snap, dict) else {}
+        store = getattr(rt, 'store', None) if rt is not None else None
+        sd = snap.get('self_development') if isinstance(snap.get('self_development'), dict) else {}
+        out = {
+            'ok': True,
+            'can_open': bool(snap.get('entry_can_submit_now')),
+            'entry_block': snap.get('entry_block_reason'),
+            'entry_intent': snap.get('entry_intent') or snap.get('policy_proposal'),
+            'neural_close_executable': bool(snap.get('neural_close_executable', True)),
+            'neural_close_diagnostic_only': bool(
+                snap.get('neural_close_diagnostic_only', False)),
+            'neural_exit_intent': snap.get('neural_exit_intent'),
+            'cards': {'active': [], 'n': 0},
+            'shadow': {},
+            'self_params': {},
+            'samples': {},
+            'flow_learn': {},
+            'adaptive': {},
+        }
+        try:
+            from . import strategy_gen
+            bag = strategy_gen.load(store) if store is not None else {'active_ids': []}
+            ids = list(bag.get('active_ids') or [])
+            out['cards'] = {
+                'active': ids[:12],
+                'n': len(ids),
+                'enabled': True,
+            }
+        except Exception as exc:
+            out['cards'] = {'active': [], 'n': 0, 'error': type(exc).__name__}
+        try:
+            sp = sd.get('shadow_paper')
+            if not isinstance(sp, dict) and store is not None and rt is not None:
+                eng = getattr(rt, 'engine', None)
+                if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
+                    sp = eng.shadow_paper.summary()
+            out['shadow'] = sp if isinstance(sp, dict) else {}
+        except Exception as exc:
+            out['shadow'] = {'error': type(exc).__name__}
+        try:
+            from . import self_params as sp_mod
+            if isinstance(sd.get('self_params'), dict):
+                out['self_params'] = sd['self_params']
+            elif store is not None:
+                out['self_params'] = sp_mod.snapshot(store)
+        except Exception as exc:
+            out['self_params'] = {'error': type(exc).__name__}
+        try:
+            if store is not None:
+                from . import sample_strategies
+                flag = store.get(sample_strategies.STORE_FLAG) or {}
+                out['samples'] = {
+                    'done': bool(isinstance(flag, dict) and flag.get('done')),
+                    'library_samples': int(
+                        (flag or {}).get('library_samples')
+                        or sample_strategies.library_sample_count(store) or 0),
+                    'trades': int((flag or {}).get('trades') or 0),
+                    'source': (flag or {}).get('source'),
+                    'active_n': int((flag or {}).get('active_n') or 0),
+                }
+        except Exception as exc:
+            out['samples'] = {'error': type(exc).__name__}
+        try:
+            fc = snap.get('flow_consensus') if isinstance(snap.get('flow_consensus'), dict) else {}
+            learn = fc.get('learn') if isinstance(fc.get('learn'), dict) else {}
+            if not learn and store is not None:
+                from . import flow_consensus
+                learn = flow_consensus.learn_snapshot(store)
+            out['flow_learn'] = learn if isinstance(learn, dict) else {}
+            out['flow_consensus'] = {
+                'consensus': fc.get('consensus'),
+                'confidence': fc.get('confidence'),
+                'blocked': bool(fc.get('blocked')),
+                'decision_effect': fc.get('decision_effect'),
+                'decision_reason': fc.get('decision_reason') or fc.get('reason'),
+            }
+        except Exception as exc:
+            out['flow_learn'] = {'error': type(exc).__name__}
+        try:
+            from . import adaptive_system
+            if store is not None:
+                out['adaptive'] = adaptive_system.snapshot(store)
+        except Exception as exc:
+            out['adaptive'] = {'error': type(exc).__name__}
+        # Highlight knobs operators care about on the board.
+        try:
+            p = out.get('self_params') or {}
+            knobs = p.get('params') if isinstance(p.get('params'), dict) else p
+            if isinstance(knobs, dict):
+                out['knobs'] = {
+                    'flow_nudge': knobs.get('flow_consensus_nudge'),
+                    'flow_block': knobs.get('flow_consensus_block_fights'),
+                    'flow_impulse': knobs.get('flow_pillar_impulse'),
+                    'strategy_gen_nudge': knobs.get('strategy_gen_nudge'),
+                    'horizon': knobs.get('self_params_horizon_trades'),
+                }
+        except Exception:
+            out['knobs'] = {}
+        return out
+
     def admin_client_card(self,client: dict) -> dict:
         """Full operator card for one client — neural, activity, results."""
         cid=int(client['id'])
@@ -676,9 +778,13 @@ class RuntimeHub:
                     'entry_trigger':view.get('entry_trigger') or snap.get('entry_trigger'),
                     'entry_wait':view.get('entry_wait') or snap.get('entry_wait'),
                     'model_readiness':snap.get('model_readiness') or view.get('model_readiness'),
-                    'neural_close_diagnostic_only':True,
-                    'neural_close_executable':False,
+                    # Desk truth — never hardcode diagnostic-only (engine snapshot is source).
+                    'neural_close_diagnostic_only':bool(
+                        snap.get('neural_close_diagnostic_only', False)),
+                    'neural_close_executable':bool(
+                        snap.get('neural_close_executable', True)),
                     'neural_exit_intent':snap.get('neural_exit_intent'),
+                    'neural_exit_rule':snap.get('neural_exit_rule'),
                     'neural_seed':view.get('neural_seed'),
                     'error':view.get('error') or snap.get('error'),
                     'last_start_error':None,
@@ -723,6 +829,9 @@ class RuntimeHub:
                     'last_open_size_plan':snap.get('last_open_size_plan'),
                     'unified_cycle':snap.get('unified_cycle'),
                     'hard_risk':snap.get('hard_risk'),
+                    # A–F desk board: cards / shadow / params / samples.
+                    'self_development':snap.get('self_development'),
+                    'desk_system':self._desk_system_payload(rt, snap),
                 },
                 'last_start_error':None,
             })
@@ -762,6 +871,18 @@ class RuntimeHub:
                 card['hard_risk']=hard_risk.snapshot(store)
             except Exception:
                 card['hard_risk']=None
+            # Desk board even when robot is stopped (store-only truth).
+            try:
+                act=card.setdefault('activity',{})
+                if not isinstance(act.get('desk_system'), dict):
+                    class _StopRT:
+                        pass
+                    fake=rt if rt is not None else _StopRT()
+                    if getattr(fake,'store',None) is None:
+                        fake.store=store
+                    act['desk_system']=self._desk_system_payload(fake, snap=None)
+            except Exception:
+                pass
         else:
             card['hard_risk']=None
         return card

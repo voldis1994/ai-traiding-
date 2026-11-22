@@ -915,7 +915,10 @@ class RuntimeHub:
         Not every-candle signals — zone bands from structure so the operator
         can see where a future BUY/SELL entry would sit relative to swings.
         """
-        from . import structure_memory, bracket_learn, ohlc_entry_zones, mtf_momentum
+        from . import (
+            structure_memory, bracket_learn, ohlc_entry_zones, mtf_momentum,
+            ohlc_scenarios,
+        )
         cid=int(client_id)
         rt=self.get(cid)
         store=None
@@ -1201,6 +1204,8 @@ class RuntimeHub:
             'zone_structure':ez.get('structure'),
             'demand_zones':ez.get('demand_zones') or [],
             'supply_zones':ez.get('supply_zones') or [],
+            'scenario':ohlc_scenarios.classify(
+                candles_full or candles,mid=mid,zones=ez,tick=tick,store=store),
             'entry_path':(getattr(eng,'_entry_path',None) if eng is not None else None),
             'overlays':overlay_wire,
             'mtf':{

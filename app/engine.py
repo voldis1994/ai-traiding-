@@ -5431,6 +5431,29 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','OHLC entry gates learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
+            # Self-audit: did scenario/zone analysis match post-trade OHLC + £?
+            try:
+                from . import ohlc_scenarios
+                ohlc_meta=(saved.get('ohlc_entry')
+                           if isinstance(saved,dict) else None)
+                sc_meta=(ohlc_meta.get('scenario')
+                         if isinstance(ohlc_meta,dict) else None)
+                audit_epic=(self.mandate or {}).get('epic') or epic
+                audit_candles=self._decision_candles(audit_epic,n=80) if audit_epic else []
+                ohlc_scenarios.audit_close(
+                    self.store,
+                    scenario_meta=sc_meta,
+                    ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else {},
+                    candles=audit_candles,
+                    broker_pnl=pnl_value,spread=spread_cost,
+                    entry=_num((saved or {}).get('entry')
+                               if isinstance(saved,dict) else None),
+                    action=(direction if direction in ('BUY','SELL')
+                            else (ohlc_meta or {}).get('action')),
+                )
+            except Exception as exc:
+                self.store.event('warning','OHLC scenario self-audit skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None
                 if isinstance(saved,dict):

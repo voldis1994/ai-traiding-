@@ -120,6 +120,8 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
     """Persist on entry_brain so close can teach OHLC gate knobs."""
     if not isinstance(gate, dict):
         return {}
+    from . import ohlc_scenarios
+    sc = gate.get('scenario') if isinstance(gate.get('scenario'), dict) else {}
     return {
         'action': action,
         'trigger': gate.get('trigger'),
@@ -128,6 +130,8 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
         'params': gate.get('params'),
         'break_reason': (gate.get('break') or {}).get('reason')
                         if isinstance(gate.get('break'), dict) else None,
+        'zone': gate.get('zone'),
+        'scenario': ohlc_scenarios.open_meta_from_scenario(sc),
     }
 
 
@@ -754,14 +758,20 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         return meta
     mtf_ok,mtf_reason=_mtf_allows_side(action,mtf,params=cfg)
     meta['mtf_ok']=mtf_ok
+    from . import ohlc_scenarios
     if not mtf_ok:
         meta['reason']=mtf_reason
         meta['zones']=compute_entry_zones(
             candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
+        meta['scenario']=ohlc_scenarios.classify(
+            candles,mid=mid,zones=meta['zones'],tick=tick,store=store)
         return meta
     zones=compute_entry_zones(
         candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
     meta['zones']=zones
+    scenario=ohlc_scenarios.classify(
+        candles,mid=mid,zones=zones,tick=tick,store=store)
+    meta['scenario']=scenario
     if not zones.get('ok'):
         meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
         return meta
@@ -779,15 +789,42 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if price is None:
         meta['reason']='wait_entry_zone (no_price)'
         return meta
-    # --- Trigger A: break (catch the move — do not wait for pullback) ---
+    # --- Trigger A: break (structure) — scenario may veto blind range break ---
     br=break_trigger_allows(
         action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles,
         params=cfg)
     meta['break']=br
     if br.get('ok'):
-        meta['allowed']=True
-        meta['trigger']='break'
-        meta['reason']=br.get('reason') or 'ohlc_break_trigger'
+        # MTF/structure break already confirmed → treat as BREAKOUT tag so
+        # RANGE "prefer retest" does not veto a real BOS.
+        sc_for_break=dict(scenario or {})
+        mtf_br=None
+        if isinstance(mtf,dict):
+            mtf_br=mtf.get('structure_break')
+        if mtf_br in ('UP','DOWN') or str(br.get('reason') or '').startswith('ohlc_break'):
+            tags=list(sc_for_break.get('scenarios') or [])
+            tag=('BREAKOUT_UP' if action=='BUY' else 'BREAKOUT_DOWN')
+            if tag not in tags:
+                tags.append(tag)
+            sc_for_break['scenarios']=tags
+            if str(sc_for_break.get('scenario') or '') in ('RANGE','COMPRESSION','UNKNOWN'):
+                sc_for_break['scenario']=tag
+                sc_for_break['entry_hint']='BUY' if action=='BUY' else 'SELL'
+        sc_ok=ohlc_scenarios.scenario_allows_trigger(
+            action,sc_for_break,'break',store=store)
+        meta['scenario_gate']=sc_ok
+        if sc_ok.get('ok'):
+            meta['allowed']=True
+            meta['trigger']='break'
+            meta['reason']=br.get('reason') or 'ohlc_break_trigger'
+            return meta
+        # Fall through to zone/retest wait instead of chasing.
+        meta['break_blocked_by_scenario']=sc_ok.get('reason')
+    # Guide: never open zone-path in the middle of a range / compression box.
+    mid_block,mid_reason=ohlc_scenarios.mid_range_blocked(
+        action,scenario,price,tick=tick)
+    if mid_block:
+        meta['reason']=mid_reason or 'wait_mid_range'
         return meta
     if not zone:
         meta['reason']=f'wait_entry_zone (no_{action.lower()}_band)'
@@ -821,6 +858,12 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     confirm=zone_confirm_allows(action,candles=candles,zone=zone,tick=tick)
     meta['confirm']=confirm
     if confirm.get('ok'):
+        sc_ok=ohlc_scenarios.scenario_allows_trigger(
+            action,scenario,'zone',store=store)
+        meta['scenario_gate']=sc_ok
+        if not sc_ok.get('ok'):
+            meta['reason']=sc_ok.get('reason') or 'wait_scenario'
+            return meta
         meta['allowed']=True
         meta['trigger']='zone'
         meta['reason']='ohlc_entry_zone_confirm'

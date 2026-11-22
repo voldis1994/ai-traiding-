@@ -157,7 +157,10 @@ def test_require_swing_still_on_decide_path():
             kama=entry - 2.0, require_swing=True, entry_zone=buy)
         if decided.get('ready'):
             src = str(decided.get('source') or '')
-            assert 'swing' in src or 'bos' in src or 'ohlc' in src
+            assert (
+                'swing' in src or 'bos' in src or 'ohlc' in src
+                or 'regime' in src
+            )
             assert decided.get('stop_distance') is not None
             assert float(decided['stop_level']) < float(buy['lo']) + 1e-6
         else:

@@ -1327,13 +1327,14 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                               tighten=1.0, entry=None, action=None,
                               candles=None, atr=None, kama=None,
                               require_swing=None, store=None,
-                              entry_zone=None) -> dict:
+                              entry_zone=None, scenario=None,
+                              zones=None, trigger=None) -> dict:
     """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
     Preference order:
-      1. Swing High/Low anchors when ``entry``+``action``+``candles`` are given
-         (real chart levels — not entry ± median bar span).
-      2. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
+      1. Regime brackets (scenario × Demand/Supply) when scenario/zones given
+      2. Swing High/Low anchors when ``entry``+``action``+``candles`` are given
+      3. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
 
     When live OPEN provides entry/action/candles, ``require_swing`` defaults True:
     if swings cannot place levels, return ``ready=False`` instead of inventing
@@ -1371,6 +1372,81 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     live_ctx = (entry is not None and action in ('BUY', 'SELL') and candles)
     if require_swing is None:
         require_swing = bool(live_ctx)
+
+    # --- Prefer regime SL/TP (scenario + opposite zone) ---
+    if live_ctx and (scenario or zones or entry_zone or trigger):
+        try:
+            from . import ohlc_regime_brackets
+            regime = ohlc_regime_brackets.regime_brackets(
+                candles=candles, entry=entry, action=action,
+                scenario=scenario, zones=zones, entry_zone=entry_zone,
+                trigger=trigger, tick=tick_f, spread=sp, min_distance=mn,
+                atr=atr, store=store)
+        except Exception:
+            regime = {'ready': False}
+        if regime.get('ready'):
+            from .math_rules import (
+                snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
+            from decimal import Decimal as _Dec
+            stop_d = float(regime['stop_distance'])
+            profit_d = float(regime['profit_distance'])
+            stop_d, stop_ticks = snap_distance_to_tick(stop_d, tick_f)
+            profit_d, profit_ticks = snap_distance_to_tick(profit_d, tick_f)
+            raised = False
+            floor_ticks = _min_ticks(_Dec(str(mn)), _Dec(str(tick_f)))
+            if floor_ticks and stop_ticks < floor_ticks:
+                stop_ticks = int(floor_ticks)
+                stop_d = float(_Dec(str(tick_f)) * stop_ticks)
+                raised = True
+            if floor_ticks and profit_ticks < floor_ticks:
+                profit_ticks = int(floor_ticks)
+                profit_d = float(_Dec(str(tick_f)) * profit_ticks)
+                raised = True
+            min_rr_need = float(regime.get('min_rr') or _min_rr(store))
+            min_rr_need = max(1.0, min(3.0, min_rr_need))
+            rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
+            if rr_now + 1e-12 < min_rr_need:
+                need_tp = float(_Dec(str(stop_d)) * _Dec(str(min_rr_need)))
+                new_tp, new_tp_ticks = snap_distance_to_tick(need_tp, tick_f)
+                if new_tp / stop_d + 1e-12 >= min_rr_need:
+                    profit_d, profit_ticks = float(new_tp), int(new_tp_ticks)
+                    rr_now = profit_d / stop_d
+            sign = 1 if action == 'BUY' else -1
+            e = float(entry)
+            stop_level = e - sign * stop_d
+            profit_level = e + sign * profit_d
+            if levels_correct_side(
+                    action=action, entry=e, stop_level=stop_level,
+                    profit_level=profit_level) and distances_meet_broker_min(
+                        stop_d, profit_d, mn):
+                return {
+                    'stop_distance': float(stop_d),
+                    'profit_distance': float(profit_d),
+                    'stop_level': float(stop_level),
+                    'profit_level': float(profit_level),
+                    'kappa': float(rr_now or regime.get('kappa') or min_rr_need),
+                    'sl_scale': 1.0,
+                    'ohlc_kappa': float(regime.get('kappa') or rr_now or min_rr_need),
+                    'ohlc_sl': float(regime['stop_distance']),
+                    'ohlc_tp': float(regime['profit_distance']),
+                    'tighten': 1.0,
+                    'source': 'regime_brackets',
+                    'ready': True,
+                    'reason': regime.get('reason'),
+                    'regime': regime.get('regime'),
+                    'trigger': regime.get('trigger') or trigger,
+                    'zone_sl': bool(regime.get('zone_sl')),
+                    'zone_tp': bool(regime.get('zone_tp')),
+                    'min_rr': min_rr_need,
+                    'rr': float(rr_now),
+                    'swing_hi': regime.get('swing_hi'),
+                    'swing_lo': regime.get('swing_lo'),
+                    'raised_to_broker_min': raised,
+                    'stop_ticks': int(stop_ticks),
+                    'profit_ticks': int(profit_ticks),
+                    'bos_event': regime.get('bos_event'),
+                    'bos_bias': regime.get('bos_bias'),
+                }
 
     # --- Prefer swing-anchored levels (chart structure) ---
     swing = None

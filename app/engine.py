@@ -5801,10 +5801,10 @@ class SingleTradeEngine:
         return True
 
     async def _maybe_scale_out_tp1(self,p):
-        """At structural TP1: reduce ~½ via opposite POST, then SL→BE, keep TP2.
+        """BUY-only: at structural TP1 reduce ~½, then SL→BE, keep TP2.
 
-        Capital supports one profitLevel — broker TP stays at TP2. TP1 is an
-        OHLC level stored at OPEN; never invented mid-trade.
+        Shorts use a single structural TP — no TP1 ladder / scale-out.
+        Capital supports one profitLevel — broker TP stays at TP2 on longs.
         """
         if self.pending_order or self.pending_close or not self.execution_enabled:
             return
@@ -5815,11 +5815,18 @@ class SingleTradeEngine:
         brain=self.store.get(key) or {}
         if not isinstance(brain,dict) or brain.get('scale_out_done') or brain.get('scale_out_pending'):
             return
+        direction=p.get('direction')
+        # TP1/TP2 scale-out is long-only by desk rule.
+        if direction!='BUY':
+            if isinstance(brain,dict) and not brain.get('scale_out_done'):
+                brain['scale_out_done']=True
+                brain['scale_out_skip']='short_no_tp_ladder'
+                self.store.set(key,brain)
+            return
         tp1=_num(brain.get('tp1_level'))
         tp2=_num(brain.get('tp2_level')) or _broker_price_level(p.get('profitLevel'))
         entry=_num(brain.get('entry')) or _num(p.get('level'))
-        direction=p.get('direction')
-        if tp1 is None or entry is None or direction not in ('BUY','SELL'):
+        if tp1 is None or entry is None:
             return
         # Same level as TP2 → nothing to scale; mark done.
         if tp2 is not None and abs(float(tp1)-float(tp2))<=1e-9:
@@ -5830,8 +5837,7 @@ class SingleTradeEngine:
         ask=_num((self.market or {}).get('ask'))
         if bid is None or ask is None:
             return
-        hit=(direction=='BUY' and float(bid)>=float(tp1)-1e-12) or (
-            direction=='SELL' and float(ask)<=float(tp1)+1e-12)
+        hit=float(bid)>=float(tp1)-1e-12
         if not hit:
             return
         try:

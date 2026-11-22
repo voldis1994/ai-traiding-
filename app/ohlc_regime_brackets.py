@@ -1,12 +1,12 @@
-"""Regime-aware SL + TP1/TP2 from *real* OHLC structure only.
+"""Regime-aware SL + TP from *real* OHLC structure only.
 
-Capital.com allows one ``profitLevel`` per deal. We therefore:
-  • set broker TP = TP2 (far structural target)
-  • remember TP1 (near structural) for robot scale-out + BE
+TP1/TP2 ladder + scale-out is **BUY (long) only**:
+  • Capital allows one ``profitLevel`` → broker TP = TP2
+  • TP1 (near structural) → robot scale-out ~½ + SL→BE
 
-Never invent mid ± κ or entry+N×risk as a fake level. If a structural
-target is missing, fall back to the next real swing — or leave that rung
-empty (TP1==TP2 when only one real target exists).
+SELL (short) keeps a single structural ``profit_level`` (no TP1 rung,
+no scale-out). Still never invent mid ± κ — short TP is a real swing/
+zone/range level.
 """
 from __future__ import annotations
 
@@ -405,6 +405,11 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         return dict(out, reason='no_structural_tp',
                     stop_distance=stop_d, stop_level=float(stop), regime=name)
 
+    # Long-only ladder: shorts collapse to a single structural TP (far target).
+    long_ladder = action == 'BUY'
+    if not long_ladder:
+        tp1 = tp2
+
     if action == 'BUY':
         tp1_d = tp1 - entry_f
         tp2_d = tp2 - entry_f
@@ -416,7 +421,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     stop_distance=stop_d, stop_level=float(stop),
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 
-    # Broker uses TP2; scale-out uses TP1.
+    # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
     return {
         'ready': True,
         'reason': reason,
@@ -425,16 +430,17 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'profit_distance': float(tp2_d),
         'stop_level': float(stop),
         'profit_level': float(tp2),
-        'tp1_level': float(tp1),
+        'tp1_level': float(tp1) if long_ladder else float(tp2),
         'tp2_level': float(tp2),
-        'tp1_distance': float(tp1_d),
+        'tp1_distance': float(tp1_d) if long_ladder else float(tp2_d),
         'tp2_distance': float(tp2_d),
         'swing_hi': float(tp2) if action == 'BUY' else float(stop),
         'swing_lo': float(stop) if action == 'BUY' else float(tp2),
         'kappa': float(tp2_d / stop_d) if stop_d > 1e-12 else min_rr,
         'min_rr': float(min_rr),
         'rr': float(tp2_d / stop_d) if stop_d > 1e-12 else None,
-        'rr_tp1': float(tp1_d / stop_d) if stop_d > 1e-12 else None,
+        'rr_tp1': (float(tp1_d / stop_d) if (long_ladder and stop_d > 1e-12)
+                   else None),
         'regime': name,
         'trigger': trig or None,
         'zone_sl': bool(zone_sl),
@@ -445,5 +451,6 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'atr_used': float(atr_v) if atr_v is not None else None,
         'bos_event': sc.get('event'),
         'bos_bias': sc.get('bias'),
-        'scale_out_frac': 0.5,
+        'scale_out_frac': 0.5 if long_ladder else 0.0,
+        'tp_ladder': bool(long_ladder),
     }

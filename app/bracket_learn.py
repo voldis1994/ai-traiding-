@@ -1465,7 +1465,12 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                     'tp2_level': float(profit_level),
                     'tp1_distance': float(tp1_d),
                     'tp2_distance': float(profit_d),
-                    'scale_out_frac': float(regime.get('scale_out_frac') or 0.5),
+                    'scale_out_frac': float(
+                        regime.get('scale_out_frac')
+                        if regime.get('scale_out_frac') is not None
+                        else (0.5 if action == 'BUY' else 0.0)),
+                    'tp_ladder': bool(regime.get('tp_ladder')) if 'tp_ladder' in regime
+                        else (action == 'BUY'),
                     'kappa': float(rr_now or regime.get('kappa') or min_rr_need),
                     'sl_scale': 1.0,
                     'ohlc_kappa': float(regime.get('kappa') or rr_now or min_rr_need),
@@ -1483,7 +1488,8 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                     'structural_rr': bool(regime.get('structural_rr')),
                     'min_rr': min_rr_need,
                     'rr': float(rr_now),
-                    'rr_tp1': float(tp1_d / stop_d) if stop_d > 1e-12 else None,
+                    'rr_tp1': (float(tp1_d / stop_d)
+                               if action == 'BUY' and stop_d > 1e-12 else None),
                     'swing_hi': regime.get('swing_hi'),
                     'swing_lo': regime.get('swing_lo'),
                     'raised_to_broker_min': raised,

@@ -1041,13 +1041,17 @@ def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
 
 def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                           min_distance=0., atr=None, zone=None, kama=None,
-                          store=None) -> dict:
+                          store=None, entry_zone=None) -> dict:
     """Place SL/TP on OHLC swing High/Low — never invent median ±distance.
 
     Uses the full pivot list so post-BOS re-entry (entry outside last SH/SL)
     still anchors to the nearest protective swing and a structural target
     (next swing or measured move from the broken range). When ``kama`` is on
     the protective side of entry, SL clears both swing and KAMA (ATR buffer).
+
+    When ``entry_zone`` (Demand/Supply base box) is given, SL is forced *behind*
+    the zone extreme (BUY → below zone.lo; SELL → above zone.hi) if that is at
+    least as protective as the swing stop — guide: SL aiz zonas.
     """
     from . import structure_memory
     out = {
@@ -1102,15 +1106,72 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         out['swing_hi'] = float(bos['range_hi'])
     if bos.get('range_lo') is not None:
         out['swing_lo'] = float(bos['range_lo'])
-    if not highs or not lows:
-        return dict(out, reason='no_swing_pivots', bos_event=bos.get('event'))
+    # Optional Demand/Supply box — used as SL-behind-zone (and TP opposite).
+    ez = entry_zone if isinstance(entry_zone, dict) else {}
+    ez_lo = _finite(ez.get('lo'))
+    ez_hi = _finite(ez.get('hi'))
+    ez_sl = _finite(ez.get('sl_anchor'))
+    if action == 'BUY' and ez_sl is None:
+        ez_sl = ez_lo
+    if action == 'SELL' and ez_sl is None:
+        ez_sl = ez_hi
 
-    picked = _pick_structural_levels(
-        action=action, entry=entry_f, highs=highs, lows=lows,
-        floor=floor, buffer=buffer)
-    if picked is None:
-        return dict(out, reason='no_structural_swings_for_entry',
-                    bos_event=bos.get('event'))
+    if not highs or not lows:
+        # Still allow SL behind a confirmed entry zone when pivots are thin.
+        if action == 'BUY' and ez_sl is not None and ez_hi is not None:
+            stop_level = min(float(ez_sl) - buffer, entry_f - floor)
+            risk = max(entry_f - stop_level, floor)
+            profit_level = entry_f + max(2.0 * risk, float(ez_hi) - entry_f + buffer)
+            picked = {
+                'stop_level': stop_level, 'profit_level': profit_level,
+                'swing_lo': float(ez_sl), 'swing_hi': float(ez_hi),
+                'reason': 'zone_behind_only',
+            }
+        elif action == 'SELL' and ez_sl is not None and ez_lo is not None:
+            stop_level = max(float(ez_sl) + buffer, entry_f + floor)
+            risk = max(stop_level - entry_f, floor)
+            profit_level = entry_f - max(2.0 * risk, entry_f - float(ez_lo) + buffer)
+            picked = {
+                'stop_level': stop_level, 'profit_level': profit_level,
+                'swing_lo': float(ez_lo), 'swing_hi': float(ez_sl),
+                'reason': 'zone_behind_only',
+            }
+        else:
+            return dict(out, reason='no_swing_pivots', bos_event=bos.get('event'))
+    else:
+        picked = _pick_structural_levels(
+            action=action, entry=entry_f, highs=highs, lows=lows,
+            floor=floor, buffer=buffer)
+        if picked is None:
+            if action == 'BUY' and ez_sl is not None:
+                z_h = float(ez_hi) if ez_hi is not None else entry_f + 2.0 * floor
+                stop_level = min(float(ez_sl) - buffer, entry_f - floor)
+                risk = max(entry_f - stop_level, floor)
+                opp = [s for s in highs if float(s['price']) >= entry_f + floor]
+                profit_level = float(min(opp, key=lambda s: float(s['price']))['price']) if opp else (
+                    entry_f + max(2.0 * risk, z_h - entry_f + buffer))
+                picked = {
+                    'stop_level': stop_level, 'profit_level': profit_level,
+                    'swing_lo': float(ez_sl),
+                    'swing_hi': float(opp[0]['price']) if opp else profit_level,
+                    'reason': 'zone_behind_fallback',
+                }
+            elif action == 'SELL' and ez_sl is not None:
+                z_l = float(ez_lo) if ez_lo is not None else entry_f - 2.0 * floor
+                stop_level = max(float(ez_sl) + buffer, entry_f + floor)
+                risk = max(stop_level - entry_f, floor)
+                opp = [s for s in lows if float(s['price']) <= entry_f - floor]
+                profit_level = float(max(opp, key=lambda s: float(s['price']))['price']) if opp else (
+                    entry_f - max(2.0 * risk, entry_f - z_l + buffer))
+                picked = {
+                    'stop_level': stop_level, 'profit_level': profit_level,
+                    'swing_hi': float(ez_sl),
+                    'swing_lo': float(opp[0]['price']) if opp else profit_level,
+                    'reason': 'zone_behind_fallback',
+                }
+            else:
+                return dict(out, reason='no_structural_swings_for_entry',
+                            bos_event=bos.get('event'))
 
     stop_level = float(picked['stop_level'])
     profit_level = float(picked['profit_level'])
@@ -1176,6 +1237,28 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 out['kama_stop'] = True
                 picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
 
+    # Demand/Supply base: SL behind the zone box (not on the edge).
+    # If broker/ATR floor needs more room, push *further* behind — never into zone.
+    out['zone_sl'] = str(picked.get('reason') or '').startswith('zone_behind')
+    if action == 'BUY' and ez_sl is not None:
+        zone_stop = min(float(ez_sl) - buffer, entry_f - floor)
+        if zone_stop < entry_f and zone_stop <= stop_level + 1e-12:
+            stop_level = zone_stop
+            stop_d = entry_f - stop_level
+            out['zone_sl'] = True
+            if 'zone_behind' not in str(picked.get('reason') or ''):
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+zone_behind'
+            picked['swing_lo'] = float(ez_sl)
+    elif action == 'SELL' and ez_sl is not None:
+        zone_stop = max(float(ez_sl) + buffer, entry_f + floor)
+        if zone_stop > entry_f and zone_stop >= stop_level - 1e-12:
+            stop_level = zone_stop
+            stop_d = stop_level - entry_f
+            out['zone_sl'] = True
+            if 'zone_behind' not in str(picked.get('reason') or ''):
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+zone_behind'
+            picked['swing_hi'] = float(ez_sl)
+
     if stop_d < floor or profit_d < floor:
         return dict(out, reason='swing_distances_below_floor',
                     stop_distance=stop_d, profit_distance=profit_d,
@@ -1234,6 +1317,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'bos_bias': bos.get('bias'),
         'buffer': float(buffer),
         'kama_stop': bool(out.get('kama_stop')),
+        'zone_sl': bool(out.get('zone_sl')),
         'atr_used': out.get('atr_used'),
         'kama': float(kama_v) if kama_v is not None else None,
     }
@@ -1242,7 +1326,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
 def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                               tighten=1.0, entry=None, action=None,
                               candles=None, atr=None, kama=None,
-                              require_swing=None, store=None) -> dict:
+                              require_swing=None, store=None,
+                              entry_zone=None) -> dict:
     """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
     Preference order:
@@ -1293,7 +1378,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         swing = swing_anchor_brackets(
             candles=candles, entry=entry, action=action, tick=tick_f,
             spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
-            store=store)
+            store=store, entry_zone=entry_zone)
         if swing.get('ready'):
             # Swing SL/TP stay on pivots — no cosmetic tighten, no post-snap
             # soft-shrink of SL (that abandoned OHLC structure).

@@ -9,19 +9,22 @@ from app.runtime_hub import RuntimeHub
 
 
 def _candles(n=60):
-    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
-    rows = []
-    price = 2000.0
-    for i in range(n):
-        o = price
-        h = o + 1.2 + (i % 5) * 0.15
-        l = o - 1.0 - (i % 4) * 0.1
-        c = o + (0.4 if i % 3 else -0.35)
-        rows.append({
-            'at': (t0 + timedelta(minutes=i)).isoformat(),
-            'open': o, 'high': h, 'low': l, 'close': c,
-        })
-        price = c
+    from tests.ohlc_zone_path import demand_zone_path
+    rows, _ = demand_zone_path(confirm=True)
+    # Keep full base→impulse anatomy; pad with quiet bars if caller wants more.
+    if n and len(rows) < n:
+        from datetime import datetime, timedelta, timezone
+        t0 = datetime.fromisoformat(rows[-1]['at'].replace('Z', '+00:00'))
+        px = float(rows[-1]['close'])
+        for i in range(1, n - len(rows) + 1):
+            o = px
+            c = px + (0.05 if i % 2 else -0.05)
+            rows.append({
+                'at': (t0 + timedelta(minutes=i)).isoformat(),
+                'open': o, 'high': max(o, c) + 0.08,
+                'low': min(o, c) - 0.08, 'close': c,
+            })
+            px = c
     return rows
 
 
@@ -44,7 +47,7 @@ def test_admin_structure_view_builds_zones():
         assert view.get('client_name') == 'Chart One' or view.get('username') == 'chart1'
         assert len(view['candles']) >= 40
         zones = view['zones']
-        # At least one structural or entry zone should be present when swings exist.
+        # Base→impulse Demand/Supply — same geometry LIVE waits on.
         assert zones.get('buy_entry') or zones.get('sell_entry') or zones.get('support')
         assert 'structure' in view
         # Same module LIVE uses before OPEN — Admin drawing == robot wait gate.

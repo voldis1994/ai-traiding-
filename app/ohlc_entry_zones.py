@@ -1,11 +1,14 @@
 """OHLC structural entry — unified intent + trigger for Admin chart and LIVE OPEN.
 
-Intent comes from neural + MTF. Trigger is either:
-  • zone  — pullback into discount (BUY) / premium (SELL) band, or
-  • break — structure / range break in the neural side (do not wait for pullback).
+1:1 zone reading (1m Supply/Demand):
+  • Zone box = base (consolidation) High→Low immediately before impulse
+  • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
+  • Structure filter: HH+HL → Demand; LH+LL → Supply
+  • Zone trigger needs price in zone + rejection / micro structure change
 
-Gate knobs (band width, tape need, MTF conf) learn from closed broker £ via
-``observe_close`` — same pattern as reentry_confirm / bracket_learn.
+Also: break trigger (structure/range break + M1 tape) when not waiting pullback.
+
+Gate knobs learn from closed broker £ via ``observe_close``.
 Never invent mid ± κ.
 """
 from __future__ import annotations
@@ -252,13 +255,30 @@ def _mtf_kama(mtf):
     return None
 
 
+def _pick_best_zone(cands, *, mid=None):
+    """Prefer high-quality, fresh base; break ties by proximity to mid."""
+    rows = [z for z in (cands or []) if isinstance(z, dict)]
+    if not rows:
+        return None
+    m = _finite(mid)
+
+    def _key(z):
+        q = float(z.get('quality') or 0)
+        if m is None:
+            return (-q, int(z.get('touches') or 0))
+        mid_z = 0.5 * (float(z['lo']) + float(z['hi']))
+        return (-q, abs(mid_z - m), int(z.get('touches') or 0))
+
+    rows.sort(key=_key)
+    return rows[0]
+
+
 def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
                         store=None,params=None):
-    """Return structural BUY/SELL entry bands from OHLC swings / BOS + MTF.
+    """Return Demand/Supply entry boxes from base→impulse OHLC (1:1 guide).
 
-    Same geometry Admin draws and LIVE waits for. ATR widens/narrows the band
-    from real volatility; KAMA can tighten the wait edge when inside the range.
-    Band fractions come from learned ``params`` (store) when present.
+    Same geometry Admin draws and LIVE waits for. Structure HH/HL/LH/LL picks
+    which side is active. Legacy discount/premium swing bands are gone.
     """
     cfg=params if isinstance(params,dict) else load_params(store)
     out={
@@ -268,7 +288,9 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
         'range_lo':None,'range_hi':None,'band':None,
         'bias':None,'event':None,
         'atr14':None,'kama':None,'mtf_mode':None,'mtf_preferred':None,
-        'info_stack':'ohlc_swing',
+        'info_stack':'ohlc_base_impulse',
+        'structure':None,
+        'demand_zones':[],'supply_zones':[],
         'params':{
             'band_span_frac':cfg.get('band_span_frac'),
             'band_atr_frac':cfg.get('band_atr_frac'),
@@ -278,67 +300,105 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
     if not candles or len(candles)<20:
         return out
     bos=structure_memory.bos_choch(candles,left=2,right=2) or {}
+    struct=structure_memory.label_swing_structure(candles,left=2,right=2) or {}
     live=structure_memory.snapshot_live(candles=candles,mid=mid) or {}
-    lo=_finite(bos.get('range_lo'))
-    hi=_finite(bos.get('range_hi'))
-    out['bias']=bos.get('bias') or live.get('live_bias')
-    out['event']=bos.get('event') or live.get('live_event')
-    out['range_lo']=lo
-    out['range_hi']=hi
     atr=_entry_band_atr(mtf,candles)
     kama=_mtf_kama(mtf)
     out['atr14']=atr
     out['kama']=kama
+    out['structure']={
+        'bias':struct.get('bias'),
+        'last_high_tag':struct.get('last_high_tag'),
+        'last_low_tag':struct.get('last_low_tag'),
+        'hh_count':struct.get('hh_count'),
+        'hl_count':struct.get('hl_count'),
+        'lh_count':struct.get('lh_count'),
+        'll_count':struct.get('ll_count'),
+    }
+    out['bias']=struct.get('bias') or bos.get('bias') or live.get('live_bias')
+    out['event']=bos.get('event') or live.get('live_event')
     if isinstance(mtf,dict) and mtf.get('ready'):
         out['mtf_mode']=mtf.get('mode')
         out['mtf_preferred']=mtf.get('preferred')
-        out['info_stack']='ohlc_swing+kama_adx_atr'
-    if lo is None or hi is None or not (hi>lo):
-        out['reason']='no_swing_range'
-        return out
-    try:
-        tick_f=max(float(tick or 0.01),1e-9)
-    except (TypeError,ValueError):
-        tick_f=0.01
-    try:
-        spread_f=max(float(spread or 0),0.)
-    except (TypeError,ValueError):
-        spread_f=0.
-    span=hi-lo
-    # M1 ATR (same candles as swings) — not M5 stop_hint. Fractions learn
-    # from closed £ (observe_close). Cap keeps discount/premium disjoint.
-    span_frac=float(cfg.get('band_span_frac') or 0.12)
-    atr_frac=float(cfg.get('band_atr_frac') or 0.35)
-    span_cap=float(cfg.get('band_span_cap') or 0.28)
-    band=max(span*span_frac,tick_f*8,spread_f*2)
-    if atr is not None:
-        band=max(band,atr_frac*atr)
-    band=min(band,span*span_cap)  # never swallow the swing mid
-    out['band']=band
-    out['support']={'lo':lo,'hi':lo,'label':'Support / swing low'}
-    out['resistance']={'lo':hi,'hi':hi,'label':'Resistance / swing high'}
-    buy_hi=lo+band
-    sell_lo=hi-band
-    # Dead mid: structural mid-range is NOT a pullback for either side.
-    mid_r=0.5*(lo+hi)
-    gap=max(tick_f*4,span*0.06)
-    buy_hi=min(buy_hi,mid_r-gap)
-    sell_lo=max(sell_lo,mid_r+gap)
-    # KAMA inside range tightens the wait edge toward adaptive trend.
-    if kama is not None and lo<kama<hi:
-        buy_hi=min(buy_hi,max(lo+tick_f,kama))
-        sell_lo=max(sell_lo,min(hi-tick_f,kama))
-    out['mid_dead']={'lo':buy_hi,'hi':sell_lo,'mid':mid_r}
-    if buy_hi>lo:
+        out['info_stack']='ohlc_base_impulse+kama_adx_atr'
+    det=structure_memory.detect_base_impulse_zones(candles,atr=atr,limit=80)
+    demand=list(det.get('demand') or [])
+    supply=list(det.get('supply') or [])
+    out['demand_zones']=demand
+    out['supply_zones']=supply
+    bias=str(out.get('bias') or 'RANGE').upper()
+    # Structure filter — UP trades Demand; DOWN trades Supply; RANGE keeps both.
+    allow_buy = bias in ('UP', 'RANGE') or str(out.get('event') or '').endswith('_UP')
+    allow_sell = bias in ('DOWN', 'RANGE') or str(out.get('event') or '').endswith('_DOWN')
+    # CHOCH flips character: allow the new side even if last tags lag.
+    event=str(out.get('event') or '').upper()
+    if event in ('CHOCH_UP', 'BOS_UP'):
+        allow_buy = True
+    if event in ('CHOCH_DOWN', 'BOS_DOWN'):
+        allow_sell = True
+    buy_raw=_pick_best_zone(demand,mid=mid) if allow_buy else None
+    sell_raw=_pick_best_zone(supply,mid=mid) if allow_sell else None
+    src=out['info_stack']
+    if buy_raw:
         out['buy_entry']={
-            'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY',
-            'source':out['info_stack']}
-    if sell_lo<hi:
+            'lo':float(buy_raw['lo']),'hi':float(buy_raw['hi']),
+            'label':'Demand zona (base→impulse UP)','side':'BUY',
+            'source':src,'kind':'demand',
+            'quality':buy_raw.get('quality'),
+            'touches':buy_raw.get('touches'),
+            'base_len':buy_raw.get('base_len'),
+            'impulse_len':buy_raw.get('impulse_len'),
+            'sl_anchor':float(buy_raw['lo']),
+        }
+        out['support']={
+            'lo':float(buy_raw['lo']),'hi':float(buy_raw['hi']),
+            'label':'Demand / base support'}
+    if sell_raw:
         out['sell_entry']={
-            'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL',
-            'source':out['info_stack']}
+            'lo':float(sell_raw['lo']),'hi':float(sell_raw['hi']),
+            'label':'Supply zona (base→impulse DOWN)','side':'SELL',
+            'source':src,'kind':'supply',
+            'quality':sell_raw.get('quality'),
+            'touches':sell_raw.get('touches'),
+            'base_len':sell_raw.get('base_len'),
+            'impulse_len':sell_raw.get('impulse_len'),
+            'sl_anchor':float(sell_raw['hi']),
+        }
+        out['resistance']={
+            'lo':float(sell_raw['lo']),'hi':float(sell_raw['hi']),
+            'label':'Supply / base resistance'}
+    # range_lo/hi = active structural box (for break + chart context).
+    if out['buy_entry'] and out['sell_entry']:
+        out['range_lo']=float(out['buy_entry']['lo'])
+        out['range_hi']=float(out['sell_entry']['hi'])
+    elif out['buy_entry']:
+        out['range_lo']=float(out['buy_entry']['lo'])
+        out['range_hi']=float(out['buy_entry']['hi'])
+    elif out['sell_entry']:
+        out['range_lo']=float(out['sell_entry']['lo'])
+        out['range_hi']=float(out['sell_entry']['hi'])
+    else:
+        # Fallback swing range so break path still has levels.
+        lo=_finite(bos.get('range_lo'));hi=_finite(bos.get('range_hi'))
+        out['range_lo']=lo;out['range_hi']=hi
+    if out['buy_entry']:
+        out['band']=float(out['buy_entry']['hi'])-float(out['buy_entry']['lo'])
+    elif out['sell_entry']:
+        out['band']=float(out['sell_entry']['hi'])-float(out['sell_entry']['lo'])
+    # Dead mid between demand top and supply bottom when both exist.
+    if out['buy_entry'] and out['sell_entry']:
+        out['mid_dead']={
+            'lo':float(out['buy_entry']['hi']),
+            'hi':float(out['sell_entry']['lo']),
+            'mid':0.5*(float(out['range_lo'] or 0)+float(out['range_hi'] or 0)),
+        }
     out['ok']=bool(out['buy_entry'] or out['sell_entry'])
-    out['reason']='swing_levels' if out['ok'] else 'empty_bands'
+    if out['ok']:
+        out['reason']='base_impulse'
+    elif not det.get('ready'):
+        out['reason']=det.get('reason') or 'no_base_impulse'
+    else:
+        out['reason']='structure_filtered'
     return out
 
 
@@ -358,6 +418,138 @@ def price_in_zone(zone,price,*,buffer=0.0):
     except (TypeError,ValueError):
         buf=0.
     return (lo-buf)<=p<=(hi+buf)
+
+
+def _candle_interacted_zone(bar, zone, *, buffer=0.0):
+    if not isinstance(bar, dict) or not isinstance(zone, dict):
+        return False
+    lo = _finite(zone.get('lo')); hi = _finite(zone.get('hi'))
+    bh = _finite(bar.get('high')); bl = _finite(bar.get('low'))
+    if None in (lo, hi, bh, bl):
+        return False
+    try:
+        buf = max(float(buffer or 0), 0.)
+    except (TypeError, ValueError):
+        buf = 0.
+    return bl <= (hi + buf) and bh >= (lo - buf)
+
+
+def rejection_candle(action, candles, zone, *, tick=0.01):
+    """1m confirmation: pin / engulf rejecting the zone (guide step 3)."""
+    action = (action or '').upper()
+    rows = list(candles or [])
+    out = {'ok': False, 'reason': 'no_bar', 'kind': None}
+    if action not in ('BUY', 'SELL') or len(rows) < 1 or not zone:
+        return out
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    last = rows[-1]
+    o = _finite(last.get('open')); h = _finite(last.get('high'))
+    l = _finite(last.get('low')); c = _finite(last.get('close'))
+    if None in (o, h, l, c):
+        return out
+    if not _candle_interacted_zone(last, zone, buffer=tick_f):
+        out['reason'] = 'no_zone_touch_on_bar'
+        return out
+    span = max(h - l, tick_f)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    if action == 'BUY':
+        # Bullish pin: long lower wick, close in upper half.
+        pin = lower >= 0.45 * span and c >= (l + 0.55 * span) and lower >= 1.2 * max(body, tick_f)
+        engulf = False
+        if len(rows) >= 2:
+            prev = rows[-2]
+            po = _finite(prev.get('open')); pc = _finite(prev.get('close'))
+            if po is not None and pc is not None and pc < po:
+                engulf = c > o and c >= po and o <= pc
+        if pin or engulf:
+            out['ok'] = True
+            out['kind'] = 'pin_bull' if pin else 'engulf_bull'
+            out['reason'] = out['kind']
+            return out
+        out['reason'] = 'no_buy_rejection'
+        return out
+    # SELL — bearish pin / engulf
+    pin = upper >= 0.45 * span and c <= (h - 0.55 * span) and upper >= 1.2 * max(body, tick_f)
+    engulf = False
+    if len(rows) >= 2:
+        prev = rows[-2]
+        po = _finite(prev.get('open')); pc = _finite(prev.get('close'))
+        if po is not None and pc is not None and pc > po:
+            engulf = c < o and c <= po and o >= pc
+    if pin or engulf:
+        out['ok'] = True
+        out['kind'] = 'pin_bear' if pin else 'engulf_bear'
+        out['reason'] = out['kind']
+        return out
+    out['reason'] = 'no_sell_rejection'
+    return out
+
+
+def micro_structure_confirm(action, candles, zone, *, tick=0.01):
+    """Structure change on 1m while reacting in/near the zone (guide step 3)."""
+    action = (action or '').upper()
+    rows = list(candles or [])
+    out = {'ok': False, 'reason': 'no_structure', 'event': None}
+    if action not in ('BUY', 'SELL') or len(rows) < 12 or not zone:
+        return out
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    # Last few bars must still be interacting with the zone context.
+    near = False
+    for b in rows[-4:]:
+        if _candle_interacted_zone(b, zone, buffer=tick_f * 3):
+            near = True
+            break
+    if not near:
+        out['reason'] = 'structure_away_from_zone'
+        return out
+    bos = structure_memory.bos_choch(rows[-24:], left=2, right=2) or {}
+    event = str(bos.get('event') or '').upper()
+    struct = structure_memory.label_swing_structure(rows[-24:], left=2, right=2) or {}
+    out['event'] = event or None
+    out['bias'] = struct.get('bias')
+    if action == 'BUY' and event in ('CHOCH_UP', 'BOS_UP'):
+        out['ok'] = True
+        out['reason'] = event.lower()
+        return out
+    if action == 'SELL' and event in ('CHOCH_DOWN', 'BOS_DOWN'):
+        out['ok'] = True
+        out['reason'] = event.lower()
+        return out
+    # Soft: last tags flipped into our side (HL after LL for BUY, LH after HH for SELL).
+    if action == 'BUY' and struct.get('last_low_tag') == 'HL' and struct.get('bias') in ('UP', 'RANGE'):
+        out['ok'] = True
+        out['reason'] = 'hl_printed'
+        return out
+    if action == 'SELL' and struct.get('last_high_tag') == 'LH' and struct.get('bias') in ('DOWN', 'RANGE'):
+        out['ok'] = True
+        out['reason'] = 'lh_printed'
+        return out
+    out['reason'] = 'wait_structure_change'
+    return out
+
+
+def zone_confirm_allows(action, *, candles, zone, tick=0.01):
+    """Zone OPEN needs rejection candle OR micro structure change (1:1)."""
+    rej = rejection_candle(action, candles, zone, tick=tick)
+    st = micro_structure_confirm(action, candles, zone, tick=tick)
+    ok = bool(rej.get('ok') or st.get('ok'))
+    return {
+        'ok': ok,
+        'rejection': rej,
+        'structure': st,
+        'reason': (
+            'rejection+' + str(rej.get('kind')) if rej.get('ok')
+            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
+        ),
+    }
 
 
 def _mtf_allows_side(action,mtf,params=None):
@@ -616,17 +808,22 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if pref==action and conf>=wide_conf:
         buf=max(buf,float(tick or 0.01)*1.5)
         meta['wide_ohlc_touch']=True
-    # --- Trigger B: pullback zone (cheaper entry into structure) ---
-    if price_in_zone(zone,price,buffer=buf):
+    # --- Trigger B: pullback into Demand/Supply base + 1m confirm ---
+    if not price_in_zone(zone,price,buffer=buf):
+        lo=_finite(zone['lo']);hi=_finite(zone['hi'])
+        if action=='BUY' and price>hi:
+            meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
+        elif action=='SELL' and price<lo:
+            meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
+        else:
+            meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+        return meta
+    confirm=zone_confirm_allows(action,candles=candles,zone=zone,tick=tick)
+    meta['confirm']=confirm
+    if confirm.get('ok'):
         meta['allowed']=True
         meta['trigger']='zone'
-        meta['reason']='ohlc_entry_zone_touch'
+        meta['reason']='ohlc_entry_zone_confirm'
         return meta
-    lo=_finite(zone['lo']);hi=_finite(zone['hi'])
-    if action=='BUY' and price>hi:
-        meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
-    elif action=='SELL' and price<lo:
-        meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
-    else:
-        meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+    meta['reason']=f"wait_zone_confirm ({confirm.get('reason') or 'rejection_or_structure'})"
     return meta

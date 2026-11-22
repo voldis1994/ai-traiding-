@@ -1197,7 +1197,10 @@ class RuntimeHub:
                 'sell_entry':sell_zone,
             },
             'entry_zone_source':'ohlc_entry_zones',
-            'info_stack':ez.get('info_stack') or 'ohlc_swing',
+            'info_stack':ez.get('info_stack') or 'ohlc_base_impulse',
+            'zone_structure':ez.get('structure'),
+            'demand_zones':ez.get('demand_zones') or [],
+            'supply_zones':ez.get('supply_zones') or [],
             'entry_path':(getattr(eng,'_entry_path',None) if eng is not None else None),
             'overlays':overlay_wire,
             'mtf':{

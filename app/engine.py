@@ -4919,10 +4919,15 @@ class SingleTradeEngine:
         kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
         if kama_hint is None:
             kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+        ez=ohlc_entry_zones.compute_entry_zones(
+            candles,mid=entry,tick=tick,spread=spread,mtf=mtf_live,
+            store=self.store)
+        entry_zone=(ez.get('buy_entry') if proposal=='BUY' else ez.get('sell_entry'))
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=1.0,
             entry=entry,action=proposal,candles=candles,atr=atr_hint,
-            kama=kama_hint,require_swing=True,store=self.store)
+            kama=kama_hint,require_swing=True,store=self.store,
+            entry_zone=entry_zone)
         # Same rule as LIVE OPEN — no invented median ±distance for shadow.
         if (not decided.get('ready') or decided.get('stop_distance') is None
                 or decided.get('profit_distance') is None):
@@ -6519,11 +6524,14 @@ class SingleTradeEngine:
             except (TypeError,AttributeError):
                 kama_hint=None
             # Swing SL/TP: tighten=1.0 — aggression/break never soft-move pivots.
+            # Prefer SL behind Demand/Supply base when zone gate has a box.
+            entry_zone=zone_gate.get('zone') if isinstance(zone_gate,dict) else None
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=1.0,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=True,store=self.store)
+                kama=kama_hint,require_swing=True,store=self.store,
+                entry_zone=entry_zone)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:

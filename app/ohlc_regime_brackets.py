@@ -1,13 +1,12 @@
-"""Regime-aware SL/TP from OHLC zones + scenario (BUY and SELL symmetric).
+"""Regime-aware SL + TP1/TP2 from *real* OHLC structure only.
 
-Guide 1:1:
-  • Zone / trend pullback → SL behind entry zone; TP at opposite zone (min R:R)
-  • Retest → SL behind retested level; TP measured / opposite structure
-  • Breakout → SL behind broken level (not a distant old pullback box)
-  • Range edge → SL behind near edge; TP opposite edge
-  • CHOCH → SL behind new character swing; TP prior opposite structure
+Capital.com allows one ``profitLevel`` per deal. We therefore:
+  • set broker TP = TP2 (far structural target)
+  • remember TP1 (near structural) for robot scale-out + BE
 
-Never invent mid ± κ. Distances always meet broker floor + ATR buffer.
+Never invent mid ± κ or entry+N×risk as a fake level. If a structural
+target is missing, fall back to the next real swing — or leave that rung
+empty (TP1==TP2 when only one real target exists).
 """
 from __future__ import annotations
 
@@ -64,7 +63,6 @@ def _min_rr(store=None):
 
 
 def _zones_pair(zones):
-    """Demand (BUY box) + Supply (SELL box) from compute_entry_zones output."""
     z = zones if isinstance(zones, dict) else {}
     demand = z.get('buy_entry') if isinstance(z.get('buy_entry'), dict) else None
     supply = z.get('sell_entry') if isinstance(z.get('sell_entry'), dict) else None
@@ -75,37 +73,16 @@ def _sl_behind_box(action, entry, box, *, buffer, floor):
     if not isinstance(box, dict):
         return None
     if action == 'BUY':
-        anchor = _finite(box.get('sl_anchor'))
-        if anchor is None:
-            anchor = _finite(box.get('lo'))
+        anchor = _finite(box.get('sl_anchor')) or _finite(box.get('lo'))
         if anchor is None:
             return None
         stop = min(float(anchor) - buffer, float(entry) - floor)
         return stop if stop < entry else None
-    anchor = _finite(box.get('sl_anchor'))
-    if anchor is None:
-        anchor = _finite(box.get('hi'))
+    anchor = _finite(box.get('sl_anchor')) or _finite(box.get('hi'))
     if anchor is None:
         return None
     stop = max(float(anchor) + buffer, float(entry) + floor)
     return stop if stop > entry else None
-
-
-def _tp_opposite_box(action, entry, opp, *, buffer, risk, min_rr):
-    """TP at opposite Demand/Supply box; stretch to min_rr if needed."""
-    need = max(float(risk) * float(min_rr), float(risk) * 1.0)
-    if action == 'BUY':
-        if isinstance(opp, dict):
-            # Target near opposite supply low (first touch of premium).
-            tgt = _finite(opp.get('lo'))
-            if tgt is not None and tgt > entry + buffer:
-                return max(float(tgt), entry + need)
-        return entry + need
-    if isinstance(opp, dict):
-        tgt = _finite(opp.get('hi'))
-        if tgt is not None and tgt < entry - buffer:
-            return min(float(tgt), entry - need)
-    return entry - need
 
 
 def _range_levels(scenario):
@@ -115,35 +92,102 @@ def _range_levels(scenario):
     return _finite(box.get('lo')), _finite(box.get('hi'))
 
 
-def _swing_fallback_tp(action, entry, highs, lows, *, floor, risk, min_rr):
-    need = max(float(risk) * float(min_rr), float(floor))
+def _swing_targets(action, entry, highs, lows, *, floor):
+    """Ordered real swing targets beyond entry (nearest → farthest)."""
+    out = []
     if action == 'BUY':
-        cands = [s for s in (highs or []) if _finite(s.get('price')) is not None
-                 and float(s['price']) >= entry + floor]
-        if cands:
-            return float(min(cands, key=lambda s: float(s['price']))['price'])
-        return entry + need
-    cands = [s for s in (lows or []) if _finite(s.get('price')) is not None
-             and float(s['price']) <= entry - floor]
-    if cands:
-        return float(max(cands, key=lambda s: float(s['price']))['price'])
-    return entry - need
+        for s in highs or []:
+            px = _finite((s or {}).get('price'))
+            if px is not None and px >= entry + floor:
+                out.append(float(px))
+        out.sort()
+    else:
+        for s in lows or []:
+            px = _finite((s or {}).get('price'))
+            if px is not None and px <= entry - floor:
+                out.append(float(px))
+        out.sort(reverse=True)
+    # Dedup near-equal.
+    clean = []
+    for p in out:
+        if not clean or abs(p - clean[-1]) > floor * 0.25:
+            clean.append(p)
+    return clean
+
+
+def _level_ok(action, entry, level, *, floor):
+    lv = _finite(level)
+    if lv is None:
+        return None
+    if action == 'BUY' and lv >= entry + floor:
+        return float(lv)
+    if action == 'SELL' and lv <= entry - floor:
+        return float(lv)
+    return None
+
+
+def _pick_tp_ladder(action, entry, *, candidates, risk, min_rr, floor):
+    """Pick TP1/TP2 only from real candidate levels (OHLC / zone / range).
+
+    TP1 = nearest structural target beyond entry.
+    TP2 = farther structural target that clears min_rr when possible.
+    If only one real level exists → TP1 == TP2.
+    If none → None (caller may refuse ready).
+    """
+    real = []
+    for c in candidates or []:
+        lv = _level_ok(action, entry, c, floor=floor)
+        if lv is not None:
+            real.append(lv)
+    if action == 'BUY':
+        real = sorted(set(real))
+    else:
+        real = sorted(set(real), reverse=True)
+    if not real:
+        return None, None, False
+    tp1 = real[0]
+    need = float(entry) + (risk * min_rr if action == 'BUY' else -risk * min_rr)
+    tp2 = tp1
+    structural_rr = False
+    for lv in real[1:]:
+        tp2 = lv
+        if action == 'BUY' and lv + 1e-12 >= need:
+            structural_rr = True
+            break
+        if action == 'SELL' and lv - 1e-12 <= need:
+            structural_rr = True
+            break
+    # If farthest still below RR but is a real level — keep it (honest OHLC).
+    if action == 'BUY' and tp2 + 1e-12 >= need:
+        structural_rr = True
+    if action == 'SELL' and tp2 - 1e-12 <= need:
+        structural_rr = True
+    return float(tp1), float(tp2), structural_rr
+
+
+def _measured_move(action, entry, r_lo, r_hi):
+    """Breakout measured move from real range height — not invented κ."""
+    if r_lo is None or r_hi is None or not (r_hi > r_lo):
+        return None
+    height = float(r_hi) - float(r_lo)
+    if action == 'BUY':
+        return float(entry) + height
+    return float(entry) - height
 
 
 def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     entry_zone=None, trigger=None, tick=0.01, spread=0.,
                     min_distance=0., atr=None, store=None) -> dict:
-    """Compute SL/TP for the live scenario — BUY and SELL use the same geometry.
-
-    Returns same shape as swing_anchor_brackets (ready/distances/levels/source).
-    """
+    """SL + TP1/TP2 from regime. Broker ``profit_level`` = TP2."""
     out = {
         'ready': False, 'reason': 'unready', 'source': 'regime_brackets',
         'stop_distance': None, 'profit_distance': None,
         'stop_level': None, 'profit_level': None,
+        'tp1_level': None, 'tp2_level': None,
+        'tp1_distance': None, 'tp2_distance': None,
         'swing_hi': None, 'swing_lo': None,
         'regime': None, 'trigger': trigger, 'min_rr': _min_rr(store),
-        'zone_sl': False, 'zone_tp': False,
+        'zone_sl': False, 'zone_tp': False, 'structural_tp': False,
     }
     action = (action or '').upper()
     if action not in ('BUY', 'SELL'):
@@ -154,12 +198,11 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
 
     buffer, tick_f, _sp, atr_v = _buf(tick, spread, atr)
     floor = _floor(min_distance, buffer, atr_v)
-    min_rr = max(1.0, float(out['min_rr'] or DEFAULT_MIN_RR))
+    min_rr = max(1.5, float(out['min_rr'] or DEFAULT_MIN_RR))
     sc = scenario if isinstance(scenario, dict) else {}
     name = str(sc.get('scenario') or 'UNKNOWN').upper()
     trig = str(trigger or '').lower()
     demand, supply = _zones_pair(zones)
-    # Prefer explicit entry_zone (the box we actually entered).
     if isinstance(entry_zone, dict) and entry_zone.get('side') == 'BUY':
         demand = entry_zone
     elif isinstance(entry_zone, dict) and entry_zone.get('side') == 'SELL':
@@ -174,16 +217,17 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
     piv = structure_memory.swing_pivots(path, left=2, right=2) if path else {}
     highs = list(piv.get('swing_highs') or [])
     lows = list(piv.get('swing_lows') or [])
+    swings = _swing_targets(action, entry_f, highs, lows, floor=floor)
     r_lo, r_hi = _range_levels(sc)
 
-    stop = profit = None
+    stop = None
+    zone_sl = False
+    candidates = []
     reason = 'regime'
-    zone_sl = zone_tp = False
 
-    # --- BREAKOUT / blind break: SL behind broken level, not old pullback ---
+    # ----- SL + TP candidate pool per regime (all candidates = real OHLC) -----
     if trig == 'break' or name in ('BREAKOUT_UP', 'BREAKOUT_DOWN'):
         if action == 'BUY':
-            # Broken resistance ≈ prior range_hi / supply.lo / last swing high below entry.
             br = r_hi
             if br is None and isinstance(supply, dict):
                 br = _finite(supply.get('lo'))
@@ -192,13 +236,12 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 br = float(max(below, key=lambda s: float(s['price']))['price']) if below else None
             if br is not None:
                 stop = min(float(br) - buffer, entry_f - floor)
-            if isinstance(supply, dict) and _finite(supply.get('hi')) is not None:
-                # Next premium / extension: opposite supply high or 2R.
-                risk0 = entry_f - (stop if stop is not None else entry_f - floor)
-                profit = _tp_opposite_box(
-                    'BUY', entry_f, supply, buffer=buffer, risk=max(risk0, floor),
-                    min_rr=min_rr)
-                zone_tp = True
+            mm = _measured_move('BUY', entry_f, r_lo, r_hi)
+            if mm is not None:
+                candidates.append(mm)
+            if isinstance(supply, dict):
+                candidates.extend([supply.get('lo'), supply.get('hi')])
+            candidates.extend(swings)
             reason = 'breakout_buy'
         else:
             br = r_lo
@@ -209,101 +252,95 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 br = float(min(above, key=lambda s: float(s['price']))['price']) if above else None
             if br is not None:
                 stop = max(float(br) + buffer, entry_f + floor)
+            mm = _measured_move('SELL', entry_f, r_lo, r_hi)
+            if mm is not None:
+                candidates.append(mm)
             if isinstance(demand, dict):
-                risk0 = (stop if stop is not None else entry_f + floor) - entry_f
-                profit = _tp_opposite_box(
-                    'SELL', entry_f, demand, buffer=buffer, risk=max(risk0, floor),
-                    min_rr=min_rr)
-                zone_tp = True
+                candidates.extend([demand.get('hi'), demand.get('lo')])
+            candidates.extend(swings)
             reason = 'breakout_sell'
 
-    # --- RANGE / COMPRESSION: edge to edge ---
     elif name in ('RANGE', 'COMPRESSION'):
         if action == 'BUY':
-            edge = r_lo
-            if edge is None and isinstance(demand, dict):
-                edge = _finite(demand.get('lo'))
+            edge = r_lo if r_lo is not None else (
+                _finite((demand or {}).get('lo')) if demand else None)
             if edge is not None:
                 stop = min(float(edge) - buffer, entry_f - floor)
                 zone_sl = True
-            opp = r_hi
-            if opp is None and isinstance(supply, dict):
-                opp = _finite(supply.get('lo'))
-            risk0 = entry_f - (stop if stop is not None else entry_f - floor)
-            if opp is not None and opp > entry_f + buffer:
-                profit = max(float(opp), entry_f + max(risk0, floor) * min_rr)
-                zone_tp = True
+            if r_lo is not None and r_hi is not None:
+                # TP1 = 75% of the real range box (OHLC geometry); TP2 = opposite edge.
+                span = float(r_hi) - float(r_lo)
+                candidates.append(float(r_lo) + 0.75 * span)
+                candidates.append(float(r_hi))
+            if isinstance(supply, dict):
+                candidates.append(supply.get('lo'))
+            candidates.extend(swings)
             reason = 'range_buy_edge'
         else:
-            edge = r_hi
-            if edge is None and isinstance(supply, dict):
-                edge = _finite(supply.get('hi'))
+            edge = r_hi if r_hi is not None else (
+                _finite((supply or {}).get('hi')) if supply else None)
             if edge is not None:
                 stop = max(float(edge) + buffer, entry_f + floor)
                 zone_sl = True
-            opp = r_lo
-            if opp is None and isinstance(demand, dict):
-                opp = _finite(demand.get('hi'))
-            risk0 = (stop if stop is not None else entry_f + floor) - entry_f
-            if opp is not None and opp < entry_f - buffer:
-                profit = min(float(opp), entry_f - max(risk0, floor) * min_rr)
-                zone_tp = True
+            if r_lo is not None and r_hi is not None:
+                span = float(r_hi) - float(r_lo)
+                candidates.append(float(r_hi) - 0.75 * span)
+                candidates.append(float(r_lo))
+            if isinstance(demand, dict):
+                candidates.append(demand.get('hi'))
+            candidates.extend(swings)
             reason = 'range_sell_edge'
 
-    # --- RETEST ---
     elif name in ('RETEST_UP', 'RETEST_DOWN'):
         box = demand if action == 'BUY' else supply
         stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
         zone_sl = stop is not None
-        risk0 = abs(entry_f - (stop if stop is not None else entry_f)) or floor
-        opp = supply if action == 'BUY' else demand
-        profit = _tp_opposite_box(
-            action, entry_f, opp, buffer=buffer, risk=max(risk0, floor), min_rr=min_rr)
-        zone_tp = isinstance(opp, dict)
+        # TP = impulse length ≈ prior opposite structure / swings.
+        if action == 'BUY' and isinstance(supply, dict):
+            candidates.extend([supply.get('lo'), supply.get('hi')])
+        if action == 'SELL' and isinstance(demand, dict):
+            candidates.extend([demand.get('hi'), demand.get('lo')])
+        mm = _measured_move(action, entry_f, r_lo, r_hi)
+        if mm is not None:
+            candidates.append(mm)
+        candidates.extend(swings)
         reason = 'retest_' + action.lower()
 
-    # --- CHOCH ---
     elif name in ('CHOCH_UP', 'CHOCH_DOWN'):
         box = demand if action == 'BUY' else supply
         stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
         if stop is None:
-            # Fall back to last swing on protective side.
             if action == 'BUY' and lows:
                 cands = [s for s in lows if float(s['price']) <= entry_f - floor]
                 if cands:
-                    sl_p = float(max(cands, key=lambda s: float(s['price']))['price'])
-                    stop = min(sl_p - buffer, entry_f - floor)
+                    stop = min(
+                        float(max(cands, key=lambda s: float(s['price']))['price']) - buffer,
+                        entry_f - floor)
             elif action == 'SELL' and highs:
                 cands = [s for s in highs if float(s['price']) >= entry_f + floor]
                 if cands:
-                    sl_p = float(min(cands, key=lambda s: float(s['price']))['price'])
-                    stop = max(sl_p + buffer, entry_f + floor)
+                    stop = max(
+                        float(min(cands, key=lambda s: float(s['price']))['price']) + buffer,
+                        entry_f + floor)
         zone_sl = stop is not None and box is not None
-        risk0 = abs(entry_f - (stop if stop is not None else entry_f)) or floor
-        opp = supply if action == 'BUY' else demand
-        profit = _tp_opposite_box(
-            action, entry_f, opp, buffer=buffer, risk=max(risk0, floor), min_rr=min_rr)
-        if profit is None or (action == 'BUY' and profit <= entry_f) or (
-                action == 'SELL' and profit >= entry_f):
-            profit = _swing_fallback_tp(
-                action, entry_f, highs, lows, floor=floor, risk=max(risk0, floor),
-                min_rr=min_rr)
-        zone_tp = isinstance(opp, dict)
+        candidates.extend(swings)
+        if action == 'BUY' and isinstance(supply, dict):
+            candidates.extend([supply.get('lo'), supply.get('hi')])
+        if action == 'SELL' and isinstance(demand, dict):
+            candidates.extend([demand.get('hi'), demand.get('lo')])
         reason = 'choch_' + action.lower()
 
-    # --- FAKEOUT fade ---
     elif name == 'FAKEOUT':
         if action == 'BUY':
-            # Sweep low then fade up — SL below sweep / range lo.
             edge = r_lo
             if edge is None and lows:
                 edge = float(min(lows, key=lambda s: float(s['price']))['price'])
             if edge is not None:
                 stop = min(float(edge) - buffer, entry_f - floor)
-            risk0 = entry_f - (stop if stop is not None else entry_f - floor)
-            mid_r = 0.5 * ((r_lo or entry_f) + (r_hi or entry_f)) if r_lo and r_hi else None
-            profit = max(mid_r or (entry_f + max(risk0, floor) * min_rr),
-                         entry_f + max(risk0, floor) * min_rr)
+            if r_lo is not None and r_hi is not None:
+                candidates.append(0.5 * (float(r_lo) + float(r_hi)))
+                candidates.append(float(r_hi))
+            candidates.extend(swings)
             reason = 'fakeout_fade_buy'
         else:
             edge = r_hi
@@ -311,19 +348,18 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 edge = float(max(highs, key=lambda s: float(s['price']))['price'])
             if edge is not None:
                 stop = max(float(edge) + buffer, entry_f + floor)
-            risk0 = (stop if stop is not None else entry_f + floor) - entry_f
-            mid_r = 0.5 * ((r_lo or entry_f) + (r_hi or entry_f)) if r_lo and r_hi else None
-            profit = min(mid_r or (entry_f - max(risk0, floor) * min_rr),
-                         entry_f - max(risk0, floor) * min_rr)
+            if r_lo is not None and r_hi is not None:
+                candidates.append(0.5 * (float(r_lo) + float(r_hi)))
+                candidates.append(float(r_lo))
+            candidates.extend(swings)
             reason = 'fakeout_fade_sell'
 
-    # --- TREND / zone pullback (default structural) ---
     else:
+        # TREND / zone pullback — SL behind HL/LH zone; TP prior HH/LL + next.
         box = demand if action == 'BUY' else supply
         stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
         zone_sl = stop is not None
         if stop is None:
-            # Nearest protective swing.
             if action == 'BUY' and lows:
                 cands = [s for s in lows if float(s['price']) <= entry_f - floor]
                 if cands:
@@ -332,72 +368,82 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 cands = [s for s in highs if float(s['price']) >= entry_f + floor]
                 if cands:
                     stop = float(min(cands, key=lambda s: float(s['price']))['price']) + buffer
-        risk0 = abs(entry_f - (stop if stop is not None else entry_f)) or floor
-        opp = supply if action == 'BUY' else demand
-        profit = _tp_opposite_box(
-            action, entry_f, opp, buffer=buffer, risk=max(risk0, floor), min_rr=min_rr)
-        zone_tp = isinstance(opp, dict)
-        if (action == 'BUY' and (profit is None or profit <= entry_f + floor * 0.5)) or (
-                action == 'SELL' and (profit is None or profit >= entry_f - floor * 0.5)):
-            profit = _swing_fallback_tp(
-                action, entry_f, highs, lows, floor=floor, risk=max(risk0, floor),
-                min_rr=min_rr)
-            zone_tp = False
+        # Prior HH / next structure for BUY; prior LL for SELL.
+        candidates.extend(swings)
+        if action == 'BUY' and isinstance(supply, dict):
+            candidates.extend([supply.get('lo'), supply.get('hi')])
+        if action == 'SELL' and isinstance(demand, dict):
+            candidates.extend([demand.get('hi'), demand.get('lo')])
         reason = 'trend_zone_' + action.lower()
 
-    # Ensure stop/profit exist and meet floor + sides.
     if stop is None:
-        stop = entry_f - floor if action == 'BUY' else entry_f + floor
-    if profit is None:
-        risk = abs(entry_f - stop) or floor
-        profit = (entry_f + risk * min_rr) if action == 'BUY' else (entry_f - risk * min_rr)
+        # Last resort SL still from a real extreme of recent path — not entry±κ.
+        if path:
+            if action == 'BUY':
+                stop = min(b['low'] for b in path[-12:]) - buffer
+                stop = min(stop, entry_f - floor)
+            else:
+                stop = max(b['high'] for b in path[-12:]) + buffer
+                stop = max(stop, entry_f + floor)
+        else:
+            return dict(out, reason='no_structural_sl', regime=name)
 
     if action == 'BUY':
         stop = min(float(stop), entry_f - floor)
         stop_d = entry_f - stop
-        profit_d = float(profit) - entry_f
-        if profit_d < floor:
-            profit = entry_f + max(floor, stop_d * min_rr)
-            profit_d = profit - entry_f
-        if profit_d / stop_d + 1e-12 < min_rr and stop_d > 1e-12:
-            profit = entry_f + stop_d * min_rr
-            profit_d = profit - entry_f
     else:
         stop = max(float(stop), entry_f + floor)
         stop_d = stop - entry_f
-        profit_d = entry_f - float(profit)
-        if profit_d < floor:
-            profit = entry_f - max(floor, stop_d * min_rr)
-            profit_d = entry_f - profit
-        if profit_d / stop_d + 1e-12 < min_rr and stop_d > 1e-12:
-            profit = entry_f - stop_d * min_rr
-            profit_d = entry_f - profit
+    if stop_d < floor:
+        return dict(out, reason='regime_sl_below_floor',
+                    stop_distance=stop_d, stop_level=float(stop), regime=name)
 
-    if stop_d < floor or profit_d < floor:
-        return dict(out, reason='regime_distances_below_floor',
-                    stop_distance=stop_d, profit_distance=profit_d,
-                    stop_level=float(stop), profit_level=float(profit),
-                    regime=name)
+    tp1, tp2, structural_rr = _pick_tp_ladder(
+        action, entry_f, candidates=candidates, risk=stop_d,
+        min_rr=min_rr, floor=floor)
+    if tp1 is None or tp2 is None:
+        return dict(out, reason='no_structural_tp',
+                    stop_distance=stop_d, stop_level=float(stop), regime=name)
 
+    if action == 'BUY':
+        tp1_d = tp1 - entry_f
+        tp2_d = tp2 - entry_f
+    else:
+        tp1_d = entry_f - tp1
+        tp2_d = entry_f - tp2
+    if tp2_d < floor:
+        return dict(out, reason='regime_tp_below_floor',
+                    stop_distance=stop_d, stop_level=float(stop),
+                    tp1_level=tp1, tp2_level=tp2, regime=name)
+
+    # Broker uses TP2; scale-out uses TP1.
     return {
         'ready': True,
         'reason': reason,
         'source': 'regime_brackets',
         'stop_distance': float(stop_d),
-        'profit_distance': float(profit_d),
+        'profit_distance': float(tp2_d),
         'stop_level': float(stop),
-        'profit_level': float(profit),
-        'swing_hi': float(profit) if action == 'BUY' else float(stop),
-        'swing_lo': float(stop) if action == 'BUY' else float(profit),
-        'kappa': float(profit_d / stop_d) if stop_d > 1e-12 else min_rr,
+        'profit_level': float(tp2),
+        'tp1_level': float(tp1),
+        'tp2_level': float(tp2),
+        'tp1_distance': float(tp1_d),
+        'tp2_distance': float(tp2_d),
+        'swing_hi': float(tp2) if action == 'BUY' else float(stop),
+        'swing_lo': float(stop) if action == 'BUY' else float(tp2),
+        'kappa': float(tp2_d / stop_d) if stop_d > 1e-12 else min_rr,
         'min_rr': float(min_rr),
-        'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
+        'rr': float(tp2_d / stop_d) if stop_d > 1e-12 else None,
+        'rr_tp1': float(tp1_d / stop_d) if stop_d > 1e-12 else None,
         'regime': name,
         'trigger': trig or None,
         'zone_sl': bool(zone_sl),
-        'zone_tp': bool(zone_tp),
+        'zone_tp': True,
+        'structural_tp': True,
+        'structural_rr': bool(structural_rr),
         'buffer': float(buffer),
         'atr_used': float(atr_v) if atr_v is not None else None,
         'bos_event': sc.get('event'),
         'bos_bias': sc.get('bias'),
+        'scale_out_frac': 0.5,
     }

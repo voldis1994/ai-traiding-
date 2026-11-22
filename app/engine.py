@@ -2196,6 +2196,7 @@ class SingleTradeEngine:
                 await self._refresh_calendar_if_due()
                 await self._refresh_liquidity_if_due()
             broker_market=await self.broker.market(self.mandate['epic'])
+            self._last_broker_market=broker_market
             snap=broker_market.get('snapshot',{});inst=broker_market.get('instrument',{})
             bid=_num(snap.get('bid'));ask=_num(snap.get('offer'));tick=self._tick(broker_market)
             streamed=getattr(self,'quote_stream',None)
@@ -2574,6 +2575,9 @@ class SingleTradeEngine:
                                  'neural_market_exit':True})
                             await self.exit_position(p['dealId'])
                             return
+                # TP1 scale-out (structural OHLC) before trail/protect adapt.
+                for pos in list(self.positions or []):
+                    await self._maybe_scale_out_tp1(pos)
                 for pos in list(self.positions or []):
                     await self.adapt_protection(pos)
                 # No self-dev / feature search while a LIVE deal is open — that
@@ -5796,6 +5800,160 @@ class SingleTradeEngine:
             {'deal_id':deal,'stop':live_sl,'profit':live_tp})
         return True
 
+    async def _maybe_scale_out_tp1(self,p):
+        """At structural TP1: reduce ~½ via opposite POST, then SL→BE, keep TP2.
+
+        Capital supports one profitLevel — broker TP stays at TP2. TP1 is an
+        OHLC level stored at OPEN; never invented mid-trade.
+        """
+        if self.pending_order or self.pending_close or not self.execution_enabled:
+            return
+        deal_id=p.get('dealId')
+        if deal_id is None:
+            return
+        key='entry_brain:'+str(deal_id)
+        brain=self.store.get(key) or {}
+        if not isinstance(brain,dict) or brain.get('scale_out_done') or brain.get('scale_out_pending'):
+            return
+        tp1=_num(brain.get('tp1_level'))
+        tp2=_num(brain.get('tp2_level')) or _broker_price_level(p.get('profitLevel'))
+        entry=_num(brain.get('entry')) or _num(p.get('level'))
+        direction=p.get('direction')
+        if tp1 is None or entry is None or direction not in ('BUY','SELL'):
+            return
+        # Same level as TP2 → nothing to scale; mark done.
+        if tp2 is not None and abs(float(tp1)-float(tp2))<=1e-9:
+            brain['scale_out_done']=True
+            self.store.set(key,brain)
+            return
+        bid=_num((self.market or {}).get('bid'))
+        ask=_num((self.market or {}).get('ask'))
+        if bid is None or ask is None:
+            return
+        hit=(direction=='BUY' and float(bid)>=float(tp1)-1e-12) or (
+            direction=='SELL' and float(ask)<=float(tp1)+1e-12)
+        if not hit:
+            return
+        try:
+            size=Decimal(str(p.get('size') or 0))
+        except Exception:
+            return
+        if size<=0:
+            return
+        frac=brain.get('scale_out_frac')
+        try:
+            frac=float(frac if frac is not None else 0.5)
+        except (TypeError,ValueError):
+            frac=0.5
+        frac=max(0.25,min(0.75,frac))
+        from .math_rules import dealing_size_grid, snap_deal_size
+        # Prefer live Capital dealingRules (cached on poll); mandate fallback alone
+        # often has step==full size and cannot split.
+        mkt=(getattr(self,'_last_broker_market',None)
+             or getattr(self,'instrument_profile',None) or {})
+        grid=dealing_size_grid(
+            mkt,mandate_size=self.mandate.get('size') if self.mandate else None)
+        min_size=grid.get('min');step=grid.get('step');max_size=grid.get('max')
+        reduce=None
+        be_only=False
+        try:
+            raw=size*Decimal(str(frac))
+            reduce=snap_deal_size(
+                raw,min_size=min_size or size,step=step or size,max_size=max_size)
+        except Exception:
+            reduce=None
+        # If grid cannot express a true partial (step ≥ open size), BE-lock only.
+        if (reduce is None or reduce<=0 or reduce>=size
+                or (step is not None and Decimal(str(step))>=size)):
+            be_only=True
+            reduce=None
+        elif min_size is not None and (size-reduce)<Decimal(str(min_size)):
+            be_only=True
+            reduce=None
+        epic=p.get('epic') or (self.mandate or {}).get('epic')
+        if not epic:
+            return
+        brain['scale_out_pending']=True
+        self.store.set(key,brain)
+        oid=self.store.order('SCALE_TP1',deal_id,{
+            'tp1':float(tp1),'tp2':float(tp2) if tp2 is not None else None,
+            'frac':frac,'reduce':str(reduce) if reduce is not None else None,
+            'be_only':be_only,'entry':float(entry)})
+        try:
+            if not be_only and reduce is not None:
+                receipt=await self.broker.reduce_position(
+                    epic,direction,float(reduce))
+                # Reduce is opposite POST — not OPEN/PROTECT shape. Confirm
+                # ACCEPTED only; then sync size. Do not use _order_fully_matched.
+                ref=receipt.get('dealReference')
+                if not ref:
+                    raise RuntimeError('No reduce deal reference')
+                self.store.order_update(oid,'PENDING',ref)
+                conf={};status=None
+                for delay in (0,.4,1.0):
+                    if delay:await asyncio.sleep(delay)
+                    conf=await self.broker.confirm(ref)
+                    status=conf.get('dealStatus')
+                    if status in ('ACCEPTED','REJECTED'):break
+                if status!='ACCEPTED':
+                    self.store.order_update(oid,'REJECTED' if status=='REJECTED' else 'SUPERSEDED',ref)
+                    raise RuntimeError('TP1 reduce not accepted')
+                self.store.order_update(oid,'CONFIRMED',ref)
+                await self.sync()
+            live=next((x for x in (self.positions or [])
+                       if str(x.get('dealId'))==str(deal_id)),None)
+            if live is None:
+                brain['scale_out_done']=True
+                brain.pop('scale_out_pending',None)
+                self.store.set(key,brain)
+                self.store.event('protection','TP1 scale-out flattened remainder',{
+                    'deal_id':deal_id,'tp1':float(tp1)})
+                return
+            tick=_num((self.market or {}).get('tick')) or _num(brain.get('tick_size')) or 0.01
+            if direction=='BUY':
+                be=float(entry)+float(tick)
+            else:
+                be=float(entry)-float(tick)
+            keep_tp=_broker_price_level(live.get('profitLevel')) or tp2
+            if keep_tp is None:
+                brain['scale_out_done']=True
+                brain.pop('scale_out_pending',None)
+                self.store.set(key,brain)
+                return
+            if not levels_meet_broker_min(
+                    direction,be,keep_tp,
+                    (self.market or {}).get('bid'),(self.market or {}).get('ask'),
+                    (self.market or {}).get('min_distance')):
+                self.store.event('warning','TP1 hit but BE SL below broker min — skipped',{
+                    'deal_id':deal_id,'be':be,'tp2':keep_tp,'tp1':float(tp1)})
+                brain['scale_out_done']=True
+                brain.pop('scale_out_pending',None)
+                self.store.set(key,brain)
+                return
+            put_oid=self.store.order('PROTECT',deal_id,{
+                'stop':be,'profit':keep_tp,'reason':'TP1_BE'})
+            receipt=await self.broker.update_position(
+                deal_id,stop_level=be,profit_level=float(keep_tp))
+            await self._confirm_reconcile(receipt,put_oid,'PROTECT',deal_id)
+            brain['scale_out_done']=True
+            brain['be_after_tp1']=True
+            brain.pop('scale_out_pending',None)
+            self.store.set(key,brain)
+            self.store.event('protection','TP1 scale-out — residual SL at BE, TP2 kept',{
+                'deal_id':deal_id,'tp1':float(tp1),
+                'tp2':float(keep_tp),'be':be,
+                'reduced':str(reduce) if reduce is not None else None,
+                'be_only':be_only})
+        except Exception as exc:
+            brain.pop('scale_out_pending',None)
+            brain['scale_out_done']=True
+            brain['scale_out_error']=type(exc).__name__
+            self.store.set(key,brain)
+            self.store.order_update(oid,'SUPERSEDED')
+            self.store.event('warning','TP1 scale-out failed; leaving residual SL/TP',{
+                'deal_id':deal_id,'type':type(exc).__name__,
+                'broker_error':_safe_broker_error(exc)})
+
     async def adapt_protection(self,p):
         """Trail path — HARD OFF. Fixed OHLC swing SL/TP only (no tip±gap PUT)."""
         deal_s=str(p.get('dealId'))
@@ -6588,10 +6746,17 @@ class SingleTradeEngine:
             if profit_level is None:
                 profit_level=float(entry)+sign*pd
             bracket_source=str(decided.get('source') or 'swing_anchor')
+            tp1_level=decided.get('tp1_level')
+            tp2_level=decided.get('tp2_level') or profit_level
+            if tp1_level is None:
+                tp1_level=profit_level
             brackets={
                 'stop_distance':sd,'profit_distance':pd,
                 'stop_level':float(stop_level),
                 'profit_level':float(profit_level),
+                'tp1_level':float(tp1_level) if tp1_level is not None else None,
+                'tp2_level':float(tp2_level) if tp2_level is not None else None,
+                'scale_out_frac':float(decided.get('scale_out_frac') or 0.5),
                 'stop_ticks':decided.get('stop_ticks'),
                 'profit_ticks':decided.get('profit_ticks'),
                 'kappa':decided.get('kappa'),'sl_scale':1.0,
@@ -6686,6 +6851,10 @@ class SingleTradeEngine:
                 'bos_event':decided.get('bos_event'),
                 'stop_level':brackets['stop_level'],
                 'profit_level':brackets['profit_level'],
+                'tp1_level':brackets.get('tp1_level'),
+                'tp2_level':brackets.get('tp2_level'),
+                'scale_out_frac':brackets.get('scale_out_frac'),
+                'structural_tp':bool(decided.get('structural_tp')),
                 'median_up':bp.get('median_up'),'median_down':bp.get('median_down'),
                 'lookback':bp.get('lookback') or zone.get('lookback'),
                 'base_sl':base_sl,'max_tp':zone.get('max_tp'),
@@ -6754,6 +6923,12 @@ class SingleTradeEngine:
                     'cycle_aggression':bp.get('aggression'),
                     'stop_distance':float(brackets['stop_distance']),
                     'profit_distance':float(brackets['profit_distance']),
+                    'stop_level':float(brackets['stop_level']),
+                    'profit_level':float(brackets['profit_level']),
+                    'tp1_level':brackets.get('tp1_level'),
+                    'tp2_level':brackets.get('tp2_level'),
+                    'scale_out_frac':brackets.get('scale_out_frac'),
+                    'scale_out_done':False,
                     'champion_context':open_ctx,
                     'reentry_confirm':reentry_confirm.open_meta_from_gate(
                         reentry_gate,action=action),

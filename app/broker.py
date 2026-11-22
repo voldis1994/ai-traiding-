@@ -118,6 +118,18 @@ class CapitalBroker:
         payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False,
                  'stopDistance':float(stop_distance),'profitDistance':float(distance)}
         return await self._request('POST','/api/v1/positions',json=payload)
+    async def reduce_position(self,epic,open_direction,size):
+        """Partial close via opposite-direction POST (Capital DELETE is full-only).
+
+        Netting accounts shrink the open deal. No SL/TP on the reduce leg —
+        brackets stay on the remaining position and are updated by PUT after.
+        """
+        if open_direction not in ('BUY','SELL') or Decimal(str(size))<=0:
+            raise ValueError('Invalid reduce')
+        opposite='SELL' if open_direction=='BUY' else 'BUY'
+        payload={'epic':epic,'direction':opposite,'size':float(size),
+                 'guaranteedStop':False}
+        return await self._request('POST','/api/v1/positions',json=payload)
     async def close_position(self,deal_id):
         return await self._request('DELETE','/api/v1/positions/'+quote(str(deal_id),safe=''))
     async def update_position(self,deal_id,stop_level=None,profit_level=None,limit_level=None):

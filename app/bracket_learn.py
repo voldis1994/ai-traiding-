@@ -1385,45 +1385,87 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         except Exception:
             regime = {'ready': False}
         if regime.get('ready'):
+            # Keep absolute OHLC levels — never invent entry±N×risk as a fake TP.
             from .math_rules import (
                 snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
-            from decimal import Decimal as _Dec
-            stop_d = float(regime['stop_distance'])
-            profit_d = float(regime['profit_distance'])
+            from decimal import Decimal as _Dec, ROUND_FLOOR, ROUND_CEILING
+            e = float(entry)
+            sign = 1 if action == 'BUY' else -1
+            tick_d = _Dec(str(tick_f))
+
+            def _snap_abs(px, *, away_up):
+                """Snap absolute price onto tick; away_up=True pushes higher."""
+                p = _Dec(str(px))
+                mode = ROUND_CEILING if away_up else ROUND_FLOOR
+                n = (p / tick_d).to_integral_value(rounding=mode)
+                return float(n * tick_d)
+
+            raw_stop = float(regime['stop_level'])
+            raw_tp2 = float(regime.get('tp2_level') or regime['profit_level'])
+            raw_tp1 = regime.get('tp1_level')
+            # SL snaps away from entry (more protective); TP2 away (farther target).
+            if action == 'BUY':
+                stop_level = _snap_abs(raw_stop, away_up=False)
+                profit_level = _snap_abs(raw_tp2, away_up=True)
+                tp1_level = (_snap_abs(float(raw_tp1), away_up=True)
+                             if raw_tp1 is not None else None)
+            else:
+                stop_level = _snap_abs(raw_stop, away_up=True)
+                profit_level = _snap_abs(raw_tp2, away_up=False)
+                tp1_level = (_snap_abs(float(raw_tp1), away_up=False)
+                             if raw_tp1 is not None else None)
+            stop_d = abs(e - stop_level)
+            profit_d = abs(profit_level - e)
             stop_d, stop_ticks = snap_distance_to_tick(stop_d, tick_f)
             profit_d, profit_ticks = snap_distance_to_tick(profit_d, tick_f)
+            # Rebuild levels from snapped distances so broker grid matches.
+            stop_level = e - sign * stop_d
+            profit_level = e + sign * profit_d
+            if tp1_level is not None:
+                tp1_d = abs(float(tp1_level) - e)
+                if tp1_d > 1e-12:
+                    tp1_d, _ = snap_distance_to_tick(tp1_d, tick_f)
+                    tp1_level = e + sign * tp1_d
+                # TP1 must stay between entry and TP2 (or equal TP2).
+                if action == 'BUY' and tp1_level > profit_level:
+                    tp1_level = profit_level
+                if action == 'SELL' and tp1_level < profit_level:
+                    tp1_level = profit_level
             raised = False
             floor_ticks = _min_ticks(_Dec(str(mn)), _Dec(str(tick_f)))
             if floor_ticks and stop_ticks < floor_ticks:
                 stop_ticks = int(floor_ticks)
                 stop_d = float(_Dec(str(tick_f)) * stop_ticks)
+                stop_level = e - sign * stop_d
                 raised = True
             if floor_ticks and profit_ticks < floor_ticks:
-                profit_ticks = int(floor_ticks)
-                profit_d = float(_Dec(str(tick_f)) * profit_ticks)
+                # Raising TP distance would invent a non-OHLC level — refuse
+                # this source instead of fabricating entry+N×min.
+                profit_ticks = int(floor_ticks)  # for audit only
                 raised = True
             min_rr_need = float(regime.get('min_rr') or _min_rr(store))
             min_rr_need = max(1.0, min(3.0, min_rr_need))
             rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
-            if rr_now + 1e-12 < min_rr_need:
-                need_tp = float(_Dec(str(stop_d)) * _Dec(str(min_rr_need)))
-                new_tp, new_tp_ticks = snap_distance_to_tick(need_tp, tick_f)
-                if new_tp / stop_d + 1e-12 >= min_rr_need:
-                    profit_d, profit_ticks = float(new_tp), int(new_tp_ticks)
-                    rr_now = profit_d / stop_d
-            sign = 1 if action == 'BUY' else -1
-            e = float(entry)
-            stop_level = e - sign * stop_d
-            profit_level = e + sign * profit_d
-            if levels_correct_side(
+            # Do NOT stretch TP to invented min_rr price. Prefer structural OHLC;
+            # if RR is soft, still accept when regime marked structural_tp.
+            structural_ok = bool(regime.get('structural_tp'))
+            rr_ok = rr_now + 1e-12 >= min_rr_need or structural_ok
+            if (rr_ok and levels_correct_side(
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level) and distances_meet_broker_min(
-                        stop_d, profit_d, mn):
+                        stop_d, profit_d, mn)):
+                tp1_d = (abs(float(tp1_level) - e)
+                         if tp1_level is not None else float(profit_d))
                 return {
                     'stop_distance': float(stop_d),
                     'profit_distance': float(profit_d),
                     'stop_level': float(stop_level),
                     'profit_level': float(profit_level),
+                    'tp1_level': float(tp1_level) if tp1_level is not None else float(profit_level),
+                    'tp2_level': float(profit_level),
+                    'tp1_distance': float(tp1_d),
+                    'tp2_distance': float(profit_d),
+                    'scale_out_frac': float(regime.get('scale_out_frac') or 0.5),
                     'kappa': float(rr_now or regime.get('kappa') or min_rr_need),
                     'sl_scale': 1.0,
                     'ohlc_kappa': float(regime.get('kappa') or rr_now or min_rr_need),
@@ -1437,8 +1479,11 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                     'trigger': regime.get('trigger') or trigger,
                     'zone_sl': bool(regime.get('zone_sl')),
                     'zone_tp': bool(regime.get('zone_tp')),
+                    'structural_tp': True,
+                    'structural_rr': bool(regime.get('structural_rr')),
                     'min_rr': min_rr_need,
                     'rr': float(rr_now),
+                    'rr_tp1': float(tp1_d / stop_d) if stop_d > 1e-12 else None,
                     'swing_hi': regime.get('swing_hi'),
                     'swing_lo': regime.get('swing_lo'),
                     'raised_to_broker_min': raised,

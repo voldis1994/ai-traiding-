@@ -172,3 +172,100 @@ def test_structure_view_uses_us500_not_gold_default():
         assert view['epic'] == 'US500'
         assert view['epic'] != 'GOLD'
         assert view.get('epic_source') == 'legacy_brain'
+
+
+def test_structure_view_mtf_hold_does_not_invent_preferred(monkeypatch):
+    """MTF HOLD must not paint a neural BUY/SELL zona (#176 honesty)."""
+    from types import SimpleNamespace
+    from app import mtf_momentum
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        platform = PlatformStore(root / 'platform.sqlite3')
+        client = platform.create_client('hold1', 'pass1234', 'Hold', 'lv')
+        cid = int(client['id'])
+        data_dir = platform.account_data_dir(cid)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(data_dir / 'robot.sqlite3')
+        store.set('legacy_brain_epic', 'GOLD')
+        for row in _candles(70):
+            store.candle('GOLD', row, source='HISTORICAL')
+        hub = RuntimeHub(platform)
+        hub._runtimes[cid] = SimpleNamespace(
+            started=True,
+            engine=SimpleNamespace(
+                market={'epic': 'GOLD', 'mid': 100.5, 'spread': 0.2,
+                        'tick': 0.1, 'min_distance': 0.5},
+                mandate={'epic': 'GOLD'},
+                brain=SimpleNamespace(epic='GOLD'),
+                last_signal={
+                    'action': 'HOLD',
+                    'scores': {'BUY': 0.7, 'SELL': 0.1, 'HOLD': 0.2},
+                },
+                positions=[],
+            ),
+            store=store,
+        )
+
+        def _hold_overlays(*_a, **_k):
+            return {
+                'analysis': {
+                    'ready': True, 'mode': 'HOLD', 'preferred': 'HOLD',
+                    'confidence': 0.5, 'tf': {},
+                },
+                'kama': [], 'ema5': [], 'atr14': 1.0,
+            }
+
+        monkeypatch.setattr(mtf_momentum, 'chart_overlays', _hold_overlays)
+        monkeypatch.setattr('app.shared_market.adopt_side', lambda *_a, **_k: None)
+        monkeypatch.setattr('app.shared_market.publish_side', lambda *_a, **_k: None)
+        view = hub.admin_client_structure_view(cid, n=90)
+        assert view['ok'] is True
+        assert view.get('preferred') not in ('BUY', 'SELL')
+
+
+def test_structure_view_omits_swing_preview_while_in_trade():
+    """Live poz owns the tape — no prospective swing SL/TP stack (#176)."""
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        platform = PlatformStore(root / 'platform.sqlite3')
+        client = platform.create_client('live1', 'pass1234', 'Live', 'lv')
+        cid = int(client['id'])
+        data_dir = platform.account_data_dir(cid)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(data_dir / 'robot.sqlite3')
+        store.set('legacy_brain_epic', 'GOLD')
+        for row in _candles(70):
+            store.candle('GOLD', row, source='HISTORICAL')
+        hub = RuntimeHub(platform)
+        hub._runtimes[cid] = SimpleNamespace(
+            started=True,
+            engine=SimpleNamespace(
+                market={'epic': 'GOLD', 'mid': 100.5, 'spread': 0.2,
+                        'tick': 0.1, 'min_distance': 0.5},
+                mandate={'epic': 'GOLD'},
+                brain=SimpleNamespace(epic='GOLD'),
+                last_signal={'action': 'BUY', 'scores': {'BUY': 0.8}},
+                positions=[{
+                    'dealId': 'd1', 'direction': 'SELL', 'level': 101.0,
+                    'stopLevel': 102.5, 'profitLevel': 98.0,
+                }],
+            ),
+            store=store,
+        )
+        view = hub.admin_client_structure_view(cid, n=90)
+        assert view['ok'] is True
+        assert view.get('preferred') == 'SELL'  # open deal wins
+        assert view.get('open_levels')
+        assert view.get('swing_brackets') is None
+
+
+def test_ohlc_page_splits_structure_and_decision_subtitle():
+    js = Path('app/web/admin/ohlc-page.js').read_text(encoding='utf-8')
+    assert 'struktūra:' in js
+    assert 'lēmums:' in js
+    assert '!inTrade&&view.swing_brackets' in js
+    html = Path('app/web/admin/ohlc.html').read_text(encoding='utf-8')
+    assert 'ohlc-page.js?v=8' in html

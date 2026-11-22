@@ -1061,20 +1061,34 @@ class RuntimeHub:
                 preferred=ss
         if not preferred and isinstance(mtf,dict) and mtf.get('ready'):
             mp=str(mtf.get('preferred') or '').upper()
+            mode=str(mtf.get('mode') or '').upper()
             if mp in ('BUY','SELL'):
                 preferred=mp
+            # MTF HOLD — do not invent a BUY/SELL zona from neural max scores
+            # (that painted opposite sides across clients while MTF said HOLD).
+            elif mode=='HOLD':
+                preferred=None
         if not preferred and action in ('BUY','SELL'):
             preferred=action
         if not preferred and isinstance(scores,dict):
-            try:
-                preferred=max(('BUY','SELL','HOLD'),
-                              key=lambda a:float(scores.get(a) or 0))
-                if preferred=='HOLD':
+            mtf_hold=(isinstance(mtf,dict) and str(mtf.get('mode') or '').upper()=='HOLD')
+            if not mtf_hold:
+                try:
+                    preferred=max(('BUY','SELL','HOLD'),
+                                  key=lambda a:float(scores.get(a) or 0))
+                    if preferred=='HOLD':
+                        preferred=None
+                except (TypeError,ValueError):
                     preferred=None
-            except (TypeError,ValueError):
-                preferred=None
+        # Live position direction wins for Admin preferred (truth on tape).
+        open_dirs=[str(p.get('direction') or '').upper()
+                   for p in positions if isinstance(p,dict)]
+        open_dirs=[d for d in open_dirs if d in ('BUY','SELL')]
+        if open_dirs:
+            preferred=open_dirs[0]
         # Publish from this client's MTF/structure so peers can adopt.
-        if preferred in ('BUY','SELL') and epic:
+        # Skip while in trade — open deal already owns the preferred side.
+        if preferred in ('BUY','SELL') and epic and not open_dirs:
             try:
                 from . import shared_market
                 conf=(mtf or {}).get('confidence') if isinstance(mtf,dict) else None
@@ -1110,22 +1124,6 @@ class RuntimeHub:
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
-        # Preview SL/TP at side price (ask/bid) — same as LIVE OPEN entry.
-        entry_px=mid
-        if preferred=='BUY' and mid is not None:
-            entry_px=mid+(spread/2.0 if spread else 0)
-        elif preferred=='SELL' and mid is not None:
-            entry_px=mid-(spread/2.0 if spread else 0)
-        if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
-            try:
-                zone=bracket_learn.zone_at_open(
-                    candles_full or candles,multi_tf=True)
-                swing_brackets=bracket_learn.swing_anchor_brackets(
-                    candles=candles_full or candles,entry=entry_px,action=preferred,
-                    tick=tick,spread=spread,min_distance=0.,zone=zone,
-                    atr=atr_hint,kama=kama_hint,store=store)
-            except Exception as exc:
-                swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
         def _level_or_none(raw):
             """Broker unset SL/TP often arrives as 0 — omit for chart + Admin."""
@@ -1146,6 +1144,31 @@ class RuntimeHub:
                 'stop':_level_or_none(p.get('stopLevel')),
                 'profit':_level_or_none(p.get('profitLevel')),
             })
+        # Prospective swing brackets only when flat — never stack on live poz.
+        if not open_levels:
+            entry_px=mid
+            if preferred=='BUY' and mid is not None:
+                entry_px=mid+(spread/2.0 if spread else 0)
+            elif preferred=='SELL' and mid is not None:
+                entry_px=mid-(spread/2.0 if spread else 0)
+            min_dist=0.
+            try:
+                # Broker min stop when known — Admin preview must match LIVE.
+                min_dist=float((eng.market or {}).get('min_distance')
+                               or (eng.market or {}).get('minStopDistance')
+                               or 0) if eng else 0.
+            except (TypeError,ValueError,AttributeError):
+                min_dist=0.
+            if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
+                try:
+                    zone=bracket_learn.zone_at_open(
+                        candles_full or candles,multi_tf=True)
+                    swing_brackets=bracket_learn.swing_anchor_brackets(
+                        candles=candles_full or candles,entry=entry_px,action=preferred,
+                        tick=tick,spread=spread,min_distance=min_dist,zone=zone,
+                        atr=atr_hint,kama=kama_hint,store=store)
+                except Exception as exc:
+                    swing_brackets={'ready':False,'reason':type(exc).__name__}
         # Compact candle payload for canvas (popup may ask for more history).
         bare=[]
         for c in candles:

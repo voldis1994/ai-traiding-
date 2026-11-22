@@ -17,9 +17,11 @@ def _engine(d):
 
 
 def test_counterfactual_trail_follows_trail_enabled():
+    """Trail hard OFF — CF path never simulates trail even if class flipped."""
     with tempfile.TemporaryDirectory() as d:
         store, e = _engine(d)
         assert e.TRAIL_ENABLED is False
+        assert e._trail_is_enabled() is False
         ctx = e._counterfactual_context(
             'd1', {'stop_distance': 1.0, 'profit_distance': 2.0},
             epic='GOLD', entry=100.0, exit_level=100.5, tick=0.01, spread=0.02)
@@ -28,7 +30,8 @@ def test_counterfactual_trail_follows_trail_enabled():
         ctx2 = e._counterfactual_context(
             'd1', {'stop_distance': 1.0, 'profit_distance': 2.0},
             epic='GOLD', entry=100.0, exit_level=100.5, tick=0.01, spread=0.02)
-        assert ctx2['trail'] is True
+        assert ctx2['trail'] is False
+        assert e._trail_is_enabled() is False
 
 
 def test_history_settle_rejects_zero_pnl():

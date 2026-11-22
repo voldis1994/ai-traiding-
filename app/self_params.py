@@ -97,8 +97,8 @@ DEFAULTS = {
     'trail_arm_mfe_frac': 0.80,
     'trail_arm_tp_frac': 0.40,
     'trail_arm_min_ev': 0.0,
-    # LIVE broker trail — on by default after GOLD near-miss audit (was hard-off).
-    'trail_live_enabled': 1,
+    # LIVE broker trail — HARD OFF (fixed OHLC swing SL/TP). Engine ignores ON.
+    'trail_live_enabled': 0,
     # First lock sits BE+ (profit cushion) so a small bounce does not scratch.
     'trail_be_cushion_frac': 0.15,
     # Post-BE gap also floors vs original TP so trail stays even with RR.
@@ -285,7 +285,8 @@ BOUNDS = {
     'trail_arm_mfe_frac': (0.70, 1.0),
     'trail_arm_tp_frac': (0.25, 0.70),
     'trail_arm_min_ev': (-1.0, 2.0),
-    'trail_live_enabled': (0, 1),
+    # Locked off — evolve cannot turn trail back on.
+    'trail_live_enabled': (0, 0),
     'trail_be_cushion_frac': (0.05, 0.35),
     'trail_gap_vs_tp_frac': (0.15, 0.50),
     'bracket_vs_vol_noise': (0.8, 2.0),
@@ -359,7 +360,8 @@ BOUNDS = {
 IMMUTABLE_NOTE = (
     'Capital: no volume/DOM (per-instrument Yahoo/Coinbase/OKX liquidity is EXTERNAL). '
     'Layout: BASE|DYNAMIC|EXTERNAL. Actions: BUY/SELL/HOLD. '
-    'Broker tick/min-stop/margin are exchange rules.'
+    'Broker tick/min-stop/margin are exchange rules. '
+    'Trail SL: hard OFF — fixed OHLC swing SL/TP only (not evolvable).'
 )
 
 # learn_lr moves only in whole hundredths — same discipline as entry_edge.
@@ -448,6 +450,8 @@ def _apply_soft_ceilings(out: dict) -> dict:
     except (TypeError,ValueError):
         out['learn_win_repeats']=int(DEFAULTS['learn_win_repeats'])
         out['learn_loss_repeats']=int(DEFAULTS['learn_loss_repeats'])
+    # Product: trail never comes back via evolve / stale Store bags.
+    out['trail_live_enabled']=0
     return out
 
 
@@ -458,7 +462,9 @@ def load(store) -> dict:
         for k,v in raw.items():
             if k in DEFAULTS:
                 out[k]=_clip(k,v)
-    return _apply_soft_ceilings(out)
+    out=_apply_soft_ceilings(out)
+    out['trail_live_enabled']=0
+    return out
 
 
 def migrate_soft_ceilings(store):
@@ -506,6 +512,7 @@ def save(store, params: dict, *, reason=''):
     if store is None:return
     clean=_apply_soft_ceilings(
         {k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS})
+    clean['trail_live_enabled']=0
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)

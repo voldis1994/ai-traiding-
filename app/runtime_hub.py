@@ -100,7 +100,15 @@ class AccountRuntime:
         has_sl=_live_lvl(p.get('stopLevel')) is not None
         has_tp=_live_lvl(p.get('profitLevel')) is not None
         enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
-        trail_on=bool(getattr(engine,'TRAIL_ENABLED',False))
+        # Prefer hard kill switch; never advertise trail from stale class defaults.
+        trail_on=False
+        if engine is not None and hasattr(engine,'_trail_is_enabled'):
+            try:
+                trail_on=bool(engine._trail_is_enabled())
+            except Exception:
+                trail_on=False
+        else:
+            trail_on=bool(getattr(engine,'TRAIL_ENABLED',False))
         phase='flat'
         # Trail disabled → never advertise armed/ratchet/trail phases (Admin honesty).
         if not trail_on:
@@ -794,7 +802,8 @@ class RuntimeHub:
                     'economic_news_risk':snap.get('economic_news_risk'),
                     'intermarket_analysis':snap.get('intermarket_analysis'),
                     'trail_enabled':bool(
-                        getattr(rt.engine,'TRAIL_ENABLED',False)),
+                        rt.engine._trail_is_enabled()
+                        if hasattr(rt.engine,'_trail_is_enabled') else False),
                     # Full robot telemetry for the Desk control panel.
                     'returns_bps':((snap.get('market_context') or {}).get('returns_bps')
                                    if isinstance(snap.get('market_context'),dict) else None),

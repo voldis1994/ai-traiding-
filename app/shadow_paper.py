@@ -3,8 +3,8 @@
 Never remaps LIVE broker £ onto the shadow vote. Each closed M1 bar the shadow
 neural core votes BUY/SELL/HOLD; this journal opens/closes a virtual position
 using the *same* execution rules as LIVE: spread fill, optional slip, fill
-delay, SL/TP brackets, and trailing stop. Opposite-signal flip exits are
-forbidden — LIVE closes only via SL/TP/trail.
+delay and fixed SL/TP brackets (trail hard OFF). Opposite-signal flip exits
+are forbidden — LIVE closes only via SL/TP.
 
 Price-unit moves are converted to account-currency cash via a scale estimated
 from recent LIVE broker trades (broker_£ / signed price move). Without that
@@ -417,33 +417,7 @@ class ShadowPaperJournal:
         pos=self.position
         if pos is not None:
             direction=pos.get('direction')
-            sign=1 if direction=='BUY' else -1
-            entry_p=_finite(pos.get('entry'));stop_p=_finite(pos.get('stop'))
-            tip=hi if direction=='BUY' else lo
-            mfe=(sign*(float(tip)-float(entry_p))
-                 if entry_p is not None and tip is not None else None)
-            be_locked=(entry_p is not None and stop_p is not None
-                       and sign*(float(stop_p)-float(entry_p))>=-1e-12)
-            try:
-                from . import structure_edge as _se
-                arm=_se.trail_arm_decision(
-                    self.store,epic=None,structure='CHOP',direction=direction,
-                    mfe=mfe,original_risk=pos.get('original_risk'),
-                    original_profit=pos.get('original_profit'),
-                    be_locked=be_locked)
-            except Exception:
-                arm=None
-            new_stop=paper_trail_stop(
-                direction,pos.get('entry'),pos.get('stop'),pos.get('profit'),
-                high=hi,low=lo,mid=mid,spread=sp,
-                original_risk=pos.get('original_risk'),
-                tick=pos.get('tick') or tick,
-                min_distance=pos.get('min_distance') or min_distance,
-                store=self.store,arm_decision=arm,
-                original_profit=pos.get('original_profit'))
-            if new_stop is not None:
-                pos=dict(pos);pos['stop']=float(new_stop);pos['trailed']=True
-                self.position=pos
+            # Trail HARD OFF — same as LIVE: fixed OHLC SL/TP only (no tip±gap).
             hit=hit_sl_tp(direction,high=hi,low=lo,stop=pos.get('stop'),
                           profit=pos.get('profit'),mid=mid,spread=sp,slip_bps=slip)
             if hit is not None:
@@ -521,5 +495,5 @@ class ShadowPaperJournal:
             'wins':sum(1 for x in pnls if x>0),
             'losses':sum(1 for x in pnls if x<0),
             'unit':'account_currency',
-            'exit_mode':'sl_tp_trail_only',
+            'exit_mode':'sl_tp_only',
         }

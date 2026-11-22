@@ -5678,25 +5678,19 @@ class SingleTradeEngine:
             path,entry=entry,exit_level=None,pre_bars=pre)
         return (frame or {}).get('structure') or 'CHOP'
 
-    # Class fallback — LIVE reads ``trail_live_enabled`` from self_params (audit ON).
-    TRAIL_ENABLED=True
+    # HARD OFF — fixed OHLC swing SL/TP only. Trail rewrote pivots (tip±gap/ATR).
+    # Do not re-enable via self_params evolve; product kill-switch.
+    TRAIL_ENABLED=False
 
     def _trail_is_enabled(self):
-        """Broker trail ON/OFF — seed from GOLD near-miss audit; evolvable."""
-        try:
-            from .self_params import get as sp_get
-            return bool(int(sp_get(self.store,'trail_live_enabled',1)))
-        except Exception:
-            return bool(getattr(self,'TRAIL_ENABLED',True))
+        """Broker trail — permanently off. Fixed OHLC SL/TP only."""
+        return False
 
     def _enroll_adaptive_protection(self,p,*,force=False):
-        """Register robot deal for broker trail. Needs entry+SL; TP optional.
+        """Register robot deal for broker trail — NO-OP (trail hard OFF).
 
-        Capital often confirms OPEN with stopLevel set and Take Profit Off —
-        requiring TP here used to skip enrollment entirely, so trail never ran.
-
-        Gated by ``trail_live_enabled`` (self_params) — audit default ON so
-        ≥0.8×TP winners can lock instead of reversing to full SL.
+        Product: fixed OHLC swing SL/TP only. Enrollment stays dead so
+        ``adapt_protection`` never PUTs tip±gap stops.
         """
         if not self._trail_is_enabled():
             return False
@@ -5772,14 +5766,7 @@ class SingleTradeEngine:
         return True
 
     async def adapt_protection(self,p):
-        """Trail SL behind broker extreme — ROBOT only; continues past BE.
-
-        Pre-BE gap = original_risk; after BE gap = recent M1 median range from
-        OHLC (same zone data), not a hardcoded fraction of R.
-        Trail self-arms from MFE / structure EV (not a fixed human 1R law).
-
-        Gated by ``trail_live_enabled`` — when off, fixed OHLC SL/TP only.
-        """
+        """Trail path — HARD OFF. Fixed OHLC swing SL/TP only (no tip±gap PUT)."""
         deal_s=str(p.get('dealId'))
         if not self._trail_is_enabled():
             self.protection_brief={

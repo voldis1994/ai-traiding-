@@ -163,25 +163,15 @@ def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
     return max(floor,min(open_gap,knobs['fallback_frac']*open_gap))
 
 
-# Live Capital trail PUTs are gated in ``SingleTradeEngine.TRAIL_ENABLED``.
-# This helper still computes proposals for unit tests / offline sims.
+# LIVE trail is HARD OFF (engine._trail_is_enabled → False). Helper kept for
+# offline unit tests / historical sims only — never call from LIVE adapt_protection.
 
 
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
                          zone_range=None,store=None,arm_decision=None,atr=None):
-    """Trail SL behind broker extreme — past break-even, even with SL/TP.
+    """Offline trail proposal (tests/sims). LIVE must not call this.
 
-    Before BE: wait for 1R *and* a share of original TP before first lock
-    (same geometry as brackets — not an aggressive early cut). After BE: gap
-    floors vs open risk, TP share, and ATR — not tip±minStop glue.
-
-    CRITICAL: always re-send live profitLevel on trail PUTs. Omitting TP on
-    Capital update_position turns Take Profit Off — price can touch the old
-    TP mark twice with no order left to fill.
-
-    BUY:  stop = peak − gap.  SELL: stop = trough + gap.
-
-    Live engine must not call this while ``TRAIL_ENABLED`` is False.
+    BUY: stop = peak − gap. SELL: stop = trough + gap — abandons OHLC swing SL.
     """
     if market.get('status')!='TRADEABLE':return None
     direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)

@@ -17,6 +17,20 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
         # Still try samples (idempotent) + harvest so visi_dati upgrades land.
         out = {'ok': True, 'reason': 'already_booted'}
         try:
+            from .self_params import load, save, STORE_KEY
+            raw = store.get(STORE_KEY) if store is not None else None
+            raw_on = (isinstance(raw, dict)
+                      and int(raw.get('trail_live_enabled') or 0) != 0)
+            p = load(store)
+            p['trail_live_enabled'] = 0
+            if raw_on:
+                save(store, p, reason='evo_boot_trail_hard_off')
+                out['trail'] = 'forced_off'
+            else:
+                out['trail'] = 'off'
+        except Exception as exc:
+            out['trail'] = type(exc).__name__
+        try:
             from . import sample_strategies, strategy_gen
             out['samples'] = sample_strategies.build_strategies_from_samples(
                 store, backup_root=None, use_store_trades=True, force=False)
@@ -58,6 +72,10 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
             hz = 8
         if hz > 12:
             p['self_params_horizon_trades'] = 8
+            touched = True
+        # Kill trail on every boot — stale Stores may still hold trail_live_enabled=1.
+        if int(p.get('trail_live_enabled') or 0) != 0:
+            p['trail_live_enabled'] = 0
             touched = True
         if touched:
             save(store, p, reason='evo_boot_audit_defaults')

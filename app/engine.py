@@ -8275,6 +8275,8 @@ class SingleTradeEngine:
         shadow_tr=None
         if shadow is not None and getattr(shadow,'last_transition',None):
             shadow_tr=self.brain._json_transition(shadow.last_transition)
+        # Same OHLC swing/regime brackets as LIVE OPEN + hold-shadow —
+        # never invent median-zone ±distance via stop_take for paper fills.
         tick=None;minimum=None;stop_d=None;profit_d=None;kappa=None;sl_scale=None
         try:
             mkt=self.market or {}
@@ -8284,23 +8286,19 @@ class SingleTradeEngine:
                 tick=max(abs(float(spread or 0))/2.,1e-4)
             if minimum is None or minimum<0:
                 minimum=float(tick)
-            rows=candles if candles is not None else (
-                self.store.candles(self.mandate['epic'],n=120,historical_only=True)
-                if self.mandate else [])
-            zone=bracket_learn.zone_at_open(rows)
-            rng=zone['range_distance'] or ohlc_range_distance(rows)
-            buffer=max(2*float(tick),2*abs(float(spread or 0)))
-            base_sl=max(float(minimum)+buffer,float(rng or 0))
-            bp=bracket_learn.propose_for_open(
-                self.store,ohlc_kappa=zone.get('kappa'),base_sl=base_sl,
-                max_tp=zone.get('max_tp'),candles=rows)
-            entry_proxy=float(mid)+abs(float(spread or 0))/2.
-            brackets=stop_take(entry_proxy,'BUY',tick,spread,minimum,
-                               kappa=bp['kappa'],sl_scale=bp['sl_scale'],
-                               range_distance=float(rng) if rng is not None else 0)
-            stop_d=float(brackets['stop_distance'])
-            profit_d=float(brackets['profit_distance'])
-            kappa=bp['kappa'];sl_scale=bp['sl_scale']
+            if action in ('BUY','SELL'):
+                wb=self._would_be_brackets(action)
+                if wb and wb.get('stop_distance') is not None \
+                        and wb.get('profit_distance') is not None:
+                    stop_d=float(wb['stop_distance'])
+                    profit_d=float(wb['profit_distance'])
+                    if wb.get('tick') is not None:
+                        tick=float(wb['tick'])
+                    if wb.get('min_distance') is not None:
+                        minimum=float(wb['min_distance'])
+                    kappa=_num(wb.get('ohlc_kappa'))
+                    sl_scale=1.0
+                # else: leave stop_d/profit_d None → journal refuses to invent
         except Exception:
             stop_d=profit_d=None
         # Critical #4: friction from Store self_params — robot evolves these.

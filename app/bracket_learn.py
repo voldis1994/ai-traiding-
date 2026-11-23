@@ -1509,34 +1509,61 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         if swing.get('ready'):
             # Swing SL/TP stay on pivots — no cosmetic tighten, no post-snap
             # soft-shrink of SL (that abandoned OHLC structure).
+            # Never invent formula TP (stop×min_rr or broker-min raise) — same
+            # honesty as regime_brackets: only real OHLC pivots or refuse.
             from .math_rules import (
                 snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
             from decimal import Decimal as _Dec
+            from . import structure_memory as _sm
             t = 1.0  # aggression/edge tighten must not move swing legs
-            stop_d = float(swing['stop_distance'])
-            profit_d = float(swing['profit_distance'])
+            e = float(entry)
+            sign = 1 if action == 'BUY' else -1
+            # Prefer absolute pivot levels from swing; fall back to distances.
+            raw_stop = _finite(swing.get('stop_level'))
+            raw_tp = _finite(swing.get('profit_level'))
+            if raw_stop is None or raw_tp is None:
+                raw_stop = e - sign * float(swing['stop_distance'])
+                raw_tp = e + sign * float(swing['profit_distance'])
+            stop_d = abs(e - float(raw_stop))
+            profit_d = abs(float(raw_tp) - e)
             stop_d, stop_ticks = snap_distance_to_tick(stop_d, tick_f)
             profit_d, profit_ticks = snap_distance_to_tick(profit_d, tick_f)
             raised = False
             floor_ticks = _min_ticks(_Dec(str(mn)), _Dec(str(tick_f)))
             if floor_ticks and stop_ticks < floor_ticks:
+                # SL further from entry = more protective broker floor — OK.
                 stop_ticks = int(floor_ticks)
                 stop_d = float(_Dec(str(tick_f)) * stop_ticks)
                 raised = True
             if floor_ticks and profit_ticks < floor_ticks:
-                profit_ticks = int(floor_ticks)
-                profit_d = float(_Dec(str(tick_f)) * profit_ticks)
+                # Raising TP to broker min would invent a non-OHLC level —
+                # refuse (same as regime_brackets), do not fabricate entry±N.
+                profit_ticks = int(floor_ticks)  # audit only
                 raised = True
-            # Re-check min RR AFTER snap — raise TP only; never invent soft SL.
+            stop_level = e - sign * stop_d
+            profit_level = e + sign * profit_d
+            # Re-check min RR AFTER snap — extend to a farther real pivot only.
             min_rr_need = float(swing.get('min_rr') or _min_rr(store))
             min_rr_need = max(1.0, min(3.0, min_rr_need))
             rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
             if rr_now + 1e-12 < min_rr_need:
                 need_tp = float(_Dec(str(stop_d)) * _Dec(str(min_rr_need)))
-                new_tp, new_tp_ticks = snap_distance_to_tick(need_tp, tick_f)
-                if new_tp / stop_d + 1e-12 >= min_rr_need:
-                    profit_d, profit_ticks = float(new_tp), int(new_tp_ticks)
-                    rr_now = profit_d / stop_d
+                path = _sm.normalise(candles, limit=80)
+                piv = _sm.swing_pivots(path, left=2, right=2)
+                ext = _extend_structural_tp(
+                    action=action, entry=e, need_d=need_tp,
+                    highs=piv.get('swing_highs'), lows=piv.get('swing_lows'))
+                if (ext and float(ext['profit_distance']) + 1e-12 >= need_tp):
+                    new_tp, new_tp_ticks = snap_distance_to_tick(
+                        float(ext['profit_distance']), tick_f)
+                    if new_tp / stop_d + 1e-12 >= min_rr_need:
+                        profit_d, profit_ticks = float(new_tp), int(new_tp_ticks)
+                        profit_level = e + sign * profit_d
+                        rr_now = profit_d / stop_d
+                        if ext.get('swing_hi') is not None:
+                            swing = dict(swing, swing_hi=float(ext['swing_hi']))
+                        if ext.get('swing_lo') is not None:
+                            swing = dict(swing, swing_lo=float(ext['swing_lo']))
                 if profit_d / stop_d + 1e-12 < min_rr_need:
                     return {
                         'stop_distance': float(stop_d),
@@ -1549,10 +1576,6 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                         'swing': swing, 'swing_reason': swing.get('reason'),
                         'raised_to_broker_min': raised,
                     }
-            sign = 1 if action == 'BUY' else -1
-            e = float(entry)
-            stop_level = e - sign * stop_d
-            profit_level = e + sign * profit_d
             if not levels_correct_side(
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level):

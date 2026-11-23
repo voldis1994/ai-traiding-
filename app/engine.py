@@ -5496,6 +5496,40 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','OHLC scenario self-audit skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
+            # Scenario memory + promote-to-LIVE (SHADOW rail visible). LIVE
+            # already applied mild ohlc penalties above — here we only track
+            # fingerprints / ready_for_live (no double-commit of knobs).
+            try:
+                from . import shadow_mistake_audit as sma
+                ohlc_meta=(saved.get('ohlc_entry')
+                           if isinstance(saved,dict) else None)
+                sc_meta=(ohlc_meta.get('scenario')
+                         if isinstance(ohlc_meta,dict) else None)
+                audit_epic=(self.mandate or {}).get('epic') or epic
+                audit_candles=self._decision_candles(audit_epic,n=80) if audit_epic else []
+                news_snap=None;im_snap=None
+                if isinstance(saved,dict):
+                    news_snap=saved.get('news') or saved.get('economic_news_risk')
+                    im_snap=saved.get('intermarket') or saved.get('intermarket_analysis')
+                sma.on_close(
+                    self.store,
+                    pnl=pnl_value,spread=spread_cost,
+                    candles=audit_candles,
+                    scenario_meta=sc_meta if isinstance(sc_meta,dict) else {},
+                    ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else {},
+                    news=news_snap if isinstance(news_snap,dict) else self._news_risk(),
+                    intermarket=im_snap if isinstance(im_snap,dict)
+                    else dict(self.intermarket.state or {}),
+                    direction=(direction if direction in ('BUY','SELL')
+                               else (ohlc_meta or {}).get('action')),
+                    entry=_num((saved or {}).get('entry')
+                               if isinstance(saved,dict) else None),
+                    source='live',
+                    apply_ohlc_penalties=False,
+                )
+            except Exception as exc:
+                self.store.event('warning','LIVE mistake-audit memory skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None
                 if isinstance(saved,dict):
@@ -7663,6 +7697,37 @@ class SingleTradeEngine:
         sp=load_self_params(self.store)
         slip_bps=float(sp['exec_slip_bps'])
         fill_delay_bars=int(sp['exec_fill_delay_bars'])
+        # Stamp open-time OHLC/news/intermarket so mistake-audit can compare.
+        entry_context=None
+        try:
+            from . import ohlc_scenarios as _osc
+            from . import ohlc_entry_zones as _oez
+            stamp_rows=candles if candles is not None else (
+                self.store.candles(self.mandate['epic'],n=80,historical_only=True)
+                if self.mandate else [])
+            sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
+            ez=_oez.compute_entry_zones(
+                stamp_rows,mid=mid,store=self.store) if stamp_rows else {}
+            zone=None
+            if isinstance(ez,dict):
+                if action=='BUY':
+                    zone=ez.get('buy_entry')
+                elif action=='SELL':
+                    zone=ez.get('sell_entry')
+                if not isinstance(zone,dict):
+                    zone=ez.get('buy_entry') or ez.get('sell_entry')
+            entry_context={
+                'scenario':_osc.open_meta_from_scenario(sc) if sc else {},
+                'ohlc_entry':{
+                    'action':action if action in ('BUY','SELL') else None,
+                    'zone':zone if isinstance(zone,dict) else None,
+                    'trigger':(ez or {}).get('trigger') if isinstance(ez,dict) else None,
+                },
+                'news':self._news_risk(),
+                'intermarket':dict(self.intermarket.state or {}),
+            }
+        except Exception:
+            entry_context=None
         closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
             cash_scale=self.shadow_paper.cash_scale,
@@ -7671,7 +7736,8 @@ class SingleTradeEngine:
             kappa=kappa,sl_scale=sl_scale,
             model_version=int(getattr(shadow,'model_version',0) or 0),
             slip_bps=slip_bps,fill_delay_bars=fill_delay_bars,
-            shadow_transition=shadow_tr)
+            shadow_transition=shadow_tr,
+            entry_context=entry_context)
         if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
             # CRITICAL: shadow paper must use the SAME loss teacher as LIVE
             # (label_from_profit). Old path called best_action_from_counterfactual
@@ -7729,6 +7795,39 @@ class SingleTradeEngine:
                         'exit_reason':closed.get('exit_reason')})
                 except Exception:
                     pass
+            # Mistake-audit loop: diagnose → scenario memory → targeted fix → promote.
+            try:
+                from . import shadow_mistake_audit as sma
+                ctx=closed.get('entry_context') if isinstance(
+                    closed.get('entry_context'),dict) else {}
+                ohlc_meta=ctx.get('ohlc_entry') if isinstance(
+                    ctx.get('ohlc_entry'),dict) else {}
+                sc_meta=ctx.get('scenario') if isinstance(
+                    ctx.get('scenario'),dict) else {}
+                audit_rows=candles if candles is not None else (
+                    self.store.candles(self.mandate['epic'],n=80,historical_only=True)
+                    if self.mandate else [])
+                sma.on_close(
+                    self.store,
+                    pnl=pnl,
+                    spread=closed.get('spread') if closed.get('spread') is not None
+                    else spread,
+                    candles=audit_rows,
+                    scenario_meta=sc_meta,
+                    ohlc_meta=ohlc_meta,
+                    news=ctx.get('news') if isinstance(ctx.get('news'),dict)
+                    else self._news_risk(),
+                    intermarket=ctx.get('intermarket') if isinstance(
+                        ctx.get('intermarket'),dict)
+                    else dict(self.intermarket.state or {}),
+                    direction=closed.get('direction'),
+                    entry=_num(closed.get('entry')),
+                    source='shadow',
+                    apply_ohlc_penalties=True,
+                )
+            except Exception as exc:
+                self.store.event('warning','Shadow mistake-audit skipped',
+                                 {'type':type(exc).__name__})
         return closed
 
     def restore_neural_weights(self, version_meta_or_path):

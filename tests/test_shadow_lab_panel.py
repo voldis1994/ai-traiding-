@@ -20,8 +20,10 @@ def test_shadow_rail_and_view_exist():
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
-    assert 'admin.css?v=127' in HTML
-    assert 'admin.js?v=133' in HTML
+    assert 'admin.css?v=128' in HTML
+    assert 'admin.js?v=134' in HTML
+    assert 'MISTAKE AUDIT' in JS or 'mistake_audit' in JS
+    assert 'SCENARIO MEMORY' in JS
 
 
 def test_shadow_lab_payload_honest_about_100():
@@ -41,6 +43,12 @@ def test_shadow_lab_payload_honest_about_100():
             'shadow_neurons': 12, 'live_samples': 4, 'paper_cash_samples': 2,
             'method': 'independent_shadow_paper_cash',
         })
+        store.set('shadow_mistake_audit_v1:last', {
+            'mistakes': ['zone_fail'], 'scenario': 'TREND_UP',
+            'source': 'shadow', 'pnl': -0.5, 'promote_count': 1, 'promote_need': 3,
+            'news_status': 'CLEAR', 'intermarket_status': 'WAITING',
+            'zone_side': 'demand', 'notes': ['price_closed_through_demand'],
+        })
         hub = RuntimeHub.__new__(RuntimeHub)
 
         class _RT:
@@ -53,8 +61,11 @@ def test_shadow_lab_payload_honest_about_100():
         assert lab['ok'] is True
         assert lab['truth']['hundred_variations'] is False
         assert lab['truth']['policy_candidates_approx'] == 30
-        assert '100' in lab['truth']['what_runs'] or 'Not a 100' in lab['truth']['what_runs']
+        assert lab['truth'].get('mistake_audit') is True
+        assert 'mistake-audit' in lab['truth']['what_runs'] or 'scenario memory' in lab['truth']['what_runs']
         assert len(lab['paper']['recent']) == 2
         assert lab['paper']['recent'][0]['paper_pnl'] in (0.42, -0.18)
         assert lab['evolution']['attempts'] == 3
         assert lab['self_dev_last']['paper_cash_samples'] == 2
+        assert lab['mistake_audit']['ok'] is True
+        assert lab['mistake_audit']['last']['mistakes'] == ['zone_fail']

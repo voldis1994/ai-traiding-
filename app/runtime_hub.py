@@ -855,11 +855,20 @@ class RuntimeHub:
                     getattr(rt, 'engine', None) is not None))
             except Exception:
                 running = False
+        mistake_audit = {}
+        if store is not None:
+            try:
+                from . import shadow_mistake_audit as sma
+                mistake_audit = sma.lab_payload(store)
+            except Exception:
+                mistake_audit = {'ok': False}
         cash_n = int(paper.get('cash_trades') or 0)
         trades_n = int(paper.get('trades') or 0)
         pulse = 'IDLE'
         if open_pos or pending:
             pulse = 'OPEN'
+        elif (mistake_audit.get('last') or {}).get('mistakes'):
+            pulse = 'LEARNING'
         elif cash_n or trades_n:
             pulse = 'LEARNING'
         elif shadow_on and running:
@@ -875,10 +884,13 @@ class RuntimeHub:
             'truth': {
                 'hundred_variations': False,
                 'what_runs': (
-                    'One shadow neural + paper SL/TP book; ~30 policy.py edge '
-                    'candidates; self-params trial/commit; HOLD opposite replay; '
-                    'structure graves. Not a 100-parallel sweep.'),
+                    'One shadow neural + paper SL/TP book; mistake-audit '
+                    '(OHLC/zones/news/intermarket) → scenario memory → targeted '
+                    'fix → promote after repeats → LIVE; ~30 policy edge '
+                    'candidates; self-params trials; HOLD opposite. '
+                    'Not a 100-parallel sweep.'),
                 'policy_candidates_approx': 30,
+                'mistake_audit': True,
             },
             'paper': {
                 **paper,
@@ -896,6 +908,7 @@ class RuntimeHub:
             'trial': trial,
             'self_dev_last': last_dev,
             'evolution': evo,
+            'mistake_audit': mistake_audit if isinstance(mistake_audit, dict) else {},
         }
 
     def admin_client_card(self,client: dict) -> dict:

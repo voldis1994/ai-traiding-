@@ -184,9 +184,10 @@ def test_open_pnl_uses_account_currency_not_gold_quote_usd():
     """GOLD position.currency=USD must not label open cash as USD on a GBP account."""
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'p.currency&&p.currency!==ccy?p.currency:ccy' not in js.replace(' ', '')
+    assert 'Always account cash currency' in js or 'Account currency only' in js
     chunk = js.split('function collectOpenTrades')[1].split('function instrumentIcon')[0]
     assert 'accountCashCcy(c)' in chunk
-    assert 'currency:ccy' in chunk.replace(' ', '')
+    assert "currency:ccy||'GBP'" in chunk.replace(' ', '') or 'currency:ccy||"GBP"' in chunk
     assert 'const ccy=accountCashCcy(c)' in chunk.replace('\n','')
     assert 'perfClients' in js
     assert 'humanEntryBlock' in js

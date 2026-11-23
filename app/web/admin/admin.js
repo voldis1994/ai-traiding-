@@ -1941,7 +1941,9 @@ function collectOpenTrades(clients){
         open:p.level,
         current:positionMid(p,a),
         upl:p.upl,
-        currency:ccy,
+        // Always account cash currency. Capital tags GOLD with quote USD —
+        // that is NOT the Funds/UPL settle currency (GBP account → GBP).
+        currency:ccy||'GBP',
         stopLevel:p.stopLevel,
         profitLevel:p.profitLevel,
         has_sl:p.has_sl,

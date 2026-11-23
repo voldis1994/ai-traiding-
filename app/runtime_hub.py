@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 259
+DESK_TRUTH_REV = 260
 
 
 def _finite_num(v):
@@ -201,6 +201,21 @@ class AccountRuntime:
             current=(p.get('currentLevel') if p.get('currentLevel') is not None
                      else (p.get('current_price') if p.get('current_price') is not None
                            else (p.get('mark') if p.get('mark') is not None else mid)))
+            # Open floating cash is account currency — never GOLD quote USD.
+            acct=None
+            try:
+                acct=(engine._account_currency()
+                      if engine is not None and hasattr(engine,'_account_currency')
+                      else None)
+            except Exception:
+                acct=None
+            cash_ccy=None
+            try:
+                cash_ccy=(engine._cash_currency(p.get('currency'))
+                          if engine is not None and hasattr(engine,'_cash_currency')
+                          else None)
+            except Exception:
+                cash_ccy=None
             out.append({
                 'dealId':p.get('dealId'),
                 'epic':p.get('epic'),
@@ -210,7 +225,7 @@ class AccountRuntime:
                 'stopLevel':p.get('stopLevel'),
                 'profitLevel':p.get('profitLevel'),
                 'upl':p.get('upl'),
-                'currency':p.get('currency'),
+                'currency':cash_ccy or acct or 'GBP',
                 'bid':bid,
                 'ask':ask,
                 'mid':mid,

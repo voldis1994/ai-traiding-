@@ -1964,7 +1964,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
   if(!rows.length)return `<div class="empty">${esc(empty)}</div>`;
   return `<table class="data"><thead><tr>
     <th>Instruments</th><th>Klients</th><th>Virziens</th><th>Apjoms</th>
-    <th>Atvēršanas</th><th>Pašreizējā</th><th>Open £</th>
+    <th>Atvēršanas</th><th>Pašreizējā</th><th>Open</th>
   </tr></thead><tbody>${rows.map(r=>`<tr>
     <td><div class="inst"><span class="badge">${icon(instrumentIcon(r.epic))}</span>${esc(r.epic)}</div></td>
     <td>${esc(r.client)}</td>
@@ -2420,7 +2420,7 @@ function renderDeal(p,ccy,activity){
         <span>Mid <strong>${mid==null?'—':esc(num(mid,2))}</strong></span>
         <span>SL <strong>${slTxt}</strong></span>
         <span>TP <strong>${tpTxt}</strong></span>
-        <span>Open £ <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
+        <span>Open <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
       </div>
     </div>
     <div class="flags">

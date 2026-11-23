@@ -1502,6 +1502,7 @@ class SingleTradeEngine:
             raw_sl=p.get('stopLevel')
             if raw_sl is None:
                 raw_sl=p.get('stop')
+            # UPL settles in account £ — never stamp GOLD quote USD onto the card.
             out.append({'dealId':str(deal).strip(),
                 'epic':epic,
                 'instrument_name':self._extract_instrument_name(p,m),
@@ -1509,7 +1510,9 @@ class SingleTradeEngine:
                 'level':_broker_price_level(p.get('level'),p.get('level')),
                 'stopLevel':_broker_price_level(raw_sl),
                 'profitLevel':_broker_price_level(raw_tp),
-                'upl':p.get('upl'),'currency':p.get('currency'),'contractSize':p.get('contractSize')})
+                'upl':p.get('upl'),
+                'currency':self._cash_currency(p.get('currency')),
+                'contractSize':p.get('contractSize')})
         return out
 
     def _supersede_stale_open_orders(self,live_deal_id):

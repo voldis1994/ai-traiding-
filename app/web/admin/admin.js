@@ -581,21 +581,46 @@ function renderDeskStatusBoard(client){
   const cons=String((ds.flow_consensus&&ds.flow_consensus.consensus)||fc.consensus||'NEUTRAL').toUpperCase();
   const consCls=cons==='BUY'?'ok':(cons==='SELL'?'bad':'neu');
   const shadowNet=shadow.paper_net!=null?Number(shadow.paper_net):null;
+  const shadowTrades=Number(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0))||0;
   const shadowTxt=shadowNet==null?'—':((shadowNet>=0?'+':'')+num(shadowNet,2));
+  const lh=ds.learn_horizon||a.learn_horizon||{};
+  const edgeN=lh.edge_closes!=null?Number(lh.edge_closes):null;
+  // Headline: never flash bare library 0 when cards/closes are live.
+  const sampleHead=samples.display_n!=null?samples.display_n
+    :(samples.active_n!=null?samples.active_n
+      :(samples.library_samples!=null?samples.library_samples
+        :(samples.closed_trades!=null?samples.closed_trades:null)));
+  const sampleSub=[
+    samples.library_samples!=null?('lib '+samples.library_samples):null,
+    samples.active_n!=null?('cards '+samples.active_n):null,
+    samples.closed_trades!=null?('closes '+samples.closed_trades):null,
+    samples.source||null,
+  ].filter(Boolean).join(' · ')||'—';
+  const flowSub=(()=>{
+    if(fc.blocked)return 'BLOCKED';
+    if(fl.n!=null&&Number(fl.n)>0){
+      return 'learn n='+fl.n+' help '+(fl.helpful||0)+'/'+(fl.harmful||0);
+    }
+    if(edgeN!=null&&edgeN>0){
+      return 'edge £ '+edgeN+(lh.adapted_closes!=null?(' · knobs '+lh.adapted_closes):'');
+    }
+    return fl.n!=null?('learn n='+fl.n+' help '+(fl.helpful||0)+'/'+(fl.harmful||0)):'—';
+  })();
   const tiles=[
     {k:'CAN OPEN',v:can?'YES':'NO',cls:can?'ok':'bad',
       s:can?('Intent '+String(intent).slice(0,18)):String(block).slice(0,48)},
     {k:'NEURAL CLOSE',v:closeExec?'LIVE':'DIAG',cls:closeExec?'ok':'neu',
       s:'Intent '+String(exitIntent).slice(0,24)},
-    {k:'M1 FLOW',v:cons,cls:consCls,
-      s:(fc.blocked?'BLOCKED · ':'')+(fl.n!=null?('learn n='+fl.n+' help '+(fl.helpful||0)+'/'+(fl.harmful||0)):'—')},
+    {k:'M1 FLOW',v:cons,cls:consCls,s:flowSub},
     {k:'STRATEGY CARDS',v:String(cards.n!=null?cards.n:0),cls:(cards.n>0)?'ok':'neu',
       s:(cards.active&&cards.active.length)?cards.active.slice(0,3).join(', '):'none active'},
-    {k:'SHADOW £',v:shadowTxt,cls:shadowNet==null?'neu':(shadowNet>=0?'ok':'bad'),
-      s:'trades '+(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0))
-        +' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)},
-    {k:'SAMPLES',v:String(samples.library_samples!=null?samples.library_samples:'—'),cls:'neu',
-      s:(samples.source||'—')+' · cards '+(samples.active_n!=null?samples.active_n:'—')},
+    {k:'SHADOW £',v:shadowTxt,
+      cls:shadowNet==null?'neu':(shadowTrades===0?'neu':(shadowNet>=0?'ok':'bad')),
+      s:shadowTrades===0
+        ?'no shadow closes yet'
+        :('trades '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))},
+    {k:'SAMPLES',v:String(sampleHead!=null?sampleHead:'—'),
+      cls:(sampleHead!=null&&Number(sampleHead)>0)?'ok':'neu',s:sampleSub},
     {k:'SELF PARAMS',v:knobs.horizon!=null?('hz '+knobs.horizon):'—',cls:'neu',
       s:'nudge '+(knobs.flow_nudge!=null?Number(knobs.flow_nudge).toFixed(2):'—')
         +' · block '+(knobs.flow_block!=null?(Number(knobs.flow_block)?'on':'off'):'—')
@@ -620,14 +645,23 @@ function renderDeskLearn(client){
   const knobs=ds.knobs||{};
   const paying=(adapt.paying||[]).slice(0,4);
   const bleeding=(adapt.bleeding||[]).slice(0,4);
+  const lh=ds.learn_horizon||{};
+  const sampleShow=samples.display_n!=null?samples.display_n
+    :(samples.library_samples!=null&&Number(samples.library_samples)>0
+      ?samples.library_samples
+      :(samples.active_n!=null?samples.active_n
+        :(samples.closed_trades!=null?samples.closed_trades:0)));
   // Short labels — long ones mid-broke ("Libra/ry") in the bottom island.
   const rows=[
-    deskKv(client.id,'Cards',cards.n),
-    deskKv(client.id,'Samples',samples.library_samples),
+    deskKv(client.id,'Cards',cards.n!=null?cards.n:0),
+    deskKv(client.id,'Samples',sampleShow),
     deskKv(client.id,'Source',samples.source||'—'),
+    deskKv(client.id,'Closes',samples.closed_trades!=null?samples.closed_trades
+      :((client.results&&client.results.closed_trades)!=null?client.results.closed_trades:'—')),
+    deskKv(client.id,'Edge £',lh.edge_closes!=null?lh.edge_closes:'—'),
     deskKv(client.id,'Shadow £',shadow.paper_net,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'W/L',
-      (shadow.wins!=null||shadow.losses!=null)
+      (shadow.wins!=null||shadow.losses!=null||shadow.paper_net!=null)
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),

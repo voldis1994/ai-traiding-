@@ -89,6 +89,49 @@ def test_desk_samples_active_n_follows_strategy_cards():
         assert out['samples']['active_n'] == 5
         assert out['samples']['source'] == 'strategy_cards'
         assert out['samples']['library_samples'] == 1
+        assert out['samples']['display_n'] == 1  # library wins when >0
+
+
+def test_desk_samples_display_n_not_zero_when_cards_live():
+    """Bare library 0 must not headline the Samples tile while cards exist."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        from app import strategy_gen, sample_strategies
+        strategy_gen.save(store, {
+            'active_ids': ['GOLD|TREND_UP|BUY', 'OIL|BREAKOUT_UP|BUY'],
+        })
+        store.set(sample_strategies.STORE_FLAG, {
+            'done': False, 'library_samples': 0, 'trades': 0,
+            'source': None, 'active_n': 0,
+        })
+        store.upsert_trade({
+            'dealId': 'c1', 'epic': 'OIL_CRUDE', 'size': '0.1',
+            'direction': 'SELL', 'level': 83,
+        })
+        store.close_trade('c1', 82.8, -0.22, currency='EUR', source='upl_estimate')
+        hub = RuntimeHub.__new__(RuntimeHub)
+
+        class _RT:
+            pass
+
+        rt = _RT()
+        rt.store = store
+        # Stale snap shadow at 0 must lose to empty live journal (both 0 OK),
+        # but samples headline must not be 0.
+        out = hub._desk_system_payload(rt, snap={
+            'self_development': {
+                'shadow_paper': {
+                    'paper_net': 0.0, 'trades': 0, 'cash_trades': 0,
+                    'wins': 0, 'losses': 0,
+                },
+            },
+        })
+        assert out['cards']['n'] == 2
+        assert out['samples']['library_samples'] == 0
+        assert out['samples']['active_n'] == 2
+        assert out['samples']['closed_trades'] == 1
+        assert out['samples']['display_n'] == 2
+        assert out['samples']['display_n'] > 0
 
 
 def test_observe_close_hist_carries_desk_fields():

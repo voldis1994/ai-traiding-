@@ -93,6 +93,49 @@ def test_audit_hist_replaces_same_deal_id_on_funds_upgrade():
         same = [h for h in hist if str(h.get('deal_id') or '') == 'deal-dup']
         assert len(same) == 1
         assert same[0]['pnl'] == pytest.approx(-0.89)
+        assert same[0].get('unit') == 'account_currency'
+        # Scenario memory must count the trade once (not −0.81 then −0.89).
+        assert second.get('memory', {}).get('undone_prior') is True
+        bag = store.get(sma.SCENARIOS_KEY) or {}
+        fp = same[0].get('fingerprint')
+        row = bag.get(fp) if isinstance(bag.get(fp), dict) else {}
+        assert int(row.get('seen') or 0) == 1
+        assert int(row.get('mistake_hits') or 0) <= 1
+
+
+def test_working_pnl_prefers_24h_capital_window():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        now = datetime.now(timezone.utc)
+        # Old close outside 24h — must not dominate Desk vs Funds today.
+        store.upsert_trade({
+            'dealId': 'old', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 4000,
+        })
+        store.close_trade(
+            'old', 3990, -12.0, currency='GBP',
+            source='broker', overwrite=True)
+        store.db.execute(
+            'UPDATE trades SET closed=? WHERE deal_id=?',
+            ((now - timedelta(hours=48)).isoformat(), 'old'))
+        store.upsert_trade({
+            'dealId': 'today', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 4188,
+        })
+        store.close_trade(
+            'today', 4187, -0.89, currency='GBP',
+            source='broker', overwrite=True)
+        store.db.execute(
+            'UPDATE trades SET closed=? WHERE deal_id=?',
+            ((now - timedelta(minutes=5)).isoformat(), 'today'))
+        store.db.commit()
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        assert stats['realized_pnl'] == pytest.approx(-12.89)
+        assert stats['realized_pnl_24h'] == pytest.approx(-0.89)
+        assert stats['working_pnl'] == pytest.approx(-0.89)
+        assert stats['working_pnl_window'] == '24h'
+        assert stats['display_losses'] == 1
 
 
 def test_fingerprint_does_not_wait_on_news_peers():

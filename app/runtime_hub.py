@@ -383,15 +383,35 @@ class RuntimeHub:
         open_n=int(store.db.execute(
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
+        by_ccy_24h: dict[str,list[float]]={}
         signed=[]
+        signed_24h=[]
         estimate_signed=[]
+        estimate_signed_24h=[]
         recent=[]
         cash_n=0
+        cash_n_24h=0
         pending_n=0
         proxy_n=0
         estimate_n=0
         estimate_sum=0.0
+        estimate_sum_24h=0.0
         blank_n=0
+        from datetime import datetime, timezone, timedelta
+        cutoff_24h=datetime.now(timezone.utc)-timedelta(hours=24)
+
+        def _in_24h(closed_raw):
+            if not closed_raw:
+                return True  # unknown stamp — keep in window rather than drop
+            try:
+                raw=str(closed_raw).replace('Z','+00:00').replace(' ','T',1)
+                dt=datetime.fromisoformat(raw)
+                if dt.tzinfo is None:
+                    dt=dt.replace(tzinfo=timezone.utc)
+                return dt>=cutoff_24h
+            except Exception:
+                return True
+
         for t in closed_rows:
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
@@ -425,6 +445,11 @@ class RuntimeHub:
                     by_ccy.setdefault(ccy,[]).append(val)
                     if not acct or ccy==acct:
                         signed.append(val)
+                    if _in_24h(t.get('closed')):
+                        cash_n_24h+=1
+                        by_ccy_24h.setdefault(ccy,[]).append(val)
+                        if not acct or ccy==acct:
+                            signed_24h.append(val)
                     if len(recent)<12:
                         recent.append(row)
             elif kind=='pending':
@@ -444,6 +469,9 @@ class RuntimeHub:
                     estimate_n+=1
                     estimate_sum+=float(show)
                     estimate_signed.append(float(show))
+                    if _in_24h(t.get('closed')):
+                        estimate_sum_24h+=float(show)
+                        estimate_signed_24h.append(float(show))
                     row={**row,'pnl':round(float(show),4),'pnl_source':'upl_estimate',
                          'pending_cash':False}
                     if hint is not None:
@@ -460,6 +488,9 @@ class RuntimeHub:
                 estimate_n+=1
                 estimate_sum+=float(val)
                 estimate_signed.append(float(val))
+                if _in_24h(t.get('closed')):
+                    estimate_sum_24h+=float(val)
+                    estimate_signed_24h.append(float(val))
                 if len(recent)<12:
                     recent.append(row)
             elif kind=='other' or (kind=='cash' and val is None):
@@ -503,18 +534,43 @@ class RuntimeHub:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
-        # Operator display: Capital £ only. ≈UPL stays in estimate_* — never
-        # invent Kopējais / equity from provisional closes (Admin vs app lie).
-        if realized is not None and cash_n>0:
+        # 24h Capital Funds window — matches phone Closed Positions better than
+        # all-time SQLite sum (that made Desk −13 look unlike Funds today).
+        realized_24h=None
+        if signed_24h:
+            realized_24h=round(sum(signed_24h),4)
+        elif by_ccy_24h:
+            if acct and acct in by_ccy_24h:
+                realized_24h=round(sum(by_ccy_24h[acct]),4)
+            elif len(by_ccy_24h)==1:
+                realized_24h=round(sum(next(iter(by_ccy_24h.values()))),4)
+        wins_24h=sum(1 for p in signed_24h if p>0)
+        losses_24h=sum(1 for p in signed_24h if p<0)
+        # Operator display: prefer 24h Capital £ (Funds window). ≈UPL stays in
+        # estimate_* — never invent Kopējais from provisional closes.
+        if realized_24h is not None and cash_n_24h>0:
+            working_pnl=realized_24h
+            working_pnl_source='broker'
+            working_pnl_window='24h'
+        elif realized is not None and cash_n>0:
             working_pnl=realized
             working_pnl_source='broker'
+            working_pnl_window='all'
+        elif estimate_signed_24h:
+            working_pnl=None
+            working_pnl_source='upl_estimate'
+            working_pnl_window='24h'
         elif estimate_n>0:
             working_pnl=None
             working_pnl_source='upl_estimate'
+            working_pnl_window='all'
         else:
             working_pnl=None
             working_pnl_source=('none' if closed_n else 'empty')
-        if cash_n>0:
+            working_pnl_window=None
+        if cash_n_24h>0:
+            display_wins,display_losses,wl_source=wins_24h,losses_24h,'broker'
+        elif cash_n>0:
             display_wins,display_losses,wl_source=wins,losses,'broker'
         else:
             # Do not advertise estimate W/L as robot results.
@@ -589,14 +645,21 @@ class RuntimeHub:
             'blank_pnl_trades':blank_n,
             'pnl_status':pnl_status,
             'realized_pnl':realized,
+            'realized_pnl_24h':realized_24h,
+            'cash_trades_24h':cash_n_24h,
+            'estimate_pnl_24h':(
+                round(estimate_sum_24h,4) if estimate_signed_24h else None),
             'working_pnl':working_pnl,
             'working_pnl_source':working_pnl_source,
+            'working_pnl_window':working_pnl_window,
             'open_upl':upl,
             'equity_pnl':equity,
             'pnl_currency':primary['currency'] if primary else acct,
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
+            'wins_24h':wins_24h,
+            'losses_24h':losses_24h,
             'display_wins':display_wins,
             'display_losses':display_losses,
             'wl_source':wl_source,
@@ -668,7 +731,7 @@ class RuntimeHub:
                 # restore, so SHADOW is not stuck at 0/0 while CLIENT CLOSES has £.
                 if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
                     try:
-                        eng._backfill_mistake_audits_from_journal(limit=160, hours=24)
+                        eng._backfill_mistake_audits_from_journal(limit=400, hours=24)
                     except Exception:
                         pass
                 # Kick Funds→Desk £ mirror so phone −0.89 overwrites stale −0.81
@@ -967,7 +1030,7 @@ class RuntimeHub:
                         eng_ma, '_backfill_mistake_audits_from_journal'):
                     try:
                         eng_ma._backfill_mistake_audits_from_journal(
-                            limit=160, hours=24)
+                            limit=400, hours=24)
                     except Exception:
                         pass
                 mistake_audit = sma.lab_payload(store)

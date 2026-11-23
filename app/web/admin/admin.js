@@ -239,9 +239,12 @@ function scoreboard(r){
   const wsrc=String(r.working_pnl_source||'').toLowerCase();
   const estN=Number(r.estimate_trades)||0;
 
-  // 1) Settled Capital cash (Funds / broker journal).
+  // 1) Settled Capital cash — prefer 24h Funds window over all-time SQLite.
   if(hasRealWorkingPnl(r) && wsrc==='broker'){
     pnl=Number(r.working_pnl);src='broker';
+  }else if(r.realized_pnl_24h!=null && Number.isFinite(Number(r.realized_pnl_24h))
+      && (Number(r.cash_trades_24h)||0)>0){
+    pnl=Number(r.realized_pnl_24h);src='broker';
   }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
     pnl=Number(r.realized_pnl);src='broker';
   }

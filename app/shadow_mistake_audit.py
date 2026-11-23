@@ -300,14 +300,66 @@ def _scenario_bag(store) -> dict:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def scenario_memory_save(store, diagnosis: dict) -> dict:
-    """Persist fingerprint counts + last mistake for promote / ready gates."""
+def _scenario_memory_undo(store, prior: dict) -> bool:
+    """Reverse one prior observation so Funds £ re-audit does not double-count."""
+    if store is None or not isinstance(prior, dict):
+        return False
+    fp = str(prior.get('fingerprint') or '')
+    if not fp:
+        return False
+    bag = _scenario_bag(store)
+    row = dict(bag.get(fp) or {})
+    if not row:
+        return False
+    row['seen'] = max(0, int(row.get('seen') or 0) - 1)
+    mistakes = list(prior.get('mistakes') or [])
+    if mistakes:
+        row['mistake_hits'] = max(0, int(row.get('mistake_hits') or 0) - 1)
+        key = '+'.join(sorted(mistakes))
+        counts = dict(row.get('mistake_counts') or {})
+        counts[key] = max(0, int(counts.get(key) or 0) - 1)
+        if counts[key] <= 0:
+            counts.pop(key, None)
+        row['mistake_counts'] = counts
+    try:
+        prior_pnl = float(prior.get('pnl'))
+    except (TypeError, ValueError):
+        prior_pnl = None
+    if prior_pnl is not None:
+        if prior_pnl > 0.02:
+            row['wins'] = max(0, int(row.get('wins') or 0) - 1)
+            if row.get('fix_committed'):
+                row['wins_after_fix'] = max(
+                    0, int(row.get('wins_after_fix') or 0) - 1)
+        elif prior_pnl < -0.02 or mistakes:
+            row['losses'] = max(0, int(row.get('losses') or 0) - 1)
+    deal_s = str(prior.get('deal_id') or '')
+    if deal_s:
+        row['deal_ids'] = [d for d in (row.get('deal_ids') or [])
+                           if str(d) != deal_s]
+    row['updated_at'] = _now_iso()
+    bag[fp] = row
+    store.set(SCENARIOS_KEY, bag)
+    return True
+
+
+def scenario_memory_save(store, diagnosis: dict, *, deal_id=None,
+                         prior=None) -> dict:
+    """Persist fingerprint counts + last mistake for promote / ready gates.
+
+    When the same ``deal_id`` is re-audited (Funds −0.81 → −0.89), undo the
+    prior observation first so ``seen`` / ``mistake_hits`` / promote counters
+    count each Capital trade once.
+    """
     if store is None or not isinstance(diagnosis, dict) or not diagnosis.get('audited'):
         return {'saved': False}
     ctx = diagnosis.get('context') if isinstance(diagnosis.get('context'), dict) else {}
     fp = str(ctx.get('fingerprint') or '')
     if not fp:
         return {'saved': False, 'reason': 'no_fingerprint'}
+    undone = False
+    if prior and deal_id and str(prior.get('deal_id') or '') == str(deal_id):
+        undone = _scenario_memory_undo(store, prior)
     bag = _scenario_bag(store)
     row = dict(bag.get(fp) or {})
     row['fingerprint'] = fp
@@ -333,8 +385,14 @@ def scenario_memory_save(store, diagnosis: dict) -> dict:
             row['wins_after_fix'] = int(row.get('wins_after_fix') or 0) + 1
     if diagnosis.get('hurt'):
         row['losses'] = int(row.get('losses') or 0) + 1
+    deal_s = str(deal_id) if deal_id is not None else ''
+    if deal_s:
+        ids = [str(d) for d in (row.get('deal_ids') or []) if str(d) != deal_s]
+        ids.append(deal_s)
+        row['deal_ids'] = ids[-40:]
     row['last_pnl'] = diagnosis.get('pnl')
     row['last_source'] = diagnosis.get('source')
+    row['last_deal_id'] = deal_s or row.get('last_deal_id')
     row['updated_at'] = _now_iso()
     bag[fp] = row
     # Cap memory size.
@@ -345,7 +403,8 @@ def scenario_memory_save(store, diagnosis: dict) -> dict:
             reverse=True)
         bag = dict(ordered[:80])
     store.set(SCENARIOS_KEY, bag)
-    return {'saved': True, 'fingerprint': fp, 'seen': row['seen'], 'row': row}
+    return {'saved': True, 'fingerprint': fp, 'seen': row['seen'],
+            'row': row, 'undone_prior': undone}
 
 
 def promote_gate(store, fingerprint: str, mistakes, *, n=PROMOTE_N) -> dict:
@@ -483,6 +542,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
              mid=None, entry=None, exit=None, exit_reason=None,
              source='shadow', deal_id=None,
+             unit=None, currency=None, paper_pnl=None, price_pnl=None,
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -493,7 +553,32 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if not diagnosis.get('audited'):
         return diagnosis
 
-    mem = scenario_memory_save(store, diagnosis)
+    # LIVE / Funds cash is account currency; shadow may pass explicit unit.
+    src_l = str(source or '').lower()
+    unit_s = str(unit or '').strip() or None
+    if unit_s not in ('price', 'account_currency', None):
+        unit_s = None
+    if unit_s is None and (src_l.startswith('live') or src_l in (
+            'broker', 'funds', 'capital', 'live_backfill', 'live_funds_mirror')):
+        unit_s = 'account_currency'
+    ccy_s = (str(currency).strip().upper() if currency else None) or None
+    paper_n = _finite(paper_pnl)
+    price_n = _finite(price_pnl)
+    if unit_s == 'account_currency' and paper_n is None:
+        paper_n = _finite(pnl)
+    if unit_s == 'price' and price_n is None:
+        price_n = _finite(pnl)
+
+    prior = None
+    deal_s = str(deal_id) if deal_id is not None else ''
+    if store is not None and deal_s:
+        for h in (store.get(HIST_KEY) or []):
+            if isinstance(h, dict) and str(h.get('deal_id') or '') == deal_s:
+                prior = h
+                break
+
+    mem = scenario_memory_save(
+        store, diagnosis, deal_id=deal_id, prior=prior)
     gate = {'ready': False}
     commit_result = {'applied': False, 'pending': False}
     if diagnosis.get('mistakes') and diagnosis.get('proposed_fix'):
@@ -515,7 +600,11 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
         'fix': commit_result,
         'ready_for_live': ready,
         'at': _now_iso(),
-        'deal_id': str(deal_id) if deal_id is not None else None,
+        'deal_id': deal_s or None,
+        'unit': unit_s,
+        'currency': ccy_s,
+        'paper_pnl': paper_n,
+        'price_pnl': price_n,
     }
     if store is not None:
         hist = list(store.get(HIST_KEY) or [])
@@ -535,16 +624,19 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'committed': bool(commit_result.get('applied')),
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
-            'deal_id': str(deal_id) if deal_id is not None else None,
+            'deal_id': deal_s or None,
+            'unit': unit_s,
+            'currency': ccy_s,
+            'paper_pnl': paper_n,
+            'price_pnl': price_n,
         }
         # Re-audit after Funds £ correction must REPLACE the prior row for this
         # deal — otherwise hist doubles and scenario repeat counters inflate.
-        deal_s = str(deal_id) if deal_id is not None else ''
         if deal_s:
             hist = [h for h in hist
                     if not (isinstance(h, dict) and str(h.get('deal_id') or '') == deal_s)]
         hist.append(entry_row)
-        store.set(HIST_KEY, hist[-120:])  # ~24h of closes for analysis
+        store.set(HIST_KEY, hist[-200:])  # keep more than a dense 24h book
         store.set(LAST_KEY, {
             'at': out['at'],
             'source': source,
@@ -564,6 +656,11 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
             'ready_for_live': bool(ready),
+            'deal_id': deal_s or None,
+            'unit': unit_s,
+            'currency': ccy_s,
+            'paper_pnl': paper_n,
+            'price_pnl': price_n,
         })
         if diagnosis.get('mistakes'):
             store.event('shadow_mistake_audit', 'Mistake diagnosed', {
@@ -574,6 +671,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
                 'promote': gate.get('count'),
                 'need': gate.get('need'),
                 'committed': bool(commit_result.get('applied')),
+                'deal_id': deal_s or None,
             })
     return out
 

@@ -4809,6 +4809,10 @@ class SingleTradeEngine:
                   or (self.mandate or {}).get('epic')
                   or getattr(self.brain,'epic',None))
             candles=self._decision_candles(epic,n=80) if epic else []
+            ccy=(self._cash_currency(
+                    (saved or {}).get('pnl_currency') if isinstance(saved,dict)
+                    else None)
+                 or self._account_currency())
             out=sma.on_close(
                 self.store,
                 pnl=pnl_n,spread=_num((saved or {}).get('entry_spread')) or 0.,
@@ -4822,6 +4826,9 @@ class SingleTradeEngine:
                     _num(saved.get('entry')) if isinstance(saved,dict) else None),
                 source=source,
                 deal_id=deal_id,
+                unit='account_currency',
+                currency=ccy,
+                paper_pnl=pnl_n,
                 apply_ohlc_penalties=False,
             )
             if out and out.get('audited'):
@@ -4836,7 +4843,7 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=160,hours=24):
+    def _backfill_mistake_audits_from_journal(self,*,limit=400,hours=24):
         """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
 
         Analysis needs both sides — skipping wins left the cycle blind to what

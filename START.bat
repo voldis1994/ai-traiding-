@@ -11,7 +11,11 @@ echo  URL after start:  http://127.0.0.1:8765/admin
 echo  Desk UI:          http://127.0.0.1:8765/desk
 echo  Leave this window OPEN while the robot runs.
 echo  After git pull you MUST close the old window / restart here
-echo  or Desk keeps serving the old process (stale -0.81 / UNMAPPED).
+echo  or Desk keeps serving the old process (stale login / zeros).
+echo.
+echo  Pull latest before start (recommended):
+echo    git checkout main
+echo    git pull origin main
 echo.
 
 if not exist "launcher.py" goto bad_folder
@@ -23,6 +27,10 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8765" ^| findstr "LISTENING
   echo [INFO] Stopping stale process on :8765 PID %%P
   taskkill /F /PID %%P >nul 2>&1
 )
+
+REM Local Desk: no Secure cookies / no production cookie mode.
+set "NTA_SECURE_COOKIES=0"
+set "NTA_PRODUCTION="
 
 REM Open browser shortly after server boot (backup if auto-open fails)
 start "" cmd /c "timeout /t 8 /nobreak >nul & start http://127.0.0.1:8765/admin"

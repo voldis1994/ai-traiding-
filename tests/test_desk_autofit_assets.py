@@ -27,12 +27,24 @@ def test_autofit_js_api():
     assert "'--desk-fs'" in JS
     assert "'--desk-col-intel'" in JS
     assert "'--desk-grid-r1'" in JS
+    assert 'bottomMin' in JS
     # Forbidden whole-app shrink APIs must not be applied by autofit.
     assert 'style.zoom' not in JS
     assert 'transform:scale' not in JS
     assert 'style.transform' not in JS
 
 
+def test_bottom_island_readable_markup():
+    """LEARN/CLOSES must not mid-break labels or clip side text."""
+    assert "deskKv(client.id,'Cards'" in JS
+    assert "deskKv(client.id,'Samples'" in JS
+    assert 'wh-top' in JS and 'wh-bot' in JS
+    assert 'grid-template-columns:1fr' in CSS or 'grid-template-columns:1fr;' in CSS.replace(' ','')
+    assert '.psx-learn-kv{display:grid;grid-template-columns:1fr' in CSS
+    assert 'overflow-wrap:anywhere' not in CSS.split('.psx-learn-kv')[1].split('.psx-ind')[0]
+    assert 'flex-direction:column' in CSS.split('.psx-whale-row')[1].split('.psx-pnl-src')[0]
+
+
 def test_cache_bust_mentions_new_assets():
-    assert 'admin.css?v=124' in HTML
-    assert 'admin.js?v=130' in HTML
+    assert 'admin.css?v=125' in HTML
+    assert 'admin.js?v=131' in HTML

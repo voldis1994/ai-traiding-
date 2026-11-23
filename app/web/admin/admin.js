@@ -377,9 +377,14 @@ function renderShadowLab(client){
       +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
       +(lab.shadow_active?' · shadow neural <b>ON</b>':' · shadow neural <b>off / booting</b>'));
   }
-  const net=paper.paper_net!=null?Number(paper.paper_net):null;
+  const paperUnit=String(paper.unit||'account_currency');
+  const net=paper.display_net!=null?Number(paper.display_net)
+    :(paper.paper_net!=null?Number(paper.paper_net):null);
   const netCls=net==null?'neu':(net>=0?'ok':'bad');
-  const netTxt=net==null?'—':((net>=0?'+':'')+num(net,2));
+  const netTxt=net==null?'—'
+    :((net>=0?'+':'')+num(net,2)+(paperUnit==='price'?' pts':''));
+  const paperTrades=paper.display_trades!=null?paper.display_trades
+    :(paper.cash_trades!=null?paper.cash_trades:(paper.trades||0));
   const open=paper.open&&typeof paper.open==='object'?paper.open:null;
   const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
   const recent=Array.isArray(paper.recent)?paper.recent:[];
@@ -389,9 +394,11 @@ function renderShadowLab(client){
   const rowsHtml=recent.length?recent.map(r=>{
     const dir=String(r.direction||'?').toUpperCase();
     const dcls=(dir==='BUY'||dir==='LONG')?'buy':'sell';
-    const pnl=r.paper_pnl!=null?Number(r.paper_pnl):null;
+    let pnl=r.paper_pnl!=null?Number(r.paper_pnl):null;
+    let unitTag='';
+    if(pnl==null&&r.price_pnl!=null){pnl=Number(r.price_pnl);unitTag=' pts';}
     const pcls=pnl==null?'':(pnl>=0?'ok':'bad');
-    const pnlTxt=pnl==null?'—':((pnl>=0?'+':'')+num(pnl,2));
+    const pnlTxt=pnl==null?'—':((pnl>=0?'+':'')+num(pnl,2)+unitTag);
     const when=r.at?String(r.at).replace('T',' ').slice(0,16):'—';
     return `<div class="shadow-row">
       <span class="dir ${dcls}">${dir==='BUY'||dir==='LONG'?'▲ BUY':'▼ SELL'}</span>
@@ -505,15 +512,18 @@ function renderShadowLab(client){
       </div>
     </article>
     <article class="shadow-card">
-      <div class="psx-h"><h2>PAPER BOOK</h2><span class="psx-src">SHADOW £</span></div>
+      <div class="psx-h"><h2>PAPER BOOK</h2><span class="psx-src">${paperUnit==='price'?'PRICE PTS':'SHADOW £'}</span></div>
       <div class="body">
         <div class="shadow-kv">
-          ${_shadowKv('Paper £',netTxt,netCls)}
-          ${_shadowKv('Cash trades',paper.cash_trades!=null?paper.cash_trades:(paper.trades||0))}
+          ${_shadowKv(paperUnit==='price'?'Paper pts':'Paper £',netTxt,netCls)}
+          ${_shadowKv('Closes',paperTrades)}
           ${_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)}
           ${_shadowKv('Open',openTxt)}
         </div>
-        <div class="shadow-note">Paper SL/TP only — Capital LIVE minuses are CLIENT CLOSES + MISTAKE AUDIT, not this £0.</div>
+        <div class="shadow-note">${esc(
+          paperUnit==='price'
+            ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
+            :('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT'))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -845,9 +855,13 @@ function renderDeskStatusBoard(client){
   const exitIntent=ds.neural_exit_intent||a.neural_exit_intent||'—';
   const cons=String((ds.flow_consensus&&ds.flow_consensus.consensus)||fc.consensus||'NEUTRAL').toUpperCase();
   const consCls=cons==='BUY'?'ok':(cons==='SELL'?'bad':'neu');
-  const shadowNet=shadow.paper_net!=null?Number(shadow.paper_net):null;
-  const shadowTrades=Number(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0))||0;
-  const shadowTxt=shadowNet==null?'—':((shadowNet>=0?'+':'')+num(shadowNet,2));
+  const shadowUnit=String(shadow.unit||'account_currency');
+  const shadowNet=shadow.display_net!=null?Number(shadow.display_net)
+    :(shadow.paper_net!=null?Number(shadow.paper_net):null);
+  const shadowTrades=Number(shadow.display_trades!=null?shadow.display_trades
+    :(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0)))||0;
+  const shadowTxt=shadowNet==null?'—'
+    :((shadowNet>=0?'+':'')+num(shadowNet,2)+(shadowUnit==='price'?' pts':''));
   const results=client.results||{};
   const liveClosed=Number(results.closed_trades!=null?results.closed_trades
     :(samples.closed_trades!=null?samples.closed_trades:0))||0;
@@ -885,7 +899,9 @@ function renderDeskStatusBoard(client){
   const shadowSub=(()=>{
     const paperBit=shadowTrades===0
       ?'paper 0 closes'
-      :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0));
+      :(shadowUnit==='price'
+        ?('paper '+shadowTrades+' pts · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))
+        :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)));
     if(liveClosed>0){
       const liveBit='LIVE '+liveClosed
         +(liveLosses||liveWins?(' · W'+liveWins+'/L'+liveLosses):'')

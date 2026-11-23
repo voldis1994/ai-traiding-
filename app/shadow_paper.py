@@ -50,19 +50,23 @@ def _close_price_pnl(direction, entry, exit_px):
     return float(sign*(exit_px-entry))
 
 
-def cash_per_price_unit(live_rows, *, min_samples=5):
+def cash_per_price_unit(live_rows, *, min_samples=3):
     """Median broker-£ per unit price move from LIVE closed trades.
 
-    Uses actual_pnl / signed(exit-entry). Captures size + FX into account
-    currency without inventing tick_value. Returns None if under-powered.
+    Uses actual_pnl (or pnl) / signed(exit-entry). Captures size + FX into
+    account currency without inventing tick_value. Returns None if under-powered.
     """
     ratios=[]
     for r in live_rows or []:
+        if not isinstance(r,dict):continue
         pnl=_finite(r.get('actual_pnl'))
+        if pnl is None:pnl=_finite(r.get('pnl'))
         entry=_finite(r.get('entry'));exit_px=_finite(r.get('exit'))
         direction=r.get('direction')
         if pnl is None or entry is None or exit_px is None:continue
         if direction not in ('BUY','SELL'):continue
+        # Skip zero-poison broker rows — they destroy the £/price scale.
+        if abs(pnl)<1e-12:continue
         sign=1 if direction=='BUY' else -1
         move=sign*(exit_px-entry)
         if abs(move)<1e-12:continue
@@ -321,13 +325,53 @@ class ShadowPaperJournal:
             'last_bar':self.last_bar,'cash_scale':self.cash_scale,
             'bars_seen':self.bars_seen})
 
-    def update_cash_scale(self, live_rows, *, min_samples=5):
-        """Refresh £/price-unit from LIVE broker history when possible."""
+    def update_cash_scale(self, live_rows, *, min_samples=3):
+        """Refresh £/price-unit from LIVE broker history when possible.
+
+        Also backfills cash on price-only paper closes so PAPER BOOK no longer
+        shows £0 while RECENT PAPER CLOSES already lists SL/TP rows.
+        """
         scale=cash_per_price_unit(live_rows,min_samples=min_samples)
-        if scale is not None and math.isfinite(scale):
+        if scale is None and self.store is not None:
+            # Fallback: journal broker cash closes (profit_learning may lag).
+            try:
+                rows=self.store.trades(80)
+            except Exception:
+                rows=[]
+            live=[]
+            for r in rows or []:
+                if not isinstance(r,dict) or not r.get('closed'):continue
+                if str(r.get('pnl_source') or '')!='broker':continue
+                live.append({
+                    'actual_pnl':r.get('pnl'),'entry':r.get('entry'),
+                    'exit':r.get('exit'),'direction':r.get('direction'),
+                })
+            scale=cash_per_price_unit(live,min_samples=min_samples)
+        if scale is not None and math.isfinite(scale) and abs(float(scale))>1e-12:
+            prev=self.cash_scale
             self.cash_scale=float(scale)
-            self._persist()
+            n=self._revalue_price_rows()
+            # Persist only when scale or row cash changed — desk polls often.
+            if n or prev!=self.cash_scale:
+                self._persist()
         return self.cash_scale
+
+    def _revalue_price_rows(self):
+        """Apply cash_scale to history rows stuck in price units."""
+        scale=_finite(self.cash_scale)
+        if scale is None or abs(scale)<1e-12:return 0
+        n=0
+        for r in self.history:
+            if not isinstance(r,dict):continue
+            if r.get('unit')=='account_currency' and r.get('paper_pnl') is not None:
+                continue
+            pp=_finite(r.get('price_pnl'))
+            if pp is None:continue
+            r['paper_pnl']=float(pp*scale)
+            r['cash_scale']=float(scale)
+            r['unit']='account_currency'
+            n+=1
+        return n
 
     def _close_row(self, pos, exit_px, *, bar_time, spread, reason):
         direction=pos['direction']
@@ -490,16 +534,40 @@ class ShadowPaperJournal:
 
     def summary(self):
         pnls=self.paper_cash_pnls()
+        price_pnls=[]
+        for r in self.history:
+            if not isinstance(r,dict):continue
+            if r.get('unit')=='account_currency':continue
+            pp=_finite(r.get('price_pnl'))
+            if pp is not None:price_pnls.append(float(pp))
+        cash_net=float(sum(pnls)) if pnls else 0.
+        price_net=float(sum(price_pnls)) if price_pnls else 0.
+        # Prefer cash £ when available; otherwise show price-unit truth (not fake 0).
+        if pnls:
+            display_net,display_trades,display_unit=cash_net,len(pnls),'account_currency'
+            wins=sum(1 for x in pnls if x>0)
+            losses=sum(1 for x in pnls if x<0)
+        elif price_pnls:
+            display_net,display_trades,display_unit=price_net,len(price_pnls),'price'
+            wins=sum(1 for x in price_pnls if x>0)
+            losses=sum(1 for x in price_pnls if x<0)
+        else:
+            display_net,display_trades,display_unit=0.,0,'account_currency'
+            wins=losses=0
         return {
             'trades':len(self.history),
             'cash_trades':len(pnls),
+            'price_trades':len(price_pnls),
             'open':self.position is not None,
             'position':self.position,
             'pending':self.pending,
             'cash_scale':self.cash_scale,
-            'paper_net':float(sum(pnls)) if pnls else 0.,
-            'wins':sum(1 for x in pnls if x>0),
-            'losses':sum(1 for x in pnls if x<0),
-            'unit':'account_currency',
+            'paper_net':cash_net if pnls else (display_net if price_pnls else 0.),
+            'price_net':price_net,
+            'display_net':display_net,
+            'display_trades':display_trades,
+            'wins':wins,
+            'losses':losses,
+            'unit':display_unit,
             'exit_mode':'sl_tp_only',
         }

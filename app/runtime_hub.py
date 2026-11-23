@@ -642,17 +642,34 @@ class RuntimeHub:
             if store is not None:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
+                    try:
+                        # Re-scale price-only paper closes from LIVE broker £.
+                        live = getattr(
+                            getattr(eng, 'profit_learning', None), 'history', None) or []
+                        eng.shadow_paper.update_cash_scale(live)
+                    except Exception:
+                        pass
                     sp_live = eng.shadow_paper.summary()
                 else:
                     from .shadow_paper import ShadowPaperJournal
-                    sp_live = ShadowPaperJournal(store).summary()
+                    jp = ShadowPaperJournal(store)
+                    try:
+                        jp.update_cash_scale([])
+                    except Exception:
+                        pass
+                    sp_live = jp.summary()
             def _shadow_richer(a, b):
                 if not isinstance(a, dict):
                     return b if isinstance(b, dict) else {}
                 if not isinstance(b, dict):
                     return a
                 # Prefer the journal that actually has closes — snap can be a stale 0.
-                score = lambda d: int(d.get('cash_trades') or 0) * 10 + int(d.get('trades') or 0)
+                # Price-only paper closes (no £ scale yet) still beat a blank snap.
+                def score(d):
+                    cash = int(d.get('cash_trades') or 0)
+                    price = int(d.get('price_trades') or 0)
+                    trades = int(d.get('display_trades') or d.get('trades') or 0)
+                    return cash * 100 + price * 10 + trades
                 return b if score(b) > score(a) else a
             out['shadow'] = _shadow_richer(sp_snap, sp_live)
         except Exception as exc:
@@ -768,6 +785,8 @@ class RuntimeHub:
                         'entry': row.get('entry'),
                         'exit': row.get('exit'),
                         'paper_pnl': row.get('paper_pnl'),
+                        'price_pnl': row.get('price_pnl'),
+                        'unit': row.get('unit'),
                         'exit_reason': row.get('exit_reason'),
                     })
                     if len(recent) >= 12:
@@ -864,12 +883,13 @@ class RuntimeHub:
                 mistake_audit = {'ok': False}
         cash_n = int(paper.get('cash_trades') or 0)
         trades_n = int(paper.get('trades') or 0)
+        price_n = int(paper.get('price_trades') or paper.get('display_trades') or 0)
         pulse = 'IDLE'
         if open_pos or pending:
             pulse = 'OPEN'
         elif (mistake_audit.get('last') or {}).get('mistakes'):
             pulse = 'LEARNING'
-        elif cash_n or trades_n:
+        elif cash_n or trades_n or price_n:
             pulse = 'LEARNING'
         elif shadow_on and running:
             pulse = 'WATCHING'

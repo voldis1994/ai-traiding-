@@ -4381,14 +4381,226 @@ class SingleTradeEngine:
             # Exact openLevel≈entry is decisive even among many GOLD micros.
             # Without this, harvest stayed on ≈UPL forever (Admin ≠ Capital app).
             if best[0] > -900.0:
-                self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
-                                 {'deal_id':deal,'candidates':len(hits),
-                                  'best_score':best[0],'second_score':hits[1][0]})
-                return None
+                # Time-decided: closest close within 30m wins even among micros.
+                b_ts=best[4];s_ts=hits[1][4]
+                time_ok=(target_ts is not None and b_ts is not None
+                         and abs(b_ts-target_ts)<=30*60
+                         and (s_ts is None
+                              or abs(s_ts-target_ts)>abs(b_ts-target_ts)+5*60))
+                if not time_ok:
+                    self.store.event('warning','Fuzzy P&L ambiguous; waiting for clearer Capital row',
+                                     {'deal_id':deal,'candidates':len(hits),
+                                      'best_score':best[0],'second_score':hits[1][0]})
+                    return None
         _score,pnl,ccy,fp,_ts=best
         if fp:
             self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
         return pnl,ccy
+
+    def _tx_epic_guess(self,tx):
+        blob=' '.join(str(tx.get(k) or '') for k in
+                      ('instrumentName','marketName','epic','description','note')).upper()
+        if 'GOLD' in blob or 'XAU' in blob:return 'GOLD'
+        if 'OIL' in blob or 'BRENT' in blob or 'WTI' in blob:return 'OIL_CRUDE'
+        epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
+        return str(epic) if epic else 'GOLD'
+
+    def _tx_direction_guess(self,tx):
+        """Close TRADE size sign → original open direction (Capital flips on close)."""
+        raw=tx.get('size') if tx.get('size') not in (None,'') else tx.get('quantity')
+        try:
+            sz=float(str(raw).replace(',',''))
+        except (TypeError,ValueError):
+            return None
+        if not math.isfinite(sz) or abs(sz)<1e-12:
+            return None
+        # Closing a BUY often shows negative size (sell to close).
+        return 'BUY' if sz<0 else 'SELL'
+
+    async def _mirror_capital_funds_closes(self):
+        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (last 24h).
+
+        1) Upgrade unsettled journal deals with matched Capital cash.
+        2) Insert orphan ``cap:{fp}`` closes so Funds rows never vanish from Desk
+           when OPEN upsert / dealId matching missed entirely.
+        """
+        if not self.broker or not hasattr(self.broker,'transactions'):
+            return 0
+        try:
+            payload=await self.broker.transactions(last_period=86400,tx_type='TRADE')
+        except Exception as exc:
+            self.store.event('warning','Capital Funds mirror fetch failed',
+                             {'type':type(exc).__name__})
+            return 0
+        rows=list(payload.get('transactions') or [])
+        if not rows:
+            return 0
+        consumed=self._fuzzy_tx_consumed()
+        ccy_default=self._account_currency() or 'GBP'
+        upgraded=0
+        inserted=0
+        for tx in rows:
+            if not isinstance(tx,dict):
+                continue
+            pnl=self._row_cash_pnl(tx)
+            if pnl is None or not math.isfinite(pnl) or abs(float(pnl))<1e-12:
+                continue
+            fp=self._tx_fingerprint(tx)
+            if not fp:
+                continue
+            # Already bound to a journal deal → skip insert; still may upgrade.
+            bound_deal=None
+            for key in ('dealId','dealReference','reference','transactionId'):
+                ref=str(tx.get(key) or '')
+                if not ref:continue
+                try:
+                    hit=self.store.db.execute(
+                        'SELECT deal_id,pnl_source FROM trades WHERE deal_id=? '
+                        'OR deal_id LIKE ? LIMIT 1',
+                        (ref,'%'+ref+'%')).fetchone()
+                except Exception:
+                    hit=None
+                if hit:
+                    bound_deal=str(hit[0]);break
+            if bound_deal:
+                try:
+                    row=self.store.db.execute(
+                        'SELECT pnl_source,pnl,closed FROM trades WHERE deal_id=?',
+                        (bound_deal,)).fetchone()
+                except Exception:
+                    row=None
+                src=str((row or [None])[0] or '')
+                if src!='broker':
+                    ccy=self._cash_currency(tx.get('currency')) or ccy_default
+                    exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+                    self.store.close_trade(
+                        bound_deal,exit_lvl,float(pnl),currency=ccy,
+                        source='broker',overwrite=True,
+                        epic=self._tx_epic_guess(tx),
+                        direction=self._tx_direction_guess(tx),
+                        entry=_num(tx.get('openLevel') or tx.get('open_level')),
+                        size=tx.get('size') or tx.get('quantity'))
+                    self._bank_broker_cash_side_effects(
+                        bound_deal,float(pnl),currency=ccy,
+                        action=self._tx_direction_guess(tx),source='broker')
+                    if fp:
+                        self._mark_fuzzy_tx_consumed(fp,deal_id=bound_deal)
+                    upgraded+=1
+                    self._run_mistake_audit_close(
+                        bound_deal,pnl=float(pnl),
+                        direction=self._tx_direction_guess(tx),
+                        entry=_num(tx.get('openLevel') or tx.get('open_level')),
+                        source='live_funds_mirror')
+                continue
+            if fp in consumed:
+                continue
+            # Orphan Capital Funds close — journal so Desk matches the phone app.
+            deal='cap:'+fp.replace(':','_')[:48]
+            try:
+                exists=self.store.db.execute(
+                    'SELECT 1 FROM trades WHERE deal_id=? LIMIT 1',(deal,)).fetchone()
+            except Exception:
+                exists=None
+            if exists:
+                if fp not in consumed:
+                    self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
+                continue
+            ccy=self._cash_currency(tx.get('currency')) or ccy_default
+            epic=self._tx_epic_guess(tx)
+            direction=self._tx_direction_guess(tx)
+            entry=_num(tx.get('openLevel') or tx.get('open_level'))
+            exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+            closed_at=(tx.get('dateUtc') or tx.get('dateUTC') or tx.get('date')
+                       or now())
+            self.store.db.execute(
+                'INSERT OR REPLACE INTO trades('
+                'deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
+                'pnl_currency,pnl_source) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                (deal,epic,
+                 str(tx.get('size') or tx.get('quantity') or ''),
+                 direction,str(closed_at),str(closed_at),
+                 entry,exit_lvl,float(pnl),ccy,'broker'))
+            self.store.db.commit()
+            self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
+            self._bank_broker_cash_side_effects(
+                deal,float(pnl),currency=ccy,action=direction,source='broker')
+            self._run_mistake_audit_close(
+                deal,pnl=float(pnl),direction=direction,entry=entry,
+                source='live_funds_mirror')
+            inserted+=1
+            self.store.event('reconcile','Capital Funds close mirrored into Desk',
+                             {'deal_id':deal,'pnl':float(pnl),'epic':epic,
+                              'currency':ccy})
+        if upgraded or inserted:
+            self.store.event('reconcile','Capital Funds mirror pass',
+                             {'upgraded':upgraded,'inserted':inserted,
+                              'scanned':len(rows)})
+        return upgraded+inserted
+
+    def _run_mistake_audit_close(self,deal_id,*,pnl,direction=None,entry=None,
+                                 source='live'):
+        """SHADOW-visible mistake audit — safe to call from any settle path."""
+        if pnl is None or deal_id is None:
+            return None
+        try:
+            pnl_n=float(pnl)
+        except (TypeError,ValueError):
+            return None
+        if not math.isfinite(pnl_n):
+            return None
+        once='mistake_audited_close:'+str(deal_id)
+        prev=self.store.get(once) if self.store else None
+        if isinstance(prev,dict):
+            prev_pnl=_num(prev.get('pnl'))
+            # One pass per deal unless first pass was a different provisional £.
+            if prev_pnl is not None and abs(float(prev_pnl)-pnl_n)<1e-9:
+                return None
+            if prev.get('source') in ('live','live_funds_mirror') and prev_pnl is not None:
+                return None
+        try:
+            from . import shadow_mistake_audit as sma
+            key='entry_brain:'+str(deal_id)
+            saved=self.store.get(key) if self.store else None
+            ohlc_meta=(saved.get('ohlc_entry')
+                       if isinstance(saved,dict) else None)
+            sc_meta=(ohlc_meta.get('scenario')
+                     if isinstance(ohlc_meta,dict) else None)
+            news_snap=im_snap=None
+            if isinstance(saved,dict):
+                news_snap=saved.get('news') or saved.get('economic_news_risk')
+                im_snap=saved.get('intermarket') or saved.get('intermarket_analysis')
+            epic=((saved.get('epic') if isinstance(saved,dict) else None)
+                  or (self.mandate or {}).get('epic')
+                  or getattr(self.brain,'epic',None))
+            candles=self._decision_candles(epic,n=80) if epic else []
+            out=sma.on_close(
+                self.store,
+                pnl=pnl_n,spread=_num((saved or {}).get('entry_spread')) or 0.,
+                candles=candles,
+                scenario_meta=sc_meta if isinstance(sc_meta,dict) else {},
+                ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else {},
+                news=news_snap if isinstance(news_snap,dict) else (
+                    self._news_risk() if self.mandate else {}),
+                intermarket=im_snap if isinstance(im_snap,dict)
+                else dict(getattr(self.intermarket,'state',{}) or {}),
+                direction=(direction if direction in ('BUY','SELL')
+                           else ((saved or {}).get('direction')
+                                 if isinstance(saved,dict) else None)),
+                entry=entry if entry is not None else (
+                    _num(saved.get('entry')) if isinstance(saved,dict) else None),
+                source=source,
+                apply_ohlc_penalties=False,
+            )
+            if out and out.get('audited'):
+                self.store.set(once,{'at':now(),'pnl':pnl_n,'source':source})
+            return out
+        except Exception as exc:
+            try:
+                self.store.event('warning','Mistake-audit close skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            except Exception:
+                pass
+            return None
 
     def _last_upl_as_realized(self,deal_id):
         """Last live Capital UPL in account currency — usable as closed peļņa."""
@@ -4742,6 +4954,12 @@ class SingleTradeEngine:
         # Also harvest Capital cash for open SQLite rows whose deal vanished
         # before we queued pending (restart / missed sync). Sibling-safe.
         await self._reconcile_orphan_open_trades()
+        # Desk ↔ Capital Funds: journal any TRADE £ still missing from CLIENT CLOSES.
+        try:
+            await self._mirror_capital_funds_closes()
+        except Exception as exc:
+            self.store.event('warning','Capital Funds mirror skipped',
+                             {'type':type(exc).__name__})
 
     async def _reconcile_orphan_open_trades(self):
         """Close SQLite open rows for deals no longer live when Capital has cash £.
@@ -5116,6 +5334,10 @@ class SingleTradeEngine:
                         deal_id,saved,broker_pnl=broker_pnl,currency=currency,
                         exit_level=exit_level,action=action)
                     self.store.set(teacher_key,{'at':now(),'pnl':broker_pnl})
+                self._run_mistake_audit_close(
+                    deal_id,pnl=broker_pnl,direction=action,
+                    entry=_num(saved.get('entry')) if isinstance(saved,dict) else None,
+                    source='live')
                 self.store.event('learning','Late broker P&L refined; neural learn skipped (once-only)',
                                  {'deal_id':deal_id,'pnl':broker_pnl,'banked':banked,
                                   'pnl_source':late_src})
@@ -5134,6 +5356,9 @@ class SingleTradeEngine:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=row[1],
                         source=pnl_source)
+                    self._run_mistake_audit_close(
+                        deal_id,pnl=pnl_value,direction=row[1],entry=_num(row[0]),
+                        source='live')
                 else:
                     if pnl_source=='upl_estimate' and pnl_value is not None:
                         # Display only — keep harvesting real Capital £.
@@ -5145,14 +5370,18 @@ class SingleTradeEngine:
                 # No entry_brain — still journal Capital close for Desk island.
                 live_epic=(self.market.get('epic') or (self.mandate or {}).get('epic')
                            or getattr(self.brain,'epic',None))
+                direction_c=confirmation.get('direction') or confirmation.get('side')
                 self.store.close_trade(
                     deal_id,exit_level,broker_pnl,currency=currency,
                     source='broker' if broker_pnl is not None else None,
                     overwrite=overwrite,epic=live_epic,
-                    direction=confirmation.get('direction') or confirmation.get('side'))
+                    direction=direction_c)
                 if broker_pnl is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,broker_pnl,currency=currency)
+                    self._run_mistake_audit_close(
+                        deal_id,pnl=broker_pnl,direction=direction_c,
+                        entry=None,source='live')
                 else:
                     self._queue_pending_pnl(deal_id,exit_level=exit_level)
             return
@@ -5496,40 +5725,12 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','OHLC scenario self-audit skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
-            # Scenario memory + promote-to-LIVE (SHADOW rail visible). LIVE
-            # already applied mild ohlc penalties above — here we only track
-            # fingerprints / ready_for_live (no double-commit of knobs).
-            try:
-                from . import shadow_mistake_audit as sma
-                ohlc_meta=(saved.get('ohlc_entry')
-                           if isinstance(saved,dict) else None)
-                sc_meta=(ohlc_meta.get('scenario')
-                         if isinstance(ohlc_meta,dict) else None)
-                audit_epic=(self.mandate or {}).get('epic') or epic
-                audit_candles=self._decision_candles(audit_epic,n=80) if audit_epic else []
-                news_snap=None;im_snap=None
-                if isinstance(saved,dict):
-                    news_snap=saved.get('news') or saved.get('economic_news_risk')
-                    im_snap=saved.get('intermarket') or saved.get('intermarket_analysis')
-                sma.on_close(
-                    self.store,
-                    pnl=pnl_value,spread=spread_cost,
-                    candles=audit_candles,
-                    scenario_meta=sc_meta if isinstance(sc_meta,dict) else {},
-                    ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else {},
-                    news=news_snap if isinstance(news_snap,dict) else self._news_risk(),
-                    intermarket=im_snap if isinstance(im_snap,dict)
-                    else dict(self.intermarket.state or {}),
-                    direction=(direction if direction in ('BUY','SELL')
-                               else (ohlc_meta or {}).get('action')),
-                    entry=_num((saved or {}).get('entry')
-                               if isinstance(saved,dict) else None),
-                    source='live',
-                    apply_ohlc_penalties=False,
-                )
-            except Exception as exc:
-                self.store.event('warning','LIVE mistake-audit memory skipped',
-                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            # Scenario memory + promote-to-LIVE (SHADOW rail visible).
+            self._run_mistake_audit_close(
+                deal_id,pnl=pnl_value,direction=direction,
+                entry=_num((saved or {}).get('entry')
+                           if isinstance(saved,dict) else None),
+                source='live')
             try:
                 edge_meta=None
                 if isinstance(saved,dict):

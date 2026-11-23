@@ -20,8 +20,8 @@ def test_shadow_rail_and_view_exist():
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
-    assert 'admin.css?v=128' in HTML
-    assert 'admin.js?v=134' in HTML
+    assert 'admin.css?v=129' in HTML
+    assert 'admin.js?v=135' in HTML
     assert 'MISTAKE AUDIT' in JS or 'mistake_audit' in JS
     assert 'SCENARIO MEMORY' in JS
 

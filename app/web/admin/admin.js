@@ -1114,14 +1114,18 @@ function renderDeskClosed(client){
     const s=String(t.direction||t.side||'').toUpperCase();
     return s.includes('SELL')||s==='SHORT';
   });
+  const closedN=Number(results.closed_trades||0)||0;
+  const cashN=Number(results.cash_trades||0)||0;
   if(!rows.length){
     const err=results.stats_error
       ?(`Stats error · ${results.stats_error}`)
-      :'No journaled closes yet · Capital Funds may still show £';
+      :(closedN
+        ?`Journal has ${closedN} closes but none match filter · Capital Funds may still show £`
+        :'No journaled closes yet · Capital Funds may still show £');
     stableHtml(el,`<div class="psx-empty">${esc(err)}</div>`);
     const srcElEmpty=$('deskClosedSrc');
     if(srcElEmpty){
-      srcElEmpty.textContent=results.stats_error?'ERROR':'EMPTY';
+      srcElEmpty.textContent=results.stats_error?'ERROR':(closedN?`${closedN} HIDDEN`:'EMPTY');
       srcElEmpty.classList.add('warn');
     }
     return;
@@ -1136,10 +1140,11 @@ function renderDeskClosed(client){
   const anyBroker=rows.some(t=>String(t.pnl_source||'').toLowerCase()==='broker');
   const anyEdge=rows.some(t=>!!t.from_edge_hist);
   if(srcEl){
-    if(anyEdge&&!anyEst)srcEl.textContent='EDGE £';
-    else if(anyEst&&!anyBroker)srcEl.textContent='≈UPL';
-    else if(anyEst)srcEl.textContent='MIXED';
-    else srcEl.textContent='CAPITAL';
+    const nLabel=closedN?`${Math.min(rows.length,closedN)}/${closedN} · `:'';
+    if(anyEdge&&!anyEst)srcEl.textContent=nLabel+'EDGE £';
+    else if(anyEst&&!anyBroker)srcEl.textContent=nLabel+'≈UPL';
+    else if(anyEst)srcEl.textContent=nLabel+'MIXED';
+    else srcEl.textContent=nLabel+(cashN?'CAPITAL':'CAPITAL');
     srcEl.classList.toggle('warn',!!anyEst);
   }
   stableHtml(el,rows.map(t=>{
@@ -1164,9 +1169,10 @@ function renderDeskClosed(client){
       isEst?'upl_estimate':t.pnl_source,blankWait&&!broker);
     const whenShow=when&&when!=='—'?when:'';
     const pnlCls=broker||isEst?pnlClass(raw):'';
+    const capOrphan=String(t.deal_id||'').startsWith('cap:');
     return `<div class="psx-whale-row">
       <div class="wh-top">
-        <span class="tag">TRADE</span>
+        <span class="tag">${capOrphan?'FUNDS':'TRADE'}</span>
         <strong class="wh-epic">${esc(epic)}</strong>
         ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:''}
       </div>

@@ -660,8 +660,8 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-whale{padding:0 8px 8px;flex:1;min-height:0;overflow:auto;max-height:none}
 /* 2-line close rows — 6-col grid clipped "▼ SELL" under the panel edge. */
 .psx-whale-row{
-  display:flex;flex-direction:column;gap:3px;
-  padding:8px 2px;border-bottom:1px solid var(--desk-grid);font-size:var(--desk-fs-md);min-height:0}
+  display:flex;flex-direction:column;gap:2px;
+  padding:5px 2px;border-bottom:1px solid var(--desk-grid);font-size:var(--desk-fs-md);min-height:0}
 .psx-whale-row .wh-top,.psx-whale-row .wh-bot{
   display:flex;align-items:center;gap:8px;min-width:0;width:100%}
 .psx-whale-row .tag{

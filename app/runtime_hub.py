@@ -16,6 +16,10 @@ from .stream import CapitalQuoteStream
 
 log=logging.getLogger('runtime_hub')
 
+# Bump when Desk Capital/SHADOW truth contract changes — shown in systemStatus
+# so Windows operators can verify the running process actually reloaded code.
+DESK_TRUTH_REV = 241
+
 
 def _finite_num(v):
     try:
@@ -2028,6 +2032,7 @@ class RuntimeHub:
             estimate_pnl_all=round(est_sum,4)
         return {
             'summary':{
+                'desk_truth_rev':DESK_TRUTH_REV,
                 'clients':len(clients),
                 'running_robots':running,
                 'open_trades_all':open_positions,

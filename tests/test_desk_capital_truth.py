@@ -270,3 +270,5 @@ def test_main_awaits_refresh_before_overview():
     assert 'await hub.refresh_live_truth()' in src
     assert 'async def admin_clients' in src
     assert 'async def admin_overview' in src
+    assert 'refresh-truth' in src
+    assert 'DESK_TRUTH_REV' in Path('app/runtime_hub.py').read_text(encoding='utf-8')

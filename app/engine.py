@@ -4871,7 +4871,8 @@ class SingleTradeEngine:
                 currency=ccy,
                 paper_pnl=pnl_n,
                 closed_at=closed_at,
-                apply_ohlc_penalties=False,
+                # Full cycle NOW — Capital closes commit fix + ready_for_live.
+                apply_ohlc_penalties=True,
             )
             if out and out.get('audited'):
                 self.store.set(once,{'at':now(),'pnl':pnl_n,'source':source,
@@ -5381,6 +5382,13 @@ class SingleTradeEngine:
             self._backfill_mistake_audits_from_journal(limit=2000,hours=0)
         except Exception as exc:
             self.store.event('warning','Mistake-audit backfill skipped',
+                             {'type':type(exc).__name__})
+        # Unstick PENDING / empty READY — full cycle NOW from existing hist.
+        try:
+            from . import shadow_mistake_audit as sma
+            sma.flush_full_cycle(self.store)
+        except Exception as exc:
+            self.store.event('warning','SHADOW full-cycle flush skipped',
                              {'type':type(exc).__name__})
         # Also mirror any currently open LIVE deals into paper (once).
         try:

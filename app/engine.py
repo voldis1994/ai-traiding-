@@ -8381,26 +8381,22 @@ class SingleTradeEngine:
                 except Exception:
                     pass
             # Break|zone knobs learn from paper cash too — not only LIVE Funds £.
-            try:
-                ctx=closed.get('entry_context') if isinstance(
-                    closed.get('entry_context'),dict) else {}
-                ohlc_meta=ctx.get('ohlc_entry') if isinstance(
-                    ctx.get('ohlc_entry'),dict) else {}
-                trade_sp=(closed.get('spread')
-                          if closed.get('spread') is not None else spread)
-                ohlc_entry_zones.observe_close(
-                    self.store,ohlc_meta=ohlc_meta,broker_pnl=pnl,
-                    spread=trade_sp)
-            except Exception as exc:
-                self.store.event('warning','Shadow entry-zone observe skipped',
-                                 {'type':type(exc).__name__})
+            ctx=closed.get('entry_context') if isinstance(
+                closed.get('entry_context'),dict) else {}
+            ohlc_meta=ctx.get('ohlc_entry') if isinstance(
+                ctx.get('ohlc_entry'),dict) else {}
+            paper_id=(closed.get('fingerprint') or closed.get('deal_id')
+                      or ('paper:'+str(closed.get('at') or '')
+                          +':'+str(closed.get('direction') or '')
+                          +':'+str(closed.get('exit_reason') or '')))
+            trade_sp=(closed.get('spread')
+                      if closed.get('spread') is not None else spread)
+            self._observe_entry_gates_once(
+                paper_id,ohlc_meta=ohlc_meta,broker_pnl=pnl,
+                spread=trade_sp,source='shadow_paper')
             # Mistake-audit loop: diagnose → scenario memory → targeted fix → promote.
             try:
                 from . import shadow_mistake_audit as sma
-                ctx=closed.get('entry_context') if isinstance(
-                    closed.get('entry_context'),dict) else {}
-                ohlc_meta=ctx.get('ohlc_entry') if isinstance(
-                    ctx.get('ohlc_entry'),dict) else {}
                 sc_meta=ctx.get('scenario') if isinstance(
                     ctx.get('scenario'),dict) else {}
                 audit_rows=candles if candles is not None else (
@@ -8412,10 +8408,6 @@ class SingleTradeEngine:
                     unit=('account_currency'
                           if closed.get('paper_pnl') is not None
                           else 'price')
-                paper_id=(closed.get('fingerprint') or closed.get('deal_id')
-                          or ('paper:'+str(closed.get('at') or '')
-                              +':'+str(closed.get('direction') or '')
-                              +':'+str(closed.get('exit_reason') or '')))
                 ccy=(self._account_currency()
                      if unit=='account_currency' else None)
                 sma.on_close(

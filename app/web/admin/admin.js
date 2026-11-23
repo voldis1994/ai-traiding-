@@ -2677,15 +2677,18 @@ function updateSystemStatus(data){
   const alerts=collectRiskAlerts(data.clients||[]);
   const sync=formatSyncClock(lastSyncAt);
   const syncBit=sync?` · ${sync}`:'';
+  // Visible proof the Windows process reloaded #241+ (not a stale uvicorn).
+  const rev=s.desk_truth_rev!=null?Number(s.desk_truth_rev):null;
+  const revBit=(rev&&Number.isFinite(rev))?` · truth #${rev}`:' · truth ?';
   if(alerts.some(a=>a.metric==='HALT'||a.metric==='ERR')){
     el.classList.add('warn');
-    el.querySelector('span:last-child').textContent='Nepieciešama uzmanība'+syncBit;
+    el.querySelector('span:last-child').textContent='Nepieciešama uzmanība'+syncBit+revBit;
   }else{
     el.classList.remove('warn');
     let msg='Sistēma aktīva';
     if(running>0)msg+=` · ${running} roboti`;
     if(open>0)msg+=` · ${open} open`;
-    el.querySelector('span:last-child').textContent=msg+syncBit;
+    el.querySelector('span:last-child').textContent=msg+syncBit+revBit;
   }
 }
 
@@ -2770,10 +2773,16 @@ function softPatchCard(el,c){
   el.dataset.contentKey=cardContentKey(c);
 }
 
+let truthForceBooted=false;
 async function loadOverview(){
   // Coalesce overlapping polls so a slow /overview cannot stack and freeze UI.
   if(overviewInFlight)return overviewInFlight;
   overviewInFlight=(async()=>{
+    // First Desk paint after browser load: force Funds mirror (ignore 12s cooldown).
+    if(!truthForceBooted){
+      truthForceBooted=true;
+      try{await api('/api/admin/refresh-truth','POST')}catch(_){/* keep poll */}
+    }
     const data=await api('/api/admin/overview');
     lastOverview=data;
     lastSyncAt=Date.now();

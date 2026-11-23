@@ -471,6 +471,17 @@ async def admin_overview(_:dict=Depends(require_admin)):
         pass
     return {'ok':True,**hub.admin_overview()}
 
+@app.post('/api/admin/refresh-truth')
+async def admin_refresh_truth(_:dict=Depends(require_admin)):
+    """Force Funds mirror + remap + shadow boot (bypass 12s cooldown)."""
+    try:
+        out=await hub.refresh_live_truth(force=True)
+    except Exception as exc:
+        return {'ok':False,'error':type(exc).__name__,'desk_truth_rev':getattr(
+            hub,'DESK_TRUTH_REV',None)}
+    from .runtime_hub import DESK_TRUTH_REV
+    return {'ok':True,'desk_truth_rev':DESK_TRUTH_REV,**out}
+
 @app.get('/api/admin/clients/{client_id}/structure-view')
 async def admin_client_structure_view(client_id:int,n:int=90,_:dict=Depends(require_admin)):
     """Per-client OHLC + swing S/R + prospective entry zones (Admin mini chart)."""

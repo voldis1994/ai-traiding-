@@ -10,11 +10,19 @@ echo.
 echo  URL after start:  http://127.0.0.1:8765/admin
 echo  Desk UI:          http://127.0.0.1:8765/desk
 echo  Leave this window OPEN while the robot runs.
+echo  After git pull you MUST close the old window / restart here
+echo  or Desk keeps serving the old process (stale -0.81 / UNMAPPED).
 echo.
 
 if not exist "launcher.py" goto bad_folder
 if not exist "app\main.py" goto bad_folder
 if not exist "run_windows.bat" goto bad_folder
+
+REM Free port 8765 so a leftover START.bat cannot keep old code alive.
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8765" ^| findstr "LISTENING"') do (
+  echo [INFO] Stopping stale process on :8765 PID %%P
+  taskkill /F /PID %%P >nul 2>&1
+)
 
 REM Open browser shortly after server boot (backup if auto-open fails)
 start "" cmd /c "timeout /t 8 /nobreak >nul & start http://127.0.0.1:8765/admin"

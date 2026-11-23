@@ -100,6 +100,38 @@ def test_mirror_upgrades_upl_estimate_to_broker():
     asyncio.run(scenario())
 
 
+def test_mirror_fixes_zero_poison_broker_to_capital_funds():
+    """Desk +0.00 while Capital Funds shows -£0.12 must be overwritten."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'deal-zero', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 3625,
+            })
+            store.close_trade(
+                'deal-zero', 3624.8, 0.0, currency='GBP',
+                source='broker', overwrite=True)
+            broker = FundsBroker([{
+                'dealId': 'deal-zero', 'instrumentName': 'Gold',
+                'pnl': -0.12, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 3625.0, 'closeLevel': 3624.8,
+                'dateUtc': '2026-11-23T13:12:00Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n == 1
+            row = next(r for r in store.trades(5) if r['deal_id'] == 'deal-zero')
+            assert row['pnl'] == pytest.approx(-0.12)
+            assert row['pnl_source'] == 'broker'
+    asyncio.run(scenario())
+
+
 def test_trade_stats_shows_mirrored_funds_rows():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:

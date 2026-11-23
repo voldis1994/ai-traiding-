@@ -4470,7 +4470,14 @@ class SingleTradeEngine:
                 except Exception:
                     row=None
                 src=str((row or [None])[0] or '')
-                if src!='broker':
+                old_pnl=_num((row or [None,None])[1] if row else None)
+                # Upgrade non-broker OR zero-poison / stale £ that ≠ Capital Funds.
+                needs=src!='broker'
+                if not needs and (old_pnl is None or abs(float(old_pnl))<1e-12):
+                    needs=True  # Capital phone shows -£0.12; Desk stuck +0.00
+                elif not needs and old_pnl is not None and abs(float(old_pnl)-float(pnl))>=0.05:
+                    needs=True  # e.g. Desk -0.58 vs Funds -0.65
+                if needs:
                     ccy=self._cash_currency(tx.get('currency')) or ccy_default
                     exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
                     self.store.close_trade(
@@ -4492,7 +4499,40 @@ class SingleTradeEngine:
                         entry=_num(tx.get('openLevel') or tx.get('open_level')),
                         source='live_funds_mirror')
                 continue
+            # Fingerprint already consumed by a zero-poison deal → rebind real £.
             if fp in consumed:
+                consumer=None
+                try:
+                    for deal_id,src,pnl_s in self.store.db.execute(
+                            "SELECT deal_id,pnl_source,pnl FROM trades "
+                            "WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 40"):
+                        if self.store.get('fuzzy_pnl_tx_for:'+str(deal_id))==fp:
+                            consumer=(str(deal_id),str(src or ''),_num(pnl_s))
+                            break
+                except Exception:
+                    consumer=None
+                if consumer:
+                    c_deal,c_src,c_pnl=consumer
+                    if (c_src!='broker' or c_pnl is None or abs(float(c_pnl))<1e-12
+                            or abs(float(c_pnl)-float(pnl))>=0.05):
+                        ccy=self._cash_currency(tx.get('currency')) or ccy_default
+                        exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+                        self.store.close_trade(
+                            c_deal,exit_lvl,float(pnl),currency=ccy,
+                            source='broker',overwrite=True,
+                            epic=self._tx_epic_guess(tx),
+                            direction=self._tx_direction_guess(tx),
+                            entry=_num(tx.get('openLevel') or tx.get('open_level')),
+                            size=tx.get('size') or tx.get('quantity'))
+                        self._bank_broker_cash_side_effects(
+                            c_deal,float(pnl),currency=ccy,
+                            action=self._tx_direction_guess(tx),source='broker')
+                        upgraded+=1
+                        self._run_mistake_audit_close(
+                            c_deal,pnl=float(pnl),
+                            direction=self._tx_direction_guess(tx),
+                            entry=_num(tx.get('openLevel') or tx.get('open_level')),
+                            source='live_funds_mirror')
                 continue
             # Orphan Capital Funds close — journal so Desk matches the phone app.
             deal='cap:'+fp.replace(':','_')[:48]

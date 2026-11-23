@@ -21,7 +21,8 @@ def test_shadow_rail_and_view_exist():
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
     assert 'admin.css?v=129' in HTML
-    assert 'admin.js?v=135' in HTML
+    assert 'admin.js?v=136' in HTML
+    assert 'paper 0 closes' in JS or 'CLIENT CLOSES + MISTAKE AUDIT' in JS
     assert 'MISTAKE AUDIT' in JS or 'mistake_audit' in JS
     assert 'SCENARIO MEMORY' in JS
 

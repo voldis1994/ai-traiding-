@@ -511,7 +511,7 @@ function renderShadowLab(client){
           ${_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)}
           ${_shadowKv('Open',openTxt)}
         </div>
-        <div class="shadow-note">SL/TP only — never places LIVE broker orders.</div>
+        <div class="shadow-note">Paper SL/TP only — Capital LIVE minuses are CLIENT CLOSES + MISTAKE AUDIT, not this £0.</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -846,6 +846,15 @@ function renderDeskStatusBoard(client){
   const shadowNet=shadow.paper_net!=null?Number(shadow.paper_net):null;
   const shadowTrades=Number(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0))||0;
   const shadowTxt=shadowNet==null?'—':((shadowNet>=0?'+':'')+num(shadowNet,2));
+  const results=client.results||{};
+  const liveClosed=Number(results.closed_trades!=null?results.closed_trades
+    :(samples.closed_trades!=null?samples.closed_trades:0))||0;
+  const liveCash=Number(results.cash_trades!=null?results.cash_trades:0)||0;
+  const liveReal=results.realized_pnl!=null?Number(results.realized_pnl):null;
+  const liveLosses=Number(results.display_losses!=null?results.display_losses
+    :(results.losses!=null?results.losses:0))||0;
+  const liveWins=Number(results.display_wins!=null?results.display_wins
+    :(results.wins!=null?results.wins:0))||0;
   const lh=ds.learn_horizon||a.learn_horizon||{};
   const edgeN=lh.edge_closes!=null?Number(lh.edge_closes):null;
   // Headline: never flash bare library 0 when cards/closes are live.
@@ -869,6 +878,22 @@ function renderDeskStatusBoard(client){
     }
     return fl.n!=null?('learn n='+fl.n+' help '+(fl.helpful||0)+'/'+(fl.harmful||0)):'—';
   })();
+  // SHADOW £ = paper book only. LIVE Capital losses live in CLIENT CLOSES —
+  // never imply "system at 0" when paper is flat but LIVE has minuses.
+  const shadowSub=(()=>{
+    const paperBit=shadowTrades===0
+      ?'paper 0 closes'
+      :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0));
+    if(liveClosed>0){
+      const liveBit='LIVE '+liveClosed
+        +(liveLosses||liveWins?(' · W'+liveWins+'/L'+liveLosses):'')
+        +(liveReal!=null&&Number.isFinite(liveReal)
+          ?(' · '+(liveReal>=0?'+':'')+num(liveReal,2))
+          :(liveCash?(' · cash '+liveCash):''));
+      return paperBit+' · '+liveBit;
+    }
+    return paperBit+(shadowTrades===0?' · waits paper SL/TP':'');
+  })();
   const tiles=[
     {k:'CAN OPEN',v:can?'YES':'NO',cls:can?'ok':'bad',
       s:can?('Intent '+String(intent).slice(0,18)):String(block).slice(0,48)},
@@ -878,10 +903,10 @@ function renderDeskStatusBoard(client){
     {k:'STRATEGY CARDS',v:String(cards.n!=null?cards.n:0),cls:(cards.n>0)?'ok':'neu',
       s:(cards.active&&cards.active.length)?cards.active.slice(0,3).join(', '):'none active'},
     {k:'SHADOW £',v:shadowTxt,
-      cls:shadowNet==null?'neu':(shadowTrades===0?'neu':(shadowNet>=0?'ok':'bad')),
-      s:shadowTrades===0
-        ?'no shadow closes yet'
-        :('trades '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))},
+      cls:shadowNet==null?'neu':(shadowTrades===0
+        ?(liveClosed>0?'neu':'neu')
+        :(shadowNet>=0?'ok':'bad')),
+      s:shadowSub},
     {k:'SAMPLES',v:String(sampleHead!=null?sampleHead:'—'),
       cls:(sampleHead!=null&&Number(sampleHead)>0)?'ok':'neu',s:sampleSub},
     {k:'SELF PARAMS',v:knobs.horizon!=null?('hz '+knobs.horizon):'—',cls:'neu',

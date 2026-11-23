@@ -156,6 +156,16 @@ def require_auth(request:Request):
         raise HTTPException(401,'Login required')
     return True
 
+def _is_loopback_request(request:Request) -> bool:
+    """True only for direct local Desk (Windows START.bat on this machine)."""
+    host=(request.client.host if request.client else '') or ''
+    if host in ('127.0.0.1','::1','localhost','testclient'):
+        return True
+    # Host header may be 127.0.0.1:8765 while client is still loopback.
+    hdr=(request.headers.get('host') or '').split(':')[0].strip().lower()
+    return hdr in ('127.0.0.1','localhost','[::1]') and host in (
+        '127.0.0.1','::1','localhost','testclient','')
+
 def require_admin(request:Request):
     token=request.cookies.get(ADMIN_COOKIE)
     session=platform.get_session(token)
@@ -436,6 +446,24 @@ async def admin_login(data:UserPass):
     if not admin:raise HTTPException(401,'Invalid admin credentials')
     token=platform.create_session('admin',admin['id'])
     response=JSONResponse({'ok':True,'username':admin['username']})
+    _set_session_cookie(response,ADMIN_COOKIE,token)
+    return response
+
+@app.post('/api/admin/local-boot')
+async def admin_local_boot(request:Request):
+    """Loopback-only: open Desk without typing password (Windows START.bat)."""
+    if not _is_loopback_request(request):
+        raise HTTPException(403,'Local boot only on 127.0.0.1')
+    _bootstrap_admin()
+    admin=platform.first_admin()
+    if not admin:
+        user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
+        password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
+        admin=platform.ensure_admin(user,password)
+    token=platform.create_session('admin',int(admin['id']))
+    response=JSONResponse({
+        'ok':True,'role':'admin','local_boot':True,
+        'username':admin.get('username') or 'admin'})
     _set_session_cookie(response,ADMIN_COOKIE,token)
     return response
 

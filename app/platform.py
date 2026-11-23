@@ -89,6 +89,13 @@ class PlatformStore:
     def admin_count(self) -> int:
         return int(self.db.execute('SELECT COUNT(*) FROM admins').fetchone()[0])
 
+    def first_admin(self) -> Optional[dict]:
+        row=self.db.execute(
+            'SELECT id,username FROM admins ORDER BY id ASC LIMIT 1').fetchone()
+        if not row:
+            return None
+        return {'id':row['id'],'username':row['username'],'role':'admin'}
+
     def verify_admin(self,username: str,password: str) -> Optional[dict]:
         row=self.db.execute('SELECT id,username,password_hash FROM admins WHERE username=? COLLATE NOCASE',
                             (username,)).fetchone()

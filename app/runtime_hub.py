@@ -643,6 +643,11 @@ class RuntimeHub:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
                     try:
+                        # Empty journal + surviving audit hist → restore closes.
+                        eng.shadow_paper.backfill_from_mistake_audits()
+                    except Exception:
+                        pass
+                    try:
                         # Re-scale price-only paper closes from LIVE broker £.
                         live = getattr(
                             getattr(eng, 'profit_learning', None), 'history', None) or []
@@ -653,6 +658,10 @@ class RuntimeHub:
                 else:
                     from .shadow_paper import ShadowPaperJournal
                     jp = ShadowPaperJournal(store)
+                    try:
+                        jp.backfill_from_mistake_audits()
+                    except Exception:
+                        pass
                     try:
                         jp.update_cash_scale([])
                     except Exception:

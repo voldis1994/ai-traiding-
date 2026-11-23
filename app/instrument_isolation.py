@@ -17,6 +17,14 @@ BAG_KEYS = (
     'profit_learning_history_v1',
     'shadow_paper_journal_v1',
     'shadow_paper_state_v1',
+    # Keep mistake-audit with the paper book — otherwise bag clear leaves
+    # audits (e.g. -12.94) while PAPER BOOK shows false 0 closes.
+    'shadow_mistake_audit_v1',
+    'shadow_mistake_audit_v1:hist',
+    'shadow_mistake_audit_v1:scenarios',
+    'shadow_mistake_audit_v1:ready',
+    'shadow_mistake_audit_v1:last',
+    'shadow_mistake_audit_v1:pending_fix',
     'shadow_neural_state_v1',
     'shadow_self_dev_last',
     'shadow_last_promote_v1',

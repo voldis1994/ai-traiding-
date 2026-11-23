@@ -450,7 +450,8 @@ def _update_ready(store, diagnosis: dict) -> dict | None:
 
 def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
-             mid=None, entry=None, source='shadow',
+             mid=None, entry=None, exit=None, exit_reason=None,
+             source='shadow',
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -490,6 +491,10 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'at': out['at'],
             'source': source,
             'pnl': diagnosis.get('pnl'),
+            'direction': direction,
+            'entry': entry,
+            'exit': exit,
+            'exit_reason': exit_reason,
             'mistakes': diagnosis.get('mistakes'),
             'notes': diagnosis.get('notes'),
             'fingerprint': (diagnosis.get('context') or {}).get('fingerprint'),
@@ -499,7 +504,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
         })
-        store.set(HIST_KEY, hist[-40:])
+        store.set(HIST_KEY, hist[-120:])  # ~24h of closes for analysis
         store.set(LAST_KEY, {
             'at': out['at'],
             'source': source,
@@ -594,6 +599,29 @@ def lab_payload(store) -> dict:
         if isinstance(h, dict) and (
             (h.get('mistakes') or [])
             or (isinstance(h.get('pnl'), (int, float)) and float(h['pnl']) < -0.02)))
+    # Full 24h analysis window — both profits and losses (not just last close).
+    window_24h = _hist_window_stats(hist, hours=24)
+    live_ext = store.get('live_external_context') if isinstance(
+        store.get('live_external_context'), dict) else {}
+    live_news = live_ext.get('news') if isinstance(live_ext.get('news'), dict) else {}
+    live_im = live_ext.get('intermarket') if isinstance(
+        live_ext.get('intermarket'), dict) else {}
+    # Fallback: assess calendar from the client data dir when engine has not
+    # written live_external_context yet (Desk open before first snapshot).
+    if not live_news.get('status') and getattr(store, 'path', None) is not None:
+        try:
+            from .external_risk import assess_news
+            cal = store.path.parent / 'economic_calendar.json'
+            live_news = assess_news('', cal) or {}
+        except Exception:
+            live_news = {'status': 'UNCONFIGURED',
+                         'reason': 'Calendar not readable yet'}
+    peer_n = 0
+    ready_peers = 0
+    if isinstance(live_im.get('peers'), list):
+        peer_n = len(live_im['peers'])
+        ready_peers = sum(1 for p in live_im['peers']
+                          if isinstance(p, dict) and p.get('ready'))
     return {
         'ok': True,
         'loop': 'diagnose → scenario memory → targeted fix → promote → LIVE',
@@ -603,6 +631,20 @@ def lab_payload(store) -> dict:
         'ready_count': len(ready),
         'hist_n': len(hist),
         'hurt_n': hurt_n,
+        'window_24h': window_24h,
+        'live_news': {
+            'status': live_news.get('status') or '—',
+            'reason': live_news.get('reason'),
+            'entry_allowed': live_news.get('entry_allowed'),
+            'event_at': live_news.get('event_at'),
+        },
+        'live_peers': {
+            'status': live_im.get('status') or 'WAITING',
+            'reason': live_im.get('reason'),
+            'peer_n': peer_n,
+            'ready_peers': ready_peers,
+            'entry_allowed': live_im.get('entry_allowed'),
+        },
         'last': display_last,
         'last_raw': last,
         'pending_fix': {
@@ -616,7 +658,56 @@ def lab_payload(store) -> dict:
         },
         'top_scenarios': top_rows,
         'ready': ready[:6],
-        'recent_audits': list(reversed(hist[-8:])),
+        'recent_audits': list(reversed(hist[-16:])),
         'respect_news_window': bool(audit.get('respect_news_window')),
         'respect_intermarket_veto': bool(audit.get('respect_intermarket_veto')),
+    }
+
+
+def _hist_window_stats(hist, *, hours=24) -> dict:
+    """Aggregate audit hist over a time window — wins and losses together."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max(1, int(hours)))
+    wins = losses = scratch = 0
+    net = 0.0
+    n = 0
+    useful_n = hurt_n = 0
+    for h in hist or []:
+        if not isinstance(h, dict):
+            continue
+        at = h.get('at')
+        if at:
+            try:
+                dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    continue
+            except Exception:
+                pass
+        pnl = _finite(h.get('pnl'))
+        if pnl is None:
+            continue
+        n += 1
+        net += float(pnl)
+        ms = h.get('mistakes') or []
+        if pnl > 0.02:
+            wins += 1
+            useful_n += 1
+        elif pnl < -0.02 or ms:
+            losses += 1
+            hurt_n += 1
+        else:
+            scratch += 1
+    return {
+        'hours': int(hours),
+        'n': n,
+        'wins': wins,
+        'losses': losses,
+        'scratch': scratch,
+        'net': round(net, 4),
+        'useful_n': useful_n,
+        'hurt_n': hurt_n,
+        'reads': 'wins+losses',
     }

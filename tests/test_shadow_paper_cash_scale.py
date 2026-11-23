@@ -61,6 +61,24 @@ def test_update_cash_scale_revalues_price_rows_from_store_trades():
         assert j.history[0]['paper_pnl'] is not None
 
 
+def test_summary_counts_orphan_price_pnl_tagged_account_currency():
+    """unit=account_currency + paper_pnl=None + price_pnl set must still display."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        j = ShadowPaperJournal(store)
+        j.history = [
+            {'direction': 'BUY', 'entry': 3680.0, 'exit': 3667.0,
+             'price_pnl': -13.0, 'paper_pnl': None, 'unit': 'account_currency',
+             'exit_reason': 'sl'},
+        ]
+        s = j.summary()
+        assert s['cash_trades'] == 0
+        assert s['price_trades'] == 1
+        assert s['display_trades'] == 1
+        assert s['unit'] == 'price'
+        assert s['display_net'] == pytest.approx(-13.0)
+
+
 def test_cash_per_price_unit_accepts_pnl_alias_and_skips_zero():
     rows = [
         {'actual_pnl': 0.0, 'entry': 3600, 'exit': 3590, 'direction': 'BUY'},

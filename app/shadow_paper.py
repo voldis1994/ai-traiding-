@@ -514,31 +514,84 @@ class ShadowPaperJournal:
         self._persist()
         return closed
 
+    @staticmethod
+    def _row_is_cash(r):
+        """Cash £ row — includes legacy paper_pnl rows that omitted unit."""
+        if not isinstance(r,dict):return False
+        if _finite(r.get('paper_pnl')) is None:return False
+        u=r.get('unit')
+        if u=='price':return False
+        if u=='account_currency':return True
+        # Legacy: paper_pnl present, no unit, no price_pnl → treated as cash.
+        if u is None and _finite(r.get('price_pnl')) is None:return True
+        if u is None and _finite(r.get('cash_scale')) is not None:return True
+        return False
+
     def paper_cash_pnls(self):
         """Only cash-denominated rows — comparable to broker £."""
         return [float(r['paper_pnl']) for r in self.history
-                if r.get('unit')=='account_currency'
-                and r.get('paper_pnl') is not None
-                and math.isfinite(float(r['paper_pnl']))]
+                if self._row_is_cash(r) and math.isfinite(float(r['paper_pnl']))]
 
     def paper_rows(self):
         """Cash rows with metadata (model_version, times) for fair compare."""
-        return [r for r in self.history
-                if r.get('unit')=='account_currency'
-                and r.get('paper_pnl') is not None
-                and math.isfinite(float(r['paper_pnl']))]
+        return [r for r in self.history if self._row_is_cash(r)]
 
     def paper_pnls(self):
         """Backward-compatible alias → cash-only (never mix price units)."""
         return self.paper_cash_pnls()
+
+    def backfill_from_mistake_audits(self):
+        """Restore empty paper journal from shadow mistake-audit hist.
+
+        Instrument bag switches clear live paper keys while audit hist is not
+        bag-scoped — Desk then shows Paper £0 with audits still listing -12.94.
+        """
+        if self.store is None:return 0
+        if any(isinstance(r,dict) for r in (self.history or [])):
+            return 0
+        try:
+            from .shadow_mistake_audit import HIST_KEY
+            hist=list(self.store.get(HIST_KEY) or [])
+        except Exception:
+            return 0
+        added=0
+        for h in hist:
+            if not isinstance(h,dict):continue
+            src=str(h.get('source') or 'shadow').lower()
+            if src=='live':continue
+            pnl=_finite(h.get('pnl'))
+            if pnl is None:continue
+            # |pnl|≫£1 for GOLD usually means price points (audit gets price_pnl
+            # when cash_scale was missing at close).
+            unit='price' if abs(pnl)>=2.0 else 'account_currency'
+            row={
+                'at':h.get('at'),
+                'direction':h.get('direction'),
+                'entry':h.get('entry'),
+                'exit':h.get('exit'),
+                'price_pnl':float(pnl) if unit=='price' else h.get('price_pnl'),
+                'paper_pnl':float(pnl) if unit=='account_currency' else None,
+                'unit':unit,
+                'exit_reason':h.get('exit_reason') or 'audit_backfill',
+                'source':'shadow_paper_audit_backfill',
+                'fingerprint':h.get('fingerprint'),
+                'scenario':h.get('scenario'),
+            }
+            self.history.append(row)
+            added+=1
+        if added:
+            self._persist()
+        return added
 
     def summary(self):
         pnls=self.paper_cash_pnls()
         price_pnls=[]
         for r in self.history:
             if not isinstance(r,dict):continue
-            if r.get('unit')=='account_currency':continue
+            if self._row_is_cash(r):continue
             pp=_finite(r.get('price_pnl'))
+            if pp is None and r.get('unit')=='price':
+                pp=_finite(r.get('paper_pnl'))
             if pp is not None:price_pnls.append(float(pp))
         cash_net=float(sum(pnls)) if pnls else 0.
         price_net=float(sum(price_pnls)) if price_pnls else 0.
@@ -570,4 +623,7 @@ class ShadowPaperJournal:
             'losses':losses,
             'unit':display_unit,
             'exit_mode':'sl_tp_only',
+            'audit_backfill':any(
+                isinstance(r,dict) and r.get('source')=='shadow_paper_audit_backfill'
+                for r in (self.history or [])),
         }

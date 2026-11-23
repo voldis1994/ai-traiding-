@@ -388,8 +388,10 @@ function renderShadowLab(client){
   const open=paper.open&&typeof paper.open==='object'?paper.open:null;
   const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
   const recent=Array.isArray(paper.recent)?paper.recent:[];
+  const openSl=open?(open.sl!=null?open.sl:(open.stop!=null?open.stop:null)):null;
+  const openTp=open?(open.tp!=null?open.tp:(open.profit!=null?open.profit:null)):null;
   const openTxt=open
-    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${open.sl!=null?num(open.sl,2):'—'} · TP ${open.tp!=null?num(open.tp,2):'—'}`)
+    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${openSl!=null?num(openSl,2):'—'} · TP ${openTp!=null?num(openTp,2):'—'}`)
     :(pending?`pending ${String(pending.direction||'?').toUpperCase()}`:'flat');
   const rowsHtml=recent.length?recent.map(r=>{
     const dir=String(r.direction||'?').toUpperCase();
@@ -421,6 +423,13 @@ function renderShadowLab(client){
   const missCls=miss.length?'bad':'ok';
   const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const auditPnlTxt=auditPnl==null?'—':((auditPnl>=0?'+':'')+num(auditPnl,2));
+  const win24=audit.window_24h&&typeof audit.window_24h==='object'?audit.window_24h:{};
+  const winN=Number(win24.n)||0;
+  const winW=Number(win24.wins)||0;
+  const winL=Number(win24.losses)||0;
+  const winNet=win24.net!=null?Number(win24.net):null;
+  const winNetTxt=winNet==null?'—'
+    :((winNet>=0?'+':'')+num(winNet,2));
   const gateTxt=(auditLast.promote_count!=null)
     ?(`${auditLast.promote_count}/${auditLast.promote_need||3}`)
     :'0/3';
@@ -462,16 +471,34 @@ function renderShadowLab(client){
         <div class="shadow-kv">
           ${_shadowKv('Last mistakes',missTxt,missCls)}
           ${_shadowKv('Last £',auditPnlTxt,auditPnl==null?'neu':(auditPnl>=0?'ok':'bad'))}
-          ${_shadowKv('Hurts',audit.hurt_n!=null?audit.hurt_n:(miss.length?1:0),miss.length||audit.hurt_n?'bad':'neu')}
-          ${_shadowKv('Source',auditLast.source||'—')}
+          ${_shadowKv('24h W/L',winN?(`${winW} / ${winL}`):'0 / 0',winL?'bad':(winW?'ok':'neu'))}
+          ${_shadowKv('24h net',winNetTxt,winNet==null?'neu':(winNet>=0?'ok':'bad'))}
         </div>
         <div class="shadow-note">${esc(
-          auditLast.display_note==='showing_last_hurt_not_scratch'
-            ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
-            :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
-              ?auditLast.notes.join(' · ')
-              :(audit.loop||'diagnose → memory → fix → promote → LIVE')))}</div>
-        <div class="shadow-note">News ${esc(auditLast.news_status||'—')} · peers ${esc(auditLast.intermarket_status||'—')} · zone ${esc(auditLast.zone_side||'—')}</div>
+          winN
+            ?('Reads full 24h · '+winN+' closes (wins+losses) · last '
+              +(auditLast.source||'—')+' '
+              +(missTxt!=='none'?missTxt:(auditLast.scenario||'')))
+            :(auditLast.display_note==='showing_last_hurt_not_scratch'
+              ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
+              :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
+                ?auditLast.notes.join(' · ')
+                :(audit.loop||'diagnose → memory → fix → promote → LIVE'))))}</div>
+        <div class="shadow-note">${esc(
+          'At close · news '+(auditLast.news_status||'—')
+          +' · peers '+(auditLast.intermarket_status||'—')
+          +' · zone '+(auditLast.zone_side||'—'))}</div>
+        <div class="shadow-note">${esc((()=>{
+          const ln=audit.live_news||{};
+          const lp=audit.live_peers||{};
+          const nr=ln.reason?String(ln.reason).slice(0,72):'';
+          const pr=lp.reason?String(lp.reason).slice(0,56):'';
+          return 'Live today · news '+(ln.status||'—')
+            +(nr?(' · '+nr):'')
+            +' · peers '+(lp.status||'—')
+            +(lp.ready_peers!=null?(' '+lp.ready_peers+'/'+(lp.peer_n||0)):'')
+            +(pr?(' · '+pr):'');
+        })())}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -521,9 +548,13 @@ function renderShadowLab(client){
           ${_shadowKv('Open',openTxt)}
         </div>
         <div class="shadow-note">${esc(
-          paperUnit==='price'
-            ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
-            :('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT'))}</div>
+          paper.audit_backfill
+            ?('Restored from MISTAKE AUDIT hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
+            :(paperUnit==='price'
+              ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
+              :(paperTrades>0
+                ?('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT')
+                :('No paper closes yet — if audits show shadow £/pts, wait one Desk refresh for backfill'))))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -896,12 +927,22 @@ function renderDeskStatusBoard(client){
   })();
   // SHADOW £ = paper book only. LIVE Capital losses live in CLIENT CLOSES —
   // never imply "system at 0" when paper is flat but LIVE has minuses.
+  const auditLab=(ds.shadow_lab&&ds.shadow_lab.mistake_audit)||{};
+  const auditLast=auditLab.last||{};
+  const auditHurt=Number(auditLab.hurt_n)||0;
+  const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const shadowSub=(()=>{
-    const paperBit=shadowTrades===0
-      ?'paper 0 closes'
+    let paperBit=shadowTrades===0
+      ?(auditHurt>0
+        ?('paper empty · audit hurts '+auditHurt
+          +(auditPnl!=null&&Number.isFinite(auditPnl)
+            ?(' · last '+(auditPnl>=0?'+':'')+num(auditPnl,2))
+            :''))
+        :'paper 0 closes')
       :(shadowUnit==='price'
         ?('paper '+shadowTrades+' pts · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))
         :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)));
+    if(shadow.audit_backfill)paperBit+=' · from audit';
     if(liveClosed>0){
       const liveBit='LIVE '+liveClosed
         +(liveLosses||liveWins?(' · W'+liveWins+'/L'+liveLosses):'')
@@ -910,7 +951,7 @@ function renderDeskStatusBoard(client){
           :(liveCash?(' · cash '+liveCash):''));
       return paperBit+' · '+liveBit;
     }
-    return paperBit+(shadowTrades===0?' · waits paper SL/TP':'');
+    return paperBit+(shadowTrades===0&&!auditHurt?' · waits paper SL/TP':'');
   })();
   const tiles=[
     {k:'CAN OPEN',v:can?'YES':'NO',cls:can?'ok':'bad',
@@ -965,9 +1006,12 @@ function renderDeskLearn(client){
     deskKv(client.id,'Closes',samples.closed_trades!=null?samples.closed_trades
       :((client.results&&client.results.closed_trades)!=null?client.results.closed_trades:'—')),
     deskKv(client.id,'Edge £',lh.edge_closes!=null?lh.edge_closes:'—'),
-    deskKv(client.id,'Shadow £',shadow.paper_net,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Shadow £',
+      (shadow.display_net!=null?shadow.display_net:shadow.paper_net),
+      v=>v==null?'—':num(v,2)+(shadow.unit==='price'?' pts':'')),
     deskKv(client.id,'W/L',
-      (shadow.wins!=null||shadow.losses!=null||shadow.paper_net!=null)
+      (shadow.wins!=null||shadow.losses!=null
+        ||shadow.display_net!=null||shadow.paper_net!=null)
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
@@ -1332,19 +1376,32 @@ function renderDeskIntel(client){
   // Full reason text — CSS wraps; do not hard-truncate GATE/NEWS to ellipsis junk.
   const push=(tag,t,cls,src)=>chips.push({tag,t:String(t),cls,src:src||'NEURAL'});
   if(news&&typeof news==='object'){
-    const risk=news.risk||news.level||news.status||news.summary;
-    const label=news.headline||news.event||news.next||news.reason||risk;
-    const bear=String(risk||'').toLowerCase().includes('high')||String(news.status||'').includes('BLOCK');
-    if(label)push(bear?'BEARISH':'NEUTRAL',label,bear?'bear':'neu',news.source||'NEWS');
+    const st=String(news.status||'');
+    const risk=news.risk||news.level||st||news.summary;
+    const label=news.headline||news.event||news.next||news.reason||risk||st;
+    const bear=st==='NEWS_WINDOW'||st==='HIGH_IMPACT'||st==='CALENDAR_UNAVAILABLE'
+      ||String(risk||'').toLowerCase().includes('high')
+      ||String(st).includes('BLOCK')
+      ||news.entry_allowed===false;
+    if(label)push(bear?'BEARISH':'NEUTRAL',
+      (st&&st!=='CLEAR'?st+' · ':'')+String(label).slice(0,140),
+      bear?'bear':'neu',news.source||'NEWS');
   }else if(typeof news==='string'&&news){
     push('NEWS',news,'neu','FEED');
   }
   if(im&&typeof im==='object'){
-    const lean=im.lean||im.bias||im.regime||im.summary||im.status;
-    const cls=String(lean||'').toLowerCase().includes('bull')?'bull'
-      :(String(lean||'').toLowerCase().includes('bear')?'bear':'neu');
-    if(lean)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
-      String(lean),cls,'INTERMARKET');
+    const st=String(im.status||'');
+    const lean=im.lean||im.bias||im.regime||im.summary||st;
+    const peers=Array.isArray(im.peers)?im.peers:[];
+    const readyN=peers.filter(p=>p&&p.ready).length;
+    const reason=im.reason?String(im.reason).slice(0,90):'';
+    const cls=st==='CONTRADICTION'||String(lean||'').toLowerCase().includes('bear')?'bear'
+      :(String(lean||'').toLowerCase().includes('bull')?'bull':'neu');
+    const line=[lean||st,
+      (readyN||peers.length)?(`peers ${readyN}/${peers.length}`):null,
+      reason&&reason!==String(lean)?reason:null].filter(Boolean).join(' · ');
+    if(line)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
+      line,cls,'INTERMARKET');
   }
   if(sit&&typeof sit==='object'){
     const tip=sit.tip||sit.summary||sit.last||sit.note;

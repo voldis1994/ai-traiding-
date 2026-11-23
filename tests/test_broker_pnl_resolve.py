@@ -140,11 +140,11 @@ def test_funds_transactions_beat_conflicting_activity():
 
 
 def test_row_cash_pnl_prefers_funds_pnl_not_account_profit_loss():
-    """accounts.balance.profitLoss is open P&L — ignore on closed TRADE rows."""
+    """TRADE-row profitLoss is phone Funds £; pnl/cash still win when both present."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
         assert e._row_cash_pnl({'pnl':'-0.27','profitLoss':1.55})==pytest.approx(-0.27)
         assert e._row_cash_pnl({'cash':'£0.33'})==pytest.approx(0.33)
-        # profitLoss alone must not settle a closed trade.
-        assert e._row_cash_pnl({'profitLoss':1.55}) is None
+        # Live Capital sometimes only stamps profitLoss on the TRADE row.
+        assert e._row_cash_pnl({'profitLoss':'-1.55'})==pytest.approx(-1.55)

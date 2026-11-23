@@ -7,7 +7,7 @@ import pytest
 
 from app.autonomy import AutoEvolution
 from app.engine import Store, SingleTradeEngine
-from app.runtime_hub import RuntimeHub
+from app.runtime_hub import AccountRuntime, RuntimeHub
 from tests.test_learning_integrity import new_brain
 from tests.test_broker_pnl_resolve import HistoryBroker
 
@@ -54,6 +54,29 @@ def test_upl_snapshot_uses_account_not_position_usd():
         e.account={}
         e._snapshot_open_upl({'dealId':'y','upl':0.05,'currency':'USD','level':2650.})
         assert store.get('last_upl:y')['currency'] is None
+
+
+def test_mapped_open_position_currency_is_account_not_gold_usd():
+    """Capital tags GOLD with quote USD — Admin must never show Open … USD."""
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+        mapped=e._map_positions([{
+            'position':{
+                'dealId':'g1','direction':'BUY','size':'0.1','level':2650,
+                'upl':-0.15,'currency':'USD','stopLevel':2660,'profitLevel':2640,
+            },
+            'market':{'epic':'GOLD'},
+        }])
+        assert len(mapped)==1
+        assert mapped[0]['currency']=='GBP'
+        rt=AccountRuntime.__new__(AccountRuntime)
+        enriched=rt._enrich_positions(e,[{
+            'dealId':'g1','epic':'GOLD','direction':'BUY','size':'0.1',
+            'level':2650,'upl':-0.15,'currency':'USD',
+        }])
+        assert enriched[0]['currency']=='GBP'
 
 
 def test_repair_relabels_usd_broker_rows_to_gbp():

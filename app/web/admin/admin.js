@@ -163,6 +163,16 @@ function money(v,ccy){
   const sign=n>0?'+':'';
   return sign+num(n,2)+(ccy?' '+ccy:'');
 }
+/** Account cash currency for open floating P&L — never GOLD quote USD / pnl_currency invent. */
+function accountCashCcy(c){
+  const a=(c&&c.activity)||{};
+  const bal=(a.balance&&typeof a.balance==='object')?a.balance:{};
+  const raw=(c&&c.account_currency)||a.currency||bal.currency||'GBP';
+  const ccy=String(raw||'GBP').trim().toUpperCase();
+  // Capital tags GOLD positions with quote USD — that is NOT account cash.
+  if(ccy==='USD'&&String((c&&c.account_currency)||'').toUpperCase()==='GBP')return 'GBP';
+  return ccy||'GBP';
+}
 function esc(s){
   return String(s??'').replace(/[&<>"']/g,c=>({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -849,12 +859,13 @@ function renderDeskLevels(view,client){
   const profit=lvl(pos&&pos.profitLevel,open[0]&&open[0].profit);
   const mid=view&&view.mid!=null?view.mid:a.market_mid;
   const upl=pos&&pos.upl!=null&&Number.isFinite(Number(pos.upl))?Number(pos.upl):null;
-  const ccy=(a.balance&&a.balance.currency)||a.currency||'';
+  const ccy=accountCashCcy(client);
   const bits=[];
   if(stop!=null)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
   if(entry!=null)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
   if(profit!=null)bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
-  if(upl!=null)bits.push(`<span class="psx-lvl mid">UPL ${esc(money(upl,ccy))}</span>`);
+  // Open floating cash in account currency — never label as inventēts UPL/USD.
+  if(upl!=null)bits.push(`<span class="psx-lvl mid">Open ${esc(money(upl,ccy))}</span>`);
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
 }
@@ -925,7 +936,7 @@ function renderDeskStatusBoard(client){
   const samples=ds.samples||{};
   const knobs=ds.knobs||{};
   const can=!!(ds.can_open||a.entry_can_submit_now);
-  const block=ds.entry_block||a.entry_block_reason||'—';
+  const block=humanEntryBlock(ds.entry_block||a.entry_block_reason)||'—';
   const intent=ds.entry_intent||a.entry_intent||a.policy_proposal||'—';
   const closeExec=ds.neural_close_executable!==false&&a.neural_close_executable!==false;
   const exitIntent=ds.neural_exit_intent||a.neural_exit_intent||'—';
@@ -1450,7 +1461,10 @@ function renderDeskIntel(client){
       'neu','FORWARD');
   }
   if(lh.message)push('NEUTRAL',lh.message,'neu','LEARN');
-  if(a.entry_block_reason)push('BEARISH',a.entry_block_reason,'bear','GATE');
+  if(a.entry_block_reason){
+    const hb=humanEntryBlock(a.entry_block_reason);
+    if(hb)push('BEARISH',hb,'bear','GATE');
+  }
   if(a.fusion_block_reason)push('BEARISH',a.fusion_block_reason,'bear','FUSION');
   if(a.flow_consensus&&typeof a.flow_consensus==='object'){
     const fc=a.flow_consensus;
@@ -1910,8 +1924,9 @@ function positionMid(p,activity){
 function collectOpenTrades(clients){
   const rows=[];
   (clients||[]).forEach(c=>{
-    const a=c.activity||{},r=c.results||{};
-    const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+    const a=c.activity||{};
+    // Never r.pnl_currency here — closed-row USD tags used to paint Open … USD.
+    const ccy=accountCashCcy(c);
     const positions=Array.isArray(a.positions)&&a.positions.length
       ?a.positions
       :(a.position?[a.position]:[]);
@@ -1960,7 +1975,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
   if(!rows.length)return `<div class="empty">${esc(empty)}</div>`;
   return `<table class="data"><thead><tr>
     <th>Instruments</th><th>Klients</th><th>Virziens</th><th>Apjoms</th>
-    <th>Atvēršanas</th><th>Pašreizējā</th><th>P&amp;L</th>
+    <th>Atvēršanas</th><th>Pašreizējā</th><th>Open</th>
   </tr></thead><tbody>${rows.map(r=>`<tr>
     <td><div class="inst"><span class="badge">${icon(instrumentIcon(r.epic))}</span>${esc(r.epic)}</div></td>
     <td>${esc(r.client)}</td>
@@ -1968,7 +1983,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
     <td>${esc(r.size==null?'—':String(r.size))}</td>
     <td>${esc(num(r.open,5))}</td>
     <td>${esc(r.current==null?'—':num(r.current,5))}</td>
-    <td class="${pnlClass(r.upl)}">${esc(money(r.upl,r.currency))}</td>
+    <td class="${pnlClass(r.upl)}">${esc(money(r.upl,r.currency||'GBP'))}</td>
   </tr>`).join('')}</tbody></table>`;
 }
 
@@ -2054,47 +2069,83 @@ function renderSummary(data){
     </article>
     <article class="stat">
       <span class="label">Kopējais P&amp;L</span>
-      <b class="${pnlClass(pnlNum)}">${esc(pnlLabel)}<small class="stat-sub">${esc(pnlNote)}</small></b>
+      <b class="${pnlClass(pnlNum)}">${esc(pnlNum==null?'gaida Funds £':pnlLabel)}<small class="stat-sub">${esc(
+        pnlNum==null?' · nav Capital closes':' · Capital £')}</small></b>
       <div class="stat-icon">${icon('layers')}</div>
       ${delta!=null?`<span class="delta-pill ${delta<0?'neg':''}">${delta>=0?'+':''}${delta.toFixed(2)}%</span>`:''}
     </article>`);
 
-  // Performance header prefers live balances, else honest working P&L.
+  // PERFORMANCE = focused client equity (never sum all 4 accounts into one number).
   const {ccy}=fleetPnl(s,clients);
-  let bal=null;
-  clients.forEach(c=>{
-    const balObj=((c.activity||{}).balance)||{};
+  const focusId=$('deskFocus')&&$('deskFocus').value;
+  const focus=clients.find(c=>String(c.id)===String(focusId))||clients[0]||null;
+  const focusBal=(()=>{
+    if(!focus)return null;
+    const balObj=((focus.activity||{}).balance)||{};
     const v=balObj.balance??balObj.available??balObj.deposit??null;
-    if(v!=null && Number.isFinite(Number(v)))bal=(bal||0)+Number(v);
-  });
-  if(bal!=null){
-    $('perfValue').textContent=money(bal,ccy||'').replace(/^\+/,'');
+    return (v!=null&&Number.isFinite(Number(v)))?Number(v):null;
+  })();
+  const focusCcy=(focus&&(focus.account_currency||(focus.results||{}).pnl_currency))||ccy||'GBP';
+  const focusName=focus?(focus.display_name||focus.username||('#'+focus.id)):'—';
+  if(focusBal!=null){
+    $('perfValue').textContent=money(focusBal,focusCcy).replace(/^\+/,'');
   }else if(pnlNum!=null){
-    $('perfValue').textContent=money(pnlNum,ccy);
+    $('perfValue').textContent=money(pnlNum,focusCcy);
   }else{
-    $('perfValue').textContent=pnlLabel;
+    $('perfValue').textContent='—';
   }
   const el=$('perfDelta');
-  if(Number.isFinite(pnlNum) && Math.abs(pnlNum)>0){
-    el.textContent=(pnlNum>=0?'+':'')+num(pnlNum,2)+(ccy?' '+ccy:'');
-    el.classList.toggle('neg',pnlNum<0);
-  }else{
-    el.textContent=open.length?`${open.length} open`:'—';
-    el.classList.remove('neg');
+  el.textContent=focus?`${focusName} · equity`:(open.length?`${open.length} open`:'—');
+  el.classList.remove('neg');
+  // Per-client equity strip — each account separate (no fleet sum).
+  const strip=$('perfClients');
+  if(strip){
+    const bits=(clients||[]).map(c=>{
+      const balObj=((c.activity||{}).balance)||{};
+      const v=balObj.balance??balObj.available??balObj.deposit??null;
+      const ccyC=c.account_currency||((c.results||{}).pnl_currency)||'GBP';
+      const nm=c.display_name||c.username||('#'+c.id);
+      const on=focus&&String(c.id)===String(focus.id)?' on':'';
+      const val=(v!=null&&Number.isFinite(Number(v)))?money(Number(v),ccyC).replace(/^\+/,''):'—';
+      return `<button type="button" class="perf-client${on}" data-perf-id="${c.id}" title="${esc(nm)}">
+        <span>${esc(nm)}</span><strong>${esc(val)}</strong></button>`;
+    }).join('');
+    stableHtml(strip,bits||'<span class="muted">Nav klientu</span>');
+    strip.querySelectorAll('[data-perf-id]').forEach(btn=>{
+      btn.onclick=()=>{
+        const sel=$('deskFocus');
+        if(sel){sel.value=btn.dataset.perfId;sel.dispatchEvent(new Event('change',{bubbles:true}))}
+      };
+    });
   }
+}
+
+function parseCloseTs(raw){
+  if(raw==null||raw==='')return NaN;
+  let s=String(raw).trim();
+  if(!s)return NaN;
+  // Capital often returns "2026-11-23T21:15:00" without Z — treat as UTC.
+  if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)&&!/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)){
+    s=s.replace(/ /,'T')+'Z';
+  }
+  const ts=Date.parse(s);
+  return Number.isFinite(ts)?ts:NaN;
 }
 
 function buildEquitySeries(clients,range){
   const trades=[];
-  (clients||[]).forEach(c=>{
+  const focusId=$('deskFocus')&&$('deskFocus').value;
+  const pool=(clients||[]).filter(c=>!focusId||String(c.id)===String(focusId));
+  const useClients=pool.length?pool:(clients||[]);
+  useClients.forEach(c=>{
     const r=c.results||{};
-    const ccy=r.pnl_currency||c.account_currency||'';
+    const ccy=r.pnl_currency||c.account_currency||'GBP';
     (r.recent_trades||[]).forEach((t)=>{
       // Capital £ closes only — skip ≈UPL and rows without a real close time.
-      if(String(t.pnl_source||'').toLowerCase()!=='broker')return;
+      if(!isCapitalFundsSrc(t.pnl_source))return;
       const pnl=Number(t.pnl);
-      if(!Number.isFinite(pnl))return;
-      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'');
+      if(!Number.isFinite(pnl)||Math.abs(pnl)<1e-12)return;
+      const ts=parseCloseTs(t.closed_at||t.closed||t.time||t.ts||'');
       if(!Number.isFinite(ts))return;
       trades.push({ts,pnl,ccy:t.pnl_currency||ccy});
     });
@@ -2133,7 +2184,9 @@ function drawPerfChart(clients){
     ctx.fillStyle='#8a9a92';
     ctx.font='13px Manrope,sans-serif';
     ctx.textAlign='center';
-    ctx.fillText('Nav broker cash closes šajā periodā',cssW/2,cssH/2);
+    ctx.fillText('Nav Capital Funds £ closes šajā periodā',cssW/2,cssH/2-8);
+    ctx.font='11px Manrope,sans-serif';
+    ctx.fillText('Gaida /api/v1/history/transactions — ne UPL',cssW/2,cssH/2+12);
     ctx.textAlign='left';
     return;
   }
@@ -2218,6 +2271,39 @@ function renderTopClients(clients){
     </div>`).join(''));
 }
 
+function humanEntryBlock(raw){
+  let s=String(raw||'').trim();
+  if(!s)return '';
+  // Strip legacy "UPL -0.15" / deal UUID / dmu noise from older engines.
+  s=s.replace(/\bUPL\b\s*[+\-]?\d+(?:\.\d+)?/gi,'')
+     .replace(/\bUPL\b\s*USD\b/gi,'')
+     .replace(/\b(?:deal|dmu)\s+[0-9a-f-]{8,}/gi,'')
+     .replace(/\bemitting block for manual fusion vote\b/gi,'')
+     .replace(/\s*[—\-·]+\s*/g,' — ')
+     .replace(/^(?:\s*[—\-·]\s*)+|(?:\s*[—\-·]\s*)+$/g,'')
+     .replace(/\s{2,}/g,' ')
+     .trim();
+  const low=s.toLowerCase();
+  if(low.includes('no adaptive')||low.includes('no adoptive')||
+     low.includes('adoptive size')||low.includes('adaptive size')||
+     low.includes('manual trade')){
+    return 'Nav pieņemta lot šajā sesijā — atver jaunu manuālu treidu Capital.com';
+  }
+  if(low.includes('existing open')||low.includes('open position')){
+    if(low.includes('fusion')||low.includes('neural')){
+      return 'Jau ir atvērta pozīcija — gaida neironu apstiprinājumu pirms nākamā OPEN';
+    }
+    return 'Jau ir atvērta pozīcija — gaida aizvēršanu';
+  }
+  if(low.includes('fusion')||low.includes('neural')){
+    return 'Gaida neironu / tirgus konteksta apstiprinājumu';
+  }
+  if(low.includes('waiting')){
+    return 'Gaida nosacījumu — '+s.slice(0,120);
+  }
+  return s.slice(0,160);
+}
+
 function collectRiskAlerts(clients){
   const alerts=[];
   (clients||[]).forEach(c=>{
@@ -2225,29 +2311,23 @@ function collectRiskAlerts(clients){
     const hr=c.hard_risk||{};
     const dd=hr.equity_drawdown_pct??hr.drawdown_pct??hr.current_drawdown_pct;
     if(dd!=null && Number(dd)>=5){
-      alerts.push({title:`${name} — augsts drawdown`,detail:'Equity drawdown',metric:Number(dd).toFixed(1)+'%'});
+      alerts.push({title:`${name} — liels kritums`,detail:'Konta equity drawdown',metric:Number(dd).toFixed(1)+'%'});
     }
     if(hr.trading_halted){
-      alerts.push({title:`${name} — tirdzniecība apturēta`,detail:hr.halt_reason||'Hard risk halt',metric:'HALT'});
+      alerts.push({title:`${name} — apturēts`,detail:humanEntryBlock(hr.halt_reason)||'Hard-risk limīts',metric:'HALT'});
     }
     const a=c.activity||{};
     if(a.entry_block_reason){
-      alerts.push({title:`${name} — ieeja bloķēta`,detail:String(a.entry_block_reason),metric:'BLOCK'});
+      alerts.push({
+        title:`${name} — pagaidām bez jauna OPEN`,
+        detail:humanEntryBlock(a.entry_block_reason),
+        metric:'WAIT'});
     }
     if(a.error||c.last_start_error||a.last_start_error){
-      alerts.push({title:`${name} — kļūda`,detail:String(a.error||c.last_start_error||a.last_start_error),metric:'ERR'});
+      alerts.push({title:`${name} — kļūda`,detail:String(a.error||c.last_start_error||a.last_start_error).slice(0,140),metric:'ERR'});
     }
-    (a.positions||(a.position?[a.position]:[])).forEach(p=>{
-      if(!p)return;
-      const epic=String(p.epic||'');
-      // Heuristic volatility flag when UPL swings hard vs size
-      const upl=Math.abs(Number(p.upl)||0);
-      if(upl>50){
-        alerts.push({title:`${epic||'INSTR'} — paaugstināta kustība`,detail:name,metric:(upl>=0?'+':'')+upl.toFixed(0)});
-      }
-    });
   });
-  return alerts.slice(0,4);
+  return alerts.slice(0,6);
 }
 
 function renderRiskAlerts(clients){
@@ -2285,7 +2365,8 @@ function renderRiskBoard(clients){
       <div class="kv"><span>Dienas zaud. limits</span><b>${esc(hr.daily_loss_limit??'—')}</b></div>
       <div class="kv"><span>Drawdown limits</span><b>${esc(hr.equity_drawdown_limit??'—')}</b></div>
       <div class="kv"><span>Halt iemesls</span><b>${esc(hr.halt_reason||'—')}</b></div>
-      <div class="kv"><span>Entry block</span><b>${esc((c.activity||{}).entry_block_reason||'—')}</b></div>
+      <div class="kv"><span>Kāpēc nav jauna OPEN</span><b>${esc(
+        humanEntryBlock((c.activity||{}).entry_block_reason)||'—')}</b></div>
     </article>`;
   }).join(''));
 }
@@ -2335,8 +2416,13 @@ function renderDeal(p,ccy,activity){
   const tpOn=!!(p.has_tp||(p.profitLevel!=null&&Number(p.profitLevel)>0));
   const trailOn=activity&&activity.trail_enabled===true;
   const phase=trailOn?(p.trail_phase||(p.enrolled?'armed':'flat')):'flat';
-  // Account currency only — never GOLD quote USD from position.currency.
-  const uplCcy=ccy||'GBP';
+  // Never p.currency (GOLD quote USD). Never invent UPL label.
+  let uplCcy=String(ccy||'GBP').trim().toUpperCase()||'GBP';
+  if(uplCcy==='USD'){
+    // GOLD quote leak — Capital GBP accounts settle open cash in GBP.
+    const acct=String((activity&&(activity.currency||(activity.balance&&activity.balance.currency)))||'').trim().toUpperCase();
+    if(acct==='GBP'||!acct)uplCcy='GBP';
+  }
   const mid=positionMid(p,activity);
   const slTxt=(p.stopLevel!=null&&Number(p.stopLevel)>0)?esc(num(p.stopLevel,2)):'OFF';
   const tpTxt=(p.profitLevel!=null&&Number(p.profitLevel)>0)?esc(num(p.profitLevel,2)):'OFF';
@@ -2350,7 +2436,7 @@ function renderDeal(p,ccy,activity){
         <span>Mid <strong>${mid==null?'—':esc(num(mid,2))}</strong></span>
         <span>SL <strong>${slTxt}</strong></span>
         <span>TP <strong>${tpTxt}</strong></span>
-        <span>UPL <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
+        <span>Open <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
       </div>
     </div>
     <div class="flags">
@@ -2388,7 +2474,8 @@ function renderCard(c){
   const pill=running?(paused?'pause':'on'):'off';
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';
   const broker=c.broker?`${c.broker.display_name}`:'nav brokera';
-  const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+  // Closed Capital £ rows may keep their own pnl_currency; open cards use account only.
+  const ccy=accountCashCcy(c);
   const day=a.day_book||{};
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
   const mandateSize=(a.mandate&&a.mandate.size)||'—';
@@ -2501,7 +2588,7 @@ function renderCard(c){
     </div>
     <div class="muted" style="padding:4px 8px;font-size:9px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)
-        ?(' · '+esc(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error))
+        ?(' · '+esc(humanEntryBlock(a.entry_block_reason)||a.error||c.last_start_error||a.last_start_error))
         :''
     }</div>
     <div class="trades">${trades}</div>

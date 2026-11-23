@@ -61,10 +61,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=137' in html
-    assert 'admin.js?v=165' in html
+    assert 'admin.css?v=138' in html
+    assert 'admin.js?v=170' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 257' in hub
+    assert 'DESK_TRUTH_REV = 261' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
@@ -181,13 +181,29 @@ def test_client_closes_marks_upl_vs_capital():
 
 
 def test_open_pnl_uses_account_currency_not_gold_quote_usd():
-    """GOLD position.currency=USD must not label UPL as USD on a GBP account."""
+    """GOLD position.currency=USD must not label open cash as USD on a GBP account."""
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'p.currency&&p.currency!==ccy?p.currency:ccy' not in js.replace(' ', '')
     assert 'Always account cash currency' in js or 'Account currency only' in js
-    # collectOpenTrades stamps account ccy (fallback GBP).
     chunk = js.split('function collectOpenTrades')[1].split('function instrumentIcon')[0]
-    assert "currency:ccy||'GBP'" in chunk.replace(' ', '') or "currency:ccy||\"GBP\"" in chunk
+    assert 'accountCashCcy(c)' in chunk
+    assert "currency:ccy||'GBP'" in chunk.replace(' ', '') or 'currency:ccy||"GBP"' in chunk
+    assert 'const ccy=accountCashCcy(c)' in chunk.replace('\n','')
+    assert 'perfClients' in js
+    assert 'humanEntryBlock' in js
+    assert 'parseCloseTs' in js
+    assert '>Open<' in js
+    assert 'function accountCashCcy' in js
+    card = js.split('function renderCard')[1].split('function renderRiskAlerts')[0]
+    assert 'accountCashCcy(c)' in card
+    assert 'UPL {0:.2f}' not in Path('app/engine.py').read_text(encoding='utf-8')
+    assert "bits.append('UPL" not in Path('app/engine.py').read_text(encoding='utf-8')
+    # Deal card must never paint the literal UPL label again.
+    deal = js.split('function renderDeal')[1].split('function renderCard')[0]
+    assert 'UPL <strong' not in deal
+    assert 'Open <strong' in deal
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'id="perfClients"' in html
 
 
 def test_demo_fixture_isolated():

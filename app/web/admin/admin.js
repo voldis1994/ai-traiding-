@@ -854,7 +854,8 @@ function renderDeskLevels(view,client){
   if(stop!=null)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
   if(entry!=null)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
   if(profit!=null)bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
-  if(upl!=null)bits.push(`<span class="psx-lvl mid">UPL ${esc(money(upl,ccy))}</span>`);
+  // Open floating cash in account currency — never label as inventēts UPL/USD.
+  if(upl!=null)bits.push(`<span class="psx-lvl mid">Open ${esc(money(upl,ccy||'GBP'))}</span>`);
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
 }
@@ -925,7 +926,7 @@ function renderDeskStatusBoard(client){
   const samples=ds.samples||{};
   const knobs=ds.knobs||{};
   const can=!!(ds.can_open||a.entry_can_submit_now);
-  const block=ds.entry_block||a.entry_block_reason||'—';
+  const block=humanEntryBlock(ds.entry_block||a.entry_block_reason)||'—';
   const intent=ds.entry_intent||a.entry_intent||a.policy_proposal||'—';
   const closeExec=ds.neural_close_executable!==false&&a.neural_close_executable!==false;
   const exitIntent=ds.neural_exit_intent||a.neural_exit_intent||'—';
@@ -1450,7 +1451,10 @@ function renderDeskIntel(client){
       'neu','FORWARD');
   }
   if(lh.message)push('NEUTRAL',lh.message,'neu','LEARN');
-  if(a.entry_block_reason)push('BEARISH',a.entry_block_reason,'bear','GATE');
+  if(a.entry_block_reason){
+    const hb=humanEntryBlock(a.entry_block_reason);
+    if(hb)push('BEARISH',hb,'bear','GATE');
+  }
   if(a.fusion_block_reason)push('BEARISH',a.fusion_block_reason,'bear','FUSION');
   if(a.flow_consensus&&typeof a.flow_consensus==='object'){
     const fc=a.flow_consensus;
@@ -1960,7 +1964,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
   if(!rows.length)return `<div class="empty">${esc(empty)}</div>`;
   return `<table class="data"><thead><tr>
     <th>Instruments</th><th>Klients</th><th>Virziens</th><th>Apjoms</th>
-    <th>Atvēršanas</th><th>Pašreizējā</th><th>UPL</th>
+    <th>Atvēršanas</th><th>Pašreizējā</th><th>Open £</th>
   </tr></thead><tbody>${rows.map(r=>`<tr>
     <td><div class="inst"><span class="badge">${icon(instrumentIcon(r.epic))}</span>${esc(r.epic)}</div></td>
     <td>${esc(r.client)}</td>
@@ -2257,10 +2261,21 @@ function renderTopClients(clients){
 }
 
 function humanEntryBlock(raw){
-  const s=String(raw||'').trim();
+  let s=String(raw||'').trim();
   if(!s)return '';
+  // Strip legacy "UPL -0.15" / deal UUID / dmu noise from older engines.
+  s=s.replace(/\bUPL\b\s*[+\-]?\d+(?:\.\d+)?/gi,'')
+     .replace(/\bUPL\b\s*USD\b/gi,'')
+     .replace(/\b(?:deal|dmu)\s+[0-9a-f-]{8,}/gi,'')
+     .replace(/\bemitting block for manual fusion vote\b/gi,'')
+     .replace(/\s*[—\-·]+\s*/g,' — ')
+     .replace(/^(?:\s*[—\-·]\s*)+|(?:\s*[—\-·]\s*)+$/g,'')
+     .replace(/\s{2,}/g,' ')
+     .trim();
   const low=s.toLowerCase();
-  if(low.includes('no adoptive')||low.includes('adoptive size')||low.includes('manual trade')){
+  if(low.includes('no adaptive')||low.includes('no adoptive')||
+     low.includes('adoptive size')||low.includes('adaptive size')||
+     low.includes('manual trade')){
     return 'Nav pieņemta lot šajā sesijā — atver jaunu manuālu treidu Capital.com';
   }
   if(low.includes('existing open')||low.includes('open position')){
@@ -2339,7 +2354,8 @@ function renderRiskBoard(clients){
       <div class="kv"><span>Dienas zaud. limits</span><b>${esc(hr.daily_loss_limit??'—')}</b></div>
       <div class="kv"><span>Drawdown limits</span><b>${esc(hr.equity_drawdown_limit??'—')}</b></div>
       <div class="kv"><span>Halt iemesls</span><b>${esc(hr.halt_reason||'—')}</b></div>
-      <div class="kv"><span>Entry block</span><b>${esc((c.activity||{}).entry_block_reason||'—')}</b></div>
+      <div class="kv"><span>Kāpēc nav jauna OPEN</span><b>${esc(
+        humanEntryBlock((c.activity||{}).entry_block_reason)||'—')}</b></div>
     </article>`;
   }).join(''));
 }
@@ -2404,7 +2420,7 @@ function renderDeal(p,ccy,activity){
         <span>Mid <strong>${mid==null?'—':esc(num(mid,2))}</strong></span>
         <span>SL <strong>${slTxt}</strong></span>
         <span>TP <strong>${tpTxt}</strong></span>
-        <span>UPL <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
+        <span>Open £ <strong class="${pnlClass(p.upl)}">${esc(money(p.upl,uplCcy))}</strong></span>
       </div>
     </div>
     <div class="flags">
@@ -2555,7 +2571,7 @@ function renderCard(c){
     </div>
     <div class="muted" style="padding:4px 8px;font-size:9px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)
-        ?(' · '+esc(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error))
+        ?(' · '+esc(humanEntryBlock(a.entry_block_reason)||a.error||c.last_start_error||a.last_start_error))
         :''
     }</div>
     <div class="trades">${trades}</div>

@@ -62,9 +62,9 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=138' in html
-    assert 'admin.js?v=167' in html
+    assert 'admin.js?v=168' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 258' in hub
+    assert 'DESK_TRUTH_REV = 259' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
@@ -189,7 +189,8 @@ def test_open_pnl_uses_account_currency_not_gold_quote_usd():
     assert 'perfClients' in js
     assert 'humanEntryBlock' in js
     assert 'parseCloseTs' in js
-    assert '>UPL<' in js
+    assert '>Open £<' in js
+    assert 'UPL {0:.2f}' not in Path('app/engine.py').read_text(encoding='utf-8')
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'id="perfClients"' in html
 

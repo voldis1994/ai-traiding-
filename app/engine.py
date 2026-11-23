@@ -7859,25 +7859,20 @@ class SingleTradeEngine:
             self.last_signal=copy.deepcopy(self._locked_entry_signal)
 
     def _existing_open_block_reason(self):
-        """Name the live deal + UPL; explain 0% scores while waiting for first vote."""
+        """Name why OPEN is blocked — never paste UPL into the reason string.
+
+        Open floating £ belongs on the position card (account currency). Stuffing
+        ``UPL -0.15`` into entry_block made OI-FUND look like inventēta peļņa.
+        """
         if not self.positions:return 'Existing open position'
-        p=self.positions[0]
-        deal=p.get('dealId')
-        upl=_num(p.get('upl'))
         if self.last_signal is None:
             fusion_cold=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                          and getattr(self.brain,'fusion_schema',None) is not None
                          and not self.latest_fusion_ready)
-            head=('Existing open position · waiting for neural fusion vote'
-                  if fusion_cold else
-                  'Existing open position · waiting for first M1 neural vote')
-        else:
-            head='Existing open position'
-        bits=[head]
-        if deal is not None:bits.append('deal '+str(deal))
-        if upl is not None and math.isfinite(upl):
-            bits.append('UPL {0:.2f}'.format(float(upl)))
-        return ' — '.join(bits)
+            if fusion_cold:
+                return 'Existing open position · waiting for neural fusion vote'
+            return 'Existing open position · waiting for first M1 neural vote'
+        return 'Existing open position'
 
     def _compose_entry_block_reason(self,*,readiness,evaluation,decision):
         """Name the real OPEN blocker — never mask hard-risk as M1 wait."""

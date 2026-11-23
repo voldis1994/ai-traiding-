@@ -4505,7 +4505,7 @@ class SingleTradeEngine:
         try:
             rows=self.store.db.execute(
                 'SELECT deal_id,epic,entry,exit,closed,pnl,pnl_source FROM trades '
-                'WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 80').fetchall()
+                'WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 240').fetchall()
         except Exception:
             return None
         for deal_id,j_epic,j_entry,j_exit,j_closed,j_pnl,j_src in rows:
@@ -4623,8 +4623,54 @@ class SingleTradeEngine:
             deal,pnl=float(pnl),direction=direction,entry=entry,
             source='live_funds_mirror')
 
+    # How far back Funds mirror rewrites already-closed journal £.
+    # Capital rejects >1d ranges — we page day chunks (see fetch helper).
+    FUNDS_MIRROR_DAYS=7
+
+    async def _fetch_capital_funds_trade_rows(self,*,days=None):
+        """Capital TRADE rows for Funds mirror — includes historical closes.
+
+        Pages ≤1 day windows (API rejects longer from/to). Day 0 also uses
+        ``lastPeriod=86400`` for the freshest phone Closed Positions window.
+        """
+        if not self.broker or not hasattr(self.broker,'transactions'):
+            return []
+        from .broker import capital_api_time
+        days=max(1,min(int(days if days is not None else self.FUNDS_MIRROR_DAYS),30))
+        now_utc=datetime.now(timezone.utc)
+        seen=set();out=[]
+        for i in range(days):
+            end=now_utc-timedelta(days=i)
+            start=end-timedelta(days=1)
+            try:
+                if i==0:
+                    payload=await self.broker.transactions(
+                        last_period=86400,tx_type='TRADE')
+                else:
+                    payload=await self.broker.transactions(
+                        from_time=capital_api_time(start),
+                        to_time=capital_api_time(end),
+                        last_period=None,tx_type='TRADE')
+            except Exception as exc:
+                self.store.event('warning','Capital Funds history page failed',
+                                 {'day':i,'type':type(exc).__name__})
+                continue
+            for tx in (payload.get('transactions') or []):
+                if not isinstance(tx,dict):
+                    continue
+                fp=self._tx_fingerprint(tx)
+                key=fp or ('anon:'+str(len(out)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(tx)
+        return out
+
     async def _mirror_capital_funds_closes(self):
-        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (last 24h).
+        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (incl. history).
+
+        Already-closed journal rows are rewritten when Funds £ differs
+        (UPL/confirm invent → real Capital cash; pence drift; zero-poison).
 
         1) Upgrade unsettled / stale journal deals with matched Capital cash.
         2) Fuzzy-bind Funds rows onto UUID closes when dealId refs miss
@@ -4634,12 +4680,11 @@ class SingleTradeEngine:
         if not self.broker or not hasattr(self.broker,'transactions'):
             return 0
         try:
-            payload=await self.broker.transactions(last_period=86400,tx_type='TRADE')
+            rows=await self._fetch_capital_funds_trade_rows()
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror fetch failed',
                              {'type':type(exc).__name__})
             return 0
-        rows=list(payload.get('transactions') or [])
         if not rows:
             return 0
         consumed=self._fuzzy_tx_consumed()

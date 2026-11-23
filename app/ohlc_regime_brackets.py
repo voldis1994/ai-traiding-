@@ -421,6 +421,18 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     stop_distance=stop_d, stop_level=float(stop),
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 
+    rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
+    # ATR/broker floor can widen SL past the structural TP — that is inverted
+    # risk (TP shorter than SL). Refuse; caller may try swing or skip OPEN.
+    if rr_now + 1e-12 < 1.0:
+        return dict(
+            out, reason='regime_rr_below_one',
+            stop_distance=float(stop_d), profit_distance=float(tp2_d),
+            stop_level=float(stop), profit_level=float(tp2),
+            tp1_level=float(tp1), tp2_level=float(tp2),
+            regime=name, rr=float(rr_now), min_rr=float(min_rr),
+            structural_tp=True, structural_rr=False)
+
     # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
     return {
         'ready': True,
@@ -436,9 +448,9 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'tp2_distance': float(tp2_d),
         'swing_hi': float(tp2) if action == 'BUY' else float(stop),
         'swing_lo': float(stop) if action == 'BUY' else float(tp2),
-        'kappa': float(tp2_d / stop_d) if stop_d > 1e-12 else min_rr,
+        'kappa': float(rr_now) if rr_now > 0 else min_rr,
         'min_rr': float(min_rr),
-        'rr': float(tp2_d / stop_d) if stop_d > 1e-12 else None,
+        'rr': float(rr_now),
         'rr_tp1': (float(tp1_d / stop_d) if (long_ladder and stop_d > 1e-12)
                    else None),
         'regime': name,
@@ -446,7 +458,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'zone_sl': bool(zone_sl),
         'zone_tp': True,
         'structural_tp': True,
-        'structural_rr': bool(structural_rr),
+        'structural_rr': bool(structural_rr or rr_now + 1e-12 >= min_rr),
         'buffer': float(buffer),
         'atr_used': float(atr_v) if atr_v is not None else None,
         'bos_event': sc.get('event'),

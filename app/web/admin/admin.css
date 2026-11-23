@@ -235,6 +235,16 @@ body:has(#dash:not(.hidden)){overflow:hidden}
 .overview-main,.overview-side{display:flex;flex-direction:column;gap:4px;min-width:0;min-height:0;overflow:hidden}
 .perf-row{display:flex;align-items:baseline;gap:8px;margin:2px 6px 0;flex-wrap:wrap}
 .perf-row strong{font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:800}
+.perf-clients{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 0;max-width:100%}
+.perf-client{
+  appearance:none;border:1px solid rgba(57,255,136,.18);background:rgba(8,17,13,.7);
+  color:var(--desk-text,#d9e6de);border-radius:3px;padding:3px 6px;cursor:pointer;
+  display:inline-flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:0;
+  font-family:"IBM Plex Mono",monospace;font-size:8px;line-height:1.2}
+.perf-client span{color:var(--desk-muted,#809188);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.perf-client strong{font-size:10px;font-weight:800;color:#e8fff0}
+.perf-client.on{border-color:rgba(57,255,136,.55);background:rgba(57,255,136,.1)}
+.perf-client:hover{border-color:rgba(57,255,136,.4)}
 .range-tabs{display:flex;gap:3px;flex-wrap:nowrap;padding-right:2px}
 .range-tab{
   appearance:none;border:1px solid var(--desk-grid,#1a2534);background:transparent;color:var(--desk-muted,#8c95a6);

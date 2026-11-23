@@ -61,10 +61,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=137' in html
-    assert 'admin.js?v=166' in html
+    assert 'admin.css?v=138' in html
+    assert 'admin.js?v=167' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 257' in hub
+    assert 'DESK_TRUTH_REV = 258' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
@@ -186,6 +186,12 @@ def test_open_pnl_uses_account_currency_not_gold_quote_usd():
     assert 'p.currency&&p.currency!==ccy?p.currency:ccy' not in js.replace(' ', '')
     chunk = js.split('function collectOpenTrades')[1].split('function instrumentIcon')[0]
     assert "currency:ccy||'GBP'" in chunk.replace(' ', '')
+    assert 'perfClients' in js
+    assert 'humanEntryBlock' in js
+    assert 'parseCloseTs' in js
+    assert '>UPL<' in js
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert 'id="perfClients"' in html
 
 
 def test_demo_fixture_isolated():

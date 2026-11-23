@@ -20,8 +20,8 @@ def test_shadow_rail_and_view_exist():
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
-    assert 'admin.css?v=137' in HTML
-    assert 'admin.js?v=166' in HTML
+    assert 'admin.css?v=138' in HTML
+    assert 'admin.js?v=167' in HTML
     assert 'live_news' in JS or 'Live today' in JS
     assert 'auditWindow24' in JS
     assert ('from_journal' in JS or 'Capital journal' in JS or 'from Capital' in JS)

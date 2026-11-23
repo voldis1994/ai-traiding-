@@ -1960,7 +1960,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
   if(!rows.length)return `<div class="empty">${esc(empty)}</div>`;
   return `<table class="data"><thead><tr>
     <th>Instruments</th><th>Klients</th><th>Virziens</th><th>Apjoms</th>
-    <th>Atvēršanas</th><th>Pašreizējā</th><th>P&amp;L</th>
+    <th>Atvēršanas</th><th>Pašreizējā</th><th>UPL</th>
   </tr></thead><tbody>${rows.map(r=>`<tr>
     <td><div class="inst"><span class="badge">${icon(instrumentIcon(r.epic))}</span>${esc(r.epic)}</div></td>
     <td>${esc(r.client)}</td>
@@ -1968,7 +1968,7 @@ function renderTradesTable(rows,{empty='Nav atvērtu treidu'}={}){
     <td>${esc(r.size==null?'—':String(r.size))}</td>
     <td>${esc(num(r.open,5))}</td>
     <td>${esc(r.current==null?'—':num(r.current,5))}</td>
-    <td class="${pnlClass(r.upl)}">${esc(money(r.upl,r.currency))}</td>
+    <td class="${pnlClass(r.upl)}">${esc(money(r.upl,r.currency||'GBP'))}</td>
   </tr>`).join('')}</tbody></table>`;
 }
 
@@ -2054,47 +2054,83 @@ function renderSummary(data){
     </article>
     <article class="stat">
       <span class="label">Kopējais P&amp;L</span>
-      <b class="${pnlClass(pnlNum)}">${esc(pnlLabel)}<small class="stat-sub">${esc(pnlNote)}</small></b>
+      <b class="${pnlClass(pnlNum)}">${esc(pnlNum==null?'gaida Funds £':pnlLabel)}<small class="stat-sub">${esc(
+        pnlNum==null?' · nav Capital closes':' · Capital £')}</small></b>
       <div class="stat-icon">${icon('layers')}</div>
       ${delta!=null?`<span class="delta-pill ${delta<0?'neg':''}">${delta>=0?'+':''}${delta.toFixed(2)}%</span>`:''}
     </article>`);
 
-  // Performance header prefers live balances, else honest working P&L.
+  // PERFORMANCE = focused client equity (never sum all 4 accounts into one number).
   const {ccy}=fleetPnl(s,clients);
-  let bal=null;
-  clients.forEach(c=>{
-    const balObj=((c.activity||{}).balance)||{};
+  const focusId=$('deskFocus')&&$('deskFocus').value;
+  const focus=clients.find(c=>String(c.id)===String(focusId))||clients[0]||null;
+  const focusBal=(()=>{
+    if(!focus)return null;
+    const balObj=((focus.activity||{}).balance)||{};
     const v=balObj.balance??balObj.available??balObj.deposit??null;
-    if(v!=null && Number.isFinite(Number(v)))bal=(bal||0)+Number(v);
-  });
-  if(bal!=null){
-    $('perfValue').textContent=money(bal,ccy||'').replace(/^\+/,'');
+    return (v!=null&&Number.isFinite(Number(v)))?Number(v):null;
+  })();
+  const focusCcy=(focus&&(focus.account_currency||(focus.results||{}).pnl_currency))||ccy||'GBP';
+  const focusName=focus?(focus.display_name||focus.username||('#'+focus.id)):'—';
+  if(focusBal!=null){
+    $('perfValue').textContent=money(focusBal,focusCcy).replace(/^\+/,'');
   }else if(pnlNum!=null){
-    $('perfValue').textContent=money(pnlNum,ccy);
+    $('perfValue').textContent=money(pnlNum,focusCcy);
   }else{
-    $('perfValue').textContent=pnlLabel;
+    $('perfValue').textContent='—';
   }
   const el=$('perfDelta');
-  if(Number.isFinite(pnlNum) && Math.abs(pnlNum)>0){
-    el.textContent=(pnlNum>=0?'+':'')+num(pnlNum,2)+(ccy?' '+ccy:'');
-    el.classList.toggle('neg',pnlNum<0);
-  }else{
-    el.textContent=open.length?`${open.length} open`:'—';
-    el.classList.remove('neg');
+  el.textContent=focus?`${focusName} · equity`:(open.length?`${open.length} open`:'—');
+  el.classList.remove('neg');
+  // Per-client equity strip — each account separate (no fleet sum).
+  const strip=$('perfClients');
+  if(strip){
+    const bits=(clients||[]).map(c=>{
+      const balObj=((c.activity||{}).balance)||{};
+      const v=balObj.balance??balObj.available??balObj.deposit??null;
+      const ccyC=c.account_currency||((c.results||{}).pnl_currency)||'GBP';
+      const nm=c.display_name||c.username||('#'+c.id);
+      const on=focus&&String(c.id)===String(focus.id)?' on':'';
+      const val=(v!=null&&Number.isFinite(Number(v)))?money(Number(v),ccyC).replace(/^\+/,''):'—';
+      return `<button type="button" class="perf-client${on}" data-perf-id="${c.id}" title="${esc(nm)}">
+        <span>${esc(nm)}</span><strong>${esc(val)}</strong></button>`;
+    }).join('');
+    stableHtml(strip,bits||'<span class="muted">Nav klientu</span>');
+    strip.querySelectorAll('[data-perf-id]').forEach(btn=>{
+      btn.onclick=()=>{
+        const sel=$('deskFocus');
+        if(sel){sel.value=btn.dataset.perfId;sel.dispatchEvent(new Event('change',{bubbles:true}))}
+      };
+    });
   }
+}
+
+function parseCloseTs(raw){
+  if(raw==null||raw==='')return NaN;
+  let s=String(raw).trim();
+  if(!s)return NaN;
+  // Capital often returns "2026-11-23T21:15:00" without Z — treat as UTC.
+  if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)&&!/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)){
+    s=s.replace(/ /,'T')+'Z';
+  }
+  const ts=Date.parse(s);
+  return Number.isFinite(ts)?ts:NaN;
 }
 
 function buildEquitySeries(clients,range){
   const trades=[];
-  (clients||[]).forEach(c=>{
+  const focusId=$('deskFocus')&&$('deskFocus').value;
+  const pool=(clients||[]).filter(c=>!focusId||String(c.id)===String(focusId));
+  const useClients=pool.length?pool:(clients||[]);
+  useClients.forEach(c=>{
     const r=c.results||{};
-    const ccy=r.pnl_currency||c.account_currency||'';
+    const ccy=r.pnl_currency||c.account_currency||'GBP';
     (r.recent_trades||[]).forEach((t)=>{
       // Capital £ closes only — skip ≈UPL and rows without a real close time.
-      if(String(t.pnl_source||'').toLowerCase()!=='broker')return;
+      if(!isCapitalFundsSrc(t.pnl_source))return;
       const pnl=Number(t.pnl);
-      if(!Number.isFinite(pnl))return;
-      const ts=Date.parse(t.closed_at||t.closed||t.time||t.ts||'');
+      if(!Number.isFinite(pnl)||Math.abs(pnl)<1e-12)return;
+      const ts=parseCloseTs(t.closed_at||t.closed||t.time||t.ts||'');
       if(!Number.isFinite(ts))return;
       trades.push({ts,pnl,ccy:t.pnl_currency||ccy});
     });
@@ -2133,7 +2169,9 @@ function drawPerfChart(clients){
     ctx.fillStyle='#8a9a92';
     ctx.font='13px Manrope,sans-serif';
     ctx.textAlign='center';
-    ctx.fillText('Nav broker cash closes šajā periodā',cssW/2,cssH/2);
+    ctx.fillText('Nav Capital Funds £ closes šajā periodā',cssW/2,cssH/2-8);
+    ctx.font='11px Manrope,sans-serif';
+    ctx.fillText('Gaida /api/v1/history/transactions — ne UPL',cssW/2,cssH/2+12);
     ctx.textAlign='left';
     return;
   }
@@ -2218,6 +2256,28 @@ function renderTopClients(clients){
     </div>`).join(''));
 }
 
+function humanEntryBlock(raw){
+  const s=String(raw||'').trim();
+  if(!s)return '';
+  const low=s.toLowerCase();
+  if(low.includes('no adoptive')||low.includes('adoptive size')||low.includes('manual trade')){
+    return 'Nav pieņemta lot šajā sesijā — atver jaunu manuālu treidu Capital.com';
+  }
+  if(low.includes('existing open')||low.includes('open position')){
+    if(low.includes('fusion')||low.includes('neural')){
+      return 'Jau ir atvērta pozīcija — gaida neironu apstiprinājumu pirms nākamā OPEN';
+    }
+    return 'Jau ir atvērta pozīcija — gaida aizvēršanu';
+  }
+  if(low.includes('fusion')||low.includes('neural')){
+    return 'Gaida neironu / tirgus konteksta apstiprinājumu';
+  }
+  if(low.includes('waiting')){
+    return 'Gaida nosacījumu — '+s.slice(0,120);
+  }
+  return s.slice(0,160);
+}
+
 function collectRiskAlerts(clients){
   const alerts=[];
   (clients||[]).forEach(c=>{
@@ -2225,29 +2285,23 @@ function collectRiskAlerts(clients){
     const hr=c.hard_risk||{};
     const dd=hr.equity_drawdown_pct??hr.drawdown_pct??hr.current_drawdown_pct;
     if(dd!=null && Number(dd)>=5){
-      alerts.push({title:`${name} — augsts drawdown`,detail:'Equity drawdown',metric:Number(dd).toFixed(1)+'%'});
+      alerts.push({title:`${name} — liels kritums`,detail:'Konta equity drawdown',metric:Number(dd).toFixed(1)+'%'});
     }
     if(hr.trading_halted){
-      alerts.push({title:`${name} — tirdzniecība apturēta`,detail:hr.halt_reason||'Hard risk halt',metric:'HALT'});
+      alerts.push({title:`${name} — apturēts`,detail:humanEntryBlock(hr.halt_reason)||'Hard-risk limīts',metric:'HALT'});
     }
     const a=c.activity||{};
     if(a.entry_block_reason){
-      alerts.push({title:`${name} — ieeja bloķēta`,detail:String(a.entry_block_reason),metric:'BLOCK'});
+      alerts.push({
+        title:`${name} — pagaidām bez jauna OPEN`,
+        detail:humanEntryBlock(a.entry_block_reason),
+        metric:'WAIT'});
     }
     if(a.error||c.last_start_error||a.last_start_error){
-      alerts.push({title:`${name} — kļūda`,detail:String(a.error||c.last_start_error||a.last_start_error),metric:'ERR'});
+      alerts.push({title:`${name} — kļūda`,detail:String(a.error||c.last_start_error||a.last_start_error).slice(0,140),metric:'ERR'});
     }
-    (a.positions||(a.position?[a.position]:[])).forEach(p=>{
-      if(!p)return;
-      const epic=String(p.epic||'');
-      // Heuristic volatility flag when UPL swings hard vs size
-      const upl=Math.abs(Number(p.upl)||0);
-      if(upl>50){
-        alerts.push({title:`${epic||'INSTR'} — paaugstināta kustība`,detail:name,metric:(upl>=0?'+':'')+upl.toFixed(0)});
-      }
-    });
   });
-  return alerts.slice(0,4);
+  return alerts.slice(0,6);
 }
 
 function renderRiskAlerts(clients){

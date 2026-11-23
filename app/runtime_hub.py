@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 257
+DESK_TRUTH_REV = 258
 
 
 def _finite_num(v):
@@ -449,7 +449,7 @@ class RuntimeHub:
                         by_ccy_24h.setdefault(ccy,[]).append(val)
                         if not acct or ccy==acct:
                             signed_24h.append(val)
-                    if len(recent)<12:
+                    if len(recent)<80:
                         recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
                 # Track for harvest only — never invent ≈UPL on Desk.
@@ -597,7 +597,7 @@ class RuntimeHub:
             'win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
-            'recent_trades':recent[:12],
+            'recent_trades':recent[:80],
             # Compact ledger for Admin — Capital Funds £ only.
             'pnl_ledger':[
                 {'pnl':float(v),'source':'broker'} for v in signed

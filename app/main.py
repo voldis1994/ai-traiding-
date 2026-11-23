@@ -455,11 +455,20 @@ async def admin_brokers(_:dict=Depends(require_admin)):
 @app.get('/api/admin/clients')
 async def admin_clients(_:dict=Depends(require_admin)):
     """Legacy list + rich control-panel fields (neural, activity, P&L)."""
+    # Await Funds mirror + news remap + shadow boot BEFORE painting Desk.
+    try:
+        await hub.refresh_live_truth()
+    except Exception:
+        pass
     overview=hub.admin_overview()
     return {'clients':overview['clients'],'summary':overview['summary']}
 
 @app.get('/api/admin/overview')
 async def admin_overview(_:dict=Depends(require_admin)):
+    try:
+        await hub.refresh_live_truth()
+    except Exception:
+        pass
     return {'ok':True,**hub.admin_overview()}
 
 @app.get('/api/admin/clients/{client_id}/structure-view')

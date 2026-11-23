@@ -57,7 +57,7 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=129' in html
-    assert 'admin.js?v=144' in html
+    assert 'admin.js?v=145' in html
     assert 'ohlc-chart.js?v=12' in html
 
 
@@ -77,6 +77,11 @@ def test_status_board_visible_at_once():
     assert 'NEURAL CLOSE' in js
     assert 'STRATEGY CARDS' in js
     assert 'SHADOW £' in js
+    assert 'LIVE 24h £' in js
+    assert "shadowHero==='live24h'" in js
+    assert 'Capital 24h' in js
+    assert "st==='UNMAPPED_INSTRUMENT'" in js
+    assert "softBoot" in js or "softWait" in js
 
 
 def test_desk_panels_have_readable_spacing():

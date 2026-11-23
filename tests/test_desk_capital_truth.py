@@ -207,3 +207,66 @@ def test_lab_payload_news_peers_not_waiting_gate():
         assert 'WAIT' not in str(lab['live_news']['status']).upper() or \
             lab['live_news']['status'] == 'NEWS_NA'
         assert lab['live_peers']['status'] != 'WAITING'
+
+
+def test_refresh_live_truth_awaits_funds_mirror():
+    """Desk poll must await Funds mirror — ensure_future raced −0.81 paint."""
+    import asyncio
+    from types import SimpleNamespace
+
+    async def scenario():
+        calls = {'n': 0}
+
+        class _Eng:
+            broker = object()
+            instrument_profile = {'mapped': False, 'currencies': []}
+            mandate = {'epic': 'CS.D.USCGC.TODAY.IP'}
+            shadow_brain = None
+            intermarket = SimpleNamespace(state={'status': 'WAITING'})
+            store = None
+
+            def _ensure_instrument_mapped(self):
+                self.instrument_profile = {
+                    'mapped': True, 'currencies': ['USD'], 'kind': 'METALS'}
+                return self.instrument_profile
+
+            def _news_risk(self):
+                return {'status': 'CLEAR', 'entry_allowed': True, 'enabled': True}
+
+            def _ensure_shadow_brain(self):
+                self.shadow_brain = object()
+                return self.shadow_brain
+
+            async def _mirror_capital_funds_closes(self):
+                await asyncio.sleep(0)
+                calls['n'] += 1
+                return 1
+
+            def _backfill_mistake_audits_from_journal(self, **_kw):
+                return 0
+
+        class _RT:
+            started = True
+            engine = _Eng()
+
+        class _Platform:
+            def list_clients(self):
+                return [{'id': 1}]
+
+        hub = RuntimeHub.__new__(RuntimeHub)
+        hub.platform = _Platform()
+        hub.get = lambda cid: _RT() if int(cid) == 1 else None
+        out = await hub.refresh_live_truth()
+        assert calls['n'] == 1
+        assert out['mirrored'] == 1
+        assert out['shadow'] == 1
+        assert out['remapped'] == 1
+
+    asyncio.run(scenario())
+
+
+def test_main_awaits_refresh_before_overview():
+    src = Path('app/main.py').read_text(encoding='utf-8')
+    assert 'await hub.refresh_live_truth()' in src
+    assert 'async def admin_clients' in src
+    assert 'async def admin_overview' in src

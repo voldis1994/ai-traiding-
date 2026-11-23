@@ -241,6 +241,46 @@ def test_mirror_fuzzy_binds_funds_onto_uuid_when_ref_misses():
     asyncio.run(scenario())
 
 
+def test_mirror_pence_cousin_when_levels_drift():
+    """Funds −0.89 vs Desk −0.81 with drifted levels must still upgrade UUID."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'uuid-drift', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 3663.3,
+            })
+            store.close_trade(
+                'uuid-drift', 3662.5, -0.81, currency='GBP',
+                source='broker', overwrite=True)
+            store.db.execute(
+                "UPDATE trades SET closed=? WHERE deal_id=?",
+                ('2026-11-23T15:50:00Z', 'uuid-drift'))
+            store.db.commit()
+            # Levels off by >1.5 — old fuzzy gate would orphan and leave −0.81.
+            broker = FundsBroker([{
+                'reference': 'NOUUID', 'instrumentName': 'Gold Spot',
+                'pnl': -0.89, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 3665.0, 'closeLevel': 3664.0,
+                'dateUtc': '2026-11-23T15:50:10Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n >= 1
+            row = next(r for r in store.trades(8) if r['deal_id'] == 'uuid-drift')
+            assert row['pnl'] == pytest.approx(-0.89)
+            orphans = [r for r in store.trades(20)
+                       if str(r['deal_id']).startswith('cap:')
+                       and abs(float(r['pnl'])+0.89)<1e-9]
+            assert not orphans, 'must upgrade UUID, not leave −0.81 + orphan −0.89'
+    asyncio.run(scenario())
+
+
 def test_reaudit_on_penny_funds_upgrade():
     """Cycle must re-diagnose when Funds moves −0.81 → −0.89."""
     async def scenario():

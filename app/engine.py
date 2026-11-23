@@ -1120,7 +1120,9 @@ class SingleTradeEngine:
         if not epic:
             return self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
         cur=self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
-        if cur.get('mapped') and cur.get('currencies'):
+        # Only trust a profile that actually carries currencies — mapped=True with
+        # an empty list still produces UNMAPPED_INSTRUMENT on Desk forever.
+        if cur.get('mapped') and list(cur.get('currencies') or []):
             return cur
         inst={}
         try:
@@ -1133,9 +1135,33 @@ class SingleTradeEngine:
         mkt=getattr(self,'market',None) or {}
         if isinstance(mkt,dict) and mkt.get('instrument_name') and not inst.get('name'):
             inst={**inst,'name':mkt.get('instrument_name')}
+        # Also fold mandate name / instrument_name when Capital epic is opaque.
+        if isinstance(self.mandate,dict):
+            for k in ('instrument_name','name','market_name'):
+                if self.mandate.get(k) and not inst.get('name'):
+                    inst={**inst,'name':self.mandate.get(k)}
+                    break
         prof=instrument_profile(epic,inst)
+        if not prof.get('currencies'):
+            # Last resort: Desk aliases (GOLD) / market name when epic is opaque.
+            mkt=getattr(self,'market',None) or {}
+            alias=str(
+                (self.mandate or {}).get('symbol')
+                or (self.mandate or {}).get('asset')
+                or (mkt.get('symbol') if isinstance(mkt,dict) else None)
+                or (mkt.get('name') if isinstance(mkt,dict) else None)
+                or '').upper()
+            if alias:
+                hint=instrument_profile(alias,inst)
+                if hint.get('currencies'):
+                    prof=hint
+            if not prof.get('currencies') and (
+                    'GOLD' in str(epic).upper() or 'USCGC' in str(epic).upper()
+                    or 'XAU' in str(epic).upper() or 'GOLD' in alias):
+                prof={**(prof or {}),
+                      'epic':epic,'kind':'METALS','currencies':['USD'],'mapped':True}
         if prof.get('currencies'):
-            was_blank=not (cur.get('mapped') and cur.get('currencies'))
+            was_blank=not (cur.get('mapped') and list(cur.get('currencies') or []))
             self.instrument_profile=prof
             # Remap METALS/etc. → force peer rediscovery (was WAITING on UNKNOWN).
             if was_blank:
@@ -4552,12 +4578,43 @@ class SingleTradeEngine:
                 score+=8.0
             if best is None or score<best[0]:
                 best=(score,deal)
-        if best is None:
+        if best is not None and best[0]<=120.0:
+            return best[1]
+        # Pence-cousin pass: confirm/UPL −0.81 vs Funds −0.89, levels missing or
+        # drifted past the 1.5 gate — still one trade, not a second orphan.
+        cousins=[]
+        for deal_id,j_epic,j_entry,j_exit,j_closed,j_pnl,j_src in rows:
+            deal=str(deal_id)
+            if deal in skip:
+                continue
+            if not self._epic_family_match(epic,j_epic):
+                continue
+            old=_num(j_pnl)
+            if old is None or not self._funds_pnl_needs_upgrade(old,j_src,pnl):
+                continue
+            delta=abs(float(old)-float(pnl))
+            if delta<self.FUNDS_PNL_EPS or delta>1.0:
+                continue
+            # Opposite-sign cash is a different close — never glue.
+            if float(old)*float(pnl)<0 and abs(float(old))>=0.05 and abs(float(pnl))>=0.05:
+                continue
+            jt=self._parse_broker_ts(j_closed)
+            if tx_ts is not None and jt is not None:
+                if abs(float(tx_ts)-float(jt))>6*3600:
+                    continue
+                tscore=abs(float(tx_ts)-float(jt))/60.0
+            else:
+                tscore=45.0
+            # Prefer UUID robot deals over other cap: orphans.
+            bonus=8.0 if deal.startswith('cap:') else 0.0
+            cousins.append((delta*10.0+tscore+bonus,deal))
+        if not cousins:
             return None
-        # Reject weak leftover matches.
-        if best[0]>120.0:
-            return None
-        return best[1]
+        cousins.sort(key=lambda x:x[0])
+        # Unique clear winner, or sole candidate.
+        if len(cousins)==1 or cousins[0][0]+3.0<cousins[1][0]:
+            return cousins[0][1]
+        return None
 
     def _apply_funds_pnl_to_deal(self,deal,tx,pnl,*,ccy_default):
         """Overwrite journal deal with Capital Funds £ and re-run cycle."""

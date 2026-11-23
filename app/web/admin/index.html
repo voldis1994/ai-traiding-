@@ -3,11 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NEURAL Trading AI · Komandcentrs</title>
+  <title>VS-System · Desk</title>
+  <link rel="icon" href="/admin/static/vs-logo-mark.png" type="image/png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=136">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=137">
   <script>
   /* Paint Desk immediately on Windows loopback — never flash Operatora ieeja. */
   (function(){
@@ -129,14 +130,14 @@
     <div class="gate-glow" aria-hidden="true"></div>
     <form id="loginForm" class="gate-panel">
       <div class="brand-row">
-        <span class="brand-icon"><svg class="ico"><use href="#i-logo"></use></svg></span>
+        <img class="brand-logo" src="/admin/static/vs-logo-mark.png" width="42" height="42" alt="VS-System">
         <div>
-          <strong>NEURAL</strong>
-          <span>Trading AI</span>
+          <strong>VS-System</strong>
+          <span>Prop desk</span>
         </div>
       </div>
       <h1>Operatora ieeja</h1>
-      <p class="lede">Komandcentrs — flote, treidi, riski vienā skatā.</p>
+      <p class="lede">VS-System — flote, treidi, riski vienā skatā.</p>
       <label>Lietotājvārds<input name="username" required autocomplete="username"></label>
       <label>Parole<input name="password" type="password" required autocomplete="current-password"></label>
       <button class="btn btn-primary full" type="submit">
@@ -151,7 +152,11 @@
   <div id="dash" class="shell hidden">
     <div class="term" id="termShell">
       <header class="term-top">
-        <div class="term-logo"><span class="term-mark">P</span><strong>PerpSignal Desk</strong><span class="term-sub">NEURAL</span></div>
+        <div class="term-logo">
+          <img class="term-mark-img" src="/admin/static/vs-logo-mark.png" width="18" height="18" alt="">
+          <strong>VS-System</strong>
+          <span class="term-sub">DESK</span>
+        </div>
         <label class="term-search" for="deskSearch">
           <input id="deskSearch" type="search" placeholder="Filter tape…" autocomplete="off">
         </label>
@@ -254,9 +259,9 @@
                 </div>
 
                 <div class="psx-cell psx-ind-cell">
-                  <div class="psx-h"><h2>INDICATORS</h2><span class="psx-src">M1 ATR</span><span class="psx-live">● LIVE</span></div>
+                  <div class="psx-h"><h2>INDICATORS</h2><span class="psx-live">● LIVE</span></div>
                   <div id="deskIndCharts" class="psx-ind"></div>
-                  <div id="deskIndicators" class="psx-ind-kv"></div>
+                  <div id="deskIndicators" class="psx-ind-kv" aria-label="Indicator values"></div>
                 </div>
                 <div class="psx-cell psx-deals-cell">
                   <div class="psx-h"><h2>OPEN POSITIONS</h2><span class="psx-src">CLIENT</span><span class="psx-live">● LIVE</span></div>
@@ -477,6 +482,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=12"></script>
-  <script src="/admin/static/admin.js?v=163"></script>
+  <script src="/admin/static/admin.js?v=164"></script>
 </body>
 </html>

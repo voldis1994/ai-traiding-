@@ -295,7 +295,7 @@ function drawOhlcStructure(canvas,view,opts){
   }
 
   if(showLabels&&labels.length){
-    // Right-side SL / ENT / TP tags (PerpSignal style)
+    // Right-side SL / ENT / TP tags (VS-System style)
     labels.sort((a,b)=>a.y-b.y);
     let lastY=-999;
     ctx.font='700 10px "IBM Plex Mono",ui-monospace,monospace';

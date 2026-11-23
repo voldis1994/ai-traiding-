@@ -2,7 +2,7 @@
 'use strict';
 window.NTA_I18N={
   lv:{
-    brand:'Neural Trading',
+    brand:'VS-System',
     tagline:'Tavs robots',
     loginTitle:'Klienta ieeja',
     username:'Lietotājvārds',
@@ -37,7 +37,7 @@ window.NTA_I18N={
     error:'Kļūda',
   },
   en:{
-    brand:'Neural Trading',
+    brand:'VS-System',
     tagline:'Your robot',
     loginTitle:'Client login',
     username:'Username',
@@ -72,7 +72,7 @@ window.NTA_I18N={
     error:'Error',
   },
   ru:{
-    brand:'Neural Trading',
+    brand:'VS-System',
     tagline:'Ваш робот',
     loginTitle:'Вход клиента',
     username:'Логин',

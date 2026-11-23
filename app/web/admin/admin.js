@@ -1652,10 +1652,10 @@ function renderDeskIndCharts(client,view){
     canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
     canvas.style.width=w+'px';canvas.style.height=h+'px';
     const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle='#060a14';ctx.fillRect(0,0,w,h);
+    ctx.fillStyle='#050a08';ctx.fillRect(0,0,w,h);
     const vals=series.map(v=>v==null?50:v);
     const yOf=v=>4+((100-v)/100)*(h-8);
-    ctx.strokeStyle='rgba(40,48,59,.8)';
+    ctx.strokeStyle='rgba(30,52,40,.85)';
     [30,70].forEach(lvl=>{ctx.beginPath();ctx.moveTo(0,yOf(lvl));ctx.lineTo(w,yOf(lvl));ctx.stroke();});
     ctx.strokeStyle=color;ctx.lineWidth=1.2;ctx.beginPath();
     vals.forEach((v,i)=>{const x=(i/Math.max(1,vals.length-1))*w;const y=yOf(v);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
@@ -1668,20 +1668,20 @@ function renderDeskIndCharts(client,view){
     canvas.width=Math.floor(w*dpr);canvas.height=Math.floor(h*dpr);
     canvas.style.width=w+'px';canvas.style.height=h+'px';
     const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.fillStyle='#060a14';ctx.fillRect(0,0,w,h);
+    ctx.fillStyle='#050a08';ctx.fillRect(0,0,w,h);
     const vals=series.map(v=>v==null?0:v);
     const max=Math.max(1,...vals.map(Math.abs));
     const mid=h/2;const slot=w/Math.max(1,vals.length);
     vals.forEach((v,i)=>{
       const bh=(Math.abs(v)/max)*(h/2-2);
-      ctx.fillStyle=v>=0?'#31d59a':'#ef6875';
+      ctx.fillStyle=v>=0?'#39ff88':'#ef6875';
       if(v>=0)ctx.fillRect(i*slot,mid-bh,Math.max(1,slot-.5),bh);
       else ctx.fillRect(i*slot,mid,Math.max(1,slot-.5),bh);
     });
-    ctx.strokeStyle='rgba(130,139,157,.5)';ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(w,mid);ctx.stroke();
+    ctx.strokeStyle='rgba(128,145,136,.45)';ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(w,mid);ctx.stroke();
   };
   const paintBoth=()=>{
-    paintLine($('deskRsiCanvas'),rsi,'#76a0de');
+    paintLine($('deskRsiCanvas'),rsi,'#39ff88');
     paintHist($('deskMacdCanvas'),macd);
   };
   requestAnimationFrame(()=>{paintBoth();requestAnimationFrame(paintBoth);});
@@ -2859,7 +2859,7 @@ document.getElementById('psDesk')?.addEventListener('click',ev=>{
 if(deskDemoMode){
   const badge=$('deskDemoBadge');
   if(badge)badge.classList.remove('hidden');
-  document.title='NEURAL Desk · DEMO fixture';
+  document.title='VS-System Desk · DEMO fixture';
 }
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible' && !$('dash').classList.contains('hidden')){

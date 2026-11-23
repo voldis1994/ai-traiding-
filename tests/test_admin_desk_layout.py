@@ -1,4 +1,4 @@
-"""PerpSignal 1:1 Desk layout — DOM ids and safe UI reset."""
+"""VS-System 1:1 Desk layout — DOM ids and safe UI reset."""
 from pathlib import Path
 
 
@@ -15,16 +15,21 @@ def test_desk_four_column_grid_present():
     assert 'OPEN POSITIONS' in html
     assert 'CLIENT CLOSES' in html
     assert 'AI SCORE LEAN' in html
+    assert 'VS-System' in html
+    assert 'vs-logo-mark.png' in html
 
 
 def test_desk_css_tokens_and_grid_areas():
     css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
     compact = css.replace(' ', '')
-    assert '--desk-bg:#060a14' in compact
+    assert '--desk-bg:#060a09' in compact
     assert 'grid-template-areas' in css
     assert 'chart chart book engine' in css
     assert 'IBM Plex Mono' in css
-    assert 'height:31px' in compact
+    assert 'height:34px' in compact
+    assert '.psx-ind-kv' in css
+    assert 'border-top:1px solid var(--desk-grid)' in css.split('.psx-ind-kv')[1].split('.psx-trades')[0]
+    assert 'term-mark-img' in css
 
 
 def test_ui_reset_never_calls_learning_wipe():
@@ -56,10 +61,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=136' in html
-    assert 'admin.js?v=163' in html
+    assert 'admin.css?v=137' in html
+    assert 'admin.js?v=164' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 254' in hub
+    assert 'DESK_TRUTH_REV = 255' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js

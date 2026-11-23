@@ -564,6 +564,36 @@ def lab_payload(store) -> dict:
             'last_mistakes': r.get('last_mistakes') or [],
         })
     audit = store.get(STORE_KEY) if isinstance(store.get(STORE_KEY), dict) else {}
+    # Prefer last hurt for operator display — a +0.00 scratch must not hide
+    # the 6 Capital minuses the cycle already (or should have) diagnosed.
+    last_hurt = None
+    for h in reversed(hist):
+        if not isinstance(h, dict):
+            continue
+        ms = h.get('mistakes') or []
+        try:
+            pnl_h = float(h.get('pnl'))
+        except (TypeError, ValueError):
+            pnl_h = None
+        if ms or (pnl_h is not None and pnl_h < -0.02):
+            last_hurt = h
+            break
+    display_last = last
+    if isinstance(last, dict) and not (last.get('mistakes') or []):
+        try:
+            last_pnl = float(last.get('pnl'))
+        except (TypeError, ValueError):
+            last_pnl = None
+        if (last_pnl is None or abs(last_pnl) < 0.02) and last_hurt:
+            display_last = {
+                **last_hurt,
+                'display_note': 'showing_last_hurt_not_scratch',
+            }
+    hurt_n = sum(
+        1 for h in hist
+        if isinstance(h, dict) and (
+            (h.get('mistakes') or [])
+            or (isinstance(h.get('pnl'), (int, float)) and float(h['pnl']) < -0.02)))
     return {
         'ok': True,
         'loop': 'diagnose → scenario memory → targeted fix → promote → LIVE',
@@ -572,7 +602,9 @@ def lab_payload(store) -> dict:
         'scenarios': len(bag),
         'ready_count': len(ready),
         'hist_n': len(hist),
-        'last': last,
+        'hurt_n': hurt_n,
+        'last': display_last,
+        'last_raw': last,
         'pending_fix': {
             'committed': bool(pending.get('committed')),
             'fingerprint': pending.get('fingerprint'),

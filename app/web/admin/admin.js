@@ -455,13 +455,15 @@ function renderShadowLab(client){
         <div class="shadow-kv">
           ${_shadowKv('Last mistakes',missTxt,missCls)}
           ${_shadowKv('Last £',auditPnlTxt,auditPnl==null?'neu':(auditPnl>=0?'ok':'bad'))}
-          ${_shadowKv('Scenario',auditLast.scenario||'—')}
+          ${_shadowKv('Hurts',audit.hurt_n!=null?audit.hurt_n:(miss.length?1:0),miss.length||audit.hurt_n?'bad':'neu')}
           ${_shadowKv('Source',auditLast.source||'—')}
         </div>
         <div class="shadow-note">${esc(
-          (Array.isArray(auditLast.notes)&&auditLast.notes.length)
-            ?auditLast.notes.join(' · ')
-            :(audit.loop||'diagnose → memory → fix → promote → LIVE'))}</div>
+          auditLast.display_note==='showing_last_hurt_not_scratch'
+            ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
+            :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
+              ?auditLast.notes.join(' · ')
+              :(audit.loop||'diagnose → memory → fix → promote → LIVE')))}</div>
         <div class="shadow-note">News ${esc(auditLast.news_status||'—')} · peers ${esc(auditLast.intermarket_status||'—')} · zone ${esc(auditLast.zone_side||'—')}</div>
       </div>
     </article>

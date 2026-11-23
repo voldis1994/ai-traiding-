@@ -4592,10 +4592,14 @@ class SingleTradeEngine:
         prev=self.store.get(once) if self.store else None
         if isinstance(prev,dict):
             prev_pnl=_num(prev.get('pnl'))
-            # One pass per deal unless first pass was a different provisional £.
+            # Same £ already audited → skip. Allow re-audit when Capital Funds
+            # overwrites zero-poison / scratch (+0.00) with a real minus.
             if prev_pnl is not None and abs(float(prev_pnl)-pnl_n)<1e-9:
                 return None
-            if prev.get('source') in ('live','live_funds_mirror') and prev_pnl is not None:
+            material=(prev_pnl is None
+                      or abs(float(prev_pnl))<1e-12
+                      or abs(float(prev_pnl)-pnl_n)>=0.05)
+            if not material:
                 return None
         try:
             from . import shadow_mistake_audit as sma
@@ -4632,7 +4636,8 @@ class SingleTradeEngine:
                 apply_ohlc_penalties=False,
             )
             if out and out.get('audited'):
-                self.store.set(once,{'at':now(),'pnl':pnl_n,'source':source})
+                self.store.set(once,{'at':now(),'pnl':pnl_n,'source':source,
+                                    'mistakes':list(out.get('mistakes') or [])})
             return out
         except Exception as exc:
             try:
@@ -4641,6 +4646,45 @@ class SingleTradeEngine:
             except Exception:
                 pass
             return None
+
+    def _backfill_mistake_audits_from_journal(self,*,limit=12):
+        """Re-run cycle on recent Capital £ losses that were missed / +0.00 audited."""
+        if self.store is None:
+            return 0
+        try:
+            rows=self.store.db.execute(
+                "SELECT deal_id,pnl,direction,entry,pnl_source FROM trades "
+                "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
+                "AND pnl_source='broker' "
+                "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
+        except Exception:
+            return 0
+        n=0
+        for deal_id,pnl,direction,entry,src in rows:
+            pnl_n=_num(pnl)
+            if pnl_n is None or abs(float(pnl_n))<1e-12:
+                continue  # still zero — wait for Funds mirror
+            if float(pnl_n)>=0:
+                continue  # wins/scratch — cycle already eases; focus hurts
+            once='mistake_audited_close:'+str(deal_id)
+            prev=self.store.get(once)
+            if isinstance(prev,dict):
+                prev_pnl=_num(prev.get('pnl'))
+                had_mistakes=bool(prev.get('mistakes'))
+                if (prev_pnl is not None and abs(float(prev_pnl)-float(pnl_n))<1e-9
+                        and had_mistakes):
+                    continue
+            out=self._run_mistake_audit_close(
+                deal_id,pnl=float(pnl_n),
+                direction=direction if direction in ('BUY','SELL') else None,
+                entry=_num(entry),source='live_backfill')
+            if out and out.get('audited'):
+                n+=1
+        if n:
+            self.store.event('shadow_mistake_audit',
+                             'Backfilled mistake audits from journal losses',
+                             {'n':n})
+        return n
 
     def _last_upl_as_realized(self,deal_id):
         """Last live Capital UPL in account currency — usable as closed peļņa."""
@@ -4999,6 +5043,12 @@ class SingleTradeEngine:
             await self._mirror_capital_funds_closes()
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror skipped',
+                             {'type':type(exc).__name__})
+        # Cycle must see the 6 Capital minuses — re-audit after Funds £ lands.
+        try:
+            self._backfill_mistake_audits_from_journal(limit=16)
+        except Exception as exc:
+            self.store.event('warning','Mistake-audit backfill skipped',
                              {'type':type(exc).__name__})
 
     async def _reconcile_orphan_open_trades(self):

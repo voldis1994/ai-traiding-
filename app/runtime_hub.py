@@ -741,7 +741,162 @@ class RuntimeHub:
                 }
         except Exception:
             out['knobs'] = {}
+        # Full SHADOW lab — what the operator can watch live (not a fake 100-sweep).
+        try:
+            out['shadow_lab'] = self._shadow_lab_payload(rt, store, sd, out)
+        except Exception as exc:
+            out['shadow_lab'] = {'ok': False, 'error': type(exc).__name__}
         return out
+
+    def _shadow_lab_payload(self, rt, store, sd, desk_out: dict) -> dict:
+        """Compact live picture of every shadow / self-dev loop."""
+        sd = sd if isinstance(sd, dict) else {}
+        paper = desk_out.get('shadow') if isinstance(desk_out.get('shadow'), dict) else {}
+        recent = []
+        open_pos = paper.get('position') if isinstance(paper.get('position'), dict) else None
+        pending = paper.get('pending') if isinstance(paper.get('pending'), dict) else None
+        if store is not None:
+            try:
+                from .shadow_paper import STORE_KEY as PAPER_KEY
+                hist = list(store.get(PAPER_KEY) or [])
+                for row in reversed(hist):
+                    if not isinstance(row, dict):
+                        continue
+                    recent.append({
+                        'at': row.get('at') or row.get('bar_time'),
+                        'direction': row.get('direction'),
+                        'entry': row.get('entry'),
+                        'exit': row.get('exit'),
+                        'paper_pnl': row.get('paper_pnl'),
+                        'exit_reason': row.get('exit_reason'),
+                    })
+                    if len(recent) >= 12:
+                        break
+            except Exception:
+                recent = []
+            if open_pos is None or pending is None:
+                try:
+                    from .shadow_paper import ShadowPaperJournal
+                    live = ShadowPaperJournal(store)
+                    if open_pos is None and isinstance(live.position, dict):
+                        open_pos = live.position
+                    if pending is None and isinstance(live.pending, dict):
+                        pending = live.pending
+                except Exception:
+                    pass
+        hold = sd.get('hold_shadow') if isinstance(sd.get('hold_shadow'), dict) else {}
+        struct = sd.get('structure_shadow') if isinstance(sd.get('structure_shadow'), dict) else {}
+        if store is not None:
+            if not hold:
+                try:
+                    from . import hold_shadow
+                    hold = hold_shadow.strategy_evidence(store)
+                except Exception:
+                    hold = {}
+            if not struct:
+                try:
+                    from . import structure_shadow
+                    struct = structure_shadow.summary(store)
+                except Exception:
+                    struct = {}
+        trial = {}
+        if store is not None:
+            try:
+                from . import self_params as sp_mod
+                pending_sp = sp_mod._pending(store)
+                trial = {
+                    'active': bool(pending_sp.get('trial_active')),
+                    'trial_id': pending_sp.get('trial_id'),
+                    'started_at_trades': int(pending_sp.get('trial_started_at_trades') or 0),
+                    'draft': pending_sp.get('draft'),
+                    'pending_events': len(pending_sp.get('events') or []),
+                    'horizon': (desk_out.get('knobs') or {}).get('horizon'),
+                }
+            except Exception:
+                trial = {}
+        last_dev = {}
+        evo = {}
+        if store is not None:
+            try:
+                raw = store.get('shadow_self_dev_last') or {}
+                if isinstance(raw, dict):
+                    dec = raw.get('decision') if isinstance(raw.get('decision'), dict) else {}
+                    last_dev = {
+                        'promote': bool(dec.get('promote') or dec.get('weights_promoted')),
+                        'rollback': bool(dec.get('rollback')),
+                        'reason': (dec.get('reason')
+                                   or store.get('evolution_last_reason')),
+                        'shadow_neurons': raw.get('shadow_neurons'),
+                        'shadow_dim': raw.get('shadow_dim'),
+                        'live_samples': raw.get('live_samples'),
+                        'paper_cash_samples': raw.get('paper_cash_samples'),
+                        'method': raw.get('method'),
+                    }
+            except Exception:
+                last_dev = {}
+            try:
+                evo = {
+                    'attempts': int(store.get('evolution_attempts') or 0),
+                    'last_reason': store.get('evolution_last_reason'),
+                    # Honesty: policy search is ~3 kinds × ~10 margins ≈ 30, not 100.
+                    'policy_candidates_approx': 30,
+                    'mode': 'paper_book + ~30 policy variants + param trials',
+                }
+            except Exception:
+                evo = {}
+        shadow_on = bool(sd.get('shadow_active'))
+        if not shadow_on and rt is not None:
+            eng = getattr(rt, 'engine', None)
+            shadow_on = bool(eng is not None and getattr(eng, 'shadow_brain', None) is not None)
+        running = False
+        if rt is not None:
+            try:
+                running = bool(getattr(rt, 'running', False) or (
+                    getattr(rt, 'engine', None) is not None))
+            except Exception:
+                running = False
+        cash_n = int(paper.get('cash_trades') or 0)
+        trades_n = int(paper.get('trades') or 0)
+        pulse = 'IDLE'
+        if open_pos or pending:
+            pulse = 'OPEN'
+        elif cash_n or trades_n:
+            pulse = 'LEARNING'
+        elif shadow_on and running:
+            pulse = 'WATCHING'
+        elif running:
+            pulse = 'BOOTING'
+        return {
+            'ok': True,
+            'pulse': pulse,
+            'shadow_active': shadow_on,
+            'robot_attached': running,
+            # Explicit honesty for the operator.
+            'truth': {
+                'hundred_variations': False,
+                'what_runs': (
+                    'One shadow neural + paper SL/TP book; ~30 policy.py edge '
+                    'candidates; self-params trial/commit; HOLD opposite replay; '
+                    'structure graves. Not a 100-parallel sweep.'),
+                'policy_candidates_approx': 30,
+            },
+            'paper': {
+                **paper,
+                'open': open_pos,
+                'pending_fill': pending,
+                'recent': recent,
+            },
+            'hold_shadow': hold if isinstance(hold, dict) else {},
+            'structure_shadow': {
+                'buckets': struct.get('buckets'),
+                'snapshots': struct.get('snapshots'),
+                'last_advice': struct.get('last_advice'),
+                'top': (struct.get('top') or [])[:5],
+            },
+            'trial': trial,
+            'self_dev_last': last_dev,
+            'evolution': evo,
+        }
 
     def admin_client_card(self,client: dict) -> dict:
         """Full operator card for one client — neural, activity, results."""

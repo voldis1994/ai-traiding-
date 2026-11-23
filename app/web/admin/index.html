@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=126">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=127">
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -166,6 +166,7 @@
       <div class="term-body">
         <nav class="psx-rail term-rail" aria-label="Modules">
           <button type="button" class="psx-rail-btn on" data-view="desk" title="Terminal"><b>2</b><i></i><span>TERMINAL</span></button>
+          <button type="button" class="psx-rail-btn" data-view="shadow" title="Shadow lab"><b>S</b><i></i><span>SHADOW</span></button>
           <button type="button" class="psx-rail-btn" data-view="overview" title="Global"><b>3</b><i></i><span>GLOBAL</span></button>
           <button type="button" class="psx-rail-btn" data-view="trades" title="Flow"><b>4</b><i></i><span>FLOW-LIQ</span></button>
           <button type="button" class="psx-rail-btn" data-view="risks" title="OI Fund"><b>5</b><i></i><span>OI-FUND</span></button>
@@ -281,6 +282,18 @@
               <div id="deskFear" class="psx-sink" hidden></div>
             </aside>
           </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="shadow">
+        <div class="term-view shadow-lab">
+          <div class="term-view-head">
+            <h1>SHADOW</h1>
+            <p>Paper book · policy search · param trials · promote / rollback</p>
+            <span class="psx-live" id="shadowPulse">● —</span>
+          </div>
+          <div id="shadowTruth" class="shadow-truth"></div>
+          <div id="shadowBoard" class="shadow-board fill-scroll" aria-label="Shadow lab"></div>
         </div>
       </section>
 
@@ -451,6 +464,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=12"></script>
-  <script src="/admin/static/admin.js?v=132"></script>
+  <script src="/admin/static/admin.js?v=133"></script>
 </body>
 </html>

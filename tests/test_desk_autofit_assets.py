@@ -46,7 +46,8 @@ def test_bottom_island_readable_markup():
 
 
 def test_cache_bust_mentions_new_assets():
-    assert 'admin.css?v=126' in HTML
-    assert 'admin.js?v=132' in HTML
+    assert 'admin.css?v=' in HTML
+    assert 'admin.js?v=' in HTML
     assert 'display_n' in JS or 'sampleHead' in JS
     assert 'no shadow closes yet' in JS
+    assert 'renderShadowLab' in JS

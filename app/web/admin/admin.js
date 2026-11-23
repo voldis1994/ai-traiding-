@@ -326,11 +326,37 @@ function setView(name){
 function shadowLab(client){
   const a=(client&&client.activity)||{};
   const ds=deskSystem(client);
-  return (ds.shadow_lab&&typeof ds.shadow_lab==='object')?ds.shadow_lab
-    :(a.self_development&&typeof a.self_development==='object'
-      ?{paper:a.self_development.shadow_paper||{},hold_shadow:a.self_development.hold_shadow||{},
-        structure_shadow:a.self_development.structure_shadow||{},
-        shadow_active:!!a.self_development.shadow_active}:{})
+  const lab=(ds.shadow_lab&&typeof ds.shadow_lab==='object')?ds.shadow_lab:null;
+  if(lab)return lab;
+  // Never drop mistake_audit — self_development fallback used to wipe 24h W/L.
+  const sd=(a.self_development&&typeof a.self_development==='object')
+    ?a.self_development:{};
+  return {
+    paper:sd.shadow_paper||{},
+    hold_shadow:sd.hold_shadow||{},
+    structure_shadow:sd.structure_shadow||{},
+    shadow_active:!!sd.shadow_active,
+    mistake_audit:sd.mistake_audit||{},
+    pulse:sd.shadow_active?'WATCHING':'BOOTING',
+  };
+}
+
+/** 24h W/L for SHADOW — journal/audit first; CLIENT CLOSES results as last resort. */
+function auditWindow24(audit,client){
+  const w=(audit&&audit.window_24h&&typeof audit.window_24h==='object')
+    ?audit.window_24h:{};
+  if((Number(w.n)||0)>0)return w;
+  const r=(client&&client.results)||{};
+  const n=Number(r.cash_trades!=null?r.cash_trades:r.closed_trades)||0;
+  if(n<=0)return w;
+  const wins=Number(r.display_wins!=null?r.display_wins:r.wins)||0;
+  const losses=Number(r.display_losses!=null?r.display_losses:r.losses)||0;
+  const net=r.realized_pnl!=null?Number(r.realized_pnl):null;
+  return {
+    hours:24,n,wins,losses,scratch:0,net,
+    useful_n:wins,hurt_n:losses,reads:'wins+losses',
+    from_journal:true,from_results:true,
+  };
 }
 
 function _shadowKv(label,val,cls){
@@ -423,7 +449,7 @@ function renderShadowLab(client){
   const missCls=miss.length?'bad':'ok';
   const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const auditPnlTxt=auditPnl==null?'—':((auditPnl>=0?'+':'')+num(auditPnl,2));
-  const win24=audit.window_24h&&typeof audit.window_24h==='object'?audit.window_24h:{};
+  const win24=auditWindow24(audit,client);
   const winN=Number(win24.n)||0;
   const winW=Number(win24.wins)||0;
   const winL=Number(win24.losses)||0;

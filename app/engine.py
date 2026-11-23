@@ -4694,7 +4694,6 @@ class SingleTradeEngine:
             rows=self.store.db.execute(
                 "SELECT deal_id,pnl,direction,entry,pnl_source,closed FROM trades "
                 "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
-                "AND pnl_source='broker' "
                 "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
         except Exception:
             return 0
@@ -4711,10 +4710,16 @@ class SingleTradeEngine:
             pnl_n=_num(pnl)
             if pnl_n is None or abs(float(pnl_n))<1e-12:
                 continue  # still zero — wait for Funds mirror
+            src_s=str(src or '').strip().lower()
+            # Cash-like sources only (broker / late UPL / funds mirror tags).
+            if src_s and src_s not in (
+                    'broker','upl_estimate','funds','capital',''):
+                continue
             # Keep inside the 24h analysis window.
             if closed:
                 try:
-                    ct=datetime.fromisoformat(str(closed).replace('Z','+00:00'))
+                    raw=str(closed).replace('Z','+00:00').replace(' ','T',1)
+                    ct=datetime.fromisoformat(raw)
                     if ct.tzinfo is None:
                         ct=ct.replace(tzinfo=timezone.utc)
                     if ct<cutoff:

@@ -38,7 +38,84 @@ async function api(path,method='GET',payload){
   if(!res.ok)throw Error(typeof body.detail==='string'?body.detail:`HTTP ${res.status}`);
   return body;
 }
-function show(login){$('login').classList.toggle('hidden',!login);$('dash').classList.toggle('hidden',login)}
+function show(login){
+  $('login').classList.toggle('hidden',!login);
+  $('dash').classList.toggle('hidden',login);
+  if(!login){
+    requestAnimationFrame(()=>{deskAutoFit();termViewsAutoFit();});
+  }
+}
+
+/** Clamp helper for Auto-Fit sizing. */
+function clampNum(n,lo,hi){return Math.max(lo,Math.min(hi,Number(n)||lo))}
+
+/**
+ * Desk Auto-Fit — size every window to the viewport WITHOUT CSS scale()/zoom.
+ * Layout order stays fixed; only CSS custom properties (fonts, gaps, tracks) change.
+ */
+function deskAutoFit(){
+  const root=$('psDesk');
+  if(!root)return;
+  const deskView=document.querySelector('.view[data-view="desk"]');
+  if(deskView&&!deskView.classList.contains('active'))return;
+  root.dataset.autofit='1';
+  const w=Math.max(root.clientWidth||0,window.innerWidth-90);
+  const h=Math.max(root.clientHeight||0,window.innerHeight-40);
+  // Prefer readable type; grow on large screens, floor for laptops.
+  const fs=clampNum(Math.round(9.5+h/95+w/420),10,15);
+  const fsSm=clampNum(fs-2,9,13);
+  const fsXs=clampNum(fs-3,8,11);
+  const fsMd=clampNum(fs-1,10,14);
+  const fsLg=clampNum(fs+3,13,20);
+  const fsXl=clampNum(fs+5,15,24);
+  const gap=clampNum(Math.round(2.5+h/260+w/700),3,8);
+  const pad=clampNum(gap+1,4,10);
+  const headH=clampNum(Math.round(20+fs*0.45),22,30);
+  const tapeH=clampNum(Math.round(16+fs*0.35),18,26);
+  const statusMin=clampNum(Math.round(48+fs*1.2),52,78);
+  // Side windows: ~15–18% width each, never collapse the center chart.
+  let side=clampNum(Math.round(w*0.155),140,280);
+  if(w<1100)side=clampNum(Math.round(w*0.13),110,180);
+  if(w<900)side=clampNum(Math.round(w*0.12),96,150);
+  // Chart row gets more height on tall screens.
+  const r1=h>=900?'1.55fr':(h>=720?'1.4fr':(h>=600?'1.3fr':'1.2fr'));
+  const set=(k,v)=>root.style.setProperty(k,v);
+  set('--desk-fs',fs+'px');
+  set('--desk-fs-xs',fsXs+'px');
+  set('--desk-fs-sm',fsSm+'px');
+  set('--desk-fs-md',fsMd+'px');
+  set('--desk-fs-lg',fsLg+'px');
+  set('--desk-fs-xl',fsXl+'px');
+  set('--desk-gap',gap+'px');
+  set('--desk-pad',pad+'px');
+  set('--desk-head-h',headH+'px');
+  set('--desk-tape-h',tapeH+'px');
+  set('--desk-status-min',statusMin+'px');
+  set('--desk-col-intel',side+'px');
+  set('--desk-col-right',side+'px');
+  set('--desk-grid-c1','minmax(0,1fr)');
+  set('--desk-grid-c2','minmax(0,1.45fr)');
+  set('--desk-grid-c3','minmax(0,1.05fr)');
+  set('--desk-grid-c4','minmax(0,1fr)');
+  set('--desk-grid-r1','minmax(0,'+r1+')');
+  set('--desk-grid-r2','minmax(0,1fr)');
+  root.dataset.autofitW=String(Math.round(w));
+  root.dataset.autofitH=String(Math.round(h));
+  root.dataset.autofitFs=String(fs);
+}
+
+/** Non-desk modules: fill the shell; only inner .fill-scroll scrolls. */
+function termViewsAutoFit(){
+  const shell=$('termShell')||document.querySelector('.term');
+  if(!shell)return;
+  const h=window.innerHeight;
+  const fs=clampNum(Math.round(9+h/110),9,13);
+  shell.style.setProperty('--term-fit-fs',fs+'px');
+  document.querySelectorAll('.term-main>.view:not([data-view="desk"]) .term-view').forEach(el=>{
+    el.style.minHeight='0';
+    el.style.height='100%';
+  });
+}
 
 /** Browser fullscreen for the Admin terminal (desktop). Needs a user gesture. */
 let deskFsArmed=false;
@@ -232,6 +309,7 @@ function setView(name){
   document.querySelectorAll('.view').forEach(v=>{
     v.classList.toggle('active',v.dataset.view===name);
   });
+  scheduleDeskAutoFit();
   if(name==='desk'){
     lastDeskChartKey='';
     if(lastOverview)renderDesk(lastOverview).catch(()=>{});
@@ -1376,6 +1454,7 @@ async function renderDesk(data){
   renderDeskIndCharts(focus,view);
   lastDeskChartKey='';
   requestAnimationFrame(()=>{
+    deskAutoFit();
     lastDeskChartKey='';
     drawDeskChart(view);
     // Second pass after flex layout settles (canvas often 0×0 on first paint).
@@ -2281,11 +2360,20 @@ document.querySelectorAll('.range-tab').forEach(btn=>{
     if(lastOverview)drawPerfChart(lastOverview.clients);
   });
 });
-window.addEventListener('resize',()=>{
-  if(lastOverview)drawPerfChart(lastOverview.clients);
-  lastDeskChartKey='';
-  if(deskStructure)drawDeskChart(deskStructure);
-});
+let deskFitRaf=0;
+function scheduleDeskAutoFit(){
+  if(deskFitRaf)cancelAnimationFrame(deskFitRaf);
+  deskFitRaf=requestAnimationFrame(()=>{
+    deskFitRaf=0;
+    deskAutoFit();
+    termViewsAutoFit();
+    lastDeskChartKey='';
+    if(deskStructure)drawDeskChart(deskStructure);
+    if(lastOverview)drawPerfChart(lastOverview.clients);
+  });
+}
+window.addEventListener('resize',scheduleDeskAutoFit);
+document.addEventListener('fullscreenchange',scheduleDeskAutoFit);
 const deskFocusEl=$('deskFocus');
 if(deskFocusEl){
   deskFocusEl.addEventListener('change',()=>{

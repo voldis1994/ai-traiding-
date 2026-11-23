@@ -363,75 +363,83 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .form-stack .btn{margin-top:10px;border-radius:2px;padding:6px 10px;font-size:10px;justify-content:center}
 .form-stack .muted,.card > .muted{font-size:9px;padding:4px 8px 8px;color:var(--desk-muted,#8c95a6)}
 
-/* —— PerpSignal 1:1 Desk terminal (viewport-fit 1290×515) —— */
-.view[data-view="desk"]{padding:0!important;margin:0}
+/* —— PerpSignal Desk terminal (Auto-Fit via CSS vars — never scale/zoom) —— */
+.view[data-view="desk"]{padding:0!important;margin:0;overflow:hidden}
 .psx{
   --desk-bg:#060a14;--desk-panel:#0a101d;--desk-panel-header:#090e19;
   --desk-border:#49464a;--desk-grid:#1a2534;--desk-text:#d5d9e3;--desk-muted:#8c95a6;
   --desk-green:#31d59a;--desk-red:#ef6875;--desk-yellow:#e9bc65;--desk-blue:#76a0de;
-  --desk-gap:8px;--desk-radius:2px;
+  --desk-gap:6px;--desk-radius:2px;--desk-pad:8px;
+  --desk-fs:13px;--desk-fs-xs:10px;--desk-fs-sm:11px;--desk-fs-md:12px;
+  --desk-fs-lg:16px;--desk-fs-xl:18px;
+  --desk-head-h:26px;--desk-tape-h:22px;--desk-status-min:64px;
+  --desk-col-intel:240px;--desk-col-right:240px;
+  --desk-grid-c1:minmax(0,1fr);--desk-grid-c2:minmax(0,1.45fr);
+  --desk-grid-c3:minmax(0,1.05fr);--desk-grid-c4:minmax(0,1fr);
+  --desk-grid-r1:minmax(0,1.35fr);--desk-grid-r2:minmax(0,1fr);
   --bg:var(--desk-bg);--panel:var(--desk-panel);--line:var(--desk-border);
   --gold:var(--desk-yellow);--g:var(--desk-green);--r:var(--desk-red);
   --mut:var(--desk-muted);--txt:var(--desk-text);
   background:var(--desk-bg);color:var(--desk-text);height:100%;min-height:0;
-  display:flex;flex-direction:column;overflow:auto;
-  font-size:13px;font-family:"IBM Plex Mono",ui-monospace,monospace;
+  display:flex;flex-direction:column;overflow:hidden;
+  font-size:var(--desk-fs);font-family:"IBM Plex Mono",ui-monospace,monospace;
   font-variant-numeric:tabular-nums}
 .psx *{box-sizing:border-box}
-.psx-utc,.psx-pulse{font-variant-numeric:tabular-nums;color:var(--mut);font-weight:700;font-size:11px}
+.psx-utc,.psx-pulse{font-variant-numeric:tabular-nums;color:var(--mut);font-weight:700;font-size:var(--desk-fs-sm)}
 .psx-pulse.hot{color:var(--g)}.psx-pulse.stale{color:var(--r)}
 .psx-demo-badge{
-  font-size:9px;font-weight:800;letter-spacing:.08em;padding:2px 6px;border-radius:2px;
+  font-size:var(--desk-fs-xs);font-weight:800;letter-spacing:.08em;padding:2px 6px;border-radius:2px;
   background:rgba(239,104,117,.2);color:var(--r);border:1px solid rgba(239,104,117,.45)}
-.psx-acct{display:flex;flex-direction:column;gap:1px;font-size:9px;letter-spacing:.08em;
+.psx-acct{display:flex;flex-direction:column;gap:1px;font-size:var(--desk-fs-xs);letter-spacing:.08em;
   text-transform:uppercase;color:var(--mut);font-weight:700}
 .psx-acct select{
   min-width:120px;padding:3px 5px;border-radius:2px;border:1px solid var(--line);
-  background:#050914;color:var(--txt);font:inherit;font-size:11px;text-transform:none;font-weight:600}
+  background:#050914;color:var(--txt);font:inherit;font-size:var(--desk-fs-sm);text-transform:none;font-weight:600}
 
 .psx-tape{
   display:flex;overflow-x:auto;border-bottom:1px solid var(--line);background:#04080f;
-  scrollbar-width:none;flex:0 0 22px;height:22px;align-items:stretch}
+  scrollbar-width:none;flex:0 0 var(--desk-tape-h);height:var(--desk-tape-h);align-items:stretch}
 .psx-tape::-webkit-scrollbar{display:none}
 .psx-tape-item{
-  flex:0 0 auto;min-width:0;height:22px;padding:0 10px;border:0;border-right:1px solid var(--desk-grid);
+  flex:0 0 auto;min-width:0;height:var(--desk-tape-h);padding:0 10px;border:0;border-right:1px solid var(--desk-grid);
   background:transparent;color:var(--txt);cursor:pointer;text-align:left;
-  display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-size:11px}
+  display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-size:var(--desk-fs-sm)}
 .psx-tape-item:hover,.psx-tape-item.active{background:rgba(118,160,222,.08)}
 .psx-tape-item.active .ep{color:var(--desk-blue)}
-.psx-tape-item .ep{font-weight:800;font-size:11px;letter-spacing:.04em;color:var(--mut)}
-.psx-tape-item .md{font-variant-numeric:tabular-nums;font-weight:700;font-size:11px;margin:0}
-.psx-tape-item .ch{font-size:10px;font-weight:700}
+.psx-tape-item .ep{font-weight:800;font-size:var(--desk-fs-sm);letter-spacing:.04em;color:var(--mut)}
+.psx-tape-item .md{font-variant-numeric:tabular-nums;font-weight:700;font-size:var(--desk-fs-sm);margin:0}
+.psx-tape-item .ch{font-size:var(--desk-fs-xs);font-weight:700}
 .psx-tape-item .ch.up{color:var(--g)}.psx-tape-item .ch.dn{color:var(--r)}
 .psx-tape-item .cl{display:none}
 
 /* Full-width status board — read every gate at once (no nested scroll hunt). */
 .psx-status-board{
-  flex:0 0 auto;display:grid;gap:6px;padding:6px 8px 0;
+  flex:0 0 auto;display:grid;gap:var(--desk-gap);padding:var(--desk-gap) var(--desk-pad) 0;
   grid-template-columns:repeat(7,minmax(0,1fr));
-  min-height:78px}
+  min-height:var(--desk-status-min)}
 .psx-status-empty{
   grid-column:1/-1;padding:12px;border:1px dashed var(--desk-border);
-  color:var(--mut);font-size:12px;text-align:center;background:var(--panel)}
+  color:var(--mut);font-size:var(--desk-fs-md);text-align:center;background:var(--panel)}
 .psx-status-tile{
   border:1px solid var(--desk-border);background:var(--panel);border-radius:2px;
-  padding:8px 10px;display:flex;flex-direction:column;gap:3px;min-width:0;
-  min-height:72px}
+  padding:calc(var(--desk-pad) * .75) var(--desk-pad);display:flex;flex-direction:column;gap:2px;min-width:0;
+  min-height:0}
 .psx-status-tile .k{
-  font-size:10px;font-weight:800;letter-spacing:.06em;color:var(--mut);text-transform:uppercase}
+  font-size:var(--desk-fs-xs);font-weight:800;letter-spacing:.06em;color:var(--mut);text-transform:uppercase}
 .psx-status-tile .v{
-  font-size:18px;font-weight:800;line-height:1.15;color:var(--txt);
+  font-size:var(--desk-fs-xl);font-weight:800;line-height:1.15;color:var(--txt);
   white-space:normal;overflow-wrap:anywhere}
 .psx-status-tile .s{
-  font-size:11px;color:var(--mut);line-height:1.35;white-space:normal;overflow-wrap:anywhere}
+  font-size:var(--desk-fs-sm);color:var(--mut);line-height:1.3;white-space:normal;overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .psx-status-tile.ok .v{color:var(--g)}
 .psx-status-tile.bad .v{color:var(--r)}
 .psx-status-tile.neu .v{color:var(--desk-blue)}
 
 .psx-body{
   flex:1;min-height:0;display:grid;gap:var(--desk-gap);padding:0 var(--desk-gap) var(--desk-gap);
-  /* Wider intel + system column so reasons stay readable. */
-  grid-template-columns:minmax(240px,280px) minmax(0,1fr) minmax(240px,280px);overflow:auto}
+  /* Side columns sized by Auto-Fit (--desk-col-*); order never changes. */
+  grid-template-columns:var(--desk-col-intel) minmax(0,1fr) var(--desk-col-right);overflow:hidden}
 
 .psx-rail{display:flex;flex-direction:column;gap:0;padding:4px 0;background:#060b16}
 .psx-rail-btn{
@@ -451,13 +459,13 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-intel{border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:var(--desk-radius)}
 .psx-h{
   display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:0 10px;height:28px;border-bottom:1px solid var(--desk-grid);flex:0 0 auto;
+  padding:0 var(--desk-pad);height:var(--desk-head-h);border-bottom:1px solid var(--desk-grid);flex:0 0 auto;
   background:var(--desk-panel-header)}
 .psx-h h2{
-  margin:0;font-size:11px;font-weight:800;letter-spacing:.06em;color:var(--mut);
+  margin:0;font-size:var(--desk-fs-sm);font-weight:800;letter-spacing:.06em;color:var(--mut);
   font-family:"IBM Plex Mono",monospace;text-transform:uppercase}
-.psx-live{font-size:10px;font-weight:800;color:var(--g);letter-spacing:.04em}
-.psx-src{font-size:10px;font-weight:800;letter-spacing:.05em;color:var(--desk-yellow);opacity:.9}
+.psx-live{font-size:var(--desk-fs-xs);font-weight:800;color:var(--g);letter-spacing:.04em}
+.psx-src{font-size:var(--desk-fs-xs);font-weight:800;letter-spacing:.05em;color:var(--desk-yellow);opacity:.9}
 .psx-intel-feed{flex:1;overflow:auto;padding:0;display:flex;flex-direction:column;gap:0;min-height:0}
 .psx-intel-feed::-webkit-scrollbar{width:5px}
 .psx-intel-feed::-webkit-scrollbar-thumb{background:#3a5f8c;border-radius:2px}
@@ -483,10 +491,10 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-mode:hover{border-color:var(--desk-blue);color:var(--desk-blue)}
 .psx-epic-row{display:flex;justify-content:flex-start;gap:10px;align-items:flex-start;min-width:0;flex:1;flex-wrap:wrap}
 .psx-epic-row>div:first-child{min-width:0;flex:1 1 240px}
-.psx-epic-row h2{margin:0;font-family:"IBM Plex Mono",monospace;font-size:14px;font-weight:700;white-space:normal;overflow-wrap:anywhere}
-.psx-quote{color:var(--mut);font-size:12px;margin:2px 0 0;font-variant-numeric:tabular-nums;
+.psx-epic-row h2{margin:0;font-family:"IBM Plex Mono",monospace;font-size:var(--desk-fs-lg);font-weight:700;white-space:normal;overflow-wrap:anywhere}
+.psx-quote{color:var(--mut);font-size:var(--desk-fs-md);margin:2px 0 0;font-variant-numeric:tabular-nums;
   white-space:normal;overflow-wrap:anywhere;line-height:1.4}
-.psx-quote .dn{color:var(--r);font-weight:800;font-size:14px}
+.psx-quote .dn{color:var(--r);font-weight:800;font-size:var(--desk-fs-lg)}
 .psx-levels{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-end}
 .psx-lvl{
   font-size:10px;font-weight:800;padding:2px 6px;border-radius:2px;border:1px solid var(--line);
@@ -503,24 +511,24 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-chart-col .psx-h{gap:6px}
 
 .psx-grid{
-  flex:1;min-height:420px;display:grid;gap:var(--desk-gap);overflow:visible;
-  /* Deals + learn readable; no squeeze into tiny scroll boxes. */
-  grid-template-columns:minmax(160px,1fr) minmax(280px,1.5fr) minmax(200px,1.1fr) minmax(160px,1fr);
-  grid-template-rows:minmax(220px,1.35fr) minmax(220px,1fr);
+  flex:1;min-height:0;display:grid;gap:var(--desk-gap);overflow:hidden;
+  /* Auto-Fit sets column/row tracks; area order is fixed forever. */
+  grid-template-columns:var(--desk-grid-c1) var(--desk-grid-c2) var(--desk-grid-c3) var(--desk-grid-c4);
+  grid-template-rows:var(--desk-grid-r1) var(--desk-grid-r2);
   grid-template-areas:
     "chart chart book engine"
     "ind deals watch whale"}
-.psx-chart-col{grid-area:chart;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
-.psx-book-col{grid-area:book;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
-.psx-engine-col{grid-area:engine;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
+.psx-chart-col{grid-area:chart;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:var(--desk-radius)}
+.psx-book-col{grid-area:book;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:var(--desk-radius)}
+.psx-engine-col{grid-area:engine;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:var(--desk-radius)}
 /* Explicit areas — never nth-of-type (chart/book/engine are also div siblings). */
 .psx-ind-cell{grid-area:ind}
 .psx-deals-cell{grid-area:deals}
 .psx-learn-cell{grid-area:watch}
 .psx-whale-cell{grid-area:whale}
-.psx-chart-wrap{min-height:120px;flex:1;height:100%;position:relative}
+.psx-chart-wrap{min-height:0;flex:1;height:100%;position:relative}
 .psx-chart-wrap canvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#060a14}
-.psx-book{flex:1;overflow:auto;padding:8px;font-variant-numeric:tabular-nums;font-size:12px;min-height:0}
+.psx-book{flex:1;overflow:auto;padding:var(--desk-pad);font-variant-numeric:tabular-nums;font-size:var(--desk-fs-md);min-height:0}
 .psx-book::-webkit-scrollbar{width:5px}
 .psx-book::-webkit-scrollbar-thumb{background:#3a5f8c}
 .psx-quote-box{border:1px solid var(--desk-grid);background:#060a14;margin-bottom:8px}
@@ -550,14 +558,14 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-spread{
   text-align:center;padding:8px 6px;margin:0;color:var(--txt);font-weight:800;font-size:11px;background:#0a101c}
 
-.psx-cell{background:var(--panel);min-width:0;border:1px solid var(--line);border-radius:var(--desk-radius);overflow:visible;display:flex;flex-direction:column;min-height:160px}
+.psx-cell{background:var(--panel);min-width:0;border:1px solid var(--line);border-radius:var(--desk-radius);overflow:hidden;display:flex;flex-direction:column;min-height:0}
 .psx-learn-board{padding:8px 10px 10px;flex:1;min-height:0;overflow:visible;display:flex;flex-direction:column;gap:6px}
 .psx-learn-kv{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .psx-learn-kv .desk-kv{padding:8px 10px;border:1px solid var(--desk-grid);background:#080d19;border-radius:2px;
   display:flex;justify-content:space-between;gap:8px;align-items:flex-start;min-height:36px}
-.psx-learn-kv .desk-kv span{color:var(--mut);font-size:11px;white-space:normal;overflow-wrap:anywhere}
-.psx-learn-kv .desk-kv strong{font-size:13px;font-weight:800;white-space:normal;overflow-wrap:anywhere;text-align:right}
-.psx-learn-line{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;border:1px solid var(--desk-grid);background:#060a14;font-size:11px}
+.psx-learn-kv .desk-kv span{color:var(--mut);font-size:var(--desk-fs-sm);white-space:normal;overflow-wrap:anywhere}
+.psx-learn-kv .desk-kv strong{font-size:var(--desk-fs);font-weight:800;white-space:normal;overflow-wrap:anywhere;text-align:right}
+.psx-learn-line{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;border:1px solid var(--desk-grid);background:#060a14;font-size:var(--desk-fs-sm)}
 .psx-learn-line span{flex:0 0 64px;color:var(--mut);font-weight:800;letter-spacing:.04em}
 .psx-learn-line b{flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;font-weight:600;line-height:1.35}
 .psx-learn-line.ok b{color:var(--g)}
@@ -573,18 +581,18 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-spark b{flex:1;display:block;background:var(--g);min-height:2px;opacity:.85}
 .psx-spark.bear b{background:var(--r)}
 /* ATR14 M1 must stay fully visible — ellipsis made it look like "AUX"/junk. */
-.psx-ind-kv{padding:6px 10px 10px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px;overflow:auto;min-height:72px;flex:0 0 auto}
-.psx-ind-kv .desk-kv{padding:8px 10px;border-radius:2px;border:1px solid var(--desk-grid);background:#080d19;
-  display:flex;justify-content:space-between;align-items:center;gap:10px;min-height:34px}
+.psx-ind-kv{padding:6px var(--desk-pad) var(--desk-pad);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:var(--desk-fs);overflow:auto;min-height:0;flex:0 0 auto}
+.psx-ind-kv .desk-kv{padding:6px 8px;border-radius:2px;border:1px solid var(--desk-grid);background:#080d19;
+  display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:0}
 .psx-ind-kv .desk-kv span{color:var(--mut);flex:1;min-width:0;overflow:visible;text-overflow:unset;
-  white-space:normal;overflow-wrap:anywhere;font-size:12px}
-.psx-ind-kv .desk-kv strong{font-variant-numeric:tabular-nums;flex:0 0 auto;font-size:13px}
+  white-space:normal;overflow-wrap:anywhere;font-size:var(--desk-fs-md)}
+.psx-ind-kv .desk-kv strong{font-variant-numeric:tabular-nums;flex:0 0 auto;font-size:var(--desk-fs)}
 
 .psx-trades{flex:1;min-height:0;overflow:auto;padding:0 10px 10px}
 .psx-trade-row{
   display:grid;grid-template-columns:minmax(64px,1.1fr) 48px minmax(56px,.9fr) minmax(56px,.9fr) minmax(56px,.9fr);
-  gap:6px 8px;padding:8px 0;border-bottom:1px solid var(--desk-grid);
-  font-size:12px;font-variant-numeric:tabular-nums;align-items:center}
+  gap:6px 8px;padding:6px 0;border-bottom:1px solid var(--desk-grid);
+  font-size:var(--desk-fs-md);font-variant-numeric:tabular-nums;align-items:center}
 .psx-trade-row>span{min-width:0;overflow-wrap:anywhere}
 .psx-trade-row .buy{color:var(--g);font-weight:800}.psx-trade-row .sell{color:var(--r);font-weight:800}
 .psx-trade-row .sl-off,.psx-trade-row .tp-off{color:var(--r);font-weight:800}
@@ -620,8 +628,8 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-ring-core span{font-size:10px;letter-spacing:.06em;color:var(--mut);font-weight:800}
 .psx-regime{font-weight:800;font-size:12px;margin:0 0 4px}
 .psx-regime.buy{color:var(--g)}.psx-regime.sell{color:var(--r)}.psx-regime.hold{color:var(--gold)}
-.psx-short{font-size:22px;font-weight:800;letter-spacing:.04em;line-height:1.1}
-.psx-engine-meta{font-size:11px;color:var(--mut);text-align:left;line-height:1.45}
+.psx-short{font-size:calc(var(--desk-fs-xl) + 4px);font-weight:800;letter-spacing:.04em;line-height:1.1}
+.psx-engine-meta{font-size:var(--desk-fs-sm);color:var(--mut);text-align:left;line-height:1.45}
 .psx-engine-meta strong{color:var(--txt)}
 .psx-engine-score{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-top:10px;font-size:11px;font-weight:700}
 .psx-engine-track{height:8px;background:linear-gradient(90deg,var(--r),#888,var(--g));position:relative}
@@ -649,8 +657,8 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-mini.on{color:var(--gold);border-color:var(--gold)}
 .psx-whale{padding:0 10px 10px;flex:1;min-height:0;overflow:auto;max-height:none}
 .psx-whale-row{
-  display:grid;grid-template-columns:auto minmax(48px,auto) auto 1fr auto auto;gap:8px 10px;align-items:center;
-  padding:10px 2px;border-bottom:1px solid var(--desk-grid);font-size:12px;min-height:40px}
+  display:grid;grid-template-columns:auto minmax(48px,auto) auto 1fr auto auto;gap:6px 8px;align-items:center;
+  padding:6px 2px;border-bottom:1px solid var(--desk-grid);font-size:var(--desk-fs-md);min-height:0}
 .psx-whale-row .tag{
   font-size:9px;font-weight:800;letter-spacing:.05em;padding:2px 5px;border-radius:2px;
   background:transparent;border:1px solid rgba(233,188,101,.4);color:var(--gold)}
@@ -691,23 +699,18 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 @media(max-width:1600px){
   .psx-ind-kv{grid-template-columns:1fr}
   .psx-status-board{grid-template-columns:repeat(4,minmax(0,1fr))}
-  .psx-body{grid-template-columns:minmax(220px,260px) minmax(0,1fr) minmax(220px,260px)}
 }
 @media(max-width:1280px){
   .psx-status-board{grid-template-columns:repeat(3,minmax(0,1fr))}
-  .psx-body{grid-template-columns:minmax(200px,240px) minmax(0,1fr) minmax(200px,240px)}
-  .psx-grid{grid-template-columns:repeat(4,minmax(140px,1fr))}
   .psx-score{grid-template-columns:1fr}
   .psx-ind-kv{grid-template-columns:1fr}
 }
 @media(max-width:1100px){
   .term-body{grid-template-columns:78px 1fr}
   .psx-status-board{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .psx-body{grid-template-columns:1fr}
-  .psx-grid{grid-template-columns:1fr;grid-template-areas:none;grid-auto-rows:minmax(160px,auto);min-height:0}
-  .psx-chart-col,.psx-book-col,.psx-engine-col,.psx-grid>.psx-cell{grid-area:auto;min-height:160px}
+  /* Non-desk views may stack; Desk Auto-Fit keeps window order (below). */
   .overview-grid,.term-split{grid-template-columns:1fr}
-  .term-main>.view,.psx,.term-view{overflow:auto}
+  .term-main>.view:not([data-view="desk"]),.term-view{overflow:auto}
   .stat-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:720px){
@@ -720,3 +723,49 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 @media(prefers-reduced-motion:reduce){
   .status-pill .dot,.view,.stat,.strip{animation:none}
 }
+
+/* —— Desk Auto-Fit lock: same window order on every screen; size via vars only —— */
+.psx[data-autofit="1"]{
+  overflow:hidden!important;
+  /* Never transform/zoom the whole desk — fonts & tracks are real CSS sizes. */
+  transform:none!important;zoom:normal!important;
+}
+.psx[data-autofit="1"] .psx-body{
+  overflow:hidden!important;
+  grid-template-columns:var(--desk-col-intel) minmax(0,1fr) var(--desk-col-right)!important;
+}
+.psx[data-autofit="1"] .psx-grid{
+  min-height:0!important;overflow:hidden!important;
+  grid-template-columns:var(--desk-grid-c1) var(--desk-grid-c2) var(--desk-grid-c3) var(--desk-grid-c4)!important;
+  grid-template-rows:var(--desk-grid-r1) var(--desk-grid-r2)!important;
+  grid-template-areas:
+    "chart chart book engine"
+    "ind deals watch whale"!important;
+  grid-auto-rows:unset!important;
+}
+.psx[data-autofit="1"] .psx-chart-col{grid-area:chart!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-book-col{grid-area:book!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-engine-col{grid-area:engine!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-ind-cell{grid-area:ind!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-deals-cell{grid-area:deals!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-learn-cell{grid-area:watch!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-whale-cell{grid-area:whale!important;min-height:0!important}
+.psx[data-autofit="1"] .psx-right{overflow:hidden}
+.psx[data-autofit="1"] .psx-intel{overflow:hidden}
+/* Inner lists may scroll; outer Desk shell never does. */
+.psx[data-autofit="1"] .psx-intel-feed,
+.psx[data-autofit="1"] .psx-book,
+.psx[data-autofit="1"] .psx-trades,
+.psx[data-autofit="1"] .psx-whale,
+.psx[data-autofit="1"] .psx-watch,
+.psx[data-autofit="1"] .psx-sigwatch,
+.psx[data-autofit="1"] .psx-score,
+.psx[data-autofit="1"] .psx-engine{overflow:auto;min-height:0}
+
+/* Other Desk modules — fill viewport, no outer scroll when possible */
+.term-main>.view:not([data-view="desk"]).active{
+  overflow:hidden}
+.term-main>.view:not([data-view="desk"]).active .term-view{
+  overflow:hidden;height:100%}
+.term-main>.view:not([data-view="desk"]).active .fill-scroll{
+  overflow:auto;min-height:0;flex:1}

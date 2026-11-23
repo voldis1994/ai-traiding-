@@ -1,4 +1,4 @@
-"""Paper OPEN must use break|zone gate and teach entry knobs from paper closes."""
+"""Paper OPEN has no break|zone block — SHADOW learns every neural BUY/SELL path."""
 import tempfile
 from pathlib import Path
 
@@ -6,7 +6,8 @@ from app import ohlc_entry_zones
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
 
 
-def test_paper_skips_open_without_break_or_zone(monkeypatch):
+def test_paper_opens_without_break_or_zone_gate(monkeypatch):
+    """No gate block — neural BUY + OHLC brackets is enough for paper OPEN."""
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(Path(tmp) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=tmp)
@@ -42,8 +43,11 @@ def test_paper_skips_open_without_break_or_zone(monkeypatch):
         e._shadow_paper_step(
             mid=2000., spread=0.2, bar_time='2026-11-23T13:00:00+00:00',
             high=2001., low=1999., candles=[])
-        assert e.shadow_paper.position is None
-        assert e.shadow_paper.pending is None
+        pos = e.shadow_paper.position
+        assert pos is not None
+        # Still stamps a learnable trigger (fallback break) for knobs.
+        assert (pos.get('entry_context') or {}).get('ohlc_entry', {}).get(
+            'trigger') in ('break', 'zone')
 
 
 def test_paper_opens_on_break_trigger(monkeypatch):
@@ -129,7 +133,6 @@ def test_paper_close_adapts_break_knobs(monkeypatch):
             self_params, 'load',
             lambda store: {**self_params.DEFAULTS, 'exec_slip_bps': 0.,
                            'exec_fill_delay_bars': 0})
-        # Hit SL → paper loss → tighten break knobs.
         closed = e._shadow_paper_step(
             mid=1994., spread=0.2, bar_time='2026-11-23T13:02:00+00:00',
             high=1996., low=1993., candles=[])

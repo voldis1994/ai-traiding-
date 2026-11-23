@@ -99,8 +99,8 @@ def test_activity_scan_without_deal_id_filter_finds_profit():
     asyncio.run(scenario())
 
 
-def test_admin_recent_trade_shows_pending_upl_hint():
-    """Pending + last_upl → Admin shows the £ figure (not blank gaida)."""
+def test_admin_recent_hides_pending_until_capital_funds():
+    """Pending close stays off Desk until Capital Funds £ settles — no UPL invent."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         store.upsert_trade({'dealId':'p1','epic':'GOLD','size':'.02','direction':'BUY','level':100})
@@ -108,14 +108,9 @@ def test_admin_recent_trade_shows_pending_upl_hint():
         store.set('last_upl:p1',{'upl':-0.13,'currency':'GBP'})
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=RuntimeHub._trade_stats(hub,store,'GBP')
-        recent=stats['recent_trades']
-        assert recent
-        assert recent[0].get('pnl')==pytest.approx(-0.13)
-        assert recent[0].get('pnl_source')=='upl_estimate'
-        assert recent[0].get('pending_cash') is False
+        # Desk CLIENT CLOSES / Kopējais = Funds cash only.
+        assert stats['recent_trades']==[]
         assert stats['working_pnl'] is None
-        assert stats['working_pnl_source']=='upl_estimate'
-        assert stats['estimate_pnl']==pytest.approx(-0.13)
-        assert stats['estimate_trades']==1
+        assert stats['working_pnl_source'] in ('none','empty')
         assert stats['cash_trades']==0
-        assert stats['pending_trades']==0
+        assert stats['pending_trades']>=1

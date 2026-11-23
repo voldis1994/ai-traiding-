@@ -4125,12 +4125,22 @@ class SingleTradeEngine:
         s=s.replace(',','.') if s.count(',')==1 and '.' not in s else s.replace(',','')
         return _num(s)
 
-    def _row_cash_pnl(self,row,details=None):
+    def _row_cash_pnl(self,row,details=None,*,prefer_funds=True):
+        """Closed-trade cash £ from Capital history — never UPL / SL-TP invent.
+
+        Capital.com TRADE rows (GET /history/transactions) expose ``pnl`` + ``cash``.
+        ``accounts.balance.profitLoss`` is the *open* account figure from
+        GET /accounts — do not treat it as a settled close here.
+        """
         details=details if isinstance(details,dict) else {}
-        # Prefer total realized £. Skip limitDistance-style fields — those are
-        # not closed P&L (Capital app "Limit +0.17" ≠ trade result).
-        for key in ('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
-                    'netAmount','netProfit','grossProfit','amount','profitLoss'):
+        # Funds settle first. Activity may only carry ``profit`` in details.
+        if prefer_funds:
+            keys=('pnl','cash','profitAndLoss','profit','realizedPnl','pl',
+                  'netAmount','netProfit','grossProfit','amount')
+        else:
+            keys=('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
+                  'netAmount','netProfit','grossProfit','amount')
+        for key in keys:
             val=self._parse_cash_num(details.get(key))
             if val is None:val=self._parse_cash_num(row.get(key))
             if val is not None and math.isfinite(val):
@@ -4182,11 +4192,34 @@ class SingleTradeEngine:
         return kwargs
 
     async def _pnl_from_broker_history(self,deal_id,*,queued_at=None,exact_deal=False):
-        """Pull closed-trade cash from Capital history/activity (not mid×size)."""
+        """Pull closed-trade cash from Capital Funds first (not mid×size / UPL).
+
+        Source of truth = GET /history/transactions TRADE ``pnl``/``cash`` —
+        the same GBP Capital.com Funds shows. Activity is fallback only when
+        Funds has not settled the row yet.
+        """
         if not self.broker or not deal_id:return None
         deal=str(deal_id)
         look=self._history_lookback(deal,queued_at=queued_at)
-        # Activity often names the dealId on SL/TP/USER closes.
+        # 1) Capital Funds TRADE cash — matches phone Closed Positions £.
+        if hasattr(self.broker,'transactions'):
+            try:
+                kwargs=self._history_kwargs(look,tx_type='TRADE')
+                payload=await self.broker.transactions(**kwargs)
+                rows=list(payload.get('transactions') or [])
+                if not rows and look.get('from_time'):
+                    payload=await self.broker.transactions(
+                        last_period=86400,tx_type='TRADE')
+                    rows=list(payload.get('transactions') or [])
+                for row in rows:
+                    if not self._transaction_matches_deal(row,deal,exact=exact_deal):continue
+                    val=self._row_cash_pnl(row,prefer_funds=True)
+                    if val is not None:
+                        return float(val),self._cash_currency(row.get('currency'))
+            except Exception as exc:
+                self.store.event('warning','Transaction history P&L lookup failed',
+                                 {'type':type(exc).__name__,'deal_id':deal})
+        # 2) Activity fallback — often has dealId before Funds posts cash.
         if hasattr(self.broker,'activity'):
             try:
                 kwargs=self._history_kwargs(look,for_activity=True,deal_id=deal)
@@ -4205,29 +4238,12 @@ class SingleTradeEngine:
                 for row in rows:
                     if not self._activity_matches_deal(row,deal,exact=exact_deal):continue
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
-                    val=self._row_cash_pnl(row,details)
+                    val=self._row_cash_pnl(row,details,prefer_funds=False)
                     if val is not None:
                         return float(val),self._cash_currency(
                             row.get('currency') or details.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
-                                 {'type':type(exc).__name__,'deal_id':deal})
-        if hasattr(self.broker,'transactions'):
-            try:
-                kwargs=self._history_kwargs(look,tx_type='TRADE')
-                payload=await self.broker.transactions(**kwargs)
-                rows=list(payload.get('transactions') or [])
-                if not rows and look.get('from_time'):
-                    payload=await self.broker.transactions(
-                        last_period=86400,tx_type='TRADE')
-                    rows=list(payload.get('transactions') or [])
-                for row in rows:
-                    if not self._transaction_matches_deal(row,deal,exact=exact_deal):continue
-                    val=self._row_cash_pnl(row)
-                    if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
-            except Exception as exc:
-                self.store.event('warning','Transaction history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
         return None
 

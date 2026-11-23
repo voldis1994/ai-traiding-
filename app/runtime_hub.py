@@ -732,11 +732,10 @@ class RuntimeHub:
             sp_live = None
             if store is not None:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
-                # Desk poll = boot path: re-audit Capital 24h book BEFORE paper
-                # restore, so SHADOW is not stuck at 0/0 while CLIENT CLOSES has £.
+                # Desk poll = boot: SHADOW learns ALL closed trades BEFORE paper restore.
                 if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
                     try:
-                        eng._backfill_mistake_audits_from_journal(limit=400, hours=24)
+                        eng._backfill_mistake_audits_from_journal(limit=2000, hours=0)
                     except Exception:
                         pass
                 # Prefer awaited mirror via refresh_live_truth(); keep a
@@ -1042,13 +1041,13 @@ class RuntimeHub:
         if store is not None:
             try:
                 from . import shadow_mistake_audit as sma
-                # Ensure cycle has today's Capital book even mid-boot.
+                # Ensure SHADOW has every closed Capital row even mid-boot.
                 eng_ma = getattr(rt, 'engine', None) if rt is not None else None
                 if eng_ma is not None and hasattr(
                         eng_ma, '_backfill_mistake_audits_from_journal'):
                     try:
                         eng_ma._backfill_mistake_audits_from_journal(
-                            limit=400, hours=24)
+                            limit=2000, hours=0)
                     except Exception:
                         pass
                 mistake_audit = sma.lab_payload(store)
@@ -1936,7 +1935,7 @@ class RuntimeHub:
                 out['skipped'] += 1
             if hasattr(eng, '_backfill_mistake_audits_from_journal'):
                 try:
-                    eng._backfill_mistake_audits_from_journal(limit=400, hours=24)
+                    eng._backfill_mistake_audits_from_journal(limit=2000, hours=0)
                 except Exception:
                     pass
         return out

@@ -4885,46 +4885,89 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=400,hours=24):
-        """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
+    def _observe_entry_gates_once(self,deal_id,*,ohlc_meta=None,broker_pnl=None,
+                                  spread=0.0,source='live'):
+        """Adapt break|zone knobs once per deal — live settle or journal backfill."""
+        if self.store is None or deal_id is None:
+            return None
+        once='ohlc_gates_observed:'+str(deal_id)
+        if self.store.get(once):
+            return {'adapted':False,'reason':'already_observed'}
+        try:
+            out=ohlc_entry_zones.observe_close(
+                self.store,ohlc_meta=ohlc_meta,broker_pnl=broker_pnl,
+                spread=spread)
+        except Exception as exc:
+            self.store.event('warning','OHLC entry gates learn skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id,
+                              'source':source})
+            return None
+        # Stamp once even when no_trigger / scratch — avoid re-probing forever.
+        self.store.set(once,{
+            'at':now(),'pnl':_num(broker_pnl),'source':source,
+            'adapted':bool(out and out.get('adapted')),
+            'reason':(out or {}).get('reason'),
+            'trigger':(ohlc_meta or {}).get('trigger')
+                      if isinstance(ohlc_meta,dict) else None})
+        return out
 
-        Analysis needs both sides — skipping wins left the cycle blind to what
-        worked next to the minuses. Window is time-based (24h), not "last 1 close".
-        Includes pending_* rows that already carry a non-zero £ so SHADOW is not
-        stuck waiting while Funds mirror catches up.
+    def _shadow_ohlc_meta_for_learn(self,ohlc_meta):
+        """Ensure break|zone trigger for knob learn — never drop a close as no_trigger."""
+        meta=dict(ohlc_meta) if isinstance(ohlc_meta,dict) else {}
+        trig=str(meta.get('trigger') or '').lower()
+        if trig in ('break','zone'):
+            return meta
+        reason=str(meta.get('reason') or '').lower()
+        if 'break' in reason or str(meta.get('break_reason') or ''):
+            meta['trigger']='break'
+        elif isinstance(meta.get('zone'),dict) or isinstance(meta.get('entry_zone'),dict):
+            meta['trigger']='zone'
+        else:
+            # Unknown path — still teach break knobs so SHADOW never skips a £.
+            meta['trigger']='break'
+        return meta
+
+    def _backfill_mistake_audits_from_journal(self,*,limit=2000,hours=0):
+        """SHADOW learns from ALL closed journal trades — no time/source blocks.
+
+        ``hours<=0`` (default) = every closed row within ``limit``. Desk 24h
+        pulse stays separate. Zero / missing £ falls back to last UPL so
+        pending Funds rows still teach SHADOW instead of waiting forever.
         """
         if self.store is None:
             return 0
         try:
             rows=self.store.db.execute(
                 "SELECT deal_id,pnl,direction,entry,pnl_source,closed FROM trades "
-                "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
+                "WHERE closed IS NOT NULL "
                 "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
         except Exception:
             return 0
         now_utc=datetime.now(timezone.utc)
+        cutoff=None
         try:
-            cutoff=now_utc-timedelta(hours=max(1,int(hours)))
-        except Exception:
-            cutoff=now_utc-timedelta(hours=24)
+            h=int(hours) if hours is not None else 0
+        except (TypeError,ValueError):
+            h=0
+        if h>0:
+            cutoff=now_utc-timedelta(hours=h)
         n=0
         scanned=0
         wins=0
         losses=0
-        cash_sources={
-            'broker','upl_estimate','funds','capital','',
-            'pending_broker_pnl','pending_close_sync','pending_upl_teach',
-        }
+        gates_n=0
         for deal_id,pnl,direction,entry,src,closed in rows:
             pnl_n=_num(pnl)
+            # Any non-zero £ — including UPL estimate / pending tags. Zero → last UPL.
             if pnl_n is None or abs(float(pnl_n))<1e-12:
-                continue  # still zero — wait for Funds mirror
-            src_s=str(src or '').strip().lower()
-            # Cash-like sources only (broker / late UPL / funds mirror tags).
-            if src_s and src_s not in cash_sources:
-                continue
-            # Keep inside the 24h analysis window.
-            if closed:
+                upl=self._last_upl_as_realized(deal_id)
+                if upl is None:
+                    continue
+                pnl_n=float(upl[0])
+                if abs(pnl_n)<1e-12:
+                    continue
+            # Optional time window only when caller asks (hours>0).
+            if cutoff is not None and closed:
                 try:
                     raw=str(closed).replace('Z','+00:00').replace(' ','T',1)
                     ct=datetime.fromisoformat(raw)
@@ -4939,21 +4982,93 @@ class SingleTradeEngine:
                 wins+=1
             elif float(pnl_n)<0:
                 losses+=1
-            # Skip only when HIST already holds this deal at this £. Once-keys
-            # alone are not enough — bag wipe left them while Scenarios=0.
             out=self._run_mistake_audit_close(
                 deal_id,pnl=float(pnl_n),
                 direction=direction if direction in ('BUY','SELL') else None,
                 entry=_num(entry),source='live_backfill')
             if out and out.get('audited'):
                 n+=1
-        if n or scanned:
+            saved=self.store.get('entry_brain:'+str(deal_id)) or {}
+            ohlc_meta=self._shadow_ohlc_meta_for_learn(
+                saved.get('ohlc_entry') if isinstance(saved,dict) else None)
+            spread=_num(saved.get('entry_spread')) if isinstance(saved,dict) else 0.
+            gate=self._observe_entry_gates_once(
+                deal_id,ohlc_meta=ohlc_meta,broker_pnl=float(pnl_n),
+                spread=spread or 0.,source='live_backfill')
+            if gate and gate.get('adapted'):
+                gates_n+=1
+        if n or scanned or gates_n:
             self.store.event('shadow_mistake_audit',
-                             'Backfilled mistake audits from 24h journal '
-                             '(wins+losses)',
+                             'Backfilled mistake audits from journal '
+                             '(all closes)',
                              {'n':n,'scanned':scanned,'wins':wins,
-                              'losses':losses,'hours':int(hours)})
+                              'losses':losses,'hours':int(h),
+                              'gates_adapted':gates_n})
         return n
+
+    def _shadow_mirror_live_open(self,deal_id,saved=None):
+        """Open paper on every LIVE OPEN so SHADOW learns the same path — no gate."""
+        if self.store is None or deal_id is None:
+            return None
+        self._ensure_shadow_brain()
+        if self.shadow_paper is None:
+            return None
+        if self.shadow_paper.position is not None or self.shadow_paper.pending is not None:
+            return None  # already in a paper trade
+        meta=saved if isinstance(saved,dict) else (
+            self.store.get('entry_brain:'+str(deal_id)) or {})
+        if not isinstance(meta,dict):
+            return None
+        direction=meta.get('direction')
+        if direction not in ('BUY','SELL'):
+            return None
+        sd=_num(meta.get('stop_distance'))
+        pd=_num(meta.get('profit_distance'))
+        entry=_num(meta.get('entry'))
+        tick=_num(meta.get('tick_size'))
+        spread=_num(meta.get('entry_spread')) or 0.
+        if sd is None or sd<=0 or pd is None or pd<=0 or entry is None:
+            return None
+        if tick is None or tick<=0:
+            tick=max(abs(float(spread))/2.,1e-4)
+        mkt=self.market or {}
+        mid=_num(mkt.get('mid')) or entry
+        shadow=self.shadow_brain
+        shadow_tr=None
+        if shadow is not None and getattr(shadow,'last_transition',None):
+            try:
+                shadow_tr=self.brain._json_transition(shadow.last_transition)
+            except Exception:
+                shadow_tr=None
+        ohlc=self._shadow_ohlc_meta_for_learn(meta.get('ohlc_entry'))
+        entry_context={
+            'scenario':(ohlc.get('scenario') if isinstance(ohlc,dict) else None) or {},
+            'ohlc_entry':ohlc,
+            'live_deal_id':str(deal_id),
+            'mirrored_from':'live_open',
+        }
+        from .self_params import load as load_self_params
+        sp=load_self_params(self.store)
+        closed=self.shadow_paper.on_bar(
+            direction,mid=mid,spread=spread,
+            bar_time=meta.get('bar_time') or now(),
+            high=mid,low=mid,tick=tick,
+            min_distance=_num(mkt.get('min_distance')) or tick,
+            stop_distance=float(sd),profit_distance=float(pd),
+            kappa=_num(meta.get('bracket_kappa')),
+            sl_scale=_num(meta.get('bracket_sl_scale')) or 1.0,
+            model_version=int(getattr(shadow,'model_version',0) or 0),
+            slip_bps=float(sp.get('exec_slip_bps') or 0.),
+            fill_delay_bars=0,
+            shadow_transition=shadow_tr,
+            entry_context=entry_context)
+        if self.shadow_paper.position is not None:
+            self.store.event('shadow_paper',
+                             'Mirrored LIVE OPEN into paper for SHADOW learn',
+                             {'deal_id':deal_id,'direction':direction,
+                              'stop_distance':sd,'profit_distance':pd,
+                              'trigger':ohlc.get('trigger')})
+        return closed
 
     def _last_upl_as_realized(self,deal_id):
         """Last live Capital UPL in account currency — usable as closed peļņa."""
@@ -5261,11 +5376,20 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror skipped',
                              {'type':type(exc).__name__})
-        # Cycle reads full 24h Capital book (wins + losses) after Funds £ lands.
+        # SHADOW reads ALL closed Capital rows after Funds/UPL £ available.
         try:
-            self._backfill_mistake_audits_from_journal(limit=400,hours=24)
+            self._backfill_mistake_audits_from_journal(limit=2000,hours=0)
         except Exception as exc:
             self.store.event('warning','Mistake-audit backfill skipped',
+                             {'type':type(exc).__name__})
+        # Also mirror any currently open LIVE deals into paper (once).
+        try:
+            for p in list(self.positions or []):
+                did=p.get('dealId')
+                if did:
+                    self._shadow_mirror_live_open(did)
+        except Exception as exc:
+            self.store.event('warning','SHADOW open-position mirror skipped',
                              {'type':type(exc).__name__})
 
     async def _reconcile_orphan_open_trades(self):
@@ -5988,15 +6112,11 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','Re-entry confirm learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
-            try:
-                ohlc_entry_zones.observe_close(
-                    self.store,
-                    ohlc_meta=(saved.get('ohlc_entry')
-                               if isinstance(saved,dict) else None),
-                    broker_pnl=pnl_value,spread=spread_cost)
-            except Exception as exc:
-                self.store.event('warning','OHLC entry gates learn skipped',
-                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            self._observe_entry_gates_once(
+                deal_id,
+                ohlc_meta=self._shadow_ohlc_meta_for_learn(
+                    saved.get('ohlc_entry') if isinstance(saved,dict) else None),
+                broker_pnl=pnl_value,spread=spread_cost,source='live')
             # Self-audit: did scenario/zone analysis match post-trade OHLC + £?
             try:
                 from . import ohlc_scenarios
@@ -7545,8 +7665,16 @@ class SingleTradeEngine:
                                    if str(x.get('dealId'))==str(conf_deal)),None)
                         entry=(live or {}).get('level') if live else pending.get('entry')
                         self.store.set(key,{**pending,'entry':entry if entry is not None else pending.get('entry')})
+                    bound=self.store.get(key) or {}
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
+                    # SHADOW learns every LIVE OPEN — mirror into paper, no gate.
+                    try:
+                        self._shadow_mirror_live_open(conf_deal,bound)
+                    except Exception as exc:
+                        self.store.event('warning','SHADOW live-open mirror skipped',
+                                         {'type':type(exc).__name__,
+                                          'deal_id':conf_deal})
                 # Immediate repair if Capital left SL Off and/or TP Off after OPEN.
                 # Must force=True — pending_order is still True until finally, so a
                 # normal protect_position call was a silent no-op (naked on Capital).
@@ -8150,12 +8278,37 @@ class SingleTradeEngine:
                 'weights_path':post_path},epic))
         self.policy.shadow_self_dev_tick(self)
 
+    def _paper_entry_gate(self,action,mtf_analysis=None):
+        """Same break|zone OPEN path as LIVE — without fleet shared_side block.
+
+        Paper must still open and learn when another client owns the epic side.
+        """
+        candles=self._decision_candles()
+        market=self.market or {}
+        mtf=mtf_analysis
+        if mtf is None and hasattr(self,'_mtf_momentum_analysis'):
+            try:
+                mtf=self._mtf_momentum_analysis()
+            except Exception:
+                mtf=None
+        return ohlc_entry_zones.entry_allows_open(
+            action,
+            candles=candles,
+            mid=_num(market.get('mid')),
+            ask=_num(market.get('ask')),
+            bid=_num(market.get('bid')),
+            tick=_num(market.get('tick')) or 0.01,
+            spread=_num(market.get('spread')) or 0.,
+            mtf=mtf,store=self.store)
+
     def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None,high=None,low=None,
                            candles=None):
         """Advance shadow state + paper journal with LIVE-identical execution rules.
 
         Votes after advancing shadow h/c on this completed candle. Opens/closes
         via SL/TP/trail (same stop_take + trail math as LIVE) — never flip-exit.
+        No break|zone gate block — SHADOW opens on neural BUY/SELL whenever OHLC
+        brackets exist, and stamps trigger when the gate would have fired.
         """
         scores=self._shadow_scores_now(advance=True,bar_time=bar_time)
         if not scores or mid is None:return None
@@ -8169,6 +8322,13 @@ class SingleTradeEngine:
         shadow_tr=None
         if shadow is not None and getattr(shadow,'last_transition',None):
             shadow_tr=self.brain._json_transition(shadow.last_transition)
+        # Stamp gate context when available — never block paper OPEN on it.
+        zone_gate=None
+        if action in ('BUY','SELL'):
+            try:
+                zone_gate=self._paper_entry_gate(action)
+            except Exception:
+                zone_gate=None
         # Same OHLC swing/regime brackets as LIVE OPEN + hold-shadow —
         # never invent median-zone ±distance via stop_take for paper fills.
         tick=None;minimum=None;stop_d=None;profit_d=None;kappa=None;sl_scale=None
@@ -8200,39 +8360,42 @@ class SingleTradeEngine:
         sp=load_self_params(self.store)
         slip_bps=float(sp['exec_slip_bps'])
         fill_delay_bars=int(sp['exec_fill_delay_bars'])
-        # Stamp open-time OHLC/news/intermarket so mistake-audit can compare.
+        # Stamp open-time OHLC/news/intermarket — force learnable trigger.
         entry_context=None
-        try:
-            from . import ohlc_scenarios as _osc
-            from . import ohlc_entry_zones as _oez
-            stamp_rows=candles if candles is not None else (
-                self.store.candles(self.mandate['epic'],n=80,historical_only=True)
-                if self.mandate else [])
-            sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
-            ez=_oez.compute_entry_zones(
-                stamp_rows,mid=mid,store=self.store) if stamp_rows else {}
-            zone=None
-            if isinstance(ez,dict):
-                if action=='BUY':
-                    zone=ez.get('buy_entry')
-                elif action=='SELL':
-                    zone=ez.get('sell_entry')
-                if not isinstance(zone,dict):
-                    zone=ez.get('buy_entry') or ez.get('sell_entry')
-            news_ctx,im_ctx=self._audit_external_context(
-                {},direction=action if action in ('BUY','SELL') else None)
-            entry_context={
-                'scenario':_osc.open_meta_from_scenario(sc) if sc else {},
-                'ohlc_entry':{
-                    'action':action if action in ('BUY','SELL') else None,
+        if action in ('BUY','SELL'):
+            try:
+                from . import ohlc_scenarios as _osc
+                news_ctx,im_ctx=self._audit_external_context(
+                    {},direction=action)
+                sc=None
+                if isinstance(zone_gate,dict) and isinstance(
+                        zone_gate.get('scenario'),dict):
+                    sc=zone_gate.get('scenario')
+                else:
+                    stamp_rows=candles if candles is not None else (
+                        self.store.candles(
+                            self.mandate['epic'],n=80,historical_only=True)
+                        if self.mandate else [])
+                    sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
+                zone=(zone_gate or {}).get('zone') if isinstance(zone_gate,dict) else None
+                raw_ohlc={
+                    'action':action,
                     'zone':zone if isinstance(zone,dict) else None,
-                    'trigger':(ez or {}).get('trigger') if isinstance(ez,dict) else None,
-                },
-                'news':news_ctx,
-                'intermarket':im_ctx,
-            }
-        except Exception:
-            entry_context=None
+                    'trigger':(zone_gate or {}).get('trigger')
+                              if isinstance(zone_gate,dict) else None,
+                    'reason':(zone_gate or {}).get('reason')
+                             if isinstance(zone_gate,dict) else None,
+                }
+                entry_context={
+                    'scenario':(_osc.open_meta_from_scenario(sc)
+                                if sc and 'scenarios' in (sc or {})
+                                else (sc if isinstance(sc,dict) else {})),
+                    'ohlc_entry':self._shadow_ohlc_meta_for_learn(raw_ohlc),
+                    'news':news_ctx,
+                    'intermarket':im_ctx,
+                }
+            except Exception:
+                entry_context=None
         closed=self.shadow_paper.on_bar(
             action,mid=mid,spread=spread,bar_time=bar_time,
             cash_scale=self.shadow_paper.cash_scale,
@@ -8300,13 +8463,23 @@ class SingleTradeEngine:
                         'exit_reason':closed.get('exit_reason')})
                 except Exception:
                     pass
+            # Break|zone knobs learn from paper cash too — not only LIVE Funds £.
+            ctx=closed.get('entry_context') if isinstance(
+                closed.get('entry_context'),dict) else {}
+            ohlc_meta=ctx.get('ohlc_entry') if isinstance(
+                ctx.get('ohlc_entry'),dict) else {}
+            paper_id=(closed.get('fingerprint') or closed.get('deal_id')
+                      or ('paper:'+str(closed.get('at') or '')
+                          +':'+str(closed.get('direction') or '')
+                          +':'+str(closed.get('exit_reason') or '')))
+            trade_sp=(closed.get('spread')
+                      if closed.get('spread') is not None else spread)
+            self._observe_entry_gates_once(
+                paper_id,ohlc_meta=ohlc_meta,broker_pnl=pnl,
+                spread=trade_sp,source='shadow_paper')
             # Mistake-audit loop: diagnose → scenario memory → targeted fix → promote.
             try:
                 from . import shadow_mistake_audit as sma
-                ctx=closed.get('entry_context') if isinstance(
-                    closed.get('entry_context'),dict) else {}
-                ohlc_meta=ctx.get('ohlc_entry') if isinstance(
-                    ctx.get('ohlc_entry'),dict) else {}
                 sc_meta=ctx.get('scenario') if isinstance(
                     ctx.get('scenario'),dict) else {}
                 audit_rows=candles if candles is not None else (
@@ -8318,10 +8491,6 @@ class SingleTradeEngine:
                     unit=('account_currency'
                           if closed.get('paper_pnl') is not None
                           else 'price')
-                paper_id=(closed.get('fingerprint') or closed.get('deal_id')
-                          or ('paper:'+str(closed.get('at') or '')
-                              +':'+str(closed.get('direction') or '')
-                              +':'+str(closed.get('exit_reason') or '')))
                 ccy=(self._account_currency()
                      if unit=='account_currency' else None)
                 sma.on_close(

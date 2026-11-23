@@ -752,31 +752,42 @@ def _journal_window_stats(store, *, hours=24) -> dict:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=max(1, int(hours)))
     try:
+        # Prefer broker £; also keep upl_estimate so Desk is not blank while
+        # Capital Funds mirror is still upgrading rows.
         rows = store.db.execute(
             "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
             "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
-            "AND pnl_source='broker' "
-            "ORDER BY closed DESC LIMIT 120").fetchall()
+            "ORDER BY closed DESC LIMIT 160").fetchall()
     except Exception:
         return empty
     wins = losses = scratch = 0
     net = 0.0
     n = 0
     recent = []
+    broker_n = 0
     for deal_id, pnl, direction, entry, exit_px, closed, src in rows:
         pnl_n = _finite(pnl)
         if pnl_n is None or abs(float(pnl_n)) < 1e-12:
             continue
+        src_s = str(src or '').strip().lower()
+        if src_s and src_s not in ('broker', 'upl_estimate', 'funds', 'capital'):
+            # Ignore synthetic / non-cash teaching rows.
+            if src_s not in ('', 'none'):
+                continue
         if closed:
             try:
-                dt = datetime.fromisoformat(str(closed).replace('Z', '+00:00'))
+                raw = str(closed).replace('Z', '+00:00').replace(' ', 'T', 1)
+                dt = datetime.fromisoformat(raw)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 if dt < cutoff:
                     continue
             except Exception:
+                # Unparseable stamp → still count (better than false 0 today).
                 pass
         n += 1
+        if src_s == 'broker':
+            broker_n += 1
         net += float(pnl_n)
         if pnl_n > 0.02:
             wins += 1
@@ -784,7 +795,7 @@ def _journal_window_stats(store, *, hours=24) -> dict:
             losses += 1
         else:
             scratch += 1
-        if len(recent) < 12:
+        if len(recent) < 16:
             recent.append({
                 'at': closed,
                 'source': 'live_journal',
@@ -792,6 +803,7 @@ def _journal_window_stats(store, *, hours=24) -> dict:
                 'direction': direction,
                 'entry': entry,
                 'exit': exit_px,
+                'pnl_source': src_s or 'broker',
                 'mistakes': ['outcome_hurt'] if pnl_n < -0.02 else [],
                 'notes': ['journal_24h_seed'],
                 'scenario': 'LIVE_JOURNAL',
@@ -806,6 +818,7 @@ def _journal_window_stats(store, *, hours=24) -> dict:
         'net': round(net, 4),
         'useful_n': wins,
         'hurt_n': losses,
+        'broker_n': broker_n,
         'reads': 'wins+losses',
         'recent': recent,
     }

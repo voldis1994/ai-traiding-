@@ -43,6 +43,26 @@ def test_lab_payload_uses_journal_when_audit_hist_empty():
         assert lab['hurt_n'] >= 2
 
 
+def test_journal_counts_upl_estimate_when_broker_pending():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        now = datetime.now(timezone.utc)
+        store.upsert_trade({
+            'dealId': 'u1', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 3600,
+        })
+        store.close_trade(
+            'u1', 3601, -0.41, currency='GBP',
+            source='upl_estimate', overwrite=True)
+        store.db.execute(
+            'UPDATE trades SET closed=? WHERE deal_id=?',
+            (now.isoformat(), 'u1'))
+        store.db.commit()
+        w = sma._journal_window_stats(store, hours=24)
+        assert w['n'] == 1
+        assert w['losses'] == 1
+
+
 def test_desk_shadow_lab_pulse_learning_when_journal_has_closes():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')

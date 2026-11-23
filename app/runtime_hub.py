@@ -609,6 +609,20 @@ class RuntimeHub:
         snap = snap if isinstance(snap, dict) else {}
         store = getattr(rt, 'store', None) if rt is not None else None
         sd = snap.get('self_development') if isinstance(snap.get('self_development'), dict) else {}
+        # Keep SHADOW "Live today" news/peers in sync even mid-boot.
+        if store is not None:
+            try:
+                news = snap.get('economic_news_risk')
+                im = snap.get('intermarket_analysis')
+                if isinstance(news, dict) or isinstance(im, dict):
+                    store.set('live_external_context', {
+                        'at': __import__('datetime').datetime.now(
+                            __import__('datetime').timezone.utc).isoformat(),
+                        'news': news if isinstance(news, dict) else {},
+                        'intermarket': im if isinstance(im, dict) else {},
+                    })
+            except Exception:
+                pass
         out = {
             'ok': True,
             'can_open': bool(snap.get('entry_can_submit_now')),

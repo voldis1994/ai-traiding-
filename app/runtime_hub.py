@@ -1837,14 +1837,20 @@ class RuntimeHub:
             'configured':True})
         return hard_risk.snapshot(store)
 
-    async def refresh_live_truth(self, *, client_id: int | None = None) -> dict:
+    async def refresh_live_truth(self, *, client_id: int | None = None,
+                                 force: bool = False) -> dict:
         """Await Funds mirror + remap news/peers + boot shadow before Desk paint.
 
         ensure_future on the sync card path raced the HTTP response — Desk kept
         −0.81 / UNMAPPED / shadow off until a later poll luckily caught up.
+        Mirror is awaited at most every ~12s per client so 2s Desk polls stay snappy.
         """
-        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0}
+        import time as _time
+        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0, 'skipped': 0}
+        if not hasattr(self, '_live_truth_last'):
+            self._live_truth_last = {}
         clients = self.platform.list_clients()
+        now_m = _time.monotonic()
         for c in clients:
             cid = int(c.get('id') or 0)
             if client_id is not None and cid != int(client_id):
@@ -1855,6 +1861,9 @@ class RuntimeHub:
             eng = getattr(rt, 'engine', None)
             if eng is None:
                 continue
+            last = float(self._live_truth_last.get(cid) or 0)
+            # Remap + shadow every poll (cheap). Capital Funds HTTP only on cooldown.
+            do_mirror = force or (now_m - last) >= 12.0
             if hasattr(eng, '_ensure_instrument_mapped'):
                 try:
                     before = dict(getattr(eng, 'instrument_profile', None) or {})
@@ -1877,7 +1886,7 @@ class RuntimeHub:
                     pass
             im = getattr(eng, 'intermarket', None)
             st = (getattr(im, 'state', None) or {}) if im is not None else {}
-            if (im is not None and hasattr(eng, 'broker') and eng.broker
+            if (do_mirror and im is not None and hasattr(eng, 'broker') and eng.broker
                     and str(st.get('status') or '') in ('WAITING', 'UNAVAILABLE', '')):
                 try:
                     epic = (getattr(eng, 'mandate', None) or {}).get('epic')
@@ -1909,13 +1918,17 @@ class RuntimeHub:
                     })
                 except Exception:
                     pass
-            if hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
+            if do_mirror and hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
                 try:
                     n = await asyncio.wait_for(
                         eng._mirror_capital_funds_closes(), timeout=10.0)
                     out['mirrored'] += int(n or 0)
+                    self._live_truth_last[cid] = now_m
                 except Exception:
-                    pass
+                    # Still stamp cooldown so a dead broker cannot stall every poll.
+                    self._live_truth_last[cid] = now_m
+            elif not do_mirror:
+                out['skipped'] += 1
             if hasattr(eng, '_backfill_mistake_audits_from_journal'):
                 try:
                     eng._backfill_mistake_audits_from_journal(limit=400, hours=24)

@@ -4578,12 +4578,43 @@ class SingleTradeEngine:
                 score+=8.0
             if best is None or score<best[0]:
                 best=(score,deal)
-        if best is None:
+        if best is not None and best[0]<=120.0:
+            return best[1]
+        # Pence-cousin pass: confirm/UPL −0.81 vs Funds −0.89, levels missing or
+        # drifted past the 1.5 gate — still one trade, not a second orphan.
+        cousins=[]
+        for deal_id,j_epic,j_entry,j_exit,j_closed,j_pnl,j_src in rows:
+            deal=str(deal_id)
+            if deal in skip:
+                continue
+            if not self._epic_family_match(epic,j_epic):
+                continue
+            old=_num(j_pnl)
+            if old is None or not self._funds_pnl_needs_upgrade(old,j_src,pnl):
+                continue
+            delta=abs(float(old)-float(pnl))
+            if delta<self.FUNDS_PNL_EPS or delta>1.0:
+                continue
+            # Opposite-sign cash is a different close — never glue.
+            if float(old)*float(pnl)<0 and abs(float(old))>=0.05 and abs(float(pnl))>=0.05:
+                continue
+            jt=self._parse_broker_ts(j_closed)
+            if tx_ts is not None and jt is not None:
+                if abs(float(tx_ts)-float(jt))>6*3600:
+                    continue
+                tscore=abs(float(tx_ts)-float(jt))/60.0
+            else:
+                tscore=45.0
+            # Prefer UUID robot deals over other cap: orphans.
+            bonus=8.0 if deal.startswith('cap:') else 0.0
+            cousins.append((delta*10.0+tscore+bonus,deal))
+        if not cousins:
             return None
-        # Reject weak leftover matches.
-        if best[0]>120.0:
-            return None
-        return best[1]
+        cousins.sort(key=lambda x:x[0])
+        # Unique clear winner, or sole candidate.
+        if len(cousins)==1 or cousins[0][0]+3.0<cousins[1][0]:
+            return cousins[0][1]
+        return None
 
     def _apply_funds_pnl_to_deal(self,deal,tx,pnl,*,ccy_default):
         """Overwrite journal deal with Capital Funds £ and re-run cycle."""

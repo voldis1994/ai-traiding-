@@ -218,7 +218,7 @@ function formatPnlDisplay(pnl,src,ccy){
   return '—';
 }
 
-/** Capital £ → live open UPL → ≈UPL closes. Never wall the desk on blank gaida. */
+/** Capital closed £ first — never hide Funds history behind one open UPL tick. */
 function scoreboard(r){
   r=r||{};
   const ccy=r.pnl_currency||'';
@@ -228,14 +228,18 @@ function scoreboard(r){
   const wsrc=String(r.working_pnl_source||'').toLowerCase();
   const estN=Number(r.estimate_trades)||0;
 
+  // 1) Settled Capital cash (Funds / broker journal).
   if(hasRealWorkingPnl(r) && wsrc==='broker'){
     pnl=Number(r.working_pnl);src='broker';
   }else if((r.cash_trades||0)>0 && r.realized_pnl!=null && Number.isFinite(Number(r.realized_pnl))){
     pnl=Number(r.realized_pnl);src='broker';
-  }else if(r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
-    // Live Capital open UPL must win — stuck ≈UPL closes must not hide +£0.31.
-    pnl=Number(r.open_upl);src='open_upl';
-  }else if(wsrc==='upl_estimate' || estN>0){
+  }
+
+  // 2) Closed ≈UPL / pending rows with a real number — BEFORE open UPL.
+  // One client with a live open used to show only open UPL while Capital
+  // Closed Positions already had −0.89 / +0.62 (looked like a "mystery" £).
+  if(pnl==null && (wsrc==='upl_estimate' || estN>0
+      || (r.estimate_pnl!=null && Number.isFinite(Number(r.estimate_pnl))))){
     const est=r.estimate_pnl!=null?Number(r.estimate_pnl):null;
     if(est!=null&&Number.isFinite(est)){pnl=est;src='upl_estimate';}
     else{
@@ -251,7 +255,8 @@ function scoreboard(r){
           const v=Number(t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint));
           const s=String(t.pnl_source||'').toLowerCase();
           if(!Number.isFinite(v))continue;
-          if(s!=='upl_estimate'&&s!=='pending_broker_pnl'&&!t.pending_cash)continue;
+          if(s!=='upl_estimate'&&s!=='pending_broker_pnl'&&s!=='pending_close_sync'
+              &&!t.pending_cash)continue;
           sum+=v;n++;
         }
       }
@@ -260,15 +265,8 @@ function scoreboard(r){
     }
   }
 
-  if(src==='broker'){
-    if(r.display_wins!=null || r.display_losses!=null){
-      wins=Number(r.display_wins)||0;losses=Number(r.display_losses)||0;
-    }else{
-      wins=Number(r.wins)||0;losses=Number(r.losses)||0;
-    }
-  }
-
-  if(pnl==null && src!=='upl_estimate' && ledger.length){
+  // 3) Ledger / recent broker rows (full-history fallback).
+  if(pnl==null && ledger.length){
     let sum=0,w=0,l=0,nBroker=0;
     for(const row of ledger){
       const v=Number(row.pnl);
@@ -276,18 +274,34 @@ function scoreboard(r){
       if(String(row.source||'').toLowerCase()!=='broker')continue;
       sum+=v;nBroker++;if(v>0)w++;else if(v<0)l++;
     }
-    if(nBroker){pnl=sum;src='broker';if(wins+losses===0){wins=w;losses=l}}
+    if(nBroker){pnl=sum;src='broker';wins=w;losses=l}
   }
-
-  if(pnl==null && src!=='upl_estimate' && recent.length){
+  if(pnl==null && recent.length){
     let sum=0,n=0,w=0,l=0;
     for(const t of recent){
       const v=Number(t.pnl);
       if(!Number.isFinite(v))continue;
-      if(String(t.pnl_source||'').toLowerCase()!=='broker')continue;
+      const s=String(t.pnl_source||'').toLowerCase();
+      if(s!=='broker'&&s!==''&&s!=='funds'&&s!=='capital')continue;
       sum+=v;n++;if(v>0)w++;else if(v<0)l++;
     }
-    if(n){pnl=sum;src='broker';if(wins+losses===0){wins=w;losses=l}}
+    if(n){pnl=sum;src='broker';wins=w;losses=l}
+  }
+
+  // 4) Live open UPL only when there are no closed £ to show.
+  if(pnl==null && r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
+    pnl=Number(r.open_upl);src='open_upl';
+  }
+
+  if(src==='broker'){
+    if(r.display_wins!=null || r.display_losses!=null){
+      wins=Number(r.display_wins)||0;losses=Number(r.display_losses)||0;
+    }else if(!(wins+losses)){
+      wins=Number(r.wins)||0;losses=Number(r.losses)||0;
+    }
+  }else if(src==='upl_estimate' && !(wins+losses)){
+    wins=Number(r.estimate_wins!=null?r.estimate_wins:0)||0;
+    losses=Number(r.estimate_losses!=null?r.estimate_losses:0)||0;
   }
 
   return {pnl,src,wins,losses,ccy,closed:Number(r.closed_trades)||0,
@@ -516,17 +530,21 @@ function renderShadowLab(client){
         <div class="shadow-note">${esc(
           'At close · news '+(auditLast.news_status||'—')
           +' · peers '+(auditLast.intermarket_status||'—')
-          +' · zone '+(auditLast.zone_side||'—'))}</div>
+          +' · zone '+(auditLast.zone_side||'—')
+          +' · cycle does not wait on news/peers')}</div>
         <div class="shadow-note">${esc((()=>{
           const ln=audit.live_news||{};
           const lp=audit.live_peers||{};
+          const ns=String(ln.status||'NEWS_NA');
+          const ps=String(lp.status||'PEERS_NA');
           const nr=ln.reason?String(ln.reason).slice(0,72):'';
           const pr=lp.reason?String(lp.reason).slice(0,56):'';
-          return 'Live today · news '+(ln.status||'—')
+          return 'Context · news '+ns
             +(nr?(' · '+nr):'')
-            +' · peers '+(lp.status||'—')
+            +' · peers '+ps
             +(lp.ready_peers!=null?(' '+lp.ready_peers+'/'+(lp.peer_n||0)):'')
-            +(pr?(' · '+pr):'');
+            +(pr?(' · '+pr):'')
+            +' · closes analyse anyway';
         })())}</div>
       </div>
     </article>
@@ -577,7 +595,9 @@ function renderShadowLab(client){
           ${_shadowKv('Open',openTxt)}
         </div>
         <div class="shadow-note">${esc(
-          paper.audit_backfill
+          paper.capital_journal_seed
+            ?('Seeded from Capital Funds journal — SHADOW £ mirrors CLIENT CLOSES ('+(paperTrades)+')')
+            :(paper.audit_backfill
             ?('Restored from MISTAKE AUDIT hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
             :(paperUnit==='price'
               ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
@@ -597,7 +617,7 @@ function renderShadowLab(client){
           ${_shadowKv('Paper samples',last.paper_cash_samples!=null?last.paper_cash_samples:'—')}
           ${_shadowKv('Live samples',last.live_samples!=null?last.live_samples:'—')}
         </div>
-        <div class="shadow-note">${esc(last.reason||evo.last_reason||'Waiting for aligned £ windows')}</div>
+        <div class="shadow-note">${esc(last.reason||evo.last_reason||'Self-dev runs on Capital + paper closes — not news events')}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -2000,16 +2020,14 @@ function fleetPnl(s,clients){
   let wins=s.display_wins_all;
   let losses=s.display_losses_all;
   const ccy=s.pnl_currency||'';
-  // Clear empty / ≈UPL-as-working placeholders — then prefer live open UPL.
-  if(total!=null && (src==='none'||src==='empty'||src==='upl_estimate'))total=null;
-  if(src==='open_upl'&&s.open_upl_all!=null&&Number.isFinite(Number(s.open_upl_all))){
-    total=Number(s.open_upl_all);
+  // Clear empty / open-UPL-as-working placeholders. Closed Capital £ (broker
+  // or ≈estimate) must beat a single client's live open tick.
+  if(total!=null && (src==='none'||src==='empty'||src==='open_upl'))total=null;
+  if(total==null && s.estimate_pnl_all!=null && Number.isFinite(Number(s.estimate_pnl_all))){
+    total=Number(s.estimate_pnl_all);src='upl_estimate';
   }
   if(total==null && s.open_upl_all!=null && Number.isFinite(Number(s.open_upl_all))){
     total=Number(s.open_upl_all);src='open_upl';
-  }
-  if(total==null && s.estimate_pnl_all!=null && Number.isFinite(Number(s.estimate_pnl_all))){
-    total=Number(s.estimate_pnl_all);src='upl_estimate';
   }
   if(total==null || wins==null || losses==null){
     let sum=0,n=0,w=0,l=0,estSum=0,estN=0,anyEst=false;

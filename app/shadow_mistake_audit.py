@@ -49,14 +49,44 @@ def _clip01(v):
     return max(0.0, min(1.0, float(n)))
 
 
+def _fp_news_bucket(status) -> str:
+    """Fingerprint news without waiting on calendar boot.
+
+    UNCONFIGURED / WAITING / CALENDAR_UNAVAILABLE used to mint a new scenario
+    class every boot, so SHADOW looked stuck on "special events" instead of
+    grouping real Capital closes.
+    """
+    s = str(status or '').strip().upper()
+    if not s or s in ('UNCONFIGURED', 'WAITING', 'CALENDAR_UNAVAILABLE',
+                      'NONE', '—', '-', 'NEWS?'):
+        return 'NEWS_NA'
+    if s in ('CLEAR', 'OK', 'READY', 'ALLOW'):
+        return 'NEWS_CLEAR'
+    if s in ('NEWS_WINDOW', 'HIGH_IMPACT') or 'BLOCK' in s:
+        return 'NEWS_BLOCK'
+    return s[:24]
+
+
+def _fp_peers_bucket(status) -> str:
+    """Fingerprint peers without waiting on intermarket READY."""
+    s = str(status or '').strip().upper()
+    if not s or s in ('WAITING', 'UNCONFIGURED', 'NONE', '—', '-', 'IM?'):
+        return 'PEERS_NA'
+    if s in ('READY', 'OK', 'CLEAR', 'ALLOW'):
+        return 'PEERS_OK'
+    if s in ('CONTRADICTION', 'FIGHT', 'VETO') or 'BLOCK' in s:
+        return 'PEERS_FIGHT'
+    return s[:24]
+
+
 def fingerprint(*, scenario=None, zone_side=None, news_status=None,
                 intermarket_status=None, direction=None, trigger=None) -> str:
     """Stable short id for a market-situation class (not a trade id)."""
     parts = [
         str(scenario or 'UNK'),
         str(zone_side or 'mid'),
-        str(news_status or 'news?'),
-        str(intermarket_status or 'im?'),
+        _fp_news_bucket(news_status),
+        _fp_peers_bucket(intermarket_status),
         str((direction or '?')).upper(),
         str(trigger or 'trig?'),
     ]
@@ -102,6 +132,7 @@ def snapshot_context(*, candles=None, scenario_meta=None, ohlc_meta=None,
     news_status = str(news.get('status') or 'UNCONFIGURED')
     im_status = str(intermarket.get('status') or 'WAITING')
     # Assess peer fight against the trade direction when peers are ready.
+    # Peers still WAITING must NOT freeze diagnose — Capital closes analyse now.
     im_fight = False
     if direction in ('BUY', 'SELL') and im_status == 'READY':
         try:
@@ -671,17 +702,24 @@ def lab_payload(store) -> dict:
             live_news = assess_news(
                 epic, cal, instrument_currencies=currencies) or {}
         except Exception:
-            live_news = {'status': 'UNCONFIGURED',
-                         'reason': 'Calendar not readable yet'}
+            live_news = {'status': 'NEWS_NA',
+                         'reason': 'Calendar optional — closes still analyse'}
     peer_n = 0
     ready_peers = 0
     if isinstance(live_im.get('peers'), list):
         peer_n = len(live_im['peers'])
         ready_peers = sum(1 for p in live_im['peers']
                           if isinstance(p, dict) and p.get('ready'))
+    # Honest lab labels: do not advertise WAITING as a gate for the cycle.
+    news_lab_status = str(live_news.get('status') or 'NEWS_NA')
+    if news_lab_status in ('UNCONFIGURED', 'WAITING', 'CALENDAR_UNAVAILABLE'):
+        news_lab_status = 'NEWS_NA'
+    peers_lab_status = str(live_im.get('status') or 'PEERS_NA')
+    if peers_lab_status in ('WAITING', 'UNCONFIGURED'):
+        peers_lab_status = 'PEERS_NA'
     return {
         'ok': True,
-        'loop': 'diagnose → scenario memory → targeted fix → promote → LIVE',
+        'loop': 'diagnose ALL Capital closes → memory → fix → promote → LIVE',
         'promote_n': PROMOTE_N,
         'ready_n': READY_N,
         'scenarios': len(bag),
@@ -690,14 +728,18 @@ def lab_payload(store) -> dict:
         'hurt_n': hurt_n,
         'window_24h': window_24h,
         'live_news': {
-            'status': live_news.get('status') or '—',
-            'reason': live_news.get('reason'),
+            'status': news_lab_status,
+            'reason': live_news.get('reason') or (
+                'context only — not a close gate' if news_lab_status == 'NEWS_NA'
+                else None),
             'entry_allowed': live_news.get('entry_allowed'),
             'event_at': live_news.get('event_at'),
         },
         'live_peers': {
-            'status': live_im.get('status') or 'WAITING',
-            'reason': live_im.get('reason'),
+            'status': peers_lab_status,
+            'reason': live_im.get('reason') or (
+                'context only — not a close gate' if peers_lab_status == 'PEERS_NA'
+                else None),
             'peer_n': peer_n,
             'ready_peers': ready_peers,
             'entry_allowed': live_im.get('entry_allowed'),

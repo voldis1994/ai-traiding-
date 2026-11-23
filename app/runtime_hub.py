@@ -679,6 +679,12 @@ class RuntimeHub:
                     except Exception:
                         pass
                     try:
+                        # Still no paper £ but Capital journal has closes → seed.
+                        eng.shadow_paper.backfill_from_capital_journal(
+                            hours=24, limit=80)
+                    except Exception:
+                        pass
+                    try:
                         # Re-scale price-only paper closes from LIVE broker £.
                         live = getattr(
                             getattr(eng, 'profit_learning', None), 'history', None) or []
@@ -691,6 +697,10 @@ class RuntimeHub:
                     jp = ShadowPaperJournal(store)
                     try:
                         jp.backfill_from_mistake_audits()
+                    except Exception:
+                        pass
+                    try:
+                        jp.backfill_from_capital_journal(hours=24, limit=80)
                     except Exception:
                         pass
                     try:

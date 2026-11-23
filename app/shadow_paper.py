@@ -583,6 +583,77 @@ class ShadowPaperJournal:
             self._persist()
         return added
 
+    def backfill_from_capital_journal(self,*,hours=24,limit=80):
+        """When paper cash is empty, seed SHADOW £ from Capital broker closes.
+
+        Operator truth: if CLIENT CLOSES has Funds £, SHADOW must not sit at 0
+        waiting for a synthetic paper fill. LIVE broker rows become display
+        cash with source ``capital_journal`` (not invented paper votes).
+        """
+        if self.store is None or not hasattr(self.store,'db'):
+            return 0
+        # Only seed when there is no cash £ yet (price-only / empty OK).
+        if self.paper_cash_pnls():
+            return 0
+        from datetime import timedelta
+        now=datetime.now(timezone.utc)
+        cutoff=now-timedelta(hours=max(1,int(hours)))
+        try:
+            rows=self.store.db.execute(
+                "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
+                "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
+                "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
+        except Exception:
+            return 0
+        existing={
+            str(r.get('deal_id') or r.get('fingerprint') or '')
+            for r in (self.history or []) if isinstance(r,dict)
+        }
+        added=0
+        for deal_id,pnl,direction,entry,exit_px,closed,src in rows:
+            pnl_n=_finite(pnl)
+            if pnl_n is None or abs(float(pnl_n))<1e-12:
+                continue
+            src_s=str(src or '').strip().lower()
+            if src_s and src_s not in (
+                    'broker','upl_estimate','funds','capital',
+                    'pending_broker_pnl','pending_close_sync',''):
+                continue
+            if closed:
+                try:
+                    raw=str(closed).replace('Z','+00:00').replace(' ','T',1)
+                    dt=datetime.fromisoformat(raw)
+                    if dt.tzinfo is None:
+                        dt=dt.replace(tzinfo=timezone.utc)
+                    if dt<cutoff:
+                        continue
+                except Exception:
+                    pass
+            key=str(deal_id or '')
+            if key and key in existing:
+                continue
+            row={
+                'at':closed,
+                'direction':direction,
+                'entry':entry,
+                'exit':exit_px,
+                'paper_pnl':float(pnl_n),
+                'price_pnl':None,
+                'unit':'account_currency',
+                'exit_reason':'capital_journal',
+                'source':'capital_journal',
+                'deal_id':key,
+                'fingerprint':key or None,
+                'pnl_source':src_s or 'broker',
+            }
+            self.history.append(row)
+            if key:
+                existing.add(key)
+            added+=1
+        if added:
+            self._persist()
+        return added
+
     def summary(self):
         pnls=self.paper_cash_pnls()
         price_pnls=[]
@@ -625,5 +696,8 @@ class ShadowPaperJournal:
             'exit_mode':'sl_tp_only',
             'audit_backfill':any(
                 isinstance(r,dict) and r.get('source')=='shadow_paper_audit_backfill'
+                for r in (self.history or [])),
+            'capital_journal_seed':any(
+                isinstance(r,dict) and r.get('source')=='capital_journal'
                 for r in (self.history or [])),
         }

@@ -4885,13 +4885,39 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=400,hours=24):
-        """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
+    def _observe_entry_gates_once(self,deal_id,*,ohlc_meta=None,broker_pnl=None,
+                                  spread=0.0,source='live'):
+        """Adapt break|zone knobs once per deal — live settle or journal backfill."""
+        if self.store is None or deal_id is None:
+            return None
+        once='ohlc_gates_observed:'+str(deal_id)
+        if self.store.get(once):
+            return {'adapted':False,'reason':'already_observed'}
+        try:
+            out=ohlc_entry_zones.observe_close(
+                self.store,ohlc_meta=ohlc_meta,broker_pnl=broker_pnl,
+                spread=spread)
+        except Exception as exc:
+            self.store.event('warning','OHLC entry gates learn skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id,
+                              'source':source})
+            return None
+        # Stamp once even when no_trigger / scratch — avoid re-probing forever.
+        self.store.set(once,{
+            'at':now(),'pnl':_num(broker_pnl),'source':source,
+            'adapted':bool(out and out.get('adapted')),
+            'reason':(out or {}).get('reason'),
+            'trigger':(ohlc_meta or {}).get('trigger')
+                      if isinstance(ohlc_meta,dict) else None})
+        return out
 
-        Analysis needs both sides — skipping wins left the cycle blind to what
-        worked next to the minuses. Window is time-based (24h), not "last 1 close".
-        Includes pending_* rows that already carry a non-zero £ so SHADOW is not
-        stuck waiting while Funds mirror catches up.
+    def _backfill_mistake_audits_from_journal(self,*,limit=400,hours=168):
+        """Re-run cycle on Capital £ closes (wins + losses) for SHADOW learning.
+
+        Default window is 7d (not only last 24h) so prior closed trades still
+        feed mistake-audit + break|zone knobs after restart / late Funds £.
+        Desk 24h pulse stays separate. Includes pending_* rows that already
+        carry a non-zero £ so SHADOW is not stuck waiting for mirror tags.
         """
         if self.store is None:
             return 0
@@ -4903,18 +4929,24 @@ class SingleTradeEngine:
         except Exception:
             return 0
         now_utc=datetime.now(timezone.utc)
+        cutoff=None
         try:
-            cutoff=now_utc-timedelta(hours=max(1,int(hours)))
-        except Exception:
-            cutoff=now_utc-timedelta(hours=24)
+            h=int(hours) if hours is not None else 0
+        except (TypeError,ValueError):
+            h=168
+        if h>0:
+            cutoff=now_utc-timedelta(hours=h)
         n=0
         scanned=0
         wins=0
         losses=0
+        gates_n=0
         cash_sources={
             'broker','upl_estimate','funds','capital','',
             'pending_broker_pnl','pending_close_sync','pending_upl_teach',
         }
+        # Knob adapts only from settled Funds-like £ — never invent from UPL.
+        gate_sources={'broker','funds','capital','','pending_broker_pnl'}
         for deal_id,pnl,direction,entry,src,closed in rows:
             pnl_n=_num(pnl)
             if pnl_n is None or abs(float(pnl_n))<1e-12:
@@ -4923,8 +4955,8 @@ class SingleTradeEngine:
             # Cash-like sources only (broker / late UPL / funds mirror tags).
             if src_s and src_s not in cash_sources:
                 continue
-            # Keep inside the 24h analysis window.
-            if closed:
+            # Optional time window (hours<=0 → all rows within limit).
+            if cutoff is not None and closed:
                 try:
                     raw=str(closed).replace('Z','+00:00').replace(' ','T',1)
                     ct=datetime.fromisoformat(raw)
@@ -4947,12 +4979,24 @@ class SingleTradeEngine:
                 entry=_num(entry),source='live_backfill')
             if out and out.get('audited'):
                 n+=1
-        if n or scanned:
+            # Also teach break|zone knobs from past closes (once per deal).
+            if src_s in gate_sources or not src_s:
+                saved=self.store.get('entry_brain:'+str(deal_id)) or {}
+                ohlc_meta=(saved.get('ohlc_entry')
+                           if isinstance(saved,dict) else None)
+                spread=_num(saved.get('entry_spread')) if isinstance(saved,dict) else 0.
+                gate=self._observe_entry_gates_once(
+                    deal_id,ohlc_meta=ohlc_meta,broker_pnl=float(pnl_n),
+                    spread=spread or 0.,source='live_backfill')
+                if gate and gate.get('adapted'):
+                    gates_n+=1
+        if n or scanned or gates_n:
             self.store.event('shadow_mistake_audit',
-                             'Backfilled mistake audits from 24h journal '
+                             'Backfilled mistake audits from journal '
                              '(wins+losses)',
                              {'n':n,'scanned':scanned,'wins':wins,
-                              'losses':losses,'hours':int(hours)})
+                              'losses':losses,'hours':int(h),
+                              'gates_adapted':gates_n})
         return n
 
     def _last_upl_as_realized(self,deal_id):
@@ -5261,9 +5305,9 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror skipped',
                              {'type':type(exc).__name__})
-        # Cycle reads full 24h Capital book (wins + losses) after Funds £ lands.
+        # Cycle reads Capital book (wins + losses, default 7d) after Funds £ lands.
         try:
-            self._backfill_mistake_audits_from_journal(limit=400,hours=24)
+            self._backfill_mistake_audits_from_journal(limit=400,hours=168)
         except Exception as exc:
             self.store.event('warning','Mistake-audit backfill skipped',
                              {'type':type(exc).__name__})
@@ -5988,15 +6032,11 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','Re-entry confirm learn skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
-            try:
-                ohlc_entry_zones.observe_close(
-                    self.store,
-                    ohlc_meta=(saved.get('ohlc_entry')
-                               if isinstance(saved,dict) else None),
-                    broker_pnl=pnl_value,spread=spread_cost)
-            except Exception as exc:
-                self.store.event('warning','OHLC entry gates learn skipped',
-                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            self._observe_entry_gates_once(
+                deal_id,
+                ohlc_meta=(saved.get('ohlc_entry')
+                           if isinstance(saved,dict) else None),
+                broker_pnl=pnl_value,spread=spread_cost,source='live')
             # Self-audit: did scenario/zone analysis match post-trade OHLC + £?
             try:
                 from . import ohlc_scenarios

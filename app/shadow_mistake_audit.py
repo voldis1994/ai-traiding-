@@ -26,8 +26,8 @@ READY_KEY = 'shadow_mistake_audit_v1:ready'
 LAST_KEY = 'shadow_mistake_audit_v1:last'
 PENDING_FIX_KEY = 'shadow_mistake_audit_v1:pending_fix'
 
-PROMOTE_N = 3   # same fingerprint+mistake repeats before settings change
-READY_N = 2     # wins after committed fix → ready_for_live
+PROMOTE_N = 1   # first same fingerprint+mistake → commit fix (full cycle NOW)
+READY_N = 0     # commit → ready_for_live immediately (no proof-win queue)
 
 
 def _finite(v):
@@ -508,8 +508,37 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
     return {'applied': True, 'changed': changed, 'params': params, 'proposed': proposed}
 
 
+def _mark_ready_entry(store, *, fingerprint: str, row: dict,
+                      source=None, wins_after=None) -> dict:
+    """Push fingerprint onto READY queue and stamp scenario bag."""
+    ready = list(store.get(READY_KEY) or [])
+    entry = {
+        'fingerprint': fingerprint,
+        'scenario': row.get('scenario'),
+        'direction': row.get('direction'),
+        'zone_side': row.get('zone_side'),
+        'wins_after_fix': int(
+            wins_after if wins_after is not None
+            else (row.get('wins_after_fix') or 0)),
+        'ready_at': _now_iso(),
+        'source': source,
+    }
+    ready = [r for r in ready if isinstance(r, dict)
+             and r.get('fingerprint') != fingerprint]
+    ready.insert(0, entry)
+    store.set(READY_KEY, ready[:20])
+    bag = _scenario_bag(store)
+    stamped = dict(bag.get(fingerprint) or row or {})
+    stamped['ready_for_live'] = True
+    stamped['fingerprint'] = fingerprint
+    bag[fingerprint] = stamped
+    store.set(SCENARIOS_KEY, bag)
+    store.event('shadow_mistake_audit', 'Scenario ready for LIVE', entry)
+    return entry
+
+
 def _update_ready(store, diagnosis: dict) -> dict | None:
-    """Mark fingerprint ready_for_live after enough wins post-fix."""
+    """Mark fingerprint ready_for_live (READY_N=0 → right after fix commit)."""
     if store is None or not isinstance(diagnosis, dict):
         return None
     ctx = diagnosis.get('context') or {}
@@ -520,29 +549,14 @@ def _update_ready(store, diagnosis: dict) -> dict | None:
     row = bag.get(fp) if isinstance(bag.get(fp), dict) else None
     if not row or not row.get('fix_committed'):
         return None
+    if row.get('ready_for_live'):
+        return {'fingerprint': fp, 'already': True}
     wins_after = int(row.get('wins_after_fix') or 0)
-    if wins_after < READY_N:
+    if wins_after < int(READY_N):
         return {'fingerprint': fp, 'wins_after_fix': wins_after, 'need': READY_N}
-    ready = list(store.get(READY_KEY) or [])
-    entry = {
-        'fingerprint': fp,
-        'scenario': row.get('scenario'),
-        'direction': row.get('direction'),
-        'zone_side': row.get('zone_side'),
-        'wins_after_fix': wins_after,
-        'ready_at': _now_iso(),
-        'source': diagnosis.get('source'),
-    }
-    ready = [r for r in ready if isinstance(r, dict)
-             and r.get('fingerprint') != fp]
-    ready.insert(0, entry)
-    store.set(READY_KEY, ready[:20])
-    row = dict(row)
-    row['ready_for_live'] = True
-    bag[fp] = row
-    store.set(SCENARIOS_KEY, bag)
-    store.event('shadow_mistake_audit', 'Scenario ready for LIVE', entry)
-    return entry
+    return _mark_ready_entry(
+        store, fingerprint=fp, row=row,
+        source=diagnosis.get('source'), wins_after=wins_after)
 
 
 def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
@@ -598,7 +612,10 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             commit_result = apply_targeted_fix(store, diagnosis, commit=False)
 
     ready = None
-    if diagnosis.get('useful'):
+    # Full cycle NOW: after fix commit → ready_for_live (READY_N may be 0).
+    if commit_result.get('applied'):
+        ready = _update_ready(store, diagnosis)
+    elif diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
     audited_at = _now_iso()
@@ -699,10 +716,110 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     return out
 
 
+def flush_full_cycle(store) -> dict:
+    """Commit every pending / repeated mistake NOW and mark ready_for_live.
+
+    Clears TARGETED FIX stuck on PENDING and READY→LIVE empty queue after
+    Capital closes already filled hist / scenarios.
+    """
+    if store is None:
+        return {'flushed': False, 'reason': 'no_store'}
+    bag = _scenario_bag(store)
+    committed = 0
+    readied = 0
+    for fp, row in list(bag.items()):
+        if not isinstance(row, dict) or not fp:
+            continue
+        counts = row.get('mistake_counts') if isinstance(
+            row.get('mistake_counts'), dict) else {}
+        # Prefer the hottest mistake class for this fingerprint.
+        mist_key = None
+        mist_n = 0
+        for k, n in counts.items():
+            try:
+                nn = int(n)
+            except (TypeError, ValueError):
+                continue
+            if nn > mist_n:
+                mist_n = nn
+                mist_key = k
+        if mist_key is None and int(row.get('mistake_hits') or 0) <= 0:
+            continue
+        mistakes = [m for m in str(mist_key or '').split('+') if m]
+        if not mistakes and row.get('last_mistakes'):
+            mistakes = list(row.get('last_mistakes') or [])
+        if not mistakes:
+            continue
+        gate = promote_gate(store, fp, mistakes)
+        if gate.get('ready') and not row.get('fix_committed'):
+            proposed = propose_fix(mistakes)
+            if not isinstance(proposed, dict):
+                continue
+            diagnosis = {
+                'mistakes': mistakes,
+                'proposed_fix': proposed,
+                'context': {
+                    'fingerprint': fp,
+                    'scenario': row.get('scenario'),
+                    'direction': row.get('direction'),
+                    'zone_side': row.get('zone_side'),
+                },
+                'source': 'flush_full_cycle',
+            }
+            out = apply_targeted_fix(store, diagnosis, commit=True)
+            if out.get('applied'):
+                committed += 1
+                bag = _scenario_bag(store)
+                row = bag.get(fp) if isinstance(bag.get(fp), dict) else row
+        bag = _scenario_bag(store)
+        row = bag.get(fp) if isinstance(bag.get(fp), dict) else None
+        if isinstance(row, dict) and row.get('fix_committed') and not row.get(
+                'ready_for_live'):
+            _mark_ready_entry(
+                store, fingerprint=fp, row=row, source='flush_full_cycle')
+            readied += 1
+    # Also commit a bare PENDING_FIX if gate already satisfied.
+    pending = store.get(PENDING_FIX_KEY) if isinstance(
+        store.get(PENDING_FIX_KEY), dict) else {}
+    if pending and not pending.get('committed') and pending.get('proposed'):
+        fp = str(pending.get('fingerprint') or '')
+        mistakes = list(pending.get('mistakes') or [])
+        if fp and mistakes:
+            gate = promote_gate(store, fp, mistakes)
+            if gate.get('ready') or gate.get('count', 0) >= PROMOTE_N:
+                diagnosis = {
+                    'mistakes': mistakes,
+                    'proposed_fix': pending.get('proposed'),
+                    'context': {'fingerprint': fp},
+                    'source': 'flush_pending',
+                }
+                out = apply_targeted_fix(store, diagnosis, commit=True)
+                if out.get('applied'):
+                    committed += 1
+                    bag = _scenario_bag(store)
+                    row = bag.get(fp) if isinstance(bag.get(fp), dict) else {
+                        'fingerprint': fp}
+                    if not row.get('ready_for_live'):
+                        _mark_ready_entry(
+                            store, fingerprint=fp, row=row,
+                            source='flush_pending')
+                        readied += 1
+    if committed or readied:
+        store.event('shadow_mistake_audit', 'Full cycle flushed', {
+            'committed': committed, 'readied': readied,
+            'promote_n': PROMOTE_N, 'ready_n': READY_N})
+    return {'flushed': True, 'committed': committed, 'readied': readied}
+
+
 def lab_payload(store) -> dict:
     """Compact payload for the SHADOW rail cards."""
     if store is None:
         return {'ok': False, 'reason': 'no_store'}
+    # Unstick PENDING / empty READY from prior 3× / 2-win gates.
+    try:
+        flush_full_cycle(store)
+    except Exception:
+        pass
     last = store.get(LAST_KEY) if isinstance(store.get(LAST_KEY), dict) else {}
     pending = (store.get(PENDING_FIX_KEY)
                if isinstance(store.get(PENDING_FIX_KEY), dict) else {})

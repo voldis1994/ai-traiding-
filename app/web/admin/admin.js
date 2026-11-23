@@ -448,7 +448,7 @@ function renderShadowLab(client){
     return `<div class="shadow-note ok-line">${esc(r.scenario||r.fingerprint||'?')} · `
       +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
   }).filter(Boolean).join('')
-    ||'<div class="shadow-note">None ready for LIVE yet (need repeats + proof wins)</div>';
+    ||'<div class="shadow-note">None ready for LIVE yet — waiting for next hurt close to commit fix</div>';
   const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,12).map(a=>{
     if(!a||typeof a!=='object')return '';
     const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
@@ -531,7 +531,7 @@ function renderShadowLab(client){
         <div class="shadow-note">${esc(
           pendingFix.committed
             ?('Committed knobs: '+((pendingFix.changed||[]).join(', ')||'flags'))
-            :(pendingFix.why||'Same mistake must repeat '+((audit.promote_n!=null)?audit.promote_n:3)+'× before settings change'))}</div>
+            :(pendingFix.why||'First same mistake commits fix → ready LIVE immediately'))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -1038,7 +1038,7 @@ function renderDeskLearn(client){
       v=>v==null?'—':num(v,2)),
     deskKv(client.id,'W/L',
       (Number(shadow.cash_trades||0)>0
-        ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
+        ?(`${shadow.wins||0}/${shadow.losses||0}`):'—')),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Strat Δ',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),

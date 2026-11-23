@@ -1033,9 +1033,10 @@ class AutoEvolution:
         winner=None;best=baseline;best_cash=None
         # Promote on a trade/learning tempo. Generation gates EXIT policy code;
         # LIVE entry is neural vote (lot+market = risk frame).
-        need_n=12 if force else 18
-        need_val=4 if force else 6
-        lift=.001 if (force and loss_trade) else .002
+        # Faster full cycle: allow promote with fewer labels after a loss teach.
+        need_n=6 if force else 12
+        need_val=2 if force else 4
+        lift=.0005 if (force and loss_trade) else .001
         # Closed-trade £ after costs — must come from profit_learning (+ entry
         # scores), not M1 brain.history alone (those lack actual_pnl).
         cash_rows=list(cash_trades) if cash_trades is not None else self.policy_cash_rows(

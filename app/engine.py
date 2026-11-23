@@ -1110,13 +1110,55 @@ class SingleTradeEngine:
                     {'type':type(exc).__name__,'detail':str(exc)[:160]})
         self._last_self_dev_bar=None
         self.shadow_brain=None  # optional alternate architecture (never executes LIVE)
+    def _ensure_instrument_mapped(self):
+        """Re-map currencies from epic when broker instrument blob left us blank.
+
+        Capital GOLD often arrives as CS.D.USCGC.TODAY.IP with an empty/partial
+        instrument dict → currencies=[] → UNMAPPED_INSTRUMENT blocker forever.
+        """
+        epic=(self.mandate or {}).get('epic') if self.mandate else None
+        if not epic:
+            return self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
+        cur=self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
+        if cur.get('mapped') and cur.get('currencies'):
+            return cur
+        inst={}
+        try:
+            bm=getattr(self,'_last_broker_market',None) or {}
+            if isinstance(bm,dict):
+                inst=bm.get('instrument') if isinstance(bm.get('instrument'),dict) else {}
+        except Exception:
+            inst={}
+        # Fold live market name when present.
+        mkt=getattr(self,'market',None) or {}
+        if isinstance(mkt,dict) and mkt.get('instrument_name') and not inst.get('name'):
+            inst={**inst,'name':mkt.get('instrument_name')}
+        prof=instrument_profile(epic,inst)
+        if prof.get('currencies'):
+            was_blank=not (cur.get('mapped') and cur.get('currencies'))
+            self.instrument_profile=prof
+            # Remap METALS/etc. → force peer rediscovery (was WAITING on UNKNOWN).
+            if was_blank:
+                try:
+                    im=getattr(self,'intermarket',None)
+                    st=(getattr(im,'state',None) or {}) if im is not None else {}
+                    if str(st.get('status') or '') in ('WAITING','UNAVAILABLE',''):
+                        im.epic=None
+                        im.peers=[]
+                        im.last_discovery=0.
+                except Exception:
+                    pass
+            return prof
+        return cur
+
     def _news_risk(self, when=None):
         # Use the engine clock so candle learning, news features and entry guards
         # share one timeline (and tests can freeze time via monkeypatching now()).
+        prof=self._ensure_instrument_mapped()
         result=assess_news(self.mandate['epic'] if self.mandate else '',
                            self.news_calendar_path,
                            now=when or clock(),
-                           instrument_currencies=self.instrument_profile['currencies'])
+                           instrument_currencies=list(prof.get('currencies') or []))
         if result.get('enabled') and result.get('status') in ('CLEAR','NEWS_WINDOW'):
             # A transient network failure does not invalidate a still-current
             # verified cached calendar; the freshness checks are in assess_news.

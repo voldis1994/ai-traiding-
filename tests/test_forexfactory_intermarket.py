@@ -58,6 +58,11 @@ def test_high_impact_window_only_and_stale_fail_closed(tmp_path):
 def test_profile_multiple_asset_classes():
     assert instrument_profile('CS.D.EURUSD.CFD.IP')['currencies']==['EUR','USD']
     assert instrument_profile('GOLD')['currencies']==['USD']
+    # Capital.com gold epic has no literal "GOLD" — must still map USD.
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['kind']=='METALS'
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['currencies']==['USD']
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['mapped'] is True
+    assert instrument_profile('OIL_CRUDE')['kind']=='COMMODITIES'
     assert instrument_profile('NASDAQ')['kind']=='INDICES'
     assert instrument_profile('BITCOIN')['kind']=='CRYPTO'
     assert instrument_profile('SIM')['mapped'] is False

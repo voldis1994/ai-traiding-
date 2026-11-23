@@ -637,8 +637,13 @@ def lab_payload(store) -> dict:
     if not live_news.get('status') and getattr(store, 'path', None) is not None:
         try:
             from .external_risk import assess_news
+            from .instrument_profile import instrument_profile
             cal = store.path.parent / 'economic_calendar.json'
-            live_news = assess_news('', cal) or {}
+            mandate = store.get('mandate') if isinstance(store.get('mandate'), dict) else {}
+            epic = str(mandate.get('epic') or '')
+            currencies = instrument_profile(epic).get('currencies') or []
+            live_news = assess_news(
+                epic, cal, instrument_currencies=currencies) or {}
         except Exception:
             live_news = {'status': 'UNCONFIGURED',
                          'reason': 'Calendar not readable yet'}

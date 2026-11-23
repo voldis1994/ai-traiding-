@@ -56,10 +56,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=134' in html
-    assert 'admin.js?v=161' in html
+    assert 'admin.css?v=135' in html
+    assert 'admin.js?v=162' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 252' in hub
+    assert 'DESK_TRUTH_REV = 253' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js

@@ -163,6 +163,16 @@ function money(v,ccy){
   const sign=n>0?'+':'';
   return sign+num(n,2)+(ccy?' '+ccy:'');
 }
+/** Account cash currency for open floating P&L — never GOLD quote USD / pnl_currency invent. */
+function accountCashCcy(c){
+  const a=(c&&c.activity)||{};
+  const bal=(a.balance&&typeof a.balance==='object')?a.balance:{};
+  const raw=(c&&c.account_currency)||a.currency||bal.currency||'GBP';
+  const ccy=String(raw||'GBP').trim().toUpperCase();
+  // Capital tags GOLD positions with quote USD — that is NOT account cash.
+  if(ccy==='USD'&&String((c&&c.account_currency)||'').toUpperCase()==='GBP')return 'GBP';
+  return ccy||'GBP';
+}
 function esc(s){
   return String(s??'').replace(/[&<>"']/g,c=>({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -849,13 +859,13 @@ function renderDeskLevels(view,client){
   const profit=lvl(pos&&pos.profitLevel,open[0]&&open[0].profit);
   const mid=view&&view.mid!=null?view.mid:a.market_mid;
   const upl=pos&&pos.upl!=null&&Number.isFinite(Number(pos.upl))?Number(pos.upl):null;
-  const ccy=(a.balance&&a.balance.currency)||a.currency||'';
+  const ccy=accountCashCcy(client);
   const bits=[];
   if(stop!=null)bits.push(`<span class="psx-lvl sl">SL ${esc(num(stop,2))}</span>`);
   if(entry!=null)bits.push(`<span class="psx-lvl ent">ENT ${esc(num(entry,2))}</span>`);
   if(profit!=null)bits.push(`<span class="psx-lvl tp">TP ${esc(num(profit,2))}</span>`);
   // Open floating cash in account currency — never label as inventēts UPL/USD.
-  if(upl!=null)bits.push(`<span class="psx-lvl mid">Open ${esc(money(upl,ccy||'GBP'))}</span>`);
+  if(upl!=null)bits.push(`<span class="psx-lvl mid">Open ${esc(money(upl,ccy))}</span>`);
   if(mid!=null&&Number(mid)>0&&!bits.length)bits.push(`<span class="psx-lvl mid">MID ${esc(num(mid,2))}</span>`);
   stableHtml(el,bits.join('')||'<span class="psx-empty" style="padding:0">No levels</span>');
 }
@@ -1914,8 +1924,9 @@ function positionMid(p,activity){
 function collectOpenTrades(clients){
   const rows=[];
   (clients||[]).forEach(c=>{
-    const a=c.activity||{},r=c.results||{};
-    const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+    const a=c.activity||{};
+    // Never r.pnl_currency here — closed-row USD tags used to paint Open … USD.
+    const ccy=accountCashCcy(c);
     const positions=Array.isArray(a.positions)&&a.positions.length
       ?a.positions
       :(a.position?[a.position]:[]);
@@ -1930,9 +1941,7 @@ function collectOpenTrades(clients){
         open:p.level,
         current:positionMid(p,a),
         upl:p.upl,
-        // Always account cash currency. Capital tags GOLD with quote USD —
-        // that is NOT the Funds/UPL settle currency (GBP account → GBP).
-        currency:ccy||'GBP',
+        currency:ccy,
         stopLevel:p.stopLevel,
         profitLevel:p.profitLevel,
         has_sl:p.has_sl,
@@ -2405,8 +2414,13 @@ function renderDeal(p,ccy,activity){
   const tpOn=!!(p.has_tp||(p.profitLevel!=null&&Number(p.profitLevel)>0));
   const trailOn=activity&&activity.trail_enabled===true;
   const phase=trailOn?(p.trail_phase||(p.enrolled?'armed':'flat')):'flat';
-  // Account currency only — never GOLD quote USD from position.currency.
-  const uplCcy=ccy||'GBP';
+  // Never p.currency (GOLD quote USD). Never invent UPL label.
+  let uplCcy=String(ccy||'GBP').trim().toUpperCase()||'GBP';
+  if(uplCcy==='USD'){
+    // GOLD quote leak — Capital GBP accounts settle open cash in GBP.
+    const acct=String((activity&&(activity.currency||(activity.balance&&activity.balance.currency)))||'').trim().toUpperCase();
+    if(acct==='GBP'||!acct)uplCcy='GBP';
+  }
   const mid=positionMid(p,activity);
   const slTxt=(p.stopLevel!=null&&Number(p.stopLevel)>0)?esc(num(p.stopLevel,2)):'OFF';
   const tpTxt=(p.profitLevel!=null&&Number(p.profitLevel)>0)?esc(num(p.profitLevel,2)):'OFF';
@@ -2458,7 +2472,8 @@ function renderCard(c){
   const pill=running?(paused?'pause':'on'):'off';
   const pillText=running?(paused?'PAUZE':'ON'):'OFF';
   const broker=c.broker?`${c.broker.display_name}`:'nav brokera';
-  const ccy=r.pnl_currency||c.account_currency||a.currency||'';
+  // Closed Capital £ rows may keep their own pnl_currency; open cards use account only.
+  const ccy=accountCashCcy(c);
   const day=a.day_book||{};
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
   const mandateSize=(a.mandate&&a.mandate.size)||'—';

@@ -29,7 +29,10 @@ def test_admin_js_strips_legacy_upl_from_entry_block_copy():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'function humanEntryBlock' in js
     assert r'\bUPL\b' in js
-    assert 'Open ${esc(money' in js or 'Open <strong' in js or '>Open<' in js
+    assert 'function accountCashCcy' in js
+    assert 'Open <strong' in js
+    deal = js.split('function renderDeal')[1].split('function renderCard')[0]
+    assert 'UPL <strong' not in deal
     eng = Path('app/engine.py').read_text(encoding='utf-8')
     assert "bits.append('UPL" not in eng
     assert 'UPL {0:.2f}' not in eng

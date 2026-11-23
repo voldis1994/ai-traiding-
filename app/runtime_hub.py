@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 260
+DESK_TRUTH_REV = 261
 
 
 def _finite_num(v):
@@ -496,12 +496,21 @@ class RuntimeHub:
         est_wins=sum(1 for p in estimate_signed if p>0)
         est_losses=sum(1 for p in estimate_signed if p<0)
         primary=None
-        if len(by_ccy)==1:
-            ccy,vals=next(iter(by_ccy.items()))
-            primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
-        elif acct and acct in by_ccy:
+        if acct and acct in by_ccy:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
+        elif len(by_ccy)==1:
+            ccy,vals=next(iter(by_ccy.items()))
+            # GOLD quote USD alone must not become Desk cash currency.
+            if acct and ccy=='USD' and acct!='USD':
+                primary={'currency':acct,'realized_pnl':round(sum(vals),4)}
+            else:
+                primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
+        elif acct and by_ccy:
+            # Prefer account currency even when SQLite still holds quote tags.
+            primary={'currency':acct,
+                     'realized_pnl':round(sum(by_ccy.get(acct) or
+                                             next(iter(by_ccy.values()))),4)}
         # Never invent 0.00 when multi-currency cash cannot be summed.
         # Also never invent 0.00 when there are simply no closed trades — that
         # blanked Admin "Kopējais P&L" while live open UPL was available.
@@ -599,7 +608,8 @@ class RuntimeHub:
             'working_pnl_window':working_pnl_window,
             'open_upl':upl,
             'equity_pnl':equity,
-            'pnl_currency':primary['currency'] if primary else acct,
+            # Always prefer account currency — never GOLD quote USD as Desk ccy.
+            'pnl_currency':(acct or (primary['currency'] if primary else None)),
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,

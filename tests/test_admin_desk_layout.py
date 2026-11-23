@@ -56,10 +56,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=135' in html
-    assert 'admin.js?v=162' in html
+    assert 'admin.css?v=136' in html
+    assert 'admin.js?v=163' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 253' in hub
+    assert 'DESK_TRUTH_REV = 254' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
@@ -106,8 +106,9 @@ def test_desk_panels_have_readable_spacing():
     assert 'grid-template-columns:78px' in css.replace(' ', '')
     # Intel reasons wrap — no 4-line clamp ellipsis.
     assert '-webkit-line-clamp:4' not in css
-    # Indicator labels (ATR14 M1) must not ellipsis into "AUX" junk.
+    # Short indicator labels — values dominate; no ellipsis clipping names.
     assert 'text-overflow:ellipsis' not in css.split('.psx-ind-kv')[1].split('.psx-trades')[0]
+    assert 'psx-ind-head i' in css.replace(' ', '') or '.psx-ind-head i' in css
     # Toolbar grows with Bid/Ask — fixed 36px clipped the quote.
     assert 'min-height:40px' in css.replace(' ', '')
 
@@ -119,8 +120,10 @@ def test_desk_chart_footer_and_levels_readable():
     assert "if(!inTrade)hline(mid" in ohlc.replace(' ', '')
     assert 'metrics.join' in ohlc
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
-    assert 'ATR14 M1' in js
+    assert "deskKv(client.id,'ATR'" in js.replace(' ', '') or "deskKv(client.id,'ATR'" in js
+    assert '<i>ATR</i>' in js
     assert "String(t).slice(0,120)" not in js
+    assert 'auditSrcTag' in js
 
 
 def test_signal_watch_and_open_positions_fit_text():

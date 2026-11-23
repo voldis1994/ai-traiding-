@@ -61,24 +61,25 @@ function deskAutoFit(){
   root.dataset.autofit='1';
   const w=Math.max(root.clientWidth||0,window.innerWidth-90);
   const h=Math.max(root.clientHeight||0,window.innerHeight-40);
-  // Prefer readable type; grow on large screens, floor for laptops.
-  const fs=clampNum(Math.round(9.5+h/95+w/420),10,15);
-  const fsSm=clampNum(fs-2,9,13);
-  const fsXs=clampNum(fs-3,8,11);
-  const fsMd=clampNum(fs-1,10,14);
-  const fsLg=clampNum(fs+3,13,20);
-  const fsXl=clampNum(fs+5,15,24);
-  const gap=clampNum(Math.round(2.5+h/260+w/700),3,8);
-  const pad=clampNum(gap+1,4,10);
-  const headH=clampNum(Math.round(20+fs*0.45),22,30);
-  const tapeH=clampNum(Math.round(16+fs*0.35),18,26);
-  const statusMin=clampNum(Math.round(48+fs*1.2),52,78);
-  // Side windows: ~15–18% width each, never collapse the center chart.
-  let side=clampNum(Math.round(w*0.155),140,280);
-  if(w<1100)side=clampNum(Math.round(w*0.13),110,180);
-  if(w<900)side=clampNum(Math.round(w*0.12),96,150);
-  // Chart row gets more height on tall screens.
-  const r1=h>=900?'1.55fr':(h>=720?'1.4fr':(h>=600?'1.3fr':'1.2fr'));
+  // Readable floor first — never crush bottom labels into mid-word wraps.
+  const fs=clampNum(Math.round(10.5+h/110+w/480),11,15);
+  const fsSm=clampNum(fs-1,10,13);
+  const fsXs=clampNum(fs-2,9,12);
+  const fsMd=clampNum(fs,11,14);
+  const fsLg=clampNum(fs+2,13,19);
+  const fsXl=clampNum(fs+4,15,22);
+  const gap=clampNum(Math.round(3+h/280),3,7);
+  const pad=clampNum(gap+1,4,9);
+  const headH=clampNum(Math.round(22+fs*0.35),24,28);
+  const tapeH=clampNum(Math.round(18+fs*0.25),20,24);
+  const statusMin=clampNum(Math.round(44+fs),48,64);
+  // Side windows: keep center chart dominant, but never starve learn/closes.
+  let side=clampNum(Math.round(w*0.15),150,260);
+  if(w<1200)side=clampNum(Math.round(w*0.135),130,200);
+  if(w<980)side=clampNum(Math.round(w*0.12),112,160);
+  // Bottom row needs real height — previous autofit starved LEARN/CLOSES.
+  const bottomMin=clampNum(Math.round(h*0.34),210,340);
+  const topMin=clampNum(Math.round(h*0.28),150,280);
   const set=(k,v)=>root.style.setProperty(k,v);
   set('--desk-fs',fs+'px');
   set('--desk-fs-xs',fsXs+'px');
@@ -93,12 +94,13 @@ function deskAutoFit(){
   set('--desk-status-min',statusMin+'px');
   set('--desk-col-intel',side+'px');
   set('--desk-col-right',side+'px');
-  set('--desk-grid-c1','minmax(0,1fr)');
-  set('--desk-grid-c2','minmax(0,1.45fr)');
-  set('--desk-grid-c3','minmax(0,1.05fr)');
-  set('--desk-grid-c4','minmax(0,1fr)');
-  set('--desk-grid-r1','minmax(0,'+r1+')');
-  set('--desk-grid-r2','minmax(0,1fr)');
+  // Give LEARN + CLOSES equal readable width (were too narrow → "Libra/ry").
+  set('--desk-grid-c1','minmax(110px,1fr)');
+  set('--desk-grid-c2','minmax(140px,1.2fr)');
+  set('--desk-grid-c3','minmax(170px,1.25fr)');
+  set('--desk-grid-c4','minmax(170px,1.25fr)');
+  set('--desk-grid-r1','minmax('+topMin+'px,1.1fr)');
+  set('--desk-grid-r2','minmax('+bottomMin+'px,1.25fr)');
   root.dataset.autofitW=String(Math.round(w));
   root.dataset.autofitH=String(Math.round(h));
   root.dataset.autofitFs=String(fs);
@@ -618,17 +620,18 @@ function renderDeskLearn(client){
   const knobs=ds.knobs||{};
   const paying=(adapt.paying||[]).slice(0,4);
   const bleeding=(adapt.bleeding||[]).slice(0,4);
+  // Short labels — long ones mid-broke ("Libra/ry") in the bottom island.
   const rows=[
-    deskKv(client.id,'Active cards',cards.n),
-    deskKv(client.id,'Library samples',samples.library_samples),
-    deskKv(client.id,'Sample source',samples.source||'—'),
-    deskKv(client.id,'Shadow paper £',shadow.paper_net,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Shadow W/L',
+    deskKv(client.id,'Cards',cards.n),
+    deskKv(client.id,'Samples',samples.library_samples),
+    deskKv(client.id,'Source',samples.source||'—'),
+    deskKv(client.id,'Shadow £',shadow.paper_net,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'W/L',
       (shadow.wins!=null||shadow.losses!=null)
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
-    deskKv(client.id,'Flow nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Pillar impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Strategy nudge',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Strat Δ',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),
   ];
   const comboBits=[];
   if(paying.length){
@@ -865,12 +868,16 @@ function renderDeskClosed(client){
     const whenShow=when&&when!=='—'?when:'';
     const pnlCls=broker||isEst?pnlClass(raw):'';
     return `<div class="psx-whale-row">
-      <span class="tag">TRADE</span>
-      <strong class="wh-epic">${esc(epic)}</strong>
-      <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
-      <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
-      <span class="${badge.cls}" title="${esc(sourceLabel(isEst?'upl_estimate':(t.pnl_source||(blankWait?'pending_broker_pnl':''))))}">${esc(badge.text)}</span>
-      ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:'<span class="wh-ago" aria-hidden="true"></span>'}
+      <div class="wh-top">
+        <span class="tag">TRADE</span>
+        <strong class="wh-epic">${esc(epic)}</strong>
+        ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:''}
+      </div>
+      <div class="wh-bot">
+        <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
+        <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
+        <span class="${badge.cls}" title="${esc(sourceLabel(isEst?'upl_estimate':(t.pnl_source||(blankWait?'pending_broker_pnl':''))))}">${esc(badge.text)}</span>
+      </div>
     </div>`;
   }).join(''));
 }

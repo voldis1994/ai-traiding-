@@ -48,6 +48,20 @@ def test_uscgc_news_clear_not_unmapped():
         assert e.intermarket.epic is None
 
 
+def test_mapped_true_empty_currencies_still_remaps():
+    """Stuck profile mapped=True with currencies=[] must not freeze UNMAPPED."""
+    e = SingleTradeEngine.__new__(SingleTradeEngine)
+    e.mandate = {'epic': 'CS.D.USCGC.TODAY.IP'}
+    e.instrument_profile = {'mapped': True, 'currencies': [], 'kind': 'OTHER'}
+    e._last_broker_market = {}
+    e.market = {}
+    e.intermarket = SimpleNamespace(
+        state={'status': 'WAITING'}, epic='stale', peers=[], last_discovery=0.)
+    prof = e._ensure_instrument_mapped()
+    assert prof.get('currencies') == ['USD']
+    assert e.instrument_profile.get('mapped') is True
+
+
 def test_assess_news_uscgc_with_mapped_currencies():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)

@@ -950,21 +950,33 @@ function renderDeskStatusBoard(client){
   const cons=String((ds.flow_consensus&&ds.flow_consensus.consensus)||fc.consensus||'NEUTRAL').toUpperCase();
   const consCls=cons==='BUY'?'ok':(cons==='SELL'?'bad':'neu');
   const shadowUnit=String(shadow.unit||'account_currency');
-  const shadowNet=shadow.display_net!=null?Number(shadow.display_net)
+  let shadowNet=shadow.display_net!=null?Number(shadow.display_net)
     :(shadow.paper_net!=null?Number(shadow.paper_net):null);
   const shadowTrades=Number(shadow.display_trades!=null?shadow.display_trades
     :(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0)))||0;
-  const shadowTxt=shadowNet==null?'—'
-    :((shadowNet>=0?'+':'')+num(shadowNet,2)+(shadowUnit==='price'?' pts':''));
   const results=client.results||{};
   const liveClosed=Number(results.closed_trades!=null?results.closed_trades
     :(samples.closed_trades!=null?samples.closed_trades:0))||0;
   const liveCash=Number(results.cash_trades!=null?results.cash_trades:0)||0;
-  const liveReal=results.realized_pnl!=null?Number(results.realized_pnl):null;
+  const liveReal24=results.realized_pnl_24h!=null?Number(results.realized_pnl_24h):null;
+  const liveReal=liveReal24!=null&&Number.isFinite(liveReal24)
+    ?liveReal24
+    :(results.realized_pnl!=null?Number(results.realized_pnl):null);
   const liveLosses=Number(results.display_losses!=null?results.display_losses
     :(results.losses!=null?results.losses:0))||0;
   const liveWins=Number(results.display_wins!=null?results.display_wins
     :(results.wins!=null?results.wins:0))||0;
+  // Paper empty ≠ system £0 — show Capital 24h net on the tile when paper is flat.
+  let shadowHero='paper';
+  if((!shadowTrades || shadowNet==null || !Number.isFinite(shadowNet) ||
+      (shadowTrades===0 && Math.abs(shadowNet)<1e-9))
+      && liveReal!=null && Number.isFinite(liveReal) && liveClosed>0){
+    shadowNet=liveReal;
+    shadowHero='live24h';
+  }
+  const shadowTxt=shadowNet==null?'—'
+    :((shadowNet>=0?'+':'')+num(shadowNet,2)
+      +(shadowHero==='live24h'?'':(shadowUnit==='price'?' pts':'')));
   const lh=ds.learn_horizon||a.learn_horizon||{};
   const edgeN=lh.edge_closes!=null?Number(lh.edge_closes):null;
   // Headline: never flash bare library 0 when cards/closes are live.
@@ -995,6 +1007,11 @@ function renderDeskStatusBoard(client){
   const auditHurt=Number(auditLab.hurt_n)||0;
   const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const shadowSub=(()=>{
+    if(shadowHero==='live24h'){
+      return 'Capital 24h · W'+liveWins+'/L'+liveLosses
+        +' · paper independent'
+        +(auditHurt?(' · audit hurts '+auditHurt):'');
+    }
     let paperBit=shadowTrades===0
       ?(auditHurt>0
         ?('paper empty · audit hurts '+auditHurt
@@ -1024,10 +1041,8 @@ function renderDeskStatusBoard(client){
     {k:'M1 FLOW',v:cons,cls:consCls,s:flowSub},
     {k:'STRATEGY CARDS',v:String(cards.n!=null?cards.n:0),cls:(cards.n>0)?'ok':'neu',
       s:(cards.active&&cards.active.length)?cards.active.slice(0,3).join(', '):'none active'},
-    {k:'SHADOW £',v:shadowTxt,
-      cls:shadowNet==null?'neu':(shadowTrades===0
-        ?(liveClosed>0?'neu':'neu')
-        :(shadowNet>=0?'ok':'bad')),
+    {k:shadowHero==='live24h'?'LIVE 24h £':'SHADOW £',v:shadowTxt,
+      cls:shadowNet==null?'neu':(shadowNet>=0?'ok':'bad'),
       s:shadowSub},
     {k:'SAMPLES',v:String(sampleHead!=null?sampleHead:'—'),
       cls:(sampleHead!=null&&Number(sampleHead)>0)?'ok':'neu',s:sampleSub},
@@ -1443,11 +1458,15 @@ function renderDeskIntel(client){
     const st=String(news.status||'');
     const risk=news.risk||news.level||st||news.summary;
     const label=news.headline||news.event||news.next||news.reason||risk||st;
-    const bear=st==='NEWS_WINDOW'||st==='HIGH_IMPACT'||st==='CALENDAR_UNAVAILABLE'
+    // Boot/remap states are context — not a permanent BEARISH gate on Desk.
+    const softBoot=st==='UNMAPPED_INSTRUMENT'||st==='CALENDAR_WAITING'
+      ||st==='CALENDAR_FEED_DEGRADED'||st==='UNCONFIGURED';
+    const bear=!softBoot&&(st==='NEWS_WINDOW'||st==='HIGH_IMPACT'
+      ||st==='CALENDAR_UNAVAILABLE'
       ||String(risk||'').toLowerCase().includes('high')
       ||String(st).includes('BLOCK')
-      ||news.entry_allowed===false;
-    if(label)push(bear?'BEARISH':'NEUTRAL',
+      ||news.entry_allowed===false);
+    if(label)push(bear?'BEARISH':(softBoot?'CONTEXT':'NEUTRAL'),
       (st&&st!=='CLEAR'?st+' · ':'')+String(label).slice(0,140),
       bear?'bear':'neu',news.source||'NEWS');
   }else if(typeof news==='string'&&news){
@@ -1459,12 +1478,15 @@ function renderDeskIntel(client){
     const peers=Array.isArray(im.peers)?im.peers:[];
     const readyN=peers.filter(p=>p&&p.ready).length;
     const reason=im.reason?String(im.reason).slice(0,90):'';
-    const cls=st==='CONTRADICTION'||String(lean||'').toLowerCase().includes('bear')?'bear'
-      :(String(lean||'').toLowerCase().includes('bull')?'bull':'neu');
+    const softWait=st==='WAITING'||st==='UNAVAILABLE'||st==='BOOTING';
+    const cls=softWait?'neu'
+      :(st==='CONTRADICTION'||String(lean||'').toLowerCase().includes('bear')?'bear'
+      :(String(lean||'').toLowerCase().includes('bull')?'bull':'neu'));
     const line=[lean||st,
       (readyN||peers.length)?(`peers ${readyN}/${peers.length}`):null,
       reason&&reason!==String(lean)?reason:null].filter(Boolean).join(' · ');
-    if(line)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
+    if(line)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH'
+      :(softWait?'CONTEXT':'NEUTRAL')),
       line,cls,'INTERMARKET');
   }
   if(sit&&typeof sit==='object'){

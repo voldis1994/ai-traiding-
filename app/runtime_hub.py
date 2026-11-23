@@ -734,14 +734,20 @@ class RuntimeHub:
                         eng._backfill_mistake_audits_from_journal(limit=400, hours=24)
                     except Exception:
                         pass
-                # Kick Funds→Desk £ mirror so phone −0.89 overwrites stale −0.81
-                # without waiting for an empty pending-pnl queue.
+                # Prefer awaited mirror via refresh_live_truth(); keep a
+                # best-effort schedule here if desk path ran without await.
                 if eng is not None and hasattr(eng, '_mirror_capital_funds_closes'):
                     try:
-                        import asyncio
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.ensure_future(eng._mirror_capital_funds_closes())
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(eng._mirror_capital_funds_closes())
+                    except RuntimeError:
+                        pass
+                    except Exception:
+                        pass
+                # Shadow neural must not stay "off / booting" on Desk while LIVE runs.
+                if eng is not None and hasattr(eng, '_ensure_shadow_brain'):
+                    try:
+                        eng._ensure_shadow_brain()
                     except Exception:
                         pass
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
@@ -1010,9 +1016,16 @@ class RuntimeHub:
             except Exception:
                 evo = {}
         shadow_on = bool(sd.get('shadow_active'))
-        if not shadow_on and rt is not None:
+        if rt is not None:
             eng = getattr(rt, 'engine', None)
-            shadow_on = bool(eng is not None and getattr(eng, 'shadow_brain', None) is not None)
+            if eng is not None and hasattr(eng, '_ensure_shadow_brain'):
+                try:
+                    eng._ensure_shadow_brain()
+                except Exception:
+                    pass
+            if not shadow_on:
+                shadow_on = bool(
+                    eng is not None and getattr(eng, 'shadow_brain', None) is not None)
         running = False
         if rt is not None:
             try:
@@ -1133,6 +1146,23 @@ class RuntimeHub:
             store=rt.store
             account_currency=((snap.get('account') or {}).get('currency') or '').strip().upper() or None
             pos=view.get('position') or {}
+            # Fresh news/peers on every Desk paint — kill stale UNMAPPED/WAITING chips.
+            desk_news=snap.get('economic_news_risk')
+            desk_im=snap.get('intermarket_analysis')
+            try:
+                if hasattr(rt.engine,'_news_risk'):
+                    fresh_news=rt.engine._news_risk()
+                    if isinstance(fresh_news,dict):
+                        desk_news=fresh_news
+            except Exception:
+                pass
+            try:
+                im_obj=getattr(rt.engine,'intermarket',None)
+                st_im=getattr(im_obj,'state',None) if im_obj is not None else None
+                if isinstance(st_im,dict) and st_im:
+                    desk_im=dict(st_im)
+            except Exception:
+                pass
             card.update({
                 'robot_running':True,
                 'phase':view.get('phase'),
@@ -1211,9 +1241,9 @@ class RuntimeHub:
                     'last_start_error':None,
                     'balance':((snap.get('account') or {}).get('balance') or {}),
                     'currency':account_currency,
-                    # Desk intel — real engine soft signals (may be empty).
-                    'economic_news_risk':snap.get('economic_news_risk'),
-                    'intermarket_analysis':snap.get('intermarket_analysis'),
+                    # Desk intel — prefer live remap over a stale UNMAPPED/WAITING snap.
+                    'economic_news_risk':desk_news,
+                    'intermarket_analysis':desk_im,
                     'trail_enabled':bool(
                         rt.engine._trail_is_enabled()
                         if hasattr(rt.engine,'_trail_is_enabled') else False),
@@ -1806,6 +1836,92 @@ class RuntimeHub:
             'equity_drawdown_limit':saved.get('equity_drawdown_limit'),
             'configured':True})
         return hard_risk.snapshot(store)
+
+    async def refresh_live_truth(self, *, client_id: int | None = None) -> dict:
+        """Await Funds mirror + remap news/peers + boot shadow before Desk paint.
+
+        ensure_future on the sync card path raced the HTTP response — Desk kept
+        −0.81 / UNMAPPED / shadow off until a later poll luckily caught up.
+        """
+        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0}
+        clients = self.platform.list_clients()
+        for c in clients:
+            cid = int(c.get('id') or 0)
+            if client_id is not None and cid != int(client_id):
+                continue
+            rt = self.get(cid)
+            if not rt or not getattr(rt, 'started', False):
+                continue
+            eng = getattr(rt, 'engine', None)
+            if eng is None:
+                continue
+            if hasattr(eng, '_ensure_instrument_mapped'):
+                try:
+                    before = dict(getattr(eng, 'instrument_profile', None) or {})
+                    prof = eng._ensure_instrument_mapped()
+                    if (prof or {}).get('currencies') and not (before.get('currencies')):
+                        out['remapped'] += 1
+                except Exception:
+                    pass
+            news_live = None
+            if hasattr(eng, '_news_risk'):
+                try:
+                    news_live = eng._news_risk()
+                except Exception:
+                    news_live = None
+            if hasattr(eng, '_ensure_shadow_brain'):
+                try:
+                    if eng._ensure_shadow_brain() is not None:
+                        out['shadow'] += 1
+                except Exception:
+                    pass
+            im = getattr(eng, 'intermarket', None)
+            st = (getattr(im, 'state', None) or {}) if im is not None else {}
+            if (im is not None and hasattr(eng, 'broker') and eng.broker
+                    and str(st.get('status') or '') in ('WAITING', 'UNAVAILABLE', '')):
+                try:
+                    epic = (getattr(eng, 'mandate', None) or {}).get('epic')
+                    inst = {}
+                    bm = getattr(eng, '_last_broker_market', None) or {}
+                    if isinstance(bm, dict):
+                        inst = bm.get('instrument') if isinstance(
+                            bm.get('instrument'), dict) else {}
+                    candles = []
+                    if epic and getattr(eng, 'store', None) is not None:
+                        candles = eng.store.candles(epic, n=80, historical_only=True)
+                    if epic and hasattr(im, 'refresh'):
+                        await asyncio.wait_for(
+                            im.refresh(eng.broker, epic, inst, candles),
+                            timeout=6.0)
+                        out['peers'] += 1
+                        st = dict(getattr(im, 'state', None) or {})
+                except Exception:
+                    pass
+            # Keep SHADOW "Live today" + INTEL in sync with remapped news/peers.
+            if getattr(eng, 'store', None) is not None and (
+                    isinstance(news_live, dict) or isinstance(st, dict)):
+                try:
+                    from datetime import datetime, timezone
+                    eng.store.set('live_external_context', {
+                        'at': datetime.now(timezone.utc).isoformat(),
+                        'news': news_live if isinstance(news_live, dict) else {},
+                        'intermarket': st if isinstance(st, dict) else {},
+                    })
+                except Exception:
+                    pass
+            if hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
+                try:
+                    n = await asyncio.wait_for(
+                        eng._mirror_capital_funds_closes(), timeout=10.0)
+                    out['mirrored'] += int(n or 0)
+                except Exception:
+                    pass
+            if hasattr(eng, '_backfill_mistake_audits_from_journal'):
+                try:
+                    eng._backfill_mistake_audits_from_journal(limit=400, hours=24)
+                except Exception:
+                    pass
+        return out
 
     def admin_overview(self) -> dict:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]

@@ -1120,7 +1120,9 @@ class SingleTradeEngine:
         if not epic:
             return self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
         cur=self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
-        if cur.get('mapped') and cur.get('currencies'):
+        # Only trust a profile that actually carries currencies — mapped=True with
+        # an empty list still produces UNMAPPED_INSTRUMENT on Desk forever.
+        if cur.get('mapped') and list(cur.get('currencies') or []):
             return cur
         inst={}
         try:
@@ -1133,9 +1135,33 @@ class SingleTradeEngine:
         mkt=getattr(self,'market',None) or {}
         if isinstance(mkt,dict) and mkt.get('instrument_name') and not inst.get('name'):
             inst={**inst,'name':mkt.get('instrument_name')}
+        # Also fold mandate name / instrument_name when Capital epic is opaque.
+        if isinstance(self.mandate,dict):
+            for k in ('instrument_name','name','market_name'):
+                if self.mandate.get(k) and not inst.get('name'):
+                    inst={**inst,'name':self.mandate.get(k)}
+                    break
         prof=instrument_profile(epic,inst)
+        if not prof.get('currencies'):
+            # Last resort: Desk aliases (GOLD) / market name when epic is opaque.
+            mkt=getattr(self,'market',None) or {}
+            alias=str(
+                (self.mandate or {}).get('symbol')
+                or (self.mandate or {}).get('asset')
+                or (mkt.get('symbol') if isinstance(mkt,dict) else None)
+                or (mkt.get('name') if isinstance(mkt,dict) else None)
+                or '').upper()
+            if alias:
+                hint=instrument_profile(alias,inst)
+                if hint.get('currencies'):
+                    prof=hint
+            if not prof.get('currencies') and (
+                    'GOLD' in str(epic).upper() or 'USCGC' in str(epic).upper()
+                    or 'XAU' in str(epic).upper() or 'GOLD' in alias):
+                prof={**(prof or {}),
+                      'epic':epic,'kind':'METALS','currencies':['USD'],'mapped':True}
         if prof.get('currencies'):
-            was_blank=not (cur.get('mapped') and cur.get('currencies'))
+            was_blank=not (cur.get('mapped') and list(cur.get('currencies') or []))
             self.instrument_profile=prof
             # Remap METALS/etc. → force peer rediscovery (was WAITING on UNKNOWN).
             if was_blank:

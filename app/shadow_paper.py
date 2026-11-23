@@ -515,9 +515,28 @@ class ShadowPaperJournal:
         return closed
 
     @staticmethod
+    def _is_live_or_capital_row(r):
+        """Capital / LIVE journal rows must never enter independent Paper £."""
+        if not isinstance(r,dict):
+            return False
+        src=str(r.get('source') or '').lower()
+        if src in ('capital_journal','live','live_backfill','live_funds_mirror',
+                   'live_journal','broker','funds','capital'):
+            return True
+        if src.startswith('live_'):
+            return True
+        # Explicit Capital deal stamps (cap:… / deal UUID from Funds mirror).
+        if r.get('pnl_source') in ('broker','funds','capital') and src in (
+                'capital_journal','live_journal',''):
+            return src=='capital_journal' or src=='live_journal'
+        return False
+
+    @staticmethod
     def _row_is_cash(r):
-        """Cash £ row — includes legacy paper_pnl rows that omitted unit."""
+        """Independent SHADOW paper cash £ only — never Capital Funds rows."""
         if not isinstance(r,dict):return False
+        if ShadowPaperJournal._is_live_or_capital_row(r):
+            return False
         if _finite(r.get('paper_pnl')) is None:return False
         u=r.get('unit')
         if u=='price':return False
@@ -528,13 +547,25 @@ class ShadowPaperJournal:
         return False
 
     def paper_cash_pnls(self):
-        """Only cash-denominated rows — comparable to broker £."""
+        """Only independent paper cash — never Capital Funds £."""
         return [float(r['paper_pnl']) for r in self.history
                 if self._row_is_cash(r) and math.isfinite(float(r['paper_pnl']))]
 
     def paper_rows(self):
         """Cash rows with metadata (model_version, times) for fair compare."""
         return [r for r in self.history if self._row_is_cash(r)]
+
+    def purge_capital_journal_rows(self):
+        """Drop any Capital→Paper mix left by a bad seed (PR #240 regression)."""
+        before=len(self.history or [])
+        self.history=[r for r in (self.history or [])
+                      if not (isinstance(r,dict)
+                              and str(r.get('source') or '').lower()
+                              =='capital_journal')]
+        dropped=before-len(self.history)
+        if dropped:
+            self._persist()
+        return dropped
 
     def paper_pnls(self):
         """Backward-compatible alias → cash-only (never mix price units)."""
@@ -558,15 +589,22 @@ class ShadowPaperJournal:
         for h in hist:
             if not isinstance(h,dict):continue
             src=str(h.get('source') or 'shadow').lower()
-            if src=='live':continue
+            # LIVE / Funds audits belong in MISTAKE AUDIT + CLIENT CLOSES — not Paper.
+            if src=='live' or src.startswith('live_') or src in (
+                    'capital_journal','broker','funds','capital'):
+                continue
             pnl=_finite(h.get('pnl'))
             if pnl is None:continue
-            # Prefer explicit unit / price_pnl — never guess £2+ LIVE losses as pts.
+            # Prefer explicit unit / price_pnl — never guess £2+ LIVE losses as pts
+            # and never invent GBP when unit is unknown → keep as price if no unit.
             explicit_unit=h.get('unit')
             has_price=_finite(h.get('price_pnl')) is not None
             if explicit_unit in ('price','account_currency'):
                 unit=explicit_unit
             elif has_price and _finite(h.get('paper_pnl')) is None:
+                unit='price'
+            elif explicit_unit is None and not has_price:
+                # Unknown unit — do NOT treat as GBP account cash.
                 unit='price'
             else:
                 unit='account_currency'
@@ -591,82 +629,18 @@ class ShadowPaperJournal:
             self._persist()
         return added
 
-    def backfill_from_capital_journal(self,*,hours=24,limit=80):
-        """When paper cash is empty, seed SHADOW £ from Capital broker closes.
-
-        Operator truth: if CLIENT CLOSES has Funds £, SHADOW must not sit at 0
-        waiting for a synthetic paper fill. LIVE broker rows become display
-        cash with source ``capital_journal`` (not invented paper votes).
-        """
-        if self.store is None or not hasattr(self.store,'db'):
-            return 0
-        # Only seed when there is no cash £ yet (price-only / empty OK).
-        if self.paper_cash_pnls():
-            return 0
-        from datetime import timedelta
-        now=datetime.now(timezone.utc)
-        cutoff=now-timedelta(hours=max(1,int(hours)))
-        try:
-            rows=self.store.db.execute(
-                "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
-                "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
-                "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
-        except Exception:
-            return 0
-        existing={
-            str(r.get('deal_id') or r.get('fingerprint') or '')
-            for r in (self.history or []) if isinstance(r,dict)
-        }
-        added=0
-        for deal_id,pnl,direction,entry,exit_px,closed,src in rows:
-            pnl_n=_finite(pnl)
-            if pnl_n is None or abs(float(pnl_n))<1e-12:
-                continue
-            src_s=str(src or '').strip().lower()
-            if src_s and src_s not in (
-                    'broker','upl_estimate','funds','capital',
-                    'pending_broker_pnl','pending_close_sync',''):
-                continue
-            if closed:
-                try:
-                    raw=str(closed).replace('Z','+00:00').replace(' ','T',1)
-                    dt=datetime.fromisoformat(raw)
-                    if dt.tzinfo is None:
-                        dt=dt.replace(tzinfo=timezone.utc)
-                    if dt<cutoff:
-                        continue
-                except Exception:
-                    pass
-            key=str(deal_id or '')
-            if key and key in existing:
-                continue
-            row={
-                'at':closed,
-                'direction':direction,
-                'entry':entry,
-                'exit':exit_px,
-                'paper_pnl':float(pnl_n),
-                'price_pnl':None,
-                'unit':'account_currency',
-                'exit_reason':'capital_journal',
-                'source':'capital_journal',
-                'deal_id':key,
-                'fingerprint':key or None,
-                'pnl_source':src_s or 'broker',
-            }
-            self.history.append(row)
-            if key:
-                existing.add(key)
-            added+=1
-        if added:
-            self._persist()
-        return added
-
     def summary(self):
+        # Scrub any Capital→Paper poison before scoring.
+        try:
+            self.purge_capital_journal_rows()
+        except Exception:
+            pass
         pnls=self.paper_cash_pnls()
         price_pnls=[]
         for r in self.history:
             if not isinstance(r,dict):continue
+            if self._is_live_or_capital_row(r):
+                continue
             if self._row_is_cash(r):continue
             pp=_finite(r.get('price_pnl'))
             if pp is None and r.get('unit')=='price':
@@ -686,8 +660,10 @@ class ShadowPaperJournal:
         else:
             display_net,display_trades,display_unit=0.,0,'account_currency'
             wins=losses=0
+        paper_only=sum(1 for r in (self.history or [])
+                       if isinstance(r,dict) and not self._is_live_or_capital_row(r))
         return {
-            'trades':len(self.history),
+            'trades':paper_only,
             'cash_trades':len(pnls),
             'price_trades':len(price_pnls),
             'open':self.position is not None,
@@ -705,7 +681,6 @@ class ShadowPaperJournal:
             'audit_backfill':any(
                 isinstance(r,dict) and r.get('source')=='shadow_paper_audit_backfill'
                 for r in (self.history or [])),
-            'capital_journal_seed':any(
-                isinstance(r,dict) and r.get('source')=='capital_journal'
-                for r in (self.history or [])),
+            'capital_journal_seed':False,
+            'independent_of_live':True,
         }

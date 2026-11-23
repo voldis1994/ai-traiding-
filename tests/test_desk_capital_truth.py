@@ -37,7 +37,8 @@ def test_scoreboard_prefers_closed_estimate_over_open_upl():
         assert stats['working_pnl'] is None or stats['working_pnl_source'] != 'open_upl'
 
 
-def test_paper_seeds_from_capital_journal_not_zero():
+def test_capital_live_never_enters_independent_paper_cash():
+    """P0: Capital Funds £ must not pollute Paper Book W/L / net."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         now = datetime.now(timezone.utc)
@@ -54,15 +55,44 @@ def test_paper_seeds_from_capital_journal_not_zero():
                 'UPDATE trades SET closed=? WHERE deal_id=?',
                 ((now - timedelta(minutes=i)).isoformat(), deal))
         store.db.commit()
+        # Simulate the bad PR #240 seed already in history.
         j = ShadowPaperJournal(store)
-        assert j.history == []
-        n = j.backfill_from_capital_journal(hours=24)
-        assert n == 2
+        j.history = [
+            {'paper_pnl': -0.89, 'unit': 'account_currency',
+             'source': 'capital_journal', 'deal_id': 'cap-seed-0'},
+            {'paper_pnl': 0.62, 'unit': 'account_currency',
+             'source': 'capital_journal', 'deal_id': 'cap-seed-1'},
+        ]
+        j._persist()
+        assert j.purge_capital_journal_rows() == 2
         s = j.summary()
-        assert s['cash_trades'] == 2
-        assert s['display_net'] == pytest.approx(-0.27)
-        assert s['capital_journal_seed'] is True
-        assert j.backfill_from_capital_journal() == 0  # idempotent cash
+        assert s['cash_trades'] == 0
+        assert s['display_trades'] == 0
+        assert s['capital_journal_seed'] is False
+        assert s['independent_of_live'] is True
+        # Capital still visible via journal stats / CLIENT CLOSES path.
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        assert stats['cash_trades'] == 2
+        assert stats['realized_pnl'] == pytest.approx(-0.27)
+
+
+def test_audit_hist_replaces_same_deal_id_on_funds_upgrade():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        first = sma.on_close(
+            store, pnl=-0.81, direction='BUY', entry=4188.0,
+            source='live', deal_id='deal-dup', apply_ohlc_penalties=False)
+        assert first.get('audited')
+        second = sma.on_close(
+            store, pnl=-0.89, direction='BUY', entry=4188.0,
+            source='live_funds_mirror', deal_id='deal-dup',
+            apply_ohlc_penalties=False)
+        assert second.get('audited')
+        hist = [h for h in (store.get(sma.HIST_KEY) or []) if isinstance(h, dict)]
+        same = [h for h in hist if str(h.get('deal_id') or '') == 'deal-dup']
+        assert len(same) == 1
+        assert same[0]['pnl'] == pytest.approx(-0.89)
 
 
 def test_fingerprint_does_not_wait_on_news_peers():

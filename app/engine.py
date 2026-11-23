@@ -4821,6 +4821,7 @@ class SingleTradeEngine:
                 entry=entry if entry is not None else (
                     _num(saved.get('entry')) if isinstance(saved,dict) else None),
                 source=source,
+                deal_id=deal_id,
                 apply_ohlc_penalties=False,
             )
             if out and out.get('audited'):

@@ -482,7 +482,7 @@ def _update_ready(store, diagnosis: dict) -> dict | None:
 def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
              mid=None, entry=None, exit=None, exit_reason=None,
-             source='shadow',
+             source='shadow', deal_id=None,
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -515,10 +515,11 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
         'fix': commit_result,
         'ready_for_live': ready,
         'at': _now_iso(),
+        'deal_id': str(deal_id) if deal_id is not None else None,
     }
     if store is not None:
         hist = list(store.get(HIST_KEY) or [])
-        hist.append({
+        entry_row = {
             'at': out['at'],
             'source': source,
             'pnl': diagnosis.get('pnl'),
@@ -534,7 +535,15 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'committed': bool(commit_result.get('applied')),
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
-        })
+            'deal_id': str(deal_id) if deal_id is not None else None,
+        }
+        # Re-audit after Funds £ correction must REPLACE the prior row for this
+        # deal — otherwise hist doubles and scenario repeat counters inflate.
+        deal_s = str(deal_id) if deal_id is not None else ''
+        if deal_s:
+            hist = [h for h in hist
+                    if not (isinstance(h, dict) and str(h.get('deal_id') or '') == deal_s)]
+        hist.append(entry_row)
         store.set(HIST_KEY, hist[-120:])  # ~24h of closes for analysis
         store.set(LAST_KEY, {
             'at': out['at'],

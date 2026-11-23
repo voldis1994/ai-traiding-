@@ -683,14 +683,10 @@ class RuntimeHub:
                         pass
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
                     try:
-                        # Empty journal + surviving audit hist → restore closes.
+                        # Empty journal + surviving *shadow* audit hist → restore.
+                        # Never seed Capital LIVE £ into independent Paper Book.
+                        eng.shadow_paper.purge_capital_journal_rows()
                         eng.shadow_paper.backfill_from_mistake_audits()
-                    except Exception:
-                        pass
-                    try:
-                        # Still no paper £ but Capital journal has closes → seed.
-                        eng.shadow_paper.backfill_from_capital_journal(
-                            hours=24, limit=80)
                     except Exception:
                         pass
                     try:
@@ -705,11 +701,8 @@ class RuntimeHub:
                     from .shadow_paper import ShadowPaperJournal
                     jp = ShadowPaperJournal(store)
                     try:
+                        jp.purge_capital_journal_rows()
                         jp.backfill_from_mistake_audits()
-                    except Exception:
-                        pass
-                    try:
-                        jp.backfill_from_capital_journal(hours=24, limit=80)
                     except Exception:
                         pass
                     try:

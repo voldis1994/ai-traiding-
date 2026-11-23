@@ -606,17 +606,15 @@ function renderShadowLab(client){
           ${_shadowKv('Open',openTxt)}
         </div>
         <div class="shadow-note">${esc(
-          paper.capital_journal_seed
-            ?('Seeded from Capital Funds journal — SHADOW £ mirrors CLIENT CLOSES ('+(paperTrades)+')')
-            :(paper.audit_backfill
-            ?('Restored from MISTAKE AUDIT hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
+          paper.audit_backfill
+            ?('Restored from SHADOW audit hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
             :(paperUnit==='price'
               ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
               :(paperTrades>0
-                ?('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT')
+                ?('Independent Paper SL/TP cash · Capital LIVE stays in CLIENT CLOSES + MISTAKE AUDIT')
                 :(winN
-                  ?('Paper book empty — Capital 24h already has '+winN+' closes (see MISTAKE AUDIT 24h W/L)')
-                  :('No paper closes yet — Desk refresh re-audits Capital 24h journal')))))}</div>
+                  ?('Paper book independent — Capital 24h has '+winN+' closes in MISTAKE AUDIT / CLIENT CLOSES (not Paper £)')
+                  :('No paper closes yet — waits shadow SL/TP fills; Capital £ is CLIENT CLOSES')))))}</div>
       </div>
     </article>
     <article class="shadow-card">

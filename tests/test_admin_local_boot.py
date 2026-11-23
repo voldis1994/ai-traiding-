@@ -49,6 +49,20 @@ def test_admin_js_auto_boots_localhost():
     assert "console.warn('loadBrokers'" in js
     assert "console.warn('loadOverview'" in js
     html = open('app/web/admin/index.html', encoding='utf-8').read()
-    assert 'admin.js?v=151' in html
+    assert 'admin.js?v=152' in html
     assert 'nta-local' in html
     assert 'html.nta-local #login' in html
+
+
+def test_admin_js_parses():
+    """Duplicate const in renderDeskStatusBoard used to kill the whole Desk script."""
+    import shutil
+    import subprocess
+    js = 'app/web/admin/admin.js'
+    raw = open(js, encoding='utf-8').read()
+    assert 'const auditLabFull=shadowLab(client)' in raw
+    assert raw.count('const auditLab=') == 1
+    node = shutil.which('node')
+    if node:
+        proc = subprocess.run([node, '--check', js], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr or proc.stdout

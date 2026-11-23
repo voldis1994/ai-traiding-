@@ -977,8 +977,8 @@ function renderDeskStatusBoard(client){
     :(results.wins!=null?results.wins:0))||0;
   // Paper empty ≠ system £0 — show Capital 24h net (results or mistake-audit window).
   let shadowHero='paper';
-  const auditLab=shadowLab(client);
-  const auditWin=((auditLab.mistake_audit)||{}).window_24h||{};
+  const auditLabFull=shadowLab(client);
+  const auditWin=((auditLabFull.mistake_audit)||{}).window_24h||{};
   const auditNet=auditWin.net!=null?Number(auditWin.net):null;
   const auditClosed=Number(auditWin.n)||0;
   if((!shadowTrades || shadowNet==null || !Number.isFinite(shadowNet) ||
@@ -1019,7 +1019,9 @@ function renderDeskStatusBoard(client){
   })();
   // SHADOW £ = paper book only. LIVE Capital losses live in CLIENT CLOSES —
   // never imply "system at 0" when paper is flat but LIVE has minuses.
-  const auditLab=(ds.shadow_lab&&ds.shadow_lab.mistake_audit)||{};
+  // Prefer live desk_system payload; fall back to shadowLab() mistake_audit.
+  const auditLab=(ds.shadow_lab&&ds.shadow_lab.mistake_audit)
+    ||(auditLabFull.mistake_audit)||{};
   const auditLast=auditLab.last||{};
   const auditHurt=Number(auditLab.hurt_n)||0;
   const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;

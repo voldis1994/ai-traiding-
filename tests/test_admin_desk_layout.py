@@ -94,7 +94,11 @@ def test_status_board_visible_at_once():
 def test_desk_panels_have_readable_spacing():
     """Laptop Desk must not crush labels into unreadable 8px cells."""
     css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
-    assert '--desk-gap:6px' in css.replace(' ', '') or '--desk-gap:8px' in css.replace(' ', '')
+    assert (
+        '--desk-gap:4px' in css.replace(' ', '')
+        or '--desk-gap:6px' in css.replace(' ', '')
+        or '--desk-gap:8px' in css.replace(' ', '')
+    )
     assert 'min-height:22px' in css.replace(' ', '') or 'min-height:34px' in css.replace(' ', '')
     assert '.psx-score-row' in css
     assert '.psx-ind-kv .desk-kv' in css

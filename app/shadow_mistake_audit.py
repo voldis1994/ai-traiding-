@@ -450,7 +450,8 @@ def _update_ready(store, diagnosis: dict) -> dict | None:
 
 def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
-             mid=None, entry=None, source='shadow',
+             mid=None, entry=None, exit=None, exit_reason=None,
+             source='shadow',
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -490,6 +491,10 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'at': out['at'],
             'source': source,
             'pnl': diagnosis.get('pnl'),
+            'direction': direction,
+            'entry': entry,
+            'exit': exit,
+            'exit_reason': exit_reason,
             'mistakes': diagnosis.get('mistakes'),
             'notes': diagnosis.get('notes'),
             'fingerprint': (diagnosis.get('context') or {}).get('fingerprint'),

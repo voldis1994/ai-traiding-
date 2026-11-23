@@ -388,8 +388,10 @@ function renderShadowLab(client){
   const open=paper.open&&typeof paper.open==='object'?paper.open:null;
   const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
   const recent=Array.isArray(paper.recent)?paper.recent:[];
+  const openSl=open?(open.sl!=null?open.sl:(open.stop!=null?open.stop:null)):null;
+  const openTp=open?(open.tp!=null?open.tp:(open.profit!=null?open.profit:null)):null;
   const openTxt=open
-    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${open.sl!=null?num(open.sl,2):'—'} · TP ${open.tp!=null?num(open.tp,2):'—'}`)
+    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${openSl!=null?num(openSl,2):'—'} · TP ${openTp!=null?num(openTp,2):'—'}`)
     :(pending?`pending ${String(pending.direction||'?').toUpperCase()}`:'flat');
   const rowsHtml=recent.length?recent.map(r=>{
     const dir=String(r.direction||'?').toUpperCase();
@@ -521,9 +523,13 @@ function renderShadowLab(client){
           ${_shadowKv('Open',openTxt)}
         </div>
         <div class="shadow-note">${esc(
-          paperUnit==='price'
-            ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
-            :('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT'))}</div>
+          paper.audit_backfill
+            ?('Restored from MISTAKE AUDIT hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
+            :(paperUnit==='price'
+              ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
+              :(paperTrades>0
+                ?('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT')
+                :('No paper closes yet — if audits show shadow £/pts, wait one Desk refresh for backfill'))))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -896,12 +902,22 @@ function renderDeskStatusBoard(client){
   })();
   // SHADOW £ = paper book only. LIVE Capital losses live in CLIENT CLOSES —
   // never imply "system at 0" when paper is flat but LIVE has minuses.
+  const auditLab=(ds.shadow_lab&&ds.shadow_lab.mistake_audit)||{};
+  const auditLast=auditLab.last||{};
+  const auditHurt=Number(auditLab.hurt_n)||0;
+  const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const shadowSub=(()=>{
-    const paperBit=shadowTrades===0
-      ?'paper 0 closes'
+    let paperBit=shadowTrades===0
+      ?(auditHurt>0
+        ?('paper empty · audit hurts '+auditHurt
+          +(auditPnl!=null&&Number.isFinite(auditPnl)
+            ?(' · last '+(auditPnl>=0?'+':'')+num(auditPnl,2))
+            :''))
+        :'paper 0 closes')
       :(shadowUnit==='price'
         ?('paper '+shadowTrades+' pts · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))
         :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)));
+    if(shadow.audit_backfill)paperBit+=' · from audit';
     if(liveClosed>0){
       const liveBit='LIVE '+liveClosed
         +(liveLosses||liveWins?(' · W'+liveWins+'/L'+liveLosses):'')
@@ -910,7 +926,7 @@ function renderDeskStatusBoard(client){
           :(liveCash?(' · cash '+liveCash):''));
       return paperBit+' · '+liveBit;
     }
-    return paperBit+(shadowTrades===0?' · waits paper SL/TP':'');
+    return paperBit+(shadowTrades===0&&!auditHurt?' · waits paper SL/TP':'');
   })();
   const tiles=[
     {k:'CAN OPEN',v:can?'YES':'NO',cls:can?'ok':'bad',

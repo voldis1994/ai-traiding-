@@ -8113,6 +8113,8 @@ class SingleTradeEngine:
                     else dict(self.intermarket.state or {}),
                     direction=closed.get('direction'),
                     entry=_num(closed.get('entry')),
+                    exit=_num(closed.get('exit') or closed.get('exit_px')),
+                    exit_reason=closed.get('exit_reason'),
                     source='shadow',
                     apply_ohlc_penalties=True,
                 )

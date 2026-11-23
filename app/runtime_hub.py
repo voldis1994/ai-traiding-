@@ -534,6 +534,37 @@ class RuntimeHub:
             pending_q=len(store.get('pending_broker_pnl_deals') or [])
         except Exception:
             pending_q=0
+        # Desk fallback: knobs moved from £ but trades journal missed OPEN upsert
+        # → still show edge-hist closes so CLIENT CLOSES is not a blank island.
+        if not recent:
+            try:
+                from . import unified_cycle
+                hist=list(store.get(unified_cycle.EDGE_OUTCOME_HIST_KEY) or [])
+            except Exception:
+                hist=[]
+            if isinstance(hist,list):
+                for h in reversed(hist):
+                    if not isinstance(h,dict):
+                        continue
+                    try:
+                        pnl_h=float(h.get('pnl'))
+                    except (TypeError,ValueError):
+                        continue
+                    if not __import__('math').isfinite(pnl_h):
+                        continue
+                    recent.append({
+                        'deal_id':h.get('deal_id') or f"edge-{len(recent)}",
+                        'epic':h.get('epic') or 'GOLD',
+                        'direction':h.get('direction') or h.get('side') or '?',
+                        'closed':h.get('at') or h.get('closed') or h.get('time'),
+                        'pnl':round(pnl_h,4),
+                        # observe_close only records useful/hurt broker £.
+                        'pnl_currency':acct or h.get('currency') or '?',
+                        'pnl_source':'broker',
+                        'from_edge_hist':True,
+                    })
+                    if len(recent)>=12:
+                        break
         return {
             'closed_trades':closed_n,
             'open_trades_recorded':open_n,
@@ -607,10 +638,14 @@ class RuntimeHub:
             out['cards'] = {'active': [], 'n': 0, 'error': type(exc).__name__}
         try:
             sp = sd.get('shadow_paper')
-            if not isinstance(sp, dict) and store is not None and rt is not None:
-                eng = getattr(rt, 'engine', None)
+            if not isinstance(sp, dict) and store is not None:
+                eng = getattr(rt, 'engine', None) if rt is not None else None
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
                     sp = eng.shadow_paper.summary()
+                else:
+                    # Robot stopped / no engine — still show journal from store.
+                    from .shadow_paper import ShadowPaperJournal
+                    sp = ShadowPaperJournal(store).summary()
             out['shadow'] = sp if isinstance(sp, dict) else {}
         except Exception as exc:
             out['shadow'] = {'error': type(exc).__name__}
@@ -626,14 +661,20 @@ class RuntimeHub:
             if store is not None:
                 from . import sample_strategies
                 flag = store.get(sample_strategies.STORE_FLAG) or {}
+                lib_n=int(
+                    (flag or {}).get('library_samples')
+                    or sample_strategies.library_sample_count(store) or 0)
+                # Prefer live strategy cards count — sample flag active_n often
+                # stays 0 after cards regenerate and made Desk show "cards 0".
+                cards_n=int((out.get('cards') or {}).get('n') or 0)
+                active_n=int((flag or {}).get('active_n') or 0) or cards_n
                 out['samples'] = {
                     'done': bool(isinstance(flag, dict) and flag.get('done')),
-                    'library_samples': int(
-                        (flag or {}).get('library_samples')
-                        or sample_strategies.library_sample_count(store) or 0),
+                    'library_samples': lib_n,
                     'trades': int((flag or {}).get('trades') or 0),
-                    'source': (flag or {}).get('source'),
-                    'active_n': int((flag or {}).get('active_n') or 0),
+                    'source': (flag or {}).get('source') or (
+                        'strategy_cards' if cards_n else None),
+                    'active_n': active_n,
                 }
         except Exception as exc:
             out['samples'] = {'error': type(exc).__name__}
@@ -874,7 +915,17 @@ class RuntimeHub:
                     upl=sum(vals)
                 card['results']=self._trade_stats(
                     store,card.get('account_currency'),open_upl=upl)
-            except Exception:pass
+            except Exception as exc:
+                try:
+                    store.event('warning','Admin trade stats failed',
+                                {'type':type(exc).__name__,'detail':str(exc)[:160]})
+                except Exception:
+                    pass
+                # Keep prior zeros but mark failure so Desk is not a silent lie.
+                card['results']={
+                    **(card.get('results') or {}),
+                    'stats_error':type(exc).__name__,
+                }
             try:
                 from . import hard_risk
                 card['hard_risk']=hard_risk.snapshot(store)

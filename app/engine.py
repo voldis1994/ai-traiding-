@@ -176,35 +176,48 @@ class Store:
         self.db.execute('INSERT OR IGNORE INTO trades(deal_id,epic,size,direction,opened,entry) VALUES(?,?,?,?,?,?)',
             (p['dealId'],p['epic'],str(p['size']),p['direction'],now(),_num(p.get('level'))))
         self.db.commit()
-    def close_trade(self,deal_id,exit_price=None,pnl=None,*,currency=None,source=None,overwrite=False):
+    def close_trade(self,deal_id,exit_price=None,pnl=None,*,currency=None,source=None,overwrite=False,
+                    epic=None,size=None,direction=None,entry=None):
         """Persist exit and realized cash P&L.
 
         Never invent (exit-entry)*size as account money — GOLD is USD-quoted while
         Capital.com profit/UPL is in account currency (often GBP). Only store cash
         when the broker (or an explicit caller) supplies it, with currency+source.
         overwrite=True lets a later CLOSE confirm replace a mid guess.
+
+        If no open row exists for ``deal_id`` (missed upsert), INSERT a closed
+        row so Admin CLIENT CLOSES still mirrors Capital Funds.
         """
         exit_n=_num(exit_price);pnl_n=_num(pnl)
         currency=(currency or '').strip().upper() or None
         source=(source or '').strip() or None
+        deal=str(deal_id)
         if overwrite:
-            self.db.execute(
+            cur=self.db.execute(
                 'UPDATE trades SET closed=COALESCE(closed,?), '
                 'exit=CASE WHEN ? IS NOT NULL THEN ? ELSE exit END, '
                 'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END, '
                 'pnl_currency=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_currency END, '
                 'pnl_source=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_source END '
                 'WHERE deal_id=?',
-                (now(),exit_n,exit_n,pnl_n,pnl_n,currency,currency,source,source,deal_id))
+                (now(),exit_n,exit_n,pnl_n,pnl_n,currency,currency,source,source,deal))
         else:
-            self.db.execute(
+            cur=self.db.execute(
                 'UPDATE trades SET closed=COALESCE(closed,?), '
                 'exit=COALESCE(?,exit), '
                 'pnl=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl END, '
                 'pnl_currency=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_currency END, '
                 'pnl_source=CASE WHEN ? IS NOT NULL THEN ? ELSE pnl_source END '
                 'WHERE deal_id=?',
-                (now(),exit_n,pnl_n,pnl_n,currency,currency,source,source,deal_id))
+                (now(),exit_n,pnl_n,pnl_n,currency,currency,source,source,deal))
+        if cur.rowcount==0:
+            # Missed OPEN upsert — still journal the Capital close for Desk.
+            self.db.execute(
+                'INSERT OR REPLACE INTO trades('
+                'deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
+                'pnl_currency,pnl_source) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                (deal,epic,str(size) if size is not None else None,
+                 direction,now(),now(),_num(entry),exit_n,pnl_n,currency,source))
         self.db.commit()
     def trades(self,n=150):
         cols=('deal_id','epic','size','direction','opened','closed','entry','exit','pnl',
@@ -4762,8 +4775,14 @@ class SingleTradeEngine:
             conf={'level':_num(exit_lvl),'profit':pnl,'pnl_currency':ccy,
                   'source':'orphan_history_reconcile'}
             if self._trade_already_learned(deal):
-                self.store.close_trade(deal,_num(exit_lvl),pnl,currency=ccy,
-                                      source='broker',overwrite=True)
+                meta=self.store.get('entry_brain:'+deal) or {}
+                self.store.close_trade(
+                    deal,_num(exit_lvl),pnl,currency=ccy,
+                    source='broker',overwrite=True,
+                    epic=(meta.get('epic') if isinstance(meta,dict) else None),
+                    direction=(meta.get('direction') if isinstance(meta,dict) else None),
+                    entry=(_num(meta.get('entry')) if isinstance(meta,dict) else None),
+                    size=(meta.get('size') if isinstance(meta,dict) else None))
                 self._bank_broker_cash_side_effects(
                     deal,pnl,currency=ccy,action=self._trade_direction(deal))
             else:
@@ -5123,9 +5142,14 @@ class SingleTradeEngine:
             elif exit_level is not None or broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or (
                     self._account_currency() if broker_pnl is not None else None)
-                self.store.close_trade(deal_id,exit_level,broker_pnl,currency=currency,
-                                       source='broker' if broker_pnl is not None else None,
-                                       overwrite=overwrite)
+                # No entry_brain — still journal Capital close for Desk island.
+                live_epic=(self.market.get('epic') or (self.mandate or {}).get('epic')
+                           or getattr(self.brain,'epic',None))
+                self.store.close_trade(
+                    deal_id,exit_level,broker_pnl,currency=currency,
+                    source='broker' if broker_pnl is not None else None,
+                    overwrite=overwrite,epic=live_epic,
+                    direction=confirmation.get('direction') or confirmation.get('side'))
                 if broker_pnl is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,broker_pnl,currency=currency)
@@ -5351,8 +5375,19 @@ class SingleTradeEngine:
                 and pnl_source not in ('broker','upl_estimate')):
             persist_source='pending_broker_pnl'
             persist_pnl=None
-        self.store.close_trade(deal_id,exit_level,persist_pnl,currency=currency,
-                               source=persist_source,overwrite=overwrite)
+        size_hint=None
+        if isinstance(saved,dict):
+            size_hint=saved.get('size') or saved.get('deal_size')
+        self.store.close_trade(
+            deal_id,exit_level,persist_pnl,currency=currency,
+            source=persist_source,overwrite=overwrite,
+            epic=epic if epic else (
+                saved.get('epic') if isinstance(saved,dict) else None),
+            size=size_hint,
+            direction=direction if direction in ('BUY','SELL') else (
+                saved.get('direction') if isinstance(saved,dict) else None),
+            entry=entry if entry is not None else (
+                _num(saved.get('entry')) if isinstance(saved,dict) else None))
         exit_mid=exit_level
         if exit_mid is None:
             exit_mid=_num((self.market or {}).get('mid'))
@@ -5469,6 +5504,14 @@ class SingleTradeEngine:
                         scores=saved.get('scores')
                         if isinstance(scores,dict):
                             edge_meta['score_edge']=AutoEvolution.score_edge(scores)
+                if isinstance(saved,dict):
+                    edge_meta=dict(edge_meta or {})
+                    edge_meta.setdefault('deal_id',deal_id)
+                    edge_meta.setdefault('epic',epic or saved.get('epic'))
+                    edge_meta.setdefault(
+                        'direction',direction if direction in ('BUY','SELL')
+                        else saved.get('direction'))
+                    edge_meta.setdefault('currency',currency)
                 unified_cycle.observe_close(
                     self.store,broker_pnl=pnl_value,spread=spread_cost,
                     entry_meta=edge_meta)

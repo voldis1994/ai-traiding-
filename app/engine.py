@@ -3845,11 +3845,14 @@ class SingleTradeEngine:
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
     def _account_currency(self):
-        account=self.account.get('accounts',[]) if isinstance(self.account,dict) else []
+        account_blob=getattr(self,'account',None)
+        account=account_blob.get('accounts',[]) if isinstance(account_blob,dict) else []
+        current_id=(account_blob.get('currentAccountId')
+                    if isinstance(account_blob,dict) else None)
         active=next((a for a in account if a.get('preferred') or
-                     a.get('accountId')==self.account.get('currentAccountId')),
+                     a.get('accountId')==current_id),
                     account[0] if account else {})
-        cur=(active.get('currency') or '').strip().upper()
+        cur=(active.get('currency') or '').strip().upper() if isinstance(active,dict) else ''
         return cur or None
 
     def _cash_currency(self, hint=None):
@@ -3860,7 +3863,10 @@ class SingleTradeEngine:
         Never store instrument quote currency on cash rows — if account currency
         is still unknown, return None (repair later) instead of trusting the hint.
         """
-        return self._account_currency()
+        try:
+            return self._account_currency()
+        except Exception:
+            return None
 
     def _account_equity(self):
         """Best-effort account equity/balance for drawdown gating (audit #21)."""
@@ -4837,7 +4843,18 @@ class SingleTradeEngine:
             return None
         once='mistake_audited_close:'+str(deal_id)
         prev=self.store.get(once) if self.store else None
-        if isinstance(prev,dict):
+        # Bag wipe / instrument switch clears HIST but leaves once-keys → Desk
+        # showed Capital 32 closes while Scenarios/Audits stayed 0 forever.
+        hist_has_deal=False
+        try:
+            from . import shadow_mistake_audit as sma
+            for h in (self.store.get(sma.HIST_KEY) or []):
+                if isinstance(h,dict) and str(h.get('deal_id') or '')==str(deal_id):
+                    hist_has_deal=True
+                    break
+        except Exception:
+            hist_has_deal=False
+        if isinstance(prev,dict) and hist_has_deal:
             prev_pnl=_num(prev.get('pnl'))
             # Same £ already audited → skip. Allow re-audit when Capital Funds
             # overwrites zero-poison / scratch / stale confirm (e.g. −0.81→−0.89).
@@ -4964,14 +4981,8 @@ class SingleTradeEngine:
                 wins+=1
             elif float(pnl_n)<0:
                 losses+=1
-            once='mistake_audited_close:'+str(deal_id)
-            prev=self.store.get(once)
-            if isinstance(prev,dict):
-                prev_pnl=_num(prev.get('pnl'))
-                # Already audited at this £ — skip (wins or losses).
-                if (prev_pnl is not None
-                        and abs(float(prev_pnl)-float(pnl_n))<1e-9):
-                    continue
+            # Skip only when HIST already holds this deal at this £. Once-keys
+            # alone are not enough — bag wipe left them while Scenarios=0.
             out=self._run_mistake_audit_close(
                 deal_id,pnl=float(pnl_n),
                 direction=direction if direction in ('BUY','SELL') else None,

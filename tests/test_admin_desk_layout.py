@@ -57,12 +57,14 @@ def test_quote_panel_no_fake_depth():
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
     assert 'admin.css?v=129' in html
-    assert 'admin.js?v=147' in html
+    assert 'admin.js?v=148' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 242' in hub
+    assert 'DESK_TRUTH_REV = 243' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
+    assert 'CAPITAL 24h' in js
+    assert 'rebuilding fingerprints from journal' in js
     assert 'ohlc-chart.js?v=12' in html
 
 

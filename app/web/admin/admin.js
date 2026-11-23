@@ -497,7 +497,9 @@ function renderShadowLab(client){
       +`${esc(s.direction||'?')} · hits ${esc(s.mistake_hits||0)}/${esc(s.seen||0)} · `
       +`<b>${esc(tag)}</b></div>`;
   }).filter(Boolean).join('')
-    ||'<div class="shadow-note">No scenario fingerprints yet — waits for shadow/LIVE closes</div>';
+    ||(winN
+      ?`<div class="shadow-note">Capital 24h has ${esc(winN)} closes — rebuilding fingerprints from journal</div>`
+      :'<div class="shadow-note">No scenario fingerprints yet — waiting for Capital / shadow closes</div>');
   const readyRows=(Array.isArray(audit.ready)?audit.ready:[]).slice(0,4).map(r=>{
     if(!r||typeof r!=='object')return '';
     return `<div class="shadow-note ok-line">${esc(r.scenario||r.fingerprint||'?')} · `
@@ -600,13 +602,20 @@ function renderShadowLab(client){
       </div>
     </article>
     <article class="shadow-card">
-      <div class="psx-h"><h2>PAPER BOOK</h2><span class="psx-src">${paperUnit==='price'?'PRICE PTS':'SHADOW £'}</span></div>
+      <div class="psx-h"><h2>${(!paperTrades && winN)?'CAPITAL 24h':'PAPER BOOK'}</h2>
+        <span class="psx-src">${(!paperTrades && winN)?'FROM CAPITAL'
+          :(paperUnit==='price'?'PRICE PTS':'SHADOW £')}</span></div>
       <div class="body">
         <div class="shadow-kv">
-          ${_shadowKv(paperUnit==='price'?'Paper pts':'Paper £',netTxt,netCls)}
-          ${_shadowKv('Closes',paperTrades)}
-          ${_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)}
-          ${_shadowKv('Open',openTxt)}
+          ${(!paperTrades && winN)
+            ?(_shadowKv('Capital £',winNetTxt,winNet==null?'neu':(winNet>=0?'ok':'bad'))
+              +_shadowKv('Closes',winN)
+              +_shadowKv('W / L',`${winW} / ${winL}`)
+              +_shadowKv('Open',openTxt))
+            :(_shadowKv(paperUnit==='price'?'Paper pts':'Paper £',netTxt,netCls)
+              +_shadowKv('Closes',paperTrades)
+              +_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)
+              +_shadowKv('Open',openTxt))}
         </div>
         <div class="shadow-note">${esc(
           paper.audit_backfill
@@ -616,8 +625,8 @@ function renderShadowLab(client){
               :(paperTrades>0
                 ?('Independent Paper SL/TP cash · Capital LIVE stays in CLIENT CLOSES + MISTAKE AUDIT')
                 :(winN
-                  ?('Paper book independent — Capital 24h has '+winN+' closes in MISTAKE AUDIT / CLIENT CLOSES (not Paper £)')
-                  :('No paper closes yet — waits shadow SL/TP fills; Capital £ is CLIENT CLOSES')))))}</div>
+                  ?('Capital.com 24h journal · Paper SL/TP book still empty (separate)')
+                  :('No Capital / paper closes yet')))))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -966,13 +975,21 @@ function renderDeskStatusBoard(client){
     :(results.losses!=null?results.losses:0))||0;
   const liveWins=Number(results.display_wins!=null?results.display_wins
     :(results.wins!=null?results.wins:0))||0;
-  // Paper empty ≠ system £0 — show Capital 24h net on the tile when paper is flat.
+  // Paper empty ≠ system £0 — show Capital 24h net (results or mistake-audit window).
   let shadowHero='paper';
+  const auditLab=shadowLab(client);
+  const auditWin=((auditLab.mistake_audit)||{}).window_24h||{};
+  const auditNet=auditWin.net!=null?Number(auditWin.net):null;
+  const auditClosed=Number(auditWin.n)||0;
   if((!shadowTrades || shadowNet==null || !Number.isFinite(shadowNet) ||
-      (shadowTrades===0 && Math.abs(shadowNet)<1e-9))
-      && liveReal!=null && Number.isFinite(liveReal) && liveClosed>0){
-    shadowNet=liveReal;
-    shadowHero='live24h';
+      (shadowTrades===0 && Math.abs(shadowNet)<1e-9))){
+    if(liveReal!=null && Number.isFinite(liveReal) && liveClosed>0){
+      shadowNet=liveReal;
+      shadowHero='live24h';
+    }else if(auditNet!=null && Number.isFinite(auditNet) && auditClosed>0){
+      shadowNet=auditNet;
+      shadowHero='live24h';
+    }
   }
   const shadowTxt=shadowNet==null?'—'
     :((shadowNet>=0?'+':'')+num(shadowNet,2)

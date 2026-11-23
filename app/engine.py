@@ -4439,10 +4439,14 @@ class SingleTradeEngine:
             self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
         return pnl,ccy
 
+    # Capital Funds vs Desk £ — phone can settle a few pence after confirm/UPL.
+    # Desk -0.81 with Funds -0.89 must overwrite (was stuck at 0.05 threshold).
+    FUNDS_PNL_EPS=0.01
+
     def _tx_epic_guess(self,tx):
         blob=' '.join(str(tx.get(k) or '') for k in
                       ('instrumentName','marketName','epic','description','note')).upper()
-        if 'GOLD' in blob or 'XAU' in blob:return 'GOLD'
+        if 'GOLD' in blob or 'XAU' in blob or 'USCGC' in blob:return 'GOLD'
         if 'OIL' in blob or 'BRENT' in blob or 'WTI' in blob:return 'OIL_CRUDE'
         epic=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
         return str(epic) if epic else 'GOLD'
@@ -4459,12 +4463,136 @@ class SingleTradeEngine:
         # Closing a BUY often shows negative size (sell to close).
         return 'BUY' if sz<0 else 'SELL'
 
+    def _funds_pnl_needs_upgrade(self,old_pnl,src,funds_pnl):
+        """True when Desk £ must be replaced by Capital Funds £."""
+        src_s=str(src or '')
+        if src_s!='broker':
+            return True
+        if old_pnl is None or abs(float(old_pnl))<1e-12:
+            return True  # zero-poison
+        return abs(float(old_pnl)-float(funds_pnl))>=self.FUNDS_PNL_EPS
+
+    def _epic_family_match(self,a,b):
+        """GOLD ↔ USCGC ↔ XAU family; otherwise exact-ish."""
+        aa=str(a or '').upper();bb=str(b or '').upper()
+        if not aa or not bb:
+            return True
+        if aa==bb or aa in bb or bb in aa:
+            return True
+        gold=lambda s:('GOLD' in s or 'USCGC' in s or 'XAU' in s)
+        return gold(aa) and gold(bb)
+
+    def _find_stale_journal_for_funds_tx(self,tx,pnl,*,skip_deals=None):
+        """Bind Funds TRADE to a robot journal close still showing wrong £.
+
+        Confirm/UPL often stamps −0.81 while Funds settles −0.89. When dealId
+        refs miss, inserting only a ``cap:`` orphan left the UUID row as Desk
+        "last" with the stale number — phone and Desk disagreed.
+        """
+        skip=set(str(x) for x in (skip_deals or ()))
+        epic=self._tx_epic_guess(tx)
+        entry=_num(tx.get('openLevel') or tx.get('open_level'))
+        exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+        tx_ts=self._parse_broker_ts(
+            tx.get('dateUtc') or tx.get('dateUTC') or tx.get('date'))
+        best=None  # (score, deal_id)
+        try:
+            rows=self.store.db.execute(
+                'SELECT deal_id,epic,entry,exit,closed,pnl,pnl_source FROM trades '
+                'WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 80').fetchall()
+        except Exception:
+            return None
+        for deal_id,j_epic,j_entry,j_exit,j_closed,j_pnl,j_src in rows:
+            deal=str(deal_id)
+            if deal in skip:
+                continue
+            if not self._epic_family_match(epic,j_epic):
+                continue
+            old=_num(j_pnl)
+            if not self._funds_pnl_needs_upgrade(old,j_src,pnl):
+                continue
+            # Already exact Funds £ on this row — nothing to do.
+            if old is not None and abs(float(old)-float(pnl))<1e-9:
+                continue
+            je=_num(j_entry);jx=_num(j_exit)
+            # Hard gates — never glue a different Funds close onto another day's
+            # journal row (that turned +0.33 into an overwrite of −0.27).
+            if entry is not None and je is not None:
+                if abs(float(entry)-float(je))>1.5:
+                    continue
+            if exit_lvl is not None and jx is not None:
+                if abs(float(exit_lvl)-float(jx))>1.5:
+                    continue
+            jt=self._parse_broker_ts(j_closed)
+            if tx_ts is not None and jt is not None:
+                # _parse_broker_ts returns UTC epoch seconds.
+                if abs(float(tx_ts)-float(jt))>3*3600:
+                    continue
+            # Require at least one strong anchor (level or close time).
+            has_level=(entry is not None and je is not None) or (
+                exit_lvl is not None and jx is not None)
+            has_time=tx_ts is not None and jt is not None
+            if not has_level and not has_time:
+                continue
+            score=0.0
+            if entry is not None and je is not None:
+                score+=abs(float(entry)-float(je))
+            else:
+                score+=5.0
+            if exit_lvl is not None and jx is not None:
+                score+=abs(float(exit_lvl)-float(jx))
+            else:
+                score+=5.0
+            if has_time:
+                score+=abs(float(tx_ts)-float(jt))/60.0
+            else:
+                score+=30.0
+            # Prefer real robot dealIds over other cap: orphans.
+            if deal.startswith('cap:'):
+                score+=8.0
+            if best is None or score<best[0]:
+                best=(score,deal)
+        if best is None:
+            return None
+        # Reject weak leftover matches.
+        if best[0]>120.0:
+            return None
+        return best[1]
+
+    def _apply_funds_pnl_to_deal(self,deal,tx,pnl,*,ccy_default):
+        """Overwrite journal deal with Capital Funds £ and re-run cycle."""
+        ccy=self._cash_currency(tx.get('currency')) or ccy_default
+        exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
+        direction=self._tx_direction_guess(tx)
+        entry=_num(tx.get('openLevel') or tx.get('open_level'))
+        self.store.close_trade(
+            deal,exit_lvl,float(pnl),currency=ccy,
+            source='broker',overwrite=True,
+            epic=self._tx_epic_guess(tx),direction=direction,
+            entry=entry,size=tx.get('size') or tx.get('quantity'))
+        # Prefer Funds close time so Desk "last" sorts with the phone app.
+        closed_at=(tx.get('dateUtc') or tx.get('dateUTC') or tx.get('date'))
+        if closed_at:
+            try:
+                self.store.db.execute(
+                    'UPDATE trades SET closed=? WHERE deal_id=?',
+                    (str(closed_at),str(deal)))
+                self.store.db.commit()
+            except Exception:
+                pass
+        self._bank_broker_cash_side_effects(
+            deal,float(pnl),currency=ccy,action=direction,source='broker')
+        self._run_mistake_audit_close(
+            deal,pnl=float(pnl),direction=direction,entry=entry,
+            source='live_funds_mirror')
+
     async def _mirror_capital_funds_closes(self):
         """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (last 24h).
 
-        1) Upgrade unsettled journal deals with matched Capital cash.
-        2) Insert orphan ``cap:{fp}`` closes so Funds rows never vanish from Desk
-           when OPEN upsert / dealId matching missed entirely.
+        1) Upgrade unsettled / stale journal deals with matched Capital cash.
+        2) Fuzzy-bind Funds rows onto UUID closes when dealId refs miss
+           (Desk −0.81 vs Funds −0.89).
+        3) Insert orphan ``cap:{fp}`` only when no journal close can take the £.
         """
         if not self.broker or not hasattr(self.broker,'transactions'):
             return 0
@@ -4513,33 +4641,12 @@ class SingleTradeEngine:
                     row=None
                 src=str((row or [None])[0] or '')
                 old_pnl=_num((row or [None,None])[1] if row else None)
-                # Upgrade non-broker OR zero-poison / stale £ that ≠ Capital Funds.
-                needs=src!='broker'
-                if not needs and (old_pnl is None or abs(float(old_pnl))<1e-12):
-                    needs=True  # Capital phone shows -£0.12; Desk stuck +0.00
-                elif not needs and old_pnl is not None and abs(float(old_pnl)-float(pnl))>=0.05:
-                    needs=True  # e.g. Desk -0.58 vs Funds -0.65
-                if needs:
-                    ccy=self._cash_currency(tx.get('currency')) or ccy_default
-                    exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
-                    self.store.close_trade(
-                        bound_deal,exit_lvl,float(pnl),currency=ccy,
-                        source='broker',overwrite=True,
-                        epic=self._tx_epic_guess(tx),
-                        direction=self._tx_direction_guess(tx),
-                        entry=_num(tx.get('openLevel') or tx.get('open_level')),
-                        size=tx.get('size') or tx.get('quantity'))
-                    self._bank_broker_cash_side_effects(
-                        bound_deal,float(pnl),currency=ccy,
-                        action=self._tx_direction_guess(tx),source='broker')
+                if self._funds_pnl_needs_upgrade(old_pnl,src,pnl):
+                    self._apply_funds_pnl_to_deal(
+                        bound_deal,tx,pnl,ccy_default=ccy_default)
                     if fp:
                         self._mark_fuzzy_tx_consumed(fp,deal_id=bound_deal)
                     upgraded+=1
-                    self._run_mistake_audit_close(
-                        bound_deal,pnl=float(pnl),
-                        direction=self._tx_direction_guess(tx),
-                        entry=_num(tx.get('openLevel') or tx.get('open_level')),
-                        source='live_funds_mirror')
                 continue
             # Fingerprint already consumed by a zero-poison deal → rebind real £.
             if fp in consumed:
@@ -4555,35 +4662,38 @@ class SingleTradeEngine:
                     consumer=None
                 if consumer:
                     c_deal,c_src,c_pnl=consumer
-                    if (c_src!='broker' or c_pnl is None or abs(float(c_pnl))<1e-12
-                            or abs(float(c_pnl)-float(pnl))>=0.05):
-                        ccy=self._cash_currency(tx.get('currency')) or ccy_default
-                        exit_lvl=_num(tx.get('closeLevel') or tx.get('close_level'))
-                        self.store.close_trade(
-                            c_deal,exit_lvl,float(pnl),currency=ccy,
-                            source='broker',overwrite=True,
-                            epic=self._tx_epic_guess(tx),
-                            direction=self._tx_direction_guess(tx),
-                            entry=_num(tx.get('openLevel') or tx.get('open_level')),
-                            size=tx.get('size') or tx.get('quantity'))
-                        self._bank_broker_cash_side_effects(
-                            c_deal,float(pnl),currency=ccy,
-                            action=self._tx_direction_guess(tx),source='broker')
+                    if self._funds_pnl_needs_upgrade(c_pnl,c_src,pnl):
+                        self._apply_funds_pnl_to_deal(
+                            c_deal,tx,pnl,ccy_default=ccy_default)
                         upgraded+=1
-                        self._run_mistake_audit_close(
-                            c_deal,pnl=float(pnl),
-                            direction=self._tx_direction_guess(tx),
-                            entry=_num(tx.get('openLevel') or tx.get('open_level')),
-                            source='live_funds_mirror')
+                continue
+            # Fuzzy: Funds reference ≠ UUID dealId — upgrade the stale robot row
+            # instead of leaving Desk "last" at confirm/UPL £.
+            fuzzy=self._find_stale_journal_for_funds_tx(tx,pnl)
+            if fuzzy:
+                self._apply_funds_pnl_to_deal(
+                    fuzzy,tx,pnl,ccy_default=ccy_default)
+                self._mark_fuzzy_tx_consumed(fp,deal_id=fuzzy)
+                upgraded+=1
+                self.store.event('reconcile',
+                                 'Capital Funds £ rebound onto journal deal',
+                                 {'deal_id':fuzzy,'pnl':float(pnl),
+                                  'fingerprint':fp})
                 continue
             # Orphan Capital Funds close — journal so Desk matches the phone app.
             deal='cap:'+fp.replace(':','_')[:48]
             try:
                 exists=self.store.db.execute(
-                    'SELECT 1 FROM trades WHERE deal_id=? LIMIT 1',(deal,)).fetchone()
+                    'SELECT pnl,pnl_source FROM trades WHERE deal_id=? LIMIT 1',
+                    (deal,)).fetchone()
             except Exception:
                 exists=None
             if exists:
+                old_pnl=_num(exists[0]);src=str(exists[1] or '')
+                if self._funds_pnl_needs_upgrade(old_pnl,src,pnl):
+                    self._apply_funds_pnl_to_deal(
+                        deal,tx,pnl,ccy_default=ccy_default)
+                    upgraded+=1
                 if fp not in consumed:
                     self._mark_fuzzy_tx_consumed(fp,deal_id=deal)
                 continue
@@ -4673,12 +4783,13 @@ class SingleTradeEngine:
         if isinstance(prev,dict):
             prev_pnl=_num(prev.get('pnl'))
             # Same £ already audited → skip. Allow re-audit when Capital Funds
-            # overwrites zero-poison / scratch (+0.00) with a real minus.
+            # overwrites zero-poison / scratch / stale confirm (e.g. −0.81→−0.89).
             if prev_pnl is not None and abs(float(prev_pnl)-pnl_n)<1e-9:
                 return None
+            eps=float(getattr(self,'FUNDS_PNL_EPS',0.01) or 0.01)
             material=(prev_pnl is None
                       or abs(float(prev_pnl))<1e-12
-                      or abs(float(prev_pnl)-pnl_n)>=0.05)
+                      or abs(float(prev_pnl)-pnl_n)>=eps)
             if not material:
                 return None
         try:
@@ -4724,11 +4835,13 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=80,hours=24):
+    def _backfill_mistake_audits_from_journal(self,*,limit=160,hours=24):
         """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
 
         Analysis needs both sides — skipping wins left the cycle blind to what
         worked next to the minuses. Window is time-based (24h), not "last 1 close".
+        Includes pending_* rows that already carry a non-zero £ so SHADOW is not
+        stuck waiting while Funds mirror catches up.
         """
         if self.store is None:
             return 0
@@ -4748,14 +4861,17 @@ class SingleTradeEngine:
         scanned=0
         wins=0
         losses=0
+        cash_sources={
+            'broker','upl_estimate','funds','capital','',
+            'pending_broker_pnl','pending_close_sync','pending_upl_teach',
+        }
         for deal_id,pnl,direction,entry,src,closed in rows:
             pnl_n=_num(pnl)
             if pnl_n is None or abs(float(pnl_n))<1e-12:
                 continue  # still zero — wait for Funds mirror
             src_s=str(src or '').strip().lower()
             # Cash-like sources only (broker / late UPL / funds mirror tags).
-            if src_s and src_s not in (
-                    'broker','upl_estimate','funds','capital',''):
+            if src_s and src_s not in cash_sources:
                 continue
             # Keep inside the 24h analysis window.
             if closed:

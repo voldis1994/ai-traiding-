@@ -170,6 +170,127 @@ def test_zero_poison_reaudit_lets_cycle_see_capital_minus():
     asyncio.run(scenario())
 
 
+def test_mirror_upgrades_stale_broker_pence_to_funds():
+    """Desk −0.81 broker must become Funds −0.89 (phone truth)."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'deal-stale', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 4188.5,
+            })
+            store.close_trade(
+                'deal-stale', 4187.9, -0.81, currency='GBP',
+                source='broker', overwrite=True)
+            broker = FundsBroker([{
+                'dealId': 'deal-stale', 'instrumentName': 'Gold',
+                'pnl': -0.89, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 4188.5, 'closeLevel': 4187.9,
+                'dateUtc': '2026-11-23T15:49:00Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n == 1
+            row = next(r for r in store.trades(5) if r['deal_id'] == 'deal-stale')
+            assert row['pnl'] == pytest.approx(-0.89)
+            assert row['pnl_source'] == 'broker'
+    asyncio.run(scenario())
+
+
+def test_mirror_fuzzy_binds_funds_onto_uuid_when_ref_misses():
+    """Funds reference ≠ UUID — still overwrite stale confirm £ on the robot deal."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'uuid-abc-111', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 4188.5,
+            })
+            store.close_trade(
+                'uuid-abc-111', 4187.9, -0.81, currency='GBP',
+                source='broker', overwrite=True)
+            # Force closed stamp near Funds time so fuzzy scores.
+            store.db.execute(
+                "UPDATE trades SET closed=? WHERE deal_id=?",
+                ('2026-11-23T15:49:05Z', 'uuid-abc-111'))
+            store.db.commit()
+            broker = FundsBroker([{
+                'reference': 'DIFFFF', 'instrumentName': 'Gold',
+                'pnl': -0.89, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 4188.5, 'closeLevel': 4187.9,
+                'dateUtc': '2026-11-23T15:49:00Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n >= 1
+            row = next(r for r in store.trades(8) if r['deal_id'] == 'uuid-abc-111')
+            assert row['pnl'] == pytest.approx(-0.89)
+            # Must not leave Desk "last" as a separate orphan with the same £
+            # while UUID stays stale — UUID is the operator's last close.
+            assert row['pnl_source'] == 'broker'
+    asyncio.run(scenario())
+
+
+def test_reaudit_on_penny_funds_upgrade():
+    """Cycle must re-diagnose when Funds moves −0.81 → −0.89."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            first = e._run_mistake_audit_close(
+                'deal-penny', pnl=-0.81, direction='BUY', entry=4188.0,
+                source='live')
+            assert first and first.get('audited')
+            second = e._run_mistake_audit_close(
+                'deal-penny', pnl=-0.89, direction='BUY', entry=4188.0,
+                source='live_funds_mirror')
+            assert second and second.get('audited')
+    asyncio.run(scenario())
+
+
+def test_backfill_analyses_all_journal_closes_not_just_last():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            for i, pnl in enumerate((-0.89, 0.62, -0.27, 0.33)):
+                deal = f'deal-all-{i}'
+                store.upsert_trade({
+                    'dealId': deal, 'epic': 'GOLD', 'size': '0.1',
+                    'direction': 'BUY' if pnl > 0 else 'SELL', 'level': 4100 + i,
+                })
+                store.close_trade(
+                    deal, 4100 + i + 0.5, pnl, currency='GBP',
+                    source='broker', overwrite=True)
+                closed = (now - timedelta(minutes=10 * i)).isoformat()
+                store.db.execute(
+                    'UPDATE trades SET closed=? WHERE deal_id=?', (closed, deal))
+            store.db.commit()
+            n = e._backfill_mistake_audits_from_journal(limit=20, hours=24)
+            assert n >= 4
+            from app import shadow_mistake_audit as sma
+            lab = sma.lab_payload(store)
+            assert int((lab.get('window_24h') or {}).get('n') or 0) >= 4
+            assert len(lab.get('recent_audits') or []) >= 4
+    asyncio.run(scenario())
+
+
 def test_trade_stats_shows_mirrored_funds_rows():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:

@@ -412,12 +412,21 @@ class RuntimeHub:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
             if val is not None and kind=='cash':
-                cash_n+=1
-                by_ccy.setdefault(ccy,[]).append(val)
-                if not acct or ccy==acct:
-                    signed.append(val)
-                if len(recent)<12:
-                    recent.append(row)
+                # Capital often journals broker £0 before Funds settles — that
+                # zero-poison must NOT paint Desk working_pnl=0 as "truth".
+                if abs(float(val))<1e-12:
+                    blank_n+=1
+                    pending_n+=1
+                    row={**row,'pending_cash':True,'pnl_source':'pending_broker_pnl'}
+                    if len(recent)<12:
+                        recent.append(row)
+                else:
+                    cash_n+=1
+                    by_ccy.setdefault(ccy,[]).append(val)
+                    if not acct or ccy==acct:
+                        signed.append(val)
+                    if len(recent)<12:
+                        recent.append(row)
             elif kind=='pending':
                 # Last live UPL as display hint when journal has a number or
                 # last_upl still holds the close figure — show as ESTIMATE,
@@ -558,9 +567,9 @@ class RuntimeHub:
                         'direction':h.get('direction') or h.get('side') or '?',
                         'closed':h.get('at') or h.get('closed') or h.get('time'),
                         'pnl':round(pnl_h,4),
-                        # observe_close only records useful/hurt broker £.
+                        # Edge hist is NOT Capital Funds — never label as broker.
                         'pnl_currency':acct or h.get('currency') or '?',
-                        'pnl_source':'broker',
+                        'pnl_source':'edge_hist',
                         'from_edge_hist':True,
                     })
                     if len(recent)>=12:
@@ -1049,7 +1058,8 @@ class RuntimeHub:
             },
             'last_start_error':self._start_errors.get(cid),
             'results':{
-                'closed_trades':0,'open_trades_recorded':0,'realized_pnl':0.0,
+                'closed_trades':0,'open_trades_recorded':0,'realized_pnl':None,
+                'working_pnl':None,'working_pnl_source':'empty',
                 'pnl_currency':None,'pnl_by_currency':{},
                 'wins':0,'losses':0,'win_rate':0.0,'recent_trades':[],
             },

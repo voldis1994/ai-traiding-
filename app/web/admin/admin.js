@@ -164,9 +164,10 @@ function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${
 
 function sourceLabel(src){
   const s=String(src||'').toLowerCase();
-  if(s==='broker')return 'Capital £';
+  if(s==='broker'||s==='funds'||s==='capital')return 'Capital £';
   if(s==='upl_estimate')return '≈UPL (nav Capital £)';
   if(s==='open_upl')return 'live UPL';
+  if(s==='edge_hist')return 'edge £ (nav Capital)';
   if(s==='working')return 'working';
   if(s==='none'||s==='empty')return 'nav skaitļu';
   if(s==='pending_broker_pnl'||s==='pending_close_sync')return 'gaida Capital £';
@@ -178,7 +179,10 @@ function closePnlSrcBadge(src,pending){
     return {cls:'psx-pnl-src wait',text:'GAIDA'};
   }
   if(s==='upl_estimate')return {cls:'psx-pnl-src est',text:'≈UPL'};
-  if(s==='broker'||s===''||!s)return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  if(s==='edge_hist')return {cls:'psx-pnl-src wait',text:'EDGE'};
+  if(s==='broker'||s==='funds'||s==='capital'||s===''||!s){
+    return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  }
   if(s==='ticks_only'||s==='price_size'||s==='position_disappeared'){
     return {cls:'psx-pnl-src wait',text:'PROXY'};
   }
@@ -201,6 +205,13 @@ function hasRealWorkingPnl(r){
   const src=String(r.working_pnl_source||'').toLowerCase();
   // Backend used to emit working_pnl=0 with source empty/none — treat as missing.
   if(src==='none'||src==='empty')return false;
+  // Zero-poison broker £0 while closes/estimates exist is NOT Capital truth.
+  if(Math.abs(Number(r.working_pnl))<1e-9){
+    const closed=Number(r.closed_trades)||0;
+    const est=Number(r.estimate_trades)||0;
+    const pending=Number(r.pending_cash_trades)||0;
+    if(closed>0||est>0||pending>0)return false;
+  }
   return true;
 }
 
@@ -1290,23 +1301,24 @@ function renderDeskClosed(client){
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
     const src=String(t.pnl_source||'').toLowerCase();
     const raw=t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint);
-    const broker=src==='broker';
+    const broker=src==='broker'||src==='funds'||src==='capital';
+    const edge=src==='edge_hist'||!!t.from_edge_hist;
     const hasNum=raw!=null&&Number.isFinite(Number(raw));
     // Any pending/estimate with a number → ≈£… Blank pending only → gaida.
-    const isEst=!broker&&hasNum&&(
+    const isEst=!broker&&!edge&&hasNum&&(
       src==='upl_estimate'||src==='pending_broker_pnl'||src==='pending_close_sync'
       ||!!t.pending_cash);
     const blankWait=!hasNum&&!!(t.pending_cash||src==='pending_broker_pnl'
       ||src==='pending_close_sync'||src==='upl_estimate');
-    const val=broker&&hasNum?money(raw,t.pnl_currency||ccy)
+    const val=(broker||edge)&&hasNum?money(raw,t.pnl_currency||ccy)
       :(isEst?'≈'+money(raw,t.pnl_currency||ccy)
         :(blankWait?'gaida Capital £':'—'));
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
     const badge=closePnlSrcBadge(
-      isEst?'upl_estimate':t.pnl_source,blankWait&&!broker);
+      isEst?'upl_estimate':(edge?'edge_hist':t.pnl_source),blankWait&&!broker);
     const whenShow=when&&when!=='—'?when:'';
-    const pnlCls=broker||isEst?pnlClass(raw):'';
+    const pnlCls=broker||isEst||edge?pnlClass(raw):'';
     const capOrphan=String(t.deal_id||'').startsWith('cap:');
     return `<div class="psx-whale-row">
       <div class="wh-top">
@@ -2244,13 +2256,13 @@ function renderTopClients(clients){
     return {
       name:c.display_name||c.username||('#'+c.id),
       user:c.username||'',
-      pnl:sb.pnl==null?0:sb.pnl,
+      pnl:sb.pnl,  // keep null — never invent £0 for clients without cash
       ccy:sb.ccy||r.pnl_currency||c.account_currency||'',
       wr,
       src:sb.src,
       wl:`${sb.wins}/${sb.losses}`,
     };
-  }).sort((a,b)=>b.pnl-a.pnl).slice(0,3);
+  }).sort((a,b)=>(Number(b.pnl)||-1e99)-(Number(a.pnl)||-1e99)).slice(0,3);
 
   if(!ranked.length){
     stableHtml($('topClients'),`<div class="empty">Vēl nav klientu</div>`);
@@ -2260,7 +2272,8 @@ function renderTopClients(clients){
     <div class="rank">
       <span class="medal m${i+1}">${i+1}</span>
       <div class="who">${esc(c.name)}<small>@${esc(c.user)} · ${esc(sourceLabel(c.src))} · W/L ${esc(c.wl)}</small></div>
-      <div class="earn ${pnlClass(c.pnl)}">${esc(money(c.pnl,c.ccy))}
+      <div class="earn ${c.pnl==null?'neu':pnlClass(c.pnl)}">${esc(
+        c.pnl==null?formatPnlDisplay(null,c.src,c.ccy):money(c.pnl,c.ccy))}
         <small>${c.wr==null?'—':((c.wr<=1?c.wr*100:c.wr).toFixed(1)+'% WR')}</small>
       </div>
     </div>`).join(''));

@@ -561,16 +561,24 @@ class ShadowPaperJournal:
             if src=='live':continue
             pnl=_finite(h.get('pnl'))
             if pnl is None:continue
-            # |pnl|≫£1 for GOLD usually means price points (audit gets price_pnl
-            # when cash_scale was missing at close).
-            unit='price' if abs(pnl)>=2.0 else 'account_currency'
+            # Prefer explicit unit / price_pnl — never guess £2+ LIVE losses as pts.
+            explicit_unit=h.get('unit')
+            has_price=_finite(h.get('price_pnl')) is not None
+            if explicit_unit in ('price','account_currency'):
+                unit=explicit_unit
+            elif has_price and _finite(h.get('paper_pnl')) is None:
+                unit='price'
+            else:
+                unit='account_currency'
             row={
                 'at':h.get('at'),
                 'direction':h.get('direction'),
                 'entry':h.get('entry'),
                 'exit':h.get('exit'),
-                'price_pnl':float(pnl) if unit=='price' else h.get('price_pnl'),
-                'paper_pnl':float(pnl) if unit=='account_currency' else None,
+                'price_pnl':(_finite(h.get('price_pnl')) if unit=='price'
+                             else None) or (float(pnl) if unit=='price' else None),
+                'paper_pnl':float(pnl) if unit=='account_currency' else (
+                    _finite(h.get('paper_pnl'))),
                 'unit':unit,
                 'exit_reason':h.get('exit_reason') or 'audit_backfill',
                 'source':'shadow_paper_audit_backfill',

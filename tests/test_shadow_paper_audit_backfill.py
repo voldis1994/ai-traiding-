@@ -15,10 +15,11 @@ def test_backfill_restores_price_closes_from_audit_hist():
         store = Store(Path(d) / 'db.sqlite3')
         store.set('shadow_mistake_audit_v1:hist', [
             {'at': '2026-11-23T14:36:00Z', 'source': 'shadow',
-             'pnl': -12.94, 'direction': 'BUY', 'scenario': 'BREAKOUT_UP',
-             'mistakes': ['outcome_hurt']},
+             'pnl': -12.94, 'unit': 'price', 'direction': 'BUY',
+             'scenario': 'BREAKOUT_UP', 'mistakes': ['outcome_hurt']},
             {'at': '2026-11-23T14:22:00Z', 'source': 'shadow',
-             'pnl': 10.0, 'direction': 'BUY', 'scenario': 'CHOCH_UP'},
+             'pnl': 10.0, 'unit': 'price', 'direction': 'BUY',
+             'scenario': 'CHOCH_UP'},
             {'at': '2026-11-23T14:16:00Z', 'source': 'live',
              'pnl': 0.70, 'direction': 'BUY'},  # LIVE must not enter paper book
         ])
@@ -43,12 +44,12 @@ def test_desk_payload_backfills_empty_paper_from_audits():
         strategy_gen.save(store, {'active_ids': ['GOLD|TREND_UP|BUY']})
         store.set('shadow_mistake_audit_v1:hist', [
             {'at': '2026-11-23T14:36:00Z', 'source': 'shadow',
-             'pnl': -12.94, 'mistakes': ['outcome_hurt'],
+             'pnl': -12.94, 'unit': 'price', 'mistakes': ['outcome_hurt'],
              'scenario': 'BREAKOUT_UP'},
         ])
         store.set('shadow_mistake_audit_v1:last', {
-            'mistakes': ['outcome_hurt'], 'pnl': -12.94, 'source': 'shadow',
-            'scenario': 'BREAKOUT_UP',
+            'mistakes': ['outcome_hurt'], 'pnl': -12.94, 'unit': 'price',
+            'source': 'shadow', 'scenario': 'BREAKOUT_UP',
         })
         hub = RuntimeHub.__new__(RuntimeHub)
 

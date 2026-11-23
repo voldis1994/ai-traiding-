@@ -86,6 +86,24 @@ def test_fingerprint_does_not_wait_on_news_peers():
     assert blocked != a
 
 
+def test_zero_poison_broker_not_counted_as_capital_cash():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        store.upsert_trade({
+            'dealId': 'z0', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 4100,
+        })
+        store.close_trade(
+            'z0', 4100, 0.0, currency='GBP',
+            source='broker', overwrite=True)
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        assert stats['cash_trades'] == 0
+        assert stats['working_pnl'] is None
+        assert stats['realized_pnl'] is None
+        assert stats['pending_cash_trades'] >= 1 or stats['blank_pnl_trades'] >= 1
+
+
 def test_lab_payload_news_peers_not_waiting_gate():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')

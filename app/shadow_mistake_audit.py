@@ -856,7 +856,9 @@ def lab_payload(store) -> dict:
         'ready_n': READY_N,
         'scenarios': len(bag),
         'ready_count': len(ready),
-        'hist_n': len(hist),
+        # Prefer real audit hist; fall back to journal merge length so Desk does
+        # not show Audits=0 while Capital 24h already lists closes.
+        'hist_n': len(hist) if hist else len(recent_audits),
         'hurt_n': hurt_n,
         'window_24h': window_24h,
         'live_news': {

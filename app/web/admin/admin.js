@@ -452,17 +452,27 @@ function renderShadowLab(client){
       +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
   }).filter(Boolean).join('')
     ||'<div class="shadow-note">None ready LIVE yet</div>';
+  const auditSrcTag=src=>{
+    const s=String(src||'?').toLowerCase();
+    if(s==='live'||s==='live_close')return 'LIVE';
+    if(s.includes('journal'))return 'JRN';
+    if(s.includes('backfill'))return 'BKF';
+    if(s.includes('paper')||s.includes('shadow'))return 'SH';
+    return s.slice(0,4).toUpperCase();
+  };
   const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,5).map(a=>{
     if(!a||typeof a!=='object')return '';
     const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
     const p=a.pnl!=null?Number(a.pnl):null;
     const pcls=p==null?'':(p>=0?'ok':'bad');
     const ptxt=p==null?'—':((p>=0?'+':'')+num(p,2));
-    const when=a.at?String(a.at).replace('T',' ').slice(0,16):'—';
+    const when=a.at?String(a.at).replace('T',' ').slice(11,16):'—';
+    const srcRaw=String(a.source||'?');
+    const liveish=/live/i.test(srcRaw);
     return `<div class="shadow-row">
-      <span class="dir ${a.source==='live'?'buy':'sell'}">${esc(String(a.source||'?').toUpperCase())}</span>
+      <span class="dir ${liveish?'buy':'sell'}" title="${esc(srcRaw)}">${esc(auditSrcTag(srcRaw))}</span>
       <span class="mut">${esc(m)} · ${esc(when)}</span>
-      <span class="mut">${esc(a.scenario||a.fingerprint||'—')}</span>
+      <span class="mut">${esc(String(a.scenario||a.fingerprint||'—').slice(0,18))}</span>
       <strong class="pnl ${pcls}">${esc(ptxt)}</strong>
     </div>`;
   }).join('')||'<div class="psx-empty">No audits yet — closes feed this loop</div>';
@@ -1123,10 +1133,10 @@ function renderDeskIndicators(client,view){
   const adx=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   const kama=mtfUi.kama??((mtf.tf||{}).m5||{}).kama??ov.kama_level??((mtf.tf||{}).m1||{}).kama;
   stableHtml(el,[
-    deskKv(client.id,'ATR14 M1',atr,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'ATR',atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
-    deskKv(client.id,'KAMA5',kama,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Spread',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
+    deskKv(client.id,'KAMA',kama,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'SPR',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
       v=>v==null?'—':num(v,3)),
   ].join(''));
 }
@@ -1628,10 +1638,10 @@ function renderDeskIndCharts(client,view){
   const adxHead=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   stableHtml(el,`
     <div class="psx-ind-head">
-      <span>RSI <b>${num(rsiNow,1)}</b></span>
-      <span>MACD <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span>
-      <span>ADX <b>${adxHead==null?'—':num(adxHead,1)}</b></span>
-      <span>ATR14 M1 <b>${atrHead==null?'—':num(atrHead,2)}</b></span>
+      <span><i>RSI</i> <b>${num(rsiNow,1)}</b></span>
+      <span><i>MACD</i> <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span>
+      <span><i>ADX</i> <b>${adxHead==null?'—':num(adxHead,1)}</b></span>
+      <span><i>ATR</i> <b>${atrHead==null?'—':num(atrHead,2)}</b></span>
     </div>
     <div class="psx-ind-canvas"><canvas id="deskRsiCanvas"></canvas></div>
     <div class="psx-ind-canvas"><canvas id="deskMacdCanvas"></canvas></div>`);

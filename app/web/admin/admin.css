@@ -495,16 +495,18 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-src{font-size:var(--desk-fs-xs);font-weight:800;letter-spacing:.05em;color:var(--desk-yellow);opacity:.9}
 .psx-intel-feed{flex:1;overflow:hidden;padding:0;display:flex;flex-direction:column;gap:0;min-height:0}
 .psx-intel-card{
-  padding:8px 8px;border:0;border-bottom:1px solid var(--desk-grid);border-radius:0;background:transparent}
+  padding:6px 8px;border:0;border-bottom:1px solid var(--desk-grid);border-radius:0;background:transparent;
+  flex:0 0 auto}
 .psx-intel-card .tag{
-  display:inline-block;font-size:9px;font-weight:800;letter-spacing:.08em;padding:2px 5px;
-  border-radius:2px;margin-bottom:4px;border:1px solid transparent}
+  display:inline-block;font-size:8px;font-weight:800;letter-spacing:.08em;padding:1px 4px;
+  border-radius:2px;margin-bottom:3px;border:1px solid transparent}
 .psx-intel-card.bull .tag{background:rgba(49,213,154,.12);color:var(--g);border-color:rgba(49,213,154,.28)}
 .psx-intel-card.bear .tag{background:rgba(239,104,117,.12);color:var(--r);border-color:rgba(239,104,117,.28)}
 .psx-intel-card.neu .tag{background:rgba(118,160,222,.1);color:var(--desk-blue);border-color:rgba(118,160,222,.25)}
-.psx-intel-card .hd{font-size:12px;font-weight:600;line-height:1.4;color:var(--txt);
-  display:block;overflow:visible;white-space:normal;overflow-wrap:anywhere}
-.psx-intel-card .meta{margin-top:4px;font-size:10px;color:var(--mut)}
+.psx-intel-card .hd{font-size:9px;font-weight:500;line-height:1.35;color:var(--txt);
+  overflow:hidden;white-space:normal;overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.psx-intel-card .meta{margin-top:3px;font-size:8px;color:var(--mut);letter-spacing:.04em}
 
 .psx-main{display:flex;flex-direction:column;min-width:0;min-height:0;background:transparent;overflow:hidden;gap:var(--desk-gap)}
 .psx-toolbar{
@@ -596,23 +598,26 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-learn-line b{flex:1;min-width:0;white-space:normal;overflow-wrap:break-word;word-break:normal;font-weight:600;line-height:1.35}
 .psx-learn-line.ok b{color:var(--g)}
 .psx-learn-line.bad b{color:var(--r)}
-.psx-ind{padding:8px 10px;display:flex;flex-direction:column;gap:6px;flex:1;min-height:0}
-.psx-ind-canvas{flex:1;min-height:56px;border:1px solid var(--desk-grid);background:#060a14;position:relative}
+.psx-ind{padding:6px 8px;display:flex;flex-direction:column;gap:8px;flex:1;min-height:0}
+.psx-ind-canvas{flex:1;min-height:48px;border:1px solid var(--desk-grid);background:#060a14;position:relative}
 .psx-ind-canvas canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-.psx-ind-head{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px 12px;font-size:13px;padding:4px 0;color:var(--mut);flex:0 0 auto}
-.psx-ind-head b{color:var(--txt);font-size:14px}
+.psx-ind-head{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px 10px;font-size:10px;padding:2px 0 6px;color:var(--mut);flex:0 0 auto}
+.psx-ind-head span{display:inline-flex;align-items:baseline;gap:4px}
+.psx-ind-head i{font-style:normal;font-size:8px;font-weight:700;letter-spacing:.04em;opacity:.85}
+.psx-ind-head b{color:var(--txt);font-size:12px;font-weight:800;font-variant-numeric:tabular-nums}
 .psx-spark{
   height:100%;min-height:28px;border:0;border-radius:0;background:transparent;
   display:flex;align-items:flex-end;gap:1px;padding:2px}
 .psx-spark b{flex:1;display:block;background:var(--g);min-height:2px;opacity:.85}
 .psx-spark.bear b{background:var(--r)}
-/* ATR14 M1 must stay fully visible — ellipsis made it look like "AUX"/junk. */
-.psx-ind-kv{padding:4px var(--desk-pad) var(--desk-pad);display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:var(--desk-fs);overflow:hidden;min-height:0;flex:0 0 auto}
-.psx-ind-kv .desk-kv{padding:6px 8px;border-radius:2px;border:1px solid var(--desk-grid);background:#080d19;
+/* Short labels (ATR/ADX) — values dominate; keep names fully visible. */
+.psx-ind-kv{padding:2px var(--desk-pad) var(--desk-pad);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:var(--desk-fs);overflow:hidden;min-height:0;flex:0 0 auto}
+.psx-ind-kv .desk-kv{padding:5px 7px;border-radius:2px;border:1px solid var(--desk-grid);background:#080d19;
   display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:0}
-.psx-ind-kv .desk-kv span{color:var(--mut);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;overflow-wrap:normal;word-break:keep-all;font-size:var(--desk-fs-md)}
-.psx-ind-kv .desk-kv strong{font-variant-numeric:tabular-nums;flex:0 0 auto;font-size:var(--desk-fs);white-space:nowrap}
+.psx-ind-kv .desk-kv span{color:var(--mut);flex:0 0 auto;overflow:visible;text-overflow:clip;
+  white-space:nowrap;font-size:8px;font-weight:700;letter-spacing:.04em}
+.psx-ind-kv .desk-kv strong{font-variant-numeric:tabular-nums;flex:1;min-width:0;font-size:var(--desk-fs-lg);white-space:nowrap;
+  text-align:right;font-weight:800}
 
 .psx-trades{flex:1;min-height:0;overflow:hidden;padding:0 6px 6px}
 .psx-trade-row{
@@ -850,15 +855,18 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .shadow-pulse-pill.LEARNING{color:var(--desk-yellow,#e9bc65);border-color:rgba(233,188,101,.4);background:rgba(233,188,101,.1)}
 .shadow-pulse-pill.WATCHING{color:var(--desk-blue,#76a0de);border-color:rgba(118,160,222,.4);background:rgba(118,160,222,.1)}
 .shadow-pulse-pill.BOOTING,.shadow-pulse-pill.IDLE{color:var(--desk-muted,#8c95a6);border-color:var(--desk-grid,#1a2534)}
-.shadow-rows{display:flex;flex-direction:column;gap:0;flex:1;min-height:0;overflow:hidden}
+.shadow-rows{display:flex;flex-direction:column;gap:4px;flex:1;min-height:0;overflow:hidden;padding:2px 0}
 .shadow-row{
-  display:grid;grid-template-columns:52px 1fr auto auto;gap:4px;align-items:center;
-  padding:2px 2px;border-bottom:1px solid var(--desk-grid,#1a2534);font-size:9px;
-  min-height:0}
-.shadow-row .dir.buy{color:var(--desk-green,#31d59a);font-weight:800}
-.shadow-row .dir.sell{color:var(--desk-red,#ef6875);font-weight:800}
+  display:grid;grid-template-columns:40px minmax(0,1.4fr) minmax(0,.9fr) auto;gap:8px;align-items:center;
+  padding:5px 4px;border-bottom:1px solid var(--desk-grid,#1a2534);font-size:9px;
+  min-height:0;min-width:0}
+.shadow-row .dir{font-size:8px;font-weight:800;letter-spacing:.04em;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;min-width:0}
+.shadow-row .dir.buy{color:var(--desk-green,#31d59a)}
+.shadow-row .dir.sell{color:var(--desk-red,#ef6875)}
+.shadow-row .pnl{font-size:10px;font-weight:800;white-space:nowrap;justify-self:end}
 .shadow-row .pnl.ok{color:var(--desk-green,#31d59a)}.shadow-row .pnl.bad{color:var(--desk-red,#ef6875)}
-.shadow-row .mut{color:var(--desk-muted,#8c95a6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.shadow-row .mut{color:var(--desk-muted,#8c95a6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .shadow-note{font-size:8px;color:var(--desk-muted,#8c95a6);line-height:1.2;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}
 .shadow-note.ok-line{color:var(--desk-green,#31d59a)}

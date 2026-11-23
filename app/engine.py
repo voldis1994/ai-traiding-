@@ -4128,18 +4128,18 @@ class SingleTradeEngine:
     def _row_cash_pnl(self,row,details=None,*,prefer_funds=True):
         """Closed-trade cash £ from Capital history — never UPL / SL-TP invent.
 
-        Capital.com TRADE rows (GET /history/transactions) expose ``pnl`` + ``cash``.
-        ``accounts.balance.profitLoss`` is the *open* account figure from
-        GET /accounts — do not treat it as a settled close here.
+        Capital.com TRADE rows expose ``pnl`` / ``cash`` (SDK). Live Funds rows
+        sometimes only carry ``profitLoss`` on the *transaction* object — that is
+        the phone £, not ``accounts.balance.profitLoss`` (open account figure).
         """
         details=details if isinstance(details,dict) else {}
         # Funds settle first. Activity may only carry ``profit`` in details.
         if prefer_funds:
-            keys=('pnl','cash','profitAndLoss','profit','realizedPnl','pl',
-                  'netAmount','netProfit','grossProfit','amount')
+            keys=('pnl','cash','profitLoss','profitAndLoss','profit','realizedPnl',
+                  'pl','netAmount','netProfit','grossProfit','amount')
         else:
-            keys=('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
-                  'netAmount','netProfit','grossProfit','amount')
+            keys=('profit','pnl','cash','profitLoss','profitAndLoss','pl',
+                  'realizedPnl','netAmount','netProfit','grossProfit','amount')
         for key in keys:
             val=self._parse_cash_num(details.get(key))
             if val is None:val=self._parse_cash_num(row.get(key))
@@ -4512,6 +4512,10 @@ class SingleTradeEngine:
             deal=str(deal_id)
             if deal in skip:
                 continue
+            # cap:* orphans are already Capital Funds rows — never let another
+            # Funds TRADE steal/overwrite them (collapsed 9 phone closes → 1).
+            if deal.startswith('cap:') and str(j_src or '')=='broker':
+                continue
             if not self._epic_family_match(epic,j_epic):
                 continue
             old=_num(j_pnl)
@@ -4630,8 +4634,9 @@ class SingleTradeEngine:
     async def _fetch_capital_funds_trade_rows(self,*,days=None):
         """Capital TRADE rows for Funds mirror — includes historical closes.
 
-        Pages ≤1 day windows (API rejects longer from/to). Day 0 also uses
-        ``lastPeriod=86400`` for the freshest phone Closed Positions window.
+        Day 0 (last 24h) is mandatory for Desk CLIENT CLOSES / NESEN SLĒGTIE.
+        Older days are best-effort — never block the fresh window (poll used to
+        hit a 10s timeout on 7 serial HTTP pages → empty Desk while phone had £).
         """
         if not self.broker or not hasattr(self.broker,'transactions'):
             return []
@@ -4639,22 +4644,8 @@ class SingleTradeEngine:
         days=max(1,min(int(days if days is not None else self.FUNDS_MIRROR_DAYS),30))
         now_utc=datetime.now(timezone.utc)
         seen=set();out=[]
-        for i in range(days):
-            end=now_utc-timedelta(days=i)
-            start=end-timedelta(days=1)
-            try:
-                if i==0:
-                    payload=await self.broker.transactions(
-                        last_period=86400,tx_type='TRADE')
-                else:
-                    payload=await self.broker.transactions(
-                        from_time=capital_api_time(start),
-                        to_time=capital_api_time(end),
-                        last_period=None,tx_type='TRADE')
-            except Exception as exc:
-                self.store.event('warning','Capital Funds history page failed',
-                                 {'day':i,'type':type(exc).__name__})
-                continue
+
+        def _ingest(payload):
             for tx in (payload.get('transactions') or []):
                 if not isinstance(tx,dict):
                     continue
@@ -4664,6 +4655,53 @@ class SingleTradeEngine:
                     continue
                 seen.add(key)
                 out.append(tx)
+
+        # —— Fresh 24h (phone Funds window) ——
+        try:
+            _ingest(await self.broker.transactions(
+                last_period=86400,tx_type='TRADE'))
+        except Exception as exc:
+            self.store.event('warning','Capital Funds 24h TRADE fetch failed',
+                             {'type':type(exc).__name__})
+        # Docs sample omits pnl/cash — if TRADE rows are empty of cash, retry
+        # untyped and keep Trade closed / TRADE rows only.
+        if out and not any(self._row_cash_pnl(tx) is not None for tx in out):
+            try:
+                _ingest(await self.broker.transactions(
+                    last_period=86400,tx_type=None))
+            except Exception as exc:
+                self.store.event('warning','Capital Funds untyped 24h fetch failed',
+                                 {'type':type(exc).__name__})
+            # Keep only closes / TRADE; drop deposits etc.
+            kept=[]
+            for tx in out:
+                note=str(tx.get('note') or '').lower()
+                ttype=str(tx.get('transactionType') or tx.get('type') or '').upper()
+                if ttype in ('TRADE','') or 'trade closed' in note or 'closed' in note:
+                    if self._row_cash_pnl(tx) is not None or ttype=='TRADE':
+                        kept.append(tx)
+            if kept:
+                out=kept
+        if not out:
+            try:
+                _ingest(await self.broker.transactions(
+                    last_period=86400,tx_type=None))
+            except Exception:
+                pass
+
+        # —— Older days (best-effort; skip if fresh already heavy) ——
+        for i in range(1,days):
+            end=now_utc-timedelta(days=i)
+            start=end-timedelta(days=1)
+            try:
+                _ingest(await self.broker.transactions(
+                    from_time=capital_api_time(start),
+                    to_time=capital_api_time(end),
+                    last_period=None,tx_type='TRADE'))
+            except Exception as exc:
+                self.store.event('warning','Capital Funds history page failed',
+                                 {'day':i,'type':type(exc).__name__})
+                continue
         return out
 
     async def _mirror_capital_funds_closes(self):
@@ -4686,16 +4724,21 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__})
             return 0
         if not rows:
+            self.store.event('warning','Capital Funds mirror: 0 transactions',
+                             {'hint':'phone Funds may still show £ — check CST/account'})
             return 0
         consumed=self._fuzzy_tx_consumed()
         ccy_default=self._account_currency() or 'GBP'
         upgraded=0
         inserted=0
+        skipped_no_pnl=0
+        handled=set()
         for tx in rows:
             if not isinstance(tx,dict):
                 continue
             pnl=self._row_cash_pnl(tx)
             if pnl is None or not math.isfinite(pnl) or abs(float(pnl))<1e-12:
+                skipped_no_pnl+=1
                 continue
             fp=self._tx_fingerprint(tx)
             if not fp:
@@ -4714,6 +4757,16 @@ class SingleTradeEngine:
                     hit=None
                 if hit:
                     bound_deal=str(hit[0]);break
+            # Prefer exact cap: orphan id for this Funds fingerprint.
+            cap_deal='cap:'+fp.replace(':','_')[:48]
+            try:
+                cap_hit=self.store.db.execute(
+                    'SELECT deal_id FROM trades WHERE deal_id=? LIMIT 1',
+                    (cap_deal,)).fetchone()
+            except Exception:
+                cap_hit=None
+            if cap_hit and not bound_deal:
+                bound_deal=str(cap_hit[0])
             if bound_deal:
                 try:
                     row=self.store.db.execute(
@@ -4729,6 +4782,7 @@ class SingleTradeEngine:
                     if fp:
                         self._mark_fuzzy_tx_consumed(fp,deal_id=bound_deal)
                     upgraded+=1
+                handled.add(bound_deal)
                 continue
             # Fingerprint already consumed by a zero-poison deal → rebind real £.
             if fp in consumed:
@@ -4748,22 +4802,25 @@ class SingleTradeEngine:
                         self._apply_funds_pnl_to_deal(
                             c_deal,tx,pnl,ccy_default=ccy_default)
                         upgraded+=1
+                    handled.add(c_deal)
                 continue
             # Fuzzy: Funds reference ≠ UUID dealId — upgrade the stale robot row
             # instead of leaving Desk "last" at confirm/UPL £.
-            fuzzy=self._find_stale_journal_for_funds_tx(tx,pnl)
+            fuzzy=self._find_stale_journal_for_funds_tx(
+                tx,pnl,skip_deals=handled)
             if fuzzy:
                 self._apply_funds_pnl_to_deal(
                     fuzzy,tx,pnl,ccy_default=ccy_default)
                 self._mark_fuzzy_tx_consumed(fp,deal_id=fuzzy)
                 upgraded+=1
+                handled.add(fuzzy)
                 self.store.event('reconcile',
                                  'Capital Funds £ rebound onto journal deal',
                                  {'deal_id':fuzzy,'pnl':float(pnl),
                                   'fingerprint':fp})
                 continue
             # Orphan Capital Funds close — journal so Desk matches the phone app.
-            deal='cap:'+fp.replace(':','_')[:48]
+            deal=cap_deal
             try:
                 exists=self.store.db.execute(
                     'SELECT pnl,pnl_source FROM trades WHERE deal_id=? LIMIT 1',
@@ -4802,13 +4859,15 @@ class SingleTradeEngine:
                 deal,pnl=float(pnl),direction=direction,entry=entry,
                 source='live_funds_mirror')
             inserted+=1
+            handled.add(deal)
             self.store.event('reconcile','Capital Funds close mirrored into Desk',
                              {'deal_id':deal,'pnl':float(pnl),'epic':epic,
                               'currency':ccy})
-        if upgraded or inserted:
+        if upgraded or inserted or skipped_no_pnl:
             self.store.event('reconcile','Capital Funds mirror pass',
                              {'upgraded':upgraded,'inserted':inserted,
-                              'scanned':len(rows)})
+                              'scanned':len(rows),'skipped_no_pnl':skipped_no_pnl,
+                              'currency':ccy_default})
         return upgraded+inserted
 
     def _audit_external_context(self,saved=None,direction=None):

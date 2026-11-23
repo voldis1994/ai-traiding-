@@ -417,3 +417,33 @@ def test_mirror_rewrites_historical_closed_trade_from_funds_pages():
             assert row['pnl'] == pytest.approx(-0.55)
             assert row['pnl_source'] == 'broker'
     asyncio.run(scenario())
+
+
+def test_mirror_accepts_trade_row_profit_loss_field():
+    """Phone Funds £ sometimes arrives only as transaction.profitLoss."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            broker = FundsBroker([
+                {'reference': 'FPL1', 'instrumentName': 'Gold',
+                 'note': 'Trade closed', 'transactionType': 'TRADE',
+                 'profitLoss': -1.55, 'currency': 'GBP', 'size': -0.1,
+                 'dateUtc': '2026-11-23T21:15:00Z'},
+                {'reference': 'FPL2', 'instrumentName': 'Gold',
+                 'note': 'Trade closed', 'transactionType': 'TRADE',
+                 'profitLoss': 0.47, 'currency': 'GBP', 'size': 0.1,
+                 'dateUtc': '2026-11-23T21:19:00Z'},
+            ])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n == 2
+            pnls = {round(float(r['pnl']), 2) for r in store.trades(10)}
+            assert pnls == {-1.55, 0.47}
+            assert all(r['pnl_source'] == 'broker' for r in store.trades(10))
+            assert all(r['pnl_currency'] == 'GBP' for r in store.trades(10))
+    asyncio.run(scenario())

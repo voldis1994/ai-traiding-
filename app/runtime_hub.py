@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 256
+DESK_TRUTH_REV = 257
 
 
 def _finite_num(v):
@@ -1856,12 +1856,17 @@ class RuntimeHub:
                 except Exception:
                     pass
             if do_mirror and hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
+                # 7d paging needs headroom; 10s used to abort before any insert
+                # → Desk "Nav nesen slēgtu treidu" while Capital phone had £.
+                mirror_timeout = 45.0 if force else 25.0
                 try:
                     n = await asyncio.wait_for(
-                        eng._mirror_capital_funds_closes(), timeout=10.0)
+                        eng._mirror_capital_funds_closes(), timeout=mirror_timeout)
                     out['mirrored'] += int(n or 0)
                     self._live_truth_last[cid] = now_m
-                except Exception:
+                except Exception as exc:
+                    out.setdefault('mirror_errors', []).append({
+                        'client_id': cid, 'type': type(exc).__name__})
                     # Still stamp cooldown so a dead broker cannot stall every poll.
                     self._live_truth_last[cid] = now_m
             elif not do_mirror:

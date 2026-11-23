@@ -421,10 +421,7 @@ class RuntimeHub:
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
                 proxy_n+=1
-                if len(recent)<12:
-                    recent.append({**t,'pnl_currency':(
-                        (t.get('pnl_currency') or '').strip().upper() or acct or '?')})
-                continue
+                continue  # Desk shows Capital Funds £ only — never pts/proxy
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
             val=None
             if t.get('pnl') is not None:
@@ -437,14 +434,11 @@ class RuntimeHub:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
             if val is not None and kind=='cash':
-                # Capital often journals broker £0 before Funds settles — that
-                # zero-poison must NOT paint Desk working_pnl=0 as "truth".
+                # Capital often journals broker £0 before Funds settles — hide
+                # from Desk until real £ arrives (no GAIDA / pending rows).
                 if abs(float(val))<1e-12:
                     blank_n+=1
                     pending_n+=1
-                    row={**row,'pending_cash':True,'pnl_source':'pending_broker_pnl'}
-                    if len(recent)<12:
-                        recent.append(row)
                 else:
                     cash_n+=1
                     by_ccy.setdefault(ccy,[]).append(val)
@@ -456,39 +450,20 @@ class RuntimeHub:
                         if not acct or ccy==acct:
                             signed_24h.append(val)
                     if len(recent)<12:
-                        recent.append(row)
+                        recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
-                # Last live UPL as display hint when journal has a number or
-                # last_upl still holds the close figure — show as ESTIMATE,
-                # never as Capital cash (that lied next to the Capital app).
-                snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
-                try:
-                    hint=float(snap.get('upl')) if snap.get('upl') is not None else None
-                except (TypeError,ValueError):
-                    hint=None
-                if hint is not None and not __import__('math').isfinite(hint):
-                    hint=None
-                show=val if val is not None else hint
-                if show is not None:
-                    # Operator: closed at 0.01 must show 0.01, not blank gaida.
-                    estimate_n+=1
-                    estimate_sum+=float(show)
-                    estimate_signed.append(float(show))
-                    if _in_24h(t.get('closed')):
-                        estimate_sum_24h+=float(show)
-                        estimate_signed_24h.append(float(show))
-                    row={**row,'pnl':round(float(show),4),'pnl_source':'upl_estimate',
-                         'pending_cash':False}
-                    if hint is not None:
-                        row['upl_hint']=round(hint,4)
-                    if len(recent)<12:
-                        recent.append(row)
-                else:
-                    pending_n+=1
+                # Track for harvest only — never invent ≈UPL on Desk.
+                pending_n+=1
+                if val is None or abs(float(val))<1e-12:
                     blank_n+=1
-                    row['pending_cash']=True
-                    if len(recent)<12:
-                        recent.append(row)
+                else:
+                    # Keep estimate counters for internal harvest, not Desk rows.
+                    estimate_n+=1
+                    estimate_sum+=float(val)
+                    estimate_signed.append(float(val))
+                    if _in_24h(t.get('closed')):
+                        estimate_sum_24h+=float(val)
+                        estimate_signed_24h.append(float(val))
             elif kind=='estimate' and val is not None:
                 estimate_n+=1
                 estimate_sum+=float(val)
@@ -496,12 +471,11 @@ class RuntimeHub:
                 if _in_24h(t.get('closed')):
                     estimate_sum_24h+=float(val)
                     estimate_signed_24h.append(float(val))
-                if len(recent)<12:
-                    recent.append(row)
+                # Not listed on Desk — Funds £ only.
             elif kind=='other' or (kind=='cash' and val is None):
-                if kind=='cash' and val is None:blank_n+=1
-                if len(recent)<12:
-                    recent.append(row)
+                if kind=='cash' and val is None:
+                    blank_n+=1
+                    pending_n+=1
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         est_wins=sum(1 for p in estimate_signed if p>0)
@@ -551,8 +525,7 @@ class RuntimeHub:
                 realized_24h=round(sum(next(iter(by_ccy_24h.values()))),4)
         wins_24h=sum(1 for p in signed_24h if p>0)
         losses_24h=sum(1 for p in signed_24h if p<0)
-        # Operator display: prefer 24h Capital £ (Funds window). ≈UPL stays in
-        # estimate_* — never invent Kopējais from provisional closes.
+        # Desk Kopējais = Capital Funds £ only. Never ≈UPL / pending / pts.
         if realized_24h is not None and cash_n_24h>0:
             working_pnl=realized_24h
             working_pnl_source='broker'
@@ -560,14 +533,6 @@ class RuntimeHub:
         elif realized is not None and cash_n>0:
             working_pnl=realized
             working_pnl_source='broker'
-            working_pnl_window='all'
-        elif estimate_signed_24h:
-            working_pnl=None
-            working_pnl_source='upl_estimate'
-            working_pnl_window='24h'
-        elif estimate_n>0:
-            working_pnl=None
-            working_pnl_source='upl_estimate'
             working_pnl_window='all'
         else:
             working_pnl=None
@@ -578,9 +543,7 @@ class RuntimeHub:
         elif cash_n>0:
             display_wins,display_losses,wl_source=wins,losses,'broker'
         else:
-            # Do not advertise estimate W/L as robot results.
-            display_wins,display_losses,wl_source=0,0,(
-                'upl_estimate' if estimate_n>0 else 'none')
+            display_wins,display_losses,wl_source=0,0,'none'
         upl=None
         if open_upl is not None:
             try:
@@ -589,52 +552,14 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
-        # Equity = broker closed £ + live open UPL only (never provisional closes).
-        base_for_equity=working_pnl if working_pnl is not None else realized
-        if base_for_equity is not None and upl is not None:
-            equity=round(float(base_for_equity)+float(upl),4)
-        elif base_for_equity is not None:
-            equity=base_for_equity
-        elif upl is not None:
-            equity=upl
-        else:
-            equity=None
+        # Equity for Desk = settled Funds £ only (open UPL stays on position cards).
+        equity=working_pnl if working_pnl is not None else realized
         pending_q=0
         try:
             pending_q=len(store.get('pending_broker_pnl_deals') or [])
         except Exception:
             pending_q=0
-        # Desk fallback: knobs moved from £ but trades journal missed OPEN upsert
-        # → still show edge-hist closes so CLIENT CLOSES is not a blank island.
-        if not recent:
-            try:
-                from . import unified_cycle
-                hist=list(store.get(unified_cycle.EDGE_OUTCOME_HIST_KEY) or [])
-            except Exception:
-                hist=[]
-            if isinstance(hist,list):
-                for h in reversed(hist):
-                    if not isinstance(h,dict):
-                        continue
-                    try:
-                        pnl_h=float(h.get('pnl'))
-                    except (TypeError,ValueError):
-                        continue
-                    if not __import__('math').isfinite(pnl_h):
-                        continue
-                    recent.append({
-                        'deal_id':h.get('deal_id') or f"edge-{len(recent)}",
-                        'epic':h.get('epic') or 'GOLD',
-                        'direction':h.get('direction') or h.get('side') or '?',
-                        'closed':h.get('at') or h.get('closed') or h.get('time'),
-                        'pnl':round(pnl_h,4),
-                        # Edge hist is NOT Capital Funds — never label as broker.
-                        'pnl_currency':acct or h.get('currency') or '?',
-                        'pnl_source':'edge_hist',
-                        'from_edge_hist':True,
-                    })
-                    if len(recent)>=12:
-                        break
+        # No edge-hist / estimate filler — CLIENT CLOSES lists Funds £ only.
         return {
             'closed_trades':closed_n,
             'open_trades_recorded':open_n,
@@ -673,11 +598,9 @@ class RuntimeHub:
             'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
             'recent_trades':recent[:12],
-            # Compact ledger for Admin cards — every closed row with a number.
+            # Compact ledger for Admin — Capital Funds £ only.
             'pnl_ledger':[
                 {'pnl':float(v),'source':'broker'} for v in signed
-            ]+[
-                {'pnl':float(v),'source':'upl_estimate'} for v in estimate_signed
             ],
         }
 

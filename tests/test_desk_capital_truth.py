@@ -11,9 +11,8 @@ from app.runtime_hub import RuntimeHub
 from app import shadow_mistake_audit as sma
 
 
-def test_scoreboard_prefers_closed_estimate_over_open_upl():
-    """One client open UPL must not hide Capital closed −0.89."""
-    # Inline the JS priority in Python via _trade_stats + scoreboard contract.
+def test_scoreboard_ignores_estimate_and_open_upl_for_totals():
+    """Desk Kopējais is Capital Funds £ only — never ≈UPL or open UPL."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         store.upsert_trade({
@@ -30,11 +29,10 @@ def test_scoreboard_prefers_closed_estimate_over_open_upl():
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP', open_upl=0.31)
         assert stats['estimate_trades'] >= 1
-        assert stats['estimate_pnl'] == pytest.approx(-0.89)
-        # working_pnl is broker-only; estimate stays separate — UI scoreboard
-        # must prefer estimate_pnl over open_upl (covered by admin.js contract).
+        assert stats['working_pnl'] is None
+        assert stats['working_pnl_source'] in ('none', 'empty')
+        assert stats['recent_trades'] == []
         assert stats['open_upl'] == pytest.approx(0.31)
-        assert stats['working_pnl'] is None or stats['working_pnl_source'] != 'open_upl'
 
 
 def test_capital_live_never_enters_independent_paper_cash():

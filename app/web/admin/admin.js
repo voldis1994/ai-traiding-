@@ -162,31 +162,20 @@ function esc(s){
 }
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
-function sourceLabel(src){
+function isCapitalFundsSrc(src){
   const s=String(src||'').toLowerCase();
-  if(s==='broker'||s==='funds'||s==='capital')return 'Capital £';
-  if(s==='upl_estimate')return '≈UPL (nav Capital £)';
-  if(s==='open_upl')return 'live UPL';
-  if(s==='edge_hist')return 'edge £ (nav Capital)';
-  if(s==='working')return 'working';
-  if(s==='none'||s==='empty')return 'nav skaitļu';
-  if(s==='pending_broker_pnl'||s==='pending_close_sync')return 'gaida Capital £';
-  return src||'—';
+  return s==='broker'||s==='funds'||s==='capital'||s===''||!s;
 }
-function closePnlSrcBadge(src,pending){
+function sourceLabel(src){
+  if(isCapitalFundsSrc(src))return 'Capital £';
   const s=String(src||'').toLowerCase();
-  if(pending||s==='pending_broker_pnl'||s==='pending_close_sync'){
-    return {cls:'psx-pnl-src wait',text:'GAIDA'};
-  }
-  if(s==='upl_estimate')return {cls:'psx-pnl-src est',text:'≈UPL'};
-  if(s==='edge_hist')return {cls:'psx-pnl-src wait',text:'EDGE'};
-  if(s==='broker'||s==='funds'||s==='capital'||s===''||!s){
-    return {cls:'psx-pnl-src ok',text:'CAPITAL'};
-  }
-  if(s==='ticks_only'||s==='price_size'||s==='position_disappeared'){
-    return {cls:'psx-pnl-src wait',text:'PROXY'};
-  }
-  return {cls:'psx-pnl-src wait',text:String(src).slice(0,8).toUpperCase()};
+  if(s==='none'||s==='empty')return 'nav Capital £';
+  return 'Capital £';
+}
+function closePnlSrcBadge(src,_pending){
+  // Desk badges: CAPITAL only — never GAIDA / ≈UPL / PROXY / EDGE.
+  if(isCapitalFundsSrc(src))return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  return {cls:'psx-pnl-src ok',text:'CAPITAL'};
 }
 function closeTimeLabel(t){
   const raw=(t&&(t.closed||t.closed_at||t.updated_at||t.at))||'';
@@ -215,21 +204,15 @@ function hasRealWorkingPnl(r){
   return true;
 }
 
-/** Format P&L for Desk — gaida only when there is literally no number. */
+/** Format P&L for Desk — Capital Funds £ only. Never ≈UPL / gaida / pts. */
 function formatPnlDisplay(pnl,src,ccy){
-  const s=String(src||'').toLowerCase();
-  if(pnl!=null&&Number.isFinite(Number(pnl))){
-    const m=money(Number(pnl),ccy);
-    if(s==='upl_estimate')return '≈'+m;
-    return m;
-  }
-  if(s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'){
-    return 'gaida Capital £';
+  if(pnl!=null&&Number.isFinite(Number(pnl))&&isCapitalFundsSrc(src)){
+    return money(Number(pnl),ccy);
   }
   return '—';
 }
 
-/** Capital closed £ first — never hide Funds history behind one open UPL tick. */
+/** Capital Funds £ only — never ≈UPL, pending, open UPL, or pts. */
 function scoreboard(r){
   r=r||{};
   const ccy=r.pnl_currency||'';
@@ -237,9 +220,7 @@ function scoreboard(r){
   const recent=Array.isArray(r.recent_trades)?r.recent_trades:[];
   let pnl=null,src='none',wins=0,losses=0;
   const wsrc=String(r.working_pnl_source||'').toLowerCase();
-  const estN=Number(r.estimate_trades)||0;
 
-  // 1) Settled Capital cash — prefer 24h Funds window over all-time SQLite.
   if(hasRealWorkingPnl(r) && wsrc==='broker'){
     pnl=Number(r.working_pnl);src='broker';
   }else if(r.realized_pnl_24h!=null && Number.isFinite(Number(r.realized_pnl_24h))
@@ -249,37 +230,6 @@ function scoreboard(r){
     pnl=Number(r.realized_pnl);src='broker';
   }
 
-  // 2) Closed ≈UPL / pending rows with a real number — BEFORE open UPL.
-  // One client with a live open used to show only open UPL while Capital
-  // Closed Positions already had −0.89 / +0.62 (looked like a "mystery" £).
-  if(pnl==null && (wsrc==='upl_estimate' || estN>0
-      || (r.estimate_pnl!=null && Number.isFinite(Number(r.estimate_pnl))))){
-    const est=r.estimate_pnl!=null?Number(r.estimate_pnl):null;
-    if(est!=null&&Number.isFinite(est)){pnl=est;src='upl_estimate';}
-    else{
-      let sum=0,n=0;
-      for(const row of ledger){
-        const v=Number(row.pnl);
-        if(!Number.isFinite(v))continue;
-        if(String(row.source||'').toLowerCase()!=='upl_estimate')continue;
-        sum+=v;n++;
-      }
-      if(!n){
-        for(const t of recent){
-          const v=Number(t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint));
-          const s=String(t.pnl_source||'').toLowerCase();
-          if(!Number.isFinite(v))continue;
-          if(s!=='upl_estimate'&&s!=='pending_broker_pnl'&&s!=='pending_close_sync'
-              &&!t.pending_cash)continue;
-          sum+=v;n++;
-        }
-      }
-      src='upl_estimate';
-      if(n)pnl=sum;
-    }
-  }
-
-  // 3) Ledger / recent broker rows (full-history fallback).
   if(pnl==null && ledger.length){
     let sum=0,w=0,l=0,nBroker=0;
     for(const row of ledger){
@@ -295,16 +245,10 @@ function scoreboard(r){
     for(const t of recent){
       const v=Number(t.pnl);
       if(!Number.isFinite(v))continue;
-      const s=String(t.pnl_source||'').toLowerCase();
-      if(s!=='broker'&&s!==''&&s!=='funds'&&s!=='capital')continue;
+      if(!isCapitalFundsSrc(t.pnl_source))continue;
       sum+=v;n++;if(v>0)w++;else if(v<0)l++;
     }
     if(n){pnl=sum;src='broker';wins=w;losses=l}
-  }
-
-  // 4) Live open UPL only when there are no closed £ to show.
-  if(pnl==null && r.open_upl!=null && Number.isFinite(Number(r.open_upl))){
-    pnl=Number(r.open_upl);src='open_upl';
   }
 
   if(src==='broker'){
@@ -313,13 +257,10 @@ function scoreboard(r){
     }else if(!(wins+losses)){
       wins=Number(r.wins)||0;losses=Number(r.losses)||0;
     }
-  }else if(src==='upl_estimate' && !(wins+losses)){
-    wins=Number(r.estimate_wins!=null?r.estimate_wins:0)||0;
-    losses=Number(r.estimate_losses!=null?r.estimate_losses:0)||0;
   }
 
   return {pnl,src,wins,losses,ccy,closed:Number(r.closed_trades)||0,
-    cash:Number(r.cash_trades)||0,estimate:estN};
+    cash:Number(r.cash_trades)||0,estimate:0};
 }
 
 function layoutCols(n){
@@ -431,30 +372,32 @@ function renderShadowLab(client){
       +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
       +(lab.shadow_active?' · shadow neural <b>ON</b>':' · shadow neural <b>off / booting</b>'));
   }
-  const paperUnit=String(paper.unit||'account_currency');
-  const net=paper.display_net!=null?Number(paper.display_net)
-    :(paper.paper_net!=null?Number(paper.paper_net):null);
+  // Shadow paper Desk: cash £ only — never price pts as P&L.
+  const cashTrades=Number(paper.cash_trades||0)||0;
+  const net=cashTrades>0&&paper.paper_net!=null?Number(paper.paper_net)
+    :(cashTrades>0&&paper.display_net!=null&&String(paper.unit||'')!=='price'
+      ?Number(paper.display_net):null);
   const netCls=net==null?'neu':(net>=0?'ok':'bad');
-  const netTxt=net==null?'—'
-    :((net>=0?'+':'')+num(net,2)+(paperUnit==='price'?' pts':''));
-  const paperTrades=paper.display_trades!=null?paper.display_trades
-    :(paper.cash_trades!=null?paper.cash_trades:(paper.trades||0));
+  const netTxt=net==null?'—':((net>=0?'+':'')+num(net,2));
+  const paperTrades=cashTrades;
   const open=paper.open&&typeof paper.open==='object'?paper.open:null;
   const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
-  const recent=Array.isArray(paper.recent)?paper.recent:[];
+  const recent=(Array.isArray(paper.recent)?paper.recent:[]).filter(r=>{
+    if(!r||typeof r!=='object')return false;
+    if(String(r.unit||'')==='price')return false;
+    return r.paper_pnl!=null&&Number.isFinite(Number(r.paper_pnl));
+  });
   const openSl=open?(open.sl!=null?open.sl:(open.stop!=null?open.stop:null)):null;
   const openTp=open?(open.tp!=null?open.tp:(open.profit!=null?open.profit:null)):null;
   const openTxt=open
     ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${openSl!=null?num(openSl,2):'—'} · TP ${openTp!=null?num(openTp,2):'—'}`)
-    :(pending?`pending ${String(pending.direction||'?').toUpperCase()}`:'flat');
+    :(pending?`${String(pending.direction||'?').toUpperCase()} (fill)`:'flat');
   const rowsHtml=recent.length?recent.map(r=>{
     const dir=String(r.direction||'?').toUpperCase();
     const dcls=(dir==='BUY'||dir==='LONG')?'buy':'sell';
-    let pnl=r.paper_pnl!=null?Number(r.paper_pnl):null;
-    let unitTag='';
-    if(pnl==null&&r.price_pnl!=null){pnl=Number(r.price_pnl);unitTag=' pts';}
-    const pcls=pnl==null?'':(pnl>=0?'ok':'bad');
-    const pnlTxt=pnl==null?'—':((pnl>=0?'+':'')+num(pnl,2)+unitTag);
+    const pnl=Number(r.paper_pnl);
+    const pcls=pnl>=0?'ok':'bad';
+    const pnlTxt=(pnl>=0?'+':'')+num(pnl,2);
     const when=r.at?String(r.at).replace('T',' ').slice(0,16):'—';
     return `<div class="shadow-row">
       <span class="dir ${dcls}">${dir==='BUY'||dir==='LONG'?'▲ BUY':'▼ SELL'}</span>
@@ -603,8 +546,7 @@ function renderShadowLab(client){
     </article>
     <article class="shadow-card">
       <div class="psx-h"><h2>${(!paperTrades && winN)?'CAPITAL 24h':'PAPER BOOK'}</h2>
-        <span class="psx-src">${(!paperTrades && winN)?'FROM CAPITAL'
-          :(paperUnit==='price'?'PRICE PTS':'SHADOW £')}</span></div>
+        <span class="psx-src">${(!paperTrades && winN)?'FROM CAPITAL':'SHADOW £'}</span></div>
       <div class="body">
         <div class="shadow-kv">
           ${(!paperTrades && winN)
@@ -612,7 +554,7 @@ function renderShadowLab(client){
               +_shadowKv('Closes',winN)
               +_shadowKv('W / L',`${winW} / ${winL}`)
               +_shadowKv('Open',openTxt))
-            :(_shadowKv(paperUnit==='price'?'Paper pts':'Paper £',netTxt,netCls)
+            :(_shadowKv('Paper £',netTxt,netCls)
               +_shadowKv('Closes',paperTrades)
               +_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)
               +_shadowKv('Open',openTxt))}
@@ -620,13 +562,11 @@ function renderShadowLab(client){
         <div class="shadow-note">${esc(
           paper.audit_backfill
             ?('Restored from SHADOW audit hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
-            :(paperUnit==='price'
-              ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
-              :(paperTrades>0
-                ?('Independent Paper SL/TP cash · Capital LIVE stays in CLIENT CLOSES + MISTAKE AUDIT')
-                :(winN
-                  ?('Capital.com 24h journal · Paper SL/TP book still empty (separate)')
-                  :('No Capital / paper closes yet')))))}</div>
+            :(paperTrades>0
+              ?('Independent Paper SL/TP cash £ · Capital LIVE stays in CLIENT CLOSES')
+              :(winN
+                ?('Capital.com 24h Funds £ · Paper cash book still empty')
+                :('No Capital Funds £ / paper cash yet'))))}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -958,42 +898,34 @@ function renderDeskStatusBoard(client){
   const exitIntent=ds.neural_exit_intent||a.neural_exit_intent||'—';
   const cons=String((ds.flow_consensus&&ds.flow_consensus.consensus)||fc.consensus||'NEUTRAL').toUpperCase();
   const consCls=cons==='BUY'?'ok':(cons==='SELL'?'bad':'neu');
-  const shadowUnit=String(shadow.unit||'account_currency');
-  let shadowNet=shadow.display_net!=null?Number(shadow.display_net)
-    :(shadow.paper_net!=null?Number(shadow.paper_net):null);
-  const shadowTrades=Number(shadow.display_trades!=null?shadow.display_trades
-    :(shadow.cash_trades!=null?shadow.cash_trades:(shadow.trades||0)))||0;
+  // Paper cash £ only — never price pts on Desk hero.
+  const shadowCash=Number(shadow.cash_trades||0)||0;
+  let shadowNet=shadowCash>0&&shadow.paper_net!=null?Number(shadow.paper_net):null;
+  const shadowTrades=shadowCash;
   const results=client.results||{};
   const liveClosed=Number(results.closed_trades!=null?results.closed_trades
     :(samples.closed_trades!=null?samples.closed_trades:0))||0;
   const liveCash=Number(results.cash_trades!=null?results.cash_trades:0)||0;
   const liveReal24=results.realized_pnl_24h!=null?Number(results.realized_pnl_24h):null;
-  const liveReal=liveReal24!=null&&Number.isFinite(liveReal24)
+  const liveReal=(liveCash>0&&liveReal24!=null&&Number.isFinite(liveReal24))
     ?liveReal24
-    :(results.realized_pnl!=null?Number(results.realized_pnl):null);
+    :(liveCash>0&&results.realized_pnl!=null?Number(results.realized_pnl):null);
   const liveLosses=Number(results.display_losses!=null?results.display_losses
     :(results.losses!=null?results.losses:0))||0;
   const liveWins=Number(results.display_wins!=null?results.display_wins
     :(results.wins!=null?results.wins:0))||0;
-  // Paper empty ≠ system £0 — show Capital 24h net (results or mistake-audit window).
+  // Paper empty → show Capital Funds 24h £ (broker only), never audit invent.
   let shadowHero='paper';
   const auditLabFull=shadowLab(client);
-  const auditWin=((auditLabFull.mistake_audit)||{}).window_24h||{};
-  const auditNet=auditWin.net!=null?Number(auditWin.net):null;
-  const auditClosed=Number(auditWin.n)||0;
   if((!shadowTrades || shadowNet==null || !Number.isFinite(shadowNet) ||
       (shadowTrades===0 && Math.abs(shadowNet)<1e-9))){
-    if(liveReal!=null && Number.isFinite(liveReal) && liveClosed>0){
+    if(liveReal!=null && Number.isFinite(liveReal) && liveCash>0){
       shadowNet=liveReal;
-      shadowHero='live24h';
-    }else if(auditNet!=null && Number.isFinite(auditNet) && auditClosed>0){
-      shadowNet=auditNet;
       shadowHero='live24h';
     }
   }
   const shadowTxt=shadowNet==null?'—'
-    :((shadowNet>=0?'+':'')+num(shadowNet,2)
-      +(shadowHero==='live24h'?'':(shadowUnit==='price'?' pts':'')));
+    :((shadowNet>=0?'+':'')+num(shadowNet,2));
   const lh=ds.learn_horizon||a.learn_horizon||{};
   const edgeN=lh.edge_closes!=null?Number(lh.edge_closes):null;
   // Headline: never flash bare library 0 when cards/closes are live.
@@ -1038,16 +970,14 @@ function renderDeskStatusBoard(client){
             ?(' · last '+(auditPnl>=0?'+':'')+num(auditPnl,2))
             :''))
         :'paper 0 closes')
-      :(shadowUnit==='price'
-        ?('paper '+shadowTrades+' pts · W'+(shadow.wins||0)+'/L'+(shadow.losses||0))
-        :('paper '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0)));
+      :('paper £ '+shadowTrades+' · W'+(shadow.wins||0)+'/L'+(shadow.losses||0));
     if(shadow.audit_backfill)paperBit+=' · from audit';
-    if(liveClosed>0){
-      const liveBit='LIVE '+liveClosed
+    if(liveCash>0){
+      const liveBit='Capital £ '+liveCash
         +(liveLosses||liveWins?(' · W'+liveWins+'/L'+liveLosses):'')
         +(liveReal!=null&&Number.isFinite(liveReal)
           ?(' · '+(liveReal>=0?'+':'')+num(liveReal,2))
-          :(liveCash?(' · cash '+liveCash):''));
+          :'');
       return paperBit+' · '+liveBit;
     }
     return paperBit+(shadowTrades===0&&!auditHurt?' · waits paper SL/TP':'');
@@ -1104,11 +1034,10 @@ function renderDeskLearn(client){
       :((client.results&&client.results.closed_trades)!=null?client.results.closed_trades:'—')),
     deskKv(client.id,'Edge £',lh.edge_closes!=null?lh.edge_closes:'—'),
     deskKv(client.id,'Shadow £',
-      (shadow.display_net!=null?shadow.display_net:shadow.paper_net),
-      v=>v==null?'—':num(v,2)+(shadow.unit==='price'?' pts':'')),
+      (Number(shadow.cash_trades||0)>0?shadow.paper_net:null),
+      v=>v==null?'—':num(v,2)),
     deskKv(client.id,'W/L',
-      (shadow.wins!=null||shadow.losses!=null
-        ||shadow.display_net!=null||shadow.paper_net!=null)
+      (Number(shadow.cash_trades||0)>0
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
@@ -1289,7 +1218,14 @@ function renderDeskClosed(client){
   if(!el)return;
   if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
   const results=client.results||{};
-  let rows=(results.recent_trades||[]).slice(0,12);
+  // Capital Funds £ only — drop ≈UPL / pending / edge / pts rows.
+  let rows=(results.recent_trades||[]).filter(t=>{
+    if(!t||typeof t!=='object')return false;
+    if(t.pending_cash||t.from_edge_hist)return false;
+    if(!isCapitalFundsSrc(t.pnl_source))return false;
+    const v=t.pnl!=null?Number(t.pnl):NaN;
+    return Number.isFinite(v)&&Math.abs(v)>=1e-12;
+  }).slice(0,12);
   if(deskWhaleFilter==='BUY')rows=rows.filter(t=>{
     const s=String(t.direction||t.side||'').toUpperCase();
     return s.includes('BUY')||s==='LONG';
@@ -1303,57 +1239,35 @@ function renderDeskClosed(client){
   if(!rows.length){
     const err=results.stats_error
       ?(`Stats error · ${results.stats_error}`)
-      :(closedN
-        ?`Journal has ${closedN} closes but none match filter · Capital Funds may still show £`
-        :'No journaled closes yet · Capital Funds may still show £');
+      :(cashN
+        ?`No Capital £ rows match filter`
+        :'No Capital Funds £ yet');
     stableHtml(el,`<div class="psx-empty">${esc(err)}</div>`);
     const srcElEmpty=$('deskClosedSrc');
     if(srcElEmpty){
-      srcElEmpty.textContent=results.stats_error?'ERROR':(closedN?`${closedN} HIDDEN`:'EMPTY');
-      srcElEmpty.classList.add('warn');
+      srcElEmpty.textContent=results.stats_error?'ERROR':(cashN?`${cashN} CAPITAL`:'EMPTY');
+      srcElEmpty.classList.remove('warn');
     }
     return;
   }
   const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))
     ||results.pnl_currency||'';
   const srcEl=$('deskClosedSrc');
-  const anyEst=rows.some(t=>{
-    const s=String(t.pnl_source||'').toLowerCase();
-    return s==='upl_estimate'||t.pending_cash;
-  });
-  const anyBroker=rows.some(t=>String(t.pnl_source||'').toLowerCase()==='broker');
-  const anyEdge=rows.some(t=>!!t.from_edge_hist);
   if(srcEl){
-    const nLabel=closedN?`${Math.min(rows.length,closedN)}/${closedN} · `:'';
-    if(anyEdge&&!anyEst)srcEl.textContent=nLabel+'EDGE £';
-    else if(anyEst&&!anyBroker)srcEl.textContent=nLabel+'≈UPL';
-    else if(anyEst)srcEl.textContent=nLabel+'MIXED';
-    else srcEl.textContent=nLabel+(cashN?'CAPITAL':'CAPITAL');
-    srcEl.classList.toggle('warn',!!anyEst);
+    const nLabel=cashN?`${Math.min(rows.length,cashN)}/${cashN} · `:'';
+    srcEl.textContent=nLabel+'CAPITAL £';
+    srcEl.classList.remove('warn');
   }
   stableHtml(el,rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
-    const src=String(t.pnl_source||'').toLowerCase();
-    const raw=t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint);
-    const broker=src==='broker'||src==='funds'||src==='capital';
-    const edge=src==='edge_hist'||!!t.from_edge_hist;
-    const hasNum=raw!=null&&Number.isFinite(Number(raw));
-    // Any pending/estimate with a number → ≈£… Blank pending only → gaida.
-    const isEst=!broker&&!edge&&hasNum&&(
-      src==='upl_estimate'||src==='pending_broker_pnl'||src==='pending_close_sync'
-      ||!!t.pending_cash);
-    const blankWait=!hasNum&&!!(t.pending_cash||src==='pending_broker_pnl'
-      ||src==='pending_close_sync'||src==='upl_estimate');
-    const val=(broker||edge)&&hasNum?money(raw,t.pnl_currency||ccy)
-      :(isEst?'≈'+money(raw,t.pnl_currency||ccy)
-        :(blankWait?'gaida Capital £':'—'));
+    const raw=Number(t.pnl);
+    const val=money(raw,t.pnl_currency||ccy);
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
-    const badge=closePnlSrcBadge(
-      isEst?'upl_estimate':(edge?'edge_hist':t.pnl_source),blankWait&&!broker);
+    const badge=closePnlSrcBadge('broker',false);
     const whenShow=when&&when!=='—'?when:'';
-    const pnlCls=broker||isEst||edge?pnlClass(raw):'';
+    const pnlCls=pnlClass(raw);
     const capOrphan=String(t.deal_id||'').startsWith('cap:');
     return `<div class="psx-whale-row">
       <div class="wh-top">
@@ -1364,7 +1278,7 @@ function renderDeskClosed(client){
       <div class="wh-bot">
         <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
         <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
-        <span class="${badge.cls}" title="${esc(sourceLabel(isEst?'upl_estimate':(t.pnl_source||(blankWait?'pending_broker_pnl':''))))}">${esc(badge.text)}</span>
+        <span class="${badge.cls}" title="${esc(sourceLabel('broker'))}">${esc(badge.text)}</span>
       </div>
     </div>`;
   }).join(''));
@@ -2074,54 +1988,35 @@ function fleetPnl(s,clients){
   let wins=s.display_wins_all;
   let losses=s.display_losses_all;
   const ccy=s.pnl_currency||'';
-  // Clear empty / open-UPL-as-working placeholders. Closed Capital £ (broker
-  // or ≈estimate) must beat a single client's live open tick.
-  if(total!=null && (src==='none'||src==='empty'||src==='open_upl'))total=null;
-  if(total==null && s.estimate_pnl_all!=null && Number.isFinite(Number(s.estimate_pnl_all))){
-    total=Number(s.estimate_pnl_all);src='upl_estimate';
-  }
-  if(total==null && s.open_upl_all!=null && Number.isFinite(Number(s.open_upl_all))){
-    total=Number(s.open_upl_all);src='open_upl';
-  }
+  // Capital Funds £ only — never open UPL / ≈estimate / gaida.
+  if(total!=null && src!=='broker')total=null;
   if(total==null || wins==null || losses==null){
-    let sum=0,n=0,w=0,l=0,estSum=0,estN=0,anyEst=false;
+    let sum=0,n=0,w=0,l=0;
     for(const c of clients||[]){
       const sb=scoreboard(c.results||{});
-      const res=c.results||{};
-      if(sb.src==='upl_estimate')anyEst=true;
       if(sb.pnl!=null && sb.src==='broker'){sum+=sb.pnl;n++}
       if(sb.src==='broker'){w+=sb.wins;l+=sb.losses}
-      if(res.estimate_pnl!=null&&Number.isFinite(Number(res.estimate_pnl))){
-        estSum+=Number(res.estimate_pnl);estN++;
-      }else if(sb.src==='upl_estimate'&&sb.pnl!=null){
-        estSum+=sb.pnl;estN++;
-      }
     }
     if(total==null && n){total=sum;src='broker'}
-    else if(total==null && estN){total=estSum;src='upl_estimate'}
-    else if(total==null && anyEst)src='upl_estimate';
     if(wins==null)wins=w;
     if(losses==null)losses=l;
   }
-  const by=(src==='open_upl'
-    ?(s.open_upl_by_currency||{})
-    :(s.working_pnl_by_currency||s.pnl_by_currency||{}));
+  const by=s.working_pnl_by_currency||s.pnl_by_currency||{};
   const keys=Object.keys(by);
   let pnlLabel,pnlNum=total;
   if(keys.length>1 && total==null){
     pnlLabel=keys.map(k=>`${num(by[k],2)} ${k}`).join(' · ');
     pnlNum=null;
-  }else if(pnlNum!=null){
-    pnlLabel=formatPnlDisplay(pnlNum,src,ccy);
-  }else if(src==='upl_estimate'||Number(s.pending_cash_trades_all)>0){
-    pnlLabel='gaida Capital £';
+  }else if(pnlNum!=null && src==='broker'){
+    pnlLabel=formatPnlDisplay(pnlNum,'broker',ccy);
   }else{
     pnlLabel='—';
+    pnlNum=null;
+    src='none';
   }
   const cash=Number(s.cash_trades_all)||0;
   const closed=Number(s.closed_trades_all)||0;
-  const est=Number(s.estimate_trades_all)||0;
-  const srcNote=` · ${sourceLabel(src)}`+(cash||est?` · £ ${cash}/${closed}`+(est?` · est ${est}`:''):'');
+  const srcNote=` · Capital £`+(cash?` · ${cash}/${closed||cash}`:'');
   return {pnlLabel,pnlNote:srcNote,pnlNum,ccy,closed,wins:wins||0,losses:losses||0,src};
 }
 
@@ -2495,23 +2390,17 @@ function renderCard(c){
   const dayPhase=day.phase||(day.daily&&day.daily.phase)||'—';
   const mandateSize=(a.mandate&&a.mandate.size)||'—';
   const sb=scoreboard(r);
-  const trades=(r.recent_trades||[]).slice(0,4).map(t=>{
+  const trades=(r.recent_trades||[]).filter(t=>{
+    if(!t||t.pending_cash||t.from_edge_hist)return false;
+    if(!isCapitalFundsSrc(t.pnl_source))return false;
+    return t.pnl!=null&&Number.isFinite(Number(t.pnl))&&Math.abs(Number(t.pnl))>=1e-12;
+  }).slice(0,4).map(t=>{
     const tCcy=t.pnl_currency||ccy;
-    const s=String(t.pnl_source||'').toLowerCase();
-    const raw=t.pnl!=null?t.pnl:(t.profit!=null?t.profit:t.upl_hint);
-    const broker=s==='broker';
-    const hasNum=raw!=null&&Number.isFinite(Number(raw));
-    const isEst=!broker&&hasNum&&(
-      s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'||!!t.pending_cash);
-    const blankWait=!hasNum&&!!(t.pending_cash||s==='pending_broker_pnl'
-      ||s==='pending_close_sync'||s==='upl_estimate');
-    const showSrc=broker?'broker':(isEst?'upl_estimate':(blankWait?'pending_broker_pnl':s));
-    const cls=hasNum?pnlClass(raw):'';
-    const srcTag=broker?' [Capital]':(isEst?' [≈UPL]':(blankWait?' [gaida Capital £]':
-      (s?` [${s}]`:'')));
-    const right=formatPnlDisplay(hasNum?raw:null,showSrc,tCcy);
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(srcTag)}</span><span class="${cls}">${esc(right)}</span></div>`;
-  }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
+    const raw=Number(t.pnl);
+    const cls=pnlClass(raw);
+    const right=formatPnlDisplay(raw,'broker',tCcy);
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')} [Capital]</span><span class="${cls}">${esc(right)}</span></div>`;
+  }).join('')||'<div><span>Nav Capital £ closes</span></div>';
 
   const dealsHtml=inTrade
     ?positions.map(p=>renderDeal(p,ccy,a)).join('')
@@ -2597,9 +2486,7 @@ function renderCard(c){
       <div><span>Kopējais P&amp;L</span><strong class="${pnlClass(sb.pnl)}">${
         esc(formatPnlDisplay(sb.pnl,sb.src,sb.ccy||ccy))
       }</strong></div>
-      <div><span>W / L · avots</span><strong>${esc(`${sb.wins} / ${sb.losses}`)} · ${esc(sourceLabel(sb.src))}</strong></div>
-      ${((r.estimate_trades||0)>0&&sb.src!=='open_upl')?`<div><span>≈UPL closes</span><strong>${esc(r.estimate_trades)} gaida Capital history</strong></div>`:''}
-      ${(r.pending_cash_trades)?`<div><span>Gaida peļņa</span><strong>${esc(r.pending_cash_trades)} bez skaitļa</strong></div>`:''}
+      <div><span>W / L · Capital £</span><strong>${esc(`${sb.wins} / ${sb.losses}`)}</strong></div>
       ${(()=>{
         const fl=a.forward_live||{};
         if(!fl.ok)return '';

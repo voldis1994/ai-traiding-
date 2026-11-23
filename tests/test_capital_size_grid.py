@@ -76,3 +76,26 @@ def test_day_book_propose_never_emits_off_grid():
     assert on_deal_size_grid(size, min_size='0.1', step='0.1', max_size='20')
     # Must be exact tenth — never 0.1009 / binary dust
     assert Decimal(str(size)) * 10 == (Decimal(str(size)) * 10).to_integral_value()
+
+
+def test_propose_size_preserves_manual_mandate_015_not_floor_to_010():
+    """Manual adopt 0.15 must not become robot OPEN 0.10 via floor snap."""
+    market = {
+        'dealingRules': {
+            'minDealSize': {'unit': 'AMOUNT', 'value': '0.1'},
+            'maxDealSize': {'unit': 'AMOUNT', 'value': '50'},
+            'minSizeIncrement': {'unit': 'AMOUNT', 'value': '0.1'},
+        }
+    }
+    # Floor-only snap would shrink 0.15 → 0.1 — that was the LIVE complaint.
+    assert snap_deal_size('0.15', min_size='0.1', step='0.1') == Decimal('0.1')
+    # Missing tick_value → mandate fallback path (common until instrument pip known).
+    params = dict(db.load_params(None))
+    params['size_full_balance'] = 0  # fractional: return mandate seed
+    out = db.propose_size(
+        mandate_size='0.15', equity=5_000.0, daily={'realized_pnl': 0},
+        params=params, stop_ticks=None, tick_value=None,
+        positions=[], score_edge=0.1, market=market)
+    assert out['allowed'] is True
+    assert Decimal(str(out['size'])) == Decimal('0.15')
+    assert out['reason'] == 'mandate_on_capital_grid'

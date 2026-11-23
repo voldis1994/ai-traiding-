@@ -1055,10 +1055,8 @@ function renderDeskClosed(client){
   const cashN=Number(results.cash_trades||0)||0;
   if(!rows.length){
     const err=results.stats_error
-      ?(`Stats error · ${results.stats_error}`)
-      :(cashN
-        ?`No Capital £ rows match filter`
-        :'No Capital Funds £ yet');
+      ?(`Stats · ${results.stats_error}`)
+      :(cashN?'Nav filtra match':'Gaida Funds £');
     stableHtml(el,`<div class="psx-empty">${esc(err)}</div>`);
     const srcElEmpty=$('deskClosedSrc');
     if(srcElEmpty){
@@ -1069,12 +1067,23 @@ function renderDeskClosed(client){
   }
   const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))
     ||results.pnl_currency||'';
+  const syncN=rows.filter(t=>!isCapitalFundsSrc(t.pnl_source)).length;
   const srcEl=$('deskClosedSrc');
   if(srcEl){
-    const nLabel=cashN?`${Math.min(rows.length,cashN)}/${cashN} · `:'';
-    srcEl.textContent=nLabel+'CAPITAL £';
-    srcEl.classList.remove('warn');
+    if(cashN){
+      srcEl.textContent=`${Math.min(rows.length,cashN)}/${cashN} · CAPITAL £`;
+      srcEl.classList.remove('warn');
+    }else if(syncN){
+      srcEl.textContent=`${syncN} · SYNC`;
+      srcEl.classList.add('warn');
+    }else{
+      srcEl.textContent='CAPITAL £';
+      srcEl.classList.remove('warn');
+    }
   }
+  const tip=syncN
+    ?'SYNC ≠ phone Funds £ — pēc CLOSE Capital nostāda īsto £ (var atšķirties no Open).'
+    :'Phone Funds £ = CAPITAL. Open ir tikai floating pirms CLOSE.';
   stableHtml(el,rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const sideCls=(side.includes('BUY')||side==='LONG')?'buy':'sell';
@@ -1100,7 +1109,7 @@ function renderDeskClosed(client){
         <span class="${badge.cls}" title="${esc(sourceLabel(src))}">${esc(badge.text)}</span>
       </div>
     </div>`;
-  }).join(''));
+  }).join('')+`<div class="psx-intel-tip">${esc(tip)}</div>`);
 }
 
 
@@ -1198,13 +1207,15 @@ function renderDeskIntel(client){
   const fl=a.forward_live||{};
   const lh=a.learn_horizon||{};
   const chips=[];
-  // Full reason text — CSS wraps; do not hard-truncate GATE/NEWS to ellipsis junk.
-  const push=(tag,t,cls,src)=>chips.push({tag,t:String(t),cls,src:src||'NEURAL'});
+  const push=(tag,t,cls,src)=>{
+    const line=shortIntelLine(t,src||tag);
+    if(!line)return;
+    chips.push({tag,t:line,cls,src:src||'NEURAL'});
+  };
   if(news&&typeof news==='object'){
     const st=String(news.status||'');
     const risk=news.risk||news.level||st||news.summary;
     const label=news.headline||news.event||news.next||news.reason||risk||st;
-    // Boot/remap states are context — not a permanent BEARISH gate on Desk.
     const softBoot=st==='UNMAPPED_INSTRUMENT'||st==='CALENDAR_WAITING'
       ||st==='CALENDAR_FEED_DEGRADED'||st==='UNCONFIGURED';
     const bear=!softBoot&&(st==='NEWS_WINDOW'||st==='HIGH_IMPACT'
@@ -1213,7 +1224,7 @@ function renderDeskIntel(client){
       ||String(st).includes('BLOCK')
       ||news.entry_allowed===false);
     if(label)push(bear?'BEARISH':(softBoot?'CONTEXT':'NEUTRAL'),
-      (st&&st!=='CLEAR'?st+' · ':'')+String(label).slice(0,140),
+      String(label),
       bear?'bear':'neu',news.source||'NEWS');
   }else if(typeof news==='string'&&news){
     push('NEWS',news,'neu','FEED');
@@ -1223,14 +1234,13 @@ function renderDeskIntel(client){
     const lean=im.lean||im.bias||im.regime||im.summary||st;
     const peers=Array.isArray(im.peers)?im.peers:[];
     const readyN=peers.filter(p=>p&&p.ready).length;
-    const reason=im.reason?String(im.reason).slice(0,90):'';
+    const reason=im.reason?String(im.reason):'';
     const softWait=st==='WAITING'||st==='UNAVAILABLE'||st==='BOOTING';
     const cls=softWait?'neu'
       :(st==='CONTRADICTION'||String(lean||'').toLowerCase().includes('bear')?'bear'
       :(String(lean||'').toLowerCase().includes('bull')?'bull':'neu'));
-    const line=[lean||st,
-      (readyN||peers.length)?(`peers ${readyN}/${peers.length}`):null,
-      reason&&reason!==String(lean)?reason:null].filter(Boolean).join(' · ');
+    const line=[(readyN||peers.length)?(`peers ${readyN}/${peers.length}`):null,
+      reason||lean||st].filter(Boolean).join(' · ');
     if(line)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH'
       :(softWait?'CONTEXT':'NEUTRAL')),
       line,cls,'INTERMARKET');
@@ -1255,9 +1265,8 @@ function renderDeskIntel(client){
     if(fc.blocked||fc.decision_effect==='blocked_fight'){
       push('BEARISH',fc.decision_reason||fc.reason||'M1 flow blocked OPEN','bear','FLOW');
     }else if(c==='BUY'||c==='SELL'){
-      const fx=fc.decision_effect?` · ${fc.decision_effect}`:'';
       push(c==='BUY'?'BULLISH':'BEARISH',
-        `M1 flow ${c} · conf ${fc.confidence==null?'—':Math.round(Number(fc.confidence)*100)+'%'}${fx}`,
+        `M1 flow ${c} · ${fc.confidence==null?'—':Math.round(Number(fc.confidence)*100)+'%'}`,
         c==='BUY'?'bull':'bear','FLOW');
     }else if(fc.reason){
       push('NEUTRAL',`M1 flow ${fc.reason}`, 'neu','FLOW');
@@ -1265,19 +1274,20 @@ function renderDeskIntel(client){
   }
   if(a.error)push('BEARISH',a.error,'bear','ERROR');
   if(!chips.length){
-    // Still show structural intel from scores so the column never looks empty/old.
     const sc=deskScoreAction(client);
     push(sc.act==='BUY'?'BULLISH':(sc.act==='SELL'?'BEARISH':'NEUTRAL'),
-      `Neural argmax ${sc.act} · edge ${a.directional_advantage!=null?num(a.directional_advantage,3):'—'}`,
+      `Neural ${sc.act}`,
       sc.act==='BUY'?'bull':(sc.act==='SELL'?'bear':'neu'),'ENGINE');
-    push('NEUTRAL',`MTF ${((a.mtf_momentum||{}).mode)||'—'} · bar ${a.bar_time?String(a.bar_time).slice(11,19):'—'}`,
+    push('NEUTRAL',`MTF ${((a.mtf_momentum||{}).mode)||'—'}`,
       'neu','MTF');
   }
+  const tip='Open/SYNC var atšķirties no phone Funds £ — Funds nostājas pēc CLOSE.';
   stableHtml(el,chips.map(c=>`<article class="psx-intel-card ${esc(c.cls)}">
     <span class="tag">${esc(c.tag)}</span>
     <div class="hd">${esc(c.t)}</div>
     <div class="meta">${esc(c.src)}</div>
-  </article>`).join(''));
+  </article>`).join('')
+    +`<div class="psx-intel-tip" title="${esc(tip)}">${esc(tip)}</div>`);
 }
 
 function renderDeskBook(client,view){
@@ -2092,21 +2102,62 @@ function humanEntryBlock(raw){
   if(low.includes('no adaptive')||low.includes('no adoptive')||
      low.includes('adoptive size')||low.includes('adaptive size')||
      low.includes('manual trade')){
-    return 'Nav pieņemta lot šajā sesijā — atver jaunu manuālu treidu Capital.com';
+    return 'Nav lot — manuāls OPEN Capital';
   }
   if(low.includes('existing open')||low.includes('open position')){
     if(low.includes('fusion')||low.includes('neural')){
-      return 'Jau ir atvērta pozīcija — gaida neironu apstiprinājumu pirms nākamā OPEN';
+      return 'Open ir — gaida neironu';
     }
-    return 'Jau ir atvērta pozīcija — gaida aizvēršanu';
+    return 'Open ir — gaida CLOSE';
   }
   if(low.includes('fusion')||low.includes('neural')){
-    return 'Gaida neironu / tirgus konteksta apstiprinājumu';
+    return 'Gaida neironu';
   }
   if(low.includes('waiting')){
-    return 'Gaida nosacījumu — '+s.slice(0,120);
+    return 'Gaida · '+s.slice(0,48);
   }
-  return s.slice(0,160);
+  return s.slice(0,72);
+}
+
+/** Desk MARKET INTEL — compress engine prose to short chips. */
+function shortIntelLine(raw,src){
+  let s=String(raw||'').trim();
+  if(!s)return '';
+  const low=s.toLowerCase();
+  const srcU=String(src||'').toUpperCase();
+  if(low.includes('no matching high-impact')||low.includes('safety window')){
+    return 'Nav HI news logā';
+  }
+  if(low.includes('no fresh aligned')||low.includes('peer history')){
+    const m=s.match(/peers\s+(\d+\/\d+)/i);
+    return m?`Peers ${m[1]} · gaida`:'Peers gaida';
+  }
+  if(srcU==='FORWARD'||/^forward\s*n=/i.test(s)){
+    const n=(s.match(/n\s*=\s*(\d+)/i)||[])[1];
+    const f=(s.match(/false\s+(\d+)%/i)||[])[1];
+    return `Fwd n=${n||'—'} · false ${f!=null?f+'%':'—'}`;
+  }
+  if(srcU==='LEARN'||low.includes('edge floor')){
+    const floor=(s.match(/edge floor\s+([\d.]+)/i)||[])[1];
+    const moved=(s.match(/(\d+)\s*\/\s*(\d+)/)||[]);
+    if(floor&&moved[1])return `Edge ${floor} · ${moved[1]}/${moved[2]} £`;
+    if(floor)return `Edge ${floor}`;
+    return s.slice(0,40);
+  }
+  if(srcU==='FLOW'||low.startsWith('m1 flow')){
+    if(low.includes('no_directional'))return 'M1 flow · nav virziena';
+    return s.replace(/^m1 flow\s*/i,'M1 · ').replace(/_/g,' ').slice(0,42);
+  }
+  if(srcU==='FUSION'||low.includes('fusion')){
+    if(low.includes('peer'))return 'Fusion · peers gaida';
+    return 'Fusion · gaida';
+  }
+  if(srcU==='GATE'||srcU==='NEWS'||srcU==='INTERMARKET'||srcU==='MEMORY'){
+    return humanEntryBlock(s)||s.slice(0,48);
+  }
+  // Strip noisy status prefixes like "CLEAR · " / "UNAVAILABLE · "
+  s=s.replace(/^(CLEAR|UNAVAILABLE|WAITING|BOOTING|NEUTRAL|READY)\s*[·\-—]+\s*/i,'');
+  return s.slice(0,48);
 }
 
 function collectRiskAlerts(clients){

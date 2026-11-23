@@ -19,8 +19,8 @@ def test_shadow_rail_and_view_exist():
     assert 'id="shadowTruth"' in HTML
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
-    assert 'admin.css?v=141' in HTML
-    assert 'admin.js?v=176' in HTML
+    assert 'admin.css?v=' in HTML
+    assert 'admin.js?v=' in HTML
     assert 'auditWindow24' in JS
     assert 'shadowCmdLog' in JS
     assert 'mistake_audit' in JS

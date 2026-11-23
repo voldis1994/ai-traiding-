@@ -103,6 +103,25 @@ def test_audit_hist_replaces_same_deal_id_on_funds_upgrade():
         assert int(row.get('mistake_hits') or 0) <= 1
 
 
+def test_hist_window_filters_by_closed_at_not_audit_time():
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    hist = [
+        # Closed 25h ago, audited "now" — must NOT count in 24h.
+        {'closed_at': (now - timedelta(hours=25)).isoformat(),
+         'at': now.isoformat(), 'pnl': -0.89, 'source': 'live',
+         'deal_id': 'old'},
+        # Closed 1h ago.
+        {'closed_at': (now - timedelta(hours=1)).isoformat(),
+         'at': now.isoformat(), 'pnl': 0.62, 'source': 'live',
+         'deal_id': 'new'},
+    ]
+    w = sma._hist_window_stats(hist, hours=24)
+    assert w['n'] == 1
+    assert w['net'] == pytest.approx(0.62)
+    assert w.get('filter') == 'closed_at'
+
+
 def test_working_pnl_prefers_24h_capital_window():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')

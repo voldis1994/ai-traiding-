@@ -328,11 +328,13 @@ def _scenario_memory_undo(store, prior: dict) -> bool:
     if prior_pnl is not None:
         if prior_pnl > 0.02:
             row['wins'] = max(0, int(row.get('wins') or 0) - 1)
-            if row.get('fix_committed'):
-                row['wins_after_fix'] = max(
-                    0, int(row.get('wins_after_fix') or 0) - 1)
         elif prior_pnl < -0.02 or mistakes:
             row['losses'] = max(0, int(row.get('losses') or 0) - 1)
+    # Only reverse wins_after_fix when THIS observation actually bumped it.
+    # Never infer from current fix_committed (re-audit after a later fix would
+    # wrongly subtract proof wins). Param commits are NOT rolled back here.
+    if prior.get('bumped_wins_after_fix'):
+        row['wins_after_fix'] = max(0, int(row.get('wins_after_fix') or 0) - 1)
     deal_s = str(prior.get('deal_id') or '')
     if deal_s:
         row['deal_ids'] = [d for d in (row.get('deal_ids') or [])
@@ -369,6 +371,8 @@ def scenario_memory_save(store, diagnosis: dict, *, deal_id=None,
     row['intermarket_status'] = ctx.get('intermarket_status')
     row['direction'] = ctx.get('direction')
     row['trigger'] = ctx.get('trigger')
+    # Snapshot whether a fix was already live BEFORE this observation.
+    fix_already = bool(row.get('fix_committed'))
     row['seen'] = int(row.get('seen') or 0) + 1
     mistakes = list(diagnosis.get('mistakes') or [])
     if mistakes:
@@ -379,10 +383,12 @@ def scenario_memory_save(store, diagnosis: dict, *, deal_id=None,
         row['mistake_counts'] = counts
         row['last_mistakes'] = mistakes
         row['last_notes'] = list(diagnosis.get('notes') or [])
+    bumped_waf = False
     if diagnosis.get('useful'):
         row['wins'] = int(row.get('wins') or 0) + 1
-        if row.get('fix_committed'):
+        if fix_already:
             row['wins_after_fix'] = int(row.get('wins_after_fix') or 0) + 1
+            bumped_waf = True
     if diagnosis.get('hurt'):
         row['losses'] = int(row.get('losses') or 0) + 1
     deal_s = str(deal_id) if deal_id is not None else ''
@@ -404,7 +410,8 @@ def scenario_memory_save(store, diagnosis: dict, *, deal_id=None,
         bag = dict(ordered[:80])
     store.set(SCENARIOS_KEY, bag)
     return {'saved': True, 'fingerprint': fp, 'seen': row['seen'],
-            'row': row, 'undone_prior': undone}
+            'row': row, 'undone_prior': undone,
+            'bumped_wins_after_fix': bumped_waf}
 
 
 def promote_gate(store, fingerprint: str, mistakes, *, n=PROMOTE_N) -> dict:
@@ -543,6 +550,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              mid=None, entry=None, exit=None, exit_reason=None,
              source='shadow', deal_id=None,
              unit=None, currency=None, paper_pnl=None, price_pnl=None,
+             closed_at=None,
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -593,13 +601,22 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
+    audited_at = _now_iso()
+    # Trade close time for 24h windows — never confuse with audit runtime.
+    closed_stamp = closed_at
+    if not closed_stamp and isinstance(prior, dict):
+        closed_stamp = prior.get('closed_at') or prior.get('at')
+    if not closed_stamp:
+        closed_stamp = audited_at
     out = {
         **diagnosis,
         'memory': mem,
         'promote_gate': gate,
         'fix': commit_result,
         'ready_for_live': ready,
-        'at': _now_iso(),
+        'at': audited_at,
+        'audited_at': audited_at,
+        'closed_at': closed_stamp,
         'deal_id': deal_s or None,
         'unit': unit_s,
         'currency': ccy_s,
@@ -609,7 +626,9 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if store is not None:
         hist = list(store.get(HIST_KEY) or [])
         entry_row = {
-            'at': out['at'],
+            'at': audited_at,  # legacy alias = audited_at
+            'audited_at': audited_at,
+            'closed_at': closed_stamp,
             'source': source,
             'pnl': diagnosis.get('pnl'),
             'direction': direction,
@@ -629,6 +648,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'currency': ccy_s,
             'paper_pnl': paper_n,
             'price_pnl': price_n,
+            'bumped_wins_after_fix': bool(
+                (mem or {}).get('bumped_wins_after_fix')),
         }
         # Re-audit after Funds £ correction must REPLACE the prior row for this
         # deal — otherwise hist doubles and scenario repeat counters inflate.
@@ -661,6 +682,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'currency': ccy_s,
             'paper_pnl': paper_n,
             'price_pnl': price_n,
+            'closed_at': closed_stamp,
+            'audited_at': audited_at,
         })
         if diagnosis.get('mistakes'):
             store.event('shadow_mistake_audit', 'Mistake diagnosed', {
@@ -773,9 +796,11 @@ def lab_payload(store) -> dict:
                 continue
             seen_keys.add(key)
             merged.append(j)
-        # Newest first by at/closed stamp.
+        # Newest first by trade close time (not audit runtime).
         def _at_key(r):
-            return str((r or {}).get('at') or (r or {}).get('closed') or '')
+            return str((r or {}).get('closed_at')
+                       or (r or {}).get('closed')
+                       or (r or {}).get('at') or '')
         merged.sort(key=_at_key, reverse=True)
         recent_audits = merged[:24]
     if (not display_last or not display_last.get('pnl')) and recent_audits:
@@ -871,7 +896,11 @@ def lab_payload(store) -> dict:
 
 
 def _hist_window_stats(hist, *, hours=24) -> dict:
-    """Aggregate audit hist over a time window — wins and losses together."""
+    """Aggregate audit hist over a time window — wins and losses together.
+
+    Filter by ``closed_at`` (trade close), not ``audited_at`` / legacy ``at``.
+    Late Funds re-audits must not keep a 25h-old close inside “last 24h”.
+    """
     from datetime import timedelta
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=max(1, int(hours)))
@@ -882,10 +911,10 @@ def _hist_window_stats(hist, *, hours=24) -> dict:
     for h in hist or []:
         if not isinstance(h, dict):
             continue
-        at = h.get('at')
-        if at:
+        stamp = h.get('closed_at') or h.get('at')
+        if stamp:
             try:
-                dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                dt = datetime.fromisoformat(str(stamp).replace('Z', '+00:00'))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 if dt < cutoff:
@@ -916,6 +945,7 @@ def _hist_window_stats(hist, *, hours=24) -> dict:
         'useful_n': useful_n,
         'hurt_n': hurt_n,
         'reads': 'wins+losses',
+        'filter': 'closed_at',
     }
 
 
@@ -937,7 +967,7 @@ def _journal_window_stats(store, *, hours=24) -> dict:
         rows = store.db.execute(
             "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
             "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
-            "ORDER BY closed DESC LIMIT 160").fetchall()
+            "ORDER BY closed DESC LIMIT 400").fetchall()
     except Exception:
         return empty
     wins = losses = scratch = 0

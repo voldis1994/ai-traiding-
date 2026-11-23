@@ -17,6 +17,16 @@ def test_local_boot_sets_admin_cookie_on_loopback():
     assert me.json().get('role') == 'admin'
 
 
+def test_get_admin_page_mints_cookie_on_loopback():
+    """Opening /admin on 127.0.0.1 must skip the login gate without JS."""
+    client = TestClient(app)
+    r = client.get('/admin')
+    assert r.status_code == 200
+    assert 'nta_admin' in r.cookies
+    me = client.get('/api/admin/me')
+    assert me.status_code == 200
+
+
 def test_admin_js_auto_boots_localhost():
     js = open('app/web/admin/admin.js', encoding='utf-8').read()
     assert '/api/admin/local-boot' in js

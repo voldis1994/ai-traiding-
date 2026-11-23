@@ -279,7 +279,28 @@ async def operator_console():
     return RedirectResponse('/admin', status_code=302)
 
 @app.get('/admin')
-async def admin_page():return FileResponse(WEB/'admin'/'index.html')
+async def admin_page(request:Request):
+    """Serve Desk HTML. On 127.0.0.1 mint admin cookie so login form is skipped."""
+    resp=FileResponse(WEB/'admin'/'index.html')
+    if not _is_loopback_request(request):
+        return resp
+    token=request.cookies.get(ADMIN_COOKIE)
+    session=platform.get_session(token) if token else None
+    if session and session.get('role')=='admin':
+        return resp
+    try:
+        _bootstrap_admin()
+        admin=platform.first_admin()
+        if not admin:
+            user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
+            password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
+            admin=platform.ensure_admin(user,password)
+        tok=platform.create_session('admin',int(admin['id']))
+        resp.set_cookie(ADMIN_COOKIE,tok,httponly=True,samesite='strict',
+                        secure=cookie_secure(),path='/')
+    except Exception:
+        logging.exception('admin local auto-session failed')
+    return resp
 
 @app.get('/desk')
 @app.get('/desk/')

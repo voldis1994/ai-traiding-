@@ -45,8 +45,8 @@ def test_resolve_uses_activity_profit_not_ticks_only():
     asyncio.run(scenario())
 
 
-def test_resolve_uses_last_upl_as_realized_peļņa():
-    """Operator: when Capital history lags, last live UPL settles as peļņa."""
+def test_resolve_ignores_upl_and_confirm_waits_for_funds():
+    """No UPL / confirm.profit invent — wait for Capital Funds/history £."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -54,14 +54,14 @@ def test_resolve_uses_last_upl_as_realized_peļņa():
             e.attach(HistoryBroker())
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
-            pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
-            assert pnl==pytest.approx(0.45)
-            assert src=='upl_estimate'
-            assert ccy=='GBP'
+            pnl,src,ccy=await e._resolve_broker_pnl(
+                'd2',{'profit':-0.81,'currency':'GBP'})
+            assert pnl is None
+            assert src=='pending_broker_pnl'
     asyncio.run(scenario())
 
 
-def test_sl_tp_vanish_writes_broker_cash_not_ticks_only():
+def test_sl_tp_vanish_waits_when_capital_cash_is_zero_placeholder():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -74,21 +74,24 @@ def test_sl_tp_vanish_writes_broker_cash_not_ticks_only():
             e.attach(broker)
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             await e.sync()
-            # Adopt clears market{}; restore quote context like a live poll would.
             e.market={'epic':'GOLD','mid':2650.2,'tick':.1,'spread':.3}
-            assert store.get('last_upl:gold1')['upl']==pytest.approx(-0.02)
-            assert store.get('last_upl:gold1')['currency']=='GBP'
             store.set('entry_brain:gold1',{'epic':'GOLD','direction':'SELL','entry':2651,
                 'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition)})
             store.upsert_trade({'dealId':'gold1','epic':'GOLD','size':'.02','direction':'SELL','level':2651})
-            # Position hit TP/SL at broker — disappears without our CLOSE confirm.
             broker.open=[]
+            # £0 activity placeholder must not settle as broker cash.
             broker.acts=[{'dealId':'gold1','details':{'profit':0.0},'currency':'USD'}]
             await e.sync()
             row=store.trades(1)[0]
-            assert row['pnl']==pytest.approx(0.0)
+            assert row['pnl'] is None
+            assert row['pnl_source']=='pending_broker_pnl'
+            # Real Funds £ later settles.
+            broker.tx=[{'reference':'gold1','pnl':'-0.12','currency':'GBP',
+                        'transactionType':'TRADE'}]
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.12)
             assert row['pnl_source']=='broker'
-            assert row['pnl_currency']=='GBP'
     asyncio.run(scenario())
 
 

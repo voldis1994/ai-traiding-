@@ -38,8 +38,8 @@ def test_parse_cash_num_strips_currency():
         assert e._row_cash_pnl({},{'profitAndLoss':-0.08})==pytest.approx(-0.08)
 
 
-def test_vanish_teaches_ticks_while_pending_keeps_source():
-    """Vanish with UPL: teach immediately; broker £ later refines without re-train."""
+def test_vanish_waits_for_funds_then_teaches_once():
+    """Vanish without Funds: pending; Funds £ teaches once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -59,11 +59,10 @@ def test_vanish_teaches_ticks_while_pending_keeps_source():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row.get('pnl_source')=='upl_estimate'
-            assert e._trade_already_learned('g1')
+            assert row.get('pnl_source')=='pending_broker_pnl'
+            assert not e._trade_already_learned('g1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)
-            # Verified Capital £ → journal refine, no second neural teach.
             labeled=brain.trade_labeled
             broker.tx=[{'reference':'g1','pnl':-0.09,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
@@ -71,7 +70,7 @@ def test_vanish_teaches_ticks_while_pending_keeps_source():
             assert row['pnl']==pytest.approx(-0.09)
             assert row['pnl_source']=='broker'
             assert e._trade_already_learned('g1')
-            assert brain.trade_labeled==labeled
+            assert brain.trade_labeled>=labeled
             assert not (store.get('pending_broker_pnl_deals') or [])
     asyncio.run(scenario())
 

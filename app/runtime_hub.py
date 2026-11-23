@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 247
+DESK_TRUTH_REV = 248
 
 
 def _finite_num(v):

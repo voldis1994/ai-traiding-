@@ -174,13 +174,14 @@ def test_trade_learn_survives_restart_no_relearn():
         assert NeuralCore.weight_delta_norm(after,brain2.core.snapshot_weights())==pytest.approx(0)
 
 
-def test_shadow_weights_persist_across_engine_restart():
-    """Pre-test #2 companion: shadow matrices survive recreate from store."""
+def test_shadow_shares_live_core_across_engine_restart():
+    """One brain: SHADOW alias is LIVE core; learn mutates shared weights."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         brain.core.last_z=np.linspace(-0.3,0.3,brain.core.d)
         e=SingleTradeEngine(store,brain)
         shadow=e._ensure_shadow_brain()
+        assert shadow is brain.core
         e._shadow_scores_now(advance=True,bar_time='t0')
         before=shadow.snapshot_weights()
         assert e._shadow_learn(None,0,lr=0.2) is not None
@@ -189,6 +190,7 @@ def test_shadow_weights_persist_across_engine_restart():
         e.shadow_brain=None
         e2=SingleTradeEngine(store,brain)
         shadow2=e2._ensure_shadow_brain()
+        assert shadow2 is brain.core
         assert NeuralCore.weight_delta_norm(after,shadow2.snapshot_weights())==pytest.approx(0)
 
 

@@ -6013,10 +6013,8 @@ class SingleTradeEngine:
         if repeats>0 and label is not None and claimed_neural and any_real_dw:
             unified_cycle.note_weight_update(
                 self.store,won=pnl_sign>0,delta_norm=last_delta)
-        # Independent shadow core trains on same label using *its* decision-time h/c.
-        # Shadow keeps its own promote/rollback; still teach even if LIVE rolled back.
-        if repeats>0 and label is not None and claimed_neural:
-            self._shadow_learn(None,label,lr=learn_lr)
+        # One brain: LIVE teach already updated shared neurons — no second pass.
+
         if cash_like:
             # Queue evidence only — commit when long-horizon £ proves improvement.
             evolve_from_feedback(self.store,broker_pnl=pnl_value,commit=False)
@@ -7981,193 +7979,105 @@ class SingleTradeEngine:
             spreads.append(float(sp) if sp is not None and sp>=0 else None)
         return bars,spreads,times
 
-    SHADOW_STATE_KEY='shadow_neural_state_v1'
+    SHADOW_STATE_KEY='shadow_neural_state_v1'  # legacy key — one-brain no longer writes it
 
     def _ensure_shadow_brain(self):
-        """Independent shadow NeuralCore — same input dim, own weights (never LIVE)."""
-        d=self.brain.core.d
-        created=False
-        if self.shadow_brain is None or self.shadow_brain.d!=d:
-            from .self_params import get as sp_get
-            nmax=int(sp_get(self.store,'max_neurons',64))
-            alt_n=max(8,self.brain.core.n+4 if self.brain.core.n<48 else max(8,self.brain.core.n-4))
-            alt_n=min(alt_n,nmax)
-            # Derive from live init_seed so shadow search is not identical across clients.
-            base=int(getattr(self.brain,'init_seed',7) or 7)
-            shadow_seed=(base^(0xA5A5+alt_n))%(2**31-1) or (base+alt_n+1)
-            saved=self.store.get(self.SHADOW_STATE_KEY) or {}
-            try:saved_n=int(saved.get('n') or 0)
-            except (TypeError,ValueError):saved_n=0
-            try:saved_d=int(saved.get('d') or -1)
-            except (TypeError,ValueError):saved_d=-1
-            use_n=saved_n if (saved_n>=8 and saved_d==d) else alt_n
-            use_n=min(max(8,use_n),nmax)
-            self.shadow_brain=self.brain.core.clone_architecture(
-                n=use_n,seed=shadow_seed,copy_weights=False)
-            self.shadow_brain.model_version=0
-            created=True
-            self.store.event('shadow','Independent shadow neural core ready',
-                {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':self.brain.core.n,
-                 'shadow_seed':shadow_seed})
-        if created:
-            self._restore_shadow_state()
+        """One NeuralCore for LIVE + SHADOW — same neurons, same weights.
+
+        Paper / mistake-audit / hold-shadow vote through the LIVE brain.
+        No second clone, no separate shadow weight store.
+        """
+        core=self.brain.core
+        if self.shadow_brain is not core:
+            self.shadow_brain=core
+            self.store.event('shadow','One neural core — SHADOW shares LIVE neurons',
+                {'neurons':core.n,'dim':core.d,'shared':True})
         return self.shadow_brain
 
     def _restore_shadow_state(self):
-        """Reload persisted shadow weights + h/c + step counter after create/restart."""
-        from .core import WEIGHT_PARAM_NAMES
-        shadow=self.shadow_brain
-        raw=self.store.get(self.SHADOW_STATE_KEY) or {}
-        if not isinstance(raw,dict) or shadow is None:return False
-        try:
-            h=np.asarray(raw.get('h'),dtype=float)
-            c=np.asarray(raw.get('c'),dtype=float)
-        except (TypeError,ValueError):
-            return False
-        if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):return False
-        if not (np.isfinite(h).all() and np.isfinite(c).all()):return False
-        if int(raw.get('d') or -1)!=shadow.d:return False
-        # Critical #1: restore trained shadow weight matrices when present.
-        weights=raw.get('weights')
-        if isinstance(weights,dict):
-            snap={}
-            try:
-                for name in WEIGHT_PARAM_NAMES:
-                    if name not in weights:raise KeyError(name)
-                    arr=np.asarray(weights[name],dtype=float)
-                    if arr.shape!=np.asarray(getattr(shadow,name)).shape:
-                        raise ValueError('shape')
-                    if not np.isfinite(arr).all():raise ValueError('nan')
-                    snap[name]=arr
-                if not shadow.restore_weights(snap):
-                    return False
-            except (TypeError,ValueError,KeyError):
-                # Corrupt weight blob — refuse partial restore (fail closed).
-                return False
-        shadow.h=h;shadow.c=c
-        try:shadow.steps=int(raw.get('steps') or 0)
-        except (TypeError,ValueError):shadow.steps=0
-        try:shadow.model_version=int(raw.get('model_version') or 0)
-        except (TypeError,ValueError):shadow.model_version=0
-        ids_raw=raw.get('neuron_ids')
-        if ids_raw is not None:
-            try:
-                ids=np.asarray(ids_raw,dtype=np.int64)
-                if ids.shape==(shadow.n,):shadow.neuron_ids=ids
-            except (TypeError,ValueError):
-                pass
-        tr=raw.get('last_transition')
-        if isinstance(tr,dict) and tr.get('z') is not None:
-            try:
-                z=np.asarray(tr['z'],dtype=float)
-                th=np.asarray(tr['h'],dtype=float);tc=np.asarray(tr['c'],dtype=float)
-                if z.shape==(shadow.d,) and th.shape==(shadow.n,) and tc.shape==(shadow.n,):
-                    ids=tr.get('neuron_ids')
-                    shadow.last_transition={
-                        'z':z,'h':th,'c':tc,
-                        'dt':float(tr.get('dt') or 1.),
-                        'neuron_ids':(np.asarray(ids,dtype=np.int64)
-                                      if ids is not None else shadow.neuron_ids.copy()),
-                        'bar_time':tr.get('bar_time')}
-            except (TypeError,ValueError,KeyError):
-                pass
+        """No-op — one brain persists via LIVE AdaptiveBrain.save()."""
+        self._ensure_shadow_brain()
         return True
 
     def _persist_shadow_state(self):
-        """Persist shadow weights + h/c + steps after every completed-candle advance."""
-        from .core import WEIGHT_PARAM_NAMES
-        shadow=self.shadow_brain
-        if shadow is None:return
-        tr=getattr(shadow,'last_transition',None)
-        # Critical #1: include trainable matrices so restart keeps shadow learning.
-        weights={name:np.asarray(getattr(shadow,name),dtype=float).tolist()
-                 for name in WEIGHT_PARAM_NAMES}
-        payload={
-            'h':np.asarray(shadow.h,dtype=float).tolist(),
-            'c':np.asarray(shadow.c,dtype=float).tolist(),
-            'steps':int(getattr(shadow,'steps',0) or 0),
-            'n':int(shadow.n),'d':int(shadow.d),
-            'model_version':int(getattr(shadow,'model_version',0) or 0),
-            'neuron_ids':np.asarray(shadow.neuron_ids,dtype=np.int64).tolist(),
-            'weights':weights,
-        }
-        if isinstance(tr,dict) and tr.get('z') is not None:
-            payload['last_transition']={
-                'z':np.asarray(tr['z'],dtype=float).tolist(),
-                'h':np.asarray(tr['h'],dtype=float).tolist(),
-                'c':np.asarray(tr['c'],dtype=float).tolist(),
-                'dt':float(tr.get('dt') or 1.),
-                'neuron_ids':np.asarray(
-                    tr.get('neuron_ids',shadow.neuron_ids),dtype=np.int64).tolist(),
-                'bar_time':tr.get('bar_time')}
-        self.store.set(self.SHADOW_STATE_KEY,payload)
+        """Persist the shared neural core via LIVE brain save (one weight file)."""
+        try:
+            if self.brain is not None and hasattr(self.brain,'save'):
+                self.brain.save()
+        except Exception:
+            pass
 
     def _shadow_decision_transition(self, preferred=None):
-        """Shadow's own decision-time state — never LIVE h/c."""
-        shadow=self._ensure_shadow_brain()
-        for cand in (preferred,getattr(shadow,'last_transition',None)):
+        """Decision-time state from the ONE neural core (LIVE = SHADOW)."""
+        core=self._ensure_shadow_brain()
+        for cand in (preferred,getattr(core,'last_transition',None)):
             if not isinstance(cand,dict):continue
             z=cand.get('z')
             if z is None:continue
             z=np.asarray(z,dtype=float)
-            if z.shape!=(shadow.d,):continue
+            if z.shape!=(core.d,):continue
             h=np.asarray(cand.get('h'),dtype=float)
             c=np.asarray(cand.get('c'),dtype=float)
-            if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):continue
-            ids=cand.get('neuron_ids',shadow.neuron_ids)
+            if h.shape!=(core.n,) or c.shape!=(core.n,):continue
+            ids=cand.get('neuron_ids',core.neuron_ids)
             return {'z':z,'h':h,'c':c,'dt':float(cand.get('dt') or 1.),
                     'neuron_ids':np.asarray(ids,dtype=np.int64)}
         return None
 
     def _shadow_learn(self,transition,label,lr=None):
-        """Train shadow on *its* decision-time h/c — never LIVE recurrent state."""
-        shadow=self._ensure_shadow_brain()
+        """Teach the ONE neural core from paper/shadow outcomes."""
+        core=self._ensure_shadow_brain()
         if label not in (0,1,2):return None
         own=self._shadow_decision_transition(
             transition if (isinstance(transition,dict)
                            and transition.get('h') is not None
-                           and len(np.asarray(transition.get('h')))==shadow.n)
+                           and len(np.asarray(transition.get('h')))==core.n)
             else None)
         if own is None and isinstance(transition,dict):
-            base=getattr(shadow,'last_transition',None)
+            base=getattr(core,'last_transition',None)
             if isinstance(base,dict) and base.get('h') is not None:
                 z=transition.get('z')
-                if z is not None and len(np.asarray(z))==shadow.d:
+                if z is not None and len(np.asarray(z))==core.d:
                     own={'z':np.asarray(z,dtype=float),
                          'h':np.asarray(base['h'],dtype=float),
                          'c':np.asarray(base['c'],dtype=float),
                          'dt':float(base.get('dt') or transition.get('dt') or 1.),
                          'neuron_ids':np.asarray(
-                             base.get('neuron_ids',shadow.neuron_ids),dtype=np.int64)}
+                             base.get('neuron_ids',core.neuron_ids),dtype=np.int64)}
         if own is None:return None
         from .core import OBJECTIVE_TRADE_PNL
-        loss=shadow.learn(own,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
+        loss=core.learn(own,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
         self._persist_shadow_state()
         return loss
 
     def _shadow_scores_now(self,*,advance=False,bar_time=None):
-        """Score with shadow weights on live z; optionally advance+persist h/c.
+        """Score with the ONE neural core (LIVE weights).
 
-        advance=True on each completed M1 candle so shadow is a real parallel
-        trajectory with its own decision-time state (not a LIVE h/c snapshot).
+        Does not double-advance LIVE h/c — LIVE tick already owns the trajectory.
+        Uses a read-only forward peek (or last_signal scores when available).
         """
-        shadow=self._ensure_shadow_brain()
-        z=self.brain.core.last_z
-        if z is None or len(z)!=shadow.d:return None
+        core=self._ensure_shadow_brain()
+        # Prefer LIVE bar scores when already computed this poll.
+        if isinstance(getattr(self,'last_signal',None),dict):
+            sc=self.last_signal.get('scores')
+            if isinstance(sc,dict) and all(k in sc for k in ('BUY','SELL','HOLD')):
+                try:
+                    return {k:float(sc[k]) for k in ('BUY','SELL','HOLD')}
+                except (TypeError,ValueError):
+                    pass
+        z=core.last_z
+        if z is None or len(z)!=core.d:return None
         try:
             z=np.asarray(z,dtype=float)
-            h0=shadow.h.copy();c0=shadow.c.copy()
-            hn,cn,logits=shadow._forward(z,h0,c0,1.0)
-            if advance:
-                shadow.last_transition={
+            h0=core.h.copy();c0=core.c.copy()
+            _hn,_cn,logits=core._forward(z,h0,c0,1.0)
+            # Stamp decision transition for paper teach without mutating LIVE h/c.
+            if advance or getattr(core,'last_transition',None) is None:
+                core.last_transition={
                     'z':z.copy(),'h':h0,'c':c0,'dt':1.0,
-                    'neuron_ids':shadow.neuron_ids.copy(),
+                    'neuron_ids':core.neuron_ids.copy(),
                     'bar_time':bar_time}
-                shadow.h=hn;shadow.c=cn
-                shadow.last_z=z.copy()
-                shadow.steps=int(getattr(shadow,'steps',0) or 0)+1
-                self._persist_shadow_state()
-            prob=shadow._softmax(logits)
+            prob=core._softmax(logits)
             return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
         except Exception:
             return None
@@ -8263,14 +8173,8 @@ class SingleTradeEngine:
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
             learning_generation.bump(self.store,'feature_registry_expanded')
-            # Keep shadow dim aligned (insert dynamic before external if on fusion).
-            if self.shadow_brain is not None and self.shadow_brain.d!=self.brain.core.d:
-                insert=old_ohlc if self.brain.feature_schema==self.brain.fusion_schema else None
-                try:
-                    self.shadow_brain.expand_inputs(self.brain.core.d,insert_at=insert)
-                except Exception:
-                    self.shadow_brain=None
-                    self._ensure_shadow_brain()
+            # One brain — registry expand already resized LIVE core (= SHADOW).
+            self.shadow_brain=self.brain.core
             post_path=None
             if hasattr(self.brain,'backup_weights'):
                 post_path=self.brain.backup_weights(

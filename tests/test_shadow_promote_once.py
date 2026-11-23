@@ -43,15 +43,11 @@ def test_second_promote_blocked_without_new_evidence():
         e=SingleTradeEngine(store,brain)
         e.policy=AutoEvolution(store,Path(d)/'policy.py')
         shadow=e._ensure_shadow_brain()
-        if shadow.d!=brain.core.d:
-            pytest.skip('shadow dim mismatch')
-        if shadow.n!=brain.core.n:
-            e.shadow_brain=brain.core.clone_architecture(
-                n=brain.core.n,seed=99,copy_weights=False)
-            shadow=e.shadow_brain
-            shadow.model_version=1
+        assert shadow is brain.core
         _seed_histories(e,n=24,model_version=1)
+        # Nudge shared weights so promote checksum sees a change.
         shadow.P[:]+=0.01
+        shadow.model_version=max(1,int(getattr(shadow,'model_version',0) or 0))
         out1=e.policy.shadow_self_dev_tick(e)
         assert out1 is not None
         last=store.get(AutoEvolution.LAST_PROMOTE_KEY)

@@ -402,15 +402,26 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
             'size': None, 'reason': 'no_capital_size_grid', 'allowed': False,
             'size_grid': grid,
         }
-    # Snap mandate itself onto the grid — Capital is source of truth.
+    # Adopted mandate is the operator risk frame (manual 0.15 stays 0.15).
+    # Floor-snap onto Capital grid is for *computed* risk lots only — never
+    # shrink the broker-accepted adopt (0.15 → 0.1 was the LIVE bug).
     seed_on_grid = snap_deal_size(
         seed, min_size=grid['min'], step=grid['step'], max_size=grid.get('max'))
-    if seed_on_grid is None:
+    if seed_on_grid is None and seed < grid['min']:
         return {
             'size': None, 'reason': 'mandate_off_capital_grid', 'allowed': False,
             'size_grid': grid,
         }
-    seed = seed_on_grid
+    # Keep exact adopted size when ≥ minDealSize (Capital already filled it).
+    if seed + Decimal('0') >= grid['min']:
+        if grid.get('max') is not None and seed > grid['max']:
+            seed = snap_deal_size(
+                grid['max'], min_size=grid['min'], step=grid['step'],
+                max_size=grid.get('max')) or seed_on_grid or seed
+        # else: preserve exact mandate (may sit between step marks if Capital
+        # accepted a finer size than minSizeIncrement reports).
+    else:
+        seed = seed_on_grid
     p = params or load_params(None)
     b = budgets(equity=equity, params=p, daily=daily)
     rpt = _finite(b.get('risk_per_trade'))

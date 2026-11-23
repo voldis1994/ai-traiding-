@@ -4809,6 +4809,19 @@ class SingleTradeEngine:
                   or (self.mandate or {}).get('epic')
                   or getattr(self.brain,'epic',None))
             candles=self._decision_candles(epic,n=80) if epic else []
+            ccy=(self._cash_currency(
+                    (saved or {}).get('pnl_currency') if isinstance(saved,dict)
+                    else None)
+                 or self._account_currency())
+            closed_at=None
+            try:
+                crow=self.store.db.execute(
+                    'SELECT closed,exit FROM trades WHERE deal_id=? LIMIT 1',
+                    (str(deal_id),)).fetchone()
+                if crow:
+                    closed_at=crow[0]
+            except Exception:
+                closed_at=None
             out=sma.on_close(
                 self.store,
                 pnl=pnl_n,spread=_num((saved or {}).get('entry_spread')) or 0.,
@@ -4821,6 +4834,11 @@ class SingleTradeEngine:
                 entry=entry if entry is not None else (
                     _num(saved.get('entry')) if isinstance(saved,dict) else None),
                 source=source,
+                deal_id=deal_id,
+                unit='account_currency',
+                currency=ccy,
+                paper_pnl=pnl_n,
+                closed_at=closed_at,
                 apply_ohlc_penalties=False,
             )
             if out and out.get('audited'):
@@ -4835,7 +4853,7 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=160,hours=24):
+    def _backfill_mistake_audits_from_journal(self,*,limit=400,hours=24):
         """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
 
         Analysis needs both sides — skipping wins left the cycle blind to what
@@ -5271,7 +5289,7 @@ class SingleTradeEngine:
                              {'type':type(exc).__name__})
         # Cycle reads full 24h Capital book (wins + losses) after Funds £ lands.
         try:
-            self._backfill_mistake_audits_from_journal(limit=80,hours=24)
+            self._backfill_mistake_audits_from_journal(limit=400,hours=24)
         except Exception as exc:
             self.store.event('warning','Mistake-audit backfill skipped',
                              {'type':type(exc).__name__})
@@ -8334,6 +8352,18 @@ class SingleTradeEngine:
                 audit_rows=candles if candles is not None else (
                     self.store.candles(self.mandate['epic'],n=80,historical_only=True)
                     if self.mandate else [])
+                unit=str(closed.get('unit') or '').strip() or None
+                if unit not in ('price','account_currency'):
+                    # Prefer cash when paper_pnl present; else price pts.
+                    unit=('account_currency'
+                          if closed.get('paper_pnl') is not None
+                          else 'price')
+                paper_id=(closed.get('fingerprint') or closed.get('deal_id')
+                          or ('paper:'+str(closed.get('at') or '')
+                              +':'+str(closed.get('direction') or '')
+                              +':'+str(closed.get('exit_reason') or '')))
+                ccy=(self._account_currency()
+                     if unit=='account_currency' else None)
                 sma.on_close(
                     self.store,
                     pnl=pnl,
@@ -8352,6 +8382,12 @@ class SingleTradeEngine:
                     exit=_num(closed.get('exit') or closed.get('exit_px')),
                     exit_reason=closed.get('exit_reason'),
                     source='shadow',
+                    deal_id=paper_id,
+                    unit=unit,
+                    currency=ccy,
+                    paper_pnl=_num(closed.get('paper_pnl')),
+                    price_pnl=_num(closed.get('price_pnl')),
+                    closed_at=closed.get('at') or closed.get('bar_time'),
                     apply_ohlc_penalties=True,
                 )
             except Exception as exc:

@@ -55,7 +55,8 @@ def test_trade_stats_falls_back_to_edge_hist_when_journal_empty():
         recent = stats['recent_trades']
         assert len(recent) == 2
         assert recent[0]['from_edge_hist'] is True
-        assert recent[0]['pnl_source'] == 'broker'
+        # Edge hist must NOT pretend to be Capital Funds broker £.
+        assert recent[0]['pnl_source'] == 'edge_hist'
         assert {r['pnl'] for r in recent} == {0.30, -0.13}
 
 

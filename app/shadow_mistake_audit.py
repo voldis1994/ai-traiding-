@@ -49,14 +49,44 @@ def _clip01(v):
     return max(0.0, min(1.0, float(n)))
 
 
+def _fp_news_bucket(status) -> str:
+    """Fingerprint news without waiting on calendar boot.
+
+    UNCONFIGURED / WAITING / CALENDAR_UNAVAILABLE used to mint a new scenario
+    class every boot, so SHADOW looked stuck on "special events" instead of
+    grouping real Capital closes.
+    """
+    s = str(status or '').strip().upper()
+    if not s or s in ('UNCONFIGURED', 'WAITING', 'CALENDAR_UNAVAILABLE',
+                      'NONE', '—', '-', 'NEWS?'):
+        return 'NEWS_NA'
+    if s in ('CLEAR', 'OK', 'READY', 'ALLOW'):
+        return 'NEWS_CLEAR'
+    if s in ('NEWS_WINDOW', 'HIGH_IMPACT') or 'BLOCK' in s:
+        return 'NEWS_BLOCK'
+    return s[:24]
+
+
+def _fp_peers_bucket(status) -> str:
+    """Fingerprint peers without waiting on intermarket READY."""
+    s = str(status or '').strip().upper()
+    if not s or s in ('WAITING', 'UNCONFIGURED', 'NONE', '—', '-', 'IM?'):
+        return 'PEERS_NA'
+    if s in ('READY', 'OK', 'CLEAR', 'ALLOW'):
+        return 'PEERS_OK'
+    if s in ('CONTRADICTION', 'FIGHT', 'VETO') or 'BLOCK' in s:
+        return 'PEERS_FIGHT'
+    return s[:24]
+
+
 def fingerprint(*, scenario=None, zone_side=None, news_status=None,
                 intermarket_status=None, direction=None, trigger=None) -> str:
     """Stable short id for a market-situation class (not a trade id)."""
     parts = [
         str(scenario or 'UNK'),
         str(zone_side or 'mid'),
-        str(news_status or 'news?'),
-        str(intermarket_status or 'im?'),
+        _fp_news_bucket(news_status),
+        _fp_peers_bucket(intermarket_status),
         str((direction or '?')).upper(),
         str(trigger or 'trig?'),
     ]
@@ -102,6 +132,7 @@ def snapshot_context(*, candles=None, scenario_meta=None, ohlc_meta=None,
     news_status = str(news.get('status') or 'UNCONFIGURED')
     im_status = str(intermarket.get('status') or 'WAITING')
     # Assess peer fight against the trade direction when peers are ready.
+    # Peers still WAITING must NOT freeze diagnose — Capital closes analyse now.
     im_fight = False
     if direction in ('BUY', 'SELL') and im_status == 'READY':
         try:
@@ -269,14 +300,68 @@ def _scenario_bag(store) -> dict:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def scenario_memory_save(store, diagnosis: dict) -> dict:
-    """Persist fingerprint counts + last mistake for promote / ready gates."""
+def _scenario_memory_undo(store, prior: dict) -> bool:
+    """Reverse one prior observation so Funds £ re-audit does not double-count."""
+    if store is None or not isinstance(prior, dict):
+        return False
+    fp = str(prior.get('fingerprint') or '')
+    if not fp:
+        return False
+    bag = _scenario_bag(store)
+    row = dict(bag.get(fp) or {})
+    if not row:
+        return False
+    row['seen'] = max(0, int(row.get('seen') or 0) - 1)
+    mistakes = list(prior.get('mistakes') or [])
+    if mistakes:
+        row['mistake_hits'] = max(0, int(row.get('mistake_hits') or 0) - 1)
+        key = '+'.join(sorted(mistakes))
+        counts = dict(row.get('mistake_counts') or {})
+        counts[key] = max(0, int(counts.get(key) or 0) - 1)
+        if counts[key] <= 0:
+            counts.pop(key, None)
+        row['mistake_counts'] = counts
+    try:
+        prior_pnl = float(prior.get('pnl'))
+    except (TypeError, ValueError):
+        prior_pnl = None
+    if prior_pnl is not None:
+        if prior_pnl > 0.02:
+            row['wins'] = max(0, int(row.get('wins') or 0) - 1)
+        elif prior_pnl < -0.02 or mistakes:
+            row['losses'] = max(0, int(row.get('losses') or 0) - 1)
+    # Only reverse wins_after_fix when THIS observation actually bumped it.
+    # Never infer from current fix_committed (re-audit after a later fix would
+    # wrongly subtract proof wins). Param commits are NOT rolled back here.
+    if prior.get('bumped_wins_after_fix'):
+        row['wins_after_fix'] = max(0, int(row.get('wins_after_fix') or 0) - 1)
+    deal_s = str(prior.get('deal_id') or '')
+    if deal_s:
+        row['deal_ids'] = [d for d in (row.get('deal_ids') or [])
+                           if str(d) != deal_s]
+    row['updated_at'] = _now_iso()
+    bag[fp] = row
+    store.set(SCENARIOS_KEY, bag)
+    return True
+
+
+def scenario_memory_save(store, diagnosis: dict, *, deal_id=None,
+                         prior=None) -> dict:
+    """Persist fingerprint counts + last mistake for promote / ready gates.
+
+    When the same ``deal_id`` is re-audited (Funds −0.81 → −0.89), undo the
+    prior observation first so ``seen`` / ``mistake_hits`` / promote counters
+    count each Capital trade once.
+    """
     if store is None or not isinstance(diagnosis, dict) or not diagnosis.get('audited'):
         return {'saved': False}
     ctx = diagnosis.get('context') if isinstance(diagnosis.get('context'), dict) else {}
     fp = str(ctx.get('fingerprint') or '')
     if not fp:
         return {'saved': False, 'reason': 'no_fingerprint'}
+    undone = False
+    if prior and deal_id and str(prior.get('deal_id') or '') == str(deal_id):
+        undone = _scenario_memory_undo(store, prior)
     bag = _scenario_bag(store)
     row = dict(bag.get(fp) or {})
     row['fingerprint'] = fp
@@ -286,6 +371,8 @@ def scenario_memory_save(store, diagnosis: dict) -> dict:
     row['intermarket_status'] = ctx.get('intermarket_status')
     row['direction'] = ctx.get('direction')
     row['trigger'] = ctx.get('trigger')
+    # Snapshot whether a fix was already live BEFORE this observation.
+    fix_already = bool(row.get('fix_committed'))
     row['seen'] = int(row.get('seen') or 0) + 1
     mistakes = list(diagnosis.get('mistakes') or [])
     if mistakes:
@@ -296,14 +383,22 @@ def scenario_memory_save(store, diagnosis: dict) -> dict:
         row['mistake_counts'] = counts
         row['last_mistakes'] = mistakes
         row['last_notes'] = list(diagnosis.get('notes') or [])
+    bumped_waf = False
     if diagnosis.get('useful'):
         row['wins'] = int(row.get('wins') or 0) + 1
-        if row.get('fix_committed'):
+        if fix_already:
             row['wins_after_fix'] = int(row.get('wins_after_fix') or 0) + 1
+            bumped_waf = True
     if diagnosis.get('hurt'):
         row['losses'] = int(row.get('losses') or 0) + 1
+    deal_s = str(deal_id) if deal_id is not None else ''
+    if deal_s:
+        ids = [str(d) for d in (row.get('deal_ids') or []) if str(d) != deal_s]
+        ids.append(deal_s)
+        row['deal_ids'] = ids[-40:]
     row['last_pnl'] = diagnosis.get('pnl')
     row['last_source'] = diagnosis.get('source')
+    row['last_deal_id'] = deal_s or row.get('last_deal_id')
     row['updated_at'] = _now_iso()
     bag[fp] = row
     # Cap memory size.
@@ -314,7 +409,9 @@ def scenario_memory_save(store, diagnosis: dict) -> dict:
             reverse=True)
         bag = dict(ordered[:80])
     store.set(SCENARIOS_KEY, bag)
-    return {'saved': True, 'fingerprint': fp, 'seen': row['seen'], 'row': row}
+    return {'saved': True, 'fingerprint': fp, 'seen': row['seen'],
+            'row': row, 'undone_prior': undone,
+            'bumped_wins_after_fix': bumped_waf}
 
 
 def promote_gate(store, fingerprint: str, mistakes, *, n=PROMOTE_N) -> dict:
@@ -451,7 +548,9 @@ def _update_ready(store, diagnosis: dict) -> dict | None:
 def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
              mid=None, entry=None, exit=None, exit_reason=None,
-             source='shadow',
+             source='shadow', deal_id=None,
+             unit=None, currency=None, paper_pnl=None, price_pnl=None,
+             closed_at=None,
              apply_ohlc_penalties=True) -> dict:
     """Full loop: diagnose → memory → promote_gate → optional commit → ready."""
     diagnosis = diagnose(
@@ -462,7 +561,32 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if not diagnosis.get('audited'):
         return diagnosis
 
-    mem = scenario_memory_save(store, diagnosis)
+    # LIVE / Funds cash is account currency; shadow may pass explicit unit.
+    src_l = str(source or '').lower()
+    unit_s = str(unit or '').strip() or None
+    if unit_s not in ('price', 'account_currency', None):
+        unit_s = None
+    if unit_s is None and (src_l.startswith('live') or src_l in (
+            'broker', 'funds', 'capital', 'live_backfill', 'live_funds_mirror')):
+        unit_s = 'account_currency'
+    ccy_s = (str(currency).strip().upper() if currency else None) or None
+    paper_n = _finite(paper_pnl)
+    price_n = _finite(price_pnl)
+    if unit_s == 'account_currency' and paper_n is None:
+        paper_n = _finite(pnl)
+    if unit_s == 'price' and price_n is None:
+        price_n = _finite(pnl)
+
+    prior = None
+    deal_s = str(deal_id) if deal_id is not None else ''
+    if store is not None and deal_s:
+        for h in (store.get(HIST_KEY) or []):
+            if isinstance(h, dict) and str(h.get('deal_id') or '') == deal_s:
+                prior = h
+                break
+
+    mem = scenario_memory_save(
+        store, diagnosis, deal_id=deal_id, prior=prior)
     gate = {'ready': False}
     commit_result = {'applied': False, 'pending': False}
     if diagnosis.get('mistakes') and diagnosis.get('proposed_fix'):
@@ -477,18 +601,34 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
+    audited_at = _now_iso()
+    # Trade close time for 24h windows — never confuse with audit runtime.
+    closed_stamp = closed_at
+    if not closed_stamp and isinstance(prior, dict):
+        closed_stamp = prior.get('closed_at') or prior.get('at')
+    if not closed_stamp:
+        closed_stamp = audited_at
     out = {
         **diagnosis,
         'memory': mem,
         'promote_gate': gate,
         'fix': commit_result,
         'ready_for_live': ready,
-        'at': _now_iso(),
+        'at': audited_at,
+        'audited_at': audited_at,
+        'closed_at': closed_stamp,
+        'deal_id': deal_s or None,
+        'unit': unit_s,
+        'currency': ccy_s,
+        'paper_pnl': paper_n,
+        'price_pnl': price_n,
     }
     if store is not None:
         hist = list(store.get(HIST_KEY) or [])
-        hist.append({
-            'at': out['at'],
+        entry_row = {
+            'at': audited_at,  # legacy alias = audited_at
+            'audited_at': audited_at,
+            'closed_at': closed_stamp,
             'source': source,
             'pnl': diagnosis.get('pnl'),
             'direction': direction,
@@ -503,8 +643,21 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'committed': bool(commit_result.get('applied')),
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
-        })
-        store.set(HIST_KEY, hist[-120:])  # ~24h of closes for analysis
+            'deal_id': deal_s or None,
+            'unit': unit_s,
+            'currency': ccy_s,
+            'paper_pnl': paper_n,
+            'price_pnl': price_n,
+            'bumped_wins_after_fix': bool(
+                (mem or {}).get('bumped_wins_after_fix')),
+        }
+        # Re-audit after Funds £ correction must REPLACE the prior row for this
+        # deal — otherwise hist doubles and scenario repeat counters inflate.
+        if deal_s:
+            hist = [h for h in hist
+                    if not (isinstance(h, dict) and str(h.get('deal_id') or '') == deal_s)]
+        hist.append(entry_row)
+        store.set(HIST_KEY, hist[-200:])  # keep more than a dense 24h book
         store.set(LAST_KEY, {
             'at': out['at'],
             'source': source,
@@ -524,6 +677,13 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
             'ready_for_live': bool(ready),
+            'deal_id': deal_s or None,
+            'unit': unit_s,
+            'currency': ccy_s,
+            'paper_pnl': paper_n,
+            'price_pnl': price_n,
+            'closed_at': closed_stamp,
+            'audited_at': audited_at,
         })
         if diagnosis.get('mistakes'):
             store.event('shadow_mistake_audit', 'Mistake diagnosed', {
@@ -534,6 +694,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
                 'promote': gate.get('count'),
                 'need': gate.get('need'),
                 'committed': bool(commit_result.get('applied')),
+                'deal_id': deal_s or None,
             })
     return out
 
@@ -635,9 +796,11 @@ def lab_payload(store) -> dict:
                 continue
             seen_keys.add(key)
             merged.append(j)
-        # Newest first by at/closed stamp.
+        # Newest first by trade close time (not audit runtime).
         def _at_key(r):
-            return str((r or {}).get('at') or (r or {}).get('closed') or '')
+            return str((r or {}).get('closed_at')
+                       or (r or {}).get('closed')
+                       or (r or {}).get('at') or '')
         merged.sort(key=_at_key, reverse=True)
         recent_audits = merged[:24]
     if (not display_last or not display_last.get('pnl')) and recent_audits:
@@ -671,17 +834,24 @@ def lab_payload(store) -> dict:
             live_news = assess_news(
                 epic, cal, instrument_currencies=currencies) or {}
         except Exception:
-            live_news = {'status': 'UNCONFIGURED',
-                         'reason': 'Calendar not readable yet'}
+            live_news = {'status': 'NEWS_NA',
+                         'reason': 'Calendar optional — closes still analyse'}
     peer_n = 0
     ready_peers = 0
     if isinstance(live_im.get('peers'), list):
         peer_n = len(live_im['peers'])
         ready_peers = sum(1 for p in live_im['peers']
                           if isinstance(p, dict) and p.get('ready'))
+    # Honest lab labels: do not advertise WAITING as a gate for the cycle.
+    news_lab_status = str(live_news.get('status') or 'NEWS_NA')
+    if news_lab_status in ('UNCONFIGURED', 'WAITING', 'CALENDAR_UNAVAILABLE'):
+        news_lab_status = 'NEWS_NA'
+    peers_lab_status = str(live_im.get('status') or 'PEERS_NA')
+    if peers_lab_status in ('WAITING', 'UNCONFIGURED'):
+        peers_lab_status = 'PEERS_NA'
     return {
         'ok': True,
-        'loop': 'diagnose → scenario memory → targeted fix → promote → LIVE',
+        'loop': 'diagnose ALL Capital closes → memory → fix → promote → LIVE',
         'promote_n': PROMOTE_N,
         'ready_n': READY_N,
         'scenarios': len(bag),
@@ -690,14 +860,18 @@ def lab_payload(store) -> dict:
         'hurt_n': hurt_n,
         'window_24h': window_24h,
         'live_news': {
-            'status': live_news.get('status') or '—',
-            'reason': live_news.get('reason'),
+            'status': news_lab_status,
+            'reason': live_news.get('reason') or (
+                'context only — not a close gate' if news_lab_status == 'NEWS_NA'
+                else None),
             'entry_allowed': live_news.get('entry_allowed'),
             'event_at': live_news.get('event_at'),
         },
         'live_peers': {
-            'status': live_im.get('status') or 'WAITING',
-            'reason': live_im.get('reason'),
+            'status': peers_lab_status,
+            'reason': live_im.get('reason') or (
+                'context only — not a close gate' if peers_lab_status == 'PEERS_NA'
+                else None),
             'peer_n': peer_n,
             'ready_peers': ready_peers,
             'entry_allowed': live_im.get('entry_allowed'),
@@ -722,7 +896,11 @@ def lab_payload(store) -> dict:
 
 
 def _hist_window_stats(hist, *, hours=24) -> dict:
-    """Aggregate audit hist over a time window — wins and losses together."""
+    """Aggregate audit hist over a time window — wins and losses together.
+
+    Filter by ``closed_at`` (trade close), not ``audited_at`` / legacy ``at``.
+    Late Funds re-audits must not keep a 25h-old close inside “last 24h”.
+    """
     from datetime import timedelta
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=max(1, int(hours)))
@@ -733,10 +911,10 @@ def _hist_window_stats(hist, *, hours=24) -> dict:
     for h in hist or []:
         if not isinstance(h, dict):
             continue
-        at = h.get('at')
-        if at:
+        stamp = h.get('closed_at') or h.get('at')
+        if stamp:
             try:
-                dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+                dt = datetime.fromisoformat(str(stamp).replace('Z', '+00:00'))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 if dt < cutoff:
@@ -767,6 +945,7 @@ def _hist_window_stats(hist, *, hours=24) -> dict:
         'useful_n': useful_n,
         'hurt_n': hurt_n,
         'reads': 'wins+losses',
+        'filter': 'closed_at',
     }
 
 
@@ -788,7 +967,7 @@ def _journal_window_stats(store, *, hours=24) -> dict:
         rows = store.db.execute(
             "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
             "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
-            "ORDER BY closed DESC LIMIT 160").fetchall()
+            "ORDER BY closed DESC LIMIT 400").fetchall()
     except Exception:
         return empty
     wins = losses = scratch = 0

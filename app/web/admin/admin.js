@@ -3046,6 +3046,8 @@ $('brokerForm').onsubmit=async ev=>{
 };
 
 (async()=>{
+  const host=(location.hostname||'').toLowerCase();
+  const isLocal=host==='127.0.0.1'||host==='localhost'||host==='[::1]'||host.startsWith('127.');
   // Prefill from ?username=&password= (and strip secrets from the address bar).
   try{
     const q=new URLSearchParams(location.search||'');
@@ -3058,14 +3060,20 @@ $('brokerForm').onsubmit=async ev=>{
       history.replaceState({},'',clean);
     }
   }catch(_){}
-  try{await api('/api/admin/me');await enterDash();return}catch(_){}
-  // Local Windows Desk: no login form — mint cookie on 127.0.0.1 only.
-  const host=(location.hostname||'').toLowerCase();
-  if(host==='127.0.0.1'||host==='localhost'||host==='[::1]'){
-    try{await api('/api/admin/local-boot','POST');await enterDash();return}
-    catch(e){console.warn('local-boot',e)}
+  // Local Desk: never leave the operator staring at an empty login gate.
+  if(isLocal){
+    const attempts=[
+      async()=>{await api('/api/admin/me')},
+      async()=>{await api('/api/admin/local-boot','POST')},
+      async()=>{await api('/api/admin/login','POST',{username:'admin',password:'admin123'})},
+    ];
+    for(const step of attempts){
+      try{await step();await enterDash();return}catch(e){console.warn('local-open',e)}
+    }
+  }else{
+    try{await api('/api/admin/me');await enterDash();return}catch(_){}
   }
-  // Query creds fallback (if someone opens with ?username=admin&password=…).
+  // Query / form creds fallback.
   try{
     const form=$('loginForm');
     if(form){

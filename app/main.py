@@ -156,22 +156,56 @@ def require_auth(request:Request):
         raise HTTPException(401,'Login required')
     return True
 
+def _is_loopback_host(host: str|None) -> bool:
+    h=(host or '').strip().lower().strip('[]')
+    if not h:
+        return False
+    if h in ('127.0.0.1','::1','localhost','testclient','0.0.0.0'):
+        return True
+    # Windows / uvicorn often reports IPv4-mapped IPv6.
+    if h.startswith('::ffff:'):
+        return _is_loopback_host(h.split('::ffff:',1)[-1])
+    return h.startswith('127.')
+
 def _is_loopback_request(request:Request) -> bool:
     """True only for direct local Desk (Windows START.bat on this machine)."""
-    host=(request.client.host if request.client else '') or ''
-    if host in ('127.0.0.1','::1','localhost','testclient'):
+    peer=(request.client.host if request.client else '') or ''
+    if _is_loopback_host(peer):
         return True
-    # Host header may be 127.0.0.1:8765 while client is still loopback.
     hdr=(request.headers.get('host') or '').split(':')[0].strip().lower()
-    return hdr in ('127.0.0.1','localhost','[::1]') and host in (
-        '127.0.0.1','::1','localhost','testclient','')
+    return _is_loopback_host(hdr)
+
+def _mint_local_admin_token() -> str:
+    _bootstrap_admin()
+    admin=platform.first_admin()
+    if not admin:
+        user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
+        password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
+        admin=platform.ensure_admin(user,password)
+    return platform.create_session('admin',int(admin['id']))
+
+def _set_local_admin_cookie(response,token: str):
+    # Local HTTP must NOT use Secure cookies — browsers drop them on http://127.0.0.1.
+    response.set_cookie(ADMIN_COOKIE,token,httponly=True,samesite='lax',
+                        secure=False,path='/')
 
 def require_admin(request:Request):
     token=request.cookies.get(ADMIN_COOKIE)
     session=platform.get_session(token)
-    if not session or session.get('role')!='admin':
-        raise HTTPException(401,'Admin login required')
-    return session
+    if session and session.get('role')=='admin':
+        return session
+    # Loopback Desk: mint session on the fly so a dropped cookie cannot trap
+    # the operator on the login gate after START.bat.
+    if _is_loopback_request(request):
+        try:
+            tok=_mint_local_admin_token()
+            request.state.local_admin_token=tok  # type: ignore[attr-defined]
+            session=platform.get_session(tok)
+            if session and session.get('role')=='admin':
+                return session
+        except Exception:
+            logging.exception('loopback admin auto-session failed')
+    raise HTTPException(401,'Admin login required')
 
 def require_client(request:Request):
     token=request.cookies.get(CLIENT_COOKIE)
@@ -289,15 +323,7 @@ async def admin_page(request:Request):
     if session and session.get('role')=='admin':
         return resp
     try:
-        _bootstrap_admin()
-        admin=platform.first_admin()
-        if not admin:
-            user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
-            password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
-            admin=platform.ensure_admin(user,password)
-        tok=platform.create_session('admin',int(admin['id']))
-        resp.set_cookie(ADMIN_COOKIE,tok,httponly=True,samesite='strict',
-                        secure=cookie_secure(),path='/')
+        _set_local_admin_cookie(resp,_mint_local_admin_token())
     except Exception:
         logging.exception('admin local auto-session failed')
     return resp
@@ -475,17 +501,24 @@ async def admin_local_boot(request:Request):
     """Loopback-only: open Desk without typing password (Windows START.bat)."""
     if not _is_loopback_request(request):
         raise HTTPException(403,'Local boot only on 127.0.0.1')
-    _bootstrap_admin()
-    admin=platform.first_admin()
-    if not admin:
-        user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
-        password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
-        admin=platform.ensure_admin(user,password)
-    token=platform.create_session('admin',int(admin['id']))
+    token=_mint_local_admin_token()
+    admin=platform.first_admin() or {'username':'admin'}
     response=JSONResponse({
         'ok':True,'role':'admin','local_boot':True,
         'username':admin.get('username') or 'admin'})
-    _set_session_cookie(response,ADMIN_COOKIE,token)
+    _set_local_admin_cookie(response,token)
+    return response
+
+@app.middleware('http')
+async def _attach_loopback_admin_cookie(request:Request,call_next):
+    """If require_admin minted a loopback token, attach Set-Cookie on the way out."""
+    response=await call_next(request)
+    tok=getattr(request.state,'local_admin_token',None)
+    if tok and _is_loopback_request(request):
+        try:
+            _set_local_admin_cookie(response,tok)
+        except Exception:
+            pass
     return response
 
 @app.post('/api/admin/logout')

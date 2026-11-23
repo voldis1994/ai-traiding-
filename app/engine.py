@@ -4125,12 +4125,22 @@ class SingleTradeEngine:
         s=s.replace(',','.') if s.count(',')==1 and '.' not in s else s.replace(',','')
         return _num(s)
 
-    def _row_cash_pnl(self,row,details=None):
+    def _row_cash_pnl(self,row,details=None,*,prefer_funds=True):
+        """Closed-trade cash £ from Capital history — never UPL / SL-TP invent.
+
+        Capital.com TRADE rows (GET /history/transactions) expose ``pnl`` + ``cash``.
+        ``accounts.balance.profitLoss`` is the *open* account figure from
+        GET /accounts — do not treat it as a settled close here.
+        """
         details=details if isinstance(details,dict) else {}
-        # Prefer total realized £. Skip limitDistance-style fields — those are
-        # not closed P&L (Capital app "Limit +0.17" ≠ trade result).
-        for key in ('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
-                    'netAmount','netProfit','grossProfit','amount','profitLoss'):
+        # Funds settle first. Activity may only carry ``profit`` in details.
+        if prefer_funds:
+            keys=('pnl','cash','profitAndLoss','profit','realizedPnl','pl',
+                  'netAmount','netProfit','grossProfit','amount')
+        else:
+            keys=('profit','pnl','profitAndLoss','pl','realizedPnl','cash',
+                  'netAmount','netProfit','grossProfit','amount')
+        for key in keys:
             val=self._parse_cash_num(details.get(key))
             if val is None:val=self._parse_cash_num(row.get(key))
             if val is not None and math.isfinite(val):
@@ -4182,11 +4192,34 @@ class SingleTradeEngine:
         return kwargs
 
     async def _pnl_from_broker_history(self,deal_id,*,queued_at=None,exact_deal=False):
-        """Pull closed-trade cash from Capital history/activity (not mid×size)."""
+        """Pull closed-trade cash from Capital Funds first (not mid×size / UPL).
+
+        Source of truth = GET /history/transactions TRADE ``pnl``/``cash`` —
+        the same GBP Capital.com Funds shows. Activity is fallback only when
+        Funds has not settled the row yet.
+        """
         if not self.broker or not deal_id:return None
         deal=str(deal_id)
         look=self._history_lookback(deal,queued_at=queued_at)
-        # Activity often names the dealId on SL/TP/USER closes.
+        # 1) Capital Funds TRADE cash — matches phone Closed Positions £.
+        if hasattr(self.broker,'transactions'):
+            try:
+                kwargs=self._history_kwargs(look,tx_type='TRADE')
+                payload=await self.broker.transactions(**kwargs)
+                rows=list(payload.get('transactions') or [])
+                if not rows and look.get('from_time'):
+                    payload=await self.broker.transactions(
+                        last_period=86400,tx_type='TRADE')
+                    rows=list(payload.get('transactions') or [])
+                for row in rows:
+                    if not self._transaction_matches_deal(row,deal,exact=exact_deal):continue
+                    val=self._row_cash_pnl(row,prefer_funds=True)
+                    if val is not None:
+                        return float(val),self._cash_currency(row.get('currency'))
+            except Exception as exc:
+                self.store.event('warning','Transaction history P&L lookup failed',
+                                 {'type':type(exc).__name__,'deal_id':deal})
+        # 2) Activity fallback — often has dealId before Funds posts cash.
         if hasattr(self.broker,'activity'):
             try:
                 kwargs=self._history_kwargs(look,for_activity=True,deal_id=deal)
@@ -4205,29 +4238,12 @@ class SingleTradeEngine:
                 for row in rows:
                     if not self._activity_matches_deal(row,deal,exact=exact_deal):continue
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
-                    val=self._row_cash_pnl(row,details)
+                    val=self._row_cash_pnl(row,details,prefer_funds=False)
                     if val is not None:
                         return float(val),self._cash_currency(
                             row.get('currency') or details.get('currency'))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
-                                 {'type':type(exc).__name__,'deal_id':deal})
-        if hasattr(self.broker,'transactions'):
-            try:
-                kwargs=self._history_kwargs(look,tx_type='TRADE')
-                payload=await self.broker.transactions(**kwargs)
-                rows=list(payload.get('transactions') or [])
-                if not rows and look.get('from_time'):
-                    payload=await self.broker.transactions(
-                        last_period=86400,tx_type='TRADE')
-                    rows=list(payload.get('transactions') or [])
-                for row in rows:
-                    if not self._transaction_matches_deal(row,deal,exact=exact_deal):continue
-                    val=self._row_cash_pnl(row)
-                    if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
-            except Exception as exc:
-                self.store.event('warning','Transaction history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
         return None
 
@@ -4489,7 +4505,7 @@ class SingleTradeEngine:
         try:
             rows=self.store.db.execute(
                 'SELECT deal_id,epic,entry,exit,closed,pnl,pnl_source FROM trades '
-                'WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 80').fetchall()
+                'WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 240').fetchall()
         except Exception:
             return None
         for deal_id,j_epic,j_entry,j_exit,j_closed,j_pnl,j_src in rows:
@@ -4607,8 +4623,54 @@ class SingleTradeEngine:
             deal,pnl=float(pnl),direction=direction,entry=entry,
             source='live_funds_mirror')
 
+    # How far back Funds mirror rewrites already-closed journal £.
+    # Capital rejects >1d ranges — we page day chunks (see fetch helper).
+    FUNDS_MIRROR_DAYS=7
+
+    async def _fetch_capital_funds_trade_rows(self,*,days=None):
+        """Capital TRADE rows for Funds mirror — includes historical closes.
+
+        Pages ≤1 day windows (API rejects longer from/to). Day 0 also uses
+        ``lastPeriod=86400`` for the freshest phone Closed Positions window.
+        """
+        if not self.broker or not hasattr(self.broker,'transactions'):
+            return []
+        from .broker import capital_api_time
+        days=max(1,min(int(days if days is not None else self.FUNDS_MIRROR_DAYS),30))
+        now_utc=datetime.now(timezone.utc)
+        seen=set();out=[]
+        for i in range(days):
+            end=now_utc-timedelta(days=i)
+            start=end-timedelta(days=1)
+            try:
+                if i==0:
+                    payload=await self.broker.transactions(
+                        last_period=86400,tx_type='TRADE')
+                else:
+                    payload=await self.broker.transactions(
+                        from_time=capital_api_time(start),
+                        to_time=capital_api_time(end),
+                        last_period=None,tx_type='TRADE')
+            except Exception as exc:
+                self.store.event('warning','Capital Funds history page failed',
+                                 {'day':i,'type':type(exc).__name__})
+                continue
+            for tx in (payload.get('transactions') or []):
+                if not isinstance(tx,dict):
+                    continue
+                fp=self._tx_fingerprint(tx)
+                key=fp or ('anon:'+str(len(out)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(tx)
+        return out
+
     async def _mirror_capital_funds_closes(self):
-        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (last 24h).
+        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (incl. history).
+
+        Already-closed journal rows are rewritten when Funds £ differs
+        (UPL/confirm invent → real Capital cash; pence drift; zero-poison).
 
         1) Upgrade unsettled / stale journal deals with matched Capital cash.
         2) Fuzzy-bind Funds rows onto UUID closes when dealId refs miss
@@ -4618,12 +4680,11 @@ class SingleTradeEngine:
         if not self.broker or not hasattr(self.broker,'transactions'):
             return 0
         try:
-            payload=await self.broker.transactions(last_period=86400,tx_type='TRADE')
+            rows=await self._fetch_capital_funds_trade_rows()
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror fetch failed',
                              {'type':type(exc).__name__})
             return 0
-        rows=list(payload.get('transactions') or [])
         if not rows:
             return 0
         consumed=self._fuzzy_tx_consumed()

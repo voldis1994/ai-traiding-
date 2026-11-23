@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 255
+DESK_TRUTH_REV = 256
 
 
 def _finite_num(v):
@@ -1224,23 +1224,34 @@ class RuntimeHub:
                 except Exception:store=None
         if store is not None:
             try:
+                # Open P&L: Capital GET /accounts balance.profitLoss first
+                # (same figure as Capital.com phone). Fall back to position upl sum.
                 upl=None
-                pos_list=card.get('activity',{}).get('positions') or []
-                if not pos_list:
-                    one=card.get('activity',{}).get('position')
-                    pos_list=[one] if isinstance(one,dict) else []
-                vals=[]
-                for pos in pos_list:
-                    if not isinstance(pos,dict) or pos.get('upl') is None:
-                        continue
+                bal=((card.get('activity') or {}).get('balance') or {})
+                if isinstance(bal,dict) and bal.get('profitLoss') is not None:
                     try:
-                        u=float(pos['upl'])
+                        pl=float(bal['profitLoss'])
+                        if __import__('math').isfinite(pl):
+                            upl=pl
                     except (TypeError,ValueError):
-                        continue
-                    if __import__('math').isfinite(u):
-                        vals.append(u)
-                if vals:
-                    upl=sum(vals)
+                        upl=None
+                if upl is None:
+                    pos_list=card.get('activity',{}).get('positions') or []
+                    if not pos_list:
+                        one=card.get('activity',{}).get('position')
+                        pos_list=[one] if isinstance(one,dict) else []
+                    vals=[]
+                    for pos in pos_list:
+                        if not isinstance(pos,dict) or pos.get('upl') is None:
+                            continue
+                        try:
+                            u=float(pos['upl'])
+                        except (TypeError,ValueError):
+                            continue
+                        if __import__('math').isfinite(u):
+                            vals.append(u)
+                    if vals:
+                        upl=sum(vals)
                 card['results']=self._trade_stats(
                     store,card.get('account_currency'),open_upl=upl)
             except Exception as exc:

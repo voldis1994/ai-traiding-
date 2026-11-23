@@ -25,10 +25,30 @@ def new_brain(d):
 class FundsBroker:
     def __init__(self, tx=None):
         self.tx = list(tx or [])
+        self.calls = []
 
     async def transactions(self, *, last_period=600, from_time=None, to_time=None,
                            tx_type='TRADE'):
-        return {'transactions': list(self.tx)}
+        self.calls.append({
+            'last_period': last_period, 'from_time': from_time,
+            'to_time': to_time, 'tx_type': tx_type})
+        rows = list(self.tx)
+        # Optional day-window filter for historical page tests.
+        if from_time or to_time:
+            filtered = []
+            for row in rows:
+                stamp = str(row.get('dateUtc') or row.get('dateUTC')
+                            or row.get('date') or '')
+                if from_time and stamp and stamp[:19] < str(from_time)[:19]:
+                    continue
+                if to_time and stamp and stamp[:19] > str(to_time)[:19]:
+                    continue
+                filtered.append(row)
+            rows = filtered
+        elif last_period is not None:
+            # Fresh window — keep only recent stamps when present.
+            rows = list(self.tx)
+        return {'transactions': rows}
 
     async def activity(self, **kwargs):
         return {'activities': []}
@@ -355,4 +375,45 @@ def test_trade_stats_shows_mirrored_funds_rows():
                        for t in stats['recent_trades'])
             assert all(t['pnl_source'] == 'broker'
                        for t in stats['recent_trades'])
+    asyncio.run(scenario())
+
+
+def test_mirror_rewrites_historical_closed_trade_from_funds_pages():
+    """Already-closed journal £ from days ago is upgraded via multi-day Funds pages."""
+    async def scenario():
+        from datetime import datetime, timezone, timedelta
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            old = datetime.now(timezone.utc) - timedelta(days=3, hours=2)
+            stamp = old.replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
+            store.upsert_trade({
+                'dealId': 'deal-old', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 3600,
+            })
+            store.close_trade(
+                'deal-old', 3598.5, -0.40, currency='GBP',
+                source='upl_estimate', overwrite=True)
+            store.db.execute(
+                'UPDATE trades SET closed=?, opened=? WHERE deal_id=?',
+                (stamp, stamp, 'deal-old'))
+            store.db.commit()
+            broker = FundsBroker([{
+                'dealId': 'deal-old', 'instrumentName': 'Gold',
+                'pnl': -0.55, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 3600.0, 'closeLevel': 3598.5,
+                'dateUtc': stamp,
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n >= 1
+            # Multi-day paging must have asked for older from/to windows.
+            assert any(c.get('from_time') for c in broker.calls)
+            row = next(r for r in store.trades(8) if r['deal_id'] == 'deal-old')
+            assert row['pnl'] == pytest.approx(-0.55)
+            assert row['pnl_source'] == 'broker'
     asyncio.run(scenario())

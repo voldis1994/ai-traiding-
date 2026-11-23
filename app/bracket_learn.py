@@ -1083,16 +1083,11 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
     atr_v = _finite(atr)
     buffer = max(2.0 * tick_f, 2.0 * sp)
     if atr_v is not None and atr_v > 0:
-        buffer = max(buffer, 0.15 * atr_v)
+        # Audit only — ATR must not invent buffer or SL distance.
         out['atr_used'] = float(atr_v)
-    # Minimum protective distance: broker min + buffer, OR half ATR —
-    # never place a hairline SL that ATR noise will stop out immediately.
-    floor = mn + buffer if (mn + buffer) > 0 else tick_f
-    if atr_v is not None and atr_v > 0:
-        atr_floor = float(ATR_STOP_FLOOR_FRAC) * float(atr_v)
-        if atr_floor > floor:
-            floor = atr_floor
-        out['atr_floor'] = float(atr_floor)
+    # Capital min distance only. Buffer is applied on the candle; never
+    # invent entry±0.5×ATR and never fold buffer into this floor.
+    floor = mn if mn > 0 else tick_f
     kama_v = _finite(kama)
 
     path = structure_memory.normalise(candles, limit=80)
@@ -1118,19 +1113,24 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
 
     if not highs or not lows:
         # Still allow SL behind a confirmed entry zone when pivots are thin.
+        # OHLC zone ± buffer only — never invent entry±ATR floor or 2×risk TP.
         if action == 'BUY' and ez_sl is not None and ez_hi is not None:
-            stop_level = min(float(ez_sl) - buffer, entry_f - floor)
-            risk = max(entry_f - stop_level, floor)
-            profit_level = entry_f + max(2.0 * risk, float(ez_hi) - entry_f + buffer)
+            stop_level = float(ez_sl) - buffer
+            profit_level = float(ez_hi) + buffer
+            if stop_level >= entry_f or profit_level <= entry_f:
+                return dict(out, reason='zone_behind_wrong_side',
+                            bos_event=bos.get('event'))
             picked = {
                 'stop_level': stop_level, 'profit_level': profit_level,
                 'swing_lo': float(ez_sl), 'swing_hi': float(ez_hi),
                 'reason': 'zone_behind_only',
             }
         elif action == 'SELL' and ez_sl is not None and ez_lo is not None:
-            stop_level = max(float(ez_sl) + buffer, entry_f + floor)
-            risk = max(stop_level - entry_f, floor)
-            profit_level = entry_f - max(2.0 * risk, entry_f - float(ez_lo) + buffer)
+            stop_level = float(ez_sl) + buffer
+            profit_level = float(ez_lo) - buffer
+            if stop_level <= entry_f or profit_level >= entry_f:
+                return dict(out, reason='zone_behind_wrong_side',
+                            bos_event=bos.get('event'))
             picked = {
                 'stop_level': stop_level, 'profit_level': profit_level,
                 'swing_lo': float(ez_lo), 'swing_hi': float(ez_sl),
@@ -1144,29 +1144,29 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
             floor=floor, buffer=buffer)
         if picked is None:
             if action == 'BUY' and ez_sl is not None:
-                z_h = float(ez_hi) if ez_hi is not None else entry_f + 2.0 * floor
-                stop_level = min(float(ez_sl) - buffer, entry_f - floor)
-                risk = max(entry_f - stop_level, floor)
+                stop_level = float(ez_sl) - buffer
                 opp = [s for s in highs if float(s['price']) >= entry_f + floor]
-                profit_level = float(min(opp, key=lambda s: float(s['price']))['price']) if opp else (
-                    entry_f + max(2.0 * risk, z_h - entry_f + buffer))
+                if not opp or stop_level >= entry_f:
+                    return dict(out, reason='no_structural_swings_for_entry',
+                                bos_event=bos.get('event'))
+                profit_level = float(min(opp, key=lambda s: float(s['price']))['price'])
                 picked = {
                     'stop_level': stop_level, 'profit_level': profit_level,
                     'swing_lo': float(ez_sl),
-                    'swing_hi': float(opp[0]['price']) if opp else profit_level,
+                    'swing_hi': float(profit_level),
                     'reason': 'zone_behind_fallback',
                 }
             elif action == 'SELL' and ez_sl is not None:
-                z_l = float(ez_lo) if ez_lo is not None else entry_f - 2.0 * floor
-                stop_level = max(float(ez_sl) + buffer, entry_f + floor)
-                risk = max(stop_level - entry_f, floor)
+                stop_level = float(ez_sl) + buffer
                 opp = [s for s in lows if float(s['price']) <= entry_f - floor]
-                profit_level = float(max(opp, key=lambda s: float(s['price']))['price']) if opp else (
-                    entry_f - max(2.0 * risk, entry_f - z_l + buffer))
+                if not opp or stop_level <= entry_f:
+                    return dict(out, reason='no_structural_swings_for_entry',
+                                bos_event=bos.get('event'))
+                profit_level = float(max(opp, key=lambda s: float(s['price']))['price'])
                 picked = {
                     'stop_level': stop_level, 'profit_level': profit_level,
                     'swing_hi': float(ez_sl),
-                    'swing_lo': float(opp[0]['price']) if opp else profit_level,
+                    'swing_lo': float(profit_level),
                     'reason': 'zone_behind_fallback',
                 }
             else:
@@ -1189,9 +1189,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     swing_hi=picked.get('swing_hi'), swing_lo=picked.get('swing_lo'))
 
     # Prefer a closer protective swing when one exists inside the multi-TF
-    # soft cap — but NEVER rewrite to entry ± median, NEVER go below ATR floor,
-    # and NEVER refuse a real structural swing just because it is wider than
-    # the zone median.
+    # soft cap — but NEVER rewrite to entry ± median / ATR, and NEVER refuse
+    # a real structural swing just because it is wider than the zone median.
     z = zone if isinstance(zone, dict) else {}
     zone_sl = _finite(z.get('range_distance')) or _finite(z.get('noise_distance'))
     if zone_sl is not None and zone_sl > 0 and stop_d > STRUCTURE_VS_MEDIAN_CAP * float(zone_sl):
@@ -1237,11 +1236,11 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 out['kama_stop'] = True
                 picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
 
-    # Demand/Supply base: SL behind the zone box (not on the edge).
-    # If broker/ATR floor needs more room, push *further* behind — never into zone.
+    # Demand/Supply base: SL behind the zone box (OHLC ± buffer only).
+    # Never invent entry±ATR floor — if zone is hairline vs floor, later refuse.
     out['zone_sl'] = str(picked.get('reason') or '').startswith('zone_behind')
     if action == 'BUY' and ez_sl is not None:
-        zone_stop = min(float(ez_sl) - buffer, entry_f - floor)
+        zone_stop = float(ez_sl) - buffer
         if zone_stop < entry_f and zone_stop <= stop_level + 1e-12:
             stop_level = zone_stop
             stop_d = entry_f - stop_level
@@ -1250,7 +1249,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 picked['reason'] = (picked.get('reason') or 'swing_levels') + '+zone_behind'
             picked['swing_lo'] = float(ez_sl)
     elif action == 'SELL' and ez_sl is not None:
-        zone_stop = max(float(ez_sl) + buffer, entry_f + floor)
+        zone_stop = float(ez_sl) + buffer
         if zone_stop > entry_f and zone_stop >= stop_level - 1e-12:
             stop_level = zone_stop
             stop_d = stop_level - entry_f

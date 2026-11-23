@@ -26,6 +26,7 @@ def _finite(v):
 
 
 def _buf(tick=0.01, spread=0., atr=None):
+    """Broker tick/spread buffer only — ATR must not invent SL/TP distance."""
     try:
         tick_f = max(float(tick or 0.01), 1e-9)
     except (TypeError, ValueError):
@@ -35,21 +36,17 @@ def _buf(tick=0.01, spread=0., atr=None):
     except (TypeError, ValueError):
         sp = 0.
     b = max(2.0 * tick_f, 2.0 * sp)
-    atr_v = _finite(atr)
-    if atr_v is not None and atr_v > 0:
-        b = max(b, 0.15 * atr_v)
+    atr_v = _finite(atr)  # audited only; never widens buffer/floor
     return b, tick_f, sp, atr_v
 
 
-def _floor(min_distance, buffer, atr_v, atr_frac=0.5):
+def _floor(min_distance, buffer=None, atr_v=None, atr_frac=None):
+    """Capital min stop/profit distance only. Buffer sits on the candle edge;
+    ATR never belongs here."""
     try:
-        mn = max(float(min_distance or 0), 0.)
+        return max(float(min_distance or 0), 0.)
     except (TypeError, ValueError):
-        mn = 0.
-    floor = mn + buffer if (mn + buffer) > 0 else buffer
-    if atr_v is not None and atr_v > 0:
-        floor = max(floor, float(atr_frac) * float(atr_v))
-    return floor
+        return 0.
 
 
 def _min_rr(store=None):
@@ -69,20 +66,27 @@ def _zones_pair(zones):
     return demand, supply
 
 
-def _sl_behind_box(action, entry, box, *, buffer, floor):
+def _ohlc_stop(action, anchor, *, entry, buffer):
+    """SL on real OHLC anchor ± buffer only — never invent entry ± floor."""
+    ax = _finite(anchor)
+    if ax is None:
+        return None
+    if action == 'BUY':
+        stop = float(ax) - float(buffer)
+        return stop if stop < float(entry) else None
+    stop = float(ax) + float(buffer)
+    return stop if stop > float(entry) else None
+
+
+def _sl_behind_box(action, entry, box, *, buffer, floor=None):
+    """SL behind demand/supply box. ``floor`` is ignored (filter at caller)."""
     if not isinstance(box, dict):
         return None
     if action == 'BUY':
         anchor = _finite(box.get('sl_anchor')) or _finite(box.get('lo'))
-        if anchor is None:
-            return None
-        stop = min(float(anchor) - buffer, float(entry) - floor)
-        return stop if stop < entry else None
+        return _ohlc_stop('BUY', anchor, entry=entry, buffer=buffer)
     anchor = _finite(box.get('sl_anchor')) or _finite(box.get('hi'))
-    if anchor is None:
-        return None
-    stop = max(float(anchor) + buffer, float(entry) + floor)
-    return stop if stop > entry else None
+    return _ohlc_stop('SELL', anchor, entry=entry, buffer=buffer)
 
 
 def _range_levels(scenario):
@@ -235,7 +239,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 below = [s for s in highs if float(s['price']) <= entry_f]
                 br = float(max(below, key=lambda s: float(s['price']))['price']) if below else None
             if br is not None:
-                stop = min(float(br) - buffer, entry_f - floor)
+                stop = _ohlc_stop('BUY', br, entry=entry_f, buffer=buffer)
             mm = _measured_move('BUY', entry_f, r_lo, r_hi)
             if mm is not None:
                 candidates.append(mm)
@@ -251,7 +255,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                 above = [s for s in lows if float(s['price']) >= entry_f]
                 br = float(min(above, key=lambda s: float(s['price']))['price']) if above else None
             if br is not None:
-                stop = max(float(br) + buffer, entry_f + floor)
+                stop = _ohlc_stop('SELL', br, entry=entry_f, buffer=buffer)
             mm = _measured_move('SELL', entry_f, r_lo, r_hi)
             if mm is not None:
                 candidates.append(mm)
@@ -265,12 +269,10 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             edge = r_lo if r_lo is not None else (
                 _finite((demand or {}).get('lo')) if demand else None)
             if edge is not None:
-                stop = min(float(edge) - buffer, entry_f - floor)
-                zone_sl = True
+                stop = _ohlc_stop('BUY', edge, entry=entry_f, buffer=buffer)
+                zone_sl = stop is not None
             if r_lo is not None and r_hi is not None:
-                # TP1 = 75% of the real range box (OHLC geometry); TP2 = opposite edge.
-                span = float(r_hi) - float(r_lo)
-                candidates.append(float(r_lo) + 0.75 * span)
+                # TP = opposite range edge (real OHLC), not invented mid/%.
                 candidates.append(float(r_hi))
             if isinstance(supply, dict):
                 candidates.append(supply.get('lo'))
@@ -280,11 +282,9 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             edge = r_hi if r_hi is not None else (
                 _finite((supply or {}).get('hi')) if supply else None)
             if edge is not None:
-                stop = max(float(edge) + buffer, entry_f + floor)
-                zone_sl = True
+                stop = _ohlc_stop('SELL', edge, entry=entry_f, buffer=buffer)
+                zone_sl = stop is not None
             if r_lo is not None and r_hi is not None:
-                span = float(r_hi) - float(r_lo)
-                candidates.append(float(r_hi) - 0.75 * span)
                 candidates.append(float(r_lo))
             if isinstance(demand, dict):
                 candidates.append(demand.get('hi'))
@@ -311,17 +311,19 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
         if stop is None:
             if action == 'BUY' and lows:
-                cands = [s for s in lows if float(s['price']) <= entry_f - floor]
+                cands = [s for s in lows if float(s['price']) < entry_f]
                 if cands:
-                    stop = min(
-                        float(max(cands, key=lambda s: float(s['price']))['price']) - buffer,
-                        entry_f - floor)
+                    stop = _ohlc_stop(
+                        'BUY',
+                        float(max(cands, key=lambda s: float(s['price']))['price']),
+                        entry=entry_f, buffer=buffer)
             elif action == 'SELL' and highs:
-                cands = [s for s in highs if float(s['price']) >= entry_f + floor]
+                cands = [s for s in highs if float(s['price']) > entry_f]
                 if cands:
-                    stop = max(
-                        float(min(cands, key=lambda s: float(s['price']))['price']) + buffer,
-                        entry_f + floor)
+                    stop = _ohlc_stop(
+                        'SELL',
+                        float(min(cands, key=lambda s: float(s['price']))['price']),
+                        entry=entry_f, buffer=buffer)
         zone_sl = stop is not None and box is not None
         candidates.extend(swings)
         if action == 'BUY' and isinstance(supply, dict):
@@ -336,9 +338,8 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             if edge is None and lows:
                 edge = float(min(lows, key=lambda s: float(s['price']))['price'])
             if edge is not None:
-                stop = min(float(edge) - buffer, entry_f - floor)
+                stop = _ohlc_stop('BUY', edge, entry=entry_f, buffer=buffer)
             if r_lo is not None and r_hi is not None:
-                candidates.append(0.5 * (float(r_lo) + float(r_hi)))
                 candidates.append(float(r_hi))
             candidates.extend(swings)
             reason = 'fakeout_fade_buy'
@@ -347,9 +348,8 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             if edge is None and highs:
                 edge = float(max(highs, key=lambda s: float(s['price']))['price'])
             if edge is not None:
-                stop = max(float(edge) + buffer, entry_f + floor)
+                stop = _ohlc_stop('SELL', edge, entry=entry_f, buffer=buffer)
             if r_lo is not None and r_hi is not None:
-                candidates.append(0.5 * (float(r_lo) + float(r_hi)))
                 candidates.append(float(r_lo))
             candidates.extend(swings)
             reason = 'fakeout_fade_sell'
@@ -361,13 +361,19 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         zone_sl = stop is not None
         if stop is None:
             if action == 'BUY' and lows:
-                cands = [s for s in lows if float(s['price']) <= entry_f - floor]
+                cands = [s for s in lows if float(s['price']) < entry_f]
                 if cands:
-                    stop = float(max(cands, key=lambda s: float(s['price']))['price']) - buffer
+                    stop = _ohlc_stop(
+                        'BUY',
+                        float(max(cands, key=lambda s: float(s['price']))['price']),
+                        entry=entry_f, buffer=buffer)
             elif action == 'SELL' and highs:
-                cands = [s for s in highs if float(s['price']) >= entry_f + floor]
+                cands = [s for s in highs if float(s['price']) > entry_f]
                 if cands:
-                    stop = float(min(cands, key=lambda s: float(s['price']))['price']) + buffer
+                    stop = _ohlc_stop(
+                        'SELL',
+                        float(min(cands, key=lambda s: float(s['price']))['price']),
+                        entry=entry_f, buffer=buffer)
         # Prior HH / next structure for BUY; prior LL for SELL.
         candidates.extend(swings)
         if action == 'BUY' and isinstance(supply, dict):
@@ -377,26 +383,29 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         reason = 'trend_zone_' + action.lower()
 
     if stop is None:
-        # Last resort SL still from a real extreme of recent path — not entry±κ.
+        # Last resort SL still from a real extreme of recent path — not entry±κ/ATR.
         if path:
             if action == 'BUY':
-                stop = min(b['low'] for b in path[-12:]) - buffer
-                stop = min(stop, entry_f - floor)
+                stop = _ohlc_stop(
+                    'BUY', min(b['low'] for b in path[-12:]),
+                    entry=entry_f, buffer=buffer)
             else:
-                stop = max(b['high'] for b in path[-12:]) + buffer
-                stop = max(stop, entry_f + floor)
-        else:
+                stop = _ohlc_stop(
+                    'SELL', max(b['high'] for b in path[-12:]),
+                    entry=entry_f, buffer=buffer)
+        if stop is None:
             return dict(out, reason='no_structural_sl', regime=name)
 
+    # OHLC stop as-is. Broker min only skips levels Capital cannot accept —
+    # never invent entry±ATR, never drop a real candle level for ATR noise.
     if action == 'BUY':
-        stop = min(float(stop), entry_f - floor)
-        stop_d = entry_f - stop
+        stop_d = entry_f - float(stop)
     else:
-        stop = max(float(stop), entry_f + floor)
-        stop_d = stop - entry_f
-    if stop_d < floor:
-        return dict(out, reason='regime_sl_below_floor',
-                    stop_distance=stop_d, stop_level=float(stop), regime=name)
+        stop_d = float(stop) - entry_f
+    if floor > 0 and stop_d + 1e-12 < floor:
+        return dict(out, reason='regime_sl_below_broker_min',
+                    stop_distance=float(stop_d), stop_level=float(stop),
+                    regime=name)
 
     tp1, tp2, structural_rr = _pick_tp_ladder(
         action, entry_f, candidates=candidates, risk=stop_d,
@@ -416,8 +425,8 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
     else:
         tp1_d = entry_f - tp1
         tp2_d = entry_f - tp2
-    if tp2_d < floor:
-        return dict(out, reason='regime_tp_below_floor',
+    if floor > 0 and tp2_d + 1e-12 < floor:
+        return dict(out, reason='regime_tp_below_broker_min',
                     stop_distance=stop_d, stop_level=float(stop),
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 

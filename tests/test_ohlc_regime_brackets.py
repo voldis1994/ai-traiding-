@@ -128,8 +128,10 @@ def test_regime_refuses_when_atr_floor_makes_tp_shorter_than_sl():
         assert float(br.get('rr') or 0) + 1e-9 >= 1.0
     else:
         assert br.get('reason') in (
-            'regime_rr_below_one', 'no_structural_tp', 'regime_tp_below_floor',
-            'regime_sl_below_floor', 'no_structural_sl')
+            'regime_rr_below_one', 'no_structural_tp',
+            'regime_tp_below_broker_min', 'regime_sl_below_broker_min',
+            'regime_tp_below_floor', 'regime_sl_below_floor',
+            'no_structural_sl')
 
 
 def test_decide_never_accepts_regime_rr_below_one(monkeypatch):

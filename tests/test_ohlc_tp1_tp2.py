@@ -51,10 +51,14 @@ def test_range_tp1_is_box_geometry_not_invented_kappa():
         candles=rows, entry=entry, action='BUY', scenario=sc, zones=None,
         trigger='zone', tick=0.1, spread=0.2, min_distance=0.5, atr=1.0)
     assert br['ready'] is True
-    # 75% of real range box = 100 + 0.75*10 = 107.5; TP2 = opposite edge 110.
-    assert float(br['tp1_level']) == pytest.approx(107.5, abs=0.2)
+    # Broker TP2 = opposite range edge (real OHLC). No invented κ×SL / 75% mid.
     assert float(br['tp2_level']) == pytest.approx(110.0, abs=0.2)
     assert float(br['profit_level']) == pytest.approx(float(br['tp2_level']))
+    assert float(br['tp1_level']) > entry
+    assert float(br['tp1_level']) <= float(br['tp2_level']) + 1e-9
+    # Must not be formula entry + κ×risk (κ=2 → 101+2×1.4=103.8).
+    invent = entry + 2.0 * float(br['stop_distance'])
+    assert abs(float(br['tp2_level']) - invent) > 0.5
 
 
 def test_decide_brackets_passes_tp_ladder_without_inventing_rr():

@@ -107,3 +107,58 @@ def test_decide_brackets_prefers_regime_source():
     assert decided.get('ready') is True
     assert decided.get('source') == 'regime_brackets'
     assert float(decided['stop_level']) < float(buy['lo']) + 1e-6
+    # SL vs TP geometry: TP distance must never be shorter than SL.
+    assert float(decided['profit_distance']) + 1e-9 >= float(decided['stop_distance'])
+
+
+def test_regime_refuses_when_atr_floor_makes_tp_shorter_than_sl():
+    """Wide ATR floor must not ship inverted risk (TP < SL)."""
+    rows, mid = supply_zone_path(confirm=True)
+    zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
+    entry = float(rows[-1]['close'])
+    sc = dict(osc.classify(rows, mid=entry, zones=zones, tick=0.1),
+              scenario='RETEST_UP')
+    # Large ATR → stop floor can exceed structural TP distance.
+    br = orb.regime_brackets(
+        candles=rows, entry=entry, action='BUY', scenario=sc, zones=zones,
+        entry_zone=zones.get('buy_entry'), trigger='zone', tick=0.1,
+        spread=0.2, min_distance=0.5, atr=8.0)
+    if br.get('ready'):
+        assert float(br['profit_distance']) + 1e-9 >= float(br['stop_distance'])
+        assert float(br.get('rr') or 0) + 1e-9 >= 1.0
+    else:
+        assert br.get('reason') in (
+            'regime_rr_below_one', 'no_structural_tp', 'regime_tp_below_floor',
+            'regime_sl_below_floor', 'no_structural_sl')
+
+
+def test_decide_never_accepts_regime_rr_below_one(monkeypatch):
+    """structural_tp must not bypass RR<1 after snap/ATR widen."""
+    rows, mid = demand_zone_path(confirm=True)
+    zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
+    buy = zones.get('buy_entry')
+    entry = (float(buy['lo']) + float(buy['hi'])) / 2 if buy else mid
+    fake = {
+        'ready': True, 'source': 'regime_brackets', 'reason': 'fake_wide_sl',
+        'stop_distance': 8.0, 'profit_distance': 7.0,
+        'stop_level': entry - 8.0, 'profit_level': entry + 7.0,
+        'tp1_level': entry + 3.5, 'tp2_level': entry + 7.0,
+        'kappa': 7 / 8, 'min_rr': 2.0, 'rr': 7 / 8,
+        'structural_tp': True, 'structural_rr': False,
+        'zone_sl': True, 'zone_tp': True, 'regime': 'RETEST_UP',
+        'scale_out_frac': 0.5, 'tp_ladder': True,
+    }
+    monkeypatch.setattr(orb, 'regime_brackets', lambda **kw: fake)
+    z = bracket_learn.zone_at_open(rows, multi_tf=True)
+    decided = bracket_learn.decide_brackets_from_ohlc(
+        z, tick=0.1, spread=0.2, min_distance=0.5, entry=entry, action='BUY',
+        candles=rows, atr=1.0, require_swing=True, entry_zone=buy,
+        scenario={'scenario': 'RETEST_UP'}, zones=zones, trigger='zone')
+    # Must not ship regime with TP < SL; swing fallback or refuse.
+    if decided.get('ready'):
+        assert float(decided['profit_distance']) + 1e-9 >= float(
+            decided['stop_distance'])
+        if decided.get('source') == 'regime_brackets':
+            raise AssertionError('regime with RR<1 must not be ready')
+    else:
+        assert decided.get('source') in ('swing_anchor', 'regime_brackets')

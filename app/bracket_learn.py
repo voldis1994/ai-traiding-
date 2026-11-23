@@ -1446,10 +1446,18 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             min_rr_need = float(regime.get('min_rr') or _min_rr(store))
             min_rr_need = max(1.0, min(3.0, min_rr_need))
             rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
-            # Do NOT stretch TP to invented min_rr price. Prefer structural OHLC;
-            # if RR is soft, still accept when regime marked structural_tp.
-            structural_ok = bool(regime.get('structural_tp'))
-            rr_ok = rr_now + 1e-12 >= min_rr_need or structural_ok
+            # Do NOT stretch TP to invented min_rr price. Prefer structural OHLC.
+            # structural_tp used to bypass min_rr entirely — that accepted RR<1
+            # (TP shorter than SL) after ATR floor widened the stop. Honest rule:
+            #   • RR < 1.0 → never accept (inverted risk)
+            #   • 1.0 ≤ RR < min_rr → allow only real OHLC structure
+            #   • RR ≥ min_rr → always ok
+            if rr_now + 1e-12 < 1.0:
+                rr_ok = False
+            elif rr_now + 1e-12 >= min_rr_need:
+                rr_ok = True
+            else:
+                rr_ok = bool(regime.get('structural_tp') or regime.get('structural_rr'))
             if (rr_ok and levels_correct_side(
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level) and distances_meet_broker_min(

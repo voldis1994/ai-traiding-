@@ -18,7 +18,7 @@ from tests.test_learning_integrity import new_brain
 
 
 def test_upl_never_becomes_realized_cash():
-    """UPL may provisional-journal — source must stay upl_estimate, never broker."""
+    """UPL must not settle peļņa — wait for Capital Funds £."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -27,8 +27,8 @@ def test_upl_never_becomes_realized_cash():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:reg1',{'upl':1.25,'currency':'GBP'})
             pnl,src,_=await e._resolve_broker_pnl('reg1',{})
-            assert pnl==pytest.approx(1.25)
-            assert src=='upl_estimate'
+            assert pnl is None
+            assert src=='pending_broker_pnl'
             assert src!='broker'
     asyncio.run(scenario())
 

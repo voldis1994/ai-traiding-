@@ -315,10 +315,173 @@ function setView(name){
   if(name==='desk'){
     lastDeskChartKey='';
     if(lastOverview)renderDesk(lastOverview).catch(()=>{});
+  }else if(name==='shadow'){
+    if(lastOverview)renderShadowLab(pickDeskFocus(lastOverview.clients||[]));
   }else if(lastOverview){
     // redraw perf when leaving desk so chart sizes correctly in viewport
     try{drawPerfChart(lastOverview.clients)}catch(_){}
   }
+}
+
+function shadowLab(client){
+  const a=(client&&client.activity)||{};
+  const ds=deskSystem(client);
+  return (ds.shadow_lab&&typeof ds.shadow_lab==='object')?ds.shadow_lab
+    :(a.self_development&&typeof a.self_development==='object'
+      ?{paper:a.self_development.shadow_paper||{},hold_shadow:a.self_development.hold_shadow||{},
+        structure_shadow:a.self_development.structure_shadow||{},
+        shadow_active:!!a.self_development.shadow_active}:{})
+}
+
+function _shadowKv(label,val,cls){
+  const v=(val==null||val==='')?'—':String(val);
+  return `<div class="desk-kv"><span>${esc(label)}</span><strong class="${esc(cls||'')}">${esc(v)}</strong></div>`;
+}
+
+function renderShadowLab(client){
+  const board=$('shadowBoard');
+  const truth=$('shadowTruth');
+  const pulseEl=$('shadowPulse');
+  if(!board)return;
+  if(!client){
+    if(truth)stableHtml(truth,'Select an account on TERMINAL — SHADOW follows the focused robot.');
+    if(pulseEl)pulseEl.textContent='● —';
+    stableHtml(board,'<div class="psx-empty">No focused client</div>');
+    return;
+  }
+  const lab=shadowLab(client);
+  const paper=lab.paper||{};
+  const hold=lab.hold_shadow||{};
+  const struct=lab.structure_shadow||{};
+  const trial=lab.trial||{};
+  const last=lab.self_dev_last||{};
+  const evo=lab.evolution||{};
+  const truthInfo=lab.truth||{};
+  const pulse=lab.pulse||'IDLE';
+  if(pulseEl){
+    pulseEl.textContent='● '+pulse;
+    pulseEl.className='psx-live shadow-pulse-pill '+pulse;
+  }
+  if(truth){
+    const hundred=truthInfo.hundred_variations===true;
+    stableHtml(truth,
+      `<strong>Does it run 100 variations?</strong> `
+      +`<b>${hundred?'YES':'NO — not today'}</b>. `
+      +esc(truthInfo.what_runs||(
+        'One shadow neural + paper SL/TP book; ~30 policy edge candidates; '
+        +'self-params trials; HOLD opposite replay. Not a 100-parallel sweep.'))
+      +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
+      +(lab.shadow_active?' · shadow neural <b>ON</b>':' · shadow neural <b>off / booting</b>'));
+  }
+  const net=paper.paper_net!=null?Number(paper.paper_net):null;
+  const netCls=net==null?'neu':(net>=0?'ok':'bad');
+  const netTxt=net==null?'—':((net>=0?'+':'')+num(net,2));
+  const open=paper.open&&typeof paper.open==='object'?paper.open:null;
+  const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
+  const recent=Array.isArray(paper.recent)?paper.recent:[];
+  const openTxt=open
+    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${open.sl!=null?num(open.sl,2):'—'} · TP ${open.tp!=null?num(open.tp,2):'—'}`)
+    :(pending?`pending ${String(pending.direction||'?').toUpperCase()}`:'flat');
+  const rowsHtml=recent.length?recent.map(r=>{
+    const dir=String(r.direction||'?').toUpperCase();
+    const dcls=(dir==='BUY'||dir==='LONG')?'buy':'sell';
+    const pnl=r.paper_pnl!=null?Number(r.paper_pnl):null;
+    const pcls=pnl==null?'':(pnl>=0?'ok':'bad');
+    const pnlTxt=pnl==null?'—':((pnl>=0?'+':'')+num(pnl,2));
+    const when=r.at?String(r.at).replace('T',' ').slice(0,16):'—';
+    return `<div class="shadow-row">
+      <span class="dir ${dcls}">${dir==='BUY'||dir==='LONG'?'▲ BUY':'▼ SELL'}</span>
+      <span class="mut">${esc(r.exit_reason||'close')} · ${esc(when)}</span>
+      <span class="mut">${esc(num(r.entry,2))}→${esc(num(r.exit,2))}</span>
+      <strong class="pnl ${pcls}">${esc(pnlTxt)}</strong>
+    </div>`;
+  }).join(''):'<div class="psx-empty">No paper closes yet — waiting for shadow fills</div>';
+  const top=(struct.top||[]).slice(0,4).map(b=>{
+    if(!b||typeof b!=='object')return '';
+    return `<div class="shadow-note">${esc(b.key||b.structure||'bucket')} · SL ${esc(b.sl_count||0)} / n ${esc(b.samples||b.n||0)}</div>`;
+  }).filter(Boolean).join('')||'<div class="shadow-note">No structure graves yet</div>';
+  const advice=struct.last_advice&&typeof struct.last_advice==='object'
+    ?`${struct.last_advice.structure||'—'} × ${struct.last_advice.side||struct.last_advice.direction||'—'} → ${struct.last_advice.action||struct.last_advice.advice||'—'}`
+    :'—';
+  const promoteCls=last.promote?'ok':(last.rollback?'bad':'neu');
+  const promoteTxt=last.promote?'PROMOTE':(last.rollback?'ROLLBACK':(last.reason?'HOLD':'—'));
+  stableHtml(board,`
+    <article class="shadow-card">
+      <div class="psx-h"><h2>PAPER BOOK</h2><span class="psx-src">SHADOW £</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Paper £',netTxt,netCls)}
+          ${_shadowKv('Cash trades',paper.cash_trades!=null?paper.cash_trades:(paper.trades||0))}
+          ${_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)}
+          ${_shadowKv('Open',openTxt)}
+        </div>
+        <div class="shadow-note">SL/TP only — never places LIVE broker orders.</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>SELF-DEV</h2><span class="psx-src">PROMOTE</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Last decision',promoteTxt,promoteCls)}
+          ${_shadowKv('Shadow n',last.shadow_neurons!=null?last.shadow_neurons:'—')}
+          ${_shadowKv('Paper samples',last.paper_cash_samples!=null?last.paper_cash_samples:'—')}
+          ${_shadowKv('Live samples',last.live_samples!=null?last.live_samples:'—')}
+        </div>
+        <div class="shadow-note">${esc(last.reason||evo.last_reason||'Waiting for aligned £ windows')}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>PARAM TRIAL</h2><span class="psx-src">SELF PARAMS</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Trial',trial.active?'ACTIVE':'off',trial.active?'ok':'neu')}
+          ${_shadowKv('Trial id',trial.trial_id||'—')}
+          ${_shadowKv('Horizon',trial.horizon!=null?trial.horizon:'—')}
+          ${_shadowKv('Queued events',trial.pending_events!=null?trial.pending_events:0)}
+        </div>
+        <div class="shadow-note">${esc(trial.draft&&trial.draft.note?trial.draft.note:(trial.active?'Frozen knobs under evaluation':'No active param trial'))}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>POLICY SEARCH</h2><span class="psx-src">~30</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Attempts',evo.attempts!=null?evo.attempts:0)}
+          ${_shadowKv('Candidates',evo.policy_candidates_approx!=null?evo.policy_candidates_approx:30)}
+          ${_shadowKv('Mode',(evo.mode||'paper + variants').split(' ')[0])}
+          ${_shadowKv('Neural',lab.shadow_active?'ON':'off',lab.shadow_active?'ok':'neu')}
+        </div>
+        <div class="shadow-note">${esc(evo.last_reason||'Policy evolve waits for enough BUY/SELL labels')}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>HOLD SHADOW</h2><span class="psx-src">OPPOSITE</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Pending',hold.pending!=null?hold.pending:0)}
+          ${_shadowKv('Resolved',hold.resolved!=null?hold.resolved:0)}
+          ${_shadowKv('Taught opp',hold.taught_opposite!=null?hold.taught_opposite:0)}
+          ${_shadowKv('Opp TP rate',hold.opposite_tp_rate!=null?num(Number(hold.opposite_tp_rate)*100,0)+'%':'—')}
+        </div>
+        <div class="shadow-note">${esc(hold.strategy_hint||'When LIVE HOLDs a BUY/SELL proposal, shadow replays the opposite path')}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>STRUCTURE</h2><span class="psx-src">GRAVES</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Buckets',struct.buckets!=null?struct.buckets:0)}
+          ${_shadowKv('Snapshots',struct.snapshots!=null?struct.snapshots:0)}
+        </div>
+        <div class="shadow-note">Last advice: ${esc(advice)}</div>
+        ${top}
+      </div>
+    </article>
+    <article class="shadow-card wide">
+      <div class="psx-h"><h2>RECENT PAPER CLOSES</h2><span class="psx-src">JOURNAL</span><span class="psx-live">● LIVE</span></div>
+      <div class="body"><div class="shadow-rows">${rowsHtml}</div></div>
+    </article>
+  `);
 }
 
 function pickDeskFocus(clients){
@@ -1440,6 +1603,7 @@ async function renderDesk(data){
   renderDeskUtc();
   renderDeskStatusBoard(focus);
   renderDeskLearn(focus);
+  renderShadowLab(focus);
   renderDeskClosed(focus);
   renderDeskEngine(focus);
   renderDeskCrowd(focus);

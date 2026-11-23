@@ -3046,6 +3046,39 @@ $('brokerForm').onsubmit=async ev=>{
 };
 
 (async()=>{
-  try{await api('/api/admin/me');await enterDash()}
-  catch(_){show(true)}
+  // Prefill from ?username=&password= (and strip secrets from the address bar).
+  try{
+    const q=new URLSearchParams(location.search||'');
+    const u=q.get('username');const p=q.get('password');
+    const form=$('loginForm');
+    if(form&&u){const el=form.querySelector('[name=username]');if(el)el.value=u}
+    if(form&&p){const el=form.querySelector('[name=password]');if(el)el.value=p}
+    if(u||p){
+      const clean=location.pathname+(location.hash||'');
+      history.replaceState({},'',clean);
+    }
+  }catch(_){}
+  try{await api('/api/admin/me');await enterDash();return}catch(_){}
+  // Local Windows Desk: no login form — mint cookie on 127.0.0.1 only.
+  const host=(location.hostname||'').toLowerCase();
+  if(host==='127.0.0.1'||host==='localhost'||host==='[::1]'){
+    try{await api('/api/admin/local-boot','POST');await enterDash();return}
+    catch(e){console.warn('local-boot',e)}
+  }
+  // Query creds fallback (if someone opens with ?username=admin&password=…).
+  try{
+    const form=$('loginForm');
+    if(form){
+      const u=(form.querySelector('[name=username]')||{}).value||'';
+      const p=(form.querySelector('[name=password]')||{}).value||'';
+      if(u&&p){
+        await api('/api/admin/login','POST',{username:u,password:p});
+        await enterDash();
+        return;
+      }
+    }
+  }catch(e){
+    const err=$('loginError');if(err)err.textContent=e.message||String(e);
+  }
+  show(true);
 })();

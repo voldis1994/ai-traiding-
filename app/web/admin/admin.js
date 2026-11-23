@@ -181,17 +181,27 @@ function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${
 
 function isCapitalFundsSrc(src){
   const s=String(src||'').toLowerCase();
-  return s==='broker'||s==='funds'||s==='capital'||s===''||!s;
+  return s==='broker'||s==='funds'||s==='capital'||s==='live_funds_mirror'||s===''||!s;
+}
+/** Rows Desk may list in NESEN / CLIENT CLOSES (Funds £ or journal waiting for Funds). */
+function isDeskListableClose(src){
+  if(isCapitalFundsSrc(src))return true;
+  const s=String(src||'').toLowerCase();
+  return s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'
+    ||s==='pending_upl_teach';
 }
 function sourceLabel(src){
   if(isCapitalFundsSrc(src))return 'Capital £';
   const s=String(src||'').toLowerCase();
+  if(s==='upl_estimate'||s.startsWith('pending'))return 'sync Funds £';
   if(s==='none'||s==='empty')return 'nav Capital £';
   return 'Capital £';
 }
 function closePnlSrcBadge(src,_pending){
-  // Desk badges: CAPITAL only — never GAIDA / ≈UPL / PROXY / EDGE.
+  // Desk badges: CAPITAL for Funds £; SYNC while journal waits for mirror upgrade.
   if(isCapitalFundsSrc(src))return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  const s=String(src||'').toLowerCase();
+  if(s==='upl_estimate'||s.startsWith('pending'))return {cls:'psx-pnl-src est',text:'SYNC'};
   return {cls:'psx-pnl-src ok',text:'CAPITAL'};
 }
 function closeTimeLabel(t){
@@ -1255,11 +1265,11 @@ function renderDeskClosed(client){
   if(!el)return;
   if(!client){stableHtml(el,'<div class="psx-empty">—</div>');return}
   const results=client.results||{};
-  // Capital Funds £ only — drop ≈UPL / pending / edge / pts rows.
+  // Funds £ first; journal SYNC rows fill NESEN while mirror upgrades to broker.
   let rows=(results.recent_trades||[]).filter(t=>{
     if(!t||typeof t!=='object')return false;
     if(t.pending_cash||t.from_edge_hist)return false;
-    if(!isCapitalFundsSrc(t.pnl_source))return false;
+    if(!isDeskListableClose(t.pnl_source))return false;
     const v=t.pnl!=null?Number(t.pnl):NaN;
     return Number.isFinite(v)&&Math.abs(v)>=1e-12;
   }).slice(0,6);
@@ -1302,20 +1312,22 @@ function renderDeskClosed(client){
     const val=money(raw,t.pnl_currency||ccy);
     const when=closeTimeLabel(t);
     const epic=t.epic||t.market||'—';
-    const badge=closePnlSrcBadge('broker',false);
+    const src=t.pnl_source||'broker';
+    const badge=closePnlSrcBadge(src,false);
     const whenShow=when&&when!=='—'?when:'';
     const pnlCls=pnlClass(raw);
     const capOrphan=String(t.deal_id||'').startsWith('cap:');
+    const tag=isCapitalFundsSrc(src)?(capOrphan?'FUNDS':'TRADE'):'SYNC';
     return `<div class="psx-whale-row">
       <div class="wh-top">
-        <span class="tag">${capOrphan?'FUNDS':'TRADE'}</span>
+        <span class="tag">${tag}</span>
         <strong class="wh-epic">${esc(epic)}</strong>
         ${whenShow?`<span class="wh-ago">${esc(whenShow)}</span>`:''}
       </div>
       <div class="wh-bot">
         <span class="${sideCls}">${sideCls==='buy'?'▲ BUY':'▼ SELL'}</span>
         <strong class="wh-pnl ${pnlCls}">${esc(val)}</strong>
-        <span class="${badge.cls}" title="${esc(sourceLabel('broker'))}">${esc(badge.text)}</span>
+        <span class="${badge.cls}" title="${esc(sourceLabel(src))}">${esc(badge.text)}</span>
       </div>
     </div>`;
   }).join(''));
@@ -2141,7 +2153,7 @@ function buildEquitySeries(clients,range){
     const r=c.results||{};
     const ccy=r.pnl_currency||c.account_currency||'GBP';
     (r.recent_trades||[]).forEach((t)=>{
-      // Capital £ closes only — skip ≈UPL and rows without a real close time.
+      // Chart = Funds £ only (not SYNC estimates) — Kopējais stays honest.
       if(!isCapitalFundsSrc(t.pnl_source))return;
       const pnl=Number(t.pnl);
       if(!Number.isFinite(pnl)||Math.abs(pnl)<1e-12)return;
@@ -2376,7 +2388,9 @@ function renderRecentClosed(clients){
   (clients||[]).forEach(c=>{
     const r=c.results||{};
     const ccy=r.pnl_currency||c.account_currency||'';
-    (r.recent_trades||[]).slice(0,8).forEach(t=>{
+    (r.recent_trades||[]).filter(t=>t&&isDeskListableClose(t.pnl_source)).slice(0,8).forEach(t=>{
+      const pnl=Number(t.pnl);
+      if(!Number.isFinite(pnl)||Math.abs(pnl)<1e-12)return;
       rows.push({
         client:c.display_name||c.username,
         epic:t.epic||'—',
@@ -2384,7 +2398,7 @@ function renderRecentClosed(clients){
         size:t.size,
         open:t.entry||t.open_level||t.level,
         current:t.exit||t.close_level,
-        upl:t.pnl,
+        upl:pnl,
         currency:t.pnl_currency||ccy,
       });
     });
@@ -2482,14 +2496,17 @@ function renderCard(c){
   const sb=scoreboard(r);
   const trades=(r.recent_trades||[]).filter(t=>{
     if(!t||t.pending_cash||t.from_edge_hist)return false;
-    if(!isCapitalFundsSrc(t.pnl_source))return false;
+    if(!isDeskListableClose(t.pnl_source))return false;
     return t.pnl!=null&&Number.isFinite(Number(t.pnl))&&Math.abs(Number(t.pnl))>=1e-12;
   }).slice(0,4).map(t=>{
     const tCcy=t.pnl_currency||ccy;
     const raw=Number(t.pnl);
     const cls=pnlClass(raw);
-    const right=formatPnlDisplay(raw,'broker',tCcy);
-    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')} [Capital]</span><span class="${cls}">${esc(right)}</span></div>`;
+    const tag=isCapitalFundsSrc(t.pnl_source)?'Capital':'sync';
+    const right=isCapitalFundsSrc(t.pnl_source)
+      ?formatPnlDisplay(raw,'broker',tCcy)
+      :money(raw,tCcy);
+    return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')} [${tag}]</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav Capital £ closes</span></div>';
 
   const dealsHtml=inTrade

@@ -611,9 +611,35 @@ def lab_payload(store) -> dict:
         window_24h = {**window_24h, 'from_journal': False,
                       'journal_n': int(journal_24h.get('n') or 0)}
     # Seed recent list from journal when audit hist was wiped but Capital £ exists.
+    # Also merge journal closes missing from hist so SHADOW shows ALL prior closes,
+    # not only the last few audited fingerprints.
     recent_audits = list(reversed(hist[-16:]))
-    if not recent_audits and journal_24h.get('recent'):
-        recent_audits = list(journal_24h['recent'])
+    if journal_24h.get('recent'):
+        seen_keys = set()
+        for a in recent_audits:
+            if not isinstance(a, dict):
+                continue
+            key = (str(a.get('deal_id') or ''), round(float(a.get('pnl') or 0), 4),
+                   str(a.get('at') or '')[:16])
+            seen_keys.add(key)
+        merged = list(recent_audits)
+        for j in journal_24h['recent']:
+            if not isinstance(j, dict):
+                continue
+            try:
+                jp = round(float(j.get('pnl') or 0), 4)
+            except (TypeError, ValueError):
+                continue
+            key = (str(j.get('deal_id') or ''), jp, str(j.get('at') or '')[:16])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(j)
+        # Newest first by at/closed stamp.
+        def _at_key(r):
+            return str((r or {}).get('at') or (r or {}).get('closed') or '')
+        merged.sort(key=_at_key, reverse=True)
+        recent_audits = merged[:24]
     if (not display_last or not display_last.get('pnl')) and recent_audits:
         seed = recent_audits[0]
         display_last = {
@@ -775,7 +801,9 @@ def _journal_window_stats(store, *, hours=24) -> dict:
         if pnl_n is None or abs(float(pnl_n)) < 1e-12:
             continue
         src_s = str(src or '').strip().lower()
-        if src_s and src_s not in ('broker', 'upl_estimate', 'funds', 'capital'):
+        if src_s and src_s not in (
+                'broker', 'upl_estimate', 'funds', 'capital',
+                'pending_broker_pnl', 'pending_close_sync', 'pending_upl_teach'):
             # Ignore synthetic / non-cash teaching rows.
             if src_s not in ('', 'none'):
                 continue

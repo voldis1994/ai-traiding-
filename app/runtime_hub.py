@@ -659,7 +659,17 @@ class RuntimeHub:
                 # restore, so SHADOW is not stuck at 0/0 while CLIENT CLOSES has £.
                 if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
                     try:
-                        eng._backfill_mistake_audits_from_journal(limit=80, hours=24)
+                        eng._backfill_mistake_audits_from_journal(limit=160, hours=24)
+                    except Exception:
+                        pass
+                # Kick Funds→Desk £ mirror so phone −0.89 overwrites stale −0.81
+                # without waiting for an empty pending-pnl queue.
+                if eng is not None and hasattr(eng, '_mirror_capital_funds_closes'):
+                    try:
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.ensure_future(eng._mirror_capital_funds_closes())
                     except Exception:
                         pass
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
@@ -823,6 +833,37 @@ class RuntimeHub:
                         break
             except Exception:
                 recent = []
+            # Paper book empty after bag wipe — still show Capital/audit closes
+            # so SHADOW is not a blank "No paper closes" while CLIENT CLOSES has £.
+            if not recent:
+                try:
+                    from . import shadow_mistake_audit as sma
+                    lab = sma.lab_payload(store) if hasattr(sma, 'lab_payload') else {}
+                    seed = list((lab or {}).get('recent_audits') or [])
+                    for row in seed:
+                        if not isinstance(row, dict):
+                            continue
+                        pnl = row.get('pnl')
+                        try:
+                            pnl_n = float(pnl) if pnl is not None else None
+                        except (TypeError, ValueError):
+                            pnl_n = None
+                        recent.append({
+                            'at': row.get('at') or row.get('closed'),
+                            'direction': row.get('direction'),
+                            'entry': row.get('entry'),
+                            'exit': row.get('exit'),
+                            'paper_pnl': pnl_n,
+                            'price_pnl': None,
+                            'unit': 'account_currency',
+                            'exit_reason': (
+                                'live_journal' if str(row.get('source') or '').startswith('live')
+                                else (row.get('source') or 'audit')),
+                        })
+                        if len(recent) >= 12:
+                            break
+                except Exception:
+                    pass
             if open_pos is None or pending is None:
                 try:
                     from .shadow_paper import ShadowPaperJournal
@@ -914,7 +955,7 @@ class RuntimeHub:
                         eng_ma, '_backfill_mistake_audits_from_journal'):
                     try:
                         eng_ma._backfill_mistake_audits_from_journal(
-                            limit=80, hours=24)
+                            limit=160, hours=24)
                     except Exception:
                         pass
                 mistake_audit = sma.lab_payload(store)

@@ -476,7 +476,7 @@ function renderShadowLab(client){
       +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
   }).filter(Boolean).join('')
     ||'<div class="shadow-note">None ready for LIVE yet (need repeats + proof wins)</div>';
-  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,6).map(a=>{
+  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,12).map(a=>{
     if(!a||typeof a!=='object')return '';
     const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
     const p=a.pnl!=null?Number(a.pnl):null;

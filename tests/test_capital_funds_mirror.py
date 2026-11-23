@@ -100,6 +100,76 @@ def test_mirror_upgrades_upl_estimate_to_broker():
     asyncio.run(scenario())
 
 
+def test_mirror_fixes_zero_poison_broker_to_capital_funds():
+    """Desk +0.00 while Capital Funds shows -£0.12 must be overwritten."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'deal-zero', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'BUY', 'level': 3625,
+            })
+            store.close_trade(
+                'deal-zero', 3624.8, 0.0, currency='GBP',
+                source='broker', overwrite=True)
+            broker = FundsBroker([{
+                'dealId': 'deal-zero', 'instrumentName': 'Gold',
+                'pnl': -0.12, 'currency': 'GBP', 'size': -0.1,
+                'openLevel': 3625.0, 'closeLevel': 3624.8,
+                'dateUtc': '2026-11-23T13:12:00Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n == 1
+            row = next(r for r in store.trades(5) if r['deal_id'] == 'deal-zero')
+            assert row['pnl'] == pytest.approx(-0.12)
+            assert row['pnl_source'] == 'broker'
+    asyncio.run(scenario())
+
+
+def test_zero_poison_reaudit_lets_cycle_see_capital_minus():
+    """First +0.00 audit must not block re-diagnose after Funds −£0.12."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            # Cycle ran on poison £0 → "no mistakes".
+            first = e._run_mistake_audit_close(
+                'deal-reaudit', pnl=0.0, direction='BUY', entry=3625.0,
+                source='live')
+            assert first and first.get('audited')
+            assert not (first.get('mistakes') or [])
+            # Capital Funds £ lands — cycle must re-run and see the hurt.
+            second = e._run_mistake_audit_close(
+                'deal-reaudit', pnl=-0.12, direction='BUY', entry=3625.0,
+                source='live_funds_mirror')
+            assert second and second.get('audited')
+            assert second.get('hurt') is True or (second.get('mistakes') or [])
+            # Backfill also picks journal losses.
+            store.upsert_trade({
+                'dealId': 'deal-loss', 'epic': 'GOLD', 'size': '0.1',
+                'direction': 'SELL', 'level': 3620,
+            })
+            store.close_trade(
+                'deal-loss', 3622, -0.65, currency='GBP',
+                source='broker', overwrite=True)
+            n = e._backfill_mistake_audits_from_journal(limit=8)
+            assert n >= 1
+            from app import shadow_mistake_audit as sma
+            lab = sma.lab_payload(store)
+            assert lab['hurt_n'] >= 1
+    asyncio.run(scenario())
+
+
 def test_trade_stats_shows_mirrored_funds_rows():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:

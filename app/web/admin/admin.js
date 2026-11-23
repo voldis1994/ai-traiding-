@@ -2860,13 +2860,16 @@ async function loadOverview(){
 }
 
 async function enterDash(){
+  // Auth succeeded — NEVER re-show the login gate if later loads fail.
   show(false);
-  // Best-effort fullscreen from login click gesture; else arm next click.
-  const ok=await enterAdminFullscreen();
-  if(!ok)armFullscreenOnNextGesture();
-  await loadBrokers();
-  await loadOverview();
-  schedulePoll(desiredPollMs(lastOverview));
+  try{
+    // Best-effort fullscreen from login click gesture; else arm next click.
+    const ok=await enterAdminFullscreen();
+    if(!ok)armFullscreenOnNextGesture();
+  }catch(_){}
+  try{await loadBrokers()}catch(e){console.warn('loadBrokers',e)}
+  try{await loadOverview()}catch(e){console.warn('loadOverview',e)}
+  try{schedulePoll(desiredPollMs(lastOverview))}catch(_){}
 }
 
 document.querySelectorAll('.psx-rail-btn[data-view],.nav-item').forEach(btn=>{
@@ -3055,24 +3058,39 @@ $('brokerForm').onsubmit=async ev=>{
     const form=$('loginForm');
     if(form&&u){const el=form.querySelector('[name=username]');if(el)el.value=u}
     if(form&&p){const el=form.querySelector('[name=password]');if(el)el.value=p}
+    // Local Windows Desk: always seed default operator creds so Ienākt works
+    // even if auto-boot races / fails.
+    if(isLocal&&form){
+      const ue=form.querySelector('[name=username]');
+      const pe=form.querySelector('[name=password]');
+      if(ue&&!ue.value)ue.value='admin';
+      if(pe&&!pe.value)pe.value='admin123';
+    }
     if(u||p){
       const clean=location.pathname+(location.hash||'');
       history.replaceState({},'',clean);
     }
   }catch(_){}
-  // Local Desk: never leave the operator staring at an empty login gate.
+  // Local Desk: open UI first, then authenticate — never bounce back to login.
   if(isLocal){
+    show(false);
     const attempts=[
       async()=>{await api('/api/admin/me')},
       async()=>{await api('/api/admin/local-boot','POST')},
       async()=>{await api('/api/admin/login','POST',{username:'admin',password:'admin123'})},
     ];
+    let authed=false;
     for(const step of attempts){
-      try{await step();await enterDash();return}catch(e){console.warn('local-open',e)}
+      try{await step();authed=true;break}catch(e){console.warn('local-open',e)}
     }
-  }else{
-    try{await api('/api/admin/me');await enterDash();return}catch(_){}
+    await enterDash();
+    if(!authed){
+      const err=$('loginError');
+      if(err)err.textContent='Local boot failed — typed admin/admin123 then Ienākt';
+    }
+    return;
   }
+  try{await api('/api/admin/me');await enterDash();return}catch(_){}
   // Query / form creds fallback.
   try{
     const form=$('loginForm');

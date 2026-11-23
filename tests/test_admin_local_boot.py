@@ -44,5 +44,11 @@ def test_admin_js_auto_boots_localhost():
     js = open('app/web/admin/admin.js', encoding='utf-8').read()
     assert '/api/admin/local-boot' in js
     assert "password:'admin123'" in js.replace(' ', '')
+    # enterDash must not bounce back to login when overview/brokers fail.
+    assert 'NEVER re-show the login gate' in js
+    assert "console.warn('loadBrokers'" in js
+    assert "console.warn('loadOverview'" in js
     html = open('app/web/admin/index.html', encoding='utf-8').read()
-    assert 'admin.js?v=150' in html
+    assert 'admin.js?v=151' in html
+    assert 'nta-local' in html
+    assert 'html.nta-local #login' in html

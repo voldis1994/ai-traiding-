@@ -8,6 +8,19 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/admin/static/admin.css?v=129">
+  <script>
+  /* Paint Desk immediately on Windows loopback — never flash Operatora ieeja. */
+  (function(){
+    var h=(location.hostname||'').toLowerCase();
+    if(h==='127.0.0.1'||h==='localhost'||h==='[::1]'||h.indexOf('127.')===0){
+      document.documentElement.classList.add('nta-local');
+    }
+  })();
+  </script>
+  <style>
+    html.nta-local #login{display:none!important}
+    html.nta-local #dash.hidden{display:block!important}
+  </style>
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
@@ -464,6 +477,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=12"></script>
-  <script src="/admin/static/admin.js?v=150"></script>
+  <script src="/admin/static/admin.js?v=151"></script>
 </body>
 </html>

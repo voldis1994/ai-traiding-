@@ -1038,7 +1038,7 @@ function renderDeskLearn(client){
       v=>v==null?'—':num(v,2)),
     deskKv(client.id,'W/L',
       (Number(shadow.cash_trades||0)>0
-        ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
+        ?(`${shadow.wins||0}/${shadow.losses||0}`):'—')),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Strat Δ',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),

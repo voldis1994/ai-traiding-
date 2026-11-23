@@ -4707,28 +4707,14 @@ class SingleTradeEngine:
                 continue
         return out
 
-    async def _mirror_capital_funds_closes(self):
-        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (incl. history).
+    def _apply_capital_funds_rows(self,rows):
+        """Write Funds TRADE £ into the journal — returns upgraded+inserted count.
 
-        Already-closed journal rows are rewritten when Funds £ differs
-        (UPL/confirm invent → real Capital cash; pence drift; zero-poison).
-
-        1) Upgrade unsettled / stale journal deals with matched Capital cash.
-        2) Fuzzy-bind Funds rows onto UUID closes when dealId refs miss
-           (Desk −0.81 vs Funds −0.89).
-        3) Insert orphan ``cap:{fp}`` only when no journal close can take the £.
+        Split from the async fetch so a 24h pass can commit before older-day
+        HTTP pages run (outer wait_for used to cancel the whole mirror and leave
+        Desk empty while SHADOW already counted journal closes).
         """
-        if not self.broker or not hasattr(self.broker,'transactions'):
-            return 0
-        try:
-            rows=await self._fetch_capital_funds_trade_rows()
-        except Exception as exc:
-            self.store.event('warning','Capital Funds mirror fetch failed',
-                             {'type':type(exc).__name__})
-            return 0
         if not rows:
-            self.store.event('warning','Capital Funds mirror: 0 transactions',
-                             {'hint':'phone Funds may still show £ — check CST/account'})
             return 0
         consumed=self._fuzzy_tx_consumed()
         ccy_default=self._account_currency() or 'GBP'
@@ -4872,6 +4858,45 @@ class SingleTradeEngine:
                               'scanned':len(rows),'skipped_no_pnl':skipped_no_pnl,
                               'currency':ccy_default})
         return upgraded+inserted
+
+    async def _mirror_capital_funds_closes(self, *, days=None):
+        """Make Desk CLIENT CLOSES mirror Capital Funds TRADE £ (incl. history).
+
+        Commits the fresh 24h window FIRST so an outer ``wait_for`` timeout on
+        older day pages cannot cancel the only rows Desk/NESEN need.
+        """
+        if not self.broker or not hasattr(self.broker,'transactions'):
+            return 0
+        total_days=max(1,min(int(days if days is not None else self.FUNDS_MIRROR_DAYS),30))
+        done=0
+        # —— 24h phone Funds window (mandatory) ——
+        try:
+            fresh=await self._fetch_capital_funds_trade_rows(days=1)
+        except Exception as exc:
+            self.store.event('warning','Capital Funds mirror fetch failed',
+                             {'type':type(exc).__name__,'window':'24h'})
+            fresh=[]
+        if fresh:
+            done+=int(self._apply_capital_funds_rows(fresh) or 0)
+        elif total_days<=1:
+            self.store.event('warning','Capital Funds mirror: 0 transactions',
+                             {'hint':'phone Funds may still show £ — check CST/account',
+                              'window':'24h'})
+        if total_days<=1:
+            return done
+        # —— Older days (best-effort; safe if cancelled after 24h commit) ——
+        try:
+            older=await self._fetch_capital_funds_trade_rows(days=total_days)
+        except Exception as exc:
+            self.store.event('warning','Capital Funds history mirror failed',
+                             {'type':type(exc).__name__})
+            return done
+        if not older:
+            return done
+        # Fresh rows already applied — re-apply is idempotent (often 0).
+        # Never overwrite the 24h commit count with that 0.
+        done+=int(self._apply_capital_funds_rows(older) or 0)
+        return done
 
     def _audit_external_context(self,saved=None,direction=None):
         """News + intermarket for mistake-audit — never let empty {} hide live feeds.

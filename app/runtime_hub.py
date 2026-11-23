@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 261
+DESK_TRUTH_REV = 262
 
 
 def _finite_num(v):
@@ -374,14 +374,14 @@ class RuntimeHub:
         s=(src or '').strip().lower()
         if s in ('ticks_only','price_size','position_disappeared'):
             return 'proxy'
-        if s in ('pending_close_sync','pending_broker_pnl'):
+        if s in ('pending_close_sync','pending_broker_pnl','pending_upl_teach'):
             return 'pending'
         # Last live UPL is provisional — never count as Capital.com cash.
         # Admin must label these ESTIMATE until history refines to broker.
         if s in ('upl_estimate',):
             return 'estimate'
-        # Explicit broker, or legacy blank source with a settled pnl figure.
-        if s in ('broker','') or not s:
+        # Explicit broker / Funds mirror, or legacy blank source with cash £.
+        if s in ('broker','funds','capital','live_funds_mirror','') or not s:
             return 'cash'
         return 'other'
 
@@ -417,6 +417,7 @@ class RuntimeHub:
         estimate_sum=0.0
         estimate_sum_24h=0.0
         blank_n=0
+        estimate_rows=[]
         from datetime import datetime, timezone, timedelta
         cutoff_24h=datetime.now(timezone.utc)-timedelta(hours=24)
 
@@ -467,30 +468,36 @@ class RuntimeHub:
                     if len(recent)<80:
                         recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
-                # Track for harvest only — never invent ≈UPL on Desk.
+                # Track for harvest; may fill NESEN if Funds mirror has not upgraded yet.
                 pending_n+=1
                 if val is None or abs(float(val))<1e-12:
                     blank_n+=1
                 else:
-                    # Keep estimate counters for internal harvest, not Desk rows.
                     estimate_n+=1
                     estimate_sum+=float(val)
                     estimate_signed.append(float(val))
                     if _in_24h(t.get('closed')):
                         estimate_sum_24h+=float(val)
                         estimate_signed_24h.append(float(val))
-            elif kind=='estimate' and val is not None:
+                    if len(estimate_rows)<80:
+                        estimate_rows.append(row)
+            elif kind=='estimate' and val is not None and abs(float(val))>=1e-12:
                 estimate_n+=1
                 estimate_sum+=float(val)
                 estimate_signed.append(float(val))
                 if _in_24h(t.get('closed')):
                     estimate_sum_24h+=float(val)
                     estimate_signed_24h.append(float(val))
-                # Not listed on Desk — Funds £ only.
+                if len(estimate_rows)<80:
+                    estimate_rows.append(row)
             elif kind=='other' or (kind=='cash' and val is None):
                 if kind=='cash' and val is None:
                     blank_n+=1
                     pending_n+=1
+        # Desk NESEN was empty while SHADOW CAPITAL 24h already counted journal
+        # upl_estimate / pending rows — surface them until Funds upgrades to broker.
+        if not recent and estimate_rows:
+            recent=list(estimate_rows[:80])
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         est_wins=sum(1 for p in estimate_signed if p>0)
@@ -1881,18 +1888,30 @@ class RuntimeHub:
                 except Exception:
                     pass
             if do_mirror and hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
-                # 7d paging needs headroom; 10s used to abort before any insert
-                # → Desk "Nav nesen slēgtu treidu" while Capital phone had £.
-                mirror_timeout = 45.0 if force else 25.0
+                # 24h first (short timeout) — must commit before older-day pages.
+                # Full 7d used to cancel the whole coroutine → empty NESEN while
+                # SHADOW already showed Capital 24h from journal estimates.
                 try:
-                    n = await asyncio.wait_for(
-                        eng._mirror_capital_funds_closes(), timeout=mirror_timeout)
-                    out['mirrored'] += int(n or 0)
+                    n24 = await asyncio.wait_for(
+                        eng._mirror_capital_funds_closes(days=1), timeout=12.0)
+                    out['mirrored'] += int(n24 or 0)
+                except Exception as exc:
+                    out.setdefault('mirror_errors', []).append({
+                        'client_id': cid, 'type': type(exc).__name__,
+                        'window': '24h'})
+                hist_timeout = 35.0 if force else 18.0
+                try:
+                    n7 = await asyncio.wait_for(
+                        eng._mirror_capital_funds_closes(
+                            days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
+                        timeout=hist_timeout)
+                    out['mirrored'] += int(n7 or 0)
                     self._live_truth_last[cid] = now_m
                 except Exception as exc:
                     out.setdefault('mirror_errors', []).append({
-                        'client_id': cid, 'type': type(exc).__name__})
-                    # Still stamp cooldown so a dead broker cannot stall every poll.
+                        'client_id': cid, 'type': type(exc).__name__,
+                        'window': 'history'})
+                    # 24h may already be in SQLite — do not block the next poll forever.
                     self._live_truth_last[cid] = now_m
             elif not do_mirror:
                 out['skipped'] += 1

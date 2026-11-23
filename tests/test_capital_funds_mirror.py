@@ -447,3 +447,43 @@ def test_mirror_accepts_trade_row_profit_loss_field():
             assert all(r['pnl_source'] == 'broker' for r in store.trades(10))
             assert all(r['pnl_currency'] == 'GBP' for r in store.trades(10))
     asyncio.run(scenario())
+
+
+def test_mirror_commits_24h_before_slow_history_pages():
+    """Older-day HTTP hang must not wipe a completed 24h Funds commit."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.1'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+
+            class SlowHistoryBroker(FundsBroker):
+                async def transactions(self, *, last_period=600, from_time=None,
+                                       to_time=None, tx_type='TRADE'):
+                    if from_time or to_time:
+                        await asyncio.sleep(60)
+                    return await super().transactions(
+                        last_period=last_period, from_time=from_time,
+                        to_time=to_time, tx_type=tx_type)
+
+            broker = SlowHistoryBroker([{
+                'reference': 'FAST1', 'instrumentName': 'Gold',
+                'pnl': -0.42, 'currency': 'GBP', 'size': -0.1,
+                'dateUtc': '2026-11-23T21:40:00Z',
+            }])
+            e.attach(broker)
+            # days=1 never touches history pages — Desk gets the close.
+            n = await e._mirror_capital_funds_closes(days=1)
+            assert n == 1
+            assert len(store.trades(5)) == 1
+            assert store.trades(5)[0]['pnl'] == pytest.approx(-0.42)
+            # Full mirror: 24h commits, then history sleep is cancelled.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    e._mirror_capital_funds_closes(days=7), timeout=0.3)
+            # Prior 24h row remains.
+            assert len(store.trades(5)) == 1
+    asyncio.run(scenario())

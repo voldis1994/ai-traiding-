@@ -366,11 +366,11 @@ function renderShadowLab(client){
       `<strong>Does it run 100 variations?</strong> `
       +`<b>${hundred?'YES':'NO — not today'}</b>. `
       +esc(truthInfo.what_runs||(
-        'One shadow neural + paper SL/TP book; mistake-audit → scenario '
-        +'memory → targeted fix → promote → LIVE; ~30 policy candidates. '
-        +'Not a 100-parallel sweep.'))
+        'One neural core for LIVE + SHADOW; paper SL/TP book; mistake-audit → '
+        +'scenario memory → targeted fix → LIVE; ~30 policy candidates. '
+        +'Not a second brain.'))
       +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
-      +(lab.shadow_active?' · shadow neural <b>ON</b>':' · shadow neural <b>off / booting</b>'));
+      +(lab.shadow_active?' · shared neurons <b>ON</b>':' · neural <b>off / booting</b>'));
   }
   // Shadow paper Desk: cash £ only — never price pts as P&L.
   const cashTrades=Number(paper.cash_trades||0)||0;

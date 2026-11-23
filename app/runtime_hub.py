@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 249
+DESK_TRUTH_REV = 250
 
 
 def _finite_num(v):
@@ -1000,11 +1000,10 @@ class RuntimeHub:
             'truth': {
                 'hundred_variations': False,
                 'what_runs': (
-                    'One shadow neural + paper SL/TP book; mistake-audit '
-                    '(OHLC/zones/news/intermarket) → scenario memory → targeted '
-                    'fix → promote after repeats → LIVE; ~30 policy edge '
-                    'candidates; self-params trials; HOLD opposite. '
-                    'Not a 100-parallel sweep.'),
+                    'One neural core for LIVE + SHADOW; paper SL/TP book; '
+                    'mistake-audit (OHLC/zones/news/intermarket) → scenario '
+                    'memory → targeted fix → LIVE; ~30 policy edge candidates; '
+                    'self-params trials; HOLD opposite. Not a second brain.'),
                 'policy_candidates_approx': 30,
                 'mistake_audit': True,
             },

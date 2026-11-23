@@ -4647,32 +4647,57 @@ class SingleTradeEngine:
                 pass
             return None
 
-    def _backfill_mistake_audits_from_journal(self,*,limit=12):
-        """Re-run cycle on recent Capital £ losses that were missed / +0.00 audited."""
+    def _backfill_mistake_audits_from_journal(self,*,limit=80,hours=24):
+        """Re-run cycle on ALL Capital £ closes in the last 24h (wins + losses).
+
+        Analysis needs both sides — skipping wins left the cycle blind to what
+        worked next to the minuses. Window is time-based (24h), not "last 1 close".
+        """
         if self.store is None:
             return 0
         try:
             rows=self.store.db.execute(
-                "SELECT deal_id,pnl,direction,entry,pnl_source FROM trades "
+                "SELECT deal_id,pnl,direction,entry,pnl_source,closed FROM trades "
                 "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
                 "AND pnl_source='broker' "
                 "ORDER BY closed DESC LIMIT ?",(int(limit),)).fetchall()
         except Exception:
             return 0
+        now_utc=datetime.now(timezone.utc)
+        try:
+            cutoff=now_utc-timedelta(hours=max(1,int(hours)))
+        except Exception:
+            cutoff=now_utc-timedelta(hours=24)
         n=0
-        for deal_id,pnl,direction,entry,src in rows:
+        scanned=0
+        wins=0
+        losses=0
+        for deal_id,pnl,direction,entry,src,closed in rows:
             pnl_n=_num(pnl)
             if pnl_n is None or abs(float(pnl_n))<1e-12:
                 continue  # still zero — wait for Funds mirror
-            if float(pnl_n)>=0:
-                continue  # wins/scratch — cycle already eases; focus hurts
+            # Keep inside the 24h analysis window.
+            if closed:
+                try:
+                    ct=datetime.fromisoformat(str(closed).replace('Z','+00:00'))
+                    if ct.tzinfo is None:
+                        ct=ct.replace(tzinfo=timezone.utc)
+                    if ct<cutoff:
+                        continue
+                except Exception:
+                    pass
+            scanned+=1
+            if float(pnl_n)>0:
+                wins+=1
+            elif float(pnl_n)<0:
+                losses+=1
             once='mistake_audited_close:'+str(deal_id)
             prev=self.store.get(once)
             if isinstance(prev,dict):
                 prev_pnl=_num(prev.get('pnl'))
-                had_mistakes=bool(prev.get('mistakes'))
-                if (prev_pnl is not None and abs(float(prev_pnl)-float(pnl_n))<1e-9
-                        and had_mistakes):
+                # Already audited at this £ — skip (wins or losses).
+                if (prev_pnl is not None
+                        and abs(float(prev_pnl)-float(pnl_n))<1e-9):
                     continue
             out=self._run_mistake_audit_close(
                 deal_id,pnl=float(pnl_n),
@@ -4680,10 +4705,12 @@ class SingleTradeEngine:
                 entry=_num(entry),source='live_backfill')
             if out and out.get('audited'):
                 n+=1
-        if n:
+        if n or scanned:
             self.store.event('shadow_mistake_audit',
-                             'Backfilled mistake audits from journal losses',
-                             {'n':n})
+                             'Backfilled mistake audits from 24h journal '
+                             '(wins+losses)',
+                             {'n':n,'scanned':scanned,'wins':wins,
+                              'losses':losses,'hours':int(hours)})
         return n
 
     def _last_upl_as_realized(self,deal_id):
@@ -5044,9 +5071,9 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror skipped',
                              {'type':type(exc).__name__})
-        # Cycle must see the 6 Capital minuses — re-audit after Funds £ lands.
+        # Cycle reads full 24h Capital book (wins + losses) after Funds £ lands.
         try:
-            self._backfill_mistake_audits_from_journal(limit=16)
+            self._backfill_mistake_audits_from_journal(limit=80,hours=24)
         except Exception as exc:
             self.store.event('warning','Mistake-audit backfill skipped',
                              {'type':type(exc).__name__})

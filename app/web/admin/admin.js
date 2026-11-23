@@ -423,6 +423,13 @@ function renderShadowLab(client){
   const missCls=miss.length?'bad':'ok';
   const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
   const auditPnlTxt=auditPnl==null?'—':((auditPnl>=0?'+':'')+num(auditPnl,2));
+  const win24=audit.window_24h&&typeof audit.window_24h==='object'?audit.window_24h:{};
+  const winN=Number(win24.n)||0;
+  const winW=Number(win24.wins)||0;
+  const winL=Number(win24.losses)||0;
+  const winNet=win24.net!=null?Number(win24.net):null;
+  const winNetTxt=winNet==null?'—'
+    :((winNet>=0?'+':'')+num(winNet,2));
   const gateTxt=(auditLast.promote_count!=null)
     ?(`${auditLast.promote_count}/${auditLast.promote_need||3}`)
     :'0/3';
@@ -464,15 +471,19 @@ function renderShadowLab(client){
         <div class="shadow-kv">
           ${_shadowKv('Last mistakes',missTxt,missCls)}
           ${_shadowKv('Last £',auditPnlTxt,auditPnl==null?'neu':(auditPnl>=0?'ok':'bad'))}
-          ${_shadowKv('Hurts',audit.hurt_n!=null?audit.hurt_n:(miss.length?1:0),miss.length||audit.hurt_n?'bad':'neu')}
-          ${_shadowKv('Source',auditLast.source||'—')}
+          ${_shadowKv('24h W/L',winN?(`${winW} / ${winL}`):'0 / 0',winL?'bad':(winW?'ok':'neu'))}
+          ${_shadowKv('24h net',winNetTxt,winNet==null?'neu':(winNet>=0?'ok':'bad'))}
         </div>
         <div class="shadow-note">${esc(
-          auditLast.display_note==='showing_last_hurt_not_scratch'
-            ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
-            :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
-              ?auditLast.notes.join(' · ')
-              :(audit.loop||'diagnose → memory → fix → promote → LIVE')))}</div>
+          winN
+            ?('Reads full 24h · '+winN+' closes (wins+losses) · last '
+              +(auditLast.source||'—')+' '
+              +(missTxt!=='none'?missTxt:(auditLast.scenario||'')))
+            :(auditLast.display_note==='showing_last_hurt_not_scratch'
+              ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
+              :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
+                ?auditLast.notes.join(' · ')
+                :(audit.loop||'diagnose → memory → fix → promote → LIVE'))))}</div>
         <div class="shadow-note">News ${esc(auditLast.news_status||'—')} · peers ${esc(auditLast.intermarket_status||'—')} · zone ${esc(auditLast.zone_side||'—')}</div>
       </div>
     </article>

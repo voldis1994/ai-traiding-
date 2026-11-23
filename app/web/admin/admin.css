@@ -513,11 +513,11 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-chart-col{grid-area:chart;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
 .psx-book-col{grid-area:book;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
 .psx-engine-col{grid-area:engine;border:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:180px;overflow:hidden;border-radius:var(--desk-radius)}
+/* Explicit areas — never nth-of-type (chart/book/engine are also div siblings). */
 .psx-ind-cell{grid-area:ind}
-.psx-grid>.psx-cell:nth-of-type(1){grid-area:ind}
-.psx-grid>.psx-cell:nth-of-type(2){grid-area:deals}
-.psx-grid>.psx-cell:nth-of-type(3){grid-area:watch}
-.psx-grid>.psx-cell:nth-of-type(4){grid-area:whale}
+.psx-deals-cell{grid-area:deals}
+.psx-learn-cell{grid-area:watch}
+.psx-whale-cell{grid-area:whale}
 .psx-chart-wrap{min-height:120px;flex:1;height:100%;position:relative}
 .psx-chart-wrap canvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#060a14}
 .psx-book{flex:1;overflow:auto;padding:8px;font-variant-numeric:tabular-nums;font-size:12px;min-height:0}

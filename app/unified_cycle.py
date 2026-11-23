@@ -308,6 +308,13 @@ def observe_close(store, *, broker_pnl=None, spread=0.0, entry_meta=None):
     hist.append({
         'pnl': pnl, 'useful': useful, 'hurt': hurt, 'before': before,
         'after': after, 'score_edge': edge_at_open, 'note': note,
+        # Desk CLIENT CLOSES fallback when trades journal missed OPEN upsert.
+        'deal_id': meta.get('deal_id'),
+        'epic': meta.get('epic'),
+        'direction': meta.get('direction') or meta.get('side'),
+        'currency': meta.get('currency'),
+        'source': 'broker',
+        'at': meta.get('at') or meta.get('closed'),
     })
     if store is not None:
         store.set(EDGE_OUTCOME_HIST_KEY, hist[-40:])

@@ -737,7 +737,15 @@ function renderDeskClosed(client){
     return s.includes('SELL')||s==='SHORT';
   });
   if(!rows.length){
-    stableHtml(el,'<div class="psx-empty">No client closes · not exchange whales</div>');
+    const err=results.stats_error
+      ?(`Stats error · ${results.stats_error}`)
+      :'No journaled closes yet · Capital Funds may still show £';
+    stableHtml(el,`<div class="psx-empty">${esc(err)}</div>`);
+    const srcElEmpty=$('deskClosedSrc');
+    if(srcElEmpty){
+      srcElEmpty.textContent=results.stats_error?'ERROR':'EMPTY';
+      srcElEmpty.classList.add('warn');
+    }
     return;
   }
   const ccy=((client.activity||{}).balance&&(client.activity.balance.currency))
@@ -748,8 +756,10 @@ function renderDeskClosed(client){
     return s==='upl_estimate'||t.pending_cash;
   });
   const anyBroker=rows.some(t=>String(t.pnl_source||'').toLowerCase()==='broker');
+  const anyEdge=rows.some(t=>!!t.from_edge_hist);
   if(srcEl){
-    if(anyEst&&!anyBroker)srcEl.textContent='≈UPL';
+    if(anyEdge&&!anyEst)srcEl.textContent='EDGE £';
+    else if(anyEst&&!anyBroker)srcEl.textContent='≈UPL';
     else if(anyEst)srcEl.textContent='MIXED';
     else srcEl.textContent='CAPITAL';
     srcEl.classList.toggle('warn',!!anyEst);

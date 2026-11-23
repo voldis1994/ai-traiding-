@@ -4577,6 +4577,44 @@ class SingleTradeEngine:
                               'scanned':len(rows)})
         return upgraded+inserted
 
+    def _audit_external_context(self,saved=None,direction=None):
+        """News + intermarket for mistake-audit — never let empty {} hide live feeds.
+
+        Entry stamps can be missing on Funds-mirrored / orphan closes. An empty
+        dict is truthy in ``isinstance`` checks and used to stamp UNCONFIGURED /
+        WAITING, so Desk looked like "nothing today" even when calendar/peers
+        were live.
+        """
+        saved=saved if isinstance(saved,dict) else {}
+        news_snap=saved.get('news') or saved.get('economic_news_risk')
+        im_snap=saved.get('intermarket') or saved.get('intermarket_analysis')
+        live_news={}
+        try:
+            if self.mandate:
+                live_news=self._news_risk() or {}
+        except Exception:
+            live_news={}
+        live_im=dict(getattr(self.intermarket,'state',{}) or {})
+        news=news_snap if isinstance(news_snap,dict) and news_snap.get('status') else live_news
+        if not isinstance(news,dict) or not news.get('status'):
+            news=live_news if isinstance(live_news,dict) else {}
+        intermarket=(im_snap if isinstance(im_snap,dict) and im_snap.get('status')
+                     else live_im)
+        if not isinstance(intermarket,dict) or not intermarket.get('status'):
+            intermarket=live_im if isinstance(live_im,dict) else {}
+        # Persist live picture so SHADOW lab can show "today" without engine snap.
+        try:
+            if self.store is not None:
+                self.store.set('live_external_context',{
+                    'at':datetime.now(timezone.utc).isoformat(),
+                    'news':news if isinstance(news,dict) else {},
+                    'intermarket':intermarket if isinstance(intermarket,dict) else {},
+                    'direction':direction if direction in ('BUY','SELL') else None,
+                })
+        except Exception:
+            pass
+        return news,intermarket
+
     def _run_mistake_audit_close(self,deal_id,*,pnl,direction=None,entry=None,
                                  source='live'):
         """SHADOW-visible mistake audit — safe to call from any settle path."""
@@ -4609,10 +4647,11 @@ class SingleTradeEngine:
                        if isinstance(saved,dict) else None)
             sc_meta=(ohlc_meta.get('scenario')
                      if isinstance(ohlc_meta,dict) else None)
-            news_snap=im_snap=None
-            if isinstance(saved,dict):
-                news_snap=saved.get('news') or saved.get('economic_news_risk')
-                im_snap=saved.get('intermarket') or saved.get('intermarket_analysis')
+            direction_r=(direction if direction in ('BUY','SELL')
+                         else ((saved or {}).get('direction')
+                               if isinstance(saved,dict) else None))
+            news,intermarket=self._audit_external_context(
+                saved,direction=direction_r)
             epic=((saved.get('epic') if isinstance(saved,dict) else None)
                   or (self.mandate or {}).get('epic')
                   or getattr(self.brain,'epic',None))
@@ -4623,13 +4662,9 @@ class SingleTradeEngine:
                 candles=candles,
                 scenario_meta=sc_meta if isinstance(sc_meta,dict) else {},
                 ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else {},
-                news=news_snap if isinstance(news_snap,dict) else (
-                    self._news_risk() if self.mandate else {}),
-                intermarket=im_snap if isinstance(im_snap,dict)
-                else dict(getattr(self.intermarket,'state',{}) or {}),
-                direction=(direction if direction in ('BUY','SELL')
-                           else ((saved or {}).get('direction')
-                                 if isinstance(saved,dict) else None)),
+                news=news,
+                intermarket=intermarket,
+                direction=direction_r,
                 entry=entry if entry is not None else (
                     _num(saved.get('entry')) if isinstance(saved,dict) else None),
                 source=source,
@@ -7500,6 +7535,15 @@ class SingleTradeEngine:
             self._publish_entry_path(evaluation)
         news=self._news_risk()
         intermarket=self.intermarket.state
+        try:
+            # Keep SHADOW lab + late audits synced with today's news/peers.
+            self.store.set('live_external_context',{
+                'at':datetime.now(timezone.utc).isoformat(),
+                'news':news if isinstance(news,dict) else {},
+                'intermarket':intermarket if isinstance(intermarket,dict) else {},
+            })
+        except Exception:
+            pass
         readiness=(self.brain.trading_readiness()
                    if hasattr(self.brain,'trading_readiness') else {'ready':False})
         hr_snap=hard_risk.snapshot(self.store)
@@ -8034,6 +8078,8 @@ class SingleTradeEngine:
                     zone=ez.get('sell_entry')
                 if not isinstance(zone,dict):
                     zone=ez.get('buy_entry') or ez.get('sell_entry')
+            news_ctx,im_ctx=self._audit_external_context(
+                {},direction=action if action in ('BUY','SELL') else None)
             entry_context={
                 'scenario':_osc.open_meta_from_scenario(sc) if sc else {},
                 'ohlc_entry':{
@@ -8041,8 +8087,8 @@ class SingleTradeEngine:
                     'zone':zone if isinstance(zone,dict) else None,
                     'trigger':(ez or {}).get('trigger') if isinstance(ez,dict) else None,
                 },
-                'news':self._news_risk(),
-                'intermarket':dict(self.intermarket.state or {}),
+                'news':news_ctx,
+                'intermarket':im_ctx,
             }
         except Exception:
             entry_context=None

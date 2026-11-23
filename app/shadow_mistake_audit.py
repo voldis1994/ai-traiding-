@@ -601,6 +601,27 @@ def lab_payload(store) -> dict:
             or (isinstance(h.get('pnl'), (int, float)) and float(h['pnl']) < -0.02)))
     # Full 24h analysis window — both profits and losses (not just last close).
     window_24h = _hist_window_stats(hist, hours=24)
+    live_ext = store.get('live_external_context') if isinstance(
+        store.get('live_external_context'), dict) else {}
+    live_news = live_ext.get('news') if isinstance(live_ext.get('news'), dict) else {}
+    live_im = live_ext.get('intermarket') if isinstance(
+        live_ext.get('intermarket'), dict) else {}
+    # Fallback: assess calendar from the client data dir when engine has not
+    # written live_external_context yet (Desk open before first snapshot).
+    if not live_news.get('status') and getattr(store, 'path', None) is not None:
+        try:
+            from .external_risk import assess_news
+            cal = store.path.parent / 'economic_calendar.json'
+            live_news = assess_news('', cal) or {}
+        except Exception:
+            live_news = {'status': 'UNCONFIGURED',
+                         'reason': 'Calendar not readable yet'}
+    peer_n = 0
+    ready_peers = 0
+    if isinstance(live_im.get('peers'), list):
+        peer_n = len(live_im['peers'])
+        ready_peers = sum(1 for p in live_im['peers']
+                          if isinstance(p, dict) and p.get('ready'))
     return {
         'ok': True,
         'loop': 'diagnose → scenario memory → targeted fix → promote → LIVE',
@@ -611,6 +632,19 @@ def lab_payload(store) -> dict:
         'hist_n': len(hist),
         'hurt_n': hurt_n,
         'window_24h': window_24h,
+        'live_news': {
+            'status': live_news.get('status') or '—',
+            'reason': live_news.get('reason'),
+            'entry_allowed': live_news.get('entry_allowed'),
+            'event_at': live_news.get('event_at'),
+        },
+        'live_peers': {
+            'status': live_im.get('status') or 'WAITING',
+            'reason': live_im.get('reason'),
+            'peer_n': peer_n,
+            'ready_peers': ready_peers,
+            'entry_allowed': live_im.get('entry_allowed'),
+        },
         'last': display_last,
         'last_raw': last,
         'pending_fix': {

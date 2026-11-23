@@ -484,7 +484,21 @@ function renderShadowLab(client){
               :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
                 ?auditLast.notes.join(' · ')
                 :(audit.loop||'diagnose → memory → fix → promote → LIVE'))))}</div>
-        <div class="shadow-note">News ${esc(auditLast.news_status||'—')} · peers ${esc(auditLast.intermarket_status||'—')} · zone ${esc(auditLast.zone_side||'—')}</div>
+        <div class="shadow-note">${esc(
+          'At close · news '+(auditLast.news_status||'—')
+          +' · peers '+(auditLast.intermarket_status||'—')
+          +' · zone '+(auditLast.zone_side||'—'))}</div>
+        <div class="shadow-note">${esc((()=>{
+          const ln=audit.live_news||{};
+          const lp=audit.live_peers||{};
+          const nr=ln.reason?String(ln.reason).slice(0,72):'';
+          const pr=lp.reason?String(lp.reason).slice(0,56):'';
+          return 'Live today · news '+(ln.status||'—')
+            +(nr?(' · '+nr):'')
+            +' · peers '+(lp.status||'—')
+            +(lp.ready_peers!=null?(' '+lp.ready_peers+'/'+(lp.peer_n||0)):'')
+            +(pr?(' · '+pr):'');
+        })())}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -1362,19 +1376,32 @@ function renderDeskIntel(client){
   // Full reason text — CSS wraps; do not hard-truncate GATE/NEWS to ellipsis junk.
   const push=(tag,t,cls,src)=>chips.push({tag,t:String(t),cls,src:src||'NEURAL'});
   if(news&&typeof news==='object'){
-    const risk=news.risk||news.level||news.status||news.summary;
-    const label=news.headline||news.event||news.next||news.reason||risk;
-    const bear=String(risk||'').toLowerCase().includes('high')||String(news.status||'').includes('BLOCK');
-    if(label)push(bear?'BEARISH':'NEUTRAL',label,bear?'bear':'neu',news.source||'NEWS');
+    const st=String(news.status||'');
+    const risk=news.risk||news.level||st||news.summary;
+    const label=news.headline||news.event||news.next||news.reason||risk||st;
+    const bear=st==='NEWS_WINDOW'||st==='HIGH_IMPACT'||st==='CALENDAR_UNAVAILABLE'
+      ||String(risk||'').toLowerCase().includes('high')
+      ||String(st).includes('BLOCK')
+      ||news.entry_allowed===false;
+    if(label)push(bear?'BEARISH':'NEUTRAL',
+      (st&&st!=='CLEAR'?st+' · ':'')+String(label).slice(0,140),
+      bear?'bear':'neu',news.source||'NEWS');
   }else if(typeof news==='string'&&news){
     push('NEWS',news,'neu','FEED');
   }
   if(im&&typeof im==='object'){
-    const lean=im.lean||im.bias||im.regime||im.summary||im.status;
-    const cls=String(lean||'').toLowerCase().includes('bull')?'bull'
-      :(String(lean||'').toLowerCase().includes('bear')?'bear':'neu');
-    if(lean)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
-      String(lean),cls,'INTERMARKET');
+    const st=String(im.status||'');
+    const lean=im.lean||im.bias||im.regime||im.summary||st;
+    const peers=Array.isArray(im.peers)?im.peers:[];
+    const readyN=peers.filter(p=>p&&p.ready).length;
+    const reason=im.reason?String(im.reason).slice(0,90):'';
+    const cls=st==='CONTRADICTION'||String(lean||'').toLowerCase().includes('bear')?'bear'
+      :(String(lean||'').toLowerCase().includes('bull')?'bull':'neu');
+    const line=[lean||st,
+      (readyN||peers.length)?(`peers ${readyN}/${peers.length}`):null,
+      reason&&reason!==String(lean)?reason:null].filter(Boolean).join(' · ');
+    if(line)push(cls==='bull'?'BULLISH':(cls==='bear'?'BEARISH':'NEUTRAL'),
+      line,cls,'INTERMARKET');
   }
   if(sit&&typeof sit==='object'){
     const tip=sit.tip||sit.summary||sit.last||sit.note;

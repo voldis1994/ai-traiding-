@@ -49,5 +49,9 @@ def test_cache_bust_mentions_new_assets():
     assert 'admin.css?v=' in HTML
     assert 'admin.js?v=' in HTML
     assert 'display_n' in JS or 'sampleHead' in JS
-    assert 'no shadow closes yet' in JS
+    assert 'No paper closes yet' in JS or 'waiting for shadow fills' in JS
     assert 'renderShadowLab' in JS
+    assert 'overflow:hidden' in CSS
+    compact = CSS.replace(' ', '').replace('\n', '')
+    assert 'shadow-card.wide{grid-column:span3}' in compact
+    assert 'Hardframelock' in compact or '#dash,.shell,.term' in compact

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=129">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=134">
   <script>
   /* Paint Desk immediately on Windows loopback — never flash Operatora ieeja. */
   (function(){
@@ -160,7 +160,7 @@
           <span id="deskUtc" class="psx-utc">UTC —</span>
           <span id="deskPulse" class="psx-pulse">Sync —</span>
           <span id="deskDemoBadge" class="psx-demo-badge hidden" title="Visual fixture only">DEMO</span>
-          <label class="psx-acct term-acct">Account
+          <label class="psx-acct term-acct" title="Account">
             <select id="deskFocus" aria-label="Desk account"></select>
           </label>
           <button type="button" id="refreshBtn" class="btn btn-ghost tiny" title="Sinhronizēt">
@@ -306,7 +306,7 @@
             <span class="psx-live" id="shadowPulse">● —</span>
           </div>
           <div id="shadowTruth" class="shadow-truth"></div>
-          <div id="shadowBoard" class="shadow-board fill-scroll" aria-label="Shadow lab"></div>
+          <div id="shadowBoard" class="shadow-board" aria-label="Shadow lab"></div>
         </div>
       </section>
 
@@ -323,7 +323,7 @@
               <article class="card chart-card">
                 <div class="card-head">
                   <div>
-                    <h2>Kopējā veiktspēja</h2>
+                    <h2>PERFORMANCE</h2>
                     <div class="perf-row">
                       <strong id="perfValue">—</strong>
                       <span id="perfDelta" class="trend-pill">—</span>
@@ -477,6 +477,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=12"></script>
-  <script src="/admin/static/admin.js?v=156"></script>
+  <script src="/admin/static/admin.js?v=161"></script>
 </body>
 </html>

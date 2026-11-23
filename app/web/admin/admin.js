@@ -61,25 +61,24 @@ function deskAutoFit(){
   root.dataset.autofit='1';
   const w=Math.max(root.clientWidth||0,window.innerWidth-90);
   const h=Math.max(root.clientHeight||0,window.innerHeight-40);
-  // Readable floor first — never crush bottom labels into mid-word wraps.
-  const fs=clampNum(Math.round(10.5+h/110+w/480),11,15);
-  const fsSm=clampNum(fs-1,10,13);
-  const fsXs=clampNum(fs-2,9,12);
-  const fsMd=clampNum(fs,11,14);
-  const fsLg=clampNum(fs+2,13,19);
-  const fsXl=clampNum(fs+4,15,22);
-  const gap=clampNum(Math.round(3+h/280),3,7);
-  const pad=clampNum(gap+1,4,9);
-  const headH=clampNum(Math.round(22+fs*0.35),24,28);
-  const tapeH=clampNum(Math.round(18+fs*0.25),20,24);
-  const statusMin=clampNum(Math.round(44+fs),48,64);
-  // Side windows: keep center chart dominant, but never starve learn/closes.
-  let side=clampNum(Math.round(w*0.15),150,260);
-  if(w<1200)side=clampNum(Math.round(w*0.135),130,200);
-  if(w<980)side=clampNum(Math.round(w*0.12),112,160);
-  // Bottom row needs real height — previous autofit starved LEARN/CLOSES.
-  const bottomMin=clampNum(Math.round(h*0.34),210,340);
-  const topMin=clampNum(Math.round(h*0.28),150,280);
+  // Fit the laptop frame first — soft mins so the grid never forces page scroll.
+  const fs=clampNum(Math.round(9.5+h/140+w/520),10,14);
+  const fsSm=clampNum(fs-1,9,12);
+  const fsXs=clampNum(fs-2,8,11);
+  const fsMd=clampNum(fs,10,13);
+  const fsLg=clampNum(fs+2,12,17);
+  const fsXl=clampNum(fs+3,13,19);
+  const gap=clampNum(Math.round(2+h/320),2,5);
+  const pad=clampNum(gap+1,3,7);
+  const headH=clampNum(Math.round(18+fs*0.3),20,26);
+  const tapeH=clampNum(Math.round(16+fs*0.2),18,22);
+  const statusMin=clampNum(Math.round(36+fs*0.8),40,56);
+  let side=clampNum(Math.round(w*0.14),130,220);
+  if(w<1200)side=clampNum(Math.round(w*0.13),118,180);
+  if(w<980)side=clampNum(Math.round(w*0.12),104,150);
+  // fr tracks with soft floors — never demand more height than the viewport.
+  const bottomMin=clampNum(Math.round(h*0.22),110,200);
+  const topMin=clampNum(Math.round(h*0.20),100,180);
   const set=(k,v)=>root.style.setProperty(k,v);
   set('--desk-fs',fs+'px');
   set('--desk-fs-xs',fsXs+'px');
@@ -94,28 +93,36 @@ function deskAutoFit(){
   set('--desk-status-min',statusMin+'px');
   set('--desk-col-intel',side+'px');
   set('--desk-col-right',side+'px');
-  // Give LEARN + CLOSES equal readable width (were too narrow → "Libra/ry").
-  set('--desk-grid-c1','minmax(110px,1fr)');
-  set('--desk-grid-c2','minmax(140px,1.2fr)');
-  set('--desk-grid-c3','minmax(170px,1.25fr)');
-  set('--desk-grid-c4','minmax(170px,1.25fr)');
-  set('--desk-grid-r1','minmax('+topMin+'px,1.1fr)');
-  set('--desk-grid-r2','minmax('+bottomMin+'px,1.25fr)');
+  set('--desk-grid-c1','minmax(96px,1fr)');
+  set('--desk-grid-c2','minmax(120px,1.15fr)');
+  set('--desk-grid-c3','minmax(140px,1.2fr)');
+  set('--desk-grid-c4','minmax(140px,1.2fr)');
+  set('--desk-grid-r1','minmax('+topMin+'px,1.05fr)');
+  set('--desk-grid-r2','minmax('+bottomMin+'px,1.1fr)');
   root.dataset.autofitW=String(Math.round(w));
   root.dataset.autofitH=String(Math.round(h));
   root.dataset.autofitFs=String(fs);
 }
 
-/** Non-desk modules: fill the shell; only inner .fill-scroll scrolls. */
+/** Non-desk modules: fill the shell frame — no scrollbars. */
 function termViewsAutoFit(){
   const shell=$('termShell')||document.querySelector('.term');
   if(!shell)return;
   const h=window.innerHeight;
-  const fs=clampNum(Math.round(9+h/110),9,13);
+  const w=window.innerWidth;
+  const fs=clampNum(Math.round(8.5+h/130+w/900),9,12);
+  const gap=clampNum(Math.round(2+h/400),2,5);
+  const pad=clampNum(gap,3,6);
   shell.style.setProperty('--term-fit-fs',fs+'px');
+  shell.style.setProperty('--term-fit-gap',gap+'px');
+  shell.style.setProperty('--term-fit-pad',pad+'px');
   document.querySelectorAll('.term-main>.view:not([data-view="desk"]) .term-view').forEach(el=>{
     el.style.minHeight='0';
     el.style.height='100%';
+    el.style.overflow='hidden';
+  });
+  document.querySelectorAll('.term-main>.view .fill-scroll').forEach(el=>{
+    el.style.overflow='hidden';
   });
 }
 
@@ -363,14 +370,10 @@ function renderShadowLab(client){
   if(truth){
     const hundred=truthInfo.hundred_variations===true;
     stableHtml(truth,
-      `<strong>Does it run 100 variations?</strong> `
-      +`<b>${hundred?'YES':'NO — not today'}</b>. `
-      +esc(truthInfo.what_runs||(
-        'One neural core for LIVE + SHADOW; paper SL/TP book; mistake-audit → '
-        +'scenario memory → targeted fix → LIVE; ~30 policy candidates. '
-        +'Not a second brain.'))
-      +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
-      +(lab.shadow_active?' · shared neurons <b>ON</b>':' · neural <b>off / booting</b>'));
+      `<strong>100 variations?</strong> <b>${hundred?'YES':'NO'}</b> · `
+      +`<b>One neural core</b> LIVE+SHADOW · paper SL/TP · audit→fix→LIVE · `
+      +`Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
+      +(lab.shadow_active?' · shared neurons <b>ON</b>':' · neural <b>off</b>'));
   }
   // Shadow paper Desk: cash £ only — never price pts as P&L.
   const cashTrades=Number(paper.cash_trades||0)||0;
@@ -386,7 +389,7 @@ function renderShadowLab(client){
     if(!r||typeof r!=='object')return false;
     if(String(r.unit||'')==='price')return false;
     return r.paper_pnl!=null&&Number.isFinite(Number(r.paper_pnl));
-  });
+  }).slice(0,5);
   const openSl=open?(open.sl!=null?open.sl:(open.stop!=null?open.stop:null)):null;
   const openTp=open?(open.tp!=null?open.tp:(open.profit!=null?open.profit:null)):null;
   const openTxt=open
@@ -406,7 +409,7 @@ function renderShadowLab(client){
       <strong class="pnl ${pcls}">${esc(pnlTxt)}</strong>
     </div>`;
   }).join(''):'<div class="psx-empty">No paper closes yet — waiting for shadow fills</div>';
-  const top=(struct.top||[]).slice(0,4).map(b=>{
+  const top=(struct.top||[]).slice(0,2).map(b=>{
     if(!b||typeof b!=='object')return '';
     return `<div class="shadow-note">${esc(b.key||b.structure||'bucket')} · SL ${esc(b.sl_count||0)} / n ${esc(b.samples||b.n||0)}</div>`;
   }).filter(Boolean).join('')||'<div class="shadow-note">No structure graves yet</div>';
@@ -433,7 +436,7 @@ function renderShadowLab(client){
   const fixState=pendingFix.committed?'COMMITTED'
     :(pendingFix.fingerprint?'PENDING':'—');
   const fixCls=pendingFix.committed?'ok':(pendingFix.fingerprint?'neu':'');
-  const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,4).map(s=>{
+  const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,2).map(s=>{
     if(!s||typeof s!=='object')return '';
     const tag=s.ready_for_live?'READY':(s.fix_committed?'FIXED':'…');
     return `<div class="shadow-note">${esc(s.scenario||s.fingerprint||'?')} · `
@@ -441,15 +444,15 @@ function renderShadowLab(client){
       +`<b>${esc(tag)}</b></div>`;
   }).filter(Boolean).join('')
     ||(winN
-      ?`<div class="shadow-note">Capital 24h has ${esc(winN)} closes — rebuilding fingerprints from journal</div>`
+      ?`<div class="shadow-note">Capital 24h · ${esc(winN)} closes — rebuilding fingerprints</div>`
       :'<div class="shadow-note">No scenario fingerprints yet — waiting for Capital / shadow closes</div>');
-  const readyRows=(Array.isArray(audit.ready)?audit.ready:[]).slice(0,4).map(r=>{
+  const readyRows=(Array.isArray(audit.ready)?audit.ready:[]).slice(0,2).map(r=>{
     if(!r||typeof r!=='object')return '';
     return `<div class="shadow-note ok-line">${esc(r.scenario||r.fingerprint||'?')} · `
       +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
   }).filter(Boolean).join('')
-    ||'<div class="shadow-note">None ready for LIVE yet — waiting for next hurt close to commit fix</div>';
-  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,12).map(a=>{
+    ||'<div class="shadow-note">None ready LIVE yet</div>';
+  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,5).map(a=>{
     if(!a||typeof a!=='object')return '';
     const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
     const p=a.pnl!=null?Number(a.pnl):null;
@@ -475,35 +478,24 @@ function renderShadowLab(client){
         </div>
         <div class="shadow-note">${esc(
           winN
-            ?('Reads full 24h · '+winN+' closes (W'+winW+'/L'+winL
-              +(win24.from_journal?' · from Capital journal':'')
-              +') · last '+(auditLast.source||'—')+' '
+            ?('24h · '+winN+' closes W'+winW+'/L'+winL
+              +(win24.from_journal?' · Capital journal':'')
+              +' · '+(auditLast.source||'—')+' '
               +(missTxt!=='none'?missTxt:(auditLast.scenario||'')))
             :(auditLast.display_note==='showing_last_hurt_not_scratch'
-              ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
+              ?('Last hurt · '+(auditLast.scenario||''))
               :(auditLast.display_note==='showing_journal_24h_seed'
-                ?('Seeded from Capital 24h journal — cycle catching up')
+                ?('Seeded from Capital 24h journal')
                 :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
-                  ?auditLast.notes.join(' · ')
-                  :(audit.loop||'diagnose → memory → fix → promote → LIVE')))))}</div>
-        <div class="shadow-note">${esc(
-          'At close · news '+(auditLast.news_status||'—')
-          +' · peers '+(auditLast.intermarket_status||'—')
-          +' · zone '+(auditLast.zone_side||'—')
-          +' · cycle does not wait on news/peers')}</div>
+                  ?String(auditLast.notes[0]).slice(0,90)
+                  :(audit.loop||'diagnose → fix → LIVE')))))}</div>
         <div class="shadow-note">${esc((()=>{
           const ln=audit.live_news||{};
           const lp=audit.live_peers||{};
-          const ns=String(ln.status||'NEWS_NA');
-          const ps=String(lp.status||'PEERS_NA');
-          const nr=ln.reason?String(ln.reason).slice(0,72):'';
-          const pr=lp.reason?String(lp.reason).slice(0,56):'';
-          return 'Context · news '+ns
-            +(nr?(' · '+nr):'')
-            +' · peers '+ps
+          return 'news '+(auditLast.news_status||ln.status||'—')
+            +' · peers '+(auditLast.intermarket_status||lp.status||'—')
             +(lp.ready_peers!=null?(' '+lp.ready_peers+'/'+(lp.peer_n||0)):'')
-            +(pr?(' · '+pr):'')
-            +' · closes analyse anyway';
+            +' · zone '+(auditLast.zone_side||'—');
         })())}</div>
       </div>
     </article>
@@ -696,37 +688,68 @@ function buildDeskDemoFixture(){
     mk('BTCUSD',1,+1.2),mk('ETHUSD',0.052,-0.8),mk('SOLUSD',0.0024,+2.1),
     mk('BNBUSD',0.0095,+0.4),mk('XRPUSD',0.000018,-1.1),mk('XAUUSD',0.042,+0.3),
   ];
-  const client={
-    id:1,username:'demo',display_name:'DEMO PLATINUM',robot_running:true,armed:true,
-    execution_enabled:false,broker:{connected:true},
-    scores:{BUY:0.14,HOLD:0.13,SELL:0.73},action:'SELL',
-    activity:{
-      market:'BTCUSD',market_mid:mid,market_bid:mid-0.5,market_ask:mid+0.5,tick:0.1,
-      market_status:'TRADEABLE',tick_count:1284,spread:1.0,entry_can_submit_now:false,
-      model_readiness:{ready:true},mtf_momentum:{mode:'ALIGNED',preferred:'SELL',ready:true},
-      day_book:{phase:'ACTIVE'},
-      economic_news_risk:{headline:'Demo: BTC funding skew widens into US open',risk:'elevated',source:'DEMO',status:'WATCH'},
-      intermarket_analysis:{lean:'BEARISH · DXY firm vs risk',bias:'bear'},
-      situation_memory:{tip:'Demo fixture — not a live news feed'},
-      positions:[{epic:'BTCUSD',direction:'SELL',size:0.25,level:62150,currentLevel:mid,upl:-42.5,has_sl:true,has_tp:true,stopLevel:mid+420,profitLevel:mid-680}],
-    },
-    results:{
-      pnl_currency:'USD',
-      recent_trades:[
-        {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed:'2024-11-20T12:01:00Z',pnl:-18,pnl_source:'broker'},
-        {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed:'2024-11-20T11:55:00Z',pnl:62,pnl_source:'broker'},
-        {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed:'2024-11-20T11:40:00Z',pnl:-11,pnl_source:'upl_estimate'},
-        {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed:'2024-11-20T11:22:00Z',pnl:24,pnl_source:'broker'},
-      ],
-    },
+  const mkClient=(id,name,user,scores,action,pos)=>{
+    const open=pos?[{epic:pos.epic||'GOLD',direction:pos.dir||'SELL',size:pos.size||0.1,
+      level:pos.entry||2634.3,currentLevel:pos.mid||2635.8,upl:pos.upl||-0.3,
+      has_sl:true,has_tp:true,stopLevel:pos.sl||2640.2,profitLevel:pos.tp||2629.2}]:[];
+    return {
+      id,username:user,display_name:name,robot_running:true,armed:true,language:'lv',
+      account_currency:'GBP',execution_enabled:false,
+      broker:{connected:true,display_name:name},
+      scores,action,
+      evolution:{neurons:120+id*7,steps:40+id*3,learning_generation:id},
+      activity:{
+        market:pos?pos.epic:'GOLD',market_mid:pos?pos.mid:2635.8,tick:0.1,
+        market_status:'TRADEABLE',tick_count:400+id*10,spread:0.5,
+        entry_can_submit_now:!pos,entry_intent:action,entry_wait:pos?null:'Neural HOLD dominates',
+        model_readiness:{ready:true},
+        mtf_momentum:{mode:action==='HOLD'?'HOLD':'ALIGNED',preferred:action,
+          ready:true,neural_period_weights:{m1:0.2,m5:0.2,m15:0.2,m30:0.2,m60:0.2}},
+        day_book:{phase:'HUNT'},mandate:{size:0.1+id*0.05,epic:pos?pos.epic:'GOLD'},
+        positions:open,position:open[0]||null,
+      },
+      results:{
+        pnl_currency:'GBP',wins:6,losses:0,cash_trades:6,closed_trades:6,
+        realized_pnl:0.5*id,pnl_source:'broker',
+        recent_trades:[{epic:'GOLD',direction:'BUY',size:0.1,pnl:0.36,pnl_source:'broker',
+          entry:2630,exit:2634,closed:'2024-11-20T12:01:00Z'}],
+      },
+    };
   };
+  const client=mkClient(1,'voldis','voldis',{BUY:0.01,HOLD:0.98,SELL:0.01},'HOLD',null);
+  client.display_name='DEMO PLATINUM';
+  client.username='demo';
+  client.scores={BUY:0.14,HOLD:0.13,SELL:0.73};client.action='SELL';
+  client.activity.market='BTCUSD';
+  client.activity.market_mid=mid;client.activity.market_bid=mid-0.5;client.activity.market_ask=mid+0.5;
+  client.activity.spread=1.0;client.activity.tick_count=1284;
+  client.activity.economic_news_risk={headline:'Demo: BTC funding skew widens into US open',risk:'elevated',source:'DEMO',status:'WATCH'};
+  client.activity.intermarket_analysis={lean:'BEARISH · DXY firm vs risk',bias:'bear'};
+  client.activity.situation_memory={tip:'Demo fixture — not a live news feed'};
+  client.activity.positions=[{epic:'BTCUSD',direction:'SELL',size:0.25,level:62150,currentLevel:mid,upl:-42.5,
+    has_sl:true,has_tp:true,stopLevel:mid+420,profitLevel:mid-680}];
+  client.activity.position=client.activity.positions[0];
+  client.results.pnl_currency='USD';
+  client.results.recent_trades=[
+    {epic:'BTCUSD',direction:'SELL',size:1.2,level:62110,closed:'2024-11-20T12:01:00Z',pnl:-18,pnl_source:'broker'},
+    {epic:'ETHUSD',direction:'BUY',size:4.0,level:3240,closed:'2024-11-20T11:55:00Z',pnl:62,pnl_source:'broker'},
+    {epic:'SOLUSD',direction:'SELL',size:40,level:148.2,closed:'2024-11-20T11:40:00Z',pnl:-11,pnl_source:'upl_estimate'},
+    {epic:'BNBUSD',direction:'BUY',size:2.5,level:590,closed:'2024-11-20T11:22:00Z',pnl:24,pnl_source:'broker'},
+  ];
+  const fleet=[
+    client,
+    mkClient(2,'guntis','guntis',{BUY:0.29,HOLD:0.58,SELL:0.13},'HOLD',
+      {epic:'GOLD',dir:'SELL',size:0.1,entry:2634.31,mid:2635.87,sl:2640.2,tp:2629.2,upl:-0.32}),
+    mkClient(3,'dimitrij','dimitrij',{BUY:0.55,HOLD:0.30,SELL:0.15},'BUY',null),
+    mkClient(4,'andris','andris',{BUY:0.22,HOLD:0.61,SELL:0.17},'HOLD',null),
+  ];
   const view={
     ok:true,epic:'BTCUSD',mid,candles,
     open_levels:[{entry:mid+40,stop:mid+420,profit:mid-680}],
     swing_brackets:{ready:true,entry:mid+40,stop:mid+420,tp1:mid-680},
     overlays:{sl:mid+420,ent:mid+40,tp:mid-680},
   };
-  return {overview:{clients:[client],system:{ok:true}},markets,view,client};
+  return {overview:{clients:fleet,system:{ok:true}},markets,view,client};
 }
 
 function deskCandleChange(candles){
@@ -1029,7 +1052,6 @@ function renderDeskLearn(client){
   const rows=[
     deskKv(client.id,'Cards',cards.n!=null?cards.n:0),
     deskKv(client.id,'Samples',sampleShow),
-    deskKv(client.id,'Source',samples.source||'—'),
     deskKv(client.id,'Closes',samples.closed_trades!=null?samples.closed_trades
       :((client.results&&client.results.closed_trades)!=null?client.results.closed_trades:'—')),
     deskKv(client.id,'Edge £',lh.edge_closes!=null?lh.edge_closes:'—'),
@@ -1039,19 +1061,13 @@ function renderDeskLearn(client){
     deskKv(client.id,'W/L',
       (Number(shadow.cash_trades||0)>0
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—')),
-    deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),
-    deskKv(client.id,'Strat Δ',knobs.strategy_gen_nudge,v=>v==null?'—':num(v,2)),
   ];
   const comboBits=[];
   if(paying.length){
-    comboBits.push(`<div class="psx-learn-line ok"><span>PAYING</span><b>${esc(paying.map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
+    comboBits.push(`<div class="psx-learn-line ok"><span>PAY</span><b>${esc(paying.slice(0,2).map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
   }
   if(bleeding.length){
-    comboBits.push(`<div class="psx-learn-line bad"><span>BLEEDING</span><b>${esc(bleeding.map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
-  }
-  if(cards.active&&cards.active.length){
-    comboBits.push(`<div class="psx-learn-line"><span>CARDS</span><b>${esc(cards.active.slice(0,8).join(' · '))}</b></div>`);
+    comboBits.push(`<div class="psx-learn-line bad"><span>BLEED</span><b>${esc(bleeding.slice(0,2).map(p=>`${p.key} ${num(p.mean_pnl,2)}`).join(' · '))}</b></div>`);
   }
   stableHtml(el,`<div class="psx-learn-kv">${rows.join('')}</div>${comboBits.join('')}`);
 }
@@ -1178,7 +1194,7 @@ function deskOhlcSignal(m,focusAct,isFocus){
 function renderDeskSignal(client,markets){
   const el=$('deskSignal');
   if(!el)return;
-  const rows=(markets||[]).slice(0,6);
+  const rows=(markets||[]).slice(0,4);
   const focusAct=client?deskScoreAction(client):null;
   const focusEpic=((client&&client.activity)||{}).market
     ||((((client&&client.activity)||{}).mandate)||{}).epic||'';
@@ -1225,7 +1241,7 @@ function renderDeskClosed(client){
     if(!isCapitalFundsSrc(t.pnl_source))return false;
     const v=t.pnl!=null?Number(t.pnl):NaN;
     return Number.isFinite(v)&&Math.abs(v)>=1e-12;
-  }).slice(0,12);
+  }).slice(0,6);
   if(deskWhaleFilter==='BUY')rows=rows.filter(t=>{
     const s=String(t.direction||t.side||'').toUpperCase();
     return s.includes('BUY')||s==='LONG';
@@ -1316,11 +1332,8 @@ function renderDeskEngine(client){
         <div class="psx-short" style="color:${ring}">${esc(side)}</div>
         <div class="psx-regime ${regimeCls}">${esc(regime)}</div>
         <div class="psx-engine-meta">
-          Score = neural alignment (not win-rate)<br>
           MTF <strong>${esc(mtf.mode||'—')}${mtf.preferred?(' · '+esc(mtf.preferred)):''}</strong>
-          · Day <strong>${esc(dayPhase)}</strong><br>
-          Armed <strong>${esc(client.armed?'YES':'NO')}</strong>
-          · Exec <strong>${esc(client.execution_enabled?'ON':'OFF')}</strong>
+          · Day <strong>${esc(dayPhase)}</strong>
           · Robot <strong>${esc(client.robot_running?'ON':'OFF')}</strong>
         </div>
       </div>
@@ -1351,22 +1364,18 @@ function renderDeskCheck(client,view){
   const canOpen=!!a.entry_can_submit_now;
   const closeLive=a.neural_close_executable!==false&&!a.neural_close_diagnostic_only;
   const rows=[
-    {k:'Trend Structure',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
+    {k:'Trend',v:lean,cls:sc.act==='HOLD'?'neu':(sc.act==='SELL'?'bad':'ok')},
     {k:'Momentum',v:mtfTag,cls:mtfTag==='NEUT'?'neu':(mtfTag==='BEAR'?'bad':'ok')},
     {k:'M1 Flow',v:(()=>{const fc=a.flow_consensus||{};const c=String(fc.consensus||'—').toUpperCase();
       return fc.blocked?('BLOCK '+c):c;})(),
       cls:(()=>{const fc=a.flow_consensus||{};const c=String(fc.consensus||'').toUpperCase();
         return fc.blocked?'bad':(c==='BUY'?'ok':(c==='SELL'?'bad':'neu'));})()},
-    {k:'Book Balance',v:a.market_status==='TRADEABLE'?'LIVE':'WAIT',
-      cls:a.market_status==='TRADEABLE'?'ok':'neu'},
-    {k:'Spread state',v:a.spread!=null?(Number(a.spread)<1?'TIGHT':'WIDE'):'—',cls:'neu'},
     {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
-    {k:'Can OPEN',v:canOpen?'YES':(a.entry_block_reason||'NO'),cls:canOpen?'ok':'bad'},
-    {k:'Neural CLOSE',v:closeLive?('LIVE '+(a.neural_exit_intent||'—')):'DIAG ONLY',
-      cls:closeLive?'ok':'neu'},
-    {k:'SL Bracket',v:hasSl?'ON':'OFF',cls:hasSl?'ok':(pos?'bad':'neu')},
-    {k:'TP Bracket',v:hasTp?'ON':'OFF',cls:hasTp?'ok':(pos?'bad':'neu')},
-    {k:'Swing Plan',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'READY':'—',
+    {k:'OPEN',v:canOpen?'YES':'NO',cls:canOpen?'ok':'bad'},
+    {k:'CLOSE',v:closeLive?'LIVE':'DIAG',cls:closeLive?'ok':'neu'},
+    {k:'SL/TP',v:(hasSl?'SL':'—')+'/'+(hasTp?'TP':'—'),
+      cls:(hasSl&&hasTp)?'ok':(pos?'bad':'neu')},
+    {k:'Swing',v:(view&&view.swing_brackets&&view.swing_brackets.ready)?'READY':'—',
       cls:(view&&view.swing_brackets&&view.swing_brackets.ready)?'ok':'neu'},
   ];
   stableHtml(el,rows.map(r=>
@@ -1486,7 +1495,7 @@ function renderDeskBook(client,view){
   const effectTxt=fc.blocked||effect==='blocked_fight'
     ?('BLOCKED '+(fc.decision_reason||''))
     :(effect?effect.replace(/_/g,' '):'');
-  const pillarRows=pillars.length?pillars.map(p=>{
+  const pillarRows=pillars.length?pillars.slice(0,3).map(p=>{
     const v=String((p&&p.vote)||'NEUTRAL').toUpperCase();
     const cls=!p||!p.ok?'off':(v==='BUY'?'bull':(v==='SELL'?'bear':'neu'));
     const tag=!p||!p.ok?'—':v;
@@ -1494,68 +1503,43 @@ function renderDeskBook(client,view){
       <span class="psx-flow-name">${esc((p&&p.label)||(p&&p.id)||'—')}</span>
       <strong>${esc(tag)}</strong>
     </div>`;
-  }).join(''):'<div class="psx-empty">Waiting for M1 multi-source votes</div>';
-  const activeProv=providers.filter(p=>!p||p.status!=='inactive').slice(0,5)
-    .map(p=>esc((p&&p.label)||(p&&p.id)||'')).filter(Boolean).join(' · ')||'—';
+  }).join(''):'<div class="psx-empty">Waiting for M1 votes</div>';
   const conf=fc.confidence!=null&&Number.isFinite(Number(fc.confidence))
     ?Math.round(Number(fc.confidence)*100)+'%':'—';
   // Capital CFD has no exchange depth — BID/ASK real; consensus = fused free M1 feeds.
   stableHtml(el,`
     <div class="psx-quote-box">
       <div class="psx-quote-row ask"><span>ASK</span><strong>${hasBa?esc(num(ask,2)):'—'}</strong></div>
-      <div class="psx-spread">MID ${esc(num(mid,2))}${spr==null?'':(' · SPREAD '+esc(num(spr,4)))}</div>
+      <div class="psx-spread">MID ${esc(num(mid,2))}${spr==null?'':(' · SPR '+esc(num(spr,3)))}</div>
       <div class="psx-quote-row bid"><span>BID</span><strong>${hasBa?esc(num(bid,2)):'—'}</strong></div>
     </div>
     <div class="psx-flow">
       <div class="psx-flow-head">
         <span>M1 CONSENSUS</span>
         <strong class="${consCls}">${esc(cons)}</strong>
-        <span class="psx-flow-meta">conf ${esc(conf)}</span>
+        <span class="psx-flow-meta">${esc(conf)}</span>
       </div>
       ${pillarRows}
-      ${effectTxt?`<div class="psx-flow-src ${fc.blocked?'bear':''}">Decision: ${esc(effectTxt)}</div>`:''}
-      <div class="psx-flow-src">Free sources fused: ${activeProv}</div>
-      ${(()=>{
-        const L=fc.learn||{};
-        if(!L||(!L.n&&L.n!==0))return '';
-        const help=L.helpful!=null?L.helpful:'—';
-        const harm=L.harmful!=null?L.harmful:'—';
-        const nud=L.nudge!=null?Number(L.nudge).toFixed(2):'—';
-        const blk=L.block_fights?'on':'off';
-        return `<div class="psx-flow-src">Learn n=${esc(String(L.n||0))} · help ${esc(String(help))}/${esc(String(harm))} · nudge ${esc(nud)} · block ${esc(blk)}</div>`;
-      })()}
-      <div class="psx-flow-note">Affects OPEN + learns from £ · Capital = fill only</div>
+      ${effectTxt?`<div class="psx-flow-src ${fc.blocked?'bear':''}">${esc(effectTxt.slice(0,48))}</div>`:''}
+      <div class="psx-flow-note">Affects OPEN + learns from £ · Capital = fill only · Free sources fused</div>
     </div>`);
 }
 
 function renderDeskWatch(markets,focusClient){
   const el=$('deskWatch');
   if(!el)return;
-  const rows=(markets||[]).slice(0,7);
+  // Frame-fit: epic + mid + Δ only (no spark) — max 4 rows.
+  const rows=(markets||[]).slice(0,4);
   if(!rows.length){stableHtml(el,'<div class="psx-empty">No markets</div>');return}
   const focusEpic=((focusClient&&focusClient.activity)||{}).market||null;
   stableHtml(el,rows.map(m=>{
     const mid=m.mid!=null?num(m.mid,2):'—';
-    const candles=(m.candles||[]).slice(-16);
     const ch=deskCandleChange(m.candles);
     const cls=ch==null?'':(ch>=0?'up':'dn');
     const chTxt=ch==null?'—':((ch>=0?'+':'')+ch.toFixed(2)+'%');
-    const closes=candles.map(c=>Number(c.close??c.c)).filter(Number.isFinite);
-    const lo=Math.min(...closes,0),hi=Math.max(...closes,1);
-    const span=Math.max(1e-9,hi-lo);
-    const pts=closes.map((v,i)=>{
-      const x=(i/Math.max(1,closes.length-1))*64;
-      const y=14-((v-lo)/span)*12;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    const stroke=(ch!=null&&ch<0)?'#ef6875':'#31d59a';
-    const spark=closes.length>1
-      ?`<svg width="64" height="16" viewBox="0 0 64 16"><polyline fill="none" stroke="${stroke}" stroke-width="1.2" points="${pts}"/></svg>`
-      :'';
     const active=focusEpic&&String(m.epic)===String(focusEpic);
     return `<button type="button" class="psx-watch-row ${active?'active':''}" data-epic="${esc(m.epic||'')}">
       <strong>${esc(m.epic||'—')}</strong>
-      <span class="psx-mini">${spark}</span>
       <span>${esc(mid)}</span>
       <span class="${cls}">${esc(chTxt)}</span>
     </button>`;
@@ -1696,12 +1680,12 @@ function renderDeskIndCharts(client,view){
 function renderDeskLiveTrades(openRows){
   const el=$('deskDeals');
   if(!el)return;
-  const rows=(openRows||[]).slice(0,10);
+  const rows=(openRows||[]).slice(0,4);
   if(!rows.length){
     stableHtml(el,'<div class="psx-empty">No live prints</div>');
     return;
   }
-  const head=`<div class="psx-trade-row psx-trade-head"><span>EPIC</span><span>SIDE</span><span>PRICE</span><span>SL</span><span>TP</span></div>`;
+  const head=`<div class="psx-trade-row psx-trade-head"><span>EPIC</span><span>SIDE</span><span>MID</span><span>SL/TP</span></div>`;
   const body=rows.map(t=>{
     const side=String(t.direction||t.side||'?').toUpperCase();
     const cls=side==='BUY'||side==='LONG'?'buy':'sell';
@@ -1711,12 +1695,18 @@ function renderDeskLiveTrades(openRows){
     const tpN=t.profitLevel!=null&&Number(t.profitLevel)>0?Number(t.profitLevel):null;
     const slOn=!!(t.has_sl||slN!=null);
     const tpOn=!!(t.has_tp||tpN!=null);
+    const bracket=(slOn||tpOn)
+      ?(`${slOn?'SL':'—'}·${tpOn?'TP':'—'}`)
+      :'—';
+    const tip=[
+      slN!=null?('SL '+num(slN,2)):null,
+      tpN!=null?('TP '+num(tpN,2)):null,
+    ].filter(Boolean).join(' · ')||'SL/TP';
     return `<div class="psx-trade-row">
       <span title="epic">${tm}</span>
       <span class="${cls}">${esc(side==='LONG'?'BUY':(side==='SHORT'?'SELL':side))}</span>
-      <span>${esc(px==null?'—':num(px,2))}</span>
-      <span class="${slOn?'sl-on':'sl-off'}" title="Capital stopLevel">${esc(slOn&&slN!=null?num(slN,2):'OFF')}</span>
-      <span class="${tpOn?'tp-on':'tp-off'}" title="Capital profitLevel">${esc(tpOn&&tpN!=null?num(tpN,2):'OFF')}</span>
+      <span>${esc(px==null?'—':num(px,1))}</span>
+      <span class="${slOn?'sl-on':'sl-off'}" title="${esc(tip)}">${esc(bracket)}</span>
     </div>`;
   }).join('');
   stableHtml(el,head+body);
@@ -2245,7 +2235,7 @@ function collectRiskAlerts(clients){
       }
     });
   });
-  return alerts.slice(0,6);
+  return alerts.slice(0,4);
 }
 
 function renderRiskAlerts(clients){
@@ -2307,7 +2297,7 @@ function renderRecentClosed(clients){
     });
   });
   rows.sort((a,b)=>Math.abs(Number(b.upl)||0)-Math.abs(Number(a.upl)||0));
-  stableHtml($('recentClosed'),renderTradesTable(rows.slice(0,20),{empty:'Nav nesen slēgtu treidu'}));
+  stableHtml($('recentClosed'),renderTradesTable(rows.slice(0,8),{empty:'Nav nesen slēgtu treidu'}));
 }
 
 function trailFlag(phase){
@@ -2446,7 +2436,7 @@ function renderCard(c){
         if(act==='HOLD'&&intent&&intent!=='HOLD')signal=`INTENT ${intent}`;
         else if(act==='BUY'||act==='SELL')signal=act;
         const trigLabel=trigger||(act==='BUY'||act==='SELL'?'open':'—');
-        const waitLabel=(act==='HOLD'&&wait)?String(wait).slice(0,72):'—';
+        const waitLabel=(act==='HOLD'&&wait)?String(wait).slice(0,42):'—';
         return `
       <div><span>Intent</span><strong>${esc(intent||'—')}</strong></div>
       <div><span>Trigger</span><strong>${esc(trigLabel)}</strong></div>
@@ -2689,14 +2679,18 @@ async function loadOverview(){
       truthForceBooted=true;
       try{await api('/api/admin/refresh-truth','POST')}catch(_){/* keep poll */}
     }
-    const data=await api('/api/admin/overview');
+    let data=await api('/api/admin/overview');
+    if(deskDemoMode){
+      const fx=buildDeskDemoFixture();
+      data={...data,...fx.overview,clients:fx.overview.clients};
+    }
     lastOverview=data;
     lastSyncAt=Date.now();
     renderSummary(data);
     updateSystemStatus(data);
     const open=collectOpenTrades(data.clients||[]);
-    stableHtml($('openTradesPreview'),renderTradesTable(open.slice(0,8)));
-    stableHtml($('openTradesFull'),renderTradesTable(open));
+    stableHtml($('openTradesPreview'),renderTradesTable(open.slice(0,4)));
+    stableHtml($('openTradesFull'),renderTradesTable(open.slice(0,8)));
     renderTopClients(data.clients);
     renderRiskAlerts(data.clients);
     renderRiskBoard(data.clients);

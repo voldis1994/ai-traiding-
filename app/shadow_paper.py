@@ -349,6 +349,7 @@ class ShadowPaperJournal:
             'model_version':pos.get('model_version'),
             'stop_level':pos.get('stop'),'profit_level':pos.get('profit'),
             'shadow_transition':pos.get('shadow_transition'),
+            'entry_context':pos.get('entry_context'),
         }
         self.history.append(closed)
         self.position=None
@@ -356,7 +357,8 @@ class ShadowPaperJournal:
 
     def _open_position(self, action, *, mid, spread, slip_bps, bar_time,
                        stop_distance, profit_distance, tick, min_distance,
-                       model_version, shadow_transition, kappa, sl_scale):
+                       model_version, shadow_transition, kappa, sl_scale,
+                       entry_context=None):
         entry=_fill_price(action,mid,spread,slip_bps=slip_bps)
         tick=float(tick) if _finite(tick) and float(tick)>0 else max(abs(float(spread or 0))/2.,1e-4)
         sd=_finite(stop_distance)
@@ -379,6 +381,7 @@ class ShadowPaperJournal:
             'model_version':model_version,
             'kappa':kappa,'sl_scale':sl_scale,
             'shadow_transition':shadow_transition,
+            'entry_context':entry_context if isinstance(entry_context,dict) else None,
             'trail_extreme':None,
         }
         self.pending=None
@@ -388,7 +391,7 @@ class ShadowPaperJournal:
                stop_distance=None, profit_distance=None,
                kappa=None, sl_scale=None,
                model_version=None, slip_bps=None, fill_delay_bars=None,
-               shadow_transition=None):
+               shadow_transition=None, entry_context=None):
         """Advance paper book one closed bar. Returns closed row or None.
 
         Execution matches LIVE: SL/TP/trail only — never exit on opposite signal.
@@ -438,7 +441,8 @@ class ShadowPaperJournal:
                     min_distance=pend.get('min_distance') or min_distance,
                     model_version=pend.get('model_version'),
                     shadow_transition=pend.get('shadow_transition'),
-                    kappa=pend.get('kappa'),sl_scale=pend.get('sl_scale'))
+                    kappa=pend.get('kappa'),sl_scale=pend.get('sl_scale'),
+                    entry_context=pend.get('entry_context'))
 
         if self.position is None and self.pending is None and action in ('BUY','SELL'):
             if delay<=0:
@@ -448,7 +452,8 @@ class ShadowPaperJournal:
                     tick=tick,min_distance=min_distance,
                     model_version=model_version,
                     shadow_transition=shadow_transition,
-                    kappa=kappa,sl_scale=sl_scale)
+                    kappa=kappa,sl_scale=sl_scale,
+                    entry_context=entry_context)
             else:
                 self.pending={
                     'direction':action,
@@ -459,6 +464,7 @@ class ShadowPaperJournal:
                     'shadow_transition':shadow_transition,
                     'kappa':kappa,'sl_scale':sl_scale,
                     'signal_bar':bar_time,
+                    'entry_context':entry_context if isinstance(entry_context,dict) else None,
                 }
 
         self._persist()

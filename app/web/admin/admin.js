@@ -356,6 +356,9 @@ function renderShadowLab(client){
   const trial=lab.trial||{};
   const last=lab.self_dev_last||{};
   const evo=lab.evolution||{};
+  const audit=lab.mistake_audit||{};
+  const auditLast=audit.last||{};
+  const pendingFix=audit.pending_fix||{};
   const truthInfo=lab.truth||{};
   const pulse=lab.pulse||'IDLE';
   if(pulseEl){
@@ -368,8 +371,9 @@ function renderShadowLab(client){
       `<strong>Does it run 100 variations?</strong> `
       +`<b>${hundred?'YES':'NO — not today'}</b>. `
       +esc(truthInfo.what_runs||(
-        'One shadow neural + paper SL/TP book; ~30 policy edge candidates; '
-        +'self-params trials; HOLD opposite replay. Not a 100-parallel sweep.'))
+        'One shadow neural + paper SL/TP book; mistake-audit → scenario '
+        +'memory → targeted fix → promote → LIVE; ~30 policy candidates. '
+        +'Not a 100-parallel sweep.'))
       +` · Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
       +(lab.shadow_active?' · shadow neural <b>ON</b>':' · shadow neural <b>off / booting</b>'));
   }
@@ -405,7 +409,99 @@ function renderShadowLab(client){
     :'—';
   const promoteCls=last.promote?'ok':(last.rollback?'bad':'neu');
   const promoteTxt=last.promote?'PROMOTE':(last.rollback?'ROLLBACK':(last.reason?'HOLD':'—'));
+  const miss=Array.isArray(auditLast.mistakes)?auditLast.mistakes:[];
+  const missTxt=miss.length?miss.join(', '):'none';
+  const missCls=miss.length?'bad':'ok';
+  const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
+  const auditPnlTxt=auditPnl==null?'—':((auditPnl>=0?'+':'')+num(auditPnl,2));
+  const gateTxt=(auditLast.promote_count!=null)
+    ?(`${auditLast.promote_count}/${auditLast.promote_need||3}`)
+    :'0/3';
+  const fixState=pendingFix.committed?'COMMITTED'
+    :(pendingFix.fingerprint?'PENDING':'—');
+  const fixCls=pendingFix.committed?'ok':(pendingFix.fingerprint?'neu':'');
+  const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,4).map(s=>{
+    if(!s||typeof s!=='object')return '';
+    const tag=s.ready_for_live?'READY':(s.fix_committed?'FIXED':'…');
+    return `<div class="shadow-note">${esc(s.scenario||s.fingerprint||'?')} · `
+      +`${esc(s.direction||'?')} · hits ${esc(s.mistake_hits||0)}/${esc(s.seen||0)} · `
+      +`<b>${esc(tag)}</b></div>`;
+  }).filter(Boolean).join('')
+    ||'<div class="shadow-note">No scenario fingerprints yet — waits for shadow/LIVE closes</div>';
+  const readyRows=(Array.isArray(audit.ready)?audit.ready:[]).slice(0,4).map(r=>{
+    if(!r||typeof r!=='object')return '';
+    return `<div class="shadow-note ok-line">${esc(r.scenario||r.fingerprint||'?')} · `
+      +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
+  }).filter(Boolean).join('')
+    ||'<div class="shadow-note">None ready for LIVE yet (need repeats + proof wins)</div>';
+  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,6).map(a=>{
+    if(!a||typeof a!=='object')return '';
+    const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
+    const p=a.pnl!=null?Number(a.pnl):null;
+    const pcls=p==null?'':(p>=0?'ok':'bad');
+    const ptxt=p==null?'—':((p>=0?'+':'')+num(p,2));
+    const when=a.at?String(a.at).replace('T',' ').slice(0,16):'—';
+    return `<div class="shadow-row">
+      <span class="dir ${a.source==='live'?'buy':'sell'}">${esc(String(a.source||'?').toUpperCase())}</span>
+      <span class="mut">${esc(m)} · ${esc(when)}</span>
+      <span class="mut">${esc(a.scenario||a.fingerprint||'—')}</span>
+      <strong class="pnl ${pcls}">${esc(ptxt)}</strong>
+    </div>`;
+  }).join('')||'<div class="psx-empty">No audits yet — closes feed this loop</div>';
   stableHtml(board,`
+    <article class="shadow-card">
+      <div class="psx-h"><h2>MISTAKE AUDIT</h2><span class="psx-src">DIAGNOSE</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Last mistakes',missTxt,missCls)}
+          ${_shadowKv('Last £',auditPnlTxt,auditPnl==null?'neu':(auditPnl>=0?'ok':'bad'))}
+          ${_shadowKv('Scenario',auditLast.scenario||'—')}
+          ${_shadowKv('Source',auditLast.source||'—')}
+        </div>
+        <div class="shadow-note">${esc(
+          (Array.isArray(auditLast.notes)&&auditLast.notes.length)
+            ?auditLast.notes.join(' · ')
+            :(audit.loop||'diagnose → memory → fix → promote → LIVE'))}</div>
+        <div class="shadow-note">News ${esc(auditLast.news_status||'—')} · peers ${esc(auditLast.intermarket_status||'—')} · zone ${esc(auditLast.zone_side||'—')}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>SCENARIO MEMORY</h2><span class="psx-src">FINGERPRINTS</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Scenarios',audit.scenarios!=null?audit.scenarios:0)}
+          ${_shadowKv('Ready LIVE',audit.ready_count!=null?audit.ready_count:0,audit.ready_count?'ok':'neu')}
+          ${_shadowKv('Promote gate',gateTxt)}
+          ${_shadowKv('Audits',audit.hist_n!=null?audit.hist_n:0)}
+        </div>
+        ${scenRows}
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>TARGETED FIX</h2><span class="psx-src">NOT £ CHASE</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('State',fixState,fixCls)}
+          ${_shadowKv('Fingerprint',pendingFix.fingerprint?String(pendingFix.fingerprint).slice(0,8):'—')}
+          ${_shadowKv('News respect',audit.respect_news_window?'ON':'off',audit.respect_news_window?'ok':'neu')}
+          ${_shadowKv('Peer veto',audit.respect_intermarket_veto?'ON':'off',audit.respect_intermarket_veto?'ok':'neu')}
+        </div>
+        <div class="shadow-note">${esc(
+          pendingFix.committed
+            ?('Committed knobs: '+((pendingFix.changed||[]).join(', ')||'flags'))
+            :(pendingFix.why||'Same mistake must repeat '+((audit.promote_n!=null)?audit.promote_n:3)+'× before settings change'))}</div>
+      </div>
+    </article>
+    <article class="shadow-card">
+      <div class="psx-h"><h2>READY → LIVE</h2><span class="psx-src">PROMOTE</span></div>
+      <div class="body">
+        <div class="shadow-kv">
+          ${_shadowKv('Proof wins need',audit.ready_n!=null?audit.ready_n:2)}
+          ${_shadowKv('Queue',audit.ready_count!=null?audit.ready_count:0)}
+        </div>
+        ${readyRows}
+      </div>
+    </article>
     <article class="shadow-card">
       <div class="psx-h"><h2>PAPER BOOK</h2><span class="psx-src">SHADOW £</span></div>
       <div class="body">
@@ -419,7 +515,7 @@ function renderShadowLab(client){
       </div>
     </article>
     <article class="shadow-card">
-      <div class="psx-h"><h2>SELF-DEV</h2><span class="psx-src">PROMOTE</span></div>
+      <div class="psx-h"><h2>SELF-DEV</h2><span class="psx-src">WEIGHTS</span></div>
       <div class="body">
         <div class="shadow-kv">
           ${_shadowKv('Last decision',promoteTxt,promoteCls)}
@@ -476,6 +572,10 @@ function renderShadowLab(client){
         <div class="shadow-note">Last advice: ${esc(advice)}</div>
         ${top}
       </div>
+    </article>
+    <article class="shadow-card wide">
+      <div class="psx-h"><h2>RECENT AUDITS</h2><span class="psx-src">LOOP</span><span class="psx-live">● LIVE</span></div>
+      <div class="body"><div class="shadow-rows">${auditRows}</div></div>
     </article>
     <article class="shadow-card wide">
       <div class="psx-h"><h2>RECENT PAPER CLOSES</h2><span class="psx-src">JOURNAL</span><span class="psx-live">● LIVE</span></div>

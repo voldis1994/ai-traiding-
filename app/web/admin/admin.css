@@ -822,6 +822,8 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .shadow-row .pnl.ok{color:var(--desk-green,#31d59a)}.shadow-row .pnl.bad{color:var(--desk-red,#ef6875)}
 .shadow-row .mut{color:var(--desk-muted,#8c95a6)}
 .shadow-note{font-size:11px;color:var(--desk-muted,#8c95a6);line-height:1.4}
+.shadow-note.ok-line{color:var(--desk-green,#31d59a)}
+.shadow-note b{color:var(--desk-text,#d5d9e3);font-weight:800}
 @media(max-width:1200px){
   .shadow-board{grid-template-columns:1fr 1fr}
 }

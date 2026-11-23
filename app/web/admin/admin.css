@@ -562,10 +562,11 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
 .psx-learn-board{padding:6px 8px 8px;flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:4px}
 .psx-learn-kv{display:grid;grid-template-columns:1fr;gap:4px}
 .psx-learn-kv .desk-kv{padding:5px 8px;border:1px solid var(--desk-grid);background:#080d19;border-radius:2px;
-  display:grid;grid-template-columns:minmax(64px,1fr) auto;gap:8px;align-items:center;min-height:28px}
+  display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;align-items:center;min-height:28px}
 .psx-learn-kv .desk-kv span{color:var(--mut);font-size:var(--desk-fs-sm);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  overflow-wrap:normal;word-break:keep-all}
-.psx-learn-kv .desk-kv strong{font-size:var(--desk-fs);font-weight:800;white-space:nowrap;overflow-wrap:normal;text-align:right}
+  overflow-wrap:normal;word-break:keep-all;flex:0 0 auto}
+.psx-learn-kv .desk-kv strong{font-size:var(--desk-fs);font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  overflow-wrap:normal;text-align:right;justify-self:end;min-width:0}
 .psx-learn-line{display:flex;gap:8px;align-items:flex-start;padding:5px 8px;border:1px solid var(--desk-grid);background:#060a14;font-size:var(--desk-fs-sm)}
 .psx-learn-line span{flex:0 0 56px;color:var(--mut);font-weight:800;letter-spacing:.04em;white-space:nowrap}
 .psx-learn-line b{flex:1;min-width:0;white-space:normal;overflow-wrap:break-word;word-break:normal;font-weight:600;line-height:1.35}

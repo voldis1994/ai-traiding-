@@ -637,16 +637,24 @@ class RuntimeHub:
         except Exception as exc:
             out['cards'] = {'active': [], 'n': 0, 'error': type(exc).__name__}
         try:
-            sp = sd.get('shadow_paper')
-            if not isinstance(sp, dict) and store is not None:
+            sp_snap = sd.get('shadow_paper') if isinstance(sd.get('shadow_paper'), dict) else None
+            sp_live = None
+            if store is not None:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
-                    sp = eng.shadow_paper.summary()
+                    sp_live = eng.shadow_paper.summary()
                 else:
-                    # Robot stopped / no engine — still show journal from store.
                     from .shadow_paper import ShadowPaperJournal
-                    sp = ShadowPaperJournal(store).summary()
-            out['shadow'] = sp if isinstance(sp, dict) else {}
+                    sp_live = ShadowPaperJournal(store).summary()
+            def _shadow_richer(a, b):
+                if not isinstance(a, dict):
+                    return b if isinstance(b, dict) else {}
+                if not isinstance(b, dict):
+                    return a
+                # Prefer the journal that actually has closes — snap can be a stale 0.
+                score = lambda d: int(d.get('cash_trades') or 0) * 10 + int(d.get('trades') or 0)
+                return b if score(b) > score(a) else a
+            out['shadow'] = _shadow_richer(sp_snap, sp_live)
         except Exception as exc:
             out['shadow'] = {'error': type(exc).__name__}
         try:
@@ -661,20 +669,33 @@ class RuntimeHub:
             if store is not None:
                 from . import sample_strategies
                 flag = store.get(sample_strategies.STORE_FLAG) or {}
-                lib_n=int(
-                    (flag or {}).get('library_samples')
+                if not isinstance(flag, dict):
+                    flag = {}
+                lib_n = int(
+                    flag.get('library_samples')
                     or sample_strategies.library_sample_count(store) or 0)
-                # Prefer live strategy cards count — sample flag active_n often
-                # stays 0 after cards regenerate and made Desk show "cards 0".
-                cards_n=int((out.get('cards') or {}).get('n') or 0)
-                active_n=int((flag or {}).get('active_n') or 0) or cards_n
+                cards_n = int((out.get('cards') or {}).get('n') or 0)
+                # Stale ingest flag often keeps active_n=0 after cards regenerate.
+                active_n = int(flag.get('active_n') or 0) or cards_n
+                closed_n = 0
+                try:
+                    closed_n = int(store.db.execute(
+                        'SELECT COUNT(*) FROM trades WHERE closed IS NOT NULL'
+                    ).fetchone()[0] or 0)
+                except Exception:
+                    closed_n = 0
+                # Headline count for Desk — never flash a bare 0 when cards/closes exist.
+                display_n = lib_n or active_n or closed_n
                 out['samples'] = {
-                    'done': bool(isinstance(flag, dict) and flag.get('done')),
+                    'done': bool(flag.get('done')),
                     'library_samples': lib_n,
-                    'trades': int((flag or {}).get('trades') or 0),
-                    'source': (flag or {}).get('source') or (
-                        'strategy_cards' if cards_n else None),
+                    'trades': int(flag.get('trades') or 0),
+                    'closed_trades': closed_n,
+                    'source': flag.get('source') or (
+                        'strategy_cards' if cards_n else (
+                            'closed_trades' if closed_n else None)),
                     'active_n': active_n,
+                    'display_n': display_n,
                 }
         except Exception as exc:
             out['samples'] = {'error': type(exc).__name__}
@@ -700,6 +721,12 @@ class RuntimeHub:
                 out['adaptive'] = adaptive_system.snapshot(store)
         except Exception as exc:
             out['adaptive'] = {'error': type(exc).__name__}
+        try:
+            if store is not None:
+                from . import unified_cycle
+                out['learn_horizon'] = unified_cycle.learn_horizon(store)
+        except Exception as exc:
+            out['learn_horizon'] = {'error': type(exc).__name__}
         # Highlight knobs operators care about on the board.
         try:
             p = out.get('self_params') or {}

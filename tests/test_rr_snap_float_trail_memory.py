@@ -31,9 +31,45 @@ def test_rr_rechecked_after_tick_snap_example():
     pd, _ = snap_distance_to_tick(pd, tick)  # 3.5
     assert abs(sd - 2.5) < 1e-12 and abs(pd - 3.5) < 1e-12
     assert pd / sd < min_rr  # 1.4 — the bug case
-    # Repair path: raise TP to clear min_rr.
-    need_tp, _ = snap_distance_to_tick(sd * min_rr, tick)
-    assert need_tp / sd + 1e-12 >= min_rr
+    # Honest repair needs a farther OHLC pivot (or refuse) — never invent
+    # formula TP = stop × min_rr as if it were a swing high/low.
+    invented, _ = snap_distance_to_tick(sd * min_rr, tick)
+    assert invented / sd + 1e-12 >= min_rr  # math works, but…
+    # LIVE decide_brackets must NOT apply that invented distance (see below).
+
+
+def test_swing_after_snap_refuses_formula_tp_not_ohlc_pivot(monkeypatch):
+    """After snap, RR shortfall must NOT invent entry+stop×min_rr as TP."""
+    from app import bracket_learn
+
+    # Swing ready with RR=1.6; large broker min forces SL raise → RR collapses.
+    fake = {
+        'ready': True, 'source': 'swing_anchor', 'reason': 'swing_levels',
+        'stop_distance': 1.0, 'profit_distance': 1.6,
+        'stop_level': 99.0, 'profit_level': 101.6,
+        'swing_hi': 101.6, 'swing_lo': 99.0,
+        'rr': 1.6, 'min_rr': 1.5, 'kappa': 1.6,
+    }
+    monkeypatch.setattr(bracket_learn, 'swing_anchor_brackets', lambda **kw: fake)
+    # No farther pivots available → structural extend must fail.
+    monkeypatch.setattr(
+        bracket_learn, '_extend_structural_tp', lambda **kw: None)
+    candles = [{'open': 100., 'high': 101., 'low': 99., 'close': 100.,
+                'at': f'2026-11-23T12:{i:02d}:00+00:00'}
+               for i in range(30)]
+    zone = {'ready': True, 'range_distance': 1.0, 'max_tp': 1.6,
+            'kappa': 1.6, 'noise_distance': 0.8}
+    out = bracket_learn.decide_brackets_from_ohlc(
+        zone, tick=0.1, spread=0.0, min_distance=2.0, tighten=1.0,
+        entry=100.0, action='BUY', candles=candles, require_swing=True)
+    # SL raised to broker min (2.0); TP stays 1.6 → RR 0.8 < 1.5.
+    # Must refuse — never ship invented TP=3.0 (2.0×1.5).
+    assert out['source'] == 'swing_anchor'
+    assert out.get('ready') is False
+    assert out.get('reason') in (
+        'rr_below_min_after_snap', 'below_broker_min_after_snap')
+    if out.get('profit_distance') is not None:
+        assert abs(float(out['profit_distance']) - 3.0) > 1e-9
 
 
 def test_decide_brackets_ignores_cosmetic_tighten_on_swing(monkeypatch):

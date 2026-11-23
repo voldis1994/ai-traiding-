@@ -130,10 +130,9 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
     if min_d is None or min_d<0:min_d=tick_v
     sd=_finite(stop_distance)
     pd=_finite(profit_distance)
-    if sd is None or sd<=0:
-        sd=max(2*tick_v,2*abs(sp))
-    if pd is None or pd<=0:
-        pd=sd
+    # Refuse invented 2×tick fantasy brackets — caller must pass LIVE OHLC SL/TP.
+    if sd is None or sd<=0 or pd is None or pd<=0:
+        return None
     sign=1 if action=='BUY' else -1
     stop=entry-sign*float(sd)
     profit=entry+sign*float(pd)
@@ -407,10 +406,11 @@ class ShadowPaperJournal:
         tick=float(tick) if _finite(tick) and float(tick)>0 else max(abs(float(spread or 0))/2.,1e-4)
         sd=_finite(stop_distance)
         pd=_finite(profit_distance)
-        if sd is None or sd<=0:
-            sd=max(2*tick,2*abs(float(spread or 0)))
-        if pd is None or pd<=0:
-            pd=sd
+        # Same honesty as LIVE OPEN: no OHLC swing/regime distances → no paper open.
+        # Never invent 2×tick fantasy SL/TP that would poison shadow→LIVE teach.
+        if sd is None or sd<=0 or pd is None or pd<=0:
+            self.pending=None
+            return
         sign=1 if action=='BUY' else -1
         stop=entry-sign*float(sd)
         profit=entry+sign*float(pd)
@@ -489,27 +489,30 @@ class ShadowPaperJournal:
                     entry_context=pend.get('entry_context'))
 
         if self.position is None and self.pending is None and action in ('BUY','SELL'):
-            if delay<=0:
-                self._open_position(
-                    action,mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
-                    stop_distance=stop_distance,profit_distance=profit_distance,
-                    tick=tick,min_distance=min_distance,
-                    model_version=model_version,
-                    shadow_transition=shadow_transition,
-                    kappa=kappa,sl_scale=sl_scale,
-                    entry_context=entry_context)
-            else:
-                self.pending={
-                    'direction':action,
-                    'open_on_bar':self.bars_seen+delay,
-                    'stop_distance':stop_distance,'profit_distance':profit_distance,
-                    'tick':tick,'min_distance':min_distance,
-                    'model_version':model_version,
-                    'shadow_transition':shadow_transition,
-                    'kappa':kappa,'sl_scale':sl_scale,
-                    'signal_bar':bar_time,
-                    'entry_context':entry_context if isinstance(entry_context,dict) else None,
-                }
+            # No OHLC SL/TP → skip paper open (do not queue fantasy 2×tick brackets).
+            sd_ok=_finite(stop_distance);pd_ok=_finite(profit_distance)
+            if sd_ok is not None and sd_ok>0 and pd_ok is not None and pd_ok>0:
+                if delay<=0:
+                    self._open_position(
+                        action,mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
+                        stop_distance=stop_distance,profit_distance=profit_distance,
+                        tick=tick,min_distance=min_distance,
+                        model_version=model_version,
+                        shadow_transition=shadow_transition,
+                        kappa=kappa,sl_scale=sl_scale,
+                        entry_context=entry_context)
+                else:
+                    self.pending={
+                        'direction':action,
+                        'open_on_bar':self.bars_seen+delay,
+                        'stop_distance':stop_distance,'profit_distance':profit_distance,
+                        'tick':tick,'min_distance':min_distance,
+                        'model_version':model_version,
+                        'shadow_transition':shadow_transition,
+                        'kappa':kappa,'sl_scale':sl_scale,
+                        'signal_bar':bar_time,
+                        'entry_context':entry_context if isinstance(entry_context,dict) else None,
+                    }
 
         self._persist()
         return closed

@@ -16,9 +16,10 @@ from .stream import CapitalQuoteStream
 
 log=logging.getLogger('runtime_hub')
 
-# Bump when Desk Capital/SHADOW truth contract changes — shown in systemStatus
-# so Windows operators can verify the running process actually reloaded code.
-DESK_TRUTH_REV = 241
+# Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
+# the Desk status pill proves the Windows process reloaded after git pull.
+# After this PR merges, operators look for this number — not #241 (already on main).
+DESK_TRUTH_REV = 242
 
 
 def _finite_num(v):

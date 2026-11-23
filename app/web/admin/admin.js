@@ -1926,7 +1926,9 @@ function collectOpenTrades(clients){
         open:p.level,
         current:positionMid(p,a),
         upl:p.upl,
-        currency:p.currency&&p.currency!==ccy?p.currency:ccy,
+        // Always account cash currency. Capital tags GOLD with quote USD —
+        // that is NOT the Funds/UPL settle currency (GBP account → GBP).
+        currency:ccy||'GBP',
         stopLevel:p.stopLevel,
         profitLevel:p.profitLevel,
         has_sl:p.has_sl,
@@ -2333,7 +2335,8 @@ function renderDeal(p,ccy,activity){
   const tpOn=!!(p.has_tp||(p.profitLevel!=null&&Number(p.profitLevel)>0));
   const trailOn=activity&&activity.trail_enabled===true;
   const phase=trailOn?(p.trail_phase||(p.enrolled?'armed':'flat')):'flat';
-  const uplCcy=p.currency&&p.currency!==ccy?p.currency:ccy;
+  // Account currency only — never GOLD quote USD from position.currency.
+  const uplCcy=ccy||'GBP';
   const mid=positionMid(p,activity);
   const slTxt=(p.stopLevel!=null&&Number(p.stopLevel)>0)?esc(num(p.stopLevel,2)):'OFF';
   const tpTxt=(p.profitLevel!=null&&Number(p.profitLevel)>0)?esc(num(p.profitLevel,2)):'OFF';

@@ -981,9 +981,12 @@ function renderDeskLearn(client){
     deskKv(client.id,'Closes',samples.closed_trades!=null?samples.closed_trades
       :((client.results&&client.results.closed_trades)!=null?client.results.closed_trades:'—')),
     deskKv(client.id,'Edge £',lh.edge_closes!=null?lh.edge_closes:'—'),
-    deskKv(client.id,'Shadow £',shadow.paper_net,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,'Shadow £',
+      (shadow.display_net!=null?shadow.display_net:shadow.paper_net),
+      v=>v==null?'—':num(v,2)+(shadow.unit==='price'?' pts':'')),
     deskKv(client.id,'W/L',
-      (shadow.wins!=null||shadow.losses!=null||shadow.paper_net!=null)
+      (shadow.wins!=null||shadow.losses!=null
+        ||shadow.display_net!=null||shadow.paper_net!=null)
         ?(`${shadow.wins||0}/${shadow.losses||0}`):'—'),
     deskKv(client.id,'Nudge',knobs.flow_nudge,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'Impulse',knobs.flow_impulse,v=>v==null?'—':num(v,2)),

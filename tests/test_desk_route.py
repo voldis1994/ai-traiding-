@@ -1,4 +1,4 @@
-"""React PerpSignal Desk is served from FastAPI at /desk when built."""
+"""React VS-System Desk is served from FastAPI at /desk when built."""
 from pathlib import Path
 
 

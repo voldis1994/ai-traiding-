@@ -641,6 +641,13 @@ class RuntimeHub:
             sp_live = None
             if store is not None:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
+                # Desk poll = boot path: re-audit Capital 24h book BEFORE paper
+                # restore, so SHADOW is not stuck at 0/0 while CLIENT CLOSES has £.
+                if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
+                    try:
+                        eng._backfill_mistake_audits_from_journal(limit=80, hours=24)
+                    except Exception:
+                        pass
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
                     try:
                         # Empty journal + surviving audit hist → restore closes.
@@ -887,16 +894,26 @@ class RuntimeHub:
         if store is not None:
             try:
                 from . import shadow_mistake_audit as sma
+                # Ensure cycle has today's Capital book even mid-boot.
+                eng_ma = getattr(rt, 'engine', None) if rt is not None else None
+                if eng_ma is not None and hasattr(
+                        eng_ma, '_backfill_mistake_audits_from_journal'):
+                    try:
+                        eng_ma._backfill_mistake_audits_from_journal(
+                            limit=80, hours=24)
+                    except Exception:
+                        pass
                 mistake_audit = sma.lab_payload(store)
             except Exception:
                 mistake_audit = {'ok': False}
         cash_n = int(paper.get('cash_trades') or 0)
         trades_n = int(paper.get('trades') or 0)
         price_n = int(paper.get('price_trades') or paper.get('display_trades') or 0)
+        win24_n = int(((mistake_audit.get('window_24h') or {}).get('n')) or 0)
         pulse = 'IDLE'
         if open_pos or pending:
             pulse = 'OPEN'
-        elif (mistake_audit.get('last') or {}).get('mistakes'):
+        elif (mistake_audit.get('last') or {}).get('mistakes') or win24_n:
             pulse = 'LEARNING'
         elif cash_n or trades_n or price_n:
             pulse = 'LEARNING'

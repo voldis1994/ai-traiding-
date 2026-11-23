@@ -594,13 +594,39 @@ def lab_payload(store) -> dict:
                 **last_hurt,
                 'display_note': 'showing_last_hurt_not_scratch',
             }
+    # Full 24h analysis — audit hist first; if empty (boot / bag wipe) use
+    # Capital broker journal so Desk never shows 0/0 while CLIENT CLOSES has £.
+    window_24h = _hist_window_stats(hist, hours=24)
+    journal_24h = _journal_window_stats(store, hours=24)
+    if int(window_24h.get('n') or 0) == 0 and int(journal_24h.get('n') or 0) > 0:
+        window_24h = {**journal_24h, 'from_journal': True}
+    elif int(journal_24h.get('n') or 0) > int(window_24h.get('n') or 0):
+        # Journal has more of today's book than audit hist yet — show journal truth.
+        window_24h = {
+            **journal_24h,
+            'from_journal': True,
+            'audit_n': int(window_24h.get('n') or 0),
+        }
+    else:
+        window_24h = {**window_24h, 'from_journal': False,
+                      'journal_n': int(journal_24h.get('n') or 0)}
+    # Seed recent list from journal when audit hist was wiped but Capital £ exists.
+    recent_audits = list(reversed(hist[-16:]))
+    if not recent_audits and journal_24h.get('recent'):
+        recent_audits = list(journal_24h['recent'])
+    if (not display_last or not display_last.get('pnl')) and recent_audits:
+        seed = recent_audits[0]
+        display_last = {
+            **seed,
+            'display_note': 'showing_journal_24h_seed',
+        }
     hurt_n = sum(
         1 for h in hist
         if isinstance(h, dict) and (
             (h.get('mistakes') or [])
             or (isinstance(h.get('pnl'), (int, float)) and float(h['pnl']) < -0.02)))
-    # Full 24h analysis window — both profits and losses (not just last close).
-    window_24h = _hist_window_stats(hist, hours=24)
+    if hurt_n == 0:
+        hurt_n = int(window_24h.get('hurt_n') or window_24h.get('losses') or 0)
     live_ext = store.get('live_external_context') if isinstance(
         store.get('live_external_context'), dict) else {}
     live_news = live_ext.get('news') if isinstance(live_ext.get('news'), dict) else {}
@@ -658,7 +684,7 @@ def lab_payload(store) -> dict:
         },
         'top_scenarios': top_rows,
         'ready': ready[:6],
-        'recent_audits': list(reversed(hist[-16:])),
+        'recent_audits': recent_audits,
         'respect_news_window': bool(audit.get('respect_news_window')),
         'respect_intermarket_veto': bool(audit.get('respect_intermarket_veto')),
     }
@@ -710,4 +736,76 @@ def _hist_window_stats(hist, *, hours=24) -> dict:
         'useful_n': useful_n,
         'hurt_n': hurt_n,
         'reads': 'wins+losses',
+    }
+
+
+def _journal_window_stats(store, *, hours=24) -> dict:
+    """24h Capital broker closes from SQLite — survives audit-hist bag wipes."""
+    from datetime import timedelta
+    empty = {
+        'hours': int(hours), 'n': 0, 'wins': 0, 'losses': 0, 'scratch': 0,
+        'net': 0.0, 'useful_n': 0, 'hurt_n': 0, 'reads': 'wins+losses',
+        'recent': [],
+    }
+    if store is None or not hasattr(store, 'db'):
+        return empty
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max(1, int(hours)))
+    try:
+        rows = store.db.execute(
+            "SELECT deal_id,pnl,direction,entry,exit,closed,pnl_source FROM trades "
+            "WHERE closed IS NOT NULL AND pnl IS NOT NULL "
+            "AND pnl_source='broker' "
+            "ORDER BY closed DESC LIMIT 120").fetchall()
+    except Exception:
+        return empty
+    wins = losses = scratch = 0
+    net = 0.0
+    n = 0
+    recent = []
+    for deal_id, pnl, direction, entry, exit_px, closed, src in rows:
+        pnl_n = _finite(pnl)
+        if pnl_n is None or abs(float(pnl_n)) < 1e-12:
+            continue
+        if closed:
+            try:
+                dt = datetime.fromisoformat(str(closed).replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    continue
+            except Exception:
+                pass
+        n += 1
+        net += float(pnl_n)
+        if pnl_n > 0.02:
+            wins += 1
+        elif pnl_n < -0.02:
+            losses += 1
+        else:
+            scratch += 1
+        if len(recent) < 12:
+            recent.append({
+                'at': closed,
+                'source': 'live_journal',
+                'pnl': float(pnl_n),
+                'direction': direction,
+                'entry': entry,
+                'exit': exit_px,
+                'mistakes': ['outcome_hurt'] if pnl_n < -0.02 else [],
+                'notes': ['journal_24h_seed'],
+                'scenario': 'LIVE_JOURNAL',
+                'deal_id': deal_id,
+            })
+    return {
+        'hours': int(hours),
+        'n': n,
+        'wins': wins,
+        'losses': losses,
+        'scratch': scratch,
+        'net': round(net, 4),
+        'useful_n': wins,
+        'hurt_n': losses,
+        'reads': 'wins+losses',
+        'recent': recent,
     }

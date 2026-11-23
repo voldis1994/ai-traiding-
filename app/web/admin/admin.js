@@ -476,14 +476,17 @@ function renderShadowLab(client){
         </div>
         <div class="shadow-note">${esc(
           winN
-            ?('Reads full 24h · '+winN+' closes (wins+losses) · last '
-              +(auditLast.source||'—')+' '
+            ?('Reads full 24h · '+winN+' closes (W'+winW+'/L'+winL
+              +(win24.from_journal?' · from Capital journal':'')
+              +') · last '+(auditLast.source||'—')+' '
               +(missTxt!=='none'?missTxt:(auditLast.scenario||'')))
             :(auditLast.display_note==='showing_last_hurt_not_scratch'
               ?('Last hurt · '+(auditLast.scenario||'')+' · cycle saw Capital minus')
-              :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
-                ?auditLast.notes.join(' · ')
-                :(audit.loop||'diagnose → memory → fix → promote → LIVE'))))}</div>
+              :(auditLast.display_note==='showing_journal_24h_seed'
+                ?('Seeded from Capital 24h journal — cycle catching up')
+                :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
+                  ?auditLast.notes.join(' · ')
+                  :(audit.loop||'diagnose → memory → fix → promote → LIVE')))))}</div>
         <div class="shadow-note">${esc(
           'At close · news '+(auditLast.news_status||'—')
           +' · peers '+(auditLast.intermarket_status||'—')
@@ -554,7 +557,9 @@ function renderShadowLab(client){
               ?('Paper SL/TP closes in price pts — £ scale pending from LIVE broker closes ('+(paper.price_trades||paperTrades)+' closes)')
               :(paperTrades>0
                 ?('Paper SL/TP cash · Capital LIVE minuses stay in CLIENT CLOSES + MISTAKE AUDIT')
-                :('No paper closes yet — if audits show shadow £/pts, wait one Desk refresh for backfill'))))}</div>
+                :(winN
+                  ?('Paper book empty — Capital 24h already has '+winN+' closes (see MISTAKE AUDIT 24h W/L)')
+                  :('No paper closes yet — Desk refresh re-audits Capital 24h journal')))))}</div>
       </div>
     </article>
     <article class="shadow-card">

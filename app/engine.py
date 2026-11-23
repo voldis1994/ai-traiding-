@@ -8150,12 +8150,37 @@ class SingleTradeEngine:
                 'weights_path':post_path},epic))
         self.policy.shadow_self_dev_tick(self)
 
+    def _paper_entry_gate(self,action,mtf_analysis=None):
+        """Same break|zone OPEN path as LIVE — without fleet shared_side block.
+
+        Paper must still open and learn when another client owns the epic side.
+        """
+        candles=self._decision_candles()
+        market=self.market or {}
+        mtf=mtf_analysis
+        if mtf is None and hasattr(self,'_mtf_momentum_analysis'):
+            try:
+                mtf=self._mtf_momentum_analysis()
+            except Exception:
+                mtf=None
+        return ohlc_entry_zones.entry_allows_open(
+            action,
+            candles=candles,
+            mid=_num(market.get('mid')),
+            ask=_num(market.get('ask')),
+            bid=_num(market.get('bid')),
+            tick=_num(market.get('tick')) or 0.01,
+            spread=_num(market.get('spread')) or 0.,
+            mtf=mtf,store=self.store)
+
     def _shadow_paper_step(self,*,mid,spread=0.,bar_time=None,high=None,low=None,
                            candles=None):
         """Advance shadow state + paper journal with LIVE-identical execution rules.
 
         Votes after advancing shadow h/c on this completed candle. Opens/closes
         via SL/TP/trail (same stop_take + trail math as LIVE) — never flip-exit.
+        Paper OPEN requires the same break|zone trigger as LIVE so shadow learns
+        from real entry paths (not blind neural opens with no trigger stamp).
         """
         scores=self._shadow_scores_now(advance=True,bar_time=bar_time)
         if not scores or mid is None:return None
@@ -8169,6 +8194,19 @@ class SingleTradeEngine:
         shadow_tr=None
         if shadow is not None and getattr(shadow,'last_transition',None):
             shadow_tr=self.brain._json_transition(shadow.last_transition)
+        # Gate paper OPEN on break|zone — else HOLD (still manage open SL/TP).
+        zone_gate=None
+        open_action=action
+        if action in ('BUY','SELL'):
+            try:
+                zone_gate=self._paper_entry_gate(action)
+            except Exception:
+                zone_gate={'allowed':False,'reason':'paper_gate_error',
+                           'trigger':None}
+            trig=(zone_gate or {}).get('trigger') if isinstance(zone_gate,dict) else None
+            if not (isinstance(zone_gate,dict) and zone_gate.get('allowed')
+                    and trig in ('break','zone')):
+                open_action='HOLD'
         # Same OHLC swing/regime brackets as LIVE OPEN + hold-shadow —
         # never invent median-zone ±distance via stop_take for paper fills.
         tick=None;minimum=None;stop_d=None;profit_d=None;kappa=None;sl_scale=None
@@ -8180,8 +8218,8 @@ class SingleTradeEngine:
                 tick=max(abs(float(spread or 0))/2.,1e-4)
             if minimum is None or minimum<0:
                 minimum=float(tick)
-            if action in ('BUY','SELL'):
-                wb=self._would_be_brackets(action)
+            if open_action in ('BUY','SELL'):
+                wb=self._would_be_brackets(open_action)
                 if wb and wb.get('stop_distance') is not None \
                         and wb.get('profit_distance') is not None:
                     stop_d=float(wb['stop_distance'])
@@ -8200,41 +8238,43 @@ class SingleTradeEngine:
         sp=load_self_params(self.store)
         slip_bps=float(sp['exec_slip_bps'])
         fill_delay_bars=int(sp['exec_fill_delay_bars'])
-        # Stamp open-time OHLC/news/intermarket so mistake-audit can compare.
+        # Stamp open-time break|zone + news/intermarket for mistake-audit + knobs.
         entry_context=None
-        try:
-            from . import ohlc_scenarios as _osc
-            from . import ohlc_entry_zones as _oez
-            stamp_rows=candles if candles is not None else (
-                self.store.candles(self.mandate['epic'],n=80,historical_only=True)
-                if self.mandate else [])
-            sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
-            ez=_oez.compute_entry_zones(
-                stamp_rows,mid=mid,store=self.store) if stamp_rows else {}
-            zone=None
-            if isinstance(ez,dict):
-                if action=='BUY':
-                    zone=ez.get('buy_entry')
-                elif action=='SELL':
-                    zone=ez.get('sell_entry')
-                if not isinstance(zone,dict):
-                    zone=ez.get('buy_entry') or ez.get('sell_entry')
-            news_ctx,im_ctx=self._audit_external_context(
-                {},direction=action if action in ('BUY','SELL') else None)
-            entry_context={
-                'scenario':_osc.open_meta_from_scenario(sc) if sc else {},
-                'ohlc_entry':{
-                    'action':action if action in ('BUY','SELL') else None,
-                    'zone':zone if isinstance(zone,dict) else None,
-                    'trigger':(ez or {}).get('trigger') if isinstance(ez,dict) else None,
-                },
-                'news':news_ctx,
-                'intermarket':im_ctx,
-            }
-        except Exception:
-            entry_context=None
+        if open_action in ('BUY','SELL'):
+            try:
+                from . import ohlc_scenarios as _osc
+                news_ctx,im_ctx=self._audit_external_context(
+                    {},direction=open_action)
+                sc=None
+                if isinstance(zone_gate,dict) and isinstance(
+                        zone_gate.get('scenario'),dict):
+                    sc=zone_gate.get('scenario')
+                else:
+                    stamp_rows=candles if candles is not None else (
+                        self.store.candles(
+                            self.mandate['epic'],n=80,historical_only=True)
+                        if self.mandate else [])
+                    sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
+                zone=(zone_gate or {}).get('zone') if isinstance(zone_gate,dict) else None
+                trig=(zone_gate or {}).get('trigger') if isinstance(zone_gate,dict) else None
+                entry_context={
+                    'scenario':(_osc.open_meta_from_scenario(sc)
+                                if sc and 'scenarios' in (sc or {})
+                                else (sc if isinstance(sc,dict) else {})),
+                    'ohlc_entry':{
+                        'action':open_action,
+                        'zone':zone if isinstance(zone,dict) else None,
+                        'trigger':trig,
+                        'reason':(zone_gate or {}).get('reason')
+                                 if isinstance(zone_gate,dict) else None,
+                    },
+                    'news':news_ctx,
+                    'intermarket':im_ctx,
+                }
+            except Exception:
+                entry_context=None
         closed=self.shadow_paper.on_bar(
-            action,mid=mid,spread=spread,bar_time=bar_time,
+            open_action,mid=mid,spread=spread,bar_time=bar_time,
             cash_scale=self.shadow_paper.cash_scale,
             high=high,low=low,tick=tick,min_distance=minimum,
             stop_distance=stop_d,profit_distance=profit_d,
@@ -8300,6 +8340,20 @@ class SingleTradeEngine:
                         'exit_reason':closed.get('exit_reason')})
                 except Exception:
                     pass
+            # Break|zone knobs learn from paper cash too — not only LIVE Funds £.
+            try:
+                ctx=closed.get('entry_context') if isinstance(
+                    closed.get('entry_context'),dict) else {}
+                ohlc_meta=ctx.get('ohlc_entry') if isinstance(
+                    ctx.get('ohlc_entry'),dict) else {}
+                trade_sp=(closed.get('spread')
+                          if closed.get('spread') is not None else spread)
+                ohlc_entry_zones.observe_close(
+                    self.store,ohlc_meta=ohlc_meta,broker_pnl=pnl,
+                    spread=trade_sp)
+            except Exception as exc:
+                self.store.event('warning','Shadow entry-zone observe skipped',
+                                 {'type':type(exc).__name__})
             # Mistake-audit loop: diagnose → scenario memory → targeted fix → promote.
             try:
                 from . import shadow_mistake_audit as sma

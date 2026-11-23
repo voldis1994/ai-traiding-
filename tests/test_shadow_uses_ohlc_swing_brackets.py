@@ -45,6 +45,13 @@ def test_shadow_paper_step_uses_would_be_brackets_not_stop_take(monkeypatch):
         monkeypatch.setattr(
             e, '_shadow_scores_now',
             lambda **kw: {'BUY': 0.8, 'SELL': 0.1, 'HOLD': 0.1})
+        monkeypatch.setattr(
+            e, '_paper_entry_gate',
+            lambda action, mtf_analysis=None: {
+                'allowed': True, 'trigger': 'break', 'action': action,
+                'reason': 'ohlc_break_trigger', 'zone': None,
+                'scenario': {'scenario': 'BREAKOUT_UP'},
+            })
         # Force delay 0 so open happens this bar.
         from app import self_params
         monkeypatch.setattr(
@@ -60,6 +67,8 @@ def test_shadow_paper_step_uses_would_be_brackets_not_stop_take(monkeypatch):
         # Distances from swing brackets — not invented 2×tick.
         assert abs(pos['entry'] - pos['stop']) == pytest.approx(4.5, abs=0.5)
         assert abs(pos['profit'] - pos['entry']) == pytest.approx(9.0, abs=0.5)
+        assert (pos.get('entry_context') or {}).get('ohlc_entry', {}).get(
+            'trigger') == 'break'
 
 
 def test_shadow_paper_skips_open_when_swing_brackets_unavailable(monkeypatch):

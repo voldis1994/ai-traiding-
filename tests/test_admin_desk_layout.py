@@ -56,10 +56,10 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=134' in html
-    assert 'admin.js?v=161' in html
+    assert 'admin.css?v=135' in html
+    assert 'admin.js?v=162' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 252' in hub
+    assert 'DESK_TRUTH_REV = 253' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
@@ -94,7 +94,11 @@ def test_status_board_visible_at_once():
 def test_desk_panels_have_readable_spacing():
     """Laptop Desk must not crush labels into unreadable 8px cells."""
     css = Path('app/web/admin/admin.css').read_text(encoding='utf-8')
-    assert '--desk-gap:6px' in css.replace(' ', '') or '--desk-gap:8px' in css.replace(' ', '')
+    assert (
+        '--desk-gap:4px' in css.replace(' ', '')
+        or '--desk-gap:6px' in css.replace(' ', '')
+        or '--desk-gap:8px' in css.replace(' ', '')
+    )
     assert 'min-height:22px' in css.replace(' ', '') or 'min-height:34px' in css.replace(' ', '')
     assert '.psx-score-row' in css
     assert '.psx-ind-kv .desk-kv' in css

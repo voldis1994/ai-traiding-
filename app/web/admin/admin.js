@@ -61,18 +61,18 @@ function deskAutoFit(){
   root.dataset.autofit='1';
   const w=Math.max(root.clientWidth||0,window.innerWidth-90);
   const h=Math.max(root.clientHeight||0,window.innerHeight-40);
-  // Fit the laptop frame first — soft mins so the grid never forces page scroll.
-  const fs=clampNum(Math.round(9.5+h/140+w/520),10,14);
-  const fsSm=clampNum(fs-1,9,12);
-  const fsXs=clampNum(fs-2,8,11);
-  const fsMd=clampNum(fs,10,13);
-  const fsLg=clampNum(fs+2,12,17);
-  const fsXl=clampNum(fs+3,13,19);
+  // Fit the laptop frame — slightly smaller type so more fits without scroll.
+  const fs=clampNum(Math.round(8.5+h/160+w/560),9,12);
+  const fsSm=clampNum(fs-1,8,11);
+  const fsXs=clampNum(fs-2,7,10);
+  const fsMd=clampNum(fs,9,12);
+  const fsLg=clampNum(fs+1,10,14);
+  const fsXl=clampNum(fs+2,11,16);
   const gap=clampNum(Math.round(2+h/320),2,5);
-  const pad=clampNum(gap+1,3,7);
-  const headH=clampNum(Math.round(18+fs*0.3),20,26);
-  const tapeH=clampNum(Math.round(16+fs*0.2),18,22);
-  const statusMin=clampNum(Math.round(36+fs*0.8),40,56);
+  const pad=clampNum(gap+1,3,6);
+  const headH=clampNum(Math.round(16+fs*0.3),18,24);
+  const tapeH=clampNum(Math.round(14+fs*0.2),16,20);
+  const statusMin=clampNum(Math.round(32+fs*0.7),36,50);
   let side=clampNum(Math.round(w*0.14),130,220);
   if(w<1200)side=clampNum(Math.round(w*0.13),118,180);
   if(w<980)side=clampNum(Math.round(w*0.12),104,150);
@@ -110,9 +110,9 @@ function termViewsAutoFit(){
   if(!shell)return;
   const h=window.innerHeight;
   const w=window.innerWidth;
-  const fs=clampNum(Math.round(8.5+h/130+w/900),9,12);
-  const gap=clampNum(Math.round(2+h/400),2,5);
-  const pad=clampNum(gap,3,6);
+  const fs=clampNum(Math.round(7.5+h/150+w/1000),8,11);
+  const gap=clampNum(Math.round(2+h/400),2,4);
+  const pad=clampNum(gap,2,5);
   shell.style.setProperty('--term-fit-fs',fs+'px');
   shell.style.setProperty('--term-fit-gap',gap+'px');
   shell.style.setProperty('--term-fit-pad',pad+'px');
@@ -2486,7 +2486,7 @@ function renderCard(c){
         )}</strong></div>${tip?`<div><span>Forward tip</span><strong>${esc(tip)}</strong></div>`:''}`;
       })()}
     </div>
-    <div class="muted" style="padding:8px 14px;font-size:12px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
+    <div class="muted" style="padding:4px 8px;font-size:9px">${esc(e.neural_adapt_reason||e.last_reason||'')}${
       (a.entry_block_reason||a.error||c.last_start_error||a.last_start_error)
         ?(' · '+esc(a.entry_block_reason||a.error||c.last_start_error||a.last_start_error))
         :''

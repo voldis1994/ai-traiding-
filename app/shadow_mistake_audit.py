@@ -1566,10 +1566,13 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
         mistakes = [m for m in (a.get('mistakes') or []) if m]
         notes = [n for n in (a.get('notes') or []) if n]
         src_l = str(a.get('source') or '').lower()
+        snap_ok = bool(a.get('open_snapshot')) or any(
+            str(n) == 'open_snapshot_used' for n in notes)
         journalish = (
-            'journal' in src_l
-            or any('journal' in str(n).lower() for n in notes)
-            or str(a.get('scenario') or '') == 'LIVE_JOURNAL')
+            not snap_ok and (
+                'journal' in src_l
+                or any('journal' in str(n).lower() for n in notes)
+                or str(a.get('scenario') or '') == 'LIVE_JOURNAL'))
         if journalish and (not mistakes or mistakes == ['outcome_hurt']):
             if pnl is not None and pnl < -0.02:
                 lines.append({
@@ -1587,6 +1590,22 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
                     'level': 'info',
                     'text': f'{when}  INFO   Capital £ flat — audit pending',
                 })
+        elif snap_ok and mistakes:
+            lines.append({
+                'level': 'error',
+                'text': (f'{when}  ERROR  ' + ' · '.join(str(m) for m in mistakes[:6])
+                         + '  [open snapshot]'),
+            })
+        elif snap_ok and pnl is not None and pnl > 0.02:
+            lines.append({
+                'level': 'ok',
+                'text': f'{when}  OK     open-snapshot audit — useful win',
+            })
+        elif snap_ok and pnl is not None and pnl < -0.02:
+            lines.append({
+                'level': 'error',
+                'text': f'{when}  ERROR  open-snapshot audit — outcome_hurt',
+            })
         elif mistakes:
             lines.append({
                 'level': 'error',

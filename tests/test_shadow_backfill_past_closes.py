@@ -130,7 +130,7 @@ def test_shadow_mirrors_live_open_into_paper():
 
 
 def test_ohlc_learn_archive_survives_entry_brain_clear():
-    """Backfill must still see OPEN OHLC after entry_brain wipe."""
+    """Backfill must still see full OPEN snapshot after entry_brain wipe."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         eng = _engine(store)
@@ -140,20 +140,74 @@ def test_ohlc_learn_archive_survives_entry_brain_clear():
             'entry': 100.0,
             'entry_spread': 0.1,
             'epic': 'IX.D.FTSE.IFM.IP',
+            'scores': {'BUY': 0.55, 'SELL': 0.2, 'HOLD': 0.25},
+            'news': {'status': 'CLEAR', 'entry_allowed': True},
+            'intermarket': {'status': 'READY'},
+            'candles_at_open': [
+                {'open': 99 + i * 0.01, 'high': 99.2 + i * 0.01,
+                 'low': 98.8 + i * 0.01, 'close': 99.1 + i * 0.01,
+                 'at': f'2026-11-24T10:{i:02d}:00+00:00'}
+                for i in range(24)
+            ],
             'ohlc_entry': {
                 'action': 'BUY',
                 'trigger': 'break',
                 'reason': 'blind_break',
                 'zone': {'lo': 99.0, 'hi': 100.0},
-                'scenario': {'scenario': 'RANGE', 'confidence': True},
+                'scenario': {'scenario': 'RANGE', 'ready': True},
             },
+            'structure_at_open': {'bias': 'RANGE'},
+            'snapshot_version': 1,
         }
         store.set('entry_brain:' + deal, brain)
         payload = eng._archive_ohlc_for_shadow(deal, brain)
         assert payload and payload.get('ohlc_entry', {}).get('trigger') == 'break'
+        assert len(payload.get('candles_at_open') or []) >= 16
+        assert payload.get('scores', {}).get('BUY') == 0.55
+        assert store.get('decision_snapshot:' + deal)
         store.set('entry_brain:' + deal, None)
         assert store.get('entry_brain:' + deal) is None
         loaded = eng._load_ohlc_learn_context(deal)
         assert loaded.get('ohlc_entry', {}).get('scenario', {}).get('scenario') == 'RANGE'
+        assert len(loaded.get('candles_at_open') or []) >= 16
+        assert loaded.get('news', {}).get('status') == 'CLEAR'
         meta = eng._shadow_ohlc_meta_for_learn(loaded.get('ohlc_entry'))
         assert meta.get('trigger') == 'break'
+
+
+def test_mistake_audit_prefers_open_candles_snapshot():
+    """Diagnose must use frozen OPEN tape, not a later live regime."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        eng = _engine(store)
+        deal = 'snap1'
+        open_bars = [
+            {'open': 100.0, 'high': 100.2, 'low': 99.8, 'close': 100.0,
+             'at': f'2026-11-24T09:{i:02d}:00+00:00'}
+            for i in range(30)
+        ]
+        eng._archive_ohlc_for_shadow(deal, {
+            'direction': 'BUY', 'entry': 100.0, 'entry_spread': 0.1,
+            'epic': 'GOLD',
+            'ohlc_entry': {
+                'action': 'BUY', 'trigger': 'break',
+                'zone': {'lo': 99.0, 'hi': 100.0},
+                'scenario': {'scenario': 'RANGE'},
+            },
+            'candles_at_open': open_bars,
+            'news': {'status': 'CLEAR', 'entry_allowed': True},
+            'intermarket': {'status': 'WAITING'},
+        })
+        eng._decision_candles = lambda epic=None, n=80: [
+            {'open': 100 + i, 'high': 101 + i, 'low': 99 + i, 'close': 100.5 + i,
+             'at': f'2026-11-24T12:{i:02d}:00+00:00'}
+            for i in range(40)
+        ]
+        out = eng._run_mistake_audit_close(
+            deal, pnl=-0.4, direction='BUY', entry=100.0,
+            source='live_backfill')
+        assert out and out.get('audited')
+        once = store.get('mistake_audited_close:' + deal) or {}
+        assert once.get('open_snapshot') is True
+        hist = store.get(sma.HIST_KEY) or []
+        assert hist and 'open_snapshot_used' in (hist[-1].get('notes') or [])

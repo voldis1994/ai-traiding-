@@ -141,3 +141,28 @@ def test_lab_pending_exposes_mutation_lines():
                 or path0.startswith('self_params_v1.')
                 or path0.startswith('shadow_mistake_audit'))
         assert pending.get('map_lines')
+
+
+def test_cmd_open_snapshot_skips_capital_only_wait():
+    """When OPEN snapshot fed audit, CMD must not tease Capital £ WAIT."""
+    log = sma.build_learning_log(
+        recent_audits=[{
+            'at': '2026-11-24T13:45:12+00:00',
+            'closed_at': '2026-11-24T13:45:12+00:00',
+            'pnl': -0.40, 'direction': 'BUY',
+            'source': 'live_backfill',
+            'mistakes': ['zone_fail'],
+            'notes': ['open_snapshot_used'],
+            'open_snapshot': True,
+            'scenario': 'RANGE',
+            'deal_id': 'snap-cmd-1',
+            'fix_steps': [],
+        }],
+        pending_fix={},
+        scenarios={},
+        limit=4,
+    )
+    text = '\n'.join(str(x.get('text') or '') for x in log)
+    assert 'open snapshot' in text.lower() or 'zone_fail' in text
+    assert 'Capital £ loss — full audit pending' not in text
+    assert 'Capital £ only' not in text

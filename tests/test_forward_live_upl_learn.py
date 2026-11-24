@@ -30,6 +30,7 @@ def test_forward_live_flags_hairline_and_scratch():
 
 
 def test_close_waits_for_funds_before_neural_teach():
+    """P0-06: vanish keeps ESTIMATE; neural teaches only on broker Funds."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -54,20 +55,22 @@ def test_close_waits_for_funds_before_neural_teach():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Last UPL before close = Capital £ — neural teaches now.
-            assert row['pnl']==pytest.approx(-0.11)
-            assert row['pnl_source']=='capital'
-            assert e._trade_already_learned('learn1')
-            assert brain.trade_labeled>=labeled_before
+            assert row['pnl'] is None
+            assert row['pnl_source']=='pending_broker_pnl'
+            assert not e._trade_already_learned('learn1')
+            assert brain.trade_labeled==labeled_before
+            est=store.get('upl_estimate:learn1')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(-0.11)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='learn1'
                        for x in pending)
-            labeled_mid=brain.trade_labeled
             broker.tx=[{'reference':'learn1','pnl':'-0.11','currency':'GBP',
                         'transactionType':'TRADE'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.11)
             assert row['pnl_source']=='broker'
-            assert brain.trade_labeled==labeled_mid
+            assert e._trade_already_learned('learn1')
+            assert brain.trade_labeled>labeled_before
     asyncio.run(scenario())

@@ -7,12 +7,13 @@ import pytest
 
 from app.autonomy import AutoEvolution
 from app.engine import SingleTradeEngine
+from app.realized_cash import classify_pnl_source, may_teach_live_cash
 from tests.test_broker_pnl_resolve import HistoryBroker
 from tests.test_learning_integrity import new_brain
 
 
-def test_resolve_upl_is_capital_and_teachable():
-    """Last open UPL before close = Capital £ (teachable); not invent mid×size."""
+def test_resolve_upl_is_estimate_not_teachable():
+    """P0-06: last open UPL → ESTIMATE store; never teach-as-cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -21,11 +22,16 @@ def test_resolve_upl_is_capital_and_teachable():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
-            assert pnl==pytest.approx(0.45)
-            assert src=='capital'
-            assert src!='broker'
-            from app.realized_cash import may_teach_live_cash
-            assert may_teach_live_cash(src) is True
+            assert pnl is None
+            assert src=='pending_broker_pnl'
+            assert ccy=='GBP'
+            est=store.get('upl_estimate:d2')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(0.45)
+            assert classify_pnl_source('capital')=='estimate'
+            assert may_teach_live_cash('capital') is False
+            assert may_teach_live_cash(src) is False
+            assert may_teach_live_cash('broker') is True
     asyncio.run(scenario())
 
 
@@ -60,6 +66,7 @@ def test_late_broker_pnl_refines_without_relearn():
 
 
 def test_vanish_queues_pending_when_history_empty():
+    """Vanish without Funds: pending + ESTIMATE — no teach yet."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -79,10 +86,12 @@ def test_vanish_queues_pending_when_history_empty():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Last open UPL before close = Capital £ — teach now.
-            assert row.get('pnl_source')=='capital'
-            assert row.get('pnl')==pytest.approx(-0.22)
-            assert e._trade_already_learned('gold1')
+            assert row.get('pnl_source')=='pending_broker_pnl'
+            assert row.get('pnl') is None
+            assert not e._trade_already_learned('gold1')
+            est=store.get('upl_estimate:gold1')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(-0.22)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
     asyncio.run(scenario())

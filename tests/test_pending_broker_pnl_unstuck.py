@@ -39,7 +39,7 @@ def test_parse_cash_num_strips_currency():
 
 
 def test_vanish_waits_for_funds_then_teaches_once():
-    """Vanish without Funds: pending; Funds £ teaches once."""
+    """P0-06: vanish without Funds stays pending; Funds £ teaches once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -59,10 +59,13 @@ def test_vanish_waits_for_funds_then_teaches_once():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Last UPL = Capital £ — teach now; Funds later refines.
-            assert row.get('pnl_source')=='capital'
-            assert row.get('pnl')==pytest.approx(-0.11)
-            assert e._trade_already_learned('g1')
+            # UPL is ESTIMATE only — no teach until broker Funds.
+            assert row.get('pnl_source')=='pending_broker_pnl'
+            assert row.get('pnl') is None
+            assert not e._trade_already_learned('g1')
+            est=store.get('upl_estimate:g1')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(-0.11)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)
             labeled=brain.trade_labeled
@@ -71,7 +74,8 @@ def test_vanish_waits_for_funds_then_teaches_once():
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.09)
             assert row['pnl_source']=='broker'
-            assert brain.trade_labeled==labeled
+            assert brain.trade_labeled>labeled
+            assert e._trade_already_learned('g1')
             assert not (store.get('pending_broker_pnl_deals') or [])
     asyncio.run(scenario())
 

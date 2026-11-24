@@ -86,21 +86,29 @@ def test_fuzzy_accepts_exact_open_level_among_similar_gold():
     asyncio.run(scenario())
 
 
-def test_zero_broker_poison_is_requeued():
+def test_verified_zero_broker_not_requeued_placeholder_is():
+    """P0-08: verified Funds £0 stays settled; unverified/placeholder zero requeues."""
     from app.engine import SingleTradeEngine
     from tests.test_learning_integrity import new_brain
 
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         e = SingleTradeEngine(store, brain)
+        # Verified Funds £0.00 — banked broker proof → SETTLED, not pending poison.
         store.upsert_trade({
             'dealId': 'z0', 'epic': 'GOLD', 'size': '.02',
             'direction': 'BUY', 'level': 100,
         })
         store.close_trade('z0', 100.1, 0.0, currency='GBP', source='broker', overwrite=True)
         store.set('broker_cash_banked:z0', {'pnl': 0.0, 'source': 'broker'})
-        n = e._requeue_unsettled_cash_closes()
-        assert n >= 1
+        # Unverified zero (no banked proof) — still harvestable.
+        store.upsert_trade({
+            'dealId': 'z1', 'epic': 'GOLD', 'size': '.02',
+            'direction': 'BUY', 'level': 100,
+        })
+        store.close_trade('z1', 100.1, 0.0, currency='GBP', source='broker', overwrite=True)
+        e._requeue_unsettled_cash_closes()
         pending = store.get('pending_broker_pnl_deals') or []
-        assert any(str(x.get('deal_id') if isinstance(x, dict) else x) == 'z0'
-                   for x in pending)
+        ids = {str(x.get('deal_id') if isinstance(x, dict) else x) for x in pending}
+        assert 'z0' not in ids
+        assert 'z1' in ids

@@ -182,8 +182,8 @@ function schedulePoll(){
     if(document.hidden)return;
     load().catch(()=>{});
   };
-  // Popup only (~2s) — no main-board hammer; paint() skips when unchanged.
-  pollTimer=setInterval(tick,2000);
+  // Popup ~500ms — #297 claimed 250ms but timer stayed at 2s; keep light.
+  pollTimer=setInterval(tick,500);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});

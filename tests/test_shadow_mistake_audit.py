@@ -1,4 +1,4 @@
-"""Mistake-audit full cycle: diagnose → fix → ready LIVE immediately."""
+"""Mistake-audit full cycle: diagnose → promote ≥3 → proof wins → ready LIVE."""
 import tempfile
 from pathlib import Path
 
@@ -19,6 +19,11 @@ def _candles(drift=0.0):
     return rows
 
 
+def test_v04_thresholds_forbid_instant_ready():
+    assert sma.PROMOTE_N >= 3
+    assert sma.READY_N >= 3
+
+
 def test_diagnose_news_and_peers():
     out = sma.diagnose(
         pnl=-1.0, spread=0.1, candles=_candles(),
@@ -37,8 +42,8 @@ def test_diagnose_news_and_peers():
         assert flags.get('respect_intermarket_veto') == 1
 
 
-def test_promote_gate_commits_on_first_hurt():
-    """PROMOTE_N=1 → first same mistake commits fix (full cycle NOW)."""
+def test_promote_gate_needs_three_repeats():
+    """PROMOTE_N≥3 → first same mistake does not commit; third does."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         kwargs = dict(
@@ -54,21 +59,27 @@ def test_promote_gate_commits_on_first_hurt():
         before = osc.load_params(store)['penalty_range']
         r1 = sma.on_close(store, **kwargs)
         assert r1['promote_gate']['count'] == 1
-        assert r1['promote_gate']['need'] == 1
-        assert r1['fix'].get('applied') is True
+        assert r1['promote_gate']['need'] == sma.PROMOTE_N
+        assert r1['fix'].get('applied') is False
+        assert sma.lab_payload(store)['ready_count'] == 0
+
+        r2 = sma.on_close(store, **kwargs)
+        assert r2['promote_gate']['count'] == 2
+        assert r2['fix'].get('applied') is False
+
+        r3 = sma.on_close(store, **kwargs)
+        assert r3['promote_gate']['count'] == 3
+        assert r3['fix'].get('applied') is True
         after = osc.load_params(store)['penalty_range']
         assert after > before
         assert osc.load_params(store)['block_mid_range'] == 1
-        # READY_N=0 → ready_for_live on commit.
-        lab = sma.lab_payload(store)
-        assert lab['ready_count'] >= 1
-        assert lab['pending_fix'].get('committed') is True
-        # Second hit must not double-commit.
-        r2 = sma.on_close(store, **kwargs)
-        assert r2['fix'].get('applied') is False
+        # READY_N≥3 → not ready_for_live on commit alone.
+        assert sma.lab_payload(store)['ready_count'] == 0
+        assert sma.lab_payload(store)['pending_fix'].get('committed') is True
 
 
-def test_ready_for_live_immediate_after_commit():
+def test_ready_for_live_requires_proof_wins():
+    """Instant ready_for_live after first mistake / commit is forbidden (V04)."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         loss_kw = dict(
@@ -81,18 +92,24 @@ def test_ready_for_live_immediate_after_commit():
             direction='BUY', entry=98.5, source='shadow',
             apply_ohlc_penalties=True,
         )
-        out = sma.on_close(store, **loss_kw)
+        for _ in range(sma.PROMOTE_N):
+            out = sma.on_close(store, **loss_kw)
         assert out['fix'].get('applied') is True
         lab = sma.lab_payload(store)
-        assert lab['ready_count'] >= 1
-        assert any(r.get('ready_for_live') for r in lab['top_scenarios']) or lab[
-            'ready_count'] >= 1
+        assert lab['ready_n'] >= 3
+        assert lab['ready_count'] == 0
+
+        win_kw = dict(loss_kw)
+        win_kw['pnl'] = 1.5
+        for _ in range(sma.READY_N):
+            sma.on_close(store, **win_kw)
+        lab2 = sma.lab_payload(store)
+        assert lab2['ready_count'] >= 1
 
 
-def test_flush_unsticks_pending_from_old_gate():
+def test_flush_respects_promote_and_ready_n():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
-        # Simulate old PENDING state (pre PROMOTE_N=1) with hist already counted.
         fp = 'flush-fp'
         store.set(sma.SCENARIOS_KEY, {
             fp: {
@@ -104,6 +121,7 @@ def test_flush_unsticks_pending_from_old_gate():
                 'mistake_counts': {'mid_range_mistake': 3},
                 'last_mistakes': ['mid_range_mistake'],
                 'fix_committed': False,
+                'wins_after_fix': 0,
             }
         })
         store.set(sma.PENDING_FIX_KEY, {
@@ -115,16 +133,17 @@ def test_flush_unsticks_pending_from_old_gate():
         })
         before = osc.load_params(store)['penalty_range']
         out = sma.flush_full_cycle(store)
-        assert out.get('committed', 0) >= 1 or out.get('readied', 0) >= 1
+        assert out.get('committed', 0) >= 1
         after = osc.load_params(store)['penalty_range']
         assert after >= before
         pending = store.get(sma.PENDING_FIX_KEY) or {}
         assert pending.get('committed') is True
+        # No proof wins yet → must not ready.
         ready = store.get(sma.READY_KEY) or []
-        assert any(str(r.get('fingerprint')) == fp for r in ready if isinstance(r, dict))
+        assert not any(str(r.get('fingerprint')) == fp for r in ready if isinstance(r, dict))
 
 
-def test_live_path_now_commits_full_cycle():
+def test_live_path_does_not_instant_ready():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         kwargs = dict(
@@ -139,5 +158,5 @@ def test_live_path_now_commits_full_cycle():
         )
         r = sma.on_close(store, **kwargs)
         assert r['memory']['saved'] is True
-        assert r['fix'].get('applied') is True
-        assert sma.lab_payload(store)['ready_count'] >= 1
+        assert r['fix'].get('applied') is False
+        assert sma.lab_payload(store)['ready_count'] == 0

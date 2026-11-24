@@ -66,8 +66,12 @@ def test_prep_eval_blocks_until_holdout_passes_and_separates_stages():
 
 
 def test_argmax_kept_but_score_edge_is_not_utility_without_readiness():
+    from app.self_params import DEFAULTS, save
     with tempfile.TemporaryDirectory() as d:
-        p = AutoEvolution(Store(Path(d) / 'db.sqlite3'), Path(d) / 'pol.py')
+        store = Store(Path(d) / 'db.sqlite3')
+        # Enable LIVE policy gate for this audit (default is research-only V3).
+        save(store, {**DEFAULTS, 'policy_live_execute': 1}, reason='test')
+        p = AutoEvolution(store, Path(d) / 'pol.py')
         # Small edge 0.05 < default MIN_EDGE 0.06 → evolved policy HOLDs.
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         weak_out = p.evaluate_neural_entry(weak)
@@ -110,6 +114,7 @@ def test_zone_shift_still_not_entry_bans():
 
 
 def test_live_open_gates_and_submit_helper():
+    from app import hard_risk
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
@@ -118,13 +123,20 @@ def test_live_open_gates_and_submit_helper():
         gates = engine.live_open_gates('BUY')
         assert gates['allowed'] is False
         brain.mark_prep_ready(reason='test fixture')
+        # V3 R02: readiness alone is not enough — hard_risk must be configured.
+        gates_blocked = engine.live_open_gates('BUY')
+        assert gates_blocked['allowed'] is False
+        hard_risk.save_operator(store, {
+            'max_risk_per_trade': 10.0, 'daily_loss_limit': 50.0,
+            'equity_drawdown_limit': 100.0, 'trading_halted': False,
+        }, reason='test')
         gates2 = engine.live_open_gates('BUY')
         assert gates2['allowed'] is True
         assert gates2['readiness']['ready'] is True
 
 
-def test_cold_start_first_manual_close_releases_prep_block():
-    """Zero-start + first manual close must not leave LIVE OPEN stuck on holdout fail."""
+def test_cold_start_first_manual_close_does_not_force_live_ready():
+    """V3 V04: cold-start sets SHADOW/demo flag — does NOT unlock LIVE OPEN."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
@@ -146,14 +158,16 @@ def test_cold_start_first_manual_close_releases_prep_block():
         engine.last_closed_step = 10  # first manual already closed
         engine.positions = []
         released = engine._maybe_release_cold_start_prep()
-        assert released and released['ready'] is True
+        assert released is not None
         assert released.get('cold_start_open') is True
-        assert brain.trading_readiness()['ready'] is True
+        assert released.get('shadow_demo_enabled') is True
+        assert released.get('ready') is False
+        assert brain.trading_readiness()['ready'] is False
         gates = engine.live_open_gates('BUY')
-        assert gates['allowed'] is True
-        # Flat re-arm path also grants (idempotent).
+        assert gates['allowed'] is False
+        # Flat re-arm path also grants demo flag only (idempotent).
         engine._release_execution_after_flat('m1')
-        assert brain.trading_readiness()['ready'] is True
+        assert brain.trading_readiness()['ready'] is False
 
 
 def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic():

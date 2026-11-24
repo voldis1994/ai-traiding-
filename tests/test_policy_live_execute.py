@@ -15,13 +15,14 @@ def sandbox():
     return tempfile.TemporaryDirectory()
 
 
-def test_policy_evolve_and_live_execute_on_by_default():
+def test_policy_evolve_on_live_execute_off_by_default():
+    """V3: evolve ON, execute OFF (research-only until operator enables)."""
     assert int(DEFAULTS['policy_evolve_enabled']) == 1
-    assert int(DEFAULTS['policy_live_execute']) == 1
+    assert int(DEFAULTS['policy_live_execute']) == 0
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         assert int(get(store, 'policy_evolve_enabled', 1)) == 1
-        assert int(get(store, 'policy_live_execute', 1)) == 1
+        assert int(get(store, 'policy_live_execute', 0)) == 0
         policy = AutoEvolution(store, Path(d) / 'policy.py')
         policy.last_change = 0
         before = policy.attempts
@@ -34,6 +35,8 @@ def test_policy_evolve_and_live_execute_on_by_default():
 def test_evolved_policy_can_veto_neural_entry():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
+        # Operator enables LIVE execute for this gate test (default is research-only).
+        save(store, {**DEFAULTS, 'policy_live_execute': 1}, reason='test')
         # Fixed 0.06 floor — weak neural edge is HOLD; file margin ignored.
         path = Path(d) / 'policy.py'
         path.write_text(
@@ -54,6 +57,7 @@ def test_evolved_policy_can_veto_neural_entry():
 def test_evolved_policy_confirms_clear_edge():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
+        save(store, {**DEFAULTS, 'policy_live_execute': 1}, reason='test')
         path = Path(d) / 'policy.py'
         path.write_text(
             TEMPLATES['edge'].format(

@@ -43,9 +43,9 @@ def test_second_promote_blocked_without_new_evidence():
         e=SingleTradeEngine(store,brain)
         e.policy=AutoEvolution(store,Path(d)/'policy.py')
         shadow=e._ensure_shadow_brain()
-        assert shadow is brain.core
+        assert shadow is not brain.core
         _seed_histories(e,n=24,model_version=1)
-        # Nudge shared weights so promote checksum sees a change.
+        # Nudge SHADOW weights so promote checksum sees a change.
         shadow.P[:]+=0.01
         shadow.model_version=max(1,int(getattr(shadow,'model_version',0) or 0))
         out1=e.policy.shadow_self_dev_tick(e)

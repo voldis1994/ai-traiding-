@@ -127,11 +127,12 @@ DEFAULTS = {
     'min_holdout_bars': 24,
     'min_online_labeled': 64,
     'min_holdout_minute_acc': 0.34,
-    # Policy.py search + LIVE entry gate — ON so promoted strategies actually execute.
-    # Neural argmax still proposes side; evolved decide() may HOLD or confirm.
+    # Policy.py search + LIVE entry gate — evolve ON, execute OFF by default (V3).
+    # Neural argmax still proposes side; evolved decide() is research-only until
+    # operator sets policy_live_execute=1 after validation.
     'policy_evolve_enabled': 1,
     # When 1, evaluate_neural_entry consults active_policy.py before OPEN.
-    'policy_live_execute': 1,
+    'policy_live_execute': 0,
     # Record full feature vectors + scores for multi-horizon forecast quality
     # (does NOT change OPEN/CLOSE rules).
     'forecast_memory_enabled': 1,

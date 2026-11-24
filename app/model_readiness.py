@@ -430,11 +430,11 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
 
 
 def grant_cold_start_open(store, brain, *, reason=None) -> dict:
-    """Unblock LIVE OPEN after first manual close when cold prep holdout trapped us.
+    """V3 V04: mark SHADOW/demo cold-start — never force LIVE OPEN readiness.
 
-    Zero-start flow: operator opens one manual trade → it closes → robot must be
-    allowed to OPEN. A failed chronological holdout must not freeze the session
-    forever while online minute labels are still near zero.
+    First manual close may enable research/SHADOW flags, but ``ready`` stays
+    False until chronological prep/eval (or online labeled path) actually
+    validates the model. Cold-start must not unlock LIVE OPEN as if validated.
     """
     epic = getattr(brain, 'epic', None)
     if not epic:
@@ -445,25 +445,27 @@ def grant_cold_start_open(store, brain, *, reason=None) -> dict:
     fl = floors(store)
     labeled = int(getattr(brain, 'labeled', 0) or 0)
     online_need = int(fl['min_online_labeled'])
-    # If warm path already has enough labels, let trading_readiness promote —
-    # do not override a real holdout failure on a warm brain.
+    # Warm path with enough labels: let trading_readiness decide (may promote).
     if labeled >= online_need:
         return trading_readiness(store, brain)
     msg = (reason or
-           'Cold-start OPEN after first manual close — live £ teaches; '
-           'prep holdout no longer hard-blocks this session')
+           'Cold-start SHADOW/demo flag after first manual close — '
+           'LIVE OPEN still requires prep/eval readiness (V3 V04)')
     state = dict(state)
     state.update({
-        'ready': True,
-        'stage': 'ready',
+        'ready': False,
+        'stage': state.get('stage') or 'blocked',
         'cold_start_open': True,
+        'shadow_demo_enabled': True,
         'reason': msg,
     })
     save_state(store, epic, state)
     if store is not None:
-        store.event('learning', 'Cold-start prep release — LIVE OPEN permitted',
+        store.event('learning',
+                    'Cold-start SHADOW/demo flag — LIVE OPEN NOT unlocked',
                     {'epic': epic, 'online_labeled': labeled,
-                     'online_need': online_need, 'reason': msg})
+                     'online_need': online_need, 'reason': msg,
+                     'ready': False})
     return state
 
 
@@ -477,9 +479,9 @@ def ensure_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0
     # Avoid retraining every poll after a failed holdout; retry when a handful
     # more bars arrive (was +32 — left zero-start sessions stuck too long).
     if status.get('stage') == 'blocked':
-        # Operator already granted cold-start OPEN for this epic — keep it.
+        # Cold-start flag is SHADOW/demo only — do not re-grant as ready.
         if status.get('cold_start_open'):
-            return grant_cold_start_open(store, brain, reason=status.get('reason'))
+            return status
         rows = _sorted_candles(candles)
         prev = int(status.get('candles_loaded') or 0)
         if len(rows) < prev + 8:

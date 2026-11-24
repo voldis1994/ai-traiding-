@@ -2709,10 +2709,9 @@ class SingleTradeEngine:
         return bool(on_fusion and not self.latest_fusion_ready)
 
     def _maybe_release_cold_start_prep(self):
-        """After first mandate close, do not leave LIVE OPEN trapped on failed holdout.
+        """After first mandate close, set SHADOW/demo cold-start flag only (V3 V04).
 
-        Zero-start: manual open → close authorizes size; prep/eval holdout often
-        fails on choppy GOLD and used to block every later robot OPEN forever.
+        Does NOT unlock LIVE OPEN readiness — prep/eval must still pass.
         """
         if not self.mandate or self.last_closed_step<0:
             return None
@@ -2724,26 +2723,28 @@ class SingleTradeEngine:
         from . import model_readiness
         return model_readiness.grant_cold_start_open(
             self.store,self.brain,
-            reason=('Cold-start OPEN after first manual close — '
-                    'prep holdout was blocking new entries'))
+            reason=('Cold-start SHADOW/demo after first manual close — '
+                    'LIVE OPEN still requires prep/eval (V3 V04)'))
 
     def live_open_gates(self,action=None):
         """Shared LIVE OPEN helper for poll/_entry_evaluation/submit (audit #22–#23).
 
-        Direction stays neural argmax; this only reports whether readiness +
-        utility gates currently allow submitting an OPEN. Other agents editing
-        submit should call this before placing an order.
+        Direction stays neural argmax; this reports whether readiness + hard_risk
+        currently allow submitting an OPEN. V3 R02: hard_risk gates OPEN.
         """
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
         if not readiness.get('ready'):
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
                     'readiness':readiness,'economic_utility':None,'hard_risk':None}
-        # Hard-risk limits are informational only — they never gate LIVE OPEN.
         hr=hard_risk.preflight(self.store)
+        if not hr.get('allowed'):
+            return {'allowed':False,
+                    'reason':hr.get('reason') or 'OPEN blocked by hard_risk',
+                    'readiness':readiness,'economic_utility':None,'hard_risk':hr}
         if action is not None and action not in ('BUY','SELL'):
             return {'allowed':False,'reason':'No directional action','readiness':readiness,
                     'economic_utility':None,'hard_risk':hr}
-        return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
+        return {'allowed':True,'reason':'Readiness + hard_risk passed — utility checked in evaluate_neural_entry',
                 'readiness':readiness,'economic_utility':None,'hard_risk':hr}
 
     def _entry_evaluation(self):
@@ -2827,10 +2828,11 @@ class SingleTradeEngine:
         nudged_scores,mtf_meta=mtf_momentum.soft_nudge_scores(
             nudged_scores,mtf_analysis,store=self.store,
             live_trend=ctx.get('trend'))
-        # Flat only: publish nudged scores to last_signal. In-trade keep OPEN freeze.
+        # Publish scores_raw (authority) + diagnostic nudged scores on last_signal.
         if isinstance(self.last_signal,dict) and not self.positions:
             self.last_signal=dict(
-                self.last_signal,scores=dict(nudged_scores),
+                self.last_signal,scores_raw=dict(base_scores),
+                scores=dict(nudged_scores),
                 structure_edge=edge_advice,structure_nudge=nudge_meta,
                 forecast_advice=f_advice,forecast_nudge=forecast_meta,
                 situation_memory=sit_advice,situation_nudge=sit_nudge,
@@ -2838,12 +2840,14 @@ class SingleTradeEngine:
                 mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
         else:
             self.last_signal=dict(
-                self.last_signal,scores=dict(nudged_scores),
+                self.last_signal,scores_raw=dict(base_scores),
+                scores=dict(nudged_scores),
                 structure_edge=edge_advice,structure_nudge=nudge_meta,
                 forecast_advice=f_advice,forecast_nudge=forecast_meta,
                 mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
+        # V3 L01: decide from scores_raw / base_scores — never nudged_scores.
         result=self.policy.evaluate_neural_entry(
-            nudged_scores,
+            base_scores,
             returns_bps=ctx.get('returns_bps'),
             trend=ctx.get('trend'),
             regime=ctx.get('regime'),
@@ -2854,14 +2858,14 @@ class SingleTradeEngine:
                     forecast_advice=f_advice,forecast_nudge=forecast_meta,
                     situation_memory=sit_advice,situation_nudge=sit_nudge,
                     day_book=db_snap,day_conviction=conv_meta,
-                    day_phase_nudge=phase_meta,scores=nudged_scores,
+                    day_phase_nudge=phase_meta,scores=dict(nudged_scores),
+                    scores_raw=dict(base_scores),
                     mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
-        # Last word: free multi-source M1 consensus must affect the LIVE decision
-        # (nudge scores; HOLD when majority fights the proposed side).
+        # Flow consensus may HOLD (block) a fight; never rewrite BUY↔SELL (L01).
         try:
             from . import flow_consensus
             flow_dec=flow_consensus.apply_to_decision(
-                nudged_scores,
+                base_scores,
                 action=result.get('action'),
                 path=getattr(self,'liquidity_path',None),
                 bar_time=ctx.get('bar_time'),
@@ -2869,11 +2873,14 @@ class SingleTradeEngine:
                 structure=live_structure,
                 trend=ctx.get('trend'),
                 store=self.store)
-            nudged_scores=flow_dec.get('scores') or nudged_scores
+            # Soft-nudge copy is diagnostic only — keep authority scores_raw.
+            diag_scores=flow_dec.get('scores') or nudged_scores
+            nudged_scores=diag_scores
             self._flow_consensus=flow_dec.get('desk') or self._flow_consensus
             result=dict(
                 result,
                 scores=dict(nudged_scores),
+                scores_raw=dict(base_scores),
                 flow_consensus=flow_dec.get('desk'),
                 flow_decision= {
                     'effect': flow_dec.get('effect'),
@@ -2884,7 +2891,8 @@ class SingleTradeEngine:
                 })
             if isinstance(self.last_signal,dict) and not self.positions:
                 self.last_signal=dict(
-                    self.last_signal,scores=dict(nudged_scores),
+                    self.last_signal,scores_raw=dict(base_scores),
+                    scores=dict(nudged_scores),
                     flow_consensus=flow_dec.get('desk'),
                     flow_decision=result.get('flow_decision'))
             if flow_dec.get('blocked'):
@@ -2912,13 +2920,7 @@ class SingleTradeEngine:
                     proposal=result.get('proposal') or result.get('action'),
                     reason=flow_dec.get('reason') or 'flow_consensus_blocked',
                     flow_blocked=True)
-            # Score flip to consensus side is still a directional OPEN candidate.
-            if (flow_dec.get('action') in ('BUY','SELL')
-                    and flow_dec.get('action') != result.get('action')
-                    and flow_dec.get('effect') == 'flipped_to_consensus'):
-                result=dict(result,action=flow_dec['action'],
-                            proposal=flow_dec['action'],
-                            reason=flow_dec.get('reason'))
+            # V3 L01: never flip action from consensus — scores_raw stay authority.
         except Exception as exc:
             result=dict(result,flow_decision={
                 'effect': 'error', 'reason': type(exc).__name__})
@@ -2933,7 +2935,7 @@ class SingleTradeEngine:
             # Robot day book: multi-pos / day phase capacity (equity risk).
             score_edge=result.get('score_edge')
             if score_edge is None and hasattr(self.policy,'score_edge'):
-                score_edge=self.policy.score_edge(nudged_scores)
+                score_edge=self.policy.score_edge(base_scores)
             book=day_book.allows_new_open(
                 store=self.store,equity=equity,positions=self.positions,
                 epic=(self.mandate or {}).get('epic'),
@@ -2944,7 +2946,7 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',reason=book.get('reason') or 'day_book_blocked')
             # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
             edge=unified_cycle.edge_allows_open(
-                nudged_scores,result,
+                base_scores,result,
                 unified_cycle.load_state(self.store))
             if not edge['allowed']:
                 return dict(result,action='HOLD',reason=edge['reason'],
@@ -2997,7 +2999,7 @@ class SingleTradeEngine:
             epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
             score_edge=result.get('score_edge')
             if score_edge is None and hasattr(self.policy,'score_edge'):
-                try:score_edge=self.policy.score_edge(nudged_scores)
+                try:score_edge=self.policy.score_edge(base_scores)
                 except Exception:score_edge=None
             gold_gate=gold_strategies.evaluate(
                 epic=epic_gs,action=result['action'],candles=candles_rg,
@@ -4017,10 +4019,12 @@ class SingleTradeEngine:
         """Only Capital Funds/history cash. Never invent price×size or UPL peļņa.
 
         GOLD mid is USD-quoted; Capital cash settles in account currency (GBP).
+        V3 P05: ``may_teach_live_cash`` gates the source.
         """
+        from . import realized_cash
         if broker_pnl is not None and math.isfinite(broker_pnl):
             src=str(preferred_source or 'broker').strip().lower()
-            if src!='broker':
+            if not realized_cash.may_teach_live_cash(src):
                 return None,'pending_broker_pnl',self._cash_currency(currency)
             return float(broker_pnl),'broker',self._cash_currency(currency)
         return None,'pending_broker_pnl',None
@@ -5080,8 +5084,7 @@ class SingleTradeEngine:
         """SHADOW learns from ALL closed journal trades — no time/source blocks.
 
         ``hours<=0`` (default) = every closed row within ``limit``. Desk 24h
-        pulse stays separate. Zero / missing £ falls back to last UPL so
-        pending Funds rows still teach SHADOW instead of waiting forever.
+        pulse stays separate. V3 P05: never fall back to UPL — skip pending £.
         """
         if self.store is None:
             return 0
@@ -5107,14 +5110,9 @@ class SingleTradeEngine:
         gates_n=0
         for deal_id,pnl,direction,entry,src,closed in rows:
             pnl_n=_num(pnl)
-            # Any non-zero £ — including UPL estimate / pending tags. Zero → last UPL.
+            # V3 P05: UPL never teaches — skip zero/missing until Funds cash lands.
             if pnl_n is None or abs(float(pnl_n))<1e-12:
-                upl=self._last_upl_as_realized(deal_id)
-                if upl is None:
-                    continue
-                pnl_n=float(upl[0])
-                if abs(pnl_n)<1e-12:
-                    continue
+                continue
             # Optional time window only when caller asks (hours>0).
             if cutoff is not None and closed:
                 try:
@@ -5220,19 +5218,17 @@ class SingleTradeEngine:
         return closed
 
     def _last_upl_as_realized(self,deal_id):
-        """Last live Capital UPL in account currency — usable as closed peļņa."""
-        snap=self.store.get('last_upl:'+str(deal_id)) or {}
-        upl=_num(snap.get('upl'))
-        if upl is None or not math.isfinite(upl):
-            return None
-        return float(upl),self._cash_currency(snap.get('currency'))
+        """V3 P05: UPL must never teach or settle as realized cash — always None."""
+        return None
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
         """Capital history/Funds cash only — never confirm.profit or UPL invent.
 
         Confirm often disagrees with Funds by pence. Desk stays
         ``pending_broker_pnl`` until activity/transactions return real £.
+        V3 P05: only ``may_teach_live_cash`` sources settle as broker cash.
         """
+        from . import realized_cash
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
         queued=None
@@ -5251,10 +5247,22 @@ class SingleTradeEngine:
                                  {'deal_id':deal_id,'type':type(exc).__name__})
         if found:
             pnl,hist_ccy=found
-            # Ignore Capital £0 placeholders — wait for real Funds settlement.
-            if abs(float(pnl))<1e-12:
+            picked=realized_cash.pick_live_realized(
+                funds=pnl,confirm_profit=confirmation.get('profit'),
+                last_upl=None,source='broker')
+            if picked.get('status')!='OK' or not realized_cash.may_teach_live_cash(
+                    picked.get('source')):
                 return None,'pending_broker_pnl',ccy
-            return float(pnl),'broker',self._cash_currency(hist_ccy)
+            # Ignore Capital £0 placeholders — wait for real Funds settlement
+            # unless settled_zero is explicitly accepted.
+            if abs(float(pnl))<1e-12 and not picked.get('settled_zero'):
+                return None,'pending_broker_pnl',ccy
+            return float(pnl),'broker',self._cash_currency(
+                picked.get('currency') or hist_ccy)
+        # Explicitly ignore UPL / confirm.profit via pick_live_realized.
+        realized_cash.pick_live_realized(
+            funds=None,confirm_profit=confirmation.get('profit'),
+            last_upl=None,source='pending')
         return None,'pending_broker_pnl',ccy
 
     def _trade_already_learned(self,deal_id):
@@ -5830,18 +5838,21 @@ class SingleTradeEngine:
         return bars
 
     def _resolve_hold_shadows(self):
-        """Resolve HOLD shadows ASAP: opposite TP, proposal TP, or both-lost→HOLD."""
+        """Resolve HOLD shadows ASAP: opposite TP, proposal TP, or both-lost→HOLD.
+
+        V3 H01: teach isolated SHADOW only — never LIVE learn_from_trade.
+        """
         from .self_params import load as load_self_params
         def _learn(label,transition,mode,detail):
-            # Light teach — not full trade-PnL cannon (was overwriting M1).
             sp=load_self_params(self.store)
             lr=float(sp.get('learn_lr',0.10))
             repeats=max(1,min(4,int(sp.get('hold_shadow_repeats',2))))
             taught=False
+            shadow=self._ensure_shadow_brain()
+            assert shadow is not self.brain.core, 'H01: hold_shadow must not teach LIVE'
             for i in range(repeats):
-                step=self.brain.learn_from_trade(
-                    transition,int(label),lr=lr,won=False,count_sample=(i==0))
-                meta=getattr(self.brain.core,'last_learn_meta',None) or {}
+                step=self._shadow_learn(transition,int(label),lr=lr)
+                meta=getattr(shadow,'last_learn_meta',None) or {}
                 if (step is not None and not meta.get('restored')
                         and float(meta.get('delta_norm') or 0)>1e-9):
                     taught=True
@@ -5852,9 +5863,9 @@ class SingleTradeEngine:
                     learning_generation.bump(self.store,'hold_shadow_proposal_tp')
                 else:
                     learning_generation.bump(self.store,'hold_shadow_hold')
-            msg=('Taught opposite after missed TP on HOLD' if 'opposite_tp' in str(mode)
-                 else ('Taught proposal after missed TP on HOLD' if 'proposal_tp' in str(mode)
-                       else 'Taught HOLD after both sides lost on abstention'))
+            msg=('Taught SHADOW opposite after missed TP on HOLD' if 'opposite_tp' in str(mode)
+                 else ('Taught SHADOW proposal after missed TP on HOLD' if 'proposal_tp' in str(mode)
+                       else 'Taught SHADOW HOLD after both sides lost on abstention'))
             self.store.event('hold_shadow',msg,{
                 'mode':mode,'label':int(label),
                 'opposite':detail.get('opposite'),
@@ -5862,6 +5873,7 @@ class SingleTradeEngine:
                 'opposite_pnl':detail.get('opposite_pnl'),
                 'proposal_pnl':detail.get('proposal_pnl'),
                 'learn_repeats':repeats,'weights_moved':taught,
+                'target':'shadow',
                 'path_bars':detail.get('path_bars') or
                 (detail.get('opposite_sim') or {}).get('bars_held')})
         outcomes=hold_shadow.resolve_ready(
@@ -6161,7 +6173,7 @@ class SingleTradeEngine:
         if repeats>0 and label is not None and claimed_neural and any_real_dw:
             unified_cycle.note_weight_update(
                 self.store,won=pnl_sign>0,delta_norm=last_delta)
-        # One brain: LIVE teach already updated shared neurons — no second pass.
+            # V3 H01: LIVE teach stays on LIVE; SHADOW learns via paper/hold_shadow.
 
         if cash_like:
             # Queue evidence only — commit when long-horizon £ proves improvement.
@@ -7456,24 +7468,12 @@ class SingleTradeEngine:
         # After fusion transition: never open on a stale signal during EXTERNAL gap.
         if self._fusion_entry_blocked():return
         if not self._external_entry_check(action)['entry_allowed']:return
-        # Audit #22–#23: prep/eval readiness (and utility via evaluate_neural_entry).
+        # Audit #22–#23: prep/eval readiness + hard_risk (utility via evaluate_neural_entry).
         gates=self.live_open_gates(action)
         if not gates.get('allowed'):
             self.last_entry_reason=gates.get('reason') or 'LIVE OPEN blocked by readiness'
             return
-        # Load profitable version only when current market task matches its context.
-        try:
-            ctx=champion_library.context_from(
-                epic=self.mandate.get('epic'),
-                trend=(self.market_context or {}).get('trend')
-                      or (self.last_signal or {}).get('trend'),
-                regime=(self.market_context or {}).get('regime')
-                       or (self.last_signal or {}).get('regime'),
-                news=self._news_risk())
-            champion_library.maybe_activate(self.store,self,context=ctx)
-        except Exception as exc:
-            self.store.event('warning','Champion activate skipped',
-                             {'type':type(exc).__name__})
+        # V3 A03: never swap champion weights between plan and POST.
         self.pending_order=True
         try:
             await self.sync()
@@ -7640,11 +7640,12 @@ class SingleTradeEngine:
                     'min_distance':float(minimum),'kappa':bp['kappa'],
                     'raised_to_broker_min':brackets.get('raised_to_broker_min')})
                 return
-            # Soft edge→size: stronger neural margin → larger lot on Capital grid.
-            # NEVER refuse OPEN when size math fails — fall back to mandate seed
-            # (operator: no HOLD freeze while learning).
+            # Soft edge→size on Capital grid. V3 R02: refuse OPEN when grid/risk
+            # math fails — never silently fall back to mandate without tick_value.
+            from .math_rules import dealing_size_grid as _deal_grid
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
-            open_scores=(self.last_signal or {}).get('scores')
+            open_scores=((self.last_signal or {}).get('scores_raw')
+                         or (self.last_signal or {}).get('scores'))
             open_edge=None
             if isinstance(open_scores,dict):
                 try:
@@ -7654,6 +7655,16 @@ class SingleTradeEngine:
             seed_size=Decimal(self.mandate['size'])
             size=seed_size
             size_plan=None
+            grid=_deal_grid(market,mandate_size=seed_size)
+            if not grid.get('ok'):
+                self.last_entry_reason=(
+                    grid.get('reason') or 'HOLD_RISK: Capital dealingRules missing')
+                self.store.event('risk','OPEN refused — size grid unavailable',{
+                    'reason':self.last_entry_reason,'grid':{
+                        k:str(v) if isinstance(v,Decimal) else v
+                        for k,v in (grid or {}).items()},
+                    'direction':action})
+                return
             try:
                 size_plan=day_book.propose_size(
                     mandate_size=seed_size,
@@ -7664,18 +7675,29 @@ class SingleTradeEngine:
                     tick_value=tick_val,
                     positions=self.positions,
                     score_edge=open_edge,
-                    market=market)
-                if (size_plan.get('allowed') and size_plan.get('size') is not None
+                    market=market,
+                    size_grid=grid)
+                if not size_plan.get('allowed'):
+                    self.last_entry_reason=(
+                        size_plan.get('reason') or 'HOLD_RISK: size plan refused')
+                    self.store.event('risk','OPEN refused — size plan failed',{
+                        'reason':self.last_entry_reason,'direction':action,
+                        'size_plan':{
+                            k:(str(v) if isinstance(v,Decimal) else v)
+                            for k,v in (size_plan or {}).items()}})
+                    return
+                if (size_plan.get('size') is not None
                         and Decimal(str(size_plan['size']))>0):
                     size=Decimal(str(size_plan['size']))
                 self.store.set('last_open_size_plan',{
                     k:(str(v) if isinstance(v,Decimal) else v)
                     for k,v in (size_plan or {}).items()})
             except Exception as exc:
-                self.store.event('warning','Edge size plan skipped — using mandate',
-                    {'type':type(exc).__name__})
-                size=seed_size
-            # Hard-risk is informational only — never block OPEN (operator request).
+                self.last_entry_reason='HOLD_RISK: size plan error — '+type(exc).__name__
+                self.store.event('risk','OPEN refused — size plan exception',
+                    {'type':type(exc).__name__,'direction':action})
+                return
+            # V3 R02: hard_risk gates OPEN — refuse when not allowed.
             proposed=None
             if tick_val is not None:
                 try:
@@ -7683,7 +7705,20 @@ class SingleTradeEngine:
                 except (ValueError,TypeError,ArithmeticError):
                     proposed=None
             gate=self._hard_risk_gate(proposed_risk=proposed)
-            self.store.event('risk','OPEN cash-risk note (not a gate)',{
+            if not gate.get('allowed'):
+                self.last_entry_reason=gate.get('reason') or 'HOLD_RISK: hard_risk blocked'
+                self.store.event('risk','OPEN refused — hard-risk gate',{
+                    'proposed_risk':proposed,'size':str(size),
+                    'seed_size':str(seed_size),
+                    'size_reason':(size_plan or {}).get('reason'),
+                    'signal_strength':(size_plan or {}).get('signal_strength'),
+                    'score_edge':open_edge,
+                    'stop_ticks':int(brackets['stop_ticks']),
+                    'tick_value':float(tick_val) if tick_val is not None else None,
+                    'limits':(gate or {}).get('limits'),'direction':action,
+                    'open_gated':True,'reason':self.last_entry_reason})
+                return
+            self.store.event('risk','OPEN cash-risk passed hard-risk gate',{
                 'proposed_risk':proposed,'size':str(size),
                 'seed_size':str(seed_size),
                 'size_reason':(size_plan or {}).get('reason'),
@@ -7692,7 +7727,7 @@ class SingleTradeEngine:
                 'stop_ticks':int(brackets['stop_ticks']),
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
-                'open_gated':False})
+                'open_gated':True})
             self.store.event('bracket','OPEN brackets decided from OHLC structure',{
                 'kappa':bp['kappa'],'sl_scale':1.0,
                 'source':bracket_source,
@@ -8122,105 +8157,246 @@ class SingleTradeEngine:
             spreads.append(float(sp) if sp is not None and sp>=0 else None)
         return bars,spreads,times
 
-    SHADOW_STATE_KEY='shadow_neural_state_v1'  # legacy key — one-brain no longer writes it
+    SHADOW_STATE_KEY='shadow_neural_state_v1'
+
+    def _shadow_npz_path(self):
+        """Separate weight file — never LIVE brain.npz (V3 H01)."""
+        try:
+            base=Path(getattr(self.brain,'path',None) or (DATA/'brain.npz'))
+            return base.with_name('shadow_brain.npz')
+        except Exception:
+            return DATA/'shadow_brain.npz'
 
     def _ensure_shadow_brain(self):
-        """One NeuralCore for LIVE + SHADOW — same neurons, same weights.
+        """Isolated SHADOW NeuralCore — warm-start clone, never LIVE core (V3 H01).
 
-        Paper / mistake-audit / hold-shadow vote through the LIVE brain.
-        No second clone, no separate shadow weight store.
+        ``clone_architecture(copy_weights=True)`` once, then persist/restore the
+        clone under a separate store key + shadow_brain.npz. Never alias
+        ``shadow_brain = brain.core``.
         """
-        core=self.brain.core
-        if self.shadow_brain is not core:
-            self.shadow_brain=core
-            self.store.event('shadow','One neural core — SHADOW shares LIVE neurons',
-                {'neurons':core.n,'dim':core.d,'shared':True})
+        live=self.brain.core
+        d=live.d
+        created=False
+        if (self.shadow_brain is None
+                or self.shadow_brain is live
+                or getattr(self.shadow_brain,'d',None)!=d
+                or getattr(self.shadow_brain,'n',None)!=live.n):
+            # Warm-start from LIVE architecture+weights, then diverge via shadow learn.
+            base=int(getattr(self.brain,'init_seed',7) or 7)
+            shadow_seed=(base^(0xA5A5+int(live.n)))%(2**31-1) or (base+int(live.n)+1)
+            self.shadow_brain=live.clone_architecture(
+                n=live.n,seed=shadow_seed,copy_weights=True)
+            self.shadow_brain.model_version=int(
+                getattr(self.shadow_brain,'model_version',0) or 0)
+            created=True
+            self.store.event('shadow','Isolated SHADOW neural core ready (V3 H01)',
+                {'neurons':self.shadow_brain.n,'dim':d,'live_neurons':live.n,
+                 'shadow_seed':shadow_seed,'shared':False,
+                 'is_live_core':False})
+        assert self.shadow_brain is not self.brain.core, (
+            'H01: shadow_brain must not be LIVE core')
+        if created:
+            self._restore_shadow_state()
         return self.shadow_brain
 
     def _restore_shadow_state(self):
-        """No-op — one brain persists via LIVE AdaptiveBrain.save()."""
-        self._ensure_shadow_brain()
+        """Reload persisted SHADOW clone weights (store key and/or npz) — not LIVE."""
+        from .core import WEIGHT_PARAM_NAMES
+        shadow=self.shadow_brain
+        if shadow is None or shadow is self.brain.core:
+            return False
+        # Prefer file when present; fall back to store blob.
+        path=self._shadow_npz_path()
+        raw=None
+        if path.exists():
+            try:
+                with np.load(path,allow_pickle=False) as z:
+                    snap={name:np.asarray(z[name],dtype=float)
+                          for name in WEIGHT_PARAM_NAMES if name in z.files}
+                    if snap and shadow.restore_weights(snap):
+                        if 'h' in z.files and 'c' in z.files:
+                            h=np.asarray(z['h'],dtype=float)
+                            c=np.asarray(z['c'],dtype=float)
+                            if h.shape==(shadow.n,) and c.shape==(shadow.n,):
+                                shadow.h=h;shadow.c=c
+                        if 'steps' in z.files:
+                            try:shadow.steps=int(z['steps'])
+                            except (TypeError,ValueError):pass
+                        if 'model_version' in z.files:
+                            try:shadow.model_version=int(z['model_version'])
+                            except (TypeError,ValueError):pass
+                        return True
+            except Exception:
+                pass
+        raw=self.store.get(self.SHADOW_STATE_KEY) or {}
+        if not isinstance(raw,dict):
+            return False
+        try:
+            h=np.asarray(raw.get('h'),dtype=float)
+            c=np.asarray(raw.get('c'),dtype=float)
+        except (TypeError,ValueError):
+            return False
+        if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):
+            return False
+        if not (np.isfinite(h).all() and np.isfinite(c).all()):
+            return False
+        if int(raw.get('d') or -1)!=shadow.d:
+            return False
+        weights=raw.get('weights')
+        if isinstance(weights,dict):
+            snap={}
+            try:
+                for name in WEIGHT_PARAM_NAMES:
+                    if name not in weights:raise KeyError(name)
+                    arr=np.asarray(weights[name],dtype=float)
+                    if arr.shape!=np.asarray(getattr(shadow,name)).shape:
+                        raise ValueError('shape')
+                    if not np.isfinite(arr).all():raise ValueError('nan')
+                    snap[name]=arr
+                if not shadow.restore_weights(snap):
+                    return False
+            except (TypeError,ValueError,KeyError):
+                return False
+        shadow.h=h;shadow.c=c
+        try:shadow.steps=int(raw.get('steps') or 0)
+        except (TypeError,ValueError):shadow.steps=0
+        try:shadow.model_version=int(raw.get('model_version') or 0)
+        except (TypeError,ValueError):shadow.model_version=0
+        ids_raw=raw.get('neuron_ids')
+        if ids_raw is not None:
+            try:
+                ids=np.asarray(ids_raw,dtype=np.int64)
+                if ids.shape==(shadow.n,):shadow.neuron_ids=ids
+            except (TypeError,ValueError):
+                pass
+        tr=raw.get('last_transition')
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            try:
+                z=np.asarray(tr['z'],dtype=float)
+                th=np.asarray(tr['h'],dtype=float);tc=np.asarray(tr['c'],dtype=float)
+                if z.shape==(shadow.d,) and th.shape==(shadow.n,) and tc.shape==(shadow.n,):
+                    ids=tr.get('neuron_ids')
+                    shadow.last_transition={
+                        'z':z,'h':th,'c':tc,
+                        'dt':float(tr.get('dt') or 1.),
+                        'neuron_ids':(np.asarray(ids,dtype=np.int64)
+                                      if ids is not None else shadow.neuron_ids.copy()),
+                        'bar_time':tr.get('bar_time')}
+            except (TypeError,ValueError,KeyError):
+                pass
         return True
 
     def _persist_shadow_state(self):
-        """Persist the shared neural core via LIVE brain save (one weight file)."""
+        """Persist the SHADOW clone only — never LIVE AdaptiveBrain.save()."""
+        from .core import WEIGHT_PARAM_NAMES
+        shadow=self.shadow_brain
+        if shadow is None or shadow is self.brain.core:
+            return
+        tr=getattr(shadow,'last_transition',None)
+        weights={name:np.asarray(getattr(shadow,name),dtype=float).tolist()
+                 for name in WEIGHT_PARAM_NAMES}
+        payload={
+            'h':np.asarray(shadow.h,dtype=float).tolist(),
+            'c':np.asarray(shadow.c,dtype=float).tolist(),
+            'steps':int(getattr(shadow,'steps',0) or 0),
+            'n':int(shadow.n),'d':int(shadow.d),
+            'model_version':int(getattr(shadow,'model_version',0) or 0),
+            'neuron_ids':np.asarray(shadow.neuron_ids,dtype=np.int64).tolist(),
+            'weights':weights,
+        }
+        if isinstance(tr,dict) and tr.get('z') is not None:
+            payload['last_transition']={
+                'z':np.asarray(tr['z'],dtype=float).tolist(),
+                'h':np.asarray(tr['h'],dtype=float).tolist(),
+                'c':np.asarray(tr['c'],dtype=float).tolist(),
+                'dt':float(tr.get('dt') or 1.),
+                'neuron_ids':np.asarray(
+                    tr.get('neuron_ids',shadow.neuron_ids),dtype=np.int64).tolist(),
+                'bar_time':tr.get('bar_time')}
+        self.store.set(self.SHADOW_STATE_KEY,payload)
+        # Also write shadow_brain.npz next to LIVE brain.npz.
         try:
-            if self.brain is not None and hasattr(self.brain,'save'):
-                self.brain.save()
+            path=self._shadow_npz_path()
+            path.parent.mkdir(exist_ok=True,parents=True)
+            tmp=path.with_suffix('.tmp.npz')
+            file_payload={name:np.asarray(getattr(shadow,name),dtype=float)
+                          for name in WEIGHT_PARAM_NAMES}
+            file_payload.update(
+                h=np.asarray(shadow.h,dtype=float),
+                c=np.asarray(shadow.c,dtype=float),
+                steps=int(getattr(shadow,'steps',0) or 0),
+                model_version=int(getattr(shadow,'model_version',0) or 0),
+                n=int(shadow.n),d=int(shadow.d))
+            np.savez_compressed(tmp,**file_payload)
+            tmp.replace(path)
         except Exception:
             pass
 
     def _shadow_decision_transition(self, preferred=None):
-        """Decision-time state from the ONE neural core (LIVE = SHADOW)."""
-        core=self._ensure_shadow_brain()
-        for cand in (preferred,getattr(core,'last_transition',None)):
+        """SHADOW's own decision-time state — never LIVE h/c."""
+        shadow=self._ensure_shadow_brain()
+        assert shadow is not self.brain.core
+        for cand in (preferred,getattr(shadow,'last_transition',None)):
             if not isinstance(cand,dict):continue
             z=cand.get('z')
             if z is None:continue
             z=np.asarray(z,dtype=float)
-            if z.shape!=(core.d,):continue
+            if z.shape!=(shadow.d,):continue
             h=np.asarray(cand.get('h'),dtype=float)
             c=np.asarray(cand.get('c'),dtype=float)
-            if h.shape!=(core.n,) or c.shape!=(core.n,):continue
-            ids=cand.get('neuron_ids',core.neuron_ids)
+            if h.shape!=(shadow.n,) or c.shape!=(shadow.n,):continue
+            ids=cand.get('neuron_ids',shadow.neuron_ids)
             return {'z':z,'h':h,'c':c,'dt':float(cand.get('dt') or 1.),
                     'neuron_ids':np.asarray(ids,dtype=np.int64)}
         return None
 
     def _shadow_learn(self,transition,label,lr=None):
-        """Teach the ONE neural core from paper/shadow outcomes."""
-        core=self._ensure_shadow_brain()
+        """Teach isolated SHADOW only — must not mutate LIVE W (V3 H01)."""
+        shadow=self._ensure_shadow_brain()
+        assert shadow is not self.brain.core, 'H01: shadow_learn must not hit LIVE'
         if label not in (0,1,2):return None
         own=self._shadow_decision_transition(
             transition if (isinstance(transition,dict)
                            and transition.get('h') is not None
-                           and len(np.asarray(transition.get('h')))==core.n)
+                           and len(np.asarray(transition.get('h')))==shadow.n)
             else None)
         if own is None and isinstance(transition,dict):
-            base=getattr(core,'last_transition',None)
+            base=getattr(shadow,'last_transition',None)
             if isinstance(base,dict) and base.get('h') is not None:
                 z=transition.get('z')
-                if z is not None and len(np.asarray(z))==core.d:
+                if z is not None and len(np.asarray(z))==shadow.d:
                     own={'z':np.asarray(z,dtype=float),
                          'h':np.asarray(base['h'],dtype=float),
                          'c':np.asarray(base['c'],dtype=float),
                          'dt':float(base.get('dt') or transition.get('dt') or 1.),
                          'neuron_ids':np.asarray(
-                             base.get('neuron_ids',core.neuron_ids),dtype=np.int64)}
+                             base.get('neuron_ids',shadow.neuron_ids),dtype=np.int64)}
         if own is None:return None
         from .core import OBJECTIVE_TRADE_PNL
-        loss=core.learn(own,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
+        loss=shadow.learn(own,label,lr=lr,objective=OBJECTIVE_TRADE_PNL)
         self._persist_shadow_state()
         return loss
 
     def _shadow_scores_now(self,*,advance=False,bar_time=None):
-        """Score with the ONE neural core (LIVE weights).
-
-        Does not double-advance LIVE h/c — LIVE tick already owns the trajectory.
-        Uses a read-only forward peek (or last_signal scores when available).
-        """
-        core=self._ensure_shadow_brain()
-        # Prefer LIVE bar scores when already computed this poll.
-        if isinstance(getattr(self,'last_signal',None),dict):
-            sc=self.last_signal.get('scores')
-            if isinstance(sc,dict) and all(k in sc for k in ('BUY','SELL','HOLD')):
-                try:
-                    return {k:float(sc[k]) for k in ('BUY','SELL','HOLD')}
-                except (TypeError,ValueError):
-                    pass
-        z=core.last_z
-        if z is None or len(z)!=core.d:return None
+        """Score with isolated SHADOW weights on live z; optionally advance h/c."""
+        shadow=self._ensure_shadow_brain()
+        assert shadow is not self.brain.core
+        z=self.brain.core.last_z
+        if z is None or len(z)!=shadow.d:return None
         try:
             z=np.asarray(z,dtype=float)
-            h0=core.h.copy();c0=core.c.copy()
-            _hn,_cn,logits=core._forward(z,h0,c0,1.0)
-            # Stamp decision transition for paper teach without mutating LIVE h/c.
-            if advance or getattr(core,'last_transition',None) is None:
-                core.last_transition={
+            h0=shadow.h.copy();c0=shadow.c.copy()
+            hn,cn,logits=shadow._forward(z,h0,c0,1.0)
+            if advance:
+                shadow.last_transition={
                     'z':z.copy(),'h':h0,'c':c0,'dt':1.0,
-                    'neuron_ids':core.neuron_ids.copy(),
+                    'neuron_ids':shadow.neuron_ids.copy(),
                     'bar_time':bar_time}
-            prob=core._softmax(logits)
+                shadow.h=hn;shadow.c=cn
+                shadow.last_z=z.copy()
+                shadow.steps=int(getattr(shadow,'steps',0) or 0)+1
+                self._persist_shadow_state()
+            prob=shadow._softmax(logits)
             return dict(zip(('BUY','SELL','HOLD'),map(float,prob)))
         except Exception:
             return None
@@ -8316,8 +8492,9 @@ class SingleTradeEngine:
             old_ohlc=self.brain.ohlc_dim
             self.brain.apply_registry(self.feature_registry)
             learning_generation.bump(self.store,'feature_registry_expanded')
-            # One brain — registry expand already resized LIVE core (= SHADOW).
-            self.shadow_brain=self.brain.core
+            # LIVE dim changed — recreate isolated SHADOW warm-started from LIVE.
+            self.shadow_brain=None
+            self._ensure_shadow_brain()
             post_path=None
             if hasattr(self.brain,'backup_weights'):
                 post_path=self.brain.backup_weights(

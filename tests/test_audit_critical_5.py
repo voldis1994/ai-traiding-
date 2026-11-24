@@ -24,12 +24,13 @@ def _op_limits(**kw):
 
 
 def test_hard_risk_no_forced_surrogate_floors():
-    """Defaults stay None (no 5/25/100) and OPEN is never gated by hard-risk."""
+    """Defaults stay None (no 5/25/100); unset limits block OPEN (V3 R02)."""
     for k in ('max_risk_per_trade','daily_loss_limit','equity_drawdown_limit'):
         assert hard_risk.DEFAULTS[k] is None
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'s.db')
-        assert hard_risk.entry_allowed(store,proposed_risk=0.1)['allowed'] is True
+        # Unset → blocked (no invented surrogate floors).
+        assert hard_risk.entry_allowed(store,proposed_risk=0.1)['allowed'] is False
         hard_risk.save_operator(store,_op_limits(
             max_risk_per_trade=7.5,daily_loss_limit=33,equity_drawdown_limit=150),
             reason='chosen')
@@ -38,7 +39,7 @@ def test_hard_risk_no_forced_surrogate_floors():
         assert lim['daily_loss_limit']==pytest.approx(33)
         assert lim['equity_drawdown_limit']==pytest.approx(150)
         assert hard_risk.entry_allowed(store,proposed_risk=1.0)['allowed'] is True
-        assert hard_risk.entry_allowed(store,proposed_risk=100.0)['allowed'] is True
+        assert hard_risk.entry_allowed(store,proposed_risk=100.0)['allowed'] is False
 
 
 def test_reconcile_open_requires_deal_id_binding(tmp_path):
@@ -174,23 +175,25 @@ def test_trade_learn_survives_restart_no_relearn():
         assert NeuralCore.weight_delta_norm(after,brain2.core.snapshot_weights())==pytest.approx(0)
 
 
-def test_shadow_shares_live_core_across_engine_restart():
-    """One brain: SHADOW alias is LIVE core; learn mutates shared weights."""
+def test_shadow_isolated_from_live_across_engine_restart():
+    """V3 H01: SHADOW is a separate NeuralCore; learn does not mutate LIVE W."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         brain.core.last_z=np.linspace(-0.3,0.3,brain.core.d)
         e=SingleTradeEngine(store,brain)
         shadow=e._ensure_shadow_brain()
-        assert shadow is brain.core
+        assert shadow is not brain.core
+        live_before=brain.core.snapshot_weights()
         e._shadow_scores_now(advance=True,bar_time='t0')
         before=shadow.snapshot_weights()
         assert e._shadow_learn(None,0,lr=0.2) is not None
         after=shadow.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)>0
+        assert NeuralCore.weight_delta_norm(live_before,brain.core.snapshot_weights())==pytest.approx(0)
         e.shadow_brain=None
         e2=SingleTradeEngine(store,brain)
         shadow2=e2._ensure_shadow_brain()
-        assert shadow2 is brain.core
+        assert shadow2 is not brain.core
         assert NeuralCore.weight_delta_norm(after,shadow2.snapshot_weights())==pytest.approx(0)
 
 

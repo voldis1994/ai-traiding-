@@ -2544,6 +2544,11 @@ class SingleTradeEngine:
                         self.store.set(key,{**pending,'entry':p.get('level') if p.get('level') is not None else pending.get('entry'),
                                            'tick_size':pending.get('tick_size') or tick,
                                            'entry_spread':pending.get('entry_spread') if pending.get('entry_spread') is not None else ask-bid})
+                        try:
+                            self._archive_ohlc_for_shadow(
+                                p.get('dealId'),self.store.get(key))
+                        except Exception:
+                            pass
                         self._pending_entry_brain=None
                 elif self.store.get(key) is None:
                     # Never bind mid-trade h/c as entry_brain — that poisons the
@@ -5141,7 +5146,15 @@ class SingleTradeEngine:
             epic=((saved.get('epic') if isinstance(saved,dict) else None)
                   or (self.mandate or {}).get('epic')
                   or getattr(self.brain,'epic',None))
-            candles=self._decision_candles(epic,n=80) if epic else []
+            # Prefer frozen OPEN tape — live tape alone invents post-close regimes.
+            open_path=list(saved.get('candles_at_open') or []) if isinstance(saved,dict) else []
+            if len(open_path)>=16:
+                candles=open_path
+                snap_used=True
+            else:
+                candles=self._decision_candles(epic,n=80) if epic else []
+                snap_used=bool(isinstance(saved,dict) and (
+                    saved.get('ohlc_entry') or saved.get('scores')))
             ccy=(self._cash_currency(
                     (saved or {}).get('pnl_currency') if isinstance(saved,dict)
                     else None)
@@ -5176,8 +5189,23 @@ class SingleTradeEngine:
                 apply_ohlc_penalties=True,
             )
             if out and out.get('audited'):
+                # Stamp whether OPEN snapshot fed diagnose (Desk CMD honesty).
+                try:
+                    hist=list(self.store.get(sma.HIST_KEY) or [])
+                    if hist and isinstance(hist[-1],dict) and str(
+                            hist[-1].get('deal_id') or '')==str(deal_id):
+                        hist[-1]=dict(hist[-1],
+                                      open_snapshot=bool(snap_used),
+                                      open_candles_n=len(open_path),
+                                      notes=list(hist[-1].get('notes') or [])+(
+                                          ['open_snapshot_used'] if snap_used
+                                          else ['no_open_snapshot_live_tape']))
+                        self.store.set(sma.HIST_KEY,hist)
+                except Exception:
+                    pass
                 self.store.set(once,{'at':now(),'pnl':pnl_n,'source':source,
-                                    'mistakes':list(out.get('mistakes') or [])})
+                                    'mistakes':list(out.get('mistakes') or []),
+                                    'open_snapshot':bool(snap_used)})
             return out
         except Exception as exc:
             try:
@@ -5233,7 +5261,11 @@ class SingleTradeEngine:
         return 'ohlc_learn:'+str(deal_id)
 
     def _archive_ohlc_for_shadow(self,deal_id,saved=None):
-        """Keep OPEN OHLC stamps after entry_brain clear so backfill can diagnose."""
+        """Durable OPEN decision snapshot for SHADOW diagnose after brain wipe.
+
+        Keeps OHLC gate meta + scenario + structure + news/peers + neural scores
+        + OPEN candle path — not just a thin ohlc_entry stub.
+        """
         if self.store is None or deal_id is None:
             return None
         meta=saved if isinstance(saved,dict) else (
@@ -5241,30 +5273,50 @@ class SingleTradeEngine:
         if not isinstance(meta,dict) or not meta:
             return None
         ohlc=meta.get('ohlc_entry') if isinstance(meta.get('ohlc_entry'),dict) else None
-        if not ohlc:
+        if not ohlc and not meta.get('candles_at_open') and not meta.get('scores'):
             return None
         payload={
-            'ohlc_entry':ohlc,
+            'ohlc_entry':ohlc or {},
             'direction':meta.get('direction'),
             'entry':meta.get('entry'),
             'entry_spread':meta.get('entry_spread'),
             'epic':meta.get('epic'),
             'pnl_currency':meta.get('pnl_currency'),
+            'tick_size':meta.get('tick_size'),
+            'scores':meta.get('scores'),
+            'scores_raw':meta.get('scores_raw'),
+            'score_edge':meta.get('score_edge'),
+            'shadow_scores':meta.get('shadow_scores'),
+            'structure_at_open':meta.get('structure_at_open'),
+            'flow_at_open':meta.get('flow_at_open'),
+            'champion_context':meta.get('champion_context'),
+            'reentry_confirm':meta.get('reentry_confirm'),
+            'news':meta.get('news') if isinstance(meta.get('news'),dict) else {},
+            'intermarket':(meta.get('intermarket')
+                           if isinstance(meta.get('intermarket'),dict) else {}),
+            'candles_at_open':list(meta.get('candles_at_open') or [])[:48],
+            'bar_time':meta.get('bar_time'),
+            'snapshot_version':int(meta.get('snapshot_version') or 1),
             'at':now(),
             'from':'entry_brain',
         }
         self.store.set(self._ohlc_learn_key(deal_id),payload)
+        # Alias for Desk/operators — same payload, clearer name.
+        self.store.set('decision_snapshot:'+str(deal_id),payload)
         return payload
 
     def _load_ohlc_learn_context(self,deal_id):
-        """entry_brain first; durable ohlc_learn archive after brain wipe."""
+        """entry_brain first; durable OPEN snapshot after brain wipe."""
         if self.store is None or deal_id is None:
             return {}
         saved=self.store.get('entry_brain:'+str(deal_id))
         if isinstance(saved,dict) and saved:
             return saved
         arch=self.store.get(self._ohlc_learn_key(deal_id))
-        return arch if isinstance(arch,dict) else {}
+        if isinstance(arch,dict) and arch:
+            return arch
+        snap=self.store.get('decision_snapshot:'+str(deal_id))
+        return snap if isinstance(snap,dict) else {}
 
     def _backfill_mistake_audits_from_journal(self,*,limit=2000,hours=0):
         """SHADOW learns from ALL closed journal trades — no time/source blocks.
@@ -8234,6 +8286,22 @@ class SingleTradeEngine:
                 except Exception:
                     flow_at_open={'effect':(flow_dec_open or {}).get('effect'),
                                   'at':now()}
+                # Freeze news/peers + OHLC path at OPEN — close/backfill must not
+                # invent diagnose from a later tape alone.
+                try:
+                    news_at_open=self._news_risk() or {}
+                except Exception:
+                    news_at_open={}
+                im_at_open=dict(getattr(self.intermarket,'state',{}) or {})
+                candles_at_open=[]
+                for c in (open_candles or [])[-48:]:
+                    if not isinstance(c,dict):
+                        continue
+                    candles_at_open.append({
+                        'open':c.get('open'),'high':c.get('high'),
+                        'low':c.get('low'),'close':c.get('close'),
+                        'at':c.get('at'),
+                    })
                 self._pending_entry_brain={
                     'epic':self.mandate['epic'],'direction':action,'entry':entry,
                     'tick_size':tick,'entry_spread':spread,
@@ -8261,6 +8329,10 @@ class SingleTradeEngine:
                         zone_gate,action=action),
                     'structure_at_open':structure_at_open,
                     'flow_at_open':flow_at_open,
+                    'news':news_at_open if isinstance(news_at_open,dict) else {},
+                    'intermarket':im_at_open if isinstance(im_at_open,dict) else {},
+                    'candles_at_open':candles_at_open,
+                    'snapshot_version':1,
                 }
             # Durable order record BEFORE a real order is sent; never blindly retry.
             oid=self.store.order('OPEN',None,{'epic':self.mandate['epic'],'direction':action,'size':str(size),
@@ -8292,6 +8364,11 @@ class SingleTradeEngine:
                         entry=(live or {}).get('level') if live else pending.get('entry')
                         self.store.set(key,{**pending,'entry':entry if entry is not None else pending.get('entry')})
                     bound=self.store.get(key) or {}
+                    # Durable OPEN snapshot immediately — survives entry_brain clear.
+                    try:
+                        self._archive_ohlc_for_shadow(conf_deal,bound)
+                    except Exception:
+                        pass
                     self._pending_entry_brain=None
                     unified_cycle.note_open(self.store,action=action)
                     # SHADOW learns every LIVE OPEN — mirror into paper, no gate.
@@ -9084,16 +9161,27 @@ class SingleTradeEngine:
                 from . import ohlc_scenarios as _osc
                 news_ctx,im_ctx=self._audit_external_context(
                     {},direction=action)
+                stamp_rows=candles if candles is not None else None
+                if stamp_rows is None:
+                    try:
+                        stamp_rows=self._decision_candles(
+                            (self.mandate or {}).get('epic'),n=80) or []
+                    except Exception:
+                        stamp_rows=[]
+                    if not stamp_rows and self.mandate:
+                        try:
+                            stamp_rows=self.store.candles(
+                                self.mandate['epic'],n=80,
+                                historical_only=True) or []
+                        except Exception:
+                            stamp_rows=[]
                 sc=None
                 if isinstance(zone_gate,dict) and isinstance(
                         zone_gate.get('scenario'),dict):
                     sc=zone_gate.get('scenario')
                 else:
-                    stamp_rows=candles if candles is not None else (
-                        self.store.candles(
-                            self.mandate['epic'],n=80,historical_only=True)
-                        if self.mandate else [])
-                    sc=_osc.classify(stamp_rows,store=self.store) if stamp_rows else {}
+                    sc=(_osc.classify(stamp_rows,store=self.store)
+                        if stamp_rows else {})
                 zone=(zone_gate or {}).get('zone') if isinstance(zone_gate,dict) else None
                 raw_ohlc={
                     'action':action,
@@ -9103,6 +9191,11 @@ class SingleTradeEngine:
                     'reason':(zone_gate or {}).get('reason')
                              if isinstance(zone_gate,dict) else None,
                 }
+                paper_candles=[{
+                    'open':c.get('open'),'high':c.get('high'),
+                    'low':c.get('low'),'close':c.get('close'),
+                    'at':c.get('at'),
+                } for c in list(stamp_rows or [])[-48:] if isinstance(c,dict)]
                 entry_context={
                     'scenario':(_osc.open_meta_from_scenario(sc)
                                 if sc and 'scenarios' in (sc or {})
@@ -9110,6 +9203,8 @@ class SingleTradeEngine:
                     'ohlc_entry':self._shadow_ohlc_meta_for_learn(raw_ohlc),
                     'news':news_ctx,
                     'intermarket':im_ctx,
+                    'candles_at_open':paper_candles,
+                    'snapshot_version':1,
                 }
             except Exception:
                 entry_context=None

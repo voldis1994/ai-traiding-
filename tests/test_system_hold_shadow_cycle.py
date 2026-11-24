@@ -83,6 +83,9 @@ def test_system_hold_shadow_teaches_opposite_with_fixed_floor():
         assert brain.core.last_transition is not None
 
         e = SingleTradeEngine(store, brain)
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'policy_live_execute': 1},
+                reason='test_hold_shadow')
         path = Path(d) / 'policy.py'
         path.write_text(
             TEMPLATES['edge'].format(

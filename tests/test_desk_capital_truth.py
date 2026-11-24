@@ -235,7 +235,7 @@ def test_refresh_live_truth_awaits_funds_mirror():
                 self.shadow_brain = object()
                 return self.shadow_brain
 
-            async def _mirror_capital_funds_closes(self):
+            async def _mirror_capital_funds_closes(self, days=1):
                 await asyncio.sleep(0)
                 calls['n'] += 1
                 return 1
@@ -255,8 +255,9 @@ def test_refresh_live_truth_awaits_funds_mirror():
         hub.platform = _Platform()
         hub.get = lambda cid: _RT() if int(cid) == 1 else None
         out = await hub.refresh_live_truth()
-        assert calls['n'] == 1
-        assert out['mirrored'] == 1
+        # 24h then history Funds windows both await the mirror (no fire-and-forget).
+        assert calls['n'] >= 1
+        assert out['mirrored'] >= 1
         assert out['shadow'] == 1
         assert out['remapped'] == 1
 

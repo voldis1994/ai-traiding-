@@ -26,8 +26,9 @@ READY_KEY = 'shadow_mistake_audit_v1:ready'
 LAST_KEY = 'shadow_mistake_audit_v1:last'
 PENDING_FIX_KEY = 'shadow_mistake_audit_v1:pending_fix'
 
-PROMOTE_N = 1   # first same fingerprint+mistake → commit fix (full cycle NOW)
-READY_N = 0     # commit → ready_for_live immediately (no proof-win queue)
+# V3.0 V04: instant ready_for_live after first mistake is forbidden.
+PROMOTE_N = 3   # same fingerprint+mistake must repeat ≥3 times before commit
+READY_N = 3     # ≥3 proof wins after fix before ready_for_live
 
 
 def _finite(v):
@@ -538,7 +539,7 @@ def _mark_ready_entry(store, *, fingerprint: str, row: dict,
 
 
 def _update_ready(store, diagnosis: dict) -> dict | None:
-    """Mark fingerprint ready_for_live (READY_N=0 → right after fix commit)."""
+    """Mark fingerprint ready_for_live only after ≥ READY_N proof wins (V04)."""
     if store is None or not isinstance(diagnosis, dict):
         return None
     ctx = diagnosis.get('context') or {}
@@ -612,10 +613,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             commit_result = apply_targeted_fix(store, diagnosis, commit=False)
 
     ready = None
-    # Full cycle NOW: after fix commit → ready_for_live (READY_N may be 0).
-    if commit_result.get('applied'):
-        ready = _update_ready(store, diagnosis)
-    elif diagnosis.get('useful'):
+    # V04: ready_for_live only after READY_N proof wins post-fix — never on commit alone.
+    if commit_result.get('applied') or diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
     audited_at = _now_iso()
@@ -717,10 +716,9 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
 
 
 def flush_full_cycle(store) -> dict:
-    """Commit every pending / repeated mistake NOW and mark ready_for_live.
+    """Commit pending fixes that already meet PROMOTE_N; ready only after READY_N.
 
-    Clears TARGETED FIX stuck on PENDING and READY→LIVE empty queue after
-    Capital closes already filled hist / scenarios.
+    Does not bypass V04 — never marks ready_for_live without proof wins.
     """
     if store is None:
         return {'flushed': False, 'reason': 'no_store'}
@@ -773,8 +771,9 @@ def flush_full_cycle(store) -> dict:
                 row = bag.get(fp) if isinstance(bag.get(fp), dict) else row
         bag = _scenario_bag(store)
         row = bag.get(fp) if isinstance(bag.get(fp), dict) else None
-        if isinstance(row, dict) and row.get('fix_committed') and not row.get(
-                'ready_for_live'):
+        if (isinstance(row, dict) and row.get('fix_committed')
+                and not row.get('ready_for_live')
+                and int(row.get('wins_after_fix') or 0) >= int(READY_N)):
             _mark_ready_entry(
                 store, fingerprint=fp, row=row, source='flush_full_cycle')
             readied += 1
@@ -799,7 +798,8 @@ def flush_full_cycle(store) -> dict:
                     bag = _scenario_bag(store)
                     row = bag.get(fp) if isinstance(bag.get(fp), dict) else {
                         'fingerprint': fp}
-                    if not row.get('ready_for_live'):
+                    if (not row.get('ready_for_live')
+                            and int(row.get('wins_after_fix') or 0) >= int(READY_N)):
                         _mark_ready_entry(
                             store, fingerprint=fp, row=row,
                             source='flush_pending')

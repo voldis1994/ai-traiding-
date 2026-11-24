@@ -136,9 +136,11 @@ def test_submit_skips_when_outside_entry_zone():
                                         })
 
         asyncio.run(_run())
-        assert 'wait' in (e.last_entry_reason or '').lower()
-        assert 'entry' in (e.last_entry_reason or '').lower() or 'zone' in (
-            e.last_entry_reason or '').lower()
+        reason=(e.last_entry_reason or '').lower()
+        assert 'wait' in reason
+        # Outside zone / mid-range / scenario gate — any HOLD that refused OPEN.
+        assert ('entry' in reason or 'zone' in reason or 'mid_range' in reason
+                or 'scenario' in reason)
 
 
 def test_require_swing_still_on_decide_path():

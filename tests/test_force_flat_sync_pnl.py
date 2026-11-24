@@ -203,6 +203,7 @@ def test_fuzzy_single_gold_tx_binds_pending():
 
 
 def test_snapshot_open_reason_includes_deal_and_upl():
+    """V5: entry_block names open state only — UPL/dealId stay on the position card."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -210,7 +211,9 @@ def test_snapshot_open_reason_includes_deal_and_upl():
         e.mandate={'epic':'GOLD','size':'0.02'}
         e.positions=[{'dealId':'live9','epic':'GOLD','direction':'SELL',
                       'size':'0.02','upl':-0.07}]
+        e.last_signal={'action':'SELL','scores':{'BUY':0.2,'SELL':0.5,'HOLD':0.3}}
         reason=e.snapshot()['entry_block_reason']
-        assert 'Existing open position' in reason
-        assert 'live9' in reason
-        assert 'UPL' in reason
+        assert reason == 'Existing open position'
+        assert 'UPL' not in reason
+        assert 'live9' not in reason
+        assert e.positions[0].get('upl') == pytest.approx(-0.07)

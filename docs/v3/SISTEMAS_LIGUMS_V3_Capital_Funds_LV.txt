@@ -1,0 +1,1153 @@
+
+
+===== PAGE 1 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 01  /  30
+Neural Trading AI
+Pilna mērķa arhitektūra un ieviešanas specifikācija
+TEHNISKAIS LĪGUMS · V3.0 · 24.11.2026.
+Mērķis: viena konsekventa tirgus analīzes, lēmumu, izpildes un pašmācīšanās
+sistēma; nevis vairāki moduļi, kuri savstarpēji pārraksta lēmumus.
+Dokumenta statuss
+Šī specifikācija aizstāj v2.0 (24 lappuses) un v1.0. Papildinājums 25–30: obligāta Capital
+Funds naudas un izpildes cenu integritāte. Pamats: četras lietotāja shēmas (SHADOW,
+SL/TP, zonas, M1 scenāriji), v1.0 un statisks GitHub #270 koda audits. Fiksētā versija:
+0d9951695d5ea5f992d5b488c9864c3ce5e2ffa0. Tā ir ieviešama mērķa sistēma, ne
+apgalvojums, ka esošais kods jau atbilst prasībām.
+Nemaināmie sistēmas principi
+ • Tirgus struktūra, zonas, scenāriji, invalidācija un mērķi rodas no faktiskām pabeigtām
+OHLC svecēm. Ziņas, citi tirgi, likviditāte un izmaksas papildina kontekstu.
+• Viena lēmumu funkcija ar vienu NeuralCore arhitektūru. LIVE un SHADOW modeļu
+svaru un recurrent state objekti ir izolēti. Nav citu moduļu, kuri pēc balsojuma maina
+BUY uz SELL vai otrādi.
+• Strukturālos SL/TP līmeņus nedrīkst mainīt tikai RR, vēsturiskas peļņas vai neironu
+pārliecības dēļ. Ja plāns neder, HOLD.
+• SHADOW ir pētniecības vide bez brokera rakstīšanas tiesībām. Tikai pārbaudīts
+kandidāts var aizstāt LIVE versiju.
+• LIVE slēgto darījumu nauda ir tikai verificēta Capital Funds summa; £0.50 ir £0.50
+visos moduļos, bez pārrēķina.
+• Visām mācībām vajadzīgs izsekojams datu un rezultāta pamats. Peļņa nav
+automātisks pareizas analīzes pierādījums, un zaudējums nav automātiska kļūda.
+Kā lietot dokumentu
+Nodaļas satur prasības ar identifikatoriem, konkrētus algoritmu līgumus, robežgadījumus,
+testus un koda atsauces. Mērķa konfigurācijas skaitļi, kas nav noteikti attēlos, ir skaidri
+marķēti kā sākotnējās projektēšanas izvēles; tie jāapstiprina un jāvalidē pirms LIVE. Ja
+prasība nav pierādāma, Cursor nedrīkst to atzīmēt kā izpildītu.
+Dokuments nav peļņas garantija. Reālu orderu izpilde nav pārbaudīta; līdz
+pieņemšanas kritēriju izpildei izmaiņas pārbauda offline un demonstrācijas kontā.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+01 / 30
+
+
+===== PAGE 2 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 02  /  30
+Satura karte
+No datiem līdz pārbaudītai sistēmai
+Arhitektūra un tirgus analīze
+03 — Vienotā arhitektūra un atbildības
+04 — Datu patiesums, UTC, M1/MTF
+05 — Ārējie avoti un fūzija
+06 — OHLC struktūra un zonas
+07 — TREND, RANGE, BREAKOUT
+08 — RETEST, CHOCH, FAKEOUT, COMPRESSION
+09 — Strukturālie SL/TP un RR
+10 — Bid/ask un izmaksu matemātika
+Izpilde, pētniecība un mācīšanās
+11 — Vienots lēmuma un darījuma plāns
+12 — Mandāts, lotes un neatkarīga riska kontrole
+13 — LIVE orderu stāvokļi un aizsardzība
+14 — SHADOW un virtuālā izpilde
+15 — Darījuma rezultāts un datu žurnāls
+16 — Kļūdu diagnoze un counterfactual
+17 — Neironu mācīšanās un versiju integritāte
+18 — Neatkarīga validācija un aktivizācija
+Ieviešana un pierādījumi
+19 — Esošo moduļu pārveides karte
+20 — Migrācija, izolācija un atkopšana
+21 — Pieņemšanas testi: dati un tirgus
+22 — Pieņemšanas testi: izpilde un mācīšanās
+23 — Izlaišanas kritēriji un Cursor darba līgums
+24 — Avoti un pierādījumu robežas
+Capital Funds — obligātais papildinājums
+25 — Naudas un cenu patiesuma līgums
+26 — API avoti, identitāte un valūta
+27 — Uzskaite, labojumi un mācīšanās
+28 — Esošā koda PnL defekti
+29 — Precīzi regresijas testi (T28–T39)
+30 — Reconciliation, migrācija un release
+Prasību lasīšanas noteikums
+D, Z, S, B, L, R, E, H, P, M, V un A ir prasību grupu prefiksi. T ir testi. Prasības ir mērķa līgums. Avotos
+norādītās esošā koda rindas attiecas uz fiksēto commit, ne uz nākotnes versiju. Testu piemēru skaitļi nav
+aktuāla tirgus dati.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+02 / 30
+
+
+===== PAGE 3 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 03  /  30
+Vienotā arhitektūra
+Atbildība un datu plūsma
+Market data → MarketContext → NeuralCore → DecisionPlan → Risk/Execution →
+TradeSample → Candidate → Validation → Approved model
+A01 — Septiņi slāņi
+1. Ingest: Capital.com OHLC un bid/ask; ārējie datu avoti un laika metadati. 2. Perception:
+OHLC/MTF, zonas, scenāriji, fūzija. 3. Decision: NeuralCore un nemaināms balsojums. 4.
+Plan: scenārija pierādījumi, strukturāli līmeņi, izmaksas un neatkarīgs risks. 5. Execution:
+LIVE Capital vai SHADOW paper. 6. Outcome: pilns ceļš, rezultāts un diagnoze. 7.
+Learning: izolēts kandidāts, neatkarīga validācija, atomiska aktivizācija.
+A02 — Viena funkcija, divas vides
+MarketContext ir nemainīgs tirgus momentuzņēmums. decide(context, model_version,
+state) izveido Proposal; plan(proposal, context, account_state, config) atgriež
+DecisionPlan vai HOLD. Gan LIVE, gan SHADOW izsauc vienu kodu. Izpildes adapteri
+atšķiras tikai ar broker/paper un attiecīgā konta stāvokli. Vienāda ievade, svari un konta
+stāvoklis dod vienādu rezultātu.
+A03 — Viena lēmuma autoritāte
+NeuralCore scores_raw ir nemaināmi pēc infer. Tirgus vārti drīkst tikai apstiprināt virzienu
+vai atteikt OPEN. Flow, forecast, situāciju atmiņa un vēsturiskās stratēģijas drīkst kļūt par
+dokumentētām pirmsbalsojuma pazīmēm tikai pēc validācijas; sākotnējā migrācijā tās
+saglabā diagnostikai, ne kā atsevišķus LIVE balsotājus. Nav slēptu score nudge,
+anti-HOLD, policy override vai automātisku virziena maiņu.
+A04 — Process un kontu izolācija
+Saglabā FastAPI, RuntimeHub, CapitalBroker, QuoteStream, Store un Desk. Katram
+klientam un instrumentam savs modeļa stāvoklis, mandāts, orderu žurnāls, peļņa un
+kandidāti. Publisko OHLC/MTF var koplietot tikai ar vienādu epic, source un context_id.
+Admin un Desk attēlo tieši izmantotos plānus, ne neatkarīgi pārrēķinātu analīzi.
+Koda pamats: engine.py:2749–3025; runtime_hub.py; architecture #270. Mērķī nav jāizdzēš infrastruktūra,
+bet jānovāc paralēlās lēmumu autoritātes.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+03 / 30
+
+
+===== PAGE 4 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 04  /  30
+Datu patiesums un MTF
+Faktiskas sveces, nekad izdomāts tirgus
+D01 — OHLC ieraksta līgums
+Candle = epic, source, price_basis (MID/BID/ASK), open_time_utc, close_time_utc, open,
+high, low, close, complete, received_at, quality, revision_id. Pārbauda finite pozitīvas
+cenas un low ≤ min(open, close) ≤ max(open, close) ≤ high. Laiki UTC, sakārtoti, unikāli
+instrumenta/perioda ietvaros. Konfliktējošu dublikātu nelabo klusējot; izmanto
+dokumentētu avota prioritāti un revision_id.
+D02 — Pabeigtas sveces un iztrūkumi
+M1 [t,t+60s) lietojama tikai pēc close_time un saņemšanas līdz lēmuma laikam. Forming
+M1 ir grafikam un izpildes quotes, ne signāla apstiprināšanai. Iztrūkuma gadījumā backfill
+no brokera; līdz atjaunošanai konteksts DEGRADED vai UNREADY. Nedrīkst aizstāt ar
+O=H=L=C. Iepriekš izdotu lēmumu neizmaina vēlāk saņemta revīzija; jaunais lēmums
+izmanto jaunu context_id.
+D03 — Vairāki periodi
+M5/M15/M30/M60 agregē UTC robežās no pilnām M1 kopām: O=pirmās O, H=max(H),
+L=min(L), C=pēdējās C. Nepilnīga vai vēl nepabeigta grupa nav pabeigta MTF svece. Ja
+izmanto brokera oriģinālās MTF sveces, saglabā avotu un pārbauda laiku. Pazīmes:
+atdeves, EMA/KAMA, ATR, ADX/DI, ķermeņi, wick, struktūra; bez future lookahead.
+Nepieciešamo vēstures garumu nosaka katras pazīmes logs un warm-up, ne tikai 61 M1.
+D04 — Svaigums un stāvokļi
+Projektēšanas sākuma robežas: svaigs izpildes quote ≤ 3 s, pēdējā pabeigtā M1 pieejama
+līdz 15 s pēc slēgšanās; pēc robežas jauns OPEN tiek atlikts. Robežas pārbauda demo pēc
+avotu faktiskās aiztures; nav universāli pierādītas. Closed market/session gap nav
+jāaizpilda ar mākslīgām svecēm. Obligāta avota trūkums vai invalid cena → HOLD_DATA;
+atvērto pozīciju aizsardzība turpinās.
+Esošais market_context.py:58–114 aizpilda līdz 2 trūkstošām secīgām minūtēm ar flat OHLC. D02 aizliedz šo
+ceļu aktīvām pazīmēm un mācībām.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+04 / 30
+
+
+===== PAGE 5 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 05  /  30
+Ārējie dati un fūzija
+Konteksts, ne paralēls tirgotājs
+D05 — Ziņu konteksts
+Forex Factory ekonomiskais kalendārs: event_id, valūta, impact, scheduled_at,
+published/received_at, revision, source. Augsta riska logu nosaka versijota konfigurācija
+(sākuma testu piemērs: 15 min pirms un 15 min pēc būtiskas ziņas). Ja risks attiecas uz
+instrumentu, atgriež HOLD_NEWS. Neizmanto vēlāk publicētus faktiskos rezultātus
+vēsturiskā lēmumā. Kalendāra snapshot vecums, piemēram, ≤24 h un aptverts
+attiecīgais periods; tas ir konfigurācijas sākumpunkts.
+D06 — Citi tirgi
+DXY, zelts/sudrabs, S&P 500, nafta, BTC u.c. izvēlas pēc instrumenta profila; korelācija ir
+statistisks konteksts, ne cēlonības pierādījums. Salīdzina vienā laika joslā un izmanto tikai
+novērojumus līdz lēmuma laikam. Katra peer pazīme glabā observation_time un lag;
+piemēram, M1 peer slēgums nedrīkst būt vecāks par 120 s, ja modelis validēts šādam
+režīmam.
+D07 — Likviditāte un order flow
+Yahoo, Coinbase, OKX u.c. sniedz ārējos apjoma/DOM aizstājējdatus. Marķē instrumenta
+saistību, aizturi, order book timestamp, faktisko avotu un pieejamību. Piemēra limits:
+book ≤10 s; aizkavētam apjomam lieto konkrētā avota dokumentēto aizturi,
+nepasniedzot to kā real-time. Sweep no OHLC ir cenu raksts, ne pierādījums īstai
+institucionālai plūsmai. flow_consensus aprēķina konteksta pazīmes, ne gala BUY/SELL.
+D08 — Fūzijas līgums
+FeatureRecord = name, value, unit, source, epic, observed_at, received_at, max_age,
+quality. Katrs avots konfigurācijā ir REQUIRED vai OPTIONAL. REQUIRED kļūme bloķē
+OPEN; OPTIONAL pazīmi drīkst aizstāt tikai ar modelim apmācībā un validācijā definētu
+missing mask. Last-good vērtība saglabā oriģinālo timestamp, nekad neatjauno vecumu
+pēc atkārtotas nolasīšanas. Konteksta hash ietver feature_schema, avotu identitāti un
+vērtības.
+Esošais engine.py:2348–2409 un market_fusion.py:134–231 glabā un atkārtoti izmanto last-good vektorus;
+jāievieš TTL un quality metadati. Skaitliskās robežas ir projektēšanas sākuma izvēles.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+05 / 30
+
+
+===== PAGE 6 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 06  /  30
+Struktūra un Supply/Demand
+Zonas ar pārbaudāmu dzīves ciklu
+Z01 — Swing, BOS un CHOCH
+Izmanto pabeigtas sveces. Sākuma pivot metode: left=2, right=2; pivot ir zināms tikai
+pēc divu labās puses sveču slēgšanās. Vienādu ekstrēmu apstrādei fiksē determinētu
+tie-break. HH/HL norāda augšupejošu struktūru; LH/LL lejupēju; mixed/neskaidrs nav
+automātisks trends. BOS prasa close aiz apstiprināta struktūras līmeņa ar tick buferi;
+CHOCH ir pretēja rakstura pārtraukums, kuru apstiprina līmeņa reakcija. Reģistrē
+pivot_time un confirmed_at.
+Z02 — Bāze un impulss
+Zonas kandidāts = kompaktas bāzes OHLC high/low pirms virziena impulsa. Demand no
+impulsa uz augšu, Supply no impulsa uz leju. Kvalitāti vērtē no impulsa/bāzes attiecības,
+ATR, ķermeņu un wick rakstura, pieskārieniem, vecuma. Esošais 2–6 sveču bāzes
+meklētājs ir sākuma metode, kas jāvalidē; kvalitāte nav garantēta varbūtība.
+Z03 — Identitāte un invalidācija
+ZoneRecord: zone_id, epic, side, low/high, source_bar_ids, created_at, impulse_end,
+quality, touch_count, state, invalidated_at/reason. Stāvokļi: CREATED → ACTIVE →
+TOUCHED → CONFIRMED → USED; INVALIDATED/EXPIRED var iestāties jebkurā aktīvā
+posmā. Mērķa sākuma noteikums: Demand invalidē pabeigts close zem low−tick; Supply
+close virs high+tick. Wick sweep nav tas pats kas close invalidācija; to klasificē atsevišķi.
+Pieskārienus uzskaita kā atsevišķas ieiešanas epizodes, ne katru sveci zonā. Nederīgu
+zonu nekad neizvēlas pat ar augstāko quality.
+Z04 — Ieeja
+ZONE: derīga zona, faktiskā bid/ask ieeja atļautajā joslā, reakcija (rejection/pin, engulfing
+vai impulss) un attiecīgā mikrostruktūra. BREAK: atsevišķs pierādīts BOS ceļš; retests, ja
+to prasa scenārijs. Nedrīkst izveidot zonu ap mid tikai tāpēc, ka neironi grib OPEN. Pirmā
+pieskaršanās ir kvalitātes hipotēze, ne automātiska atļauja.
+structure_memory.py:242–359; ohlc_entry_zones.py:262–408, 441–558, 738–873. Esošajā zonu
+apstiprinājumā ir OR; mērķa ZONE līgums prasa abus pierādījumu veidus.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+06 / 30
+
+
+===== PAGE 7 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 07  /  30
+Tirgus scenāriji I
+Trend, diapazons un izlaušanās
+S01 — TREND_UP / TREND_DOWN
+BUY: apstiprināti HH/HL, pullback uz aktīvu Demand vai atbalsta struktūru, reakcija un
+turpinājuma pierādījums. SL zem konkrētā HL/zonas invalidācijas, TP1 pie iepriekšējā HH,
+TP2 pie nākamā pamatotā līmeņa. SELL simetriski LH/LL, Supply, SL virs LH, TP pie LL un
+nākamās struktūras. Ja cena jau izstiepta prom no zonas, gaida jaunu plānu. Trend
+continuation ir TREND apakštips; nav nepieciešams jauns neironu balsotājs.
+S02 — RANGE / konsolidācija
+Nepieciešamas reālas un identificējamas augšējā/apakšējā robeža, atkārtota reakcija un
+pietiekams diapazons pēc izmaksām. BUY pie apakšējās malas, SELL pie augšējās; SL aiz
+attiecīgās malas vai konkrētā sweep. TP1 var būt vidus, TP2 pretējā mala. Ja mērķis vai
+risks neder, HOLD. Testu sākuma definīcija: diapazona centrālie 40% nav RANGE ieeja;
+malas un kvalitātes parametri jāvalidē. Ne katrs RANGE ir netirgojams CHOP: jānošķir
+skaidras malas no haotiska trokšņa.
+S03 — BREAKOUT_UP / BREAKOUT_DOWN
+Apstiprināts BOS, pabeigts close ārpus robežas, kvalitatīvs impulss un pietiekams
+attālums līdz nākamajam mērķim. Apjoms ir papildu pierādījums, tikai ja avots derīgs.
+BUY SL zem izlauztā līmeņa vai konkrētās breakout struktūras; SELL virs tās. TP no
+nākamās zonas/swing vai measured move no faktiska diapazona augstuma. Ja breakout
+pārmērīgi izstiepts vai neapstiprināts, HOLD; retests nav obligāts katram kvalitatīvam
+breakout, bet obligāts RETEST scenārijā.
+S04 — Scenārija rezultāts
+ScenarioRecord = primary, secondary_tags, direction_hint, evidence_ids, detected_at,
+ready, invalidation_anchor, target_candidates, confidence_metadata. Klasifikators nosaka
+struktūru, ne gala darījuma virzienu. Ja neural proposal ir pretrunā obligātam scenārija
+pierādījumam, HOLD ar reason. Fiksētu confidence sākumvērtību nedrīkst pasniegt kā
+empīriski kalibrētu peļņas varbūtību.
+ohlc_scenarios.py:131–346; ohlc_regime_gate.py:128–233; ohlc_regime_brackets.py:214–295.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+07 / 30
+
+
+===== PAGE 8 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 08  /  30
+Tirgus scenāriji II
+Retests, reversija, sweep un kompresija
+S05 — RETEST_UP / RETEST_DOWN
+Reģistrē iepriekš apstiprinātu BOS un izlauztā līmeņa identitāti. Cena atgriežas šajā
+līmenī un notur to; noraidījums + atbilstoša mikrostruktūra apstiprina retestu. SL aiz
+faktiskās retesta zonas vai rejection wick invalidācijas; TP nākamā struktūra vai
+dokumentēta impulsa projekcija. Bez atgriešanās nav RETEST. Neveido retesta label tikai
+no cenas tuvuma līmenim.
+S06 — CHOCH_UP / CHOCH_DOWN
+Nozīmīga līmeņa noraidījums, iepriekšējās struktūras pārtraukums un jaunā virziena
+apstiprinājums. BUY SL aiz reversal low/sweep vai Demand; SELL aiz reversal high/sweep
+vai Supply. TP1 pie pirmās pretējās struktūras, TP2 pie tālākā pamatotā līmeņa. Viena
+pretējas krāsas M1 svece pati par sevi nav CHOCH.
+S07 — FAKEOUT / SWEEP
+Fiksē precīzu pārkāpto līmeni un konkrētās izlaušanās ekstrēmu. Cena atgriežas aiz
+līmeņa ar pabeigtu close, pēc tam reakcija un pretēja mikrostruktūra. BUY pēc sweep
+zem atbalsta: SL zem konkrētā sweep low. SELL pēc sweep virs pretestības: SL virs
+konkrētā sweep high. TP1 range vidus, TP2 pretējā mala vai cita scenārija reāls mērķis.
+Range robeža viena pati nav pietiekams SL enkurs, ja sweep pārsniedz to.
+S08 — COMPRESSION, UNKNOWN, CHOP
+Saraujošs diapazons ir sagatavošanās, ne automātisks virziens. Gaida kvalitatīvu BREAK
+vai derīgu RANGE malas reakciju. Pārāk zema volatilite pret izmaksām, doji/haoss bez
+struktūras vai neskaidrs scenārijs → HOLD. Nevajag vienu universālu filtru, kas vienlaikus
+aizliedz katru RANGE vai katru breakout impulsu. UNKNOWN, disabled vai unready
+scenārijs nav sekmīga pārbaude.
+S09 — Apstiprinājumi un izsekojamība
+Saglabā pin/rejection, engulfing, BOS, CHOCH, impulsa, retesta, sweep, vairāku līmeņu
+sakritības un atkārtotu wick pazīmes kā identificējamus pierādījumus. Nepieprasa visus
+desmit vienlaikus katram režīmam; tieši konkrētais scenārijs nosaka obligātos. Sesijas
+laiks un apjoms ir konteksts.
+ohlc_scenarios.py:297–346 pašlaik atgriež ok=True arī unready/disabled gadījumā;
+ohlc_regime_brackets.py:332–408 satur FAKEOUT range/swing un rezerves pēdējo 12 sveču enkuru.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+08 / 30
+
+
+===== PAGE 9 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 09  /  30
+Strukturālie SL un TP
+Cena ir struktūras līmenis, RR ir pārbaude
+B01 — Līmeņu izvēle
+BUY: raw_SL = invalidation_low − buffer. SELL: raw_SL = invalidation_high + buffer.
+Enkurs vienmēr satur scenario_id, source_bar_id, price un apstiprinājuma laiku. Buferis
+dokumentēts (sākuma formula max(tick, spread/2, 0.1 × ATR14), jāpārbauda atbilstoši
+price_basis un režīmam). Neizdomā ±κ vai fiksētu punktu skaitu bez struktūras. Ja enkurs
+nav atrodams, HOLD_NO_ANCHOR.
+B02 — Tick un brokera distances
+BUY SL noapaļo uz leju, SELL SL uz augšu līdz tick režģim; BUY TP uz leju un SELL TP uz
+augšu konservatīvi, ja atbilst brokera prasībām. Pēc snap atkārtoti pārbauda virzienu, SL
+aiz invalidācijas, TP strukturālo izcelsmi, brokera minimālās distances un neto RR. Ja
+broker minimums prasa platāku SL, der tikai skaidri pamatots līmenis/buferis un atkārtots
+risks; citādi HOLD. Nekad saīsināt SL, lai piespiedu kārtā sasniegtu RR.
+B03 — Mērķu izvēle
+TP kandidāti: nākamais swing, pretējās zonas tuvākā robeža, range mala, dokumentēts
+measured move. Pārbauda tuvāko būtisko šķērsli; nevar izvēlēties tālu TP, ignorējot
+tuvāku strukturālu pretestību. TP1 un TP2 iespējami BUY un SELL, ja režīmam ir divi reāli
+mērķi. Ja nav drošas daļējas izpildes, lieto vienu pamatotu TP. Nelieto trailing; BE tikai
+validētā pārvaldības politikā ar atbilstošu izmaksu modeli.
+B04 — RR un konfigurācija
+D_SL=|entry−SL|; D_TP=|TP−entry|; RR_bruto=D_TP/D_SL. Neto RR=potenciālā neto
+peļņa / potenciālais neto zaudējums. Attēli min 1:1.5–1:2 un atsevišķi 1:2–1:3; mērķa
+sākuma min neto RR=1.5, 2.0 kā vēlamais testu profils, ne universāls likums. Režīmu
+robežas apstiprina pirms testiem. Ja RR nepietiek, HOLD_RR, ne RR soft-cap vai mākslīgs
+TP. TP1/TP2 plānam aprēķina arī svērto neto RR pēc daļām un izmaksām.
+PR #269 piespiež min_rr=1.0. ohlc_regime_brackets.py:435–493 saīsina SL līdz RR≥1, TP ladder tikai BUY.
+bracket_learn.py:888–1040, 1538–1593. Mērķis aizliedz SL pārvietošanu pāri invalidācijai.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+09 / 30
+
+
+===== PAGE 10 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 10  /  30
+Izpildes cenu matemātika
+Bid/ask, spread, izmaksas un skaitliski testi
+B05 — Cenu puse
+Pie mid m un pilna spread s: bid=m−s/2, ask=m+s/2. BUY entry=ask+adverse_slippage;
+BUY exit=bid−adverse_slippage. SELL entry=bid−adverse_slippage; SELL
+exit=ask+adverse_slippage. Ja pieejami faktiskie bid/ask tick, izmanto tos, ne mid
+pārrēķinu. SL/TP trigger cenas puse jāapstiprina Capital demo; mērķa simulācijā BUY
+slēdzas ar bid, SELL ar ask.
+B06 — Neto PnL un RR
+Ar izpildāmām cenām E un X, daudzumu q un verificētu cenas vienības naudas
+koeficientu k: BUY gross=(X−E)×q×k, SELL gross=(E−X)×q×k.
+Neto=gross−komisija−finansēšana−citas vēl neiekļautas izmaksas. Ja E un X jau ir
+bid/ask un slippage koriģēti, spread un slippage vairs neatņem. Ja k ir citā valūtā,
+konvertē pēc dokumentēta FX kursa. Ja k/valūta nav droši zināma, cash PnL paliek
+UNKNOWN. Neto RR aprēķina ar konservatīvi prognozētām fill cenām pie SL un TP.
+B07 — Precīzs piemērs no SL/TP shēmas
+EURUSD BUY mid ieeja 1.0850, mid SL 1.0846, mid TP 1.0858; bruto 4/8 pipi, RR=2. Pie
+ilustratīva pilna spread 1 pips un nemainīga spread, E=1.08505, SL fill=1.08455, TP
+fill=1.08575, bez papildu komisijas/slippage. Risks 5 pipi, ieguvums 7 pipi, neto RR=1.4.
+Pie min 1.5 šis plāns jāatsaka. Piemērs attiecas uz mid enkuriem; reāla brokera ordera
+līmeņus pārvērš atbilstoši tā trigger semantikai.
+B08 — TP trigger pretpiemērs
+BUY TP=105 izpildāmā bid cenā; M1 high_mid=104 un spread=2. Augstākais teorētiskais
+bid=103, ask=105: TP nav sasniegts. SELL TP=95 ask cenā, low_mid=96 un spread=2:
+zemākais ask=97, bid=95; TP nav sasniegts. SL un TP jāpārbauda vienā pareizajā
+slēgšanas pusē. Ja nav tick secības un abi sasniegti, konservatīvi SL vai AMBIGUOUS, ne
+optimistisks TP.
+shadow_paper.py:284–304 lieto pretējo spread pusi TP testam, ja bar ir mid; SL fill bez gap/slippage. Šī
+neatbilstība jālabo un jāpārbauda cenu avota semantika.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+10 / 30
+
+
+===== PAGE 11 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 11  /  30
+Lēmuma līgums
+No NeuralCore balsojuma līdz nemaināmam plānam
+L01 — Lēmuma secība
+1. Sinhronizē broker positions un unresolved orders; aizsargā atvērtās pozīcijas. 2.
+Izveido pabeigtas M1 MarketContext. 3. Aktivizē tikai apstiprinātu modeli PIRMS infer. 4.
+NeuralCore infer ar versijotu feature_schema un dt=1 pabeigta M1; saglabā scores_raw
+un recurrent state atsauci. 5. Argmax BUY/SELL/HOLD (nefinite/tie → HOLD). 6. Pārbauda
+scenāriju, zonu, reakciju, ziņas, data quality. 7. Izveido strukturālos SL/TP, izmaksas un
+risku. 8. Atgriež vienu DecisionPlan vai HOLD. 9. Izpilde pirms POST pārbauda svaigo
+cenu, risku un orderu stāvokli.
+L02 — DecisionPlan shēma
+Obligāti: decision_id, client_id, epic, context_id/hash, bar_time, created_at, expires_at,
+model_version/hash, feature_schema/hash, config_version/hash, scores_raw,
+proposed_action, final_action, scenario_id, zone_id, evidence_ids, invalidation_anchor,
+trigger, entry_quote, SL/TP absolute_levels, expected_fill, RR, costs, size, risk,
+gate_results, reason_code. Visi ordera dati saistīti ar vienu plan_id; modelis un plāns nav
+maināmi pēc apstiprināšanas.
+L03 — Pārbaude pirms izpildes
+M1 lēmums rodas vienreiz uz pabeigtu baru; quote retry drīkst atkārtoti novērtēt tikai
+nemainītu, vēl derīgu plānu. Sākuma expiry: līdz nākamās M1 sveces slēgumam, vai
+agrāk, ja zona/scenārijs, news, quote, model/config versija vai risks vairs neatbilst.
+Atjaunina paredzēto fill un RR pret tiem pašiem absolūtajiem līmeņiem. Ja plāns
+neizpildāms, HOLD_PLAN_EXPIRED; jauns plāns tikai ar jaunu autorizētu lēmumu.
+L04 — Iemeslu kodi
+HOLD_NEURAL, HOLD_DATA, HOLD_NEWS, HOLD_SCENARIO, HOLD_ZONE,
+HOLD_NO_ANCHOR, HOLD_RR, HOLD_RISK, HOLD_MANDATE, HOLD_UNRESOLVED,
+HOLD_MODEL, HOLD_PLAN_EXPIRED. Reģistrē visus pārbaudītos vārtus, pirmo atteikumu
+un skaitliskos pierādījumus. UI rāda proposal atsevišķi no final_action; nedrīkst rādīt 80%
+BUY kā atļautu orderi, ja vārti atteikuši.
+engine.py:2749–3025; 7447–7478 (champion activation pēc lēmuma). flow_consensus.py:536–649
+(flipped_to_consensus) jāizņem no LIVE gala lēmuma.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+11 / 30
+
+
+===== PAGE 12 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 12  /  30
+Mandāts, lotes un risks
+Neatkarīga drošība nav otra stratēģija
+R01 — Mandāts un starta gatavība
+Operators autorizē epic un lotes maksimumu, kontu un risku. V6: pirmais manuālais
+darījums var noteikt instrumentu un lotes griestus, robots to adoptē un aizsargā; tikai pēc
+close un nākamās pabeigtās M1 drīkst apsvērt autonomu OPEN. Mandāts nav modeļa
+validācija. Auksts starts bez apstiprināta modeļa → SHADOW/demo, ne piespiedu ready.
+Manuālā darījuma nezināms entry context nav pilnvērtīgs mācību paraugs.
+R02 — Naudas risks
+Aprēķina sliktākā saprātīgā SL fill zaudējumu konta valūtā, ieskaitot komisiju, slippage un
+attiecīgās izmaksas. Konfigurēti operatora limiti: max risk per trade, max aggregate risk,
+daily loss, drawdown, max positions, allowed exposure, margin reserve. Tie ir neatkarīgi
+vārti, kuri tikai atļauj vai noraida darījumu. Nav universāla droša procenta; pirms LIVE
+vērtības jāapstiprina. SL nav garantēta maksimālā zaudējuma robeža cenu gap gadījumā.
+R03 — Lotes aprēķins
+Pie risk_budget C un pārbaudīta risk_per_lot r: allowed_size ≤ C/r un mandate_max;
+noapaļo uz leju līdz brokera solim, pārbauda min/max un margin. Ja nav droša
+k/tick_value, aprēķins neder, vai minimālā lote pārsniedz limitu, HOLD_RISK. Piemērs
+testam: budžets £10, zaudējums £25 uz loti, solis 0.1 → 0.4 lotes maksimums; ja
+min=0.5, HOLD. Nekad risk math kļūmes gadījumā akli atgriezties pie mandāta lotes.
+R04 — Pozīciju un operatora kontrole
+Sākuma mērķa režīms: viena vienlaicīga LIVE pozīcija uz klienta mandātu, kamēr
+multi-position nav atsevišķi validēts. Pause aptur jaunus OPEN, turpina aizsardzību;
+emergency aptur jaunos OPEN un izpilda operatora iepriekš noteiktu drošības procedūru.
+Neviena neironu vai day_book funkcija nedrīkst atcelt risku vai emergency. Day book
+glabā PnL un risku, ne samazina HOLD.
+model_readiness.py:432–469 aukstā starta override; engine.py:7650–7695 mandāta fallback un informatīvs
+hard-risk. Mērķī tie ir obligāti drošības līguma labojumi.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+12 / 30
+
+
+===== PAGE 13 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 13  /  30
+LIVE izpilde un aizsardzība
+Orderu atkopšana, ne atkārtots akls POST
+E01 — Stāvokļu mašīna
+IDLE → PLAN_READY → PENDING (durable journal pirms POST) → SENT/UNCERTAIN →
+CONFIRMED → PROTECTED → MANAGING → CLOSING → CLOSED_PENDING_FUNDS →
+SETTLED. REJECTED un CANCELLED ir pierādīti termināli stāvokļi. Katrā ierakstā client_id,
+order_intent_id, plan_id, dealReference/dealId, payload hash, status, timestamps. Ja
+broker atbalsta idempotency key, lieto dokumentēti; citādi lokāla serializācija +
+reconcile. Neskaidrs OPEN bloķē jaunu OPEN, ne esošā darījuma aizsardzību.
+E02 — Pirms un pēc POST
+Izpildes lock vienam klientam; svaigi bid/ask un broker dealingRules, marketStatus,
+margin. Absolūtos SL/TP līmeņus pārveido par broker API prasītajām distancēm tikai
+adapterī. Pēc faktiskā fill pārbauda broker apstiprinātos SL/TP un risku; distances var
+pārbīdīt līmeņus, tāpēc reconcile salīdzina faktiskos līmeņus ar plānu. Ja vajag, droši labot
+ar broker atļautu update; ja aizsardzību nevar nodrošināt, iedarbina noteikto ārkārtas
+slēgšanas procedūru. Nekad neatvērt papildu pozīciju, lai labotu kļūdu.
+E03 — Pozīcijas pārvaldīšana
+Fiksē modeļa un plāna versiju visam darījuma dzīves laikam. Trailing OFF. SL/TP
+pārvaldība tikai ar apstiprinātu noteikumu; SL nedrīkst pārbīdīt tālāk, lai glābtu
+zaudējumu. BUY/SELL TP1/TP2 izmanto identisku loģiku, ja broker droši atbalsta daļēju
+slēgšanu. Ja nevar droši samazināt pozīciju, lieto vienu TP, ne pretēju neapstiprinātu
+OPEN. Pārbaudīt netting/hedging konta režīmu demo, atlikušās lotes un SL/TP.
+E04 — Nezināma izpilde
+Timeout, 429, restart, confirm aizture: neatkārtot non-idempotent orderi bez
+pārliecinošas reconciliation. Pēc restart no brokera atjauno pozīcijas un pending journal,
+ne balstās tikai uz RAM. Neizdomā deal_id; sasaista ar unikālu broker reference. Monitorē
+aizsardzību arī tad, ja dati vai modelis nav gatavs.
+broker.py:109–142; engine.py:7770–7845, 6660–6745. reduce_position izmanto pretēju POST, tāpēc konta
+režīma pārbaude ir kritiska, ne apstiprināts broker fakts.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+13 / 30
+
+
+===== PAGE 14 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 14  /  30
+SHADOW pētniecības vide
+Identiska loģika, neatkarīgs stāvoklis
+H01 — Izolācija
+SHADOW izmanto to pašu NeuralCore arhitektūru, feature schema un plan() funkciju, bet
+citu modeļa objektu, svaru masīvus, recurrent state, random seed/state, Store
+namespace un paper kontu. Sākumā kopē apstiprinātu LIVE versiju. Nekad shadow_brain
+is live.core, koplietotus tensor storage vai SHADOW piekļuvi broker order adapterim.
+Pētniecības kļūda nevar mainīt aktīvo LIVE modeli.
+H02 — Divi atšķirīgi žurnāli
+PARITY paper book: tieši tie paši datu, scenāriju, zonu, risku, izmaksu, plāna derīguma un
+izpildes noteikumi. RESEARCH book: HOLD, bloķēto un pretējo scenāriju kontrfaktuāli;
+skaidri marķē, kuri vārti nebūtu izpildīti. Research rezultāti nav executable parity
+performance un nav LIVE nauda. Vienam faktiskam darījumam atsevišķi salīdzināmi
+mirror un actual rezultāti; mirror nav obligāti katrs LIVE OPEN, ja simulatora grāmata
+aizņemta.
+H03 — Paper fill un laika secība
+Neizmanto signāla sveces High/Low, kas notika pirms ieejas. Ieeja tikai pēc decision_time
+ar nākamo pieejamo atbilstošo bid/ask quote vai skaidri definētu nākamās sveces fill
+modeli. Aizture nedrīkst pārvietot absolūtos strukturālos SL/TP. Pirms fill atkārto plan
+validity; ja invalidācija, ziņu logs, quote vai RR vairs neder, atceļ pending. Pēc fill
+pārbauda tikai vēlākus tick/bar. Ja high/low trūkst, neizdomā tos no mid; marķē nepilnīgu
+ceļu.
+H04 — Reālistiska izpilde
+Izmanto B05–B08: pareizā bid/ask puse, gap un adverse slippage, komisija, partial
+fill/scale-out, broker min distance un lotes solis. Ja tick secība nav zināma un vienā bar
+sasniegts SL/TP, conservative SL vai AMBIGUOUS pēc fiksētas politikas. Paper cash tikai
+ar pārbaudītu k un valūtu; price_pnl atsevišķi. Abas vides izmanto vienu order plan un
+cenu semantiku, ne apgalvo identisku faktisko fill.
+engine.py:5158–5228, 8170–8195, 8359–8520; shadow_paper.py:284–304, 401–520. Esošais paper OPEN
+ignorē zonas vārtu rezultātu un izmanto pārvietojamas distances.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+14 / 30
+
+
+===== PAGE 15 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 15  /  30
+Rezultāta patiesums
+Darījumu žurnāls un Capital Funds
+P01 — Darījuma nemaināmais ieraksts
+TradeSample: account_id, epic, source (LIVE/PARITY/RESEARCH), decision_id,
+model/config/feature hashes, order reference, deal ID, open/close timestamps, fill prices
+un size, absolute SL/TP, entry features, pre-entry OHLC references, pēc ieejas cenu ceļš,
+costs, MFE/MAE, exit_reason, quality flags. Saglabā arī HOLD un atteikumu reason kodus.
+Pēc atjauninājuma neveido retrospektīvi citu entry context.
+P02 — Trīs atsevišķi PnL tipi
+LIVE_REALIZED: tikai verificēts Capital Funds/transactions ieraksts attiecīgā konta valūtā.
+LIVE_UNREALIZED: brokera UPL, skaidri atsevišķi. PAPER_SIMULATED: simulatora
+rezultāts ar modeļa versiju; cenu punktu rezultāts nav GBP. Ja faktiskā peļņa nav
+pieejama, CLOSED_PENDING_FUNDS, value=null. Neizmanto UPL, confirm, mid×size vai
+price_pnl kā reālu cash. PnL=0 var būt īsts rezultāts, ja transakcija ir pierādīti pabeigta;
+neignorē validētu nulli tikai skaitļa dēļ.
+P03 — Sasaistīšana un daļēja slēgšana
+Primāri sasaista broker deal ID/reference ar account ID, instrumentu, valūtu, daudzumu,
+slēgšanas laiku un transakcijas identitāti. Ja tikai fuzzy instrument/size atbilstība, status
+MATCH_UNCERTAIN; līdz unikālam pierādījumam nerēķina LIVE mācību PnL. Vienu Funds
+transakciju nedrīkst piesaistīt diviem darījumiem. Partial close saglabā atsevišķas izpildes
+un cash rindas, apkopo tikai pēc pilnīgas reconciliation. Nelieto pence atšķirību kā vienīgo
+identitātes pierādījumu.
+P04 — Ceļa metrikas un kvalitāte
+MFE/MAE aprēķina no izpildāmām slēgšanas cenām pēc fill līdz close: BUY
+signed_move=bid−entry; SELL=entry−ask. MFE=max(0,max(move));
+MAE=max(0,−min(move)). Marķē price/cash vienības. Ja OHLC/tick intervāls nepilnīgs vai
+secība nenosakāma, atbilstošais quality flag; nav pilna ceļa label. Desk parāda settled,
+pending, uncertain un simulated atsevišķi.
+Obligāts precizējums: nodaļas 25–30 definē stingrāku naudas avota, valūtas, darījuma identitātes, izpildes
+cenu un validācijas līgumu. Tās prevalē pār visiem vispārīgajiem PnL formulējumiem.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+15 / 30
+
+
+===== PAGE 16 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 16  /  30
+Kļūdu diagnoze
+Pašmācīšanās no konkrētās tirgus situācijas
+M01 — Pilns konteksts pirms mācībām
+Pārbauda entry context, pirmsieejas OHLC, pilnu ceļu līdz close, precīzu invalidāciju,
+izpildi un PnL tipu. Nepilnīgu paraugu atļauts glabāt uzskaitei, bet nedrīkst no entry/exit
+starpības izgudrot TREND_UP/DOWN/CHOP. Path-less vecie stratēģijas paraugi un to
+izcelsmes svari jāmarķē un jāizolē; nedzēst pierādījumus.
+M02 — Diagnozes kategorijas
+DATA_ERROR: nepilnīgs/novecojis vai nepareizi sasaistīts avots. SCENARIO_ERROR:
+neatbilstošs režīms. ZONE_ERROR: nederīga zona vai false reaction. ENTRY_ERROR: ieeja
+pirms apstiprinājuma vai pēc izstieptas kustības. SL_ERROR: invalidācijas enkurs vai
+distances pārbīde. TP_ERROR: nepamatots mērķis. EXEC_ERROR: slippage, spread, gap,
+broker mismatch. NORMAL_LOSS: plāns atbilda līgumam, bet tirgus mainījās.
+UNDETERMINED: pierādījumu nepietiek. Vairākas kategorijas var būt vienlaikus; saglabā
+evidence_ids un nenoteiktību, ne apgalvo cēloni tikai no PnL zīmes.
+M03 — Counterfactual BUY/SELL/HOLD
+Katra virziena alternatīvu izveido no tās pašas informācijas, kas bija zināma
+decision_time. Katram savs scenārijs, ieeja, SL/TP, izmaksas un riska atļauja; nedrīkst
+vienkārši apgriezt faktiskās distances vai izmantot vēlāk zināmus swing. Pēc tam replay
+uz vēlāk pieejamā ceļa; vienāds laika horizonts un izpildes semantika. Neizpildāma
+alternatīva nav peļņas iespēja. HOLD ir bez jaunas pozīcijas. Pēc nepilnīga ceļa neizdara
+automātisku pretējās puses vai HOLD label.
+M04 — Mācību parauga rezultāts
+Saglabā label vai target tikai ar pierādītu pamatojumu, sample_id, source, modeļa versiju,
+izmaksu un quality metadatiem. Peļņa var būt atlīdzības komponents, bet ne vienīgā
+diagnoze. Zaudējums, kurā plāns bija pareizs, nav piespiedu apgriešanas signāls. M1
+direction objective saglabā tikai kā atsevišķi validētu palīgmērķi.
+profit_learning.py:74–245; sample_strategies.py:96–155; engine.py:8455–8520 SHADOW label bez pilna bars
+argumenta. Mērķī endpoint-only fallback nav pilnvērtīga OHLC mācība.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+16 / 30
+
+
+===== PAGE 17 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 17  /  30
+Neironu mācīšanās
+Vienota kandidātu rinda, izsekojamas svaru izmaiņas
+M05 — Visi mācību avoti vienā līgumā
+M1 labels, LIVE close, paper close, HOLD counterfactual, structure shadow, history
+relearn, feature discovery, architecture growth/prune un parametru evolūcija iesniedz
+kandidāta izmaiņu pieprasījumu. Neviena funkcija nedrīkst tieši mainīt aktīvos LIVE
+svarus, registry vai lēmumu parametrus. LIVE infer lieto read-only approved checkpoint;
+recurrent state ir atsevišķs no svariem un var attīstīties infer laikā ar determinētu M1 soli.
+M06 — Mācību transakcija
+QUEUED → CLAIMED (lease, attempt_id) → CANDIDATE_SAVED → EVALUATED →
+ACCEPTED/REJECTED → ACTIVATED. Unique sample_id + objective +
+candidate_base_version; idempotenta apstrāde. Claim ar nebeidzamu lock nav
+completed. Pēc avārijas pārbauda kandidāta checkpoint hash, training ledger un lease; ja
+nav apstiprināta saglabāšana, atjauno no bāzes un determinēti atkārto vai atzīmē failed.
+Apstiprināta versija nekad netiek dubulttrenēta no viena sample_id tajā pašā mācību
+mēģinājumā.
+M07 — Checkpoint pakete
+ModelVersion: architecture spec, weights, feature registry/order/dimensions,
+preprocessing, period parameters, config hash, train dataset IDs, validation metrics,
+candidate lineage, code commit, checksum. Saglabā temp failā, pārbauda un atomiski
+pārdēvē; DB pointer uz apstiprinātu versiju maina tikai pēc pabeigtas validācijas. Registry
+un svari tiek atjaunoti kopā; ja restore neizdodas, vecais komplekts paliek aktīvs.
+Neveiksmīgs registry restore nedrīkst atstāt neatbilstošu feature layout.
+M08 — Konsekvence
+Kandidāta mācības determinētas pēc snapshot un seed, reģistrē objective, LR, sample
+IDs, delta_norm un rezultātu. Paaudze nav kvalitātes mērs: UI atsevišķi rāda training
+attempts, rejected candidates un approved generation. LIVE versija nemainās starp plan
+un submit vai atvērtas pozīcijas laikā. Atsevišķi testa scenāriji apstiprina, ka
+SHADOW/HOLD/M1 mācības nemaina LIVE svaru hash.
+engine.py:778–890, 5260–5280, 5832–5869, 6110–6163, 8170–8195, 8582–8636. Pašreizējie claim un restore
+ceļi rada atkopšanas risku.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+17 / 30
+
+
+===== PAGE 18 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 18  /  30
+Neatkarīga modeļa validācija
+Pierādījumi pirms LIVE aktivizācijas
+V01 — Hronoloģija un datu noplūde
+Fiksē train, validation un locked test periodus pirms mācībām; nodala pēc instrumenta un
+laika. Purge paraugus, kuru label/hold periods šķērso robežu; embargo vismaz
+maksimālais izmantotais label/counterfactual horizonts, nepieciešamības gadījumā
+lielāks. Datu normalizāciju, feature izvēli, parametru optimizāciju fit tikai train.
+Neizmantot locked test atkārtotai kandidāta atlasei. Recurrent state inicializē ar vienādu
+pagātnes warm-up, ne ar aktuālo LIVE state.
+V02 — Salīdzināšanas metode
+Apstiprinātais incumbent un kandidāts replay vienādos novērojumu logos, ar vienādu
+izpildes un izmaksu modeli, datu kvalitāti, mandātu/risku un sākuma kapitālu.
+Walk-forward pa secīgiem logiem; mēra neto PnL, expectancy pēc izmaksām, max
+drawdown, risku, darījumu skaitu, kļūdas režīmos, HOLD/OPEN coverage un nenoteiktību.
+M1 direction accuracy ir tikai diagnostikas metrika. Ja kandidāts izslēdz gandrīz visus
+OPEN, salīdzina arī coverage un riska atšķirību; neuzskata bezdarījumu par pierādītu
+pārākumu.
+V03 — Sākotnējais release protokols
+Projektēšanas minimuma piemērs (ne statistiska peļņas garantija): ≥3 hronoloģiski OOS
+logi, ≥100 pabeigti parity darījumi kopā un ≥20 katrā deklarētajā atbalstītajā režīmu
+grupā; ja paraugu nepietiek, grupa paliek neapstiprināta. Neto expectancy pozitīva un
+labāka par incumbent pēc izmaksām, drawdown nepārsniedz iepriekš apstiprinātu limitu;
+pārbaudīt uncertainty ar laika blokiem, ne neatkarīgu tick pieņēmumu. Parametrus un
+pieņemšanas sliekšņus fiksē PIRMS testa; ja nepietiek datu vai rezultāti neskaidri,
+REJECT/INSUFFICIENT, ne cold-start KEEP.
+V04 — Forward demo un aktivizācija
+Pēc OOS vismaz 20 tirdzniecības sesijas un 50 pabeigti demo/parity darījumi kā sākuma
+minimums; pagarināt, ja nav režīmu pārklājuma vai ticamu izmaksu. Salīdzināt fill,
+slippage, partial close un risku ar broker demo. Aktivizācija tikai flat, bez pending order
+un pēc operatora apstiprināta release. Rollback uz iepriekš apstiprinātu pilnu paketi, ne
+vienkārši statusa maiņa. READY_N=0 vai PROMOTE_N=1 nav validācija.
+learn_gate.py:36–112, 188–286; model_readiness.py:432–469; shadow_mistake_audit.py:29–30. V03/V04 ir
+ierosināts sākuma protokols, jāapstiprina pirms izmantošanas.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+18 / 30
+
+
+===== PAGE 19 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 19  /  30
+Moduļu pārveides karte
+Ko saglabāt, pārveidot vai atslēgt no LIVE
+P0 — Dati, izpilde un mācību integritāte
+market_context.py / market_fusion.py / engine.py: aizliegt sintētisku OHLC un beztermiņa
+last-good; D01–D08. structure_memory.py / ohlc_entry_zones.py / ohlc_scenarios.py:
+invalidācija, ZONE AND apstiprinājums, UNKNOWN HOLD; Z01–S09. bracket_learn.py /
+ohlc_regime_brackets.py: tikai strukturāli absolūtie līmeņi, noņemt RR soft-cap un
+nepamatotu fallback; B01–B08. shadow_paper.py: pareizas bid/ask puses, delay, gap,
+atsevišķi žurnāli; H01–H04.
+P0 — Viena lēmumu un mācību autoritāte
+engine.py / core.py: viena plan() funkcija, immutable proposal, izolēts candidate;
+L01–L04, M05–M08. learn_gate.py / model_readiness.py / model_validation.py /
+shadow_mistake_audit.py: neatkarīgs V01–V04; ne cold-start bypass, ne tieša LIVE svaru
+maiņa. profit_learning.py / sample_strategies.py / hold_shadow.py / structure_shadow.py:
+pilns OHLC ceļš un atsevišķi mērķi; M01–M04. champion_library.py: tikai apstiprināta
+pakete pirms infer, ne submit.
+P1 — Atvienot papildu LIVE lēmumu korektorus
+autonomy.py / generated policy: tikai research, ne gala policy veto/override ārpus
+definētajiem vārtiem. adaptive_system.py: koordinācija, ne nudge. flow_consensus.py:
+saglabāt ārējo pazīmju aprēķinus, noņemt flipped_to_consensus. unified_cycle.py:
+saglabāt uzskaiti, noņemt automātisku margin floor maiņu pēc PnL; day_book.py: risks un
+uzskaite, bez anti-HOLD un fallback size. forecast_bridge / strategy_gen / gold_strategies
+/ situation_memory / structure_edge: sākumā diagnostika; iespējama validēta
+pirmsbalsojuma pazīme vēlāk. Ne dzēst vēsturiskos pierādījumus.
+P1 — Riska un konfigurācijas līgums
+hard_risk.py: atjaunot reālu, neatkarīgu OPEN aizliegumu; day_book, math_rules,
+trade_costs: naudas vienības, lotes un izmaksas. evo_boot/self_params: ne pārrakstīt
+apstiprinātu konfigurāciju boot laikā; noņemt PR #181 forced baseline. Reentry gate tikai
+tad, ja dokumentēts scenārija pierādījums; ne papildu paralēls slieksnis.
+Saglabāt infrastruktūru
+broker, stream, config, storage, platform, security, runtime_hub, app/main,
+instrument_isolation, shared_market un Admin/Desk/Client. Saglabāt žurnālus, health un
+aizsardzības ceļus; pārbaudīt, ka neviens no tiem neizsauc alternatīvu OPEN ārpus jaunā
+plāna.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+19 / 30
+
+
+===== PAGE 20 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 20  /  30
+Migrācija un atkopšana
+Droša pāreja bez veco kļūdu pārnešanas
+A05 — Inventārs pirms izmaiņām
+Fiksē git commit, dependency lock, test baseline, feature schemas, datu DB versiju,
+modeļa checkpoints, self_params un broker adaptera konfigurāciju. Dublē kontu datus un
+svarus ar pārbaudāmu checksum. Neiekļaut API secrets, .env, secret.key, klientu SQLite
+vai neironu failus GitHub. Izmaiņas atsevišķā branch; ne tieši LIVE deployment. Saglabā
+pašreizējos neveiksmīgos testus atsevišķi, lai regresijas nepazūd.
+A06 — Pakāpeniska pāreja
+1. Datu provenance un immutable context; testēt bez orderiem. 2. Zonas/scenāriji/SLTP
+un vienota plan funkcija ar fixtures. 3. Broker adapteris un paper parity, risk gate, order
+reconcile. 4. Mācību žurnāls un izolēti kandidāti. 5. Izņemt legacy score overrides no
+visiem LIVE call sites un UI. 6. Offline replay, OOS, forward demo. 7. Tikai pēc visu release
+kritēriju izpildes aktivizēt operatora apstiprinātu checkpoint.
+A07 — Vecie paraugi un svari
+Vecā modeļa svari var būt ietekmēti no paper, endpoint label, veciem ārējiem datiem vai
+nudge; nav automātiski derīgi. Marķē legacy checkpoints, saglabā reproducējamību,
+revalidē pret jauno feature schema. Ja schema mainīta, neklusi paplašināt svarus vai
+pielīmēt nulles; apmāca/validē kandidātu. Path-less ieraksti paliek uzskaitei; ja iespējams,
+atjauno pilno ceļu no verificēta avota. Neizdomā trūkstošus datus.
+A08 — Rollback un drošs starts
+Feature flag vada tikai pāreju starp pilnām apstiprinātām paketēm; nav drošības vārtu
+override. Restart ar atvērtu pozīciju: atjauno plan, broker līmeņus, pending orders,
+nodrošina aizsardzību, neaktivizē jaunu versiju. Ja nav apstiprinātas paketes,
+SHADOW-only un operatora manuālo pozīciju aizsardzība; ne automātisks OPEN.
+Model/data/schema kļūme jāatspoguļo UI reason kodā. Auditējama piekļuves kontrole
+katram klientam.
+Mērķa izmaiņas nav piemērotas GitHub šajā dokumenta sagatavošanas reizē. Šī ir secība, kas jārealizē un
+jāpārbauda.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+20 / 30
+
+
+===== PAGE 21 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 21  /  30
+Pieņemšanas testi I
+Dati, struktūra un lēmums
+T01–T04 — Datu testi
+T01: 61+ reālas M1, izņem 1 vai 2 sveces no nepieciešamā loga. Sagaida
+UNREADY/HOLD_DATA, nevienu synthetic bar nepadod modelim; aizsardzība turpinās.
+T02: forming bar un vēlāk saņemta revīzija. Sagaida, ka vecais context hash nemainās;
+pabeigtais logs izmanto tikai zināmos datus. T03: 5 pilnas M1 → precīza M5 O/H/L/C;
+trūkst 1 → nav pabeigta M5. T04: last-good ārējais avots pārsniedz konfigurēto TTL;
+REQUIRED→HOLD, OPTIONAL→validēta missing mask; atkārtota nolasīšana neatsvaidzina
+timestamp.
+T05–T08 — Zonas un scenāriji
+T05: demand base 100–102, apstiprināts impulss; vēlāk close 99 ar tick 0.1. Sagaida
+INVALIDATED, arī pie augsta quality. T06: zone touch ar pin, bet bez mikrostruktūras;
+ZONE HOLD. Pievieno derīgu mikrostruktūru → zona apstiprināta (ja pārējie vārti iziet).
+T07: fixture katram TREND UP/DOWN, RANGE abās malās, BREAKOUT UP/DOWN, RETEST
+UP/DOWN, CHOCH UP/DOWN, FAKEOUT abos virzienos, COMPRESSION; sagaidāmi
+scenario tag, evidence un invalidation anchor. T08: RANGE 100–110, entry 105 →
+HOLD_ZONE; UNKNOWN/unready/disabled → HOLD_SCENARIO.
+T09–T12 — SL/TP un lēmuma integritāte
+T09: BUY invalidation 95, buffer 0.5, entry 100, TP 104, tick 0.1. SL=94.5, bruto
+RR=4/5.5; sagaida HOLD_RR, ne SL=96. T10: fakeout BUY ar range low 100, sweep low
+98, buffer 0.2 → SL ≤97.8; SELL simetriski. T11: B07 piemērs: neto 7/5=1.4, min=1.5 →
+HOLD; spread netiek atņemts otrreiz. T12: scores BUY=0.6, SELL=0.3, HOLD=0.1; ārējais
+consensus SELL pēc infer nedrīkst mainīt proposal. Atļauts BUY vai HOLD; raw scores
+nemainās. Vienādi modeļi/konteksts/account state LIVE un parity → vienāds plan hash
+(izņemot execution namespace).
+Obligātā pārbaudes forma
+Katram testam fiksē input fixture, config/hash, model version, sagaidāmo rezultātu,
+faktisko rezultātu, PASS/FAIL un pierādījuma logu. Nepietiek ar testu, kas pārbauda tikai
+funkcijas atgriezto boolean; pārbauda arī side effects, aizliegtu POST un svaru hash.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+21 / 30
+
+
+===== PAGE 22 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 22  /  30
+Pieņemšanas testi II
+Izpilde, rezultāti, mācīšanās
+T13–T16 — Broker/paper izpilde
+T13: BUY TP=105, high_mid=104, spread=2 → nav TP; SELL TP=95, low_mid=96 → nav
+TP. Abi SL/TP skarti bez tick secības → conservative SL vai AMBIGUOUS. T14: pending BUY
+ar fixed SL/TP; fill delay pārvieto cenu tā, ka RR vairs neder → cancel, absolūtie līmeņi
+nemainās. T15: OPEN timeout pēc broker pieņemšanas → UNCERTAIN un reconcile;
+neviena otra POST. Restart, restore un apstiprināta SL/TP pārbaude. T16: broker demo
+BUY un SELL partial close, pārbaudīt, ka atlikusī pozīcija samazinās un nav pretēja jauna
+ordera; ja netting nav pierādīts, izmanto vienu TP.
+T17–T20 — Risks un rezultātu patiesums
+T17: budžets £10, risks £25/lot, step 0.1, min 0.5 → HOLD_RISK. Tick value trūkst →
+HOLD_RISK, ne mandate fallback. Pause/emergency/daily loss aptur jaunus OPEN, ne
+aizsardzību. T18: Funds pending + UPL £12 → realized=null; verificēts final zero → £0;
+divas līdzīgas transakcijas bez unikālas sasaistes → MATCH_UNCERTAIN. T19: path-less
+trade ar entry/exit → nav OHLC label vai strategy card; saglabā accounting. T20:
+SHADOW order adapter bez write tiesībām; aizliegt broker POST/PUT/DELETE; blocked
+parity nav paper OPEN, research atsevišķi.
+T21–T25 — Mācību un modeļu integritāte
+T21: paper close, HOLD shadow, M1 label un LIVE close maina tikai kandidāta hash, ne
+approved LIVE weights. T22: avārija pēc CLAIMED, pirms CANDIDATE_SAVED; restart
+droši atjauno vai atkārto, bez pazuduša/dubulta parauga. T23: corrupt checkpoint vai
+nesaderīga registry → restore failed, vecā pakete identiska. T24: manuāla close + failed
+readiness → nav LIVE OPEN; champion activation pēc plan aizliegta, jāveido jauns plan.
+T25: train/holdout pārklājoši label laiki → purge/embargo; kandidāts ar lielāku accuracy,
+bet sliktāku net expectancy vai drawdown → REJECT. Nepietiekama izlase →
+INSUFFICIENT, ne KEEP.
+T26–T27 — Pilns cikls un izolācija
+T26: atsevišķi BUY/SELL
+OPEN→protect→close→Funds→diagnose→candidate→validation→activate/rollback, plus
+restart katrā orderu un mācību posmā. T27: divi klienti, viens epic: publiskais context
+kopīgs, bet atšķirīgi konti, svari, state un risk; nav savstarpēju orderu vai PnL piejaukumu.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+22 / 30
+
+
+===== PAGE 23 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 23  /  30
+Izlaišanas kritēriji
+Precīzs uzdevums Cursor aģentam
+Darba izpildes līgums
+1. Pirms labojumiem atver #270 pinned code un noskaidro visus faktisko OPEN, CLOSE,
+model mutation, feature fusion, state restore un legacy override call sites. Neizdari
+secinājumus tikai no docstring. 2. Izveido izmaiņu plānu ar prasību ID un failiem; norādi,
+kur ir apzināta dizaina izvēle, kas jāapstiprina. 3. Vispirms uzraksti regresijas testus, kuri
+atkārto auditā konstatēto kļūdu. 4. Veic minimālo strukturālo refactor, izslēdz dublētu
+lēmumu loģiku, ne pievieno vēl vienu score korekcijas slāni. 5. Palaid visu pytest un
+integrācijas/replay pārbaudes. 6. Iesniedz rezultātus ar commit un test log; neaktivizē
+LIVE.
+Obligātā release pārbaude
+ • Visas P0 prasības, visi T01–T39 testi un papildus atklātie regresijas testi iziet; nav
+neatrisinātu kritisku datu, orderu, svaru vai kontu izolācijas kļūdu. Neapstiprināts demo
+tests nedrīkst būt PASS.
+• Nevienā aktīvā LIVE ceļā nav post-argmax BUY↔SELL, anti-HOLD vai neapstiprināta
+policy override; visi OPEN iet caur vienu plānu un risku.
+• Pārbaudāma SL/TP invalidācija, RR pēc izmaksām, bid/ask trigger, fill delay un brokera
+orderu reconciliation; bez nepamatota SL cap un stale data.
+• Kandidāta validācija atbilst V01–V04 un operatora iepriekš fiksētiem sliekšņiem; LIVE
+versija apstiprināta tikai flat stāvoklī. Nav peļņas solījumu vai automātiskas aktivizācijas
+no paper PnL.
+Ko aģentam jāatgriež
+Pilns mainīto failu saraksts, prasība→tests→pierādījums (PASS/FAIL/NOT RUN), vecā/jaunā
+lēmuma plūsma, datu migrācijas un rollback soļi, faktiskā pytest komanda un rezultāts,
+replay dati un metrikas, demo verifikācijas statuss un atlikušie riski. Atšķirt koda
+atbilstību no statistiskas tirdzniecības priekšrocības. Ja nav broker demo pieejas, skaidri
+norādīt NOT RUN un atstāt LIVE neapstiprinātu.
+Gala kritērijs: sistēma dara tieši definēto, un katrs lēmums, līmenis, fill, mācību
+paraugs un modeļa versija ir izsekojami. Darījumu biežums vai viens veiksmīgs
+darījums nav pieņemšanas kritērijs.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+23 / 30
+
+
+===== PAGE 24 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 24  /  30
+Avoti un pierādījumu robežas
+Fiksētā GitHub versija un lietotāja shēmas
+Mērķa koncepcijas avoti
+1. SHADOW — pilna lēmumu sistēma: dati, fūzija, neatkarīgs modelis, vārti, paper,
+žurnāls, mācīšanās, neatkarīgs tests. 2. SL un TP distances visos 1m režīmos: invalidācija,
+strukturāls mērķis, RR un izmaksas. 3. Zonu lasīšana: bāze/impulss, kvalitāte, reakcija,
+struktūra. 4. M1 scenāriji: trend, range, breakout, retest, CHOCH, fakeout, compression.
+Iepriekšējais 10 lappušu PDF v1.0 ir paplašināts, ne izmantots kā pierādījums koda
+darbībai.
+GitHub — tiešās saites uz fiksētu kodu
+PR #270: arhitektūras karte
+PR #269: RR un forced baseline
+market_context.py:58–114, synthetic OHLC
+engine.py:2348–2409, last-good fūzija
+structure_memory.py:242–359, zonu noteikšana
+ohlc_entry_zones.py:543–558, OR apstiprinājums
+ohlc_scenarios.py:297–346, scenārija vārti
+ohlc_regime_brackets.py:435–493, RR cap
+flow_consensus.py:536–649, virziena maiņa
+engine.py:2749–3025, LIVE lēmumu ķēde
+shadow_paper.py:284–304, TP trigger
+shadow_paper.py:401–520, fill un delay
+engine.py:8170–8195, SHADOW svaru mācības
+engine.py:8455–8520, SHADOW label
+engine.py:5832–5869, HOLD mācības
+learn_gate.py:36–112, holdout
+model_readiness.py:432–469, cold start
+engine.py:5230–5289, Funds un claim
+engine.py:7447–7478, champion activate
+engine.py:7650–7695, size fallback/risk
+broker.py:109–142, broker POST/reduce
+Koda apskate nav runtime tests. Nav pārbaudīti konkrēti klientu Store, Capital konta režīms, LIVE fill
+semantika vai faktiskā peļņa. Visas skaitliskās mērķa konfigurācijas ir priekšlikumi, ne pierādīta optimizācija.
+Šajā darbā nav veikti orderi vai mainīts repozitorijs.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+24 / 30
+
+
+===== PAGE 25 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 25  /  30
+Capital Funds — vienīgā patiesība
+Obligāts P0 līgums visai sistēmai
+Ja Capital.com apstiprinātā slēgtā darījuma peļņa ir +£0.50, tad datubāzē, API, Desk,
+Admin, day_book, LIVE mācību žurnālā un pārskatos tā ir +£0.50. Ja tā ir −£0.50,
+visur −£0.50. Nav alternatīva reālās peļņas aprēķina.
+P05 — Divas neatkarīgas patiesības: cena un nauda
+LIVE faktiskā ieejas/izejas cena ir brokera izpildes cena, ar darījuma/izpildes ID, laiku un
+cenu vienību. BUY atveras ar ask un aizveras ar bid, SELL otrādi, bet tieši fill apliecina
+faktisko cenu (ieskaitot izpildes novirzi). Ja fill cena trūkst, actual_exit_price=null;
+pēdējais mid, SL/TP līmenis vai bid/ask novērojums drīkst būt tikai diagnostic_estimate.
+Nedrīkst mācīties no tā kā no faktiskās izpildes.
+Nauda ir brokera verificētais slēgšanas Funds rezultāts konta valūtā, nevis no fill cenām
+izrēķināts rezultāts. Pat ja cenu starpība norāda citu summu, Funds ir noteicošais. Ja cena
+nav zināma, verificētu naudu uzskaita, bet nepilnīgs cenu ceļš nav pilnvērtīgs mācību
+paraugs.
+P06 — Precīza summa un vienība
+GBP naudu glabā Decimal vai veselos pensos (amount_minor=50, currency=GBP,
+exponent=2). Parsē oriģinālo API vērtību tieši, nevis ar starpposma float. Noraida
+neskaidru skaitļa formātu, NaN/Infinity un nesaderīgu precizitāti; saglabā raw value.
+Neizmanto epsilon, noapaļošanu vai scratch slieksni, lai mainītu broker amount. Scratch ir
+atsevišķa diagnostikas kategorija, ne naudas vērtība. UI GBP parāda divas zīmes aiz
+komata; null nav £0.00.
+P07 — Aizliegtie LIVE realized avoti
+UPL, accounts.balance.profitLoss, confirm.profit, mid×size, bid/ask×size, cenu punkti,
+ticks, Paper PnL, valūtas pārrēķina aplēse, cita darījuma peļņa, ±1 label, legacy source
+bez pierādījuma. Spread/komisiju nedrīkst vēlreiz atņemt no brokera jau uzrādītā
+rezultāta. Citas broker maksas uzskaita atsevišķi, ja tās nav iekļautas konkrētajā Funds
+rādītājā.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+25 / 30
+
+
+===== PAGE 26 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 26  /  30
+API un identitāte
+Precīzi avoti, statuss un konta valūta
+P08 — Vienots adapteris RealizedCash
+GET /api/v1/history/transactions (TRADE) ir primārais brokera naudas avots. GET
+/api/v1/history/activity izmanto slēgšanas un ID sasaistes pierādījumiem; GET
+/api/v1/confirms un positions — izpildes un stāvokļa pierādījumiem, ne patvaļīgai peļņas
+aizvietošanai. GET /accounts nosaka tieši aktīvā konta valūtu un identitāti. Saglabā UTC,
+query window, raw row/hash un adaptera versiju.
+Oficiālais API piemērs parāda transactionType=TRADE, note=Trade closed,
+status=PROCESSED, reference, currency un size, bet piemērs negarantē skaitliskā PnL
+lauka klātbūtni. Tāpēc amount lauku un tā semantiku apstiprina ar anonimizētu API
+fixture un attiecīgo Funds izraksta rindu. Lauku whitelist ir versēts. Nav patvaļīgas
+pnl/cash/profit/grossProfit/amount atslēgu secības. Ja summa nav pieejama vai atšķirīgi
+lauki konfliktē, PENDING_FUNDS vai SOURCE_CONFLICT; nekad neizgudro naudu.
+P09 — Konta un slēgšanas identitāte
+Unikālais cash ledger key: broker_environment + account_id + verificēts transakcijas ID
+(vai dokumentēta stabila saliktā identitāte). Sasaista ar closing execution/deal ID, order
+reference un pozīcijas ID caur brokera pierādītu sakarību. Vienāds epic, size, openLevel,
+PnL vai tuvākais laiks nav identitātes pierādījums. Neizmanto substring/SQL LIKE kā
+galīgo sasaisti. Verificētu, bet nesasaistītu cash rindu glabā UNMATCHED: konta Funds
+kopsummā vienreiz, bet ne konkrēta darījuma mācīšanās datos.
+P10 — Valūta un nulles rezultāts
+GBP kontā GOLD quote USD nav cash currency. Verificē naudas lauka semantiku un
+valūtu; ja cash currency tiešām USD vai nezināma, nenomaina etiķeti uz GBP. Glabā
+oriģinālo valūtu un gaida konta Funds summu. Nekonvertē ar minētu FX. PROCESSED
+slēgšana ar pierādītu £0.00 ir SETTLED_ZERO, ne missing; opening TRADE vai pending
+placeholder nav final zero. Nezināmais paliek null.
+Capital.com oficiālā REST API: Account transactions / activity history
+broker.py:90–108 — pašreizējais API adapteris
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+26 / 30
+
+
+===== PAGE 27 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 27  /  30
+Naudas uzskaite un mācīšanās
+Viens ledger visām reālās peļņas funkcijām
+P11 — Nemaināms, versēts cash ledger
+CashEvent: account_id, environment, cash_id, raw_hash, transaction_type, close_proof,
+status, amount_minor, currency, effective_at, observed_at, source_field, source_schema,
+deal_link, revision. Vienīgais rakstītājs ir validētais broker adapteris. Ledger ieraksts un
+outbox event vienā DB transakcijā. Atkārtota poll, restart vai dienu pārklāšanās
+nepalielina summu. PENDING nav realizēta nauda. Aizliegts ar null/source update
+saglabāt vecu aplēsi zem jaunas broker etiķetes.
+P12 — Daļējas slēgšanas un labojumi
+Ja vienai pozīcijai ir divas neatkarīgas verificētas slēgšanas +£0.20 un +£0.30, cash kopā
++£0.50. Katra daļa uzskaitīta tieši vienreiz. Pabeigta darījuma mācības tikai pēc visu
+izpilžu sasaistes; atlikusī atvērtā pozīcija nav realizēta. Broker correction/reversal glabā
+kā izsekojamu revīziju vai atsevišķu broker cash event atbilstoši faktiskajai semantikai. Ja
+£0.50 aizstāj £0.49, precīzi +£0.01 labojums; ja vēlāk £0.48, attiecīgi −£0.02. Vienu
+correction nedrīkst ieskaitīt divreiz. Pārbūvē dependent ledgers un atzīmē skartos
+kandidātus pārvalidācijai.
+P13 — Visur viena summa
+API, trades, NESEN, KOPĒJAIS, klientu statistika, day_book, hard_risk, profit_learning,
+unified_cycle, scenario/structure audit, learn_gate un strategy ledger saņem
+cash_id/revision, ne nesaistītu float. Konta Funds kopsumma = SUM unikālu verificētu
+event summu pa valūtām un definētu periodu. Atsevišķi rādītāji: piesaistītie darījumi,
+nepiesaistītā cash, atvērtā UPL, paper, komisijas/funding un citi konta darījumi.
+Neapvieno tos vienā 'peļņa'.
+P14 — Mācības neizmaina naudu
++50 pensi paliek +50 arī tad, ja label ir HOLD, paraugs izlaists, loss funkcija normalizēta
+vai kandidāts noraidīts. Mācību reward, label, simulētais counterfactual, MFE/MAE, R un
+costs ir atsevišķi lauki ar savām vienībām. LIVE audit/backfill nav UPL fallback. Ja cash
+pending/uncertain, nav LIVE cash mācību, bet OHLC diagnostiku var glabāt bez cash
+label. Paper nauda nekad nav LIVE nauda.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+27 / 30
+
+
+===== PAGE 28 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 28  /  30
+Koda PnL defekti
+Konstatēts commit #270 — obligāti novērst
+P0 — Nepierādītas summas un darījuma piesaiste
+engine.py:4119–4265 — parseris noņem valūtas simbolus, izvēlas plašu cash lauku
+sarakstu un var izmantot Activity; sasaistē iespējama ID substring atbilstība. 4336–4474
+— fuzzy scoring var izvēlēties tuvāko darījumu; 4710–4861 — mirror izmanto LIKE un
+fuzzy binding, izlaiž nulles rezultātus. Aizstāt ar P08–P10; atsevišķs cash ledger bez
+minētas deal saites.
+P0 — Nepareiza peļņa var sasniegt mācību slāni
+engine.py:5090–5145 — backfill izmanto arī UPL, pending un pēdējo UPL, nodod to
+auditam un entry gates. 5872–6065 — daži close ceļi pieņem confirmation.profit/pnl un
+var piešķirt broker statusu bez avota pierādījuma; exit_level var kļūt par mid vai entry.
+4015–4026 — _realized_trade_pnl pēc noklusējuma pieņem broker source. Visos ceļos
+pieprasa validētu cash event un actual fill pierādījumu, ne string flag.
+P0 — Neatbilstība starp Desk un mācību uzskaiti
+runtime_hub.py:372–515 — blank source klasificēts cash, NESEN fallback var rādīt
+estimate; nulles cash tiek slēpts. engine.py:179–245 — close_trade saglabā iepriekšējo
+pnl, ja jaunā summa null; valūtas remonts var pārlīmēt etiķeti bez naudas pierādījuma.
+4475–4493 — 0.01 epsilon var aizturēt pensu labojumu. 5299–5355 — bankas side
+effects labo UPL→broker, bet ne visas broker→broker revīzijas. Pārbūvēt no ledger, ne no
+lokāla cache.
+P0 — Precīzās avotu saites
+Cash parsing, history, ID
+Fuzzy matching un epsilon
+Funds mirror
+UPL backfill un gate teach
+Close / confirmation un mid fallback
+Side effects bank
+Desk stats un estimate fallback
+DB update un valūtas etiķete
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+28 / 30
+
+
+===== PAGE 29 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 29  /  30
+Capital Funds regresijas testi
+T28–T39 — skaitliski un pārbaudāmi
+T28–T31 — Summas nemainība
+T28: GBP konts, verificēts close +0.50, confirm +0.48, last UPL +0.81, mid proxy +0.73 →
+visos LIVE realized patērētājos +50 pensi, UI £0.50; viens cash event. T29: SELL close
+−0.50, quote USD, proxy +0.10 → −50 pensi; nav zīmes maiņas. T30: final close £0.00 →
+SETTLED_ZERO; opening/pending £0.00 → null, bez teach. T31: UPL £0.50 bez Funds →
+null; confirm.profit=£0.50 bez Funds → null; Activity bez verificēta cash → null; visi cash
+patērētāji bez jauna ieraksta.
+T32–T35 — Identitāte, valūta un precizitāte
+T32: divi GOLD closes ar vienādu size/entry/close time, +£0.50 un −£0.30 bez drošas
+deal saites → abas verificētās cash rindas kontā vienreiz, deal PnL MATCH_UNCERTAIN,
+neviena label. Pēc unikāla ID sasaista pareizi. T33: cash USD 0.50 vai nezināma valūta
+GBP kontā → nav GBP 0.50; gaida Funds GBP. T34: +£0.49 → +£0.50 korekcija, pēc tam
++£0.48 → journal, daily, stats un training provenance precīzi 48 pensi; netiek lietots
+epsilon. T35: dublikāts/restart/overlap, vienādi reference dažādos kontos → katra konta
+cash uzskaite tieši vienreiz, bez pārklāšanās.
+T36–T39 — Izpilde, daļas, kļūdas un patērētāji
+T36: actual fill 103.15, market mid 103.40, Funds −£0.50 → actual_exit_price=103.15,
+realized=−50; fill trūkst → null, realized joprojām −50; nav path label. T37: partial
++£0.20 un +£0.30 → kopā 50; atkārtota partial rinda nedubultojas; komisija −£0.05
+atsevišķi, ja Capital to atspoguļo atsevišķi (trade result paliek 50; attiecīgais konta net
+rādītājs 45). T38: legacy UPL £0.80 un blank source, Funds vēl nav → nekas LIVE realized
+vai cash teacher; vēlāk +£0.50 → tikai 50. T39: kļūdains API lauks, 1,234 neskaidra
+locale, conflicting cash fields vai raw status pending → quarantine, nekādas aplēses;
+crash starp ledger un outbox → atkārtota izpilde nerada dubultu mācību.
+Visos testos pārbauda SQLite, API JSON, UI tekstu, cash side effects, mācību žurnāla
+provenance un konta kopsummu; nav pietiekami ar vienas parser funkcijas PASS.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+29 / 30
+
+
+===== PAGE 30 =====
+NEURAL TRADING AI  /  SISTĒMAS LĪGUMS
+V3.0  ·  24.11.2026.
+NODAĻA 30  /  30
+Izlaišanas vārti — Capital Funds
+Cursor ieviešanas, migrācijas un verifikācijas uzdevums
+P15 — Migrācija bez vēsturiskās peļņas viltošanas
+Backup SQLite, brain, registry un parametri; izveido jaunu ledger paralēli. Legacy
+broker/source ieraksts bez raw pierādījuma → UNVERIFIED; aplēse → ESTIMATE, ne cash.
+Atkārtoti iegūst brokera vēsturi pa pilniem pārklājošiem UTC logiem ar idempotentu
+ingest un rate-limit/backoff. Datu vēstures nepieejamību skaidri atzīmē, ne aizpilda.
+Rebuild day_book, risk, stats un profit ledgers tikai no apstiprinātajiem event. Kļūdaini
+trenētiem svariem no legacy UPL/paper/false match veic provenance auditu; kandidāta
+pārmācīšana un neatkarīga validācija, ne klusā svaru aktivizācija.
+P16 — Faktiskā Capital verifikācija
+Izmanto autorizētu DEMO kontu un/vai lietotāja droši eksportētus Funds izrakstus, bez API
+atslēgu ievietošanas dokumentā vai logā. Pārbauda reālu BUY, SELL, SL, TP, manuālu
+close, partial, zero (ja pieejams), komisiju/correction semantiku. Pārbauda pareizo kontu,
+UTC periodu, currency, transakciju ID, slēgšanas statusu, raw cash lauku un actual fill
+cenas. Salīdzina Funds ekrāna/izraksta summas ar adapteri un datubāzi. Neizveido reālus
+LIVE orderus testa dēļ.
+P17 — Izmērāms pieņemšanas kritērijs
+Katram verificētam GBP cash event: DB amount_minor == Capital amount_minor == API
+amount_minor == UI displayed pence == cash teacher amount_minor (ja mācībām
+atbilstošs). Atšķirība tieši 0 pensi. Kopsummas atšķirība 0 pensi vienādam kontam,
+valūtai, laika periodam un transakciju filtram. Ja atšķirība, sagatavo reconciliation report
+ar trūkstošiem, dublētiem, atšķirīgiem, nesasaistītiem un pending ierakstiem. PENDING
+var būt korekts, bet nav PASS kā settled trade. Pārbaudīts konta Funds ledger var būt
+precīzs arī ar nesasaistītu darījumu, kas netiek mācīts.
+Cursor atskaite un bloķēšana
+Atgriež commit, visu T01–T39 testu rezultātus un broker fixture/reconciliation
+pierādījumus, anonimizētu. Ja demo/API pārbaude nav iespējama, statuss NOT RUN;
+nedrīkst apgalvot pilnīgu atbilstību vai aktivizēt LIVE. Šī specifikācija nenozīmē, ka
+esošais kods jau ir salabots.
+P0: neviens reālās peļņas skaitlis nedrīkst rasties ārpus Capital Funds verifikācijas.
+£0.50 paliek £0.50 — bez mid, UPL, USD pārlīmēšanas, spread pārrēķina vai citas
+darījuma summas.
+Mērķa arhitektūra  ·  #270 koda pamats  ·  Tehniskā specifikācija
+30 / 30

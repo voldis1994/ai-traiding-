@@ -67,12 +67,20 @@ def test_prep_eval_blocks_until_holdout_passes_and_separates_stages():
 
 def test_argmax_kept_but_score_edge_is_not_utility_without_readiness():
     with tempfile.TemporaryDirectory() as d:
-        p = AutoEvolution(Store(Path(d) / 'db.sqlite3'), Path(d) / 'pol.py')
-        # Small edge 0.05 < default MIN_EDGE 0.06 → evolved policy HOLDs.
+        store = Store(Path(d) / 'db.sqlite3')
+        p = AutoEvolution(store, Path(d) / 'pol.py')
+        # V5: policy_live_execute defaults OFF — research only; argmax passes through.
+        # Score edge is still marked as not calibrated profit probability.
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         weak_out = p.evaluate_neural_entry(weak)
-        assert weak_out['action'] == 'HOLD' and weak_out['proposal'] == 'BUY'
+        assert weak_out['action'] == 'BUY' and weak_out['proposal'] == 'BUY'
         assert weak_out['evidence']['score_edge_is_not_trading_advantage'] is True
+        # With live execute ON, small edge < MIN_EDGE → evolved policy HOLDs.
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'policy_live_execute': 1},
+                reason='test_policy_live')
+        weak_hold = p.evaluate_neural_entry(weak)
+        assert weak_hold['action'] == 'HOLD' and weak_hold['proposal'] == 'BUY'
         scores = {'BUY': 0.48, 'SELL': 0.30, 'HOLD': 0.22}  # edge clears policy
         bare = p.evaluate_neural_entry(scores)
         assert bare['action'] == 'BUY'

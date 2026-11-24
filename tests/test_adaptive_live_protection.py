@@ -270,10 +270,14 @@ def test_open_without_tp_does_not_enroll_trail_when_disabled():
             b.market=_mkt
             await e.submit('BUY')
             assert s.get('adaptive_protection:b2') in (None, False, {})
+            # Bracket PROTECT on OPEN is separate from trail enrollment.
+            before_protect=len([r for r in b.requests if r[0]=='PROTECT'])
             await e.adapt_protection({
                 'dealId':'b2','epic':'SIM','direction':'BUY','level':100.,
                 'stopLevel':99.2,'profitLevel':None,'size':'1'})
-            assert not [r for r in b.requests if r[0]=='PROTECT']
+            # Trail off + missing TP → adapt must not fire another PROTECT/enroll.
+            assert len([r for r in b.requests if r[0]=='PROTECT'])==before_protect
+            assert s.get('adaptive_protection:b2') in (None, False, {})
     asyncio.run(scenario())
 
 

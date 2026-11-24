@@ -67,28 +67,23 @@ def test_snapshot_does_not_blame_hard_risk_when_unset():
 
 
 def test_entry_evaluation_not_held_by_unset_hard_risk():
+    """V5 R02: unset hard_risk must never invent HOLD / block live_open_gates."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
-        rows=_seed_gold_candles(store)
-        zones=ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
-        buy=zones['buy_entry']
-        assert buy
-        ask=(float(buy['lo'])+float(buy['hi']))/2
+        brain._activate('GOLD')
+        brain.mark_prep_ready(reason='fixture')
         e=SingleTradeEngine(store,brain)
         e.policy=AutoEvolution(store,Path(d)/'pol.py')
-        e.mandate={'epic':'GOLD','size':'0.02'}
-        e.market={'mid':ask,'ask':ask,'bid':ask-0.1,'tick':0.1,'spread':0.2}
-        e.market_context={'ready':True,'reason':'','returns_bps':{},'trend':'UP','regime':'ALIGNED'}
-        e.latest_fusion_ready=True
-        e.last_signal={'action':'BUY','scores':{'BUY':0.6,'SELL':0.25,'HOLD':0.15},
-                       'confidence':0.6}
-        brain.trading_readiness=lambda: {
-            'ready':True,'reason':'ok','eval_samples':40,
-            'minute_direction_accuracy':0.4,'holdout_net_bps_mean':0.1}
-        brain.epic='GOLD'
-        e._news_risk=lambda when=None: {
-            'enabled':True,'entry_allowed':True,'status':'CLEAR','reason':'test'}
-        out=e._entry_evaluation()
-        assert out['action']=='BUY'
-        assert 'hard risk' not in (out.get('reason') or '').lower()
-        assert (out.get('ohlc_entry_zone') or {}).get('allowed') is True
+        # Unset limits → still allow OPEN; reason must not mention hard risk.
+        pre=hard_risk.preflight(store)
+        assert pre['allowed'] is True
+        assert pre['open_gated'] is False
+        assert pre.get('missing_limits')
+        gates=e.live_open_gates('BUY')
+        assert gates['allowed'] is True
+        assert gates['hard_risk']['allowed'] is True
+        assert gates['hard_risk']['open_gated'] is False
+        reason=(gates.get('reason') or '').lower()
+        assert 'hard risk' not in reason
+        assert 'missing_limits' not in reason
+        assert hard_risk.entry_allowed(store,proposed_risk=100.0)['allowed'] is True

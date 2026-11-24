@@ -58,10 +58,10 @@ def test_trade_stats_recent_is_broker_gbp_only():
         assert stats['equity_pnl'] == pytest.approx(-0.89)
 
 
-def test_estimate_fills_recent_when_no_broker_but_not_working_pnl():
-    """NESEN must not stay empty while SHADOW already counts journal estimates.
+def test_estimate_not_treated_as_nesen_cash_totals():
+    """NESEN / working_pnl stay Funds-only; estimates are listed separately.
 
-    Kopējais / working_pnl stays Funds-only (None) until broker upgrades.
+    V3 P05–P13: never fill recent_trades from upl_estimate as if Capital £.
     """
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
@@ -82,7 +82,8 @@ def test_estimate_fills_recent_when_no_broker_but_not_working_pnl():
         assert stats['working_pnl'] is None
         assert stats['working_pnl_source'] in ('none', 'empty')
         assert stats['cash_trades'] == 0
-        assert len(stats['recent_trades']) == 1
-        assert stats['recent_trades'][0]['pnl'] == pytest.approx(-0.89)
-        assert stats['recent_trades'][0]['pnl_source'] == 'upl_estimate'
+        assert stats['recent_trades'] == []
         assert stats['pnl_ledger'] == []
+        assert len(stats['estimate_recent']) == 1
+        assert stats['estimate_recent'][0]['pnl'] == pytest.approx(-0.89)
+        assert stats['estimate_recent'][0]['pnl_source'] == 'upl_estimate'

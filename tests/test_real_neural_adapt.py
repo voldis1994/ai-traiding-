@@ -40,14 +40,14 @@ def test_closed_trade_learn_changes_live_weights_and_bumps_paaudze(tmp_path):
     assert 'LIVE learn' in reason or 'Closed' in reason
 
 
-def test_shadow_shares_live_neurons(tmp_path):
+def test_shadow_is_isolated_neurons(tmp_path):
     d=tmp_path/'s';d.mkdir()
     store=Store(d/'robot.sqlite3')
     brain=AdaptiveBrain(store,data_dir=d,seed=9)
     engine=SingleTradeEngine(store,brain,policy_path=d/'policy.py')
     brain.core.step(np.ones(brain.core.d)*0.2,dt=1.0)
     sh=engine._ensure_shadow_brain()
-    assert sh is brain.core
+    assert sh is not brain.core
     scores=engine._shadow_scores_now(advance=True)
     assert scores and math.isclose(sum(scores.values()),1.0,rel_tol=1e-5)
 

@@ -1,4 +1,4 @@
-"""One neural core: SHADOW shares LIVE neurons; paper still no flip-exit."""
+"""V3 H01: isolated SHADOW NeuralCore; paper still no flip-exit."""
 import tempfile
 from pathlib import Path
 
@@ -10,7 +10,7 @@ from app.engine import AdaptiveBrain, SingleTradeEngine, Store
 from app.shadow_paper import ShadowPaperJournal
 
 
-def test_shadow_is_same_core_as_live():
+def test_shadow_is_isolated_from_live():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
@@ -18,28 +18,30 @@ def test_shadow_is_same_core_as_live():
         brain.core.last_z[0] = 0.4
         e = SingleTradeEngine(store, brain)
         shadow = e._ensure_shadow_brain()
-        assert shadow is brain.core
+        assert shadow is not brain.core
         scores = e._shadow_scores_now(advance=True, bar_time='2024-01-01T00:01:00+00:00')
         assert scores is not None
         assert set(scores) == {'BUY', 'SELL', 'HOLD'}
-        # Recreate alias still points at LIVE core.
         e.shadow_brain = None
         shadow2 = e._ensure_shadow_brain()
-        assert shadow2 is brain.core
+        assert shadow2 is not brain.core
 
 
-def test_shadow_learn_teaches_live_core():
+def test_shadow_learn_does_not_teach_live_core():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
         brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
         e = SingleTradeEngine(store, brain)
         e._shadow_scores_now(advance=True, bar_time='t0')
-        before = brain.core.snapshot_weights()
+        live_before = brain.core.snapshot_weights()
+        shadow_before = e.shadow_brain.snapshot_weights()
         assert e._shadow_learn(None, 0, lr=0.1) is not None
-        after = brain.core.snapshot_weights()
-        assert NeuralCore.weight_delta_norm(before, after) > 0
-        assert e.shadow_brain is brain.core
+        assert NeuralCore.weight_delta_norm(
+            shadow_before, e.shadow_brain.snapshot_weights()) > 0
+        assert NeuralCore.weight_delta_norm(
+            live_before, brain.core.snapshot_weights()) == pytest.approx(0)
+        assert e.shadow_brain is not brain.core
 
 
 def test_no_flip_exit_vs_live_trail_rules():

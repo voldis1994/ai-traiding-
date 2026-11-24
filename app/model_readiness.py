@@ -430,11 +430,12 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
 
 
 def grant_cold_start_open(store, brain, *, reason=None) -> dict:
-    """Unblock LIVE OPEN after first manual close when cold prep holdout trapped us.
+    """Unblock LIVE OPEN after first manual close (V5 T24 / #270).
 
     Zero-start flow: operator opens one manual trade → it closes → robot must be
     allowed to OPEN. A failed chronological holdout must not freeze the session
-    forever while online minute labels are still near zero.
+    forever while online minute labels are still near zero. Candidate validation
+    must not invent HOLD_MODEL against the existing LIVE cycle.
     """
     epic = getattr(brain, 'epic', None)
     if not epic:
@@ -477,9 +478,9 @@ def ensure_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0
     # Avoid retraining every poll after a failed holdout; retry when a handful
     # more bars arrive (was +32 — left zero-start sessions stuck too long).
     if status.get('stage') == 'blocked':
-        # Operator already granted cold-start OPEN for this epic — keep it.
+        # Cold-start flag is SHADOW/demo only — do not re-grant as ready.
         if status.get('cold_start_open'):
-            return grant_cold_start_open(store, brain, reason=status.get('reason'))
+            return status
         rows = _sorted_candles(candles)
         prev = int(status.get('candles_loaded') or 0)
         if len(rows) < prev + 8:

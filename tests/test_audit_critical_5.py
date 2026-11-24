@@ -175,22 +175,26 @@ def test_trade_learn_survives_restart_no_relearn():
 
 
 def test_shadow_shares_live_core_across_engine_restart():
-    """One brain: SHADOW alias is LIVE core; learn mutates shared weights."""
+    """V5 H01: SHADOW is an isolated clone — learn must not mutate LIVE W."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         brain.core.last_z=np.linspace(-0.3,0.3,brain.core.d)
         e=SingleTradeEngine(store,brain)
         shadow=e._ensure_shadow_brain()
-        assert shadow is brain.core
+        assert shadow is not brain.core
+        live_before=brain.core.snapshot_weights()
         e._shadow_scores_now(advance=True,bar_time='t0')
         before=shadow.snapshot_weights()
         assert e._shadow_learn(None,0,lr=0.2) is not None
         after=shadow.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)>0
+        assert NeuralCore.weight_delta_norm(
+            live_before,brain.core.snapshot_weights())==pytest.approx(0)
         e.shadow_brain=None
         e2=SingleTradeEngine(store,brain)
         shadow2=e2._ensure_shadow_brain()
-        assert shadow2 is brain.core
+        assert shadow2 is not brain.core
+        # Isolated shadow persists weights across engine restart.
         assert NeuralCore.weight_delta_norm(after,shadow2.snapshot_weights())==pytest.approx(0)
 
 

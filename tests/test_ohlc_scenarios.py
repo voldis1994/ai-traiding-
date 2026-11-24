@@ -141,3 +141,69 @@ def test_open_meta_includes_scenario_and_zone():
     meta = oez.open_meta_from_gate(gate, action='BUY')
     assert meta.get('scenario', {}).get('scenario')
     assert meta.get('zone')
+
+
+def test_s08_unready_disabled_unknown_are_not_ok():
+    """V3 T08/S08: UNKNOWN / unready / disabled → HOLD_SCENARIO, never ok=True."""
+    # Unready
+    gate = osc.scenario_allows_trigger(
+        'BUY', {'ready': False, 'scenario': 'TREND_UP'}, 'zone')
+    assert gate['ok'] is False
+    assert gate['reason'] == 'HOLD_SCENARIO'
+    assert gate.get('detail') == 'scenario_unready'
+    assert gate.get('ready') is False
+
+    # Missing / non-dict
+    gate2 = osc.scenario_allows_trigger('BUY', None, 'break')
+    assert gate2['ok'] is False
+    assert gate2['reason'] == 'HOLD_SCENARIO'
+
+    # Disabled
+    gate3 = osc.scenario_allows_trigger(
+        'BUY',
+        {'ready': True, 'enabled': False, 'scenario': 'TREND_UP',
+         'entry_hint': 'BUY', 'confidence': 0.8},
+        'zone')
+    assert gate3['ok'] is False
+    assert gate3['reason'] == 'HOLD_SCENARIO'
+    assert gate3.get('detail') == 'scenario_disabled'
+
+    # UNKNOWN primary
+    gate4 = osc.scenario_allows_trigger(
+        'BUY',
+        {'ready': True, 'enabled': True, 'scenario': 'UNKNOWN',
+         'entry_hint': 'WAIT', 'confidence': 0.5},
+        'zone')
+    assert gate4['ok'] is False
+    assert gate4['reason'] == 'HOLD_SCENARIO'
+
+    # CHOP
+    gate5 = osc.scenario_allows_trigger(
+        'SELL',
+        {'ready': True, 'enabled': True, 'scenario': 'CHOP',
+         'entry_hint': 'WAIT', 'confidence': 0.4},
+        'break')
+    assert gate5['ok'] is False
+    assert gate5['reason'] == 'HOLD_SCENARIO'
+
+
+def test_s08_compression_blind_break_holds():
+    sc = {
+        'ready': True, 'enabled': True, 'scenario': 'COMPRESSION',
+        'scenarios': ['COMPRESSION'], 'entry_hint': 'WAIT', 'confidence': 0.5,
+    }
+    gate = osc.scenario_allows_trigger('BUY', sc, 'break')
+    assert gate['ok'] is False
+    assert 'HOLD_SCENARIO' in (gate.get('reason') or '')
+
+
+def test_s09_ready_named_scenario_can_pass_zone():
+    sc = {
+        'ready': True, 'enabled': True, 'scenario': 'TREND_UP',
+        'scenarios': ['TREND_UP'], 'entry_hint': 'BUY', 'confidence': 0.7,
+    }
+    gate = osc.scenario_allows_trigger('BUY', sc, 'zone')
+    assert gate['ok'] is True
+    assert gate['reason'] == 'scenario_ok'
+    assert gate.get('hold') is None
+    assert gate.get('ready') is True

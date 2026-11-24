@@ -480,13 +480,21 @@ def deal_realized(store, deal_id: str, *, currency: str | None = None) -> dict:
     """
     deal = str(deal_id or '').strip()
     matches = []
+    uncertain = False
     for ev in load_events(store):
         if str(ev.get('deal_link') or '') != deal:
             continue
         if currency and str(ev.get('currency') or '').upper() != currency.upper():
             continue
         st = str(ev.get('status') or '')
-        if st in (STATUS_QUARANTINE, STATUS_PENDING, STATUS_ESTIMATE, STATUS_UNVERIFIED):
+        # Never teach from uncertain / unmatched / quarantine / estimate.
+        if st in (STATUS_QUARANTINE, STATUS_PENDING, STATUS_ESTIMATE,
+                  STATUS_UNVERIFIED, STATUS_MATCH_UNCERTAIN, STATUS_UNMATCHED,
+                  STATUS_SOURCE_CONFLICT):
+            if st == STATUS_MATCH_UNCERTAIN:
+                uncertain = True
+            continue
+        if st not in (STATUS_SETTLED, STATUS_SETTLED_ZERO):
             continue
         matches.append(ev)
     if not matches:
@@ -497,6 +505,7 @@ def deal_realized(store, deal_id: str, *, currency: str | None = None) -> dict:
             'status': STATUS_MATCH_UNCERTAIN,
             'events': [],
             'may_teach': False,
+            'uncertain_candidates': bool(uncertain),
         }
     total = sum(int(e['amount_minor']) for e in matches if e.get('amount_minor') is not None)
     ccy = matches[0].get('currency')

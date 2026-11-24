@@ -54,8 +54,10 @@ _UNVERIFIED_SOURCES = frozenset({
 })
 
 # Cash field whitelist — ordered preference, versioned (P08). No invent scan.
+# Capital Funds phone rows often expose cash only as profitLoss / amount.
 _CASH_FIELD_WHITELIST = (
-    'pnl', 'profitAndLoss', 'profit_and_loss', 'realizedPnl', 'realized_pnl',
+    'pnl', 'profitAndLoss', 'profitLoss', 'profit_and_loss',
+    'realizedPnl', 'realized_pnl', 'cash', 'netAmount',
 )
 
 _CURRENCY_SYMBOLS = {

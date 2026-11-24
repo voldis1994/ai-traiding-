@@ -16,8 +16,9 @@ from collections import defaultdict, deque
 from typing import Any, Callable, Awaitable
 
 
-DEFAULT_RPS = 8.0
-DEFAULT_BURST = 10
+# Stay under Capital's 10 req/s with headroom for concurrent clients.
+DEFAULT_RPS = 7.0
+DEFAULT_BURST = 8
 SESSION_POST_MIN_INTERVAL = 1.05
 
 # Lower number = higher priority.
@@ -69,6 +70,15 @@ class CapitalRestManager:
         while self._waiter_heap and self._waiter_heap[0][2].done():
             heapq.heappop(self._waiter_heap)
 
+    def _drop_waiter(self, fut: asyncio.Future) -> None:
+        """Remove a cancelled/abandoned waiter so it cannot block the heap."""
+        if not self._waiter_heap:
+            return
+        alive = [w for w in self._waiter_heap if w[2] is not fut and not w[2].done()]
+        self._waiter_heap = alive
+        heapq.heapify(self._waiter_heap)
+        self.stats['waiter_cancelled'] += 1
+
     async def _acquire_token(self, *, priority: int = PRIORITY_DEFAULT) -> None:
         """Grant tokens in priority order — ORDER always before HISTORY."""
         loop = asyncio.get_running_loop()
@@ -77,31 +87,37 @@ class CapitalRestManager:
             self._waiter_seq += 1
             heapq.heappush(self._waiter_heap, (int(priority), self._waiter_seq, fut))
             self.stats['queued'] += 1
-        while True:
+        try:
+            while True:
+                async with self._lock:
+                    self._refill()
+                    self._purge_done_waiters()
+                    if (
+                        self._tokens >= 1.0
+                        and self._waiter_heap
+                        and self._waiter_heap[0][2] is fut
+                    ):
+                        heapq.heappop(self._waiter_heap)
+                        self._tokens -= 1.0
+                        self._recent.append(self._clock())
+                        self.stats['acquired'] += 1
+                        self.stats[f'prio_{int(priority)}'] += 1
+                        if not fut.done():
+                            fut.set_result(True)
+                        self._grant_event.set()
+                        self._grant_event.clear()
+                        return
+                    need = (
+                        max(0.01, (1.0 - self._tokens) / self.rps)
+                        if self._tokens < 1.0 else 0.01)
+                try:
+                    await asyncio.wait_for(self._grant_event.wait(), timeout=need)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
             async with self._lock:
-                self._refill()
-                self._purge_done_waiters()
-                if (
-                    self._tokens >= 1.0
-                    and self._waiter_heap
-                    and self._waiter_heap[0][2] is fut
-                ):
-                    heapq.heappop(self._waiter_heap)
-                    self._tokens -= 1.0
-                    self._recent.append(self._clock())
-                    self.stats['acquired'] += 1
-                    self.stats[f'prio_{int(priority)}'] += 1
-                    if not fut.done():
-                        fut.set_result(True)
-                    # Wake next waiter if tokens remain.
-                    self._grant_event.set()
-                    self._grant_event.clear()
-                    return
-                need = max(0.01, (1.0 - self._tokens) / self.rps) if self._tokens < 1.0 else 0.01
-            try:
-                await asyncio.wait_for(self._grant_event.wait(), timeout=need)
-            except asyncio.TimeoutError:
-                pass
+                self._drop_waiter(fut)
+            raise
 
     def calls_per_second(self, window: float = 1.0) -> float:
         now = self._clock()

@@ -335,3 +335,215 @@ def test_main_and_hub_expose_parallel_light_heavy():
     assert 'await engine.sync()' not in light_src
     legacy_light = inspect.getsource(main_mod._legacy_light_loop)
     assert 'await engine.poll()' not in legacy_light
+
+
+def test_learn_correction_is_compensatory_not_full_rewind():
+    """P0: correcting A must not wipe later B/C ΔW; APPLIED only after reteach."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        store.upsert_trade({
+            'dealId': 'A', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade('A', 100, 5.0, currency='GBP', source='capital')
+        store.upsert_trade({
+            'dealId': 'B', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade('B', 101, 1.0, currency='GBP', source='broker')
+        # Deal A taught from bad source (capital/UPL path).
+        learn_attempt.claim(store, 'A', source='broker', pnl=5.0)
+        learn_attempt.transition(store, 'A', learn_attempt.STATE_RUNNING)
+        learn_attempt.transition(store, 'A', learn_attempt.STATE_APPLIED)
+        learn_attempt.transition(
+            store, 'A', learn_attempt.STATE_COMMITTED, pnl=5.0, source='broker')
+        att_a = dict(learn_attempt.get_attempt(store, 'A'))
+        att_a['source'] = 'capital'
+        att_a['at'] = '2026-01-01T00:00:00.000000Z'
+        store.set(learn_attempt._key('A'), att_a)
+        store.set('learned_trade:A', {
+            'learned': True, 'source': 'capital', 'pnl': 5.0,
+            'at': '2026-01-01T00:00:00.000000Z',
+        })
+        # Later deal B correctly committed after A.
+        learn_attempt.claim(store, 'B', source='broker', pnl=1.0)
+        learn_attempt.transition(store, 'B', learn_attempt.STATE_RUNNING)
+        learn_attempt.transition(store, 'B', learn_attempt.STATE_APPLIED)
+        learn_attempt.transition(
+            store, 'B', learn_attempt.STATE_COMMITTED, pnl=1.0, source='broker')
+        att_b = dict(learn_attempt.get_attempt(store, 'B'))
+        att_b['at'] = '2026-01-01T02:00:00.000000Z'
+        store.set(learn_attempt._key('B'), att_b)
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': -1.0, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'A'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='A', transaction_id='tx-a-corr')
+        info = learn_correction.needs_correction(store, 'A')
+        assert info is not None
+        flagged = learn_correction.flag_for_replay(store, info['deal_id'], info)
+        assert flagged['status'] == 'QUEUED'
+        assert flagged.get('mode') == 'compensatory'
+        # Newer committed exists → full rewind refused.
+        assert learn_correction._newer_committed_exists(
+            store, 'A', '2026-01-01T00:00:00.000000Z') is True
+
+
+def test_match_uncertain_never_teaches():
+    """P0: MATCH_UNCERTAIN / UNMATCHED excluded from deal_realized teach set."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cash_ledger.append_event(store, cash_ledger.cash_event(
+            account_id='1', environment='live',
+            transaction_id='u1', transaction_type='TRADE',
+            close_proof=True, status=cash_ledger.STATUS_MATCH_UNCERTAIN,
+            amount_minor=100, currency='GBP', deal_link='U1'))
+        realized = cash_ledger.deal_realized(store, 'U1')
+        assert realized.get('may_teach') is False
+        assert realized.get('amount_minor') is None
+
+
+def test_desk_keeps_usd_not_relabeled_gbp():
+    """P0: Desk must not force ccy=acct (USD → £)."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
+        store.upsert_trade({
+            'dealId': 'USD1', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade(
+            'USD1', 101, 10.0, currency='USD', source='broker')
+        from app.runtime_hub import RuntimeHub
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        recent = {t['deal_id']: t for t in stats.get('recent_trades') or []}
+        assert 'USD1' in recent
+        assert recent['USD1']['pnl_currency'] == 'USD'
+        # Foreign cash must not inflate GBP signed sum.
+        assert stats.get('realized_pnl') in (None, 0, 0.0)
+        assert float(stats.get('pnl_by_currency', {}).get('USD') or 0) == 0.0
+
+
+def test_unmatched_funds_do_not_enter_broker_journal():
+    """P0: UNMATCHED cash stays in ledger — not inserted as broker journal."""
+    async def run():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            e.attach(broker)
+            e.account = {
+                'accounts': [{'preferred': True, 'currency': 'GBP',
+                              'accountId': '1'}]}
+            store.set('capital_account_id', '1')
+            store.set('capital_environment', 'live')
+            orphan = {
+                'pnl': 3.33, 'currency': 'GBP',
+                'transactionType': 'TRADE',
+                'transactionId': 'orphan-tx-99',
+                'reference': 'orphan-tx-99',
+            }
+            n = e._apply_capital_funds_rows([orphan])
+            assert n == 0  # no journal insert
+            row = store.db.execute(
+                "SELECT COUNT(*) FROM trades WHERE pnl=?", (3.33,)).fetchone()
+            assert int(row[0]) == 0
+            events = cash_ledger.load_events(store)
+            unmatched = [
+                ev for ev in events
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]
+            assert unmatched
+
+    asyncio.run(run())
+
+
+def test_complete_requires_learn_validate_proof():
+    """P0: COMPLETE only after LEARN + real VALIDATE (not after journal alone)."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cyc = cycle_runtime.begin_analysis_cycle(store, account_id='a')
+        cyc = cycle_runtime.mark_perceived(store, cyc, snapshot_id='b')
+        cyc = cycle_runtime.mark_analyzed(store, cyc)
+        cyc = cycle_runtime.decide(store, cyc, 'BUY', reason='edge')
+        cyc = cycle_runtime.mark_executed(store, cyc, deal_id='C1', deal_ref='R')
+        cycle_runtime.bind_deal(store, cyc, 'C1')
+        cyc = cycle_runtime.load_by_deal(store, 'C1')
+        cyc = cycle_runtime.mark_manage_tick(store, cyc, upl=0.1)
+        cyc = cycle_runtime.mark_closed(store, cyc, close_proof='ok')
+        cyc = cycle_runtime.mark_settled(
+            store, cyc, funds_proof={'pnl': 1.0, 'source': 'broker'}, pending=False)
+        # Journal saved / settle done — still incomplete without learn proof.
+        assert cyc.get('complete') is not True
+        done = cycle_runtime.mark_learned(
+            store, cyc, model_version='9',
+            validate_proof={
+                'deal_id': 'C1', 'pnl_source': 'broker',
+                'taught': True, 'journal_persisted': True,
+                'teachers_settled': True, 'learn_committed': True,
+                'adaptive_done': True, 'bracket_done': True,
+            })
+        assert done['complete'] is True
+
+
+def test_work_queue_requeues_stale_running_and_respects_backoff():
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        work_queue.ensure_schema(store)
+        wid = work_queue.enqueue(
+            store, work_queue.KIND_SETTLE_PNL,
+            {'deal_id': 's1'}, dedupe_key='settle:s1')
+        due = work_queue.claim_due(
+            store, kinds=[work_queue.KIND_SETTLE_PNL], limit=1)
+        assert due and due[0]['id'] == wid
+        # Force stale updated_at.
+        store.db.execute(
+            "UPDATE work_queue SET updated_at=? WHERE id=?",
+            ('2000-01-01T00:00:00.000000Z', wid))
+        store.db.commit()
+        n = work_queue.requeue_stale_running(store, older_than_s=1.0)
+        assert n == 1
+        row = store.db.execute(
+            'SELECT status,last_error FROM work_queue WHERE id=?',
+            (wid,)).fetchone()
+        assert row[0] in (work_queue.STATUS_FAILED, work_queue.STATUS_DEAD)
+        assert 'stale_running' in str(row[1])
+        assert work_queue.deal_in_backoff(store, 's1') is True
+
+
+def test_rest_priority_heap_drops_cancelled_waiter():
+    async def run():
+        m = capital_rest.CapitalRestManager(
+            identity='cancel-t', rps=1.0, burst=1)
+        assert m.burst <= 8
+        assert capital_rest.DEFAULT_BURST <= 8
+        assert capital_rest.DEFAULT_RPS <= 7.0
+
+        gate = asyncio.Event()
+
+        async def slow():
+            await gate.wait()
+
+            class Resp:
+                status_code = 200
+
+            return Resp()
+
+        # Occupy the only token with a history-priority call.
+        t_hist = asyncio.create_task(
+            m.request('GET', '/api/v1/history/transactions',
+                      do_request=slow, priority=capital_rest.PRIORITY_HISTORY))
+        await asyncio.sleep(0.05)
+        # Cancel a waiting high-priority acquire mid-queue.
+        t_order = asyncio.create_task(
+            m._acquire_token(priority=capital_rest.PRIORITY_ORDER))
+        await asyncio.sleep(0.05)
+        t_order.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t_order
+        assert int(m.stats.get('waiter_cancelled') or 0) >= 1
+        # Remaining waiter must still be grantable (heap not jammed).
+        gate.set()
+        await t_hist
+        await m._acquire_token(priority=capital_rest.PRIORITY_ACCOUNT)
+
+    asyncio.run(run())

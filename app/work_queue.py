@@ -186,6 +186,41 @@ def diagnostics(store) -> dict[str, Any]:
     }
 
 
+def requeue_stale_running(store, *, older_than_s: float = 120.0) -> int:
+    """Crash recovery: RUNNING jobs older than threshold → PENDING with backoff."""
+    ensure_schema(store)
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(seconds=float(older_than_s))).strftime(
+        '%Y-%m-%dT%H:%M:%S.%fZ')
+    rows = store.db.execute(
+        "SELECT id,attempts FROM work_queue WHERE status=? AND updated_at<=?",
+        (STATUS_RUNNING, cutoff)).fetchall()
+    n = 0
+    for wid, attempts in rows:
+        fail(store, int(wid), 'stale_running_recovered',
+             attempts=int(attempts or 0))
+        n += 1
+    return n
+
+
+def deal_in_backoff(store, deal_id: str) -> bool:
+    """True when durable settle job for deal is not yet due (respect backoff)."""
+    ensure_schema(store)
+    now = _utc_now()
+    row = store.db.execute(
+        "SELECT status,next_attempt_at FROM work_queue "
+        "WHERE dedupe_key=? AND status IN ('PENDING','FAILED','RUNNING') LIMIT 1",
+        ('settle:' + str(deal_id),)).fetchone()
+    if not row:
+        return False
+    status, nxt = row[0], row[1]
+    if status == STATUS_RUNNING:
+        return True  # already claimed this cycle
+    if nxt and str(nxt) > now:
+        return True
+    return False
+
+
 def migrate_legacy_pending_pnl(store) -> int:
     """Move legacy pending_broker_pnl_deals JSON into durable queue once."""
     ensure_schema(store)

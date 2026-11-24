@@ -55,6 +55,7 @@ class FundsBroker:
 
 
 def test_mirror_inserts_orphan_capital_funds_closes():
+    """P0: orphan Funds → UNMATCHED ledger; no fake broker journal deals."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -63,6 +64,8 @@ def test_mirror_inserts_orphan_capital_funds_closes():
             e.mandate = {'epic': 'GOLD', 'size': '0.1'}
             e.account = {'accounts': [
                 {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.set('capital_account_id', '1')
+            store.set('capital_environment', 'live')
             broker = FundsBroker([
                 {'reference': 'F1', 'instrumentName': 'Gold',
                  'pnl': -0.27, 'currency': 'GBP', 'size': -0.1,
@@ -75,17 +78,21 @@ def test_mirror_inserts_orphan_capital_funds_closes():
             ])
             e.attach(broker)
             n = await e._mirror_capital_funds_closes()
-            assert n == 2
-            rows = store.trades(10)
-            assert len(rows) == 2
-            pnls = {round(float(r['pnl']), 2) for r in rows}
-            assert pnls == {-0.27, 0.33}
-            assert all(r['pnl_source'] == 'broker' for r in rows)
-            assert all(str(r['deal_id']).startswith('cap:') for r in rows)
-            # Idempotent — second pass must not duplicate.
+            assert n == 0  # no AI journal insert
+            assert len(store.trades(10)) == 0
+            from app import cash_ledger
+            unmatched = [
+                ev for ev in cash_ledger.load_events(store)
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]
+            assert len(unmatched) == 2
+            minors = {int(ev['amount_minor']) for ev in unmatched}
+            assert minors == {-27, 33}
+            # Idempotent — second pass must not duplicate ledger cash_ids.
             n2 = await e._mirror_capital_funds_closes()
             assert n2 == 0
-            assert len(store.trades(20)) == 2
+            assert len([
+                ev for ev in cash_ledger.load_events(store)
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]) == 2
     asyncio.run(scenario())
 
 
@@ -340,6 +347,7 @@ def test_backfill_analyses_all_journal_closes_not_just_last():
 
 
 def test_trade_stats_shows_mirrored_funds_rows():
+    """Desk shows UNMATCHED account £ from ledger — not invented journal deals."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -347,6 +355,8 @@ def test_trade_stats_shows_mirrored_funds_rows():
             e.mandate = {'epic': 'GOLD'}
             e.account = {'accounts': [
                 {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.set('capital_account_id', '1')
+            store.set('capital_environment', 'live')
             broker = FundsBroker([{
                 'reference': 'FX', 'instrumentName': 'Gold',
                 'pnl': -0.18, 'currency': 'GBP', 'size': 0.1,
@@ -354,14 +364,16 @@ def test_trade_stats_shows_mirrored_funds_rows():
             }])
             e.attach(broker)
             await e._mirror_capital_funds_closes()
+            assert len(store.trades(10)) == 0
             from app.runtime_hub import RuntimeHub
             hub = RuntimeHub.__new__(RuntimeHub)
             stats = hub._trade_stats(store, 'GBP')
             assert stats['cash_trades'] >= 1
-            assert stats['closed_trades'] >= 1
             assert any(abs(float(t['pnl']) - (-0.18)) < 1e-9
                        for t in stats['recent_trades'])
             assert all(t['pnl_source'] == 'broker'
+                       for t in stats['recent_trades'])
+            assert any(t.get('unmatched_cash') or str(t.get('deal_id','')).startswith('unmatched:')
                        for t in stats['recent_trades'])
     asyncio.run(scenario())
 
@@ -417,6 +429,8 @@ def test_mirror_accepts_trade_row_profit_loss_field():
             e.mandate = {'epic': 'GOLD', 'size': '0.1'}
             e.account = {'accounts': [
                 {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.set('capital_account_id', '1')
+            store.set('capital_environment', 'live')
             broker = FundsBroker([
                 {'reference': 'FPL1', 'instrumentName': 'Gold',
                  'note': 'Trade closed', 'transactionType': 'TRADE',
@@ -429,11 +443,14 @@ def test_mirror_accepts_trade_row_profit_loss_field():
             ])
             e.attach(broker)
             n = await e._mirror_capital_funds_closes()
-            assert n == 2
-            pnls = {round(float(r['pnl']), 2) for r in store.trades(10)}
-            assert pnls == {-1.55, 0.47}
-            assert all(r['pnl_source'] == 'broker' for r in store.trades(10))
-            assert all(r['pnl_currency'] == 'GBP' for r in store.trades(10))
+            assert n == 0  # orphans stay out of AI journal
+            from app import cash_ledger
+            unmatched = [
+                ev for ev in cash_ledger.load_events(store)
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]
+            assert len(unmatched) == 2
+            minors = {int(ev['amount_minor']) for ev in unmatched}
+            assert minors == {-155, 47}
     asyncio.run(scenario())
 
 
@@ -457,23 +474,31 @@ def test_mirror_commits_24h_before_slow_history_pages():
                         last_period=last_period, from_time=from_time,
                         to_time=to_time, tx_type=tx_type)
 
+            store.set('capital_account_id', '1')
+            store.set('capital_environment', 'live')
             broker = SlowHistoryBroker([{
                 'reference': 'FAST1', 'instrumentName': 'Gold',
                 'pnl': -0.42, 'currency': 'GBP', 'size': -0.1,
                 'dateUtc': '2026-11-23T21:40:00Z',
             }])
             e.attach(broker)
-            # days=1 never touches history pages — Desk gets the close.
+            # days=1 never touches history pages — ledger gets UNMATCHED cash.
             n = await e._mirror_capital_funds_closes(days=1)
-            assert n == 1
-            assert len(store.trades(5)) == 1
-            assert store.trades(5)[0]['pnl'] == pytest.approx(-0.42)
+            assert n == 0
+            from app import cash_ledger
+            unmatched = [
+                ev for ev in cash_ledger.load_events(store)
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]
+            assert len(unmatched) == 1
+            assert int(unmatched[0]['amount_minor']) == -42
             # Full mirror: 24h commits, then history sleep is cancelled.
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     e._mirror_capital_funds_closes(days=7), timeout=0.3)
-            # Prior 24h row remains.
-            assert len(store.trades(5)) == 1
+            # Prior 24h ledger cash remains (idempotent).
+            assert len([
+                ev for ev in cash_ledger.load_events(store)
+                if ev.get('status') == cash_ledger.STATUS_UNMATCHED]) == 1
     asyncio.run(scenario())
 
 

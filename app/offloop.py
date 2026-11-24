@@ -21,9 +21,9 @@ _CPU_LOCK = threading.Lock()  # serialize brain.tick / weight mutation across wo
 def _pool() -> concurrent.futures.ThreadPoolExecutor:
     global _EXECUTOR
     if _EXECUTOR is None:
-        # Single worker avoids concurrent brain/numpy mutation races.
+        # Few workers; CPU_LOCK serializes brain mutation across clients.
         _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix='nta-offloop')
+            max_workers=2, thread_name_prefix='nta-offloop')
     return _EXECUTOR
 
 

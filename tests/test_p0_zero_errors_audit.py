@@ -355,14 +355,24 @@ def test_fuzzy_cash_not_double_bound_across_pending():
                 {'deal_id':'a1','exit_level':2649,'attempts':1},
                 {'deal_id':'b1','exit_level':2649,'attempts':1},
             ])
-            # Single TRADE row — only one pending may consume it.
-            broker.tx=[{'reference':'ZZ99','instrumentName':'Gold Spot',
+            # Exact dealId only — no fuzzy bind of orphan reference to pending.
+            broker.tx=[{'dealId':'a1','reference':'ZZ99','instrumentName':'Gold Spot',
                         'size':'0.02','direction':'SELL','pnl':0.40,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             rows={t['deal_id']:t for t in store.trades(10)}
             cashed=[r for r in rows.values() if r.get('pnl_source')=='broker']
             assert len(cashed)==1
+            assert cashed[0]['deal_id']=='a1'
             assert cashed[0]['pnl']==pytest.approx(0.40)
+            # Orphan Funds without dealId must NOT bank onto the other pending.
+            broker.tx=[{'reference':'ORPHAN','instrumentName':'Gold Spot',
+                        'size':'0.02','pnl':0.99,'currency':'GBP'}]
+            store.set('pending_broker_pnl_deals',
+                      [{'deal_id':'b1','exit_level':2649,'attempts':1}])
+            await e._retry_pending_broker_pnl()
+            rows2={t['deal_id']:t for t in store.trades(10)}
+            b1=rows2['b1']
+            assert not (b1.get('pnl_source')=='broker' and abs(float(b1.get('pnl') or 0)-0.99)<1e-9)
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.40)
     asyncio.run(scenario())
@@ -385,14 +395,15 @@ def test_fuzzy_rejects_zero_open_trade_poison():
             e._mark_trade_learned('z1',mode='ticks',pnl=None,source='ticks_only')
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'z1','exit_level':2649,'attempts':2}])
+            # Orphan £0 reference must not fuzzy-bank onto pending z1.
             broker.tx=[{'reference':'OPEN0','instrumentName':'Gold Spot',
                         'size':'0.02','pnl':0.0,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             assert store.get('broker_cash_banked:z1') in (None,False,{})
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==0.0
-            # Later real close cash must still bank.
-            broker.tx=[{'reference':'CLOSE1','instrumentName':'Gold Spot',
+            # Later exact-deal Funds £ must still bank.
+            broker.tx=[{'dealId':'z1','reference':'CLOSE1','instrumentName':'Gold Spot',
                         'size':'0.02','pnl':-0.22,'currency':'GBP'}]
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'z1','exit_level':2649,'attempts':3}])

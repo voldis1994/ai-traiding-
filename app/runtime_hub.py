@@ -388,11 +388,12 @@ class RuntimeHub:
         # Item 5: Cash Ledger is authoritative for realized £; journal is derived.
         ledger_by_deal={}
         ledger_snap=None
+        acct_id=str(store.get('capital_account_id') or 'live')
+        ccy_l=acct or 'GBP'
+        env_l=str(store.get('capital_environment') or 'live').lower()
         try:
             from . import cash_ledger
             from .realized_cash import from_minor
-            acct_id=str(store.get('capital_account_id') or 'live')
-            ccy_l=acct or 'GBP'
             ledger_snap=cash_ledger.consumer_snapshot(
                 store,acct_id,currency=ccy_l)
             for ev in cash_ledger.load_events(store):
@@ -400,24 +401,33 @@ class RuntimeHub:
                 st=str(ev.get('status') or '')
                 if not deal or ev.get('amount_minor') is None:
                     continue
+                # Isolate by account + environment; never mix LIVE/DEMO.
+                ev_acct=str(ev.get('account_id') or '')
+                if ev_acct and ev_acct!=acct_id:
+                    continue
+                ev_env=str(ev.get('environment') or '').lower()
+                if ev_env and ev_env!=env_l:
+                    continue
                 # P0-03: only verified SETTLED / SETTLED_ZERO — never MATCH_UNCERTAIN.
                 if st not in (cash_ledger.STATUS_SETTLED,cash_ledger.STATUS_SETTLED_ZERO):
                     continue
+                ev_ccy=str(ev.get('currency') or '').upper() or ccy_l
+                # Do not fold foreign-currency cash into account GBP sum.
+                if acct and ev_ccy and ev_ccy!=acct:
+                    continue
                 try:
-                    major=float(from_minor(int(ev['amount_minor']),
-                                           str(ev.get('currency') or ccy_l)))
+                    major=float(from_minor(int(ev['amount_minor']),ev_ccy))
                 except Exception:
                     continue
                 # Sum multiple cash rows per deal (fees/partials) — never overwrite.
                 prev=ledger_by_deal.get(deal)
                 if prev:
                     major=float(prev['pnl'])+major
-                    # Prefer SETTLED_ZERO only when aggregate is exactly zero.
                     st=(cash_ledger.STATUS_SETTLED_ZERO if abs(major)<1e-12
                         else cash_ledger.STATUS_SETTLED)
                 ledger_by_deal[deal]={
                     'pnl':major,
-                    'pnl_currency':str(ev.get('currency') or ccy_l).upper(),
+                    'pnl_currency':ev_ccy,
                     'pnl_source':'broker',
                     'ledger_status':st,
                 }
@@ -438,6 +448,42 @@ class RuntimeHub:
                 t['pnl_currency']=ledger_by_deal[deal]['pnl_currency']
                 t['pnl_source']='broker'
                 t['ledger_status']=ledger_by_deal[deal]['ledger_status']
+        # UNMATCHED account cash (no deal_link yet) — show as ledger rows, never
+        # invent AI journal deals. Separates account £ from specific AI results.
+        unmatched_rows=[]
+        try:
+            from . import cash_ledger as _cl
+            from .realized_cash import from_minor as _fm
+            for ev in _cl.load_events(store):
+                if str(ev.get('status') or '')!=_cl.STATUS_UNMATCHED:
+                    continue
+                if ev.get('amount_minor') is None:
+                    continue
+                ev_acct=str(ev.get('account_id') or '')
+                if ev_acct and ev_acct!=acct_id:
+                    continue
+                ev_env=str(ev.get('environment') or '').lower()
+                if ev_env and ev_env!=env_l:
+                    continue
+                ev_ccy=str(ev.get('currency') or '').upper() or ccy_l
+                try:
+                    major=float(_fm(int(ev['amount_minor']),ev_ccy))
+                except Exception:
+                    continue
+                cid=str(ev.get('cash_id') or ev.get('transaction_id') or '')
+                unmatched_rows.append({
+                    'deal_id':'unmatched:'+cid[:40],
+                    'epic':None,'size':None,'direction':None,
+                    'opened':ev.get('effective_at'),
+                    'closed':ev.get('effective_at') or ev.get('observed_at'),
+                    'entry':None,'exit':None,
+                    'pnl':major,'pnl_currency':ev_ccy,
+                    'pnl_source':'broker',
+                    'ledger_status':_cl.STATUS_UNMATCHED,
+                    'unmatched_cash':True,
+                })
+        except Exception:
+            unmatched_rows=[]
         open_n=int(store.db.execute(
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
@@ -471,7 +517,7 @@ class RuntimeHub:
             except Exception:
                 return True
 
-        for t in closed_rows:
+        for t in list(closed_rows)+list(unmatched_rows):
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
                 proxy_n+=1
@@ -481,12 +527,16 @@ class RuntimeHub:
             if t.get('pnl') is not None:
                 try:val=float(t['pnl'])
                 except (TypeError,ValueError):val=None
-            # Broker / legacy cash → account currency when known.
-            if kind=='cash' and acct:
-                ccy=acct
-            else:
-                ccy=raw_ccy or acct or '?'
+            # P0: never relabel proven USD as GBP. Use journal/ledger tag;
+            # account currency only fills blanks.
+            ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
+            # Foreign-currency cash is visible but not summed into account £.
+            if kind=='cash' and acct and raw_ccy and raw_ccy!=acct:
+                if len(recent)<80:
+                    recent.append({**row,'pnl_source':t.get('pnl_source') or 'broker',
+                                   'foreign_currency':True})
+                continue
             if val is not None and kind=='cash':
                 # P0-08: verified broker £0.00 is SETTLED (scratch), not pending.
                 # Only blank/missing amounts stay pending — exact zero is cash.

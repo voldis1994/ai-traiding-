@@ -1,13 +1,13 @@
 """Identify and controlled-correct trades learned from bad cash (item 8).
 
-When a later Funds correction flips sign or material amount vs the taught
-source, restore pre-learn neural weights (when checkpoint exists) and re-teach
-from verified Cash Ledger £. Simple retrain without undo is not enough.
+Never restore a pre-deal-A weight checkpoint after deals B/C have correctly
+trained — that would wipe good ΔW. Instead: compensatory re-teach from
+verified Cash Ledger £ (opposite of the bad teach when possible), and only
+mark APPLIED when the re-teach actually commits.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from . import learn_attempt as la
@@ -29,6 +29,29 @@ def taught_meta(store, deal_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _newer_committed_exists(store, deal_id: str, after_at: str | None) -> bool:
+    """True when another deal COMMITTED learn after this deal's teach time."""
+    if not after_at:
+        return True  # unknown → refuse full rewind
+    try:
+        rows = store.db.execute(
+            "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
+            "ORDER BY closed DESC LIMIT 80").fetchall()
+    except Exception:
+        return True
+    for (other,) in rows:
+        oid = str(other)
+        if oid == str(deal_id):
+            continue
+        att = la.get_attempt(store, oid)
+        if not att or att.get('state') != la.STATE_COMMITTED:
+            continue
+        at = str(att.get('at') or '')
+        if at and at > str(after_at):
+            return True
+    return False
+
+
 def needs_correction(store, deal_id: str) -> dict[str, Any] | None:
     """Compare taught pnl/source vs cash_ledger truth."""
     meta = taught_meta(store, deal_id)
@@ -47,7 +70,7 @@ def needs_correction(store, deal_id: str) -> dict[str, Any] | None:
                 'taught_source': taught_src,
                 'taught_pnl': taught_pnl,
                 'ledger_status': realized.get('status'),
-                'checkpoint': meta.get('checkpoint'),
+                'taught_at': meta.get('at'),
             }
         return None
     ccy = realized.get('currency') or 'GBP'
@@ -75,7 +98,7 @@ def needs_correction(store, deal_id: str) -> dict[str, Any] | None:
             'taught_pnl': taught_f,
             'ledger_pnl': ledger_pnl,
             'ledger_status': realized.get('status'),
-            'checkpoint': meta.get('checkpoint'),
+            'taught_at': meta.get('at'),
         }
     return None
 
@@ -86,10 +109,8 @@ def flag_for_replay(store, deal_id: str, info: dict[str, Any]) -> dict:
     payload = dict(info)
     payload['at'] = _utc_now()
     payload['status'] = 'QUEUED'
-    # Preserve weight checkpoint for undo before re-teach.
+    payload['mode'] = 'compensatory'  # never full weight rewind by default
     att = la.get_attempt(store, deal_id)
-    if att and att.get('checkpoint') and not payload.get('checkpoint'):
-        payload['checkpoint'] = att.get('checkpoint')
     store.set(key, payload)
     if att and att.get('state') == la.STATE_COMMITTED:
         la.transition(
@@ -100,40 +121,18 @@ def flag_for_replay(store, deal_id: str, info: dict[str, Any]) -> dict:
         store.set('learned_trade:' + str(deal_id), {
             'claimed': False, 'learned': False, 'at': _utc_now(),
             'correction': True, 'prev': att,
-            'checkpoint': payload.get('checkpoint'),
         })
+        # Allow re-teach past teachers_settled gate.
+        store.set('teachers_settled:' + str(deal_id), None)
     store.event('learning', 'Learn correction queued', payload)
     return payload
 
 
-def _undo_weights(engine, checkpoint: Any) -> bool:
-    """Restore neural weights from pre-learn checkpoint when available."""
-    if not checkpoint or engine is None:
-        return False
-    path = None
-    if isinstance(checkpoint, dict):
-        path = checkpoint.get('weights_path') or checkpoint.get('path')
-    elif isinstance(checkpoint, (str, Path)):
-        path = str(checkpoint)
-    if not path:
-        return False
-    brain = getattr(engine, 'brain', None)
-    if brain is None or not hasattr(brain, 'restore_weights'):
-        return False
-    try:
-        ok = bool(brain.restore_weights(path))
-        if ok:
-            engine.store.event('learning', 'Bad-learn weights undone from checkpoint',
-                               {'path': str(path)})
-        return ok
-    except Exception as exc:
-        engine.store.event('warning', 'Weight undo failed',
-                           {'type': type(exc).__name__, 'path': str(path)})
-        return False
-
-
 def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
-    """Undo bad weights (if checkpoint) and re-teach from ledger cash."""
+    """Compensatory re-teach from ledger — never wipe later correct ΔW.
+
+    APPLIED only when `_learn_closed_trade` actually commits a new learn.
+    """
     store = engine.store
     applied = []
     try:
@@ -152,32 +151,67 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
         realized = cash_ledger.deal_realized(store, str(deal_id))
         if not realized.get('may_teach') or realized.get('amount_minor') is None:
             continue
-        # 1) Undo prior incorrect ΔW when we have a checkpoint.
-        undone = _undo_weights(engine, flag.get('checkpoint'))
+        if str(realized.get('status') or '') not in (
+                cash_ledger.STATUS_SETTLED, cash_ledger.STATUS_SETTLED_ZERO):
+            continue
         ccy = realized.get('currency') or engine._account_currency() or 'GBP'
         try:
             pnl = float(from_minor(int(realized['amount_minor']), ccy))
         except Exception:
             continue
-        # 2) Re-teach from verified Funds £.
+        # Refuse full weight restore when newer correct learns exist.
+        taught_at = flag.get('taught_at')
+        if _newer_committed_exists(store, str(deal_id), taught_at):
+            flag = dict(flag)
+            flag['mode'] = 'compensatory'
+            flag['rewind_refused'] = 'newer_committed_exists'
+        # Clear gates that would skip re-teach.
+        store.set('teachers_settled:' + str(deal_id), None)
+        store.set('learned_trade:' + str(deal_id), {
+            'claimed': False, 'learned': False, 'at': _utc_now(),
+            'correction': True,
+        })
         conf = {
             'profit': pnl, 'pnl_currency': ccy, 'pnl_source': 'broker',
             'source': 'learn_correction', 'level': None,
+            'correction': True,
         }
+        before = la.get_attempt(store, str(deal_id))
+        before_state = (before or {}).get('state')
         try:
             engine._learn_closed_trade(str(deal_id), conf)
         except Exception as exc:
             store.event('warning', 'Learn correction re-teach failed',
                         {'deal_id': deal_id, 'type': type(exc).__name__})
+            flag = dict(flag)
+            flag['status'] = 'FAILED'
+            flag['error'] = type(exc).__name__
+            flag['at'] = _utc_now()
+            store.set(key, flag)
             continue
+        after = la.get_attempt(store, str(deal_id))
+        committed = bool(after and after.get('state') == la.STATE_COMMITTED)
+        # Also accept teachers_settled if neural claim was scratch-skipped but
+        # ledger cash teachers ran.
+        teachers = store.get('teachers_settled:' + str(deal_id))
+        ok = committed or (
+            isinstance(teachers, dict)
+            and teachers.get('source') in ('broker', 'cash_ledger', 'funds')
+            and before_state != la.STATE_COMMITTED)
         flag = dict(flag)
-        flag['status'] = 'APPLIED'
-        flag['applied_at'] = _utc_now()
-        flag['undone'] = undone
-        flag['ledger_pnl'] = pnl
+        if ok:
+            flag['status'] = 'APPLIED'
+            flag['applied_at'] = _utc_now()
+            flag['ledger_pnl'] = pnl
+            flag['committed'] = committed
+            applied.append(flag)
+            store.event('learning', 'Learn correction applied', flag)
+        else:
+            flag['status'] = 'FAILED'
+            flag['error'] = 'reteach_did_not_commit'
+            flag['at'] = _utc_now()
+            store.event('warning', 'Learn correction did not commit', flag)
         store.set(key, flag)
-        applied.append(flag)
-        store.event('learning', 'Learn correction applied', flag)
     return applied
 
 
@@ -208,19 +242,18 @@ def recover_incomplete_on_boot(store) -> list[dict]:
     try:
         from . import work_queue
         work_queue.ensure_schema(store)
+        work_queue.requeue_stale_running(store)
         work_queue.enqueue(
             store, work_queue.KIND_LEARN_RECOVERY,
             {'scan': True}, dedupe_key='learn_recovery:boot', delay_s=0.5)
     except Exception:
         pass
-    # Pending settle list.
     pending = list(store.get('pending_broker_pnl_deals') or [])
     deal_ids = set()
     for item in pending:
         deal = str(item.get('deal_id') if isinstance(item, dict) else item)
         if deal:
             deal_ids.add(deal)
-    # Also scan recent closed trades for in-flight learn attempts.
     try:
         rows = store.db.execute(
             "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
@@ -229,7 +262,6 @@ def recover_incomplete_on_boot(store) -> list[dict]:
             deal_ids.add(str(deal_id))
     except Exception:
         pass
-    # Correction-queued deals.
     for deal in list(deal_ids):
         corr = store.get('learn_correction:' + deal)
         if isinstance(corr, dict) and corr.get('status') == 'QUEUED':

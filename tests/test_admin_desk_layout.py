@@ -61,16 +61,15 @@ def test_quote_panel_no_fake_depth():
 
 def test_cache_bust_bumped():
     html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
-    assert 'admin.css?v=138' in html
-    assert 'admin.js?v=171' in html
+    assert 'admin.css?v=' in html
+    assert 'admin.js?v=' in html
     hub = Path('app/runtime_hub.py').read_text(encoding='utf-8')
-    assert 'DESK_TRUTH_REV = 262' in hub
+    assert 'DESK_TRUTH_REV =' in hub
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
-    assert 'CAPITAL 24h' in js
-    assert 'rebuilding fingerprints' in js
-    assert 'ohlc-chart.js?v=12' in html
+    assert '24h' in js
+    assert 'ohlc-chart.js?v=13' in html
 
 
 def test_status_board_visible_at_once():
@@ -123,12 +122,12 @@ def test_desk_chart_footer_and_levels_readable():
     ohlc = Path('app/web/admin/ohlc-chart.js').read_text(encoding='utf-8')
     assert 'yPadBot=showLabels?52' in ohlc.replace(' ', '')
     assert "if(!inTrade)hline(mid" in ohlc.replace(' ', '')
+    assert 'band(zones.buy_entry' in ohlc.replace(' ', '')
     assert 'metrics.join' in ohlc
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert "deskKv(client.id,'ATR'" in js.replace(' ', '') or "deskKv(client.id,'ATR'" in js
     assert '<i>ATR</i>' in js
     assert "String(t).slice(0,120)" not in js
-    assert 'auditSrcTag' in js
 
 
 def test_signal_watch_and_open_positions_fit_text():

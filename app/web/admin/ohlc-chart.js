@@ -74,13 +74,13 @@ function drawOhlcStructure(canvas,view,opts){
   const br=view.swing_brackets||{};
   const openEarly=(view.open_levels||[]).filter(p=>p&&(p.entry||p.stop||p.profit));
   const scaledInTrade=openEarly.length>0;
-  // In a live trade, scale to candles + position levels only — prospective
-  // swing/zone lines were collapsing GOLD into a hairline mess.
+  // Always include Demand/Supply boxes in Y-scale (near-tape). In-trade still
+  // shows zones dimmed — operator asked why zones disappeared entirely.
+  for(const z of [zones.buy_entry,zones.sell_entry,zones.support,zones.resistance]){
+    if(!z)continue;
+    expand(z.lo);expand(z.hi);
+  }
   if(!scaledInTrade){
-    for(const z of [zones.support,zones.resistance,zones.buy_entry,zones.sell_entry]){
-      if(!z)continue;
-      expand(z.lo);expand(z.hi);
-    }
     for(const k of ['stop_level','profit_level','swing_hi','swing_lo','kama']){
       expand(br[k]);
     }
@@ -166,18 +166,29 @@ function drawOhlcStructure(canvas,view,opts){
     }
   };
 
-  // Live position = truth. Hide prospective S/R + zones so entry/SL/TP
-  // are not buried under overlapping swing/zone spaghetti.
+  // Always paint Demand/Supply when OHLC found them. Preferred side is brighter;
+  // in-trade zones stay visible (dimmer) so the box does not vanish mid-deal.
   const openLv=(view.open_levels||[]).filter(p=>p&&(p.entry||p.stop||p.profit));
   const inTrade=openLv.length>0;
-  if(!inTrade){
-    band(zones.resistance,'rgba(255,92,122,.12)','rgba(255,92,122,.45)');
-    band(zones.support,'rgba(57,255,136,.10)','rgba(57,255,136,.4)');
-  }
   const pref=view.preferred;
-  if(!inTrade){
-    if(!pref||pref==='BUY')band(zones.buy_entry,'rgba(57,255,136,.28)',null);
-    if(!pref||pref==='SELL')band(zones.sell_entry,'rgba(255,92,122,.26)',null);
+  const buyFill=inTrade?'rgba(57,255,136,.12)':(pref==='SELL'?'rgba(57,255,136,.14)':'rgba(57,255,136,.28)');
+  const sellFill=inTrade?'rgba(255,92,122,.12)':(pref==='BUY'?'rgba(255,92,122,.14)':'rgba(255,92,122,.26)');
+  band(zones.resistance,'rgba(255,92,122,.08)','rgba(255,92,122,.35)');
+  band(zones.support,'rgba(57,255,136,.08)','rgba(57,255,136,.35)');
+  band(zones.buy_entry,buyFill,null);
+  band(zones.sell_entry,sellFill,null);
+  if(!zones.buy_entry&&!zones.sell_entry&&showLabels){
+    const why=String(zones.reason||view.entry_zone_reason||'').trim();
+    const n=Number(view.candles_n||candles.length||0);
+    ctx.fillStyle='rgba(233,188,101,.85)';
+    ctx.font='11px Manrope,sans-serif';
+    ctx.textAlign='left';
+    let msg='Nav Demand/Supply zonas';
+    if(why==='no_candles'||n<20)msg='Nav OHLC (DNS/tīkls vai <20 sveces) — zonas nav';
+    else if(why==='no_base_impulse')msg='Tape bez base→impulse — zonas vēl nav';
+    else if(why==='structure_filtered')msg='Zonas filtrētas pēc struktūras bias';
+    else if(why)msg='Nav zonas · '+why;
+    ctx.fillText(msg,leftPad+6,yPadTop+14);
   }
 
   if(atr!=null&&atr>0&&mid!=null&&_ohlcNearTape(mid,anchor,candleSpan)!=null){
@@ -263,8 +274,8 @@ function drawOhlcStructure(canvas,view,opts){
     hline(p.stop,'#ef6875',[4,3],'SL',true);
     hline(p.profit,'#31d59a',[4,3],'TP',true);
   }
-  if(showLabels&&!inTrade){
-    if(zones.buy_entry&&(!pref||pref==='BUY')){
+  if(showLabels){
+    if(zones.buy_entry){
       const z=zones.buy_entry;
       const a=_ohlcNearTape(z.lo,anchor,candleSpan);
       const b=_ohlcNearTape(z.hi,anchor,candleSpan)||a;
@@ -273,7 +284,7 @@ function drawOhlcStructure(canvas,view,opts){
         labels.push({y:y(midZ),color:'#39ff88',label:'BUY zona',price:midZ});
       }
     }
-    if(zones.sell_entry&&(!pref||pref==='SELL')){
+    if(zones.sell_entry){
       const z=zones.sell_entry;
       const a=_ohlcNearTape(z.lo,anchor,candleSpan);
       const b=_ohlcNearTape(z.hi,anchor,candleSpan)||a;

@@ -71,8 +71,12 @@ def test_shared_side_keeps_fleet_on_one_side():
     sm.clear('GOLD')
 
 
-def test_admin_chart_js_hides_prospective_when_in_trade():
+def test_admin_chart_js_keeps_zones_visible_in_trade():
+    """Demand/Supply bands stay on chart mid-trade; only swing SL/TP stay flat-only."""
     js = Path('app/web/admin/ohlc-chart.js').read_text(encoding='utf-8')
     assert 'inTrade' in js
+    assert 'band(zones.buy_entry' in js.replace(' ', '')
+    assert 'band(zones.sell_entry' in js.replace(' ', '')
+    assert 'Nav Demand/Supply zonas' in js or 'no_base_impulse' in js
     assert 'Prospective swing brackets only when flat' in js or 'only when flat' in js
     assert 'scaledInTrade' in js

@@ -6,6 +6,40 @@ and a 20-trade trial horizon. Call once per engine / runtime start.
 from __future__ import annotations
 
 STORE_FLAG = 'evo_boot_v1'
+# Temporary PR #181 OPEN baseline — force into Store even after prior boots.
+# Stale self_params_v1 alone kept min_rr=1.5 + flow fight HOLD after DEFAULTS change.
+PR181_OPEN_BASELINE = {
+    'bracket_min_rr': 1.0,
+    'flow_consensus_block_fights': 0,
+    'reentry_confirm_enabled': 0,
+}
+
+
+def _force_pr181_open_baseline(store, p, *, out=None):
+    """Overwrite OPEN-blocking knobs back to PR #181 seeds."""
+    touched = False
+    forced = []
+    for k, want in PR181_OPEN_BASELINE.items():
+        try:
+            cur = p.get(k)
+            if isinstance(want, float):
+                same = abs(float(cur) - float(want)) < 1e-12
+            else:
+                same = int(cur) == int(want)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            p[k] = want
+            forced.append(k)
+            touched = True
+    if touched:
+        from .self_params import save
+        save(store, p, reason='evo_boot_pr181_open_baseline')
+        if isinstance(out, dict):
+            out['pr181_open'] = 'forced:' + ','.join(forced)
+    elif isinstance(out, dict):
+        out['pr181_open'] = 'ok'
+    return touched
 
 
 def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
@@ -28,8 +62,12 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
                 out['trail'] = 'forced_off'
             else:
                 out['trail'] = 'off'
+            # Re-load after trail save so PR181 force sees latest bag.
+            p = load(store)
+            _force_pr181_open_baseline(store, p, out=out)
         except Exception as exc:
             out['trail'] = type(exc).__name__
+            out['pr181_open'] = type(exc).__name__
         try:
             from . import sample_strategies, strategy_gen
             out['samples'] = sample_strategies.build_strategies_from_samples(
@@ -77,11 +115,26 @@ def ensure_physical_evo(store, *, epic=None, force=False) -> dict:
         if int(p.get('trail_live_enabled') or 0) != 0:
             p['trail_live_enabled'] = 0
             touched = True
+        # PR #181 OPEN baseline — wipe stale min_rr / flow fight / reentry HOLD.
+        for k, want in PR181_OPEN_BASELINE.items():
+            try:
+                cur = p.get(k)
+                if isinstance(want, float):
+                    same = abs(float(cur) - float(want)) < 1e-12
+                else:
+                    same = int(cur) == int(want)
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                p[k] = want
+                touched = True
+                out['pr181_open'] = 'forced'
         if touched:
             save(store, p, reason='evo_boot_audit_defaults')
             out['params'] = 'seeded'
         else:
             out['params'] = 'ok'
+            out.setdefault('pr181_open', 'ok')
     except Exception as exc:
         out['params'] = type(exc).__name__
 

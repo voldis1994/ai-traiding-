@@ -134,8 +134,8 @@ def test_regime_refuses_when_atr_floor_makes_tp_shorter_than_sl():
             'no_structural_sl')
 
 
-def test_decide_never_accepts_regime_rr_below_one(monkeypatch):
-    """structural_tp must not bypass RR<1 after snap/ATR widen."""
+def test_decide_soft_caps_regime_rr_below_one(monkeypatch):
+    """PR #181: regime RR<1 soft-caps SL — never invents TP, never ships TP<SL."""
     rows, mid = demand_zone_path(confirm=True)
     zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     buy = zones.get('buy_entry')
@@ -145,7 +145,7 @@ def test_decide_never_accepts_regime_rr_below_one(monkeypatch):
         'stop_distance': 8.0, 'profit_distance': 7.0,
         'stop_level': entry - 8.0, 'profit_level': entry + 7.0,
         'tp1_level': entry + 3.5, 'tp2_level': entry + 7.0,
-        'kappa': 7 / 8, 'min_rr': 2.0, 'rr': 7 / 8,
+        'kappa': 7 / 8, 'min_rr': 1.0, 'rr': 7 / 8,
         'structural_tp': True, 'structural_rr': False,
         'zone_sl': True, 'zone_tp': True, 'regime': 'RETEST_UP',
         'scale_out_frac': 0.5, 'tp_ladder': True,
@@ -156,11 +156,9 @@ def test_decide_never_accepts_regime_rr_below_one(monkeypatch):
         z, tick=0.1, spread=0.2, min_distance=0.5, entry=entry, action='BUY',
         candles=rows, atr=1.0, require_swing=True, entry_zone=buy,
         scenario={'scenario': 'RETEST_UP'}, zones=zones, trigger='zone')
-    # Must not ship regime with TP < SL; swing fallback or refuse.
-    if decided.get('ready'):
-        assert float(decided['profit_distance']) + 1e-9 >= float(
-            decided['stop_distance'])
-        if decided.get('source') == 'regime_brackets':
-            raise AssertionError('regime with RR<1 must not be ready')
-    else:
-        assert decided.get('source') in ('swing_anchor', 'regime_brackets')
+    assert decided.get('ready') is True
+    assert float(decided['profit_distance']) + 1e-9 >= float(
+        decided['stop_distance'])
+    if decided.get('source') == 'regime_brackets':
+        assert float(decided.get('rr') or 0) + 1e-9 >= 1.0
+        assert decided.get('rr_capped') is True

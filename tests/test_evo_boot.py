@@ -55,3 +55,29 @@ def test_soft_nudge_works_after_boot_without_library():
             scores, structure='TREND_DOWN', epic='GOLD', store=store)
         assert meta['nudged'] is True
         assert nudged['SELL'] > nudged['BUY']
+
+
+def test_pr181_open_baseline_defaults():
+    assert float(DEFAULTS['bracket_min_rr']) == 1.0
+    assert int(DEFAULTS['flow_consensus_block_fights']) == 0
+    assert int(DEFAULTS['reentry_confirm_enabled']) == 0
+
+
+def test_evo_boot_forces_pr181_open_baseline_on_stale_store():
+    """Stale Store kept min_rr=1.5 + flow fight — boot must wipe to #181."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 't.sqlite3')
+        store.set(evo_boot.STORE_FLAG, {'done': True})
+        save(store, {
+            **DEFAULTS,
+            'bracket_min_rr': 1.5,
+            'flow_consensus_block_fights': 1,
+            'reentry_confirm_enabled': 1,
+        }, reason='stale')
+        out = evo_boot.ensure_physical_evo(store, force=False)
+        assert out.get('ok')
+        assert str(out.get('pr181_open') or '').startswith('forced')
+        p = load(store)
+        assert float(p['bracket_min_rr']) == 1.0
+        assert int(p['flow_consensus_block_fights']) == 0
+        assert int(p['reentry_confirm_enabled']) == 0

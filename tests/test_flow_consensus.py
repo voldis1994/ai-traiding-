@@ -110,6 +110,32 @@ def test_apply_to_decision_aligned_does_not_block():
     assert dec['action'] == 'BUY'
     assert dec['effect'] in ('aligned_boost', 'nudged')
     assert dec['nudged'] is True
+    assert dec.get('scores_raw') == scores
+
+
+def test_apply_to_decision_never_flips_buy_sell():
+    """V3 L01: soft nudge must not change BUY↔SELL; scores_raw stay authority."""
+    cons = fc.evaluate(
+        _obs(imbalance=-0.4, micro=-0.4, impulse=-0.35, vol_z=-0.4),
+        proposed='BUY', epic='GOLD')
+    assert cons['consensus'] == 'SELL'
+    # Disable hard block so nudge could previously flip via argmax.
+    class _Store:
+        def get(self, k, default=None):
+            return default
+        def set(self, k, v):
+            pass
+    # Force block_fights off via soft path: use consensus with agree=1 only.
+    cons = dict(cons)
+    cons['agree'] = 1
+    scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
+    dec = fc.apply_to_decision(
+        scores, action='BUY', consensus=cons, store=None)
+    assert dec['effect'] != 'flipped_to_consensus'
+    assert dec['action'] in ('BUY', 'HOLD')  # HOLD gate OK; never SELL flip
+    if not dec.get('blocked'):
+        assert dec['action'] == 'BUY'
+    assert dec.get('scores_raw') == scores
 
 
 def test_apply_to_decision_missing_feed_does_not_freeze():

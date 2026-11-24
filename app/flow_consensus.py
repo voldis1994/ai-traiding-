@@ -7,8 +7,11 @@ feeds are fused into one consensus — no paid CME/dxFeed path planned.
   • Coinbase / OKX ``PAXG`` volume + L2 book (gold substitute, labeled)
   • Capital BID/ASK + OHLC structure remain execution / swing truth
 
-Affects LIVE OPEN (nudge / block). After closes and resolved blocks, the
-ledger scores whether consensus helped £ and adapts nudge/block strength.
+Gate / diagnostic only (V3.0 L01): soft-nudge scores for desk display, and
+may HOLD a fight as a confirm/refuse gate — never flips BUY↔SELL. Neural
+``scores_raw`` remain the decision authority; consensus does not rewrite
+the proposed side. After closes and resolved blocks, the ledger scores
+whether consensus helped £ and adapts nudge/block strength.
 """
 from __future__ import annotations
 
@@ -474,10 +477,11 @@ def evaluate_from_path(
 
 
 def soft_nudge_scores(scores, consensus, *, store=None):
-    """Tilt scores toward M1 multi-source consensus — never hard veto.
+    """Diagnostic tilt of a *copy* of scores toward M1 consensus.
 
-    When proposed side fights consensus, damp that side and boost the other /
-    HOLD. When aligned, mild boost. Missing/neutral consensus → no change.
+    Never a hard veto and never authority over ``scores_raw`` / final action.
+    Callers must keep the proposed BUY/SELL; only ``apply_to_decision`` may
+    HOLD a fight as a gate. Missing/neutral consensus → no change.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
@@ -499,7 +503,7 @@ def soft_nudge_scores(scores, consensus, *, store=None):
     proposed = (consensus.get('proposed') or '').upper()
     delta = strength * conf
     fight = proposed in ('BUY', 'SELL') and proposed != advice
-    # Fighting consensus → louder damp so majority M1 votes can flip the tilt.
+    # Fighting consensus → louder damp for desk diagnostics only (no action flip).
     if fight:
         delta *= 1.85
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
@@ -545,14 +549,18 @@ def apply_to_decision(
     store=None,
     consensus=None,
 ) -> dict:
-    """Last-word M1 consensus on LIVE OPEN — nudge scores and may HOLD a fight.
+    """M1 consensus gate / diagnostic on LIVE OPEN (V3 L01).
 
-    Missing / weak feeds → no-op (never freeze the robot). Strong majority
-    against the proposed side → action forced to HOLD when block_fights is on.
+    Soft-nudges a score *copy* for desk diagnostics only — never changes
+    BUY↔SELL (no ``flipped_to_consensus``). Neural ``scores_raw`` / proposed
+    action stay authority. Strong majority against the proposed side may
+    HOLD as a confirm/refuse gate when ``block_fights`` is on. Missing /
+    weak feeds → no-op.
     """
     prop = (action or '').upper()
     out = {
         'scores': dict(scores) if isinstance(scores, dict) else scores,
+        'scores_raw': dict(scores) if isinstance(scores, dict) else scores,
         'action': prop if prop in ('BUY', 'SELL', 'HOLD') else 'HOLD',
         'proposal': prop if prop in ('BUY', 'SELL', 'HOLD') else 'HOLD',
         'blocked': False,
@@ -614,20 +622,13 @@ def apply_to_decision(
             'decision_effect': out['effect'],
             'decision_reason': out['reason'],
             'blocked': True,
+            'final_action': 'HOLD',
         })
         return out
 
-    # After nudge, if argmax flipped to consensus side, surface that as the action.
-    try:
-        argmax = max(('BUY', 'SELL', 'HOLD'),
-                     key=lambda a: float(nudged.get(a, 0) or 0))
-    except Exception:
-        argmax = prop
-    if argmax in ('BUY', 'SELL') and argmax != prop and cons.get('advice') == argmax:
-        out['action'] = argmax
-        out['effect'] = 'flipped_to_consensus'
-        out['reason'] = f'scores flipped {prop}→{argmax} by M1 consensus'
-    elif out['nudged'] and cons.get('accept') is True:
+    # L01: never flip BUY↔SELL from nudged argmax — scores_raw stay authority.
+    # Soft nudge is diagnostic only; action stays the proposed side.
+    if out['nudged'] and cons.get('accept') is True:
         out['effect'] = 'aligned_boost'
         out['reason'] = f'M1 consensus confirms {prop}'
     elif out['nudged']:

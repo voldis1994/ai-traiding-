@@ -38,7 +38,10 @@ def test_scoreboard_ignores_estimate_and_open_upl_for_totals():
 def test_capital_live_never_enters_independent_paper_cash():
     """P0: Capital Funds £ must not pollute Paper Book W/L / net."""
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         now = datetime.now(timezone.utc)
         for i, pnl in enumerate((-0.89, 0.62)):
             deal = f'cap-seed-{i}'
@@ -52,6 +55,10 @@ def test_capital_live_never_enters_independent_paper_cash():
             store.db.execute(
                 'UPDATE trades SET closed=? WHERE deal_id=?',
                 ((now - timedelta(minutes=i)).isoformat(), deal))
+            cash_ledger.ingest_funds_row(
+                store, {'pnl': pnl, 'currency': 'GBP', 'transactionType': 'TRADE'},
+                account_id='1', environment='live', account_currency='GBP',
+                deal_link=deal, transaction_id=f'TX-{deal}')
         store.db.commit()
         # Simulate the bad PR #240 seed already in history.
         j = ShadowPaperJournal(store)
@@ -122,7 +129,10 @@ def test_hist_window_filters_by_closed_at_not_audit_time():
 
 def test_working_pnl_prefers_24h_capital_window():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         now = datetime.now(timezone.utc)
         # Old close outside 24h — must not dominate Desk vs Funds today.
         store.upsert_trade({
@@ -135,6 +145,10 @@ def test_working_pnl_prefers_24h_capital_window():
         store.db.execute(
             'UPDATE trades SET closed=? WHERE deal_id=?',
             ((now - timedelta(hours=48)).isoformat(), 'old'))
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': -12.0, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='old', transaction_id='TX-old')
         store.upsert_trade({
             'dealId': 'today', 'epic': 'GOLD', 'size': '0.1',
             'direction': 'BUY', 'level': 4188,
@@ -145,6 +159,10 @@ def test_working_pnl_prefers_24h_capital_window():
         store.db.execute(
             'UPDATE trades SET closed=? WHERE deal_id=?',
             ((now - timedelta(minutes=5)).isoformat(), 'today'))
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': -0.89, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='today', transaction_id='TX-today')
         store.db.commit()
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
@@ -179,7 +197,10 @@ def test_fingerprint_does_not_wait_on_news_peers():
 def test_verified_zero_broker_is_settled_capital_cash():
     """P0-08: verified Funds £0.00 is SETTLED cash — Desk counts it."""
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         store.upsert_trade({
             'dealId': 'z0', 'epic': 'GOLD', 'size': '0.1',
             'direction': 'BUY', 'level': 4100,
@@ -187,6 +208,10 @@ def test_verified_zero_broker_is_settled_capital_cash():
         store.close_trade(
             'z0', 4100, 0.0, currency='GBP',
             source='broker', overwrite=True)
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.0, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='z0', transaction_id='TX-z0')
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
         assert stats['cash_trades'] == 1

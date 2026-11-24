@@ -25,17 +25,21 @@ def test_cash_currency_account_only_never_hint():
         assert e._cash_currency(None) is None
 
 
-def test_activity_usd_tag_stores_account_gbp():
+def test_funds_usd_tag_stores_account_gbp():
+    """Funds cash uses account GBP; Activity-only does not settle."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
             broker=HistoryBroker()
-            # Capital often tags GOLD activity with USD even though cash is GBP.
             broker.acts=[{'dealId':'d1','details':{'profit':0.29},'currency':'USD'}]
             e.attach(broker)
-            # attach() clears account — restore after, as live poll does via accounts().
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            pnl,src,_=await e._resolve_broker_pnl('d1',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            # Funds row with account GBP — sole settle path.
+            broker.tx=[{'dealId':'d1','pnl':0.29,'currency':'GBP',
+                        'transactionId':'TX-d1'}]
             pnl,src,ccy=await e._resolve_broker_pnl('d1',{})
             assert pnl==pytest.approx(0.29)
             assert src=='broker' and ccy=='GBP'
@@ -104,13 +108,21 @@ def test_repair_fills_blank_currency_only_never_rewrites():
 
 def test_admin_trade_stats_sum_gbp_not_split_usd():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         # Minimal hub without full platform DB — call _trade_stats directly.
         store=Store(Path(d)/'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         for i,pnl in enumerate([0.26,-0.30,0.14,0.17,0.20]):
-            store.upsert_trade({'dealId':f't{i}','epic':'GOLD','size':'0.1',
+            deal = f't{i}'
+            store.upsert_trade({'dealId':deal,'epic':'GOLD','size':'0.1',
                                 'direction':'BUY','level':100})
             # Account-currency broker cash (correct identity).
-            store.close_trade(f't{i}',101,pnl,currency='GBP',source='broker')
+            store.close_trade(deal,101,pnl,currency='GBP',source='broker')
+            cash_ledger.ingest_funds_row(
+                store, {'pnl': pnl, 'currency': 'GBP', 'transactionType': 'TRADE'},
+                account_id='1', environment='live', account_currency='GBP',
+                deal_link=deal, transaction_id=f'TX-{deal}')
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP')
         assert stats['pnl_currency']=='GBP'
@@ -122,23 +134,31 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
 def test_admin_trade_stats_sums_beyond_200_and_legacy_blank_source():
     """Full history sums broker cash; blank source is NOT cash (V3 P05/T38)."""
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store=Store(Path(d)/'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         broker_total=0.0
         blank_n=0
         for i in range(250):
             pnl=-0.04
-            store.upsert_trade({'dealId':f'old{i}','epic':'GOLD','size':'0.1',
+            deal = f'old{i}'
+            store.upsert_trade({'dealId':deal,'epic':'GOLD','size':'0.1',
                                 'direction':'SELL','level':2000})
             # Half broker cash, half legacy blank — blank ≠ Funds £.
             src='broker' if i%2==0 else None
-            store.close_trade(f'old{i}',1999,pnl,currency='GBP',source=src)
+            store.close_trade(deal,1999,pnl,currency='GBP',source=src)
             if src is None:
                 blank_n+=1
                 store.db.execute(
-                    "UPDATE trades SET pnl_source=NULL WHERE deal_id=?",(f'old{i}',))
+                    "UPDATE trades SET pnl_source=NULL WHERE deal_id=?",(deal,))
                 store.db.commit()
             else:
                 broker_total+=pnl
+                cash_ledger.ingest_funds_row(
+                    store, {'pnl': pnl, 'currency': 'GBP', 'transactionType': 'TRADE'},
+                    account_id='1', environment='live', account_currency='GBP',
+                    deal_link=deal, transaction_id=f'TX-{deal}')
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP',open_upl=-0.57)
         assert stats['cash_trades']==125

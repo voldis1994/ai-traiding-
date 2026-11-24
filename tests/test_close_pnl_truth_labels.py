@@ -20,12 +20,19 @@ def test_cash_pnl_source_classifies_upl_as_estimate():
 
 def test_mixed_broker_and_upl_keeps_sources_honest():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         store.upsert_trade({
             'dealId': 'b1', 'epic': 'GOLD', 'size': '0.02',
             'direction': 'SELL', 'level': 3570,
         })
         store.close_trade('b1', 3568, 0.14, currency='GBP', source='broker')
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.14, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='b1', transaction_id='TX-b1')
         store.upsert_trade({
             'dealId': 'u1', 'epic': 'GOLD', 'size': '0.02',
             'direction': 'SELL', 'level': 3572,

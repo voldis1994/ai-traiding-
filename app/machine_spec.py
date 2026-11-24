@@ -24,7 +24,7 @@ LIVE_DECISION_BAR = 'completed_broker_M1'
 # Perceive on completed M1; trigger OPEN on WS mid (break|zone) between polls.
 LIVE_ENTRY_PATH = 'intent_then_break_or_zone_trigger'
 # OHLC band/tape/MTF knobs adapt from closed £ (ohlc_entry_gates_v1).
-OHLC_GATES_LEARN = 'ohlc_entry_gates_v1_observe_close'
+OHLC_GATES_LEARN = 'ohlc_entry_gates_v2_observe_close'
 POLL_SECONDS = 1  # heavy poll gated ~0.8–1.2s; light ticks at 50ms
 FAST_ENTRY_TICK_SECONDS = 0.05
 NEURAL_DT_SECONDS = 60

@@ -56,14 +56,14 @@ def test_ohlc_break_tape_visible_after_1_break_loss():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
         p0 = oez.load_params(store)
-        assert int(p0['tape_need']) == 2
+        assert int(p0['tape_need']) == 1
         out = oez.observe_close(
             store,
             ohlc_meta={'trigger': 'break', 'action': 'BUY'},
             broker_pnl=-1.0, spread=0.1)
         assert out['adapted'] is True
         p1 = oez.load_params(store)
-        assert int(p1['tape_need']) == 3
+        assert int(p1['tape_need']) == 2
         assert float(p1['break_mtf_conf']) > float(p0['break_mtf_conf'])
 
 

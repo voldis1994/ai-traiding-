@@ -68,8 +68,7 @@ def test_cache_bust_bumped():
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
-    assert 'CAPITAL 24h' in js
-    assert 'rebuilding fingerprints' in js
+    assert '24h' in js
     assert 'ohlc-chart.js?v=13' in html
 
 

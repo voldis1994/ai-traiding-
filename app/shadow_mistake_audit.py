@@ -949,7 +949,7 @@ def journal_seed_fix_steps(audit_row: dict | None, store=None) -> list:
         'changed': [], 'skipped': ['mistakes'],
     }, {
         'step': 'propose', 'status': 'skip',
-        'detail': 'no MAP until on_close — will not invent penalty_zone',
+        'detail': 'no MAP until on_close — no invented knobs',
         'changed': [], 'skipped': ['knobs'],
         'mutations': [], 'map_lines': [], 'untouched': [],
         'mutation_lines': [], 'untouched_lines': [],
@@ -1662,15 +1662,22 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
             gate = ''
             if pc is not None and pn is not None:
                 gate = f' · promote {pc}/{pn}'
-            lines.append({
-                'level': 'wait',
-                'text': (f'{when}  WAIT   full path below'
-                         f'{gate} — MAP / VALUE / KEEP'),
-            })
+            if journalish:
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  WAIT   Capital £ only — full path after '
+                             f'on_close{gate}'),
+                })
+            else:
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  WAIT   full path below'
+                             f'{gate} — MAP / VALUE / KEEP'),
+                })
             if fix_steps:
                 for s in fix_steps:
                     lines.extend(_format_fix_step_lines(when, s))
-            else:
+            elif not journalish:
                 lines.append({
                     'level': 'note',
                     'text': (f'{when}  STEP   diagnose · ok · '

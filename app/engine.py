@@ -8102,7 +8102,8 @@ class SingleTradeEngine:
                 action=action,scores=scores,evaluation=evaluation,zone=zone,
                 learned=learned,cycle_state=cycle_state,base_sl=base_sl,
                 max_tp=zone.get('max_tp'))
-            # Edge soft: if compose HOLDs, still build brackets from shape helpers.
+            # Edge soft: if compose HOLDs, still try OHLC swing/regime distances.
+            # Never invent broker-min × κ — that is not OHLC 1m structure.
             if pkg.get('blocked') or pkg.get('action') not in ('BUY','SELL'):
                 self.store.event('entry','Unified cycle soft note (OPEN not banned)',{
                     'reason':pkg.get('reason'),'decision':pkg.get('decision'),
@@ -8114,13 +8115,6 @@ class SingleTradeEngine:
                              profit_distance=swing_fb.get('profit_distance'),
                              kappa=swing_fb.get('ohlc_kappa'),
                              sl_scale=swing_fb.get('sl_scale') or 1.0)
-                else:
-                    # Last resort: broker min distance × learned κ — neural still posts.
-                    k=float((learned or {}).get('kappa') or 1.5)
-                    pkg=dict(pkg or {},action=action,blocked=False,
-                             stop_distance=base_sl,
-                             profit_distance=max(base_sl*k,float(minimum)+buffer),
-                             kappa=k,sl_scale=float((learned or {}).get('sl_scale') or 1.0))
             atr_hint=self._bracket_atr_hint(mtf_live,candles)
             kama_hint=None
             try:
@@ -8130,7 +8124,7 @@ class SingleTradeEngine:
             except (TypeError,AttributeError):
                 kama_hint=None
             # Regime SL/TP: scenario × Demand/Supply (BUY/SELL symmetric).
-            # Fallback: swing pivots. tighten=1.0 — never soft-move structure.
+            # Fallback: swing pivots on completed M1. Never invent median/κ.
             entry_zone=zone_gate.get('zone') if isinstance(zone_gate,dict) else None
             scenario=(zone_gate.get('scenario')
                       if isinstance(zone_gate,dict) else None)
@@ -8138,28 +8132,24 @@ class SingleTradeEngine:
                         if isinstance(zone_gate,dict) else None)
             trigger=(zone_gate.get('trigger')
                      if isinstance(zone_gate,dict) else None)
-            # Prefer swing anchors; if tape has none, fall back to zone/median
-            # so neural OPEN is not banned waiting forever for structure.
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=1.0,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=False,store=self.store,
+                kama=kama_hint,require_swing=True,store=self.store,
                 entry_zone=entry_zone,scenario=scenario,zones=zones_card,
                 trigger=trigger)
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:
-                # Broker still needs numeric SL/TP — use compose/pkg or min×κ.
-                fb_sl=float(pkg.get('stop_distance') or base_sl)
-                fb_tp=float(pkg.get('profit_distance')
-                            or max(fb_sl*float((learned or {}).get('kappa') or 1.5),
-                                   float(minimum)+buffer))
-                decided=dict(decided or {},ready=True,source='neural_min_fallback',
-                             stop_distance=fb_sl,profit_distance=fb_tp,
-                             kappa=pkg.get('kappa') or (learned or {}).get('kappa'),
-                             reason='fallback_no_swing')
-                self.store.event('entry','OPEN brackets fallback (no swing ban)',{
-                    'stop_distance':fb_sl,'profit_distance':fb_tp,'action':action})
+                # Wait for completed M1 swing/regime — do not POST fantasy SL/TP.
+                reason=(decided.get('reason') or decided.get('swing_reason')
+                        or 'wait_ohlc_swing_rr')
+                self.last_entry_reason=str(reason)
+                self.store.event('entry','OPEN deferred — need OHLC 1m SL/TP',{
+                    'reason':reason,'action':action,
+                    'source':decided.get('source'),
+                    'bars':len(candles or [])})
+                return
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
             stop_level=decided.get('stop_level')

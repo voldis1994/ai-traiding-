@@ -166,3 +166,36 @@ def test_cmd_open_snapshot_skips_capital_only_wait():
     assert 'open snapshot' in text.lower() or 'zone_fail' in text
     assert 'Capital £ loss — full audit pending' not in text
     assert 'Capital £ only' not in text
+
+
+def test_fakeout_stamp_loss_maps_ohlc_not_same_four_nudges():
+    """FAKEOUT £ loss must hit fakeout_missed → OHLC knobs, not outcome_hurt quartet."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        before = osc.load_params(store)
+        before_self = sp.load(store)
+        out = sma.on_close(
+            store,
+            pnl=-0.12, spread=0.1, candles=_candles(),
+            scenario_meta={'scenario': 'FAKEOUT'},
+            ohlc_meta={'action': 'SELL', 'trigger': 'break',
+                       'zone': {'lo': 99.0, 'hi': 100.0}},
+            news={'status': 'CLEAR', 'entry_allowed': True},
+            intermarket={'status': 'WAITING'},
+            direction='SELL', entry=99.5, source='live',
+            deal_id='fk1', apply_ohlc_penalties=True,
+        )
+        assert 'fakeout_missed' in (out.get('mistakes') or [])
+        assert 'outcome_hurt' not in (out.get('mistakes') or [])
+        after = osc.load_params(store)
+        assert after['penalty_breakout'] > before['penalty_breakout']
+        assert after.get('prefer_retest_over_blind_break') == 1
+        # Must NOT be the catch-all self_params quartet alone.
+        after_self = sp.load(store)
+        assert after_self['structure_edge_nudge'] == before_self['structure_edge_nudge']
+        lab = sma.lab_payload(store)
+        text = '\n'.join(
+            str(x.get('text') or '') for x in (lab.get('learning_log') or []))
+        assert 'fakeout_missed' in text
+        assert 'penalty_breakout' in text
+        assert 'structure_edge_nudge' not in text or 'penalty_breakout' in text

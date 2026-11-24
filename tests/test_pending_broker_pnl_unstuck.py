@@ -59,10 +59,10 @@ def test_vanish_waits_for_funds_then_teaches_once():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Desk provisional UPL; teach only after Funds £.
-            assert row.get('pnl_source')=='upl_estimate'
+            # Last UPL = Capital £ — teach now; Funds later refines.
+            assert row.get('pnl_source')=='capital'
             assert row.get('pnl')==pytest.approx(-0.11)
-            assert not e._trade_already_learned('g1')
+            assert e._trade_already_learned('g1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)
             labeled=brain.trade_labeled
@@ -71,8 +71,7 @@ def test_vanish_waits_for_funds_then_teaches_once():
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.09)
             assert row['pnl_source']=='broker'
-            assert e._trade_already_learned('g1')
-            assert brain.trade_labeled>=labeled
+            assert brain.trade_labeled==labeled
             assert not (store.get('pending_broker_pnl_deals') or [])
     asyncio.run(scenario())
 

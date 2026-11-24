@@ -47,21 +47,22 @@ def test_vanish_without_funds_shows_provisional_upl_then_funds():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Desk shows last Capital UPL; neural waits for Funds £.
+            # Last UPL before close = Capital £ — teach immediately.
             assert row['pnl']==pytest.approx(0.01)
-            assert row['pnl_source']=='upl_estimate'
-            assert not e._trade_already_learned('g01')
+            assert row['pnl_source']=='capital'
+            assert e._trade_already_learned('g01')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='g01'
                        for x in pending)
-            # Real Funds £ overwrites + teaches.
+            # Real Funds £ overwrites without double-teach.
+            labeled_mid=brain.trade_labeled
             broker.tx=[{'reference':'g01','pnl':'0.01','currency':'GBP',
                         'transactionType':'TRADE'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(0.01)
             assert row['pnl_source']=='broker'
-            assert e._trade_already_learned('g01')
+            assert brain.trade_labeled==labeled_mid
     asyncio.run(scenario())
 
 

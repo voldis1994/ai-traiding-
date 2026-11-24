@@ -1751,27 +1751,24 @@ class SingleTradeEngine:
             self.store.event('trade','Deal closed pending broker confirm P&L',
                              {'dealId':prev_id,'exit_guess':exit_guess})
             return None,'pending_close_sync',None
-        # SL/TP/manual vanish: Capital £ when available; UPL Desk-only until Funds.
+        # SL/TP/manual vanish: Funds £ if ready; else last UPL = Capital £.
         if exit_guess is None:
             snap=self.store.get('last_upl:'+str(prev_id)) or {}
             exit_guess=_num(snap.get('exit_hint'))
         conf={'level':exit_guess,'source':'position_disappeared'}
         pnl,src,ccy=await self._resolve_broker_pnl(prev_id,conf)
-        if pnl is not None and src=='broker':
+        if pnl is not None and src in ('broker','capital'):
             conf['profit']=pnl
             if ccy:conf['pnl_currency']=ccy
-            conf['pnl_source']='broker'
+            conf['pnl_source']=src
             self._learn_closed_trade(prev_id,conf)
-        elif pnl is not None and src=='upl_estimate':
-            self.store.close_trade(
-                prev_id,exit_guess,pnl,
-                currency=ccy or self._account_currency(),
-                source='upl_estimate',overwrite=True)
-            self._queue_pending_pnl(prev_id,exit_level=exit_guess)
-            self.store.event('trade',
-                'Deal closed; provisional UPL on Desk — waiting Capital £',
-                {'dealId':prev_id,'exit_guess':exit_guess,'pnl':pnl,
-                 'pnl_source':'upl_estimate'})
+            if src=='capital':
+                # Keep harvesting Funds so a later true £ can refine the bank.
+                self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+                self.store.event('trade',
+                    'Deal closed; last UPL before close = Capital £',
+                    {'dealId':prev_id,'exit_guess':exit_guess,'pnl':pnl,
+                     'pnl_source':'capital'})
         else:
             self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
             self._queue_pending_pnl(prev_id,exit_level=exit_guess)
@@ -1995,7 +1992,7 @@ class SingleTradeEngine:
         else:
             self.position_age=0
         # Harvest pending Capital £ every sync — even while a sibling is still open.
-        # Never invent UPL as cash; retry only binds history/activity £.
+        # Last open UPL may already be Capital £; Funds £ refines when it lands.
         try:
             await self._retry_pending_broker_pnl()
         except Exception as exc:
@@ -3830,22 +3827,19 @@ class SingleTradeEngine:
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
-            # Capital £ when available; UPL only provisional on Desk; never invent.
+            # Funds £ if ready; else last registered UPL = Capital £ (teach now).
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
             exit_lvl=_num(confirmation.get('level'))
-            if pnl is not None and src=='broker':
-                confirmation={**confirmation,'profit':pnl,'pnl_source':'broker'}
+            if pnl is not None and src in ('broker','capital'):
+                confirmation={**confirmation,'profit':pnl,'pnl_source':src}
                 if _ccy and not confirmation.get('pnl_currency'):
                     confirmation={**confirmation,'pnl_currency':_ccy}
                 self._learn_closed_trade(deal_id,confirmation)
-            elif pnl is not None and src=='upl_estimate':
-                # Show Capital's last UPL now; harvest upgrades to Funds £ later.
-                self.store.close_trade(deal_id,exit_lvl,pnl,currency=_ccy or self._account_currency(),
-                                       source='upl_estimate',overwrite=True)
-                self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
-                self.store.event('learning',
-                    'Close: provisional UPL on Desk — waiting Capital Funds/activity £',
-                    {'deal_id':deal_id,'pnl':pnl,'pnl_source':'upl_estimate'})
+                if src=='capital':
+                    self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                    self.store.event('learning',
+                        'Close: last UPL before close = Capital £',
+                        {'deal_id':deal_id,'pnl':pnl,'pnl_source':'capital'})
             else:
                 self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
                 self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
@@ -4062,11 +4056,16 @@ class SingleTradeEngine:
             if not realized_cash.may_teach_live_cash(src):
                 return None,'pending_broker_pnl',self._cash_currency(currency)
             # Preserve verified cash source label (funds/capital/…), not always 'broker'.
+            # ``capital`` = last open UPL before close; Funds may later refine → broker.
             kind=realized_cash.classify_pnl_source(src)
-            stamp='broker' if kind=='cash' and src in (
-                'broker','funds','capital','live_funds_mirror','cash_ledger',
-                'capital_funds','verified_funds','cash') else (
-                'broker' if kind=='cash' else src)
+            known=('broker','funds','capital','live_funds_mirror','cash_ledger',
+                   'capital_funds','verified_funds','cash')
+            if kind=='cash' and src in known:
+                stamp=src if src!='cash' else 'broker'
+            elif kind=='cash':
+                stamp='broker'
+            else:
+                stamp=src
             return float(broker_pnl),stamp,self._cash_currency(currency)
         return None,'pending_broker_pnl',None
 
@@ -4089,7 +4088,7 @@ class SingleTradeEngine:
                           'scratch_pnl_abs':band})
 
     def _snapshot_open_upl(self,position):
-        """Keep last broker UPL (account currency) so SL/TP auto-closes are not ticks_only."""
+        """Keep last broker UPL (account currency). Last snap before close = Capital £."""
         deal_id=position.get('dealId')
         # Capital sometimes sends UPL as '£0.01' — _num alone yields None.
         upl=self._parse_cash_num(position.get('upl'))
@@ -4100,12 +4099,87 @@ class SingleTradeEngine:
         if not deal_id or upl is None or not math.isfinite(upl):return
         # Ignore position.currency when it is the instrument quote (GOLD→USD).
         ccy=self._cash_currency(position.get('currency'))
+        mid=_num((self.market or {}).get('mid'))
+        bid=_num((self.market or {}).get('bid'));ask=_num((self.market or {}).get('ask'))
+        direction=str(position.get('direction') or '').upper()
+        if direction=='BUY' and bid is not None:
+            exit_hint=bid
+        elif direction=='SELL' and ask is not None:
+            exit_hint=ask
+        elif mid is not None:
+            exit_hint=mid
+        else:
+            exit_hint=_num(position.get('level'))
         self.store.set('last_upl:'+str(deal_id),{
             'upl':float(upl),'currency':ccy,'at':now(),
-            'exit_hint':_num(position.get('level')) or _num((self.market or {}).get('mid'))})
+            'exit_hint':exit_hint})
+
+    def _bump_upl_exit_hint(self,position):
+        """Refresh exit_hint from live quote without inventing a new UPL figure."""
+        deal_id=position.get('dealId')
+        if not deal_id:return
+        key='last_upl:'+str(deal_id)
+        snap=self.store.get(key)
+        if not isinstance(snap,dict) or snap.get('upl') is None:
+            return
+        bid=_num((self.market or {}).get('bid'));ask=_num((self.market or {}).get('ask'))
+        mid=_num((self.market or {}).get('mid'))
+        direction=str(position.get('direction') or '').upper()
+        hint=None
+        if direction=='BUY' and bid is not None:
+            hint=bid
+        elif direction=='SELL' and ask is not None:
+            hint=ask
+        elif mid is not None:
+            hint=mid
+        if hint is None:
+            return
+        nxt=dict(snap);nxt['exit_hint']=hint;nxt['at']=now()
+        self.store.set(key,nxt)
+
+    async def quote_upl_tick(self):
+        """On every received quote tick while open: refresh Capital UPL snap.
+
+        Capital WS streams bid/ask only — UPL comes from positions(). Throttle
+        the REST pull (~1s) but always bump exit_hint from the live quote so
+        the last registered UPL before close is ready as Capital £.
+        """
+        if not self.positions or not self.broker:
+            return
+        self._apply_stream_quote()
+        for p in list(self.positions or []):
+            self._bump_upl_exit_hint(p)
+        now_m=time.monotonic()
+        if now_m-float(getattr(self,'_upl_tick_mono',0) or 0)<0.85:
+            return
+        self._upl_tick_mono=now_m
+        try:
+            raw=await self.broker.positions()
+        except Exception as exc:
+            self.store.event('warning','UPL tick positions failed',
+                             {'type':type(exc).__name__})
+            return
+        latest=self._map_positions(raw)
+        prev={str(p['dealId']):p for p in (self.positions or [])
+              if p.get('dealId') is not None}
+        latest_by={str(p['dealId']):p for p in latest if p.get('dealId') is not None}
+        # Update open book UPL in place; vanish → settle from last snap.
+        merged=[]
+        for deal,old in prev.items():
+            if deal in latest_by:
+                p=latest_by[deal]
+                self._snapshot_open_upl(p)
+                merged.append(p)
+            else:
+                # Flat at broker — settle with last registered UPL as Capital £.
+                await self._record_vanished_deal(deal)
+        # Keep self.positions aligned with still-open deals (order by latest).
+        self.positions=[latest_by[d] for d in latest_by if d in prev] or merged
+        self._open_deal_ids={str(p['dealId']) for p in (self.positions or [])
+                             if p.get('dealId') is not None}
 
     def _stamp_provisional_from_upl(self,deal_id,exit_level=None):
-        """Disabled — never invent peļņa from UPL. Wait for Capital Funds £."""
+        """Legacy hook — close path now settles last UPL as Capital £ directly."""
         return False
 
     def _history_lookback(self,deal_id,*,queued_at=None):
@@ -4315,10 +4389,10 @@ class SingleTradeEngine:
             return None
 
     def _requeue_unsettled_cash_closes(self):
-        """Pull journal rows stuck on pending/upl_estimate back into the harvest queue.
+        """Pull journal rows stuck on pending/capital/upl_estimate into harvest.
 
-        ``upl_estimate`` is display-only until Capital history returns real £ —
-        those rows must stay harvestable (neural teach waits for ``broker``).
+        ``capital`` (last UPL before close) already taught; keep harvesting so
+        Funds £ can refine. Legacy ``upl_estimate`` rows stay harvestable too.
         Also re-arm £0 ``broker`` binds — Capital often journals 0 before the
         real close £ lands (poison that used to freeze Admin forever).
         """
@@ -4328,7 +4402,7 @@ class SingleTradeEngine:
                 "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
                 "('pending_broker_pnl','pending_close_sync',"
                 "'ticks_only','price_size','position_disappeared',"
-                "'upl_estimate','broker')) "
+                "'upl_estimate','capital','broker')) "
                 "ORDER BY closed DESC LIMIT 80").fetchall()
         except Exception:
             return 0
@@ -4346,7 +4420,9 @@ class SingleTradeEngine:
                 banked_pnl=_num(banked.get('pnl'))
                 if banked_pnl is not None and abs(float(banked_pnl))>=1e-12 and not zero_broker:
                     continue
-            elif banked and src_s!='upl_estimate' and not zero_broker:
+            # capital / upl_estimate stay harvestable so Funds £ can refine.
+            elif (banked and src_s not in ('upl_estimate','capital')
+                  and not zero_broker):
                 continue
             self._queue_pending_pnl(deal,exit_level=_num(exit_lvl))
             n+=1
@@ -5523,11 +5599,18 @@ class SingleTradeEngine:
         return out
 
     def _last_upl_as_realized(self,deal_id):
-        """UPL must never teach as realized cash — always None."""
-        return None
+        """Last registered open UPL before close — Capital £ for settle/teach."""
+        upl=self._provisional_upl_cash(deal_id)
+        if upl is None or not math.isfinite(float(upl)):
+            return None
+        snap=self.store.get('last_upl:'+str(deal_id)) or {}
+        ccy=None
+        if isinstance(snap,dict):
+            ccy=self._cash_currency(snap.get('currency'))
+        return float(upl),ccy
 
     def _provisional_upl_cash(self,deal_id):
-        """Last open-position UPL snap for Desk display only (not teach)."""
+        """Last open-position UPL snap (Capital £ candidate on close)."""
         snap=self.store.get('last_upl:'+str(deal_id)) or {}
         if not isinstance(snap,dict):
             return None
@@ -5535,12 +5618,12 @@ class SingleTradeEngine:
                                     else snap.get('pnl'))
 
     async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Take the £ Capital.com already sends — no invented paths.
+        """Take the £ Capital.com already sends — no invented mid×size.
 
-        Order (same as phone):
+        Order:
           1) GET /history/transactions TRADE ``pnl``/``cash`` (Funds)
           2) GET /history/activity ``profitAndLoss`` (when Funds not posted yet)
-          3) else last open UPL as ``upl_estimate`` for Desk only — never teach
+          3) else last registered open UPL as ``capital`` (Capital £ — teach now)
         Never invent mid×size. Never treat confirm.profit as Funds.
         Fuzzy bind stays on the Funds-mirror harvest, not on every close.
         """
@@ -5558,9 +5641,10 @@ class SingleTradeEngine:
             pnl,hist_ccy=found
             # Capital's number — take it (including honest £0 scratch from Funds).
             return float(pnl),'broker',self._cash_currency(hist_ccy) or ccy
-        upl=self._provisional_upl_cash(deal_id)
-        if upl is not None and math.isfinite(float(upl)):
-            return float(upl),'upl_estimate',ccy
+        got=self._last_upl_as_realized(deal_id)
+        if got:
+            upl,upl_ccy=got
+            return float(upl),'capital',upl_ccy or ccy or self._account_currency()
         return None,'pending_broker_pnl',ccy
 
     def _trade_already_learned(self,deal_id):
@@ -5630,21 +5714,22 @@ class SingleTradeEngine:
             prev_src=str(prev.get('source') or '')
             zero_poison=(prev_pnl is not None and abs(prev_pnl)<1e-12
                          and abs(val)>=1e-12)
-            upl_to_broker=(prev_src in ('upl_estimate','') and src=='broker'
+            upl_to_broker=(prev_src in ('upl_estimate','capital','') and src=='broker'
                           and prev_pnl is not None)
             if upl_to_broker and not zero_poison:
-                # Refine provisional UPL bank with Capital £ — apply delta only.
+                # Refine last-UPL Capital £ bank with Funds £ — apply delta only.
                 hard_risk.refine_realized_pnl(self.store,prev_pnl,val)
                 day_book.refine_close(
                     self.store,deal_id=deal,old_pnl=prev_pnl,new_pnl=val,
                     equity=equity,open_count=open_n)
                 self.store.set(key,{
                     'at':now(),'pnl':val,'currency':currency,'action':action,
-                    'source':'broker','refined_from':'upl_estimate',
+                    'source':'broker','refined_from':prev_src or 'capital',
                     'prev_pnl':prev_pnl})
                 self.store.event('learning',
-                    'Day-book/hard-risk refined UPL→broker £',
-                    {'deal_id':deal,'prev':prev_pnl,'pnl':val})
+                    'Day-book/hard-risk refined UPL/capital→Funds £',
+                    {'deal_id':deal,'prev':prev_pnl,'pnl':val,
+                     'refined_from':prev_src or 'capital'})
                 return True
             if not zero_poison:
                 return False
@@ -5747,15 +5832,15 @@ class SingleTradeEngine:
         return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
-        """Keep journal pending/provisional until Capital £ — never teach from UPL."""
+        """Keep journal pending until Capital £; last UPL settles as capital separately."""
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
         row=self.store.db.execute(
             'SELECT pnl_source,pnl FROM trades WHERE deal_id=?',(deal,)).fetchone()
         src=str(row[0] or '') if row else ''
-        # Leave confirm-in-flight and Desk provisional UPL alone — Funds overwrites later.
-        if src in ('pending_close_sync','upl_estimate'):
+        # Confirm-in-flight or already stamped capital/upl — do not wipe.
+        if src in ('pending_close_sync','upl_estimate','capital','broker'):
             self.store.event('learning',
                 'Pending Capital £ — neural teach deferred',
                 {'deal_id':deal,'exit_level':exit_level,'pnl_source':src})
@@ -6183,9 +6268,9 @@ class SingleTradeEngine:
     def _learn_closed_trade(self,deal_id,confirmation):
         """Immediate self-evaluation from a closed trade's signed outcome.
 
-        Teach + bank only on verified Capital Funds/history £
-        (``pnl_source=broker``). Never invent from UPL or confirm.profit.
-        Each deal trains LIVE weights at most once.
+        Teach + bank on Capital Funds/history £ (``broker``) or last open UPL
+        before close (``capital``). Never invent mid×size or confirm.profit.
+        Each deal trains LIVE weights at most once; Funds may refine capital.
         """
         key='entry_brain:'+str(deal_id)
         saved=self.store.get(key)
@@ -6260,7 +6345,7 @@ class SingleTradeEngine:
                     preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker' and pnl_value is not None:
+                if pnl_source in ('broker','capital') and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=row[1],
                         source=pnl_source)
@@ -6313,7 +6398,7 @@ class SingleTradeEngine:
                     currency=hint_ccy,preferred_source=pref_src)
                 self.store.close_trade(deal_id,exit_level,pnl_value,currency=currency,
                                        source=pnl_source,overwrite=overwrite)
-                if pnl_source=='broker' and pnl_value is not None:
+                if pnl_source in ('broker','capital') and pnl_value is not None:
                     self._bank_broker_cash_side_effects(
                         deal_id,pnl_value,currency=currency,action=direction,
                         source=pnl_source)
@@ -6374,8 +6459,8 @@ class SingleTradeEngine:
             path_mfe=struct_ctx.get('path_mfe'),
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
-        # Neural teach + day-book only from Capital Funds/history £.
-        teach_like=(pnl_source=='broker' and pnl_value is not None)
+        # Neural teach + day-book from Funds £ or last UPL Capital £.
+        teach_like=(pnl_source in ('broker','capital') and pnl_value is not None)
         bank_like=teach_like
         cash_like=teach_like
         entry_scores=saved.get('scores') if isinstance(saved.get('scores'),dict) else None
@@ -6490,10 +6575,10 @@ class SingleTradeEngine:
         if repeats>0 and transition.get('h') is not None and transition.get('c') is not None:
             self.brain.core.update_utility(transition['h'],transition['c'],label,
                 neuron_ids=transition.get('neuron_ids'))
-        # Only Funds £ persists as cash; everything else stays pending.
+        # Funds £ or last-UPL Capital £ persist; invent/blank stay pending.
         persist_source=pnl_source
         persist_pnl=pnl_value
-        if pnl_source!='broker':
+        if pnl_source not in ('broker','capital'):
             persist_source='pending_broker_pnl'
             persist_pnl=None
         size_hint=None

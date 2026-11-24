@@ -1617,6 +1617,22 @@ class RuntimeHub:
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
+        # Preview SL/TP at side price (ask/bid) — same as LIVE OPEN entry.
+        entry_px=mid
+        if preferred=='BUY' and mid is not None:
+            entry_px=mid+(spread/2.0 if spread else 0)
+        elif preferred=='SELL' and mid is not None:
+            entry_px=mid-(spread/2.0 if spread else 0)
+        if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
+            try:
+                zone=bracket_learn.zone_at_open(
+                    candles_full or candles,multi_tf=True)
+                swing_brackets=bracket_learn.swing_anchor_brackets(
+                    candles=candles_full or candles,entry=entry_px,action=preferred,
+                    tick=tick,spread=spread,min_distance=0.,zone=zone,
+                    atr=atr_hint,kama=kama_hint,store=store)
+            except Exception as exc:
+                swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
         def _level_or_none(raw):
             """Broker unset SL/TP often arrives as 0 — omit for chart + Admin."""

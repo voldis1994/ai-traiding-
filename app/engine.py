@@ -6977,8 +6977,7 @@ class SingleTradeEngine:
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=1.0,
             entry=entry,action=proposal,candles=candles,atr=atr_hint,
-            kama=kama_hint,require_swing=True,store=self.store,
-            entry_zone=entry_zone,scenario=scenario,zones=ez)
+            kama=kama_hint,require_swing=True,store=self.store)
         # Same rule as LIVE OPEN — no invented median ±distance for shadow.
         if (not decided.get('ready') or decided.get('stop_distance') is None
                 or decided.get('profit_distance') is None):
@@ -9010,9 +9009,8 @@ class SingleTradeEngine:
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=1.0,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=True,store=self.store,
-                entry_zone=entry_zone,scenario=scenario,zones=zones_card,
-                trigger=trigger)
+                kama=kama_hint,require_swing=True,store=self.store)
+            # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:
                 # Wait for completed M1 swing/regime — do not POST fantasy SL/TP.

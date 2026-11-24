@@ -119,10 +119,8 @@ DEFAULTS = {
     'bracket_scratch_kappa_step': 0.97,
     'bracket_batch_raise_step': 1.08,
     'bracket_batch_cut_step': 0.92,
-    # PR #181 baseline (temporary restore): min RR 1.0 + soft-cap SL, not invent TP.
+    # Min reward:risk for LIVE SL/TP — swing SL is capped (or vetoed) to this RR.
     'bracket_min_rr': 1.0,
-    # Swing SL beyond this × ATR is "unrealistically far" — pull toward entry.
-    'bracket_sl_max_atr': 2.0,
     # LIVE OPEN prep/eval floors (seeds) — robot-owned, not frozen module consts.
     'min_prep_candles': 96,
     'train_frac': 0.70,
@@ -319,7 +317,6 @@ BOUNDS = {
     'bracket_batch_raise_step': (1.02, 1.2),
     'bracket_batch_cut_step': (0.8, 0.98),
     'bracket_min_rr': (0.6, 2.5),
-    'bracket_sl_max_atr': (1.0, 4.0),
     'min_prep_candles': (64, 240),
     'train_frac': (0.55, 0.85),
     'min_holdout_bars': (12, 80),

@@ -1173,7 +1173,8 @@ function renderDeskCheck(client,view){
       return fc.blocked?('BLOCK '+c):c;})(),
       cls:(()=>{const fc=a.flow_consensus||{};const c=String(fc.consensus||'').toUpperCase();
         return fc.blocked?'bad':(c==='BUY'?'ok':(c==='SELL'?'bad':'neu'));})()},
-    {k:'Model',v:ready.ready?'READY':'WAIT',cls:ready.ready?'ok':'neu'},
+    {k:'Model',v:ready.ready?'READY':(ready.cold_start_open?'COLD':'WAIT'),
+      cls:ready.ready?'ok':(ready.cold_start_open?'neu':'neu')},
     {k:'OPEN',v:canOpen?'YES':'NO',cls:canOpen?'ok':'bad'},
     {k:'CLOSE',v:closeLive?'LIVE':'DIAG',cls:closeLive?'ok':'neu'},
     {k:'SL/TP',v:(hasSl?'SL':'—')+'/'+(hasTp?'TP':'—'),

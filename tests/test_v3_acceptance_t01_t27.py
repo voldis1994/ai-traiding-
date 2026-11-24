@@ -217,7 +217,7 @@ def test_t05_zone_invalidation_close_through():
 
 
 def test_t06_zone_and_confirm_pin_and_microstructure():
-    """T06: playbook AND needs pin + microstructure; soft OR remains opt-out."""
+    """T06: confirm OFF by default; AND/OR only when require_confirm=1."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
@@ -231,19 +231,24 @@ def test_t06_zone_and_confirm_pin_and_microstructure():
         'open': mid + 0.05, 'high': mid + 0.2,
         'low': base_lo - 0.05, 'close': mid + 0.12,
     }
+    skipped = oez.zone_confirm_allows(
+        'BUY', candles=list(rows) + [pin], zone=buy, tick=0.1)
+    assert skipped['ok'] is True
+    assert skipped.get('reason') == 'confirm_skipped'
     soft = oez.zone_confirm_allows(
         'BUY', candles=list(rows) + [pin], zone=buy, tick=0.1,
-        require_both=False)
+        require_confirm=True, require_both=False)
     assert soft['ok'] is True
     hard = oez.zone_confirm_allows(
         'BUY', candles=list(rows) + [pin], zone=buy, tick=0.1,
-        require_both=True)
+        require_confirm=True, require_both=True)
     assert hard['ok'] is False
 
     rows_ok, _ = demand_zone_path(confirm=True)
     buy2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)['buy_entry']
     conf2 = oez.zone_confirm_allows(
-        'BUY', candles=rows_ok, zone=buy2, tick=0.1, require_both=True)
+        'BUY', candles=rows_ok, zone=buy2, tick=0.1,
+        require_confirm=True, require_both=True)
     assert conf2['ok'] is True
     assert conf2['rejection'].get('ok') is True
     assert conf2['structure'].get('ok') is True

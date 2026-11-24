@@ -1,11 +1,13 @@
 """1m playbook hard ENTRY checklist — structure / zone / session / brackets.
 
 Default ON via ``self_params.playbook_hard_entry``. When hard:
-  • Zone confirm = rejection AND micro structure (not OR)
   • Mid-range / failed zone / failed regime → hard OPEN ban (not soft note)
   • Active session window (London→NY overlap) required
-  • Flow fight can hard-block (opt-in via flow_consensus_block_fights)
+  • Flow fight can hard-block
   • Regime SL prefers HL/LH tags, break-candle extreme, sweep wick
+
+Zone candle confirm (pin/engulf/structure) is OFF by default —
+``playbook_require_zone_confirm=0``: price-in-zone + regime is enough.
 """
 from __future__ import annotations
 
@@ -59,17 +61,26 @@ def session_allows_open(*, now=None, store=None) -> dict:
     }
 
 
-def zone_confirm_require_both(store=None) -> bool:
-    """Playbook card: rejection candle + structure shift (AND)."""
-    if not hard_entry_enabled(store):
-        return False
-    if store is None:
-        return True
+def zone_confirm_required(store=None) -> bool:
+    """When False (default), skip pin/engulf/structure wait — zone touch is enough."""
     try:
         from .self_params import get as sp_get
-        return int(sp_get(store, 'playbook_zone_confirm_and', 1)) == 1
+        return int(sp_get(store, 'playbook_require_zone_confirm', 0)) == 1
     except Exception:
-        return True
+        return False
+
+
+def zone_confirm_require_both(store=None) -> bool:
+    """Optional AND (rejection + structure) — only when confirm is required."""
+    if not zone_confirm_required(store):
+        return False
+    if not hard_entry_enabled(store):
+        return False
+    try:
+        from .self_params import get as sp_get
+        return int(sp_get(store, 'playbook_zone_confirm_and', 0)) == 1
+    except Exception:
+        return False
 
 
 def break_candle_extreme(action, candles):

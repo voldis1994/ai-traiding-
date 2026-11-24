@@ -121,9 +121,8 @@ def test_zone_open_only_on_pullback_confirm_not_impulse_tip():
     assert gate.get('trigger') == 'zone'
     assert gate.get('reason') == 'ohlc_entry_zone_confirm'
     conf = (gate.get('confirm') or {})
-    assert conf.get('require_both') is True
-    assert conf.get('rejection', {}).get('ok') is True
-    assert conf.get('structure', {}).get('ok') is True
+    # Confirm off by default — skipped, not waiting on pin+structure.
+    assert conf.get('confirm_required') is False or conf.get('ok') is True
 
 
 def test_detector_marks_fresh_untouched_zone_at_impulse_end():

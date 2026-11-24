@@ -4,8 +4,8 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger needs price in zone + rejection AND micro structure (playbook hard)
-    — soft OR remains when ``playbook_hard_entry=0`` / ``playbook_zone_confirm_and=0``
+  • Zone trigger: price in zone (confirm OFF by default). Optional pin/structure
+    when ``playbook_require_zone_confirm=1`` (AND if ``playbook_zone_confirm_and=1``)
   • Invalidated zones (close through) are never selected (V3 Z03)
 
 Also: break trigger (structure/range break + M1 tape) when not waiting pullback.
@@ -666,11 +666,11 @@ def micro_structure_confirm(action, candles, zone, *, tick=0.01):
 
 
 def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
-                        require_both=None):
-    """Zone OPEN confirm — playbook AND (rejection + structure) by default.
+                        require_both=None, require_confirm=None):
+    """Zone OPEN confirm — OFF by default (price-in-zone is enough).
 
-    Soft OR when ``playbook_hard_entry=0`` / ``playbook_zone_confirm_and=0``.
-    Invalidated zones are never confirmed (Z03).
+    When ``playbook_require_zone_confirm=1``: pin/engulf/impulse and/or structure.
+    AND only if ``playbook_zone_confirm_and=1``. Invalidated zones never pass (Z03).
     """
     # Never confirm an already-invalidated zone (Z03).
     if isinstance(zone, dict) and (
@@ -680,6 +680,7 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
             'rejection': {'ok': False, 'reason': 'zone_invalidated', 'kind': None},
             'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
             'reason': 'zone_invalidated',
+            'confirm_required': False,
         }
     inv = zone_invalidation_status(zone, candles, tick=tick)
     if inv.get('invalidated'):
@@ -689,6 +690,26 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
             'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
             'reason': 'zone_invalidated',
             'invalidation': inv,
+            'confirm_required': False,
+        }
+    need_confirm = require_confirm
+    if need_confirm is None:
+        try:
+            from . import playbook_entry as _pb
+            need_confirm = _pb.zone_confirm_required(store)
+        except Exception:
+            need_confirm = False
+    if not need_confirm:
+        # Confirm off — still report candle evidence for Desk, but do not wait.
+        rej = rejection_candle(action, candles, zone, tick=tick)
+        st = micro_structure_confirm(action, candles, zone, tick=tick)
+        return {
+            'ok': True,
+            'rejection': rej,
+            'structure': st,
+            'require_both': False,
+            'confirm_required': False,
+            'reason': 'confirm_skipped',
         }
     rej = rejection_candle(action, candles, zone, tick=tick)
     st = micro_structure_confirm(action, candles, zone, tick=tick)
@@ -698,7 +719,7 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
             from . import playbook_entry as _pb
             and_mode = _pb.zone_confirm_require_both(store)
         except Exception:
-            and_mode = True
+            and_mode = False
     if and_mode:
         ok = bool(rej.get('ok') and st.get('ok'))
         if ok:
@@ -722,6 +743,7 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
         'rejection': rej,
         'structure': st,
         'require_both': bool(and_mode),
+        'confirm_required': True,
         'reason': reason,
     }
 

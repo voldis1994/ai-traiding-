@@ -59,11 +59,27 @@ def test_regime_breakout_sl_uses_break_candle_low():
     assert abs(out['stop_level'] - (99.9 - out['buffer'])) < 1e-6
 
 
-def test_zone_confirm_and_default_on_without_store():
+def test_zone_confirm_off_by_default():
     rows = [{'open': 100, 'high': 101, 'low': 99, 'close': 100.5,
              'at': '2026-11-24T10:00:00+00:00'}]
     zone = {'lo': 99.0, 'hi': 101.0, 'side': 'BUY'}
-    # Without structure evidence, default AND must wait.
     conf = oez.zone_confirm_allows('BUY', candles=rows, zone=zone, tick=0.1)
-    assert conf.get('require_both') is True
-    assert conf['ok'] is False
+    assert conf.get('confirm_required') is False
+    assert conf['ok'] is True
+    assert conf.get('reason') == 'confirm_skipped'
+    assert pb.zone_confirm_required(None) is False
+
+
+def test_zone_touch_allows_open_without_pin():
+    """With confirm off, price inside Demand is enough for zone trigger."""
+    from tests.ohlc_zone_path import demand_zone_path
+    rows, _ = demand_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    inside = (float(buy['lo']) + float(buy['hi'])) / 2
+    gate = oez.entry_allows_open(
+        'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
+        tick=0.1, spread=0.2)
+    assert gate['allowed'] is True
+    assert gate.get('trigger') == 'zone'
+    assert (gate.get('confirm') or {}).get('reason') == 'confirm_skipped'

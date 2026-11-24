@@ -144,20 +144,47 @@ def test_p0_06_resolve_does_not_return_upl_as_cash():
 
 
 def test_p0_02_poll_does_not_double_retry_pending():
-    src = Path('app/engine.py').read_text(encoding='utf-8')
-    # Locate poll body — must not call _retry_pending_broker_pnl after sync.
-    start = src.index('async def poll(self):')
-    end = src.index('\n    async def ', start + 10)
-    body = src[start:end]
-    assert 'await self.sync()' in body
-    assert 'await self._retry_pending_broker_pnl()' not in body
+    """Behaviour: sync owns pending retry; poll must not call it again."""
+    async def run():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            e.attach(broker)
+            calls = {'n': 0}
+            orig = e._retry_pending_broker_pnl
+
+            async def counted():
+                calls['n'] += 1
+                return await orig()
+
+            e._retry_pending_broker_pnl = counted  # type: ignore
+            # sync alone → one retry.
+            await e.sync()
+            after_sync = calls['n']
+            assert after_sync == 1
+            # poll → sync again (second call) but not a third double inside poll.
+            await e.poll()
+            assert calls['n'] == after_sync + 1
+
+    asyncio.run(run())
 
 
 def test_p0_10_funds_bind_exact_deal_id_only():
-    src = Path('app/engine.py').read_text(encoding='utf-8')
-    assert "OR deal_id LIKE ?" not in src or 'P0-10' in src
-    # Positive: exact bind query present.
-    assert 'WHERE deal_id=? LIMIT 1' in src
+    """Behaviour: unidentified cash stays UNMATCHED; exact deal_link teaches."""
+    from app import cash_ledger
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        orphan = cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.55, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link=None, transaction_id='orph-x')
+        assert (orphan.get('event') or orphan)['status'] == cash_ledger.STATUS_UNMATCHED
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.55, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='EXACT1', transaction_id='exact-x')
+        assert cash_ledger.deal_realized(store, 'EXACT1')['may_teach'] is True
 
 
 def test_pending_queue_does_not_silently_drop():
@@ -168,3 +195,8 @@ def test_pending_queue_does_not_silently_drop():
             e._queue_pending_pnl(f'd{i}')
         pending = store.get('pending_broker_pnl_deals') or []
         assert len(pending) >= 520
+        from app import work_queue
+        n = store.db.execute(
+            "SELECT COUNT(*) FROM work_queue WHERE kind=?",
+            (work_queue.KIND_SETTLE_PNL,)).fetchone()[0]
+        assert int(n) >= 520

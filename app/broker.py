@@ -48,11 +48,14 @@ def capital_api_time(value):
 class CapitalBroker:
     def __init__(self, api_key, identifier, password, live=True, client=None):
         self.api_key=api_key;self.identifier=identifier;self.password=password
+        self.live=bool(live)
         self.base=LIVE if live else DEMO
         self.client=client or httpx.AsyncClient(base_url=self.base, timeout=15.0, follow_redirects=False)
         self.cst=None;self.security=None
-        # Identity = API key + login — shared budget across this session.
-        self._rest=manager_for(f'{api_key}:{identifier}')
+        # LIVE/DEMO isolated budgets (item 9).
+        self._rest=manager_for(
+            f'{api_key}:{identifier}',
+            environment=('live' if live else 'demo'))
 
     async def _connect_raw(self):
         """Session POST only — manager owns rate slot + generation bump."""

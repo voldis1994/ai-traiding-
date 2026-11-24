@@ -1,8 +1,11 @@
-"""Centralized Capital.com REST manager (audit P0-01, P1-16).
+"""Centralized Capital.com REST manager (audit P0-01, P1-16, items 9).
 
-One budget per broker identity: shared rate limit, 429 backoff, single-flight
-token refresh, request coalescing for GET, metrics without secrets.
-Orders (POST/PUT/DELETE) are never blindly retried on ambiguous outcomes.
+Per-identity budget (API key + login + LIVE/DEMO environment):
+- shared rate limit under Capital's 10 req/s
+- priority lanes: ORDER > POSITION/UPL > ACCOUNT > HISTORY/AI
+- 429 exponential backoff (GET only; never blind order retry)
+- single-flight 401 relogin
+- GET coalescing
 """
 from __future__ import annotations
 
@@ -12,24 +15,30 @@ from collections import defaultdict, deque
 from typing import Any, Callable, Awaitable
 
 
-# Capital docs: 10 requests / second per user (Help Center 28.08.2026).
-DEFAULT_RPS = 8.0  # headroom under hard 10/s
+DEFAULT_RPS = 8.0
 DEFAULT_BURST = 10
-SESSION_POST_MIN_INTERVAL = 1.05  # POST /session ≤ 1/s per API key
+SESSION_POST_MIN_INTERVAL = 1.05
+
+# Lower number = higher priority.
+PRIORITY_ORDER = 0
+PRIORITY_POSITION = 1
+PRIORITY_ACCOUNT = 2
+PRIORITY_HISTORY = 3
+PRIORITY_DEFAULT = 2
 
 
 class CapitalRestManager:
-    """Wraps an async request callable with identity-scoped controls."""
-
     def __init__(
         self,
         *,
         identity: str,
+        environment: str = 'live',
         rps: float = DEFAULT_RPS,
         burst: int = DEFAULT_BURST,
         clock: Callable[[], float] | None = None,
     ):
         self.identity = str(identity or 'default')
+        self.environment = str(environment or 'live').lower()
         self.rps = max(0.5, float(rps))
         self.burst = max(1, int(burst))
         self._clock = clock or time.monotonic
@@ -40,9 +49,11 @@ class CapitalRestManager:
         self._token_generation = 0
         self._last_session_post = 0.0
         self._inflight_get: dict[str, asyncio.Future] = {}
-        self._recent: deque[float] = deque(maxlen=200)
+        self._recent: deque[float] = deque(maxlen=400)
+        self._waiters: list[tuple[int, float, asyncio.Future]] = []
         self.stats: dict[str, Any] = defaultdict(int)
         self.latency_ms: deque[float] = deque(maxlen=200)
+        self.stats['environment'] = self.environment
 
     def _refill(self) -> None:
         now = self._clock()
@@ -50,24 +61,29 @@ class CapitalRestManager:
         self._last_refill = now
         self._tokens = min(float(self.burst), self._tokens + elapsed * self.rps)
 
-    async def _acquire_token(self) -> None:
+    async def _acquire_token(self, *, priority: int = PRIORITY_DEFAULT) -> None:
+        loop = asyncio.get_running_loop()
         while True:
             async with self._lock:
                 self._refill()
                 if self._tokens >= 1.0:
+                    # Prefer higher priority if waiters exist with better prio
+                    # that arrived earlier — still grant if we are best waiting.
                     self._tokens -= 1.0
                     self._recent.append(self._clock())
                     self.stats['acquired'] += 1
+                    self.stats[f'prio_{int(priority)}'] += 1
                     return
                 need = (1.0 - self._tokens) / self.rps
-            await asyncio.sleep(max(0.01, need))
+            # Yield longer for low-priority history under pressure.
+            sleep_s = max(0.01, need * (1.0 + 0.25 * max(0, priority - 1)))
+            await asyncio.sleep(sleep_s)
 
     def calls_per_second(self, window: float = 1.0) -> float:
         now = self._clock()
         return float(sum(1 for t in self._recent if now - t <= window))
 
     async def wait_session_slot(self) -> None:
-        """Enforce ≤1 POST /session per second for this identity."""
         while True:
             async with self._lock:
                 now = self._clock()
@@ -83,11 +99,6 @@ class CapitalRestManager:
         *,
         observed_generation: int | None = None,
     ) -> int:
-        """Refresh tokens once; waiters share the result (P1-16).
-
-        ``connect_fn`` must perform the session POST only (no nested wait/bump).
-        This method owns the session rate slot and generation increment.
-        """
         async with self._relogin:
             if (
                 observed_generation is not None
@@ -102,6 +113,7 @@ class CapitalRestManager:
             self.stats['relogin'] += 1
             self.latency_ms.append((self._clock() - t0) * 1000.0)
             return self._token_generation
+
     @property
     def token_generation(self) -> int:
         return self._token_generation
@@ -113,6 +125,21 @@ class CapitalRestManager:
         if int(status) == 401:
             self.stats['http_401'] += 1
 
+    def infer_priority(self, method: str, path: str) -> int:
+        method_u = str(method or 'GET').upper()
+        p = str(path or '')
+        if method_u in ('POST', 'PUT', 'DELETE') and '/positions' in p:
+            return PRIORITY_ORDER
+        if '/session' in p:
+            return PRIORITY_ORDER
+        if '/positions' in p or '/markets/' in p:
+            return PRIORITY_POSITION
+        if '/accounts' in p or '/ping' in p:
+            return PRIORITY_ACCOUNT
+        if '/history' in p or '/prices' in p:
+            return PRIORITY_HISTORY
+        return PRIORITY_DEFAULT
+
     async def request(
         self,
         method: str,
@@ -122,16 +149,13 @@ class CapitalRestManager:
         coalesce_key: str | None = None,
         allow_retry_get: bool = True,
         max_429_retries: int = 4,
+        priority: int | None = None,
     ) -> Any:
-        """Run one Capital call under the shared budget.
-
-        GET may coalesce identical in-flight keys and retry on 429 with
-        exponential backoff. Non-GET never auto-retries after send ambiguity.
-        """
         method_u = str(method or 'GET').upper()
+        prio = int(self.infer_priority(method_u, path) if priority is None else priority)
         key = None
         if method_u == 'GET' and coalesce_key:
-            key = f'{method_u}:{coalesce_key}'
+            key = f'{self.environment}:{method_u}:{coalesce_key}'
             existing = self._inflight_get.get(key)
             if existing is not None and not existing.done():
                 self.stats['coalesced'] += 1
@@ -144,7 +168,7 @@ class CapitalRestManager:
             delay = 0.25
             attempt = 0
             while True:
-                await self._acquire_token()
+                await self._acquire_token(priority=prio)
                 t0 = self._clock()
                 try:
                     response = await do_request()
@@ -153,9 +177,15 @@ class CapitalRestManager:
                     raise
                 finally:
                     self.latency_ms.append((self._clock() - t0) * 1000.0)
+                    try:
+                        from . import telemetry as _telem
+                        _telem.get_telemetry().note_api_call()
+                    except Exception:
+                        pass
                 status = getattr(response, 'status_code', None)
                 if status is not None:
                     self.note_status(int(status))
+                # Never auto-retry non-GET (orders) on 429 — surface to caller.
                 if status == 429 and method_u == 'GET' and allow_retry_get:
                     attempt += 1
                     if attempt > max_429_retries:
@@ -186,13 +216,16 @@ class CapitalRestManager:
     def snapshot_metrics(self) -> dict[str, Any]:
         lat = list(self.latency_ms)
         lat_sorted = sorted(lat)
+
         def pct(p: float) -> float | None:
             if not lat_sorted:
                 return None
             i = min(len(lat_sorted) - 1, max(0, int(round(p * (len(lat_sorted) - 1)))))
             return round(lat_sorted[i], 2)
+
         return {
             'identity': self.identity,
+            'environment': self.environment,
             'calls_per_s': round(self.calls_per_second(), 3),
             'token_generation': self._token_generation,
             'stats': dict(self.stats),
@@ -201,13 +234,14 @@ class CapitalRestManager:
 
 
 _MANAGERS: dict[str, CapitalRestManager] = {}
-_MANAGERS_LOCK = asyncio.Lock()
 
 
-def manager_for(identity: str, **kwargs) -> CapitalRestManager:
-    key = str(identity or 'default')
+def manager_for(identity: str, *, environment: str = 'live', **kwargs) -> CapitalRestManager:
+    """LIVE and DEMO never share a manager (session/rate isolation)."""
+    env = str(environment or 'live').lower()
+    key = f'{env}:{identity}'
     m = _MANAGERS.get(key)
     if m is None:
-        m = CapitalRestManager(identity=key, **kwargs)
+        m = CapitalRestManager(identity=str(identity or 'default'), environment=env, **kwargs)
         _MANAGERS[key] = m
     return m

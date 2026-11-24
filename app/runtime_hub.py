@@ -381,18 +381,57 @@ class RuntimeHub:
     def _trade_stats(self,store: Store, account_currency: str|None=None,
                      open_upl: float|None=None) -> dict:
         acct=(account_currency or '').strip().upper() or None
-        # Fix historical GOLD→USD tags so admin P&L matches Capital account cash.
+        # Item 6: fill blank currency only — never rewrite proven tags blindly.
         if acct:
             try:store.repair_broker_pnl_currency(acct)
             except Exception:pass
-        # Full history — Admin P&L must NOT silently drop older closes past a
-        # trades(200) window (that made −13 look like −3).
+        # Item 5: Cash Ledger is authoritative for realized £; journal is derived.
+        ledger_by_deal={}
+        ledger_snap=None
+        try:
+            from . import cash_ledger
+            from .realized_cash import from_minor
+            acct_id=str(store.get('capital_account_id') or 'live')
+            ccy_l=acct or 'GBP'
+            ledger_snap=cash_ledger.consumer_snapshot(
+                store,acct_id,currency=ccy_l,
+                environment=str(store.get('capital_environment') or 'live'))
+            for ev in cash_ledger.load_events(store):
+                deal=str(ev.get('deal_link') or '')
+                st=str(ev.get('status') or '')
+                if not deal or ev.get('amount_minor') is None:
+                    continue
+                if st not in (cash_ledger.STATUS_SETTLED,cash_ledger.STATUS_SETTLED_ZERO,
+                              cash_ledger.STATUS_MATCH_UNCERTAIN):
+                    continue
+                try:
+                    major=float(from_minor(int(ev['amount_minor']),
+                                           str(ev.get('currency') or ccy_l)))
+                except Exception:
+                    continue
+                ledger_by_deal[deal]={
+                    'pnl':major,
+                    'pnl_currency':str(ev.get('currency') or ccy_l).upper(),
+                    'pnl_source':'broker',
+                    'ledger_status':st,
+                }
+        except Exception:
+            ledger_by_deal={}
+            ledger_snap=None
         cols=('deal_id','epic','size','direction','opened','closed','entry','exit',
               'pnl','pnl_currency','pnl_source')
         closed_rows=[dict(zip(cols,r)) for r in store.db.execute(
             'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
             'pnl_currency,pnl_source FROM trades WHERE closed IS NOT NULL '
             'ORDER BY closed DESC')]
+        # Overlay ledger amounts onto matching deals.
+        for t in closed_rows:
+            deal=str(t.get('deal_id') or '')
+            if deal in ledger_by_deal:
+                t['pnl']=ledger_by_deal[deal]['pnl']
+                t['pnl_currency']=ledger_by_deal[deal]['pnl_currency']
+                t['pnl_source']='broker'
+                t['ledger_status']=ledger_by_deal[deal]['ledger_status']
         open_n=int(store.db.execute(
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
@@ -2290,6 +2329,13 @@ class RuntimeHub:
                         engine.execution_enabled=True
                         store.event('recovery',
                             'Read-only broker outage recovered; autonomous execution resumed')
+                    try:
+                        from . import telemetry as _telem
+                        from . import offloop as _off
+                        _telem.get_telemetry().note_loop_tick()
+                        _off.schedule(_telem.get_telemetry().persist,store)
+                    except Exception:
+                        pass
                     # Yield so light loop + Desk HTTP get the event loop.
                     await asyncio.sleep(0.05)
                     continue

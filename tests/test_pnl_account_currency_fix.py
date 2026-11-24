@@ -12,8 +12,8 @@ from tests.test_learning_integrity import new_brain
 from tests.test_broker_pnl_resolve import HistoryBroker
 
 
-def test_cash_currency_prefers_account_may_return_hint():
-    """Account currency wins; when unknown, hint may be returned (P0-09)."""
+def test_cash_currency_account_only_never_hint():
+    """Item 6: account currency only — never stamp cash from unproven hint."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -21,7 +21,7 @@ def test_cash_currency_prefers_account_may_return_hint():
         assert e._cash_currency('USD')=='GBP'
         assert e._cash_currency(None)=='GBP'
         e.account={}
-        assert e._cash_currency('USD')=='USD'  # hint ok when account currency unknown
+        assert e._cash_currency('USD') is None
         assert e._cash_currency(None) is None
 
 
@@ -52,10 +52,11 @@ def test_upl_snapshot_uses_account_not_position_usd():
         snap=store.get('last_upl:x')
         assert snap['currency']=='GBP'
         assert snap['upl']==pytest.approx(0.12)
-        # Without account currency, hint may stamp (diagnostic only — not teach cash).
+        # Without account currency, do not invent a currency tag from quote hint.
         e.account={}
         e._snapshot_open_upl({'dealId':'y','upl':0.05,'currency':'USD','level':2650.})
-        assert store.get('last_upl:y')['currency']=='USD'
+        snap_y=store.get('last_upl:y')
+        assert snap_y['currency'] in (None,'') or snap_y.get('currency') is None
 
 
 def test_mapped_open_position_currency_is_account_not_gold_usd():

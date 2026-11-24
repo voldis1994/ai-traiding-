@@ -21,8 +21,12 @@ def test_worker_runs_independent_light_and_heavy_loops():
 
 
 def test_legacy_worker_still_has_light_window():
+    """Item 13: main.worker runs parallel heavy/light like RuntimeHub."""
     src = inspect.getsource(main_mod.worker)
-    assert 'quote_upl_tick' in src or 'light_n' in src
+    assert '_legacy_heavy_loop' in src and '_legacy_light_loop' in src
+    light = inspect.getsource(main_mod._legacy_light_loop)
+    assert 'quote_upl_tick' in light
+    assert 'await engine.poll()' not in light
 
 
 def test_overview_truth_refresh_is_time_bounded():

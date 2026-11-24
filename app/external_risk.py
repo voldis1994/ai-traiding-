@@ -62,8 +62,9 @@ def assess_news(epic, path, *, now=None, instrument_currencies=None):
             if not start <= current.date() < end:
                 raise ValueError('weekly economic calendar does not cover today')
             if not currencies:
-                return {'enabled':True,'entry_allowed':False,'status':'UNMAPPED_INSTRUMENT',
-                        'reason':'Cannot map broker instrument to economic event currencies'}
+                # V5 D08/L04: unmapped instrument is context for the model, not an OPEN veto.
+                return {'enabled':True,'entry_allowed':True,'status':'UNMAPPED_INSTRUMENT',
+                        'reason':'Cannot map broker instrument to economic event currencies — OPEN not blocked'}
         for event in events:
             if not isinstance(event, dict):
                 raise ValueError('invalid event')
@@ -77,11 +78,13 @@ def assess_news(epic, path, *, now=None, instrument_currencies=None):
             if epic not in targets and '*' not in targets and not set(currencies).intersection(affected) and 'ALL' not in affected:
                 continue
             if at-timedelta(minutes=before) <= current <= at+timedelta(minutes=after):
-                return {'enabled': True, 'entry_allowed': False, 'status': 'NEWS_WINDOW',
-                        'reason': 'High-impact event: '+str(event.get('name', 'Unnamed event'))[:100],
+                # V5 D05/L04: news window is context only — never HOLD_NEWS / OPEN veto.
+                return {'enabled': True, 'entry_allowed': True, 'status': 'NEWS_WINDOW',
+                        'reason': 'High-impact event (info): '+str(event.get('name', 'Unnamed event'))[:100],
                         'event_at': at.isoformat()}
         return {'enabled': True, 'entry_allowed': True, 'status': 'CLEAR',
                 'reason': 'Verified calendar has no matching high-impact event in safety window'}
     except (ValueError, TypeError, KeyError, OSError, OverflowError) as exc:
-        return {'enabled': True, 'entry_allowed': False, 'status': 'CALENDAR_UNAVAILABLE',
-                'reason': 'Economic calendar unavailable or invalid: '+str(exc)[:160]}
+        # V5 D08/T04: stale/invalid calendar must not REQUIRED→HOLD OPEN.
+        return {'enabled': True, 'entry_allowed': True, 'status': 'CALENDAR_UNAVAILABLE',
+                'reason': 'Economic calendar unavailable or invalid (OPEN continues): '+str(exc)[:160]}

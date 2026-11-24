@@ -59,7 +59,9 @@ def test_vanish_waits_for_funds_then_teaches_once():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row.get('pnl_source')=='pending_broker_pnl'
+            # Desk provisional UPL; teach only after Funds £.
+            assert row.get('pnl_source')=='upl_estimate'
+            assert row.get('pnl')==pytest.approx(-0.11)
             assert not e._trade_already_learned('g1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)

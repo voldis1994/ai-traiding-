@@ -4,7 +4,7 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger needs price in zone + rejection AND micro structure change (V3 Z04)
+  • Zone trigger needs price in zone + rejection OR micro structure change (V5 Z04/T06)
   • Invalidated zones (close through) are never selected (V3 Z03)
 
 Also: break trigger (structure/range break + M1 tape) when not waiting pullback.

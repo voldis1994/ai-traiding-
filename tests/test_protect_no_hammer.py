@@ -22,6 +22,15 @@ def _engine(d):
     return engine, store
 
 
+def _open_bracket_snapshot(store, pos, *, stop=2.0, profit=3.0):
+    """V5 swing path may refuse RR — OPEN snapshot still drives protect tests."""
+    entry = float(pos['level'])
+    store.set('open_brackets:' + str(pos['dealId']), {
+        'stop_distance': stop, 'profit_distance': profit,
+        'direction': pos['direction'], 'entry': entry,
+    })
+
+
 def test_protect_reject_backs_off_before_next_put():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
@@ -52,6 +61,7 @@ def test_protect_reject_backs_off_before_next_put():
                 'spread': 0.5, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
             }
             pos = engine.positions[0]
+            _open_bracket_snapshot(store, pos)
             await engine.protect_position(pos)
             assert len([r for r in broker.requests if r[0] == 'PROTECT']) == 1
             rt = store.get('protect_runtime:andris-hammer')

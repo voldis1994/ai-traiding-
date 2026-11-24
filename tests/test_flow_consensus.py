@@ -87,13 +87,24 @@ def test_adaptive_system_includes_flow_stage():
 
 
 def test_apply_to_decision_blocks_fight_with_majority():
+    import tempfile
+    from pathlib import Path
+    from app.engine import Store
+    from app import self_params as sp
+
     cons = fc.evaluate(
         _obs(imbalance=-0.4, micro=-0.4, impulse=-0.35, vol_z=-0.4),
         proposed='BUY', epic='GOLD')
     assert cons['agree'] >= 2
     scores = {'BUY': 0.70, 'SELL': 0.20, 'HOLD': 0.10}
-    dec = fc.apply_to_decision(
-        scores, action='BUY', consensus=cons, store=None)
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        store.set(sp.STORE_KEY, {
+            **(store.get(sp.STORE_KEY) or {}),
+            fc.STORE_BLOCK_KEY: 1,
+        })
+        dec = fc.apply_to_decision(
+            scores, action='BUY', consensus=cons, store=store)
     assert dec['blocked'] is True
     assert dec['action'] == 'HOLD'
     assert dec['effect'] == 'blocked_fight'

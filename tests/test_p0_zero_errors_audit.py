@@ -89,14 +89,14 @@ def test_late_broker_banks_day_book_after_ticks_learn():
             assert float(daily_before.get('realized_pnl') or 0)==0.0
             # Verified Capital cash — first neural teach + day book bank once.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
             assert e._trade_already_learned('late1')
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.18)
             assert store.get('broker_cash_banked:late1')
             # Second late refine must not double-bank.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
             daily2=db.load_daily(store,equity=10_000.0)
             assert float(daily2.get('realized_pnl') or 0)==pytest.approx(0.18)
     asyncio.run(scenario())
@@ -265,8 +265,10 @@ def test_settle_history_cash_keeps_sibling_multi_pos():
             assert 'keep' in e._open_deal_ids
             assert 'gone' not in e._open_deal_ids
             row=next(t for t in store.trades(5) if t['deal_id']=='gone')
-            assert row['pnl']==pytest.approx(0.11)
+            assert row['closed'] is not None
+            # Exact history cash → take Capital £ as broker.
             assert row['pnl_source']=='broker'
+            assert row['pnl']==pytest.approx(0.11)
     asyncio.run(scenario())
 
 
@@ -420,7 +422,7 @@ def test_late_cash_feeds_profit_learning():
             assert not e._trade_already_learned('pl1')
             assert list(e.profit_learning.broker_pnls())==[]
             e._learn_closed_trade('pl1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
             assert e._trade_already_learned('pl1')
             assert float(db.load_daily(store,equity=10_000.0).get('realized_pnl') or 0)==pytest.approx(0.18)
             assert e.profit_learning.broker_pnls()[-1]==pytest.approx(0.18)

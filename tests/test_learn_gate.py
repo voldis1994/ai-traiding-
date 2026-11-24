@@ -249,7 +249,7 @@ def test_engine_closed_trade_keeps_on_thin_holdout():
         store.upsert_trade({'dealId':'lg1','epic':'GOLD','size':'1','direction':'BUY','level':100})
         store.set('entry_brain:lg1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
-        engine._learn_closed_trade('lg1',{'level':99.0,'profit':-12.5})
+        engine._learn_closed_trade('lg1',{'level':99.0,'profit':-12.5,'pnl_source':'broker'})
         gate=store.get('learn_gate_last_v1') or {}
         assert gate.get('keep') is True or gate.get('reason')=='learn_gate_disabled'
         last=[e for e in store.recent()
@@ -295,7 +295,7 @@ def test_engine_rollback_skips_weight_update_event():
                     'trade_pnl':trade_pnl}
         lg.gate_closed_trade_learn=force_rollback
         try:
-            engine._learn_closed_trade('lg2',{'level':99.0,'profit':-12.5})
+            engine._learn_closed_trade('lg2',{'level':99.0,'profit':-12.5,'pnl_source':'broker'})
         finally:
             lg.gate_closed_trade_learn=real_gate
         assert np.allclose(before,brain.core.P)

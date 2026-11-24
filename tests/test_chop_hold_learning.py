@@ -22,7 +22,7 @@ def test_loss_uses_counterfactual_not_forced_hold():
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition),
             'entry_spread':0.3})
         # SELL into a rise → counterfactual BUY beats HOLD/SELL after costs.
-        e._learn_closed_trade('s1',{'level':101,'profit':-0.2})
+        e._learn_closed_trade('s1',{'level':101,'profit':-0.2,'pnl_source':'broker'})
         out=store.get('last_trade_outcome')
         assert out['mode'].startswith('flip_loss_counterfactual_buy')
         store.set('last_trade_outcome',None)
@@ -30,5 +30,5 @@ def test_loss_uses_counterfactual_not_forced_hold():
         store.set('entry_brain:s2',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition),
             'entry_spread':0.3})
-        e._learn_closed_trade('s2',{'level':99,'profit':-0.15})
+        e._learn_closed_trade('s2',{'level':99,'profit':-0.15,'pnl_source':'broker'})
         assert store.get('last_trade_outcome')['mode']=='loss_counterfactual_sell'

@@ -26,9 +26,10 @@ READY_KEY = 'shadow_mistake_audit_v1:ready'
 LAST_KEY = 'shadow_mistake_audit_v1:last'
 PENDING_FIX_KEY = 'shadow_mistake_audit_v1:pending_fix'
 
-# V3.0 V04: instant ready_for_live after first mistake is forbidden.
-PROMOTE_N = 3   # same fingerprint+mistake must repeat ≥3 times before commit
-READY_N = 3     # ≥3 proof wins after fix before ready_for_live
+# Loss → diagnose → change knobs → re-test same situation next time.
+# One repeat is enough: neural must improve itself without waiting for 3 losses.
+PROMOTE_N = 1   # first same fingerprint+mistake commits the targeted fix
+READY_N = 1     # first proof win after fix marks ready_for_live
 
 
 def _finite(v):
@@ -607,10 +608,13 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if diagnosis.get('mistakes') and diagnosis.get('proposed_fix'):
         fp = (diagnosis.get('context') or {}).get('fingerprint')
         gate = promote_gate(store, fp, diagnosis['mistakes'])
-        if apply_ohlc_penalties and gate.get('ready'):
-            commit_result = apply_targeted_fix(store, diagnosis, commit=True)
-        else:
-            commit_result = apply_targeted_fix(store, diagnosis, commit=False)
+        # Apply targeted fix so the next same-situation OPEN tests the change.
+        # LIVE Capital £ and SHADOW paper both commit — no pending-only stall.
+        do_commit = bool(apply_ohlc_penalties and gate.get('ready'))
+        commit_result = apply_targeted_fix(
+            store, diagnosis, commit=do_commit)
+        if isinstance(commit_result, dict) and do_commit:
+            commit_result = dict(commit_result, live_commit=True)
 
     ready = None
     # V04: ready_for_live only after READY_N proof wins post-fix — never on commit alone.

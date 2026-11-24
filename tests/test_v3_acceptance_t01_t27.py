@@ -338,6 +338,29 @@ def test_t09_hold_rr_not_sl_move():
     assert float(br['stop_level']) < 96.0 - 1e-9
     assert float(br.get('rr') or 0) == pytest.approx(bruto_rr, rel=1e-3)
 
+    # LIVE wrapper must also refuse soft-cap (F01/F02 — not only regime_brackets).
+    from app.bracket_learn import decide_brackets_from_ohlc, apply_min_rr
+    soft = apply_min_rr(
+        action='BUY', entry=100.0, stop_level=94.5, profit_level=104.0,
+        stop_d=5.5, profit_d=4.0, floor=0.5, min_rr=1.5, allow_soft_shrink=False)
+    assert soft.get('ok') is False
+    assert soft.get('capped') is not True
+    zone = {
+        'kappa': 1.0, 'range_distance': 5.0, 'max_tp': 8.0, 'noise_distance': 2.0,
+        'ready': True,
+        'buy_entry': {'side': 'BUY', 'lo': 95.0, 'hi': 96.0, 'sl_anchor': 95.0},
+        'sell_entry': {'side': 'SELL', 'lo': 103.5, 'hi': 104.0},
+    }
+    decided = decide_brackets_from_ohlc(
+        zone, tick=0.25, spread=0.0, min_distance=0.5, entry=100.0, action='BUY',
+        candles=candles, atr=None, store=None, entry_zone=zone['buy_entry'],
+        scenario={'scenario': 'TREND_UP', 'range': {'lo': 95.0, 'hi': 110.0}},
+        trigger='zone')
+    if decided.get('ready') and decided.get('stop_level') is not None:
+        assert float(decided['stop_level']) < 96.0 - 1e-9
+        assert decided.get('rr_capped') is not True
+        assert '+rr_cap_sl' not in str(decided.get('reason') or '')
+
 
 def test_t10_fakeout_sl_below_sweep():
     """T10: fakeout BUY range/sweep low 98, buffer 0.2 → SL ≤ 97.8; SELL symmetric."""

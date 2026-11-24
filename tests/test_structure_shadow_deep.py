@@ -177,7 +177,7 @@ def test_deep_engine_sl_records_frame_and_teaches_neurons():
         })
         e._learn_closed_trade(deal, {
             'level': exit_px, 'profit': -0.12, 'pnl_currency': 'GBP',
-            'exit_reason': 'sl',
+            'pnl_source': 'broker', 'exit_reason': 'sl',
         })
 
         # Snapshot library populated — engine splits pre/path by bar_time, so a

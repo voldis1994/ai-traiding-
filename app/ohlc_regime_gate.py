@@ -15,7 +15,8 @@ from __future__ import annotations
 import math
 
 DEFAULTS = {
-    'enabled': 1,
+    # Soft by default — chop/doji/impulse are notes for the neural, not OPEN bans.
+    'enabled': 0,
     'lookback': 12,
     'chop_flip_min': 5,          # direction flips in lookback
     'chop_progress_max': 0.28,   # |net| / sum(range) → chop
@@ -42,7 +43,8 @@ def _params(store=None) -> dict:
         return out
     try:
         from .self_params import get as sp_get
-        out['enabled'] = int(sp_get(store, 'ohlc_regime_gate_enabled', 1))
+        out['enabled'] = int(sp_get(
+            store, 'ohlc_regime_gate_enabled', DEFAULTS['enabled']))
         out['lookback'] = int(sp_get(store, 'ohlc_regime_lookback', DEFAULTS['lookback']))
         out['chop_flip_min'] = int(sp_get(store, 'ohlc_regime_chop_flips', DEFAULTS['chop_flip_min']))
         out['chop_progress_max'] = float(

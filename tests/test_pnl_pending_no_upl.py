@@ -11,8 +11,8 @@ from tests.test_broker_pnl_resolve import HistoryBroker
 from tests.test_learning_integrity import new_brain
 
 
-def test_resolve_ignores_upl_waits_for_funds():
-    """UPL must not settle — source stays pending until Funds/history £."""
+def test_resolve_upl_is_provisional_never_broker():
+    """UPL may show on Desk as estimate — never teach / never stamp broker."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -21,9 +21,11 @@ def test_resolve_ignores_upl_waits_for_funds():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
-            assert pnl is None
-            assert src=='pending_broker_pnl'
+            assert pnl==pytest.approx(0.45)
+            assert src=='upl_estimate'
             assert src!='broker'
+            from app.realized_cash import may_teach_live_cash
+            assert may_teach_live_cash(src) is False
     asyncio.run(scenario())
 
 
@@ -77,8 +79,9 @@ def test_vanish_queues_pending_when_history_empty():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row.get('pnl_source')=='pending_broker_pnl'
-            assert row.get('pnl') is None
+            # Last open UPL is Desk-only until Funds/activity £ arrives.
+            assert row.get('pnl_source')=='upl_estimate'
+            assert row.get('pnl')==pytest.approx(-0.22)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
             assert not e._trade_already_learned('gold1')

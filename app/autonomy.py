@@ -339,12 +339,16 @@ class AutoEvolution:
         return 'CLOSE'
 
     def _policy_live_execute_on(self):
-        """Promoted policy.py may gate LIVE OPEN when enabled (default ON)."""
+        """Promoted policy.py may gate LIVE OPEN when enabled (default OFF).
+
+        V5 / ops: fail-closed — missing/broken params → research-only (OFF).
+        """
         try:
-            from .self_params import get as sp_get
-            return int(sp_get(self.store,'policy_live_execute',1))==1
+            from .self_params import get as sp_get, DEFAULTS as SP_DEFAULTS
+            return int(sp_get(self.store,'policy_live_execute',
+                              SP_DEFAULTS.get('policy_live_execute',0)))==1
         except Exception:
-            return True
+            return False
 
     def calibrate_live_entry_floor(self,direction,*,history=None,spread_bps=0.0,
                                    accuracy=None,samples=0):
@@ -514,7 +518,7 @@ class AutoEvolution:
             return {**base,'action':'HOLD',
                     'reason':('Argmax '+direction+' blocked: need prep/eval readiness or '
                               'cost-adjusted utility evidence (score edge is not enough)')}
-        # --- Evolved strategy executes: confirm or HOLD (default ON) ---
+        # --- Evolved strategy executes: confirm or HOLD (when policy_live_execute=1) ---
         if self._policy_live_execute_on():
             # Accuracy/samples from readiness when available — feed calibration.
             acc=None;samp=0
@@ -966,7 +970,7 @@ class AutoEvolution:
 
         Default self_params.policy_evolve_enabled=1 runs the search. Promoted
         modules are consulted by evaluate_neural_entry when policy_live_execute=1
-        (also default ON) — neural proposes side, decide() confirms or HOLDs.
+        (default OFF) — neural proposes side, decide() confirms or HOLDs.
 
         ``cash_trades``: joined profit rows (scores+direction+actual_pnl). When
         omitted, falls back to rows already embedded in ``history`` (rare).
@@ -1350,7 +1354,8 @@ class AutoEvolution:
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
         maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
-        # Real promote: shadow paper £ beat LIVE → copy shadow weights into LIVE.
+        # V5 H01: SHADOW may research / signal promote, but must NEVER rewrite LIVE W.
+        # Record evidence + event only — operator/manual path owns any LIVE adopt.
         if decision.get('promote') and getattr(engine,'shadow_brain',None) is not None:
             brain=getattr(engine,'brain',None)
             shadow=engine.shadow_brain
@@ -1362,34 +1367,26 @@ class AutoEvolution:
                               reason=self.last_reason)
             elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
-                self._push_model_snapshot(engine,note='pre_shadow_promote')
-                # Full architecture adopt — never silently drop shadow neurons
-                # when shadow.n != live.n (partial min(n) copy was a fake promote).
-                if brain.core.copy_weights_from(shadow,adopt_architecture=True):
-                    brain.model_version=int(getattr(brain,'model_version',0) or 0)+1
-                    try:brain.save()
-                    except Exception:pass
-                    from .learning_generation import bump as bump_generation
-                    bumped=bump_generation(
-                        self.store,'shadow_weights_promoted_to_live',
-                        kind='verified_candidate_promotes',
-                        weight_checksum=checksum)
-                    self._record_promote_evidence(
-                        engine,live_hist,shadow_rows,checksum)
-                    shadow.model_version=int(getattr(shadow,'model_version',0) or 0)+1
-                    if hasattr(engine,'_persist_shadow_state'):
-                        engine._persist_shadow_state()
-                    self.last_reason='Shadow weights promoted to LIVE neural core'
-                    self.store.set('neural_adapt_reason',
-                        'Shadow paper £ beat LIVE — weights copied into LIVE core')
-                    self.store.event('learning','Shadow neural weights promoted to LIVE',
-                        {'model_version':brain.model_version,
-                         'shadow_neurons':shadow.n,'live_neurons':brain.core.n,
-                         'weight_checksum':checksum,'learning_generation':bumped,
-                         'architecture_adopted':True})
-                    decision=dict(decision,weights_promoted=True,
-                                  weight_checksum=checksum,
-                                  architecture_adopted=True)
+                self._record_promote_evidence(
+                    engine,live_hist,shadow_rows,checksum)
+                from .learning_generation import bump as bump_generation
+                bumped=bump_generation(
+                    self.store,'shadow_promote_signal_no_live_rewrite',
+                    kind='verified_candidate_promotes',
+                    weight_checksum=checksum)
+                self.last_reason=(
+                    'Shadow beat LIVE on paper £ — promote signal only '
+                    '(V5 H01: LIVE weights not rewritten)')
+                self.store.set('neural_adapt_reason',self.last_reason)
+                self.store.event('learning','Shadow promote signal (LIVE W unchanged)',
+                    {'shadow_neurons':getattr(shadow,'n',None),
+                     'live_neurons':brain.core.n,
+                     'weight_checksum':checksum,'learning_generation':bumped,
+                     'weights_promoted':False,'live_rewrite':False})
+                decision=dict(decision,weights_promoted=False,
+                              weight_checksum=checksum,
+                              promote_signal=True,live_rewrite=False,
+                              reason=self.last_reason)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])

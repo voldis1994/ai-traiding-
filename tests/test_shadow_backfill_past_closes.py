@@ -62,7 +62,7 @@ def test_backfill_adapts_even_without_trigger_meta():
             'direction': 'BUY', 'level': 3600,
         })
         store.close_trade(
-            deal, 3601, -1.20, currency='GBP', source='upl_estimate',
+            deal, 3601, -1.20, currency='GBP', source='broker',
             overwrite=True)
         store.db.execute(
             'UPDATE trades SET closed=? WHERE deal_id=?',

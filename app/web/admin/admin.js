@@ -663,7 +663,13 @@ function renderDeskQuote(view,client){
   const mid=a.market_mid!=null?a.market_mid:(view&&view.mid);
   if(title)title.textContent=mid!=null?`${epic}  ·  LAST ${num(mid,2)}`:epic;
   if(!el)return;
-  const bid=a.market_bid,ask=a.market_ask;
+  // Prefer live activity quotes; fall back to structure mid±spread when
+  // mandate was cleared on login and observe path has not refreshed yet.
+  let bid=a.market_bid,ask=a.market_ask;
+  if((bid==null||ask==null)&&view){
+    if(bid==null&&view.bid!=null)bid=view.bid;
+    if(ask==null&&view.ask!=null)ask=view.ask;
+  }
   const spread=(bid!=null&&ask!=null&&Number.isFinite(Number(bid))&&Number.isFinite(Number(ask)))
     ?(Number(ask)-Number(bid)):null;
   const status=a.market_status||'—';
@@ -1261,7 +1267,12 @@ function renderDeskIntel(client){
   if(lh.message)push('NEUTRAL',lh.message,'neu','LEARN');
   if(a.entry_block_reason){
     const hb=humanEntryBlock(a.entry_block_reason);
-    if(hb)push('BEARISH',hb,'bear','GATE');
+    if(hb){
+      // Lot wait after login is operator action — not a bearish market gate.
+      const lotWait=/nav lot|manuāls open|manual trade|adoptive size|adaptive size/i.test(hb)
+        ||/no adoptive|no adaptive|manual trade/i.test(String(a.entry_block_reason||''));
+      push(lotWait?'CONTEXT':'BEARISH',hb,lotWait?'neu':'bear','GATE');
+    }
   }
   if(a.fusion_block_reason)push('BEARISH',a.fusion_block_reason,'bear','FUSION');
   if(a.flow_consensus&&typeof a.flow_consensus==='object'){
@@ -2175,6 +2186,9 @@ function shortIntelLine(raw,src){
   }
   if(srcU==='FLOW'||low.startsWith('m1 flow')){
     if(low.includes('no_directional'))return 'M1 flow · nav virziena';
+    if(low.includes('waiting_for_m1')||low.includes('waiting for m1')){
+      return 'M1 · gaida likviditāti';
+    }
     return s.replace(/^m1 flow\s*/i,'M1 · ').replace(/_/g,' ').slice(0,42);
   }
   if(srcU==='FUSION'||low.includes('fusion')){
@@ -2182,6 +2196,15 @@ function shortIntelLine(raw,src){
     return 'Fusion · gaida';
   }
   if(srcU==='GATE'||srcU==='NEWS'||srcU==='INTERMARKET'||srcU==='MEMORY'){
+    if(low.includes('cannot map')||low.includes('unmap')||low.includes('unmapped')){
+      return 'Gaida epic · manuāls OPEN';
+    }
+    if(low.includes('waiting for broker reference')||low.includes('reference markets')){
+      return 'Peers · gaida manuālu OPEN';
+    }
+    if(low.includes('waiting_for_m1')||low.includes('waiting for m1')){
+      return 'M1 · gaida likviditāti';
+    }
     return humanEntryBlock(s)||s.slice(0,48);
   }
   // Strip noisy status prefixes like "CLEAR · " / "UNAVAILABLE · "

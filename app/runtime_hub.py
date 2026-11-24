@@ -1354,6 +1354,8 @@ class RuntimeHub:
                     'candles':[],'zones':{},'levels':{}}
         epic_source=None
         eng=None
+        market_bid=None
+        market_ask=None
         if rt and rt.started and rt.engine is not None:
             eng=rt.engine
             market=getattr(eng,'market',None) or {}
@@ -1365,6 +1367,9 @@ class RuntimeHub:
             elif getattr(eng.brain,'epic',None):
                 epic=eng.brain.epic;epic_source='brain'
             mid=market.get('mid')
+            market_bid=market.get('bid')
+            market_ask=(market.get('ask') if market.get('ask') is not None
+                        else market.get('offer'))
             try:
                 spread=float(market.get('spread') or 0)
             except (TypeError,ValueError):
@@ -1613,6 +1618,8 @@ class RuntimeHub:
             'epic':epic,
             'epic_source':epic_source,
             'mid':mid,
+            'bid':market_bid,
+            'ask':market_ask,
             'action':action,
             'preferred':preferred,
             'shared_side':(shared_side.get('side')

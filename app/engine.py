@@ -1116,7 +1116,8 @@ class SingleTradeEngine:
         Capital GOLD often arrives as CS.D.USCGC.TODAY.IP with an empty/partial
         instrument dict → currencies=[] → UNMAPPED_INSTRUMENT blocker forever.
         """
-        epic=(self.mandate or {}).get('epic') if self.mandate else None
+        epic=((self.mandate or {}).get('epic') if self.mandate
+              else (self._desk_watch_epic() if hasattr(self,'_desk_watch_epic') else None))
         if not epic:
             return self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
         cur=self.instrument_profile if isinstance(self.instrument_profile,dict) else {}
@@ -1181,7 +1182,9 @@ class SingleTradeEngine:
         # Use the engine clock so candle learning, news features and entry guards
         # share one timeline (and tests can freeze time via monkeypatching now()).
         prof=self._ensure_instrument_mapped()
-        result=assess_news(self.mandate['epic'] if self.mandate else '',
+        news_epic=((self.mandate or {}).get('epic') if self.mandate
+                   else (self._desk_watch_epic() or ''))
+        result=assess_news(news_epic,
                            self.news_calendar_path,
                            now=when or clock(),
                            instrument_currencies=list(prof.get('currencies') or []))
@@ -2272,7 +2275,12 @@ class SingleTradeEngine:
             except Exception as exc:
                 self.store.event('warning','Pending broker P&L retry failed',
                                  {'type':type(exc).__name__})
-            if not self.mandate:return
+            if not self.mandate:
+                # Login clears adoptive size — still keep Desk Bid/Ask + map alive
+                # from last-known epic. Never authorizes OPEN without mandate.
+                try:await self._observe_desk_quotes()
+                except Exception:pass
+                return
             # Do not delay managing SL/TP on an OPEN trade for a remote news feed.
             # External feeds gate future NEW entries only.
             if not self.positions:
@@ -3192,12 +3200,71 @@ class SingleTradeEngine:
             'chase_extension','same_range')
         return any(n in r for n in needles)
 
+    def _desk_watch_epic(self):
+        """Epic for Desk quotes when mandate is cleared — never authorizes OPEN size."""
+        if isinstance(self.mandate,dict) and self.mandate.get('epic'):
+            return self.mandate['epic']
+        for cand in (
+                (self.market or {}).get('epic') if isinstance(self.market,dict) else None,
+                getattr(self.brain,'epic',None),
+                self.store.get('legacy_brain_epic'),
+                self.store.get('instrument_bag_epic'),
+        ):
+            if isinstance(cand,str):
+                e=cand.strip().strip('"')
+                if e and e.upper()!='SIM':
+                    return e
+        try:
+            row=self.store.db.execute(
+                'SELECT epic FROM trades ORDER BY opened DESC LIMIT 1').fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except Exception:
+            pass
+        return None
+
+    async def _observe_desk_quotes(self):
+        """Keep Bid/Ask + instrument map alive while waiting for manual OPEN.
+
+        Does not run entry/manage — mandate remains None until a live deal adopts.
+        """
+        epic=self._desk_watch_epic()
+        if not epic or not self.broker:
+            return False
+        broker_market=await self.broker.market(epic)
+        self._last_broker_market=broker_market
+        snap=broker_market.get('snapshot',{}) or {}
+        inst=broker_market.get('instrument',{}) or {}
+        bid=_num(snap.get('bid'));ask=_num(snap.get('offer'))
+        tick=self._tick(broker_market)
+        streamed=getattr(self,'quote_stream',None)
+        streamed=streamed.current(epic) if streamed else None
+        if streamed:
+            bid=streamed['bid'];ask=streamed['ask']
+        if bid is None or ask is None or tick is None or ask<bid or bid<=0:
+            return False
+        mid=(bid+ask)/2
+        self.instrument_profile=instrument_profile(epic,inst)
+        self.market={
+            'epic':epic,'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
+            'time':now(),'status':snap.get('marketStatus'),
+            'min_distance':self._min_distance(broker_market,mid),
+            'instrument_name':inst.get('name') or inst.get('epic') or epic,
+            'source':'WEBSOCKET' if streamed else 'REST',
+            'observe_only':True,
+        }
+        # Soft remap so Desk news/peers leave UNMAPPED/WAITING cold boot.
+        try:self._ensure_instrument_mapped()
+        except Exception:pass
+        return True
+
     def _apply_stream_quote(self):
         """Refresh bid/ask/mid from Capital WS without a full REST market call."""
-        if not self.mandate:
+        epic=self._desk_watch_epic()
+        if not epic:
             return False
         streamed=getattr(self,'quote_stream',None)
-        streamed=streamed.current(self.mandate['epic']) if streamed else None
+        streamed=streamed.current(epic) if streamed else None
         if not streamed:
             return False
         bid=streamed.get('bid');ask=streamed.get('ask')
@@ -3212,9 +3279,10 @@ class SingleTradeEngine:
         prev=dict(self.market or {})
         self.market={
             **prev,
-            'epic':self.mandate['epic'],
+            'epic':epic,
             'bid':bid,'ask':ask,'mid':mid,'spread':ask-bid,'tick':tick,
             'time':now(),'source':'WEBSOCKET',
+            'observe_only':not bool(self.mandate),
         }
         return True
 

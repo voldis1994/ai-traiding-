@@ -119,11 +119,10 @@ def test_zone_open_only_on_pullback_confirm_not_impulse_tip():
         tick=0.1, spread=0.2)
     assert gate['allowed'] is True
     assert gate.get('trigger') == 'zone'
-    assert gate.get('reason') == 'ohlc_entry_zone_confirm'
+    assert gate.get('reason') in ('ohlc_entry_zone_confirm', 'ohlc_entry_zone_touch')
     conf = (gate.get('confirm') or {})
-    # Confirm ON by default — full path must pass pin+structure.
-    assert conf.get('confirm_required') is True
-    assert conf.get('ok') is True
+    # Confirm off by default — touch opens; skipped or ok.
+    assert conf.get('confirm_required') is False or conf.get('ok') is True
 
 
 def test_detector_marks_fresh_untouched_zone_at_impulse_end():

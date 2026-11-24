@@ -169,8 +169,9 @@ DEFAULTS = {
     'mtf_mode_preset': 'trend_follow',  # trend_follow | fast_shift | noise_hold
     # 1m playbook (zones / scenarios / SL·TP regimes)
     'playbook_hard_entry': 1,
-    'playbook_require_zone_confirm': 1,
-    'playbook_zone_confirm_and': 1,
+    # Zone touch/cross is enough for OPEN — do not wait for pin+structure.
+    'playbook_require_zone_confirm': 0,
+    'playbook_zone_confirm_and': 0,
     'playbook_session_filter': 1,
 }
 
@@ -296,7 +297,9 @@ LEARN_LR_STEP = 0.01
 # Hard rail in BOUNDS is 0.50; soft ceiling stops live Stores from keeping 0.28+.
 LEARN_LR_SOFT_MAX = 0.12
 LEARN_WIN_REPEATS_SOFT_MAX = 3
-LEARN_LOSS_REPEATS_SOFT_MAX = 3
+# Loss teacher stays asymmetric: may exceed win soft-max so £ minuses
+# actually deepen ΔW (defaults already 3 loss vs 2 win).
+LEARN_LOSS_REPEATS_SOFT_MAX = 5
 
 
 def _finite(v):
@@ -618,10 +621,13 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 # Calm LR after losses — raising it was "learning bigger mistakes"
                 # and diverged clients (one balloons, peers stay compact).
                 p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
-                # Never let loss repeats exceed win repeats (symmetric teacher).
-                win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
-                cur=int(p['learn_loss_repeats'])
-                p['learn_loss_repeats']=min(win_r,cur)
+                # Asymmetric loss teacher: bump loss repeats so ΔW on £ minuses
+                # actually sticks (defaults already loss 3 > win 2). Never shrink
+                # loss path down to win path — that erased improvement after SL.
+                cur=int(p.get('learn_loss_repeats',DEFAULTS['learn_loss_repeats']))
+                p['learn_loss_repeats']=min(
+                    BOUNDS['learn_loss_repeats'][1], max(cur, cur + 1,
+                        int(DEFAULTS['learn_loss_repeats'])))
                 # Adverse cash → assume more LIVE friction; raise shadow slip estimate.
                 p['exec_slip_bps']=min(BOUNDS['exec_slip_bps'][1],
                     float(p['exec_slip_bps'])*1.05)
@@ -654,9 +660,8 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 notes.append('scratch loss — later arm + wider trail cushion/gap')
             elif pnl>0:
                 p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
-                win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
-                # Soft nudge win path so it stays ≥ loss path.
-                p['learn_win_repeats']=min(BOUNDS['learn_win_repeats'][1],max(win_r,int(p['learn_loss_repeats'])))
+                # Keep win repeats stable — do not yank them up to match a
+                # bumped loss path (loss teacher stays asymmetric on purpose).
                 # Wins → slightly less assumed friction (fills were friendly).
                 p['exec_slip_bps']=max(BOUNDS['exec_slip_bps'][0],
                     float(p['exec_slip_bps'])*0.99)

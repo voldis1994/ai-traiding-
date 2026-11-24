@@ -887,13 +887,19 @@ def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
 
 def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                           min_distance=0., atr=None, zone=None, kama=None,
-                          store=None) -> dict:
+                          store=None, entry_zone=None) -> dict:
     """Place SL/TP on OHLC swing High/Low — never invent median ±distance.
 
     Uses the full pivot list so post-BOS re-entry (entry outside last SH/SL)
     still anchors to the nearest protective swing and a structural target
     (next swing or measured move from the broken range). When ``kama`` is on
     the protective side of entry, SL clears both swing and KAMA (ATR buffer).
+
+    When ``entry_zone`` (Demand/Supply base box) is given, SL is forced *behind*
+    the zone extreme (BUY → below zone.lo; SELL → above zone.hi) if that is at
+    least as protective as the swing stop — guide: SL aiz zonas. If the only
+    protective pivot sits inside the zone (common on zone-touch OPEN), fall
+    back to zone-behind SL + opposite swing TP instead of refusing.
     """
     from . import structure_memory
     out = {
@@ -901,7 +907,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'stop_distance': None, 'profit_distance': None,
         'stop_level': None, 'profit_level': None,
         'swing_hi': None, 'swing_lo': None,
-        'kama_stop': False, 'atr_used': None,
+        'kama_stop': False, 'atr_used': None, 'zone_sl': False,
     }
     if action not in ('BUY', 'SELL'):
         return dict(out, reason='bad_action')
@@ -948,15 +954,84 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         out['swing_hi'] = float(bos['range_hi'])
     if bos.get('range_lo') is not None:
         out['swing_lo'] = float(bos['range_lo'])
-    if not highs or not lows:
-        return dict(out, reason='no_swing_pivots', bos_event=bos.get('event'))
 
-    picked = _pick_structural_levels(
-        action=action, entry=entry_f, highs=highs, lows=lows,
-        floor=floor, buffer=buffer)
-    if picked is None:
-        return dict(out, reason='no_structural_swings_for_entry',
-                    bos_event=bos.get('event'))
+    # Optional Demand/Supply box — SL behind zone (and TP from opposite swing).
+    ez = entry_zone if isinstance(entry_zone, dict) else {}
+    ez_lo = _finite(ez.get('lo'))
+    ez_hi = _finite(ez.get('hi'))
+    ez_sl = _finite(ez.get('sl_anchor'))
+    if action == 'BUY' and ez_sl is None:
+        ez_sl = ez_lo
+    if action == 'SELL' and ez_sl is None:
+        ez_sl = ez_hi
+
+    def _zone_behind_with_opp_tp():
+        """SL behind Demand/Supply + TP from opposite OHLC swing."""
+        if action == 'BUY' and ez_sl is not None:
+            stop_level = float(ez_sl) - buffer
+            # Meet ATR/broker floor by extending *further* behind the zone —
+            # still OHLC invalidation, never invent entry±ATR without zone.
+            if entry_f - stop_level + 1e-12 < floor:
+                stop_level = entry_f - floor
+            if stop_level >= entry_f:
+                return None
+            opp = [s for s in highs if float(s['price']) >= entry_f + floor]
+            if not opp:
+                # BOS range high is still a real chart level.
+                rh = _finite(out.get('swing_hi'))
+                if rh is not None and rh >= entry_f + floor:
+                    profit_level = float(rh)
+                    return {
+                        'stop_level': stop_level, 'profit_level': profit_level,
+                        'swing_lo': float(ez_sl), 'swing_hi': profit_level,
+                        'reason': 'zone_behind_fallback',
+                    }
+                return None
+            profit_level = float(min(opp, key=lambda s: float(s['price']))['price'])
+            return {
+                'stop_level': stop_level, 'profit_level': profit_level,
+                'swing_lo': float(ez_sl), 'swing_hi': profit_level,
+                'reason': 'zone_behind_fallback',
+            }
+        if action == 'SELL' and ez_sl is not None:
+            stop_level = float(ez_sl) + buffer
+            if stop_level - entry_f + 1e-12 < floor:
+                stop_level = entry_f + floor
+            if stop_level <= entry_f:
+                return None
+            opp = [s for s in lows if float(s['price']) <= entry_f - floor]
+            if not opp:
+                rl = _finite(out.get('swing_lo'))
+                if rl is not None and rl <= entry_f - floor:
+                    profit_level = float(rl)
+                    return {
+                        'stop_level': stop_level, 'profit_level': profit_level,
+                        'swing_hi': float(ez_sl), 'swing_lo': profit_level,
+                        'reason': 'zone_behind_fallback',
+                    }
+                return None
+            profit_level = float(max(opp, key=lambda s: float(s['price']))['price'])
+            return {
+                'stop_level': stop_level, 'profit_level': profit_level,
+                'swing_hi': float(ez_sl), 'swing_lo': profit_level,
+                'reason': 'zone_behind_fallback',
+            }
+        return None
+
+    if not highs or not lows:
+        # Thin pivots: still allow SL behind a confirmed entry zone + BOS TP.
+        picked = _zone_behind_with_opp_tp()
+        if picked is None:
+            return dict(out, reason='no_swing_pivots', bos_event=bos.get('event'))
+    else:
+        picked = _pick_structural_levels(
+            action=action, entry=entry_f, highs=highs, lows=lows,
+            floor=floor, buffer=buffer)
+        if picked is None:
+            picked = _zone_behind_with_opp_tp()
+            if picked is None:
+                return dict(out, reason='no_structural_swings_for_entry',
+                            bos_event=bos.get('event'))
 
     stop_level = float(picked['stop_level'])
     profit_level = float(picked['profit_level'])
@@ -1022,11 +1097,36 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 out['kama_stop'] = True
                 picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
 
+    # Demand/Supply base: SL behind the zone box (OHLC ± buffer, then ATR floor).
+    out['zone_sl'] = str(picked.get('reason') or '').startswith('zone_behind')
+    if action == 'BUY' and ez_sl is not None:
+        zone_stop = float(ez_sl) - buffer
+        if entry_f - zone_stop + 1e-12 < floor:
+            zone_stop = entry_f - floor
+        if zone_stop < entry_f and zone_stop <= stop_level + 1e-12:
+            stop_level = zone_stop
+            stop_d = entry_f - stop_level
+            out['zone_sl'] = True
+            if 'zone_behind' not in str(picked.get('reason') or ''):
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+zone_behind'
+            picked['swing_lo'] = float(ez_sl)
+    elif action == 'SELL' and ez_sl is not None:
+        zone_stop = float(ez_sl) + buffer
+        if zone_stop - entry_f + 1e-12 < floor:
+            zone_stop = entry_f + floor
+        if zone_stop > entry_f and zone_stop >= stop_level - 1e-12:
+            stop_level = zone_stop
+            stop_d = stop_level - entry_f
+            out['zone_sl'] = True
+            if 'zone_behind' not in str(picked.get('reason') or ''):
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+zone_behind'
+            picked['swing_hi'] = float(ez_sl)
+
     if stop_d < floor or profit_d < floor:
         return dict(out, reason='swing_distances_below_floor',
                     stop_distance=stop_d, profit_distance=profit_d,
                     stop_level=stop_level, profit_level=profit_level,
-                    kama_stop=out.get('kama_stop'))
+                    kama_stop=out.get('kama_stop'), zone_sl=out.get('zone_sl'))
 
     # Combine swing SL with min RR — never keep 21pt SL vs 3pt TP.
     rr = apply_min_rr(
@@ -1038,7 +1138,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     stop_distance=float(stop_d), profit_distance=float(profit_d),
                     stop_level=float(stop_level), profit_level=float(profit_level),
                     min_rr=rr.get('min_rr'), rr=rr.get('rr'),
-                    kama_stop=out.get('kama_stop'))
+                    kama_stop=out.get('kama_stop'), zone_sl=out.get('zone_sl'))
     stop_d = float(rr['stop_distance']); profit_d = float(rr['profit_distance'])
     stop_level = float(rr['stop_level']); profit_level = float(rr['profit_level'])
     reason = picked.get('reason') or 'swing_levels'
@@ -1063,6 +1163,7 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'bos_bias': bos.get('bias'),
         'buffer': float(buffer),
         'kama_stop': bool(out.get('kama_stop')),
+        'zone_sl': bool(out.get('zone_sl')),
         'atr_used': out.get('atr_used'),
         'kama': float(kama_v) if kama_v is not None else None,
     }
@@ -1078,12 +1179,15 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
 
     Preference order:
       1. Swing High/Low anchors when ``entry``+``action``+``candles`` are given
-         (real chart levels — not entry ± median bar span).
-      2. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
+         (real chart levels — not entry ± median bar span). With ``entry_zone``,
+         SL is forced behind the Demand/Supply box when pivots alone cannot.
+      2. Else regime brackets (scenario + opposite zone) when playbook context
+         is provided.
+      3. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
 
     When live OPEN provides entry/action/candles, ``require_swing`` defaults True:
-    if swings cannot place levels, return ``ready=False`` instead of inventing
-    median-zone ±distance (the post-BOS 2nd-open bug).
+    if swing+regime cannot place levels, return ``ready=False`` instead of
+    inventing median-zone ±distance (the post-BOS 2nd-open bug).
 
     ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
     *same* OHLC decision, never an invented wider target.
@@ -1118,7 +1222,66 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     if require_swing is None:
         require_swing = bool(live_ctx)
 
-# --- Prefer regime SL/TP (scenario + opposite zone) ---
+    # --- Prefer swing-anchored levels (chart structure + zone-behind) ---
+    swing = None
+    if live_ctx:
+        swing = swing_anchor_brackets(
+            candles=candles, entry=entry, action=action, tick=tick_f,
+            spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
+            store=store, entry_zone=entry_zone)
+        if swing.get('ready'):
+            stop_d = float(swing['stop_distance']) * t
+            profit_d = float(swing['profit_distance']) * t
+            eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
+            snapped = stop_take(
+                float(entry), action, tick_f, sp, mn,
+                kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
+                range_distance=stop_d)
+            # Keep swing price levels; only snap distances onto broker tick grid.
+            sign = 1 if action == 'BUY' else -1
+            e = float(entry)
+            # Prefer the structural levels; re-align if snap shifted them.
+            stop_level = float(swing['stop_level'])
+            profit_level = float(swing['profit_level'])
+            # If tighten shrunk distances, move levels toward entry proportionally.
+            if abs(t - 1.0) > 1e-9:
+                stop_level = e - sign * stop_d
+                profit_level = e + sign * profit_d
+            return {
+                'stop_distance': abs(e - stop_level),
+                'profit_distance': abs(profit_level - e),
+                'stop_level': float(stop_level),
+                'profit_level': float(profit_level),
+                'kappa': float(
+                    abs(profit_level - e) / abs(e - stop_level)
+                    if abs(e - stop_level) > 1e-12 else eff_kappa),
+                'sl_scale': 1.0,
+                'ohlc_kappa': float(swing.get('kappa') or eff_kappa),
+                'ohlc_sl': float(swing['stop_distance']),
+                'ohlc_tp': float(swing['profit_distance']),
+                'tighten': float(t),
+                'source': 'swing_anchor',
+                'ready': True,
+                'lookback': z.get('lookback'),
+                'median_up': z.get('median_up'),
+                'median_down': z.get('median_down'),
+                'pull_share': z.get('pull_share'),
+                'favor_share': z.get('favor_share'),
+                'swing_hi': swing.get('swing_hi'),
+                'swing_lo': swing.get('swing_lo'),
+                'bos_event': swing.get('bos_event'),
+                'min_rr': swing.get('min_rr'),
+                'rr': swing.get('rr'),
+                'rr_capped': swing.get('rr_capped'),
+                'stop_ticks': snapped.get('stop_ticks'),
+                'profit_ticks': snapped.get('profit_ticks'),
+                'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
+                'swing': swing,
+                'swing_reason': swing.get('reason'),
+                'zone_sl': bool(swing.get('zone_sl')),
+            }
+
+    # --- Fallback: regime SL/TP (scenario + opposite zone) ---
     if live_ctx and (scenario or zones or entry_zone or trigger):
         try:
             from . import ohlc_regime_brackets
@@ -1287,83 +1450,28 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 }
 
     
-    # --- Prefer swing-anchored levels (chart structure) ---
-    swing = None
-    if live_ctx:
-        swing = swing_anchor_brackets(
-            candles=candles, entry=entry, action=action, tick=tick_f,
-            spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
-            store=store)
-        if swing.get('ready'):
-            stop_d = float(swing['stop_distance']) * t
-            profit_d = float(swing['profit_distance']) * t
-            eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
-            snapped = stop_take(
-                float(entry), action, tick_f, sp, mn,
-                kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
-                range_distance=stop_d)
-            # Keep swing price levels; only snap distances onto broker tick grid.
-            sign = 1 if action == 'BUY' else -1
-            e = float(entry)
-            # Prefer the structural levels; re-align if snap shifted them.
-            stop_level = float(swing['stop_level'])
-            profit_level = float(swing['profit_level'])
-            # If tighten shrunk distances, move levels toward entry proportionally.
-            if abs(t - 1.0) > 1e-9:
-                stop_level = e - sign * stop_d
-                profit_level = e + sign * profit_d
-            return {
-                'stop_distance': abs(e - stop_level),
-                'profit_distance': abs(profit_level - e),
-                'stop_level': float(stop_level),
-                'profit_level': float(profit_level),
-                'kappa': float(
-                    abs(profit_level - e) / abs(e - stop_level)
-                    if abs(e - stop_level) > 1e-12 else eff_kappa),
-                'sl_scale': 1.0,
-                'ohlc_kappa': float(swing.get('kappa') or eff_kappa),
-                'ohlc_sl': float(swing['stop_distance']),
-                'ohlc_tp': float(swing['profit_distance']),
-                'tighten': float(t),
-                'source': 'swing_anchor',
-                'ready': True,
-                'lookback': z.get('lookback'),
-                'median_up': z.get('median_up'),
-                'median_down': z.get('median_down'),
-                'pull_share': z.get('pull_share'),
-                'favor_share': z.get('favor_share'),
-                'swing_hi': swing.get('swing_hi'),
-                'swing_lo': swing.get('swing_lo'),
-                'bos_event': swing.get('bos_event'),
-                'min_rr': swing.get('min_rr'),
-                'rr': swing.get('rr'),
-                'rr_capped': swing.get('rr_capped'),
-                'stop_ticks': snapped.get('stop_ticks'),
-                'profit_ticks': snapped.get('profit_ticks'),
-                'raised_to_broker_min': bool(snapped.get('raised_to_broker_min')),
-                'swing': swing,
-                'swing_reason': swing.get('reason'),
-            }
-        if require_swing:
-            # Do NOT invent ohlc_zone ±distance for live OPEN — caller must skip.
-            return {
-                'stop_distance': None, 'profit_distance': None,
-                'stop_level': None, 'profit_level': None,
-                'kappa': None, 'sl_scale': 1.0,
-                'ohlc_kappa': None, 'ohlc_sl': None, 'ohlc_tp': None,
-                'tighten': float(t),
-                'source': 'swing_anchor',
-                'ready': False,
-                'reason': (swing or {}).get('reason') or 'swing_unavailable',
-                'lookback': z.get('lookback'),
-                'median_up': z.get('median_up'),
-                'median_down': z.get('median_down'),
-                'swing_hi': (swing or {}).get('swing_hi'),
-                'swing_lo': (swing or {}).get('swing_lo'),
-                'bos_event': (swing or {}).get('bos_event'),
-                'swing': swing,
-                'swing_reason': (swing or {}).get('reason'),
-            }
+
+    # Live OPEN: refuse invented median ±distance when swing+regime both miss.
+    if live_ctx and require_swing:
+        return {
+            'stop_distance': None, 'profit_distance': None,
+            'stop_level': None, 'profit_level': None,
+            'kappa': None, 'sl_scale': 1.0,
+            'ohlc_kappa': None, 'ohlc_sl': None, 'ohlc_tp': None,
+            'tighten': float(t),
+            'source': 'swing_anchor',
+            'ready': False,
+            'reason': (swing or {}).get('reason') or 'swing_unavailable',
+            'lookback': z.get('lookback'),
+            'median_up': z.get('median_up'),
+            'median_down': z.get('median_down'),
+            'swing_hi': (swing or {}).get('swing_hi'),
+            'swing_lo': (swing or {}).get('swing_lo'),
+            'bos_event': (swing or {}).get('bos_event'),
+            'swing': swing,
+            'swing_reason': (swing or {}).get('reason'),
+        }
+
 
     ohlc_sl = _finite(z.get('range_distance'))
     if ohlc_sl is None or ohlc_sl <= 0:
@@ -1450,7 +1558,8 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
                      candles=None, tick: float=0.01, spread: float=0.,
                      min_distance: float=0., tighten: float=1.0,
                      entry=None, action=None, atr=None, kama=None,
-                     require_swing=None) -> dict:
+                     require_swing=None, entry_zone=None, scenario=None,
+                     zones=None, trigger=None) -> dict:
     """OHLC swing (or zone) decides κ / SL / TP — learned multipliers do not set width."""
     zone=zone_at_open(candles or []) if candles is not None else {
         'kappa':float(ohlc_kappa) if ohlc_kappa and ohlc_kappa>0 else DEFAULT_KAPPA,
@@ -1469,10 +1578,31 @@ def propose_for_open(store, *, explore_every: int=2, rng=None, ohlc_kappa=None,
     if max_tp is not None:
         zone=dict(zone);zone['max_tp']=max_tp
     # LIVE protect/OPEN share require_swing default when entry+action+candles given.
+    # When entry_zone omitted, derive Demand/Supply from the same OHLC window so
+    # swing can place SL behind the box (zone-touch OPEN / protect adopt).
+    ez = entry_zone if isinstance(entry_zone, dict) else None
+    zones_card = zones if isinstance(zones, dict) else None
+    sc = scenario if isinstance(scenario, dict) else None
+    if candles and action in ('BUY', 'SELL') and (ez is None or zones_card is None):
+        try:
+            from . import ohlc_entry_zones as _oez
+            from . import ohlc_scenarios as _osc
+            mid_hint = _finite(entry)
+            zones_card = zones_card or _oez.compute_entry_zones(
+                candles, mid=mid_hint, tick=tick, spread=spread)
+            if ez is None and isinstance(zones_card, dict):
+                ez = (zones_card.get('buy_entry') if action == 'BUY'
+                      else zones_card.get('sell_entry'))
+            if sc is None and isinstance(zones_card, dict) and mid_hint is not None:
+                sc = _osc.classify(
+                    candles, mid=mid_hint, zones=zones_card, tick=tick)
+        except Exception:
+            pass
     decided=decide_brackets_from_ohlc(
         zone,tick=tick,spread=spread,min_distance=min_distance,tighten=tighten,
         entry=entry,action=action,candles=candles,atr=atr,kama=kama,
-        require_swing=require_swing)
+        require_swing=require_swing,store=store,entry_zone=ez,scenario=sc,
+        zones=zones_card,trigger=trigger)
     src=str(decided.get('source') or 'ohlc_zone')
     if decided.get('kappa') is not None:
         save_params(store,decided['kappa'],1.0,

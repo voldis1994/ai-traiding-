@@ -87,17 +87,17 @@ def test_decide_keep_demands_larger_lift_when_degrading():
 
 
 def test_decide_keep_refuses_loss_in_red_cash_tiny_lift():
-    """Dump smoking gun: KEEP on −£0.47 with +0.0417 while cash OOS red."""
+    """Refuse noise lifts on −£ while cash OOS red — but allow real loss ΔW."""
     before={'ok':True,'n':24,'accuracy':0.29}
-    after={'ok':True,'n':24,'accuracy':0.333}  # +0.043 < 0.08
+    after_noise={'ok':True,'n':24,'accuracy':0.31}  # +0.02 < 0.03
     cash={'ok':True,'n':6,'mean':-0.15,'net':-0.9,'trade_count':12}
-    out=decide_keep(before,after,cash=cash,trade_pnl=-0.47)
+    out=decide_keep(before,after_noise,cash=cash,trade_pnl=-0.47)
     assert out['keep'] is False
     assert 'loss_in_red_cash' in out['reason']
-    after_clear={'ok':True,'n':24,'accuracy':0.38}  # +0.09 ≥ 0.08
+    after_clear={'ok':True,'n':24,'accuracy':0.333}  # +0.043 ≥ 0.03
     assert decide_keep(before,after_clear,cash=cash,trade_pnl=-0.47)['keep'] is True
-    # Win in red cash still uses normal (slightly raised) margin, not 0.08 floor.
-    assert decide_keep(before,after,cash=cash,trade_pnl=0.40)['keep'] is True
+    # Win in red cash still uses normal (slightly raised) margin, not loss floor.
+    assert decide_keep(before,after_noise,cash=cash,trade_pnl=0.40)['keep'] is True
 
 
 def test_should_skip_teach_when_degrading():

@@ -4,9 +4,9 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger: live ask/bid in zone + confirmation (pin/engulf/impulse AND
-    structure) — OPEN on WS tick after confirm. Defaults follow 1m guide
-    (``playbook_require_zone_confirm=1``, ``playbook_zone_confirm_and=1``).
+  • Zone trigger: live ask/bid touch/cross of Demand/Supply — OPEN on WS
+    tick. Candle confirm is OFF by default (``playbook_require_zone_confirm=0``);
+    optional pin/structure when confirm is opted in.
   • Invalidated zones (close through) are never selected (V3 Z03)
 
 Also: break trigger (structure/range break + M1 tape) on live mid when aligned.
@@ -157,13 +157,26 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
 
 
 def observe_close(store, *, ohlc_meta=None, broker_pnl=None, spread=0.0):
-    """Adapt band / break knobs from break|zone OPEN outcomes (after costs)."""
+    """Adapt band / break knobs from OPEN outcomes (after costs).
+
+    Neurons / gate teachers must still learn when the deal was *not* stamped
+    as a pure zone|break OPEN (manual adopt, orphan meta, blank trigger) —
+    if a Demand/Supply box or neural side is on the meta, treat losses as
+    zone-selectivity feedback so the robot improves on £ minuses.
+    """
     meta = ohlc_meta if isinstance(ohlc_meta, dict) else {}
     if not meta:
         return {'adapted': False, 'reason': 'no_ohlc_meta'}
     trigger = str(meta.get('trigger') or '').lower()
+    has_zone = isinstance(meta.get('zone'), dict) and (
+        meta['zone'].get('lo') is not None or meta['zone'].get('hi') is not None)
+    neural_side = str(meta.get('action') or '').upper() in ('BUY', 'SELL')
     if trigger not in ('break', 'zone'):
-        return {'adapted': False, 'reason': 'no_trigger'}
+        # Non-zone / blank trigger: still teach from the stamped box or side.
+        if has_zone or neural_side or meta.get('allowed'):
+            trigger = 'zone'
+        else:
+            return {'adapted': False, 'reason': 'no_trigger'}
     pnl = _finite(broker_pnl)
     if pnl is None:
         return {'adapted': False, 'reason': 'no_pnl'}
@@ -688,9 +701,10 @@ def micro_structure_confirm(action, candles, zone, *, tick=0.01):
 
 def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
                         require_both=None, require_confirm=None):
-    """Zone OPEN confirm — ON by default (1m guide: wait for confirmation).
+    """Zone OPEN confirm — OFF by default (price touch/cross is enough).
 
-    Default AND: pin/engulf/impulse + structure. Invalidated zones never pass (Z03).
+    When ``playbook_require_zone_confirm=1``: pin/engulf/impulse and/or structure.
+    AND only if ``playbook_zone_confirm_and=1``. Invalidated zones never pass (Z03).
     """
     # Never confirm an already-invalidated zone (Z03).
     if isinstance(zone, dict) and (
@@ -718,7 +732,7 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
             from . import playbook_entry as _pb
             need_confirm = _pb.zone_confirm_required(store)
         except Exception:
-            need_confirm = True
+            need_confirm = False
     if not need_confirm:
         # Confirm off — still report candle evidence for Desk, but do not wait.
         rej = rejection_candle(action, candles, zone, tick=tick)
@@ -739,7 +753,7 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
             from . import playbook_entry as _pb
             and_mode = _pb.zone_confirm_require_both(store)
         except Exception:
-            and_mode = True
+            and_mode = False
     if and_mode:
         ok = bool(rej.get('ok') and st.get('ok'))
         if ok:
@@ -1066,12 +1080,19 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         conf=0.
     pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
     wide_conf=float(cfg.get('zone_wide_conf') or 0.50)
-    # Mild widen only — 3× used to erase the wait and look like OHLC ignored.
+    # Mild widen — cross into the band still fires without waiting another M1.
     if pref==action and conf>=wide_conf:
         buf=max(buf,float(tick or 0.01)*1.5)
         meta['wide_ohlc_touch']=True
-    # --- Trigger B: pullback into Demand/Supply base + 1m confirm ---
-    if not price_in_zone(zone,price,buffer=buf):
+    # Also treat a just-crossed bar that still tags the box as a touch.
+    crossed=False
+    if candles:
+        last=candles[-1] if isinstance(candles[-1],dict) else None
+        if last and _candle_interacted_zone(last,zone,buffer=buf):
+            crossed=True
+            meta['zone_cross_bar']=True
+    # --- Trigger B: touch/cross Demand/Supply (confirm optional) ---
+    if not (price_in_zone(zone,price,buffer=buf) or crossed):
         lo=_finite(zone['lo']);hi=_finite(zone['hi'])
         if action=='BUY' and price>hi:
             meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
@@ -1092,7 +1113,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
             return meta
         meta['allowed']=True
         meta['trigger']='zone'
-        meta['reason']='ohlc_entry_zone_confirm'
+        meta['reason']=(
+            'ohlc_entry_zone_touch' if confirm.get('reason')=='confirm_skipped'
+            else 'ohlc_entry_zone_confirm')
         return meta
     meta['reason']=f"wait_zone_confirm ({confirm.get('reason') or 'rejection_and_structure'})"
     return meta

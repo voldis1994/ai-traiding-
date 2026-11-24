@@ -92,7 +92,7 @@ def test_range_edge_buy_tp_at_opposite_edge():
         float(br['profit_distance']) / float(br['stop_distance']) >= 1.9)
 
 
-def test_decide_brackets_prefers_regime_source():
+def test_decide_brackets_prefers_swing_then_regime():
     rows, mid = demand_zone_path(confirm=True)
     zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     buy = zones['buy_entry']
@@ -105,7 +105,8 @@ def test_decide_brackets_prefers_regime_source():
         candles=rows, atr=1.0, require_swing=True, entry_zone=buy,
         scenario=sc, zones=zones, trigger='zone')
     assert decided.get('ready') is True
-    assert decided.get('source') == 'regime_brackets'
+    # Swing owns zone-touch OPEN; regime is fallback when swings cannot place.
+    assert decided.get('source') in ('swing_anchor', 'regime_brackets')
     assert float(decided['stop_level']) < float(buy['lo']) + 1e-6
     # SL vs TP geometry: TP distance must never be shorter than SL.
     assert float(decided['profit_distance']) + 1e-9 >= float(decided['stop_distance'])

@@ -42,10 +42,9 @@ def _ready_engine(d, store, brain, *, ask):
     return e
 
 
-def test_entry_evaluation_holds_until_confirm_in_buy_zone():
+def test_entry_evaluation_holds_until_price_in_buy_zone():
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
-        # Without confirm candles — inside zone still HOLDs.
         rows = _seed_demand(store, confirm=False)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
@@ -62,23 +61,10 @@ def test_entry_evaluation_holds_until_confirm_in_buy_zone():
             'tick': 0.1, 'spread': 0.2,
         }
         out2 = e._entry_evaluation()
-        assert out2['action'] == 'HOLD'
-        assert (out2.get('ohlc_entry_zone') or {}).get('allowed') is False
-
-    # Full confirm path → BUY (separate store so candles are confirm=True).
-    with tempfile.TemporaryDirectory() as d2:
-        store2, brain2 = new_brain(d2)
-        rows_ok = _seed_demand(store2, confirm=True)
-        zones_ok = ohlc_entry_zones.compute_entry_zones(
-            rows_ok, tick=0.1, spread=0.2)
-        buy_ok = zones_ok['buy_entry']
-        inside_ok = (float(buy_ok['lo']) + float(buy_ok['hi'])) / 2
-        e2 = _ready_engine(d2, store2, brain2, ask=inside_ok)
-        out3 = e2._entry_evaluation()
-        assert out3['action'] == 'BUY'
-        gate = out3.get('ohlc_entry_zone') or {}
+        assert out2['action'] == 'BUY'
+        gate = out2.get('ohlc_entry_zone') or {}
         assert gate.get('allowed') is True
-        assert gate.get('reason') == 'ohlc_entry_zone_confirm'
+        assert gate.get('reason') == 'ohlc_entry_zone_touch'
 
 
 def test_submit_skips_when_outside_entry_zone():

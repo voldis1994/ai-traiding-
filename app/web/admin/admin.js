@@ -436,20 +436,40 @@ function renderShadowLab(client){
   `);
 }
 
+function clientOpenPositions(c){
+  const a=(c&&c.activity)||{};
+  return Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
+}
+
 function pickDeskFocus(clients){
   const list=clients||[];
+  const withOpen=list.filter(c=>clientOpenPositions(c).length>0);
+  // Live open book ALWAYS beats sticky focus — otherwise ATR/chart stay on
+  // US100 while OPEN POSITIONS show GOLD (ATR looks "debesīs" for gold).
+  if(withOpen.length===1)return withOpen[0];
   if(deskFocusId!=null){
     const keep=list.find(c=>String(c.id)===String(deskFocusId));
-    if(keep)return keep;
+    if(keep){
+      if(clientOpenPositions(keep).length||!withOpen.length)return keep;
+      return withOpen[0];
+    }
   }
-  const open=list.find(c=>{
-    const a=c.activity||{};
-    const pos=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
-    return pos.length>0;
-  });
-  if(open)return open;
+  if(withOpen.length)return withOpen[0];
   const run=list.find(c=>c.robot_running);
   return run||list[0]||null;
+}
+
+/** Epic for Desk ATR/chart — open deal epic wins over mandate after switch. */
+function deskFocusEpic(client,view){
+  const pos=clientOpenPositions(client);
+  for(const p of pos){
+    const ep=p&&p.epic;
+    if(ep)return String(ep);
+  }
+  const a=(client&&client.activity)||{};
+  return String(
+    (view&&view.epic)||a.market||((a.mandate)||{}).epic||''
+  )||null;
 }
 
 function deskScoreAction(c){
@@ -878,35 +898,61 @@ function renderDeskLearn(client){
   stableHtml(el,`<div class="psx-learn-kv">${rows.join('')}</div>${comboBits.join('')}`);
 }
 
+/** True-range list from OHLC candles (for Wilder ATR + spike clip). */
+function deskTrueRanges(candles){
+  const trs=[];
+  let prevC=null;
+  for(const c of candles||[]){
+    const h=Number(c.high??c.h),l=Number(c.low??c.l),cl=Number(c.close??c.c);
+    if(!Number.isFinite(h)||!Number.isFinite(l))continue;
+    if(prevC==null)trs.push(Math.max(0,h-l));
+    else{
+      const pc=Number.isFinite(prevC)?prevC:cl;
+      trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+    }
+    if(Number.isFinite(cl))prevC=cl;
+  }
+  return trs;
+}
+
+/** Clip sky ATR: Wilder must stay within 6× median TR (gap/spike bars). */
+function deskClipAtr(atr,trs){
+  if(atr==null||!Number.isFinite(atr)||atr<=0)return null;
+  if(!trs||trs.length<8)return atr;
+  const sorted=trs.slice(-30).filter(v=>v>0).sort((a,b)=>a-b);
+  if(sorted.length<5)return atr;
+  const mid=sorted[Math.floor(sorted.length/2)];
+  if(!(mid>0))return atr;
+  const cap=mid*6;
+  return atr>cap?cap:atr;
+}
+
 /** M1 ATR14 from completed candles — never invent from M5 stop_hint (~7.5 lie). */
-function deskM1Atr14(view,mtf,ov){
+function deskM1Atr14(view,mtf,ov,expectedEpic){
+  // Refuse ATR from a different epic than the live book / focus (GOLD vs US100).
+  const viewEpic=view&&view.epic?String(view.epic):null;
+  if(expectedEpic&&viewEpic&&viewEpic!==String(expectedEpic)){
+    // Fall through to candle recompute only if candles match expected — else null.
+    const candleEpic=(view.candles&&view.candles[0]&&view.candles[0].epic)||null;
+    if(candleEpic&&String(candleEpic)!==String(expectedEpic))return null;
+  }
   const mtfUi=(view&&view.mtf)||{};
   const m1tf=((mtf&&mtf.tf)||{}).m1||{};
+  // Never take stop_hint / atr14_m5 / M5 atr as Desk ATR14.
   const direct=mtfUi.atr14??m1tf.atr14??(ov&&ov.atr14);
-  if(direct!=null&&Number.isFinite(Number(direct))&&Number(direct)>0)return Number(direct);
-  const closes=_deskCloses(view);
-  // Need OHLC highs/lows for true ATR — fall back to close-range proxy only if thin.
   const candles=(view&&view.candles)||[];
-  if(candles.length>=16){
-    let prevC=null;const trs=[];
-    for(const c of candles){
-      const h=Number(c.high??c.h),l=Number(c.low??c.l),cl=Number(c.close??c.c);
-      if(!Number.isFinite(h)||!Number.isFinite(l))continue;
-      if(prevC==null){trs.push(Math.max(0,h-l));}
-      else{
-        const pc=Number.isFinite(prevC)?prevC:cl;
-        trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
-      }
-      if(Number.isFinite(cl))prevC=cl;
-    }
-    if(trs.length>=14){
-      let atr=trs.slice(0,14).reduce((a,b)=>a+b,0)/14;
-      for(let i=14;i<trs.length;i++)atr=(atr*13+trs[i])/14;
-      return atr>0?atr:null;
-    }
+  const trs=deskTrueRanges(candles);
+  if(direct!=null&&Number.isFinite(Number(direct))&&Number(direct)>0){
+    return deskClipAtr(Number(direct),trs);
+  }
+  const closes=_deskCloses(view);
+  if(trs.length>=14){
+    let atr=trs.slice(0,14).reduce((a,b)=>a+b,0)/14;
+    for(let i=14;i<trs.length;i++)atr=(atr*13+trs[i])/14;
+    return deskClipAtr(atr>0?atr:null,trs);
   }
   if(closes.length>=16){
-    // Last resort: mean |Δclose| × scale — better than painting M5 as ATR14.
+    // Last resort: mean |Δclose| — better than painting M5 as ATR14.
     let s=0,n=0;
     for(let i=Math.max(1,closes.length-14);i<closes.length;i++){
       s+=Math.abs(closes[i]-closes[i-1]);n++;
@@ -924,12 +970,14 @@ function renderDeskIndicators(client,view){
   const mtf=a.mtf_momentum||{};
   const ov=(view&&view.overlays)||{};
   const mtfUi=(view&&view.mtf)||{};
-  // ATR14 = M1 only (LIVE brackets). Never fall back to M5 stop_hint (~7.5 on GOLD).
-  const atr=deskM1Atr14(view,mtf,ov);
+  const epic=deskFocusEpic(client,view);
+  // ATR14 = M1 only for the live epic. Never M5 stop_hint; never other-epic ATR.
+  const atr=deskM1Atr14(view,mtf,ov,epic);
   const adx=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   const kama=mtfUi.kama??((mtf.tf||{}).m5||{}).kama??ov.kama_level??((mtf.tf||{}).m1||{}).kama;
+  const atrLabel=epic?`ATR M1 · ${epic}`:'ATR M1';
   stableHtml(el,[
-    deskKv(client.id,'ATR',atr,v=>v==null?'—':num(v,2)),
+    deskKv(client.id,atrLabel,atr,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'ADX',adx,v=>v==null?'—':num(v,1)),
     deskKv(client.id,'KAMA',kama,v=>v==null?'—':num(v,2)),
     deskKv(client.id,'SPR',a.spread!=null?a.spread:((a.market_ask!=null&&a.market_bid!=null)?(Number(a.market_ask)-Number(a.market_bid)):null),
@@ -1446,14 +1494,15 @@ function renderDeskIndCharts(client,view){
   const mtf=a.mtf_momentum||{};
   const ov=(view&&view.overlays)||{};
   const mtfUi=(view&&view.mtf)||{};
-  const atrHead=deskM1Atr14(view,mtf,ov);
+  const epicHead=deskFocusEpic(client,view);
+  const atrHead=deskM1Atr14(view,mtf,ov,epicHead);
   const adxHead=mtfUi.adx??ov.adx??((mtf.tf||{}).m5||{}).adx;
   stableHtml(el,`
     <div class="psx-ind-head">
       <span><i>RSI</i> <b>${num(rsiNow,1)}</b></span>
       <span><i>MACD</i> <b class="${macdNow<0?'sell':'buy'}">${num(macdNow,2)}</b></span>
       <span><i>ADX</i> <b>${adxHead==null?'—':num(adxHead,1)}</b></span>
-      <span><i>ATR</i> <b>${atrHead==null?'—':num(atrHead,2)}</b></span>
+      <span title="${esc(epicHead?('M1 '+epicHead):'M1')}"><i>ATR</i> <b>${atrHead==null?'—':num(atrHead,2)}</b></span>
     </div>
     <div class="psx-ind-canvas"><canvas id="deskRsiCanvas"></canvas></div>
     <div class="psx-ind-canvas"><canvas id="deskMacdCanvas"></canvas></div>`);
@@ -1670,13 +1719,17 @@ async function renderDeskHeavy(focus,demoFx){
           markets=board.markets||[];
         }catch(_){markets=[]}
         if(focus){
-          const epic=((focus.activity||{}).market)
+          // Open deal epic first — never paint US100 ATR while GOLD is live.
+          const epic=deskFocusEpic(focus,null)
+            ||((focus.activity||{}).market)
             ||(((focus.activity||{}).mandate)||{}).epic;
           view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
             &&(m.client_ids||[]).map(String).includes(String(focus.id)))
+            ||(markets||[]).find(m=>epic&&String(m.epic)===String(epic))
             ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
             ||null;
-          if(!view||!(view.candles||[]).length){
+          if(!view||!(view.candles||[]).length
+              ||(epic&&view.epic&&String(view.epic)!==String(epic))){
             view=await loadDeskStructure(focus.id);
           }
         }

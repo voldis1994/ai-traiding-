@@ -71,7 +71,7 @@ def test_cache_bust_bumped():
     assert 'truth #' in js
     assert '/api/admin/refresh-truth' in js
     assert '24h' in js
-    assert 'ohlc-chart.js?v=13' in html
+    assert 'ohlc-chart.js?v=14' in html
 
 
 def test_status_board_visible_at_once():

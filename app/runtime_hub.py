@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 275
+DESK_TRUTH_REV = 276
 
 
 def _finite_num(v):
@@ -1433,13 +1433,40 @@ class RuntimeHub:
             eng=rt.engine
             market=getattr(eng,'market',None) or {}
             mandate=(getattr(eng,'mandate',None) or {})
-            if market.get('epic'):
-                epic=market.get('epic');epic_source='live_quote'
-            elif mandate.get('epic'):
-                epic=mandate.get('epic');epic_source='mandate'
-            elif getattr(eng.brain,'epic',None):
-                epic=eng.brain.epic;epic_source='brain'
+            positions=list(getattr(eng,'positions',None) or [])
+            # Live open deal epic beats mandate/quote after instrument switch —
+            # otherwise Desk paints US100 ATR while GOLD is still the book.
+            for p in positions:
+                pe=p.get('epic') if isinstance(p,dict) else None
+                if pe:
+                    epic=str(pe);epic_source='open_position'
+                    break
+            if not epic:
+                if market.get('epic'):
+                    epic=market.get('epic');epic_source='live_quote'
+                elif mandate.get('epic'):
+                    epic=mandate.get('epic');epic_source='mandate'
+                elif getattr(eng.brain,'epic',None):
+                    epic=eng.brain.epic;epic_source='brain'
             mid=market.get('mid')
+            # If chart epic is the open book but quote mid is another market, drop mid.
+            if (epic_source=='open_position' and market.get('epic')
+                    and str(market.get('epic'))!=str(epic)):
+                mid=None
+                for p in positions:
+                    if not isinstance(p,dict):
+                        continue
+                    if str(p.get('epic') or '')!=str(epic):
+                        continue
+                    for key in ('currentLevel','current_price','mark','mid','level'):
+                        try:
+                            v=float(p.get(key))
+                        except (TypeError,ValueError):
+                            continue
+                        if math.isfinite(v) and v>0:
+                            mid=v;break
+                    if mid is not None:
+                        break
             try:
                 spread=float(market.get('spread') or 0)
             except (TypeError,ValueError):
@@ -1452,7 +1479,6 @@ class RuntimeHub:
             if isinstance(sig,dict):
                 action=sig.get('action')
                 scores=sig.get('scores') or {}
-            positions=list(getattr(eng,'positions',None) or [])
         if not epic:
             epic=store.get('legacy_brain_epic')
             if isinstance(epic,str):

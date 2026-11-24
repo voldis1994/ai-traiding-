@@ -131,7 +131,11 @@ def kama_series(closes, er_period: int = 10, fast: int = 2, slow: int = 30) -> l
 
 
 def atr_wilder(bars, period: int = 14) -> float | None:
-    """Wilder ATR on OHLC dict bars. Needs period+1 bars."""
+    """Wilder ATR on OHLC dict bars. Needs period+1 bars.
+
+    Spike/gap bars that would send ATR \"to the sky\" are clipped to 6× the
+    median true range of the recent window (Desk + LIVE share this path).
+    """
     n = max(1, int(period))
     if len(bars) < n + 1:
         return None
@@ -147,7 +151,16 @@ def atr_wilder(bars, period: int = 14) -> float | None:
     atr = sum(trs[:n]) / n
     for tr in trs[n:]:
         atr = (atr * (n - 1) + tr) / n
-    return atr if math.isfinite(atr) and atr > 0 else None
+    if not (math.isfinite(atr) and atr > 0):
+        return None
+    # Cap sky ATR from one bad gap/spike candle.
+    sample = [t for t in trs[-max(30, n * 2):] if t > 0]
+    if len(sample) >= 5:
+        ordered = sorted(sample)
+        median = ordered[len(ordered) // 2]
+        if median > 0 and atr > median * 6.0:
+            atr = median * 6.0
+    return atr
 
 
 def atr_bundle(bars) -> dict:

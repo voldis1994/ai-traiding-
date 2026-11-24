@@ -335,7 +335,10 @@ function drawOhlcStructure(canvas,view,opts){
   const metrics=[];
   if(mtf.mode||ov.mode)metrics.push(`MTF ${mtf.mode||ov.mode}`);
   if(adx!=null)metrics.push(`ADX ${adx.toFixed(0)}`);
-  if(atrShow!=null)metrics.push(`ATR ${atrShow.toFixed(2)}`);
+  if(atrShow!=null){
+    const ep=view.epic?String(view.epic):'';
+    metrics.push(ep?`ATR M1 ${atrShow.toFixed(2)} · ${ep}`:`ATR M1 ${atrShow.toFixed(2)}`);
+  }
   if(kamaSeries.length||ov.kama_level!=null)metrics.push('KAMA');
   if(view.info_stack)metrics.push(String(view.info_stack));
   const timeBits=[];

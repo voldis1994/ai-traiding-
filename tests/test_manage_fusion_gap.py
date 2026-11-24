@@ -102,7 +102,8 @@ def test_runtime_hub_surfaces_manage_scores_when_signal_empty():
         view = rt.client_view()
         assert view['scores']['SELL'] == 0.6
         assert 'waiting for first M1 neural vote' not in (view.get('entry_block_reason') or '')
-        assert view.get('neural_close_executable') is True
+        # Neural reverse is Desk diagnostic only — live exits = SL/TP.
+        assert view.get('neural_close_executable') is False
         assert 'Reverse watch' in (view['evolution'].get('last_reason') or '')
 
 

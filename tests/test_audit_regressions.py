@@ -18,7 +18,7 @@ from tests.test_learning_integrity import new_brain
 
 
 def test_upl_settles_as_capital_not_invented_cash():
-    """Last open UPL settles as capital £ — not invent mid×size / confirm.profit."""
+    """P0-06: last open UPL is ESTIMATE — never invent mid×size / teach-as-cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -27,11 +27,16 @@ def test_upl_settles_as_capital_not_invented_cash():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.set('last_upl:reg1',{'upl':1.25,'currency':'GBP'})
             pnl,src,_=await e._resolve_broker_pnl('reg1',{})
-            assert pnl==pytest.approx(1.25)
-            assert src=='capital'
-            assert src!='broker'
-            from app.realized_cash import may_teach_live_cash
-            assert may_teach_live_cash(src) is True
+            assert pnl is None
+            assert src=='pending_broker_pnl'
+            est=store.get('upl_estimate:reg1')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(1.25)
+            from app.realized_cash import classify_pnl_source, may_teach_live_cash
+            assert classify_pnl_source('capital')=='estimate'
+            assert may_teach_live_cash('capital') is False
+            assert may_teach_live_cash(src) is False
+            assert may_teach_live_cash('broker') is True
     asyncio.run(scenario())
 
 

@@ -123,9 +123,16 @@ def test_pending_close_sync_queues_broker_pnl_retry():
 
 def test_admin_recent_trades_lists_pending_cash_bind():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store=Store(Path(d)/'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         store.upsert_trade({'dealId':'old','epic':'GOLD','size':'0.1','direction':'SELL','level':100})
         store.close_trade('old',99,0.14,currency='GBP',source='broker')
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.14, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='old', transaction_id='TX-old')
         store.upsert_trade({'dealId':'new1','epic':'GOLD','size':'0.1','direction':'SELL','level':100})
         store.close_trade('new1',99.5,source='pending_broker_pnl',overwrite=True)
         hub=RuntimeHub.__new__(RuntimeHub)

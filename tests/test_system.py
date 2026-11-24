@@ -45,6 +45,9 @@ def test_auto_adopt_and_order_cycle():
             store=Store(Path(d)/'state.sqlite3');e=SingleTradeEngine(store,AdaptiveBrain(store));broker=FakeBroker()
             e.attach(broker)
             assert e.armed and e.execution_enabled
+            # Adopt/order cycle unit test — not playbook hard ENTRY / regime chop.
+            from app import self_params as sp
+            sp.save(store,{**sp.load(store),'playbook_hard_entry':0},reason='test_adopt')
             await e.sync()
             assert e.mandate['epic']=='TEST' and e.mandate['size']=='0.2'
             broker.open=[]

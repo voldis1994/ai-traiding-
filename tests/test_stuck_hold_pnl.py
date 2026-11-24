@@ -59,18 +59,24 @@ def test_snapshot_shows_hold_reason_not_m1_wait_mask():
         assert 'Waiting for next completed M1 candle' not in (snap.get('entry_block_reason') or '')
 
 
-def test_history_matches_short_tx_reference_substring():
+def test_history_matches_exact_deal_id_only():
+    """P0-02: substring reference must not bind; exact dealId does."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
             broker=HistoryBroker()
-            # Capital often uses short reference that is a suffix/prefix of dealId.
+            # Substring-only reference must stay unmatched.
             broker.tx=[{'reference':'abcd1234','pnl':0.14,'currency':'GBP'}]
             e.attach(broker)
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.upsert_trade({'dealId':'deal-abcd1234-xyz','epic':'GOLD','size':'.02',
                                 'direction':'SELL','level':2650})
+            pnl,src,_=await e._resolve_broker_pnl('deal-abcd1234-xyz',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            # Exact dealId on Funds row settles.
+            broker.tx=[{'dealId':'deal-abcd1234-xyz','reference':'TX-exact',
+                        'pnl':0.14,'currency':'GBP'}]
             pnl,src,ccy=await e._resolve_broker_pnl('deal-abcd1234-xyz',{})
             assert src=='broker' and pnl==pytest.approx(0.14) and ccy=='GBP'
     asyncio.run(scenario())

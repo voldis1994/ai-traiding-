@@ -1,4 +1,4 @@
-"""Worker quote loop must keep mid/UPL near Capital tick rate."""
+"""Worker quote loop must keep mid/UPL near Capital tick rate without starving light path."""
 import inspect
 from pathlib import Path
 
@@ -8,23 +8,25 @@ from app import machine_spec
 from app import main as main_mod
 
 
-def test_worker_guarantees_light_window_after_poll():
-    """After poll, must sleep/light-tick — never back-to-back heavy poll."""
+def test_worker_runs_independent_light_and_heavy_loops():
+    """P0-03: light ticks must not wait for heavy poll to finish."""
     src = inspect.getsource(runtime_hub.RuntimeHub._worker)
-    assert 'asyncio.sleep(3 if' not in src
-    assert 'light_n' in src
-    assert 'gap=0.025' in src or '0.025' in src
-    assert 'quote_upl_tick' in src
-    assert '_apply_stream_quote' in src
-    # Gated heavy-only loop (no post-poll light) must not return.
-    assert 'heavy_gap' not in src
+    assert '_heavy_loop' in src
+    assert '_light_loop' in src
+    assert 'create_task' in src
+    light = inspect.getsource(runtime_hub.RuntimeHub._light_loop)
+    assert 'quote_upl_tick' in light
+    assert '_apply_stream_quote' in light
+    assert 'asyncio.sleep' in light
 
 
-def test_legacy_worker_also_has_light_window():
+def test_legacy_worker_still_has_light_window():
+    """Item 13: main.worker runs parallel heavy/light like RuntimeHub."""
     src = inspect.getsource(main_mod.worker)
-    assert 'light_n' in src
-    assert '0.025' in src
-    assert 'heavy_gap' not in src
+    assert '_legacy_heavy_loop' in src and '_legacy_light_loop' in src
+    light = inspect.getsource(main_mod._legacy_light_loop)
+    assert 'quote_upl_tick' in light
+    assert 'await engine.poll()' not in light
 
 
 def test_overview_truth_refresh_is_time_bounded():
@@ -44,11 +46,13 @@ def test_funds_mirror_not_awaited_on_desk_poll():
     assert int(__import__('re').search(r'DESK_TRUTH_REV\s*=\s*(\d+)', src).group(1)) >= 266
 
 
-def test_upl_tick_throttle_is_sub_tenth_second():
+def test_upl_tick_throttle_respects_api_budget():
+    """P0-01: UPL REST path must not hammer Capital at ~14 req/s."""
     from app.engine import SingleTradeEngine
     src = inspect.getsource(SingleTradeEngine.quote_upl_tick)
-    assert '0.07' in src
-    assert '<0.15' not in src
+    assert '0.25' in src
+    assert '0.07' not in src
+    assert 'lock.locked()' in src or 'wait_for' in src
 
 
 def test_entry_zone_retry_is_sub_quarter_second():
@@ -63,6 +67,12 @@ def test_machine_spec_documents_fast_cadence():
     assert machine_spec.FAST_ENTRY_TICK_SECONDS <= 0.05
 
 
-def test_stream_pushes_quote_into_engine_market():
-    src = inspect.getsource(stream_mod.CapitalQuoteStream.run)
-    assert '_apply_stream_quote' in src
+def test_stream_has_regular_app_ping_and_subscribe_gate():
+    """P1-04: ping on timer + connected after subscribe/quote."""
+    src = Path('app/stream.py').read_text(encoding='utf-8')
+    assert 'APP_PING_INTERVAL_S' in src
+    assert '_ping_loop' in src
+    assert '_await_subscribe_ack' in src
+    assert 'last_broker_ts' in src
+    apply = inspect.getsource(stream_mod.CapitalQuoteStream._apply_quote_payload)
+    assert '_apply_stream_quote' in apply

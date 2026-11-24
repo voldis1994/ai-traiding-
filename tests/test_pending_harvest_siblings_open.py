@@ -67,8 +67,11 @@ def test_orphan_sqlite_open_harvests_with_sibling_live():
             store.set('entry_brain:orphan',{
                 'epic':'GOLD','direction':'SELL','entry':2651,'tick_size':.1,
                 'transition':brain._json_transition(brain.core.last_transition)})
-            broker.tx=[{'reference':'orphan','pnl':0.09,'currency':'GBP'}]
+            broker.tx=[{'dealId':'orphan','reference':'orphan','pnl':0.09,
+                        'currency':'GBP','transactionId':'TX-orphan'}]
             await e.sync()
+            # Orphan harvest runs via Funds-mirror path (not free-running sync).
+            await e._reconcile_orphan_open_trades()
             assert len(e.positions)==1 and e.positions[0]['dealId']=='live'
             row=next(t for t in store.trades(5) if t['deal_id']=='orphan')
             assert row.get('closed') is not None

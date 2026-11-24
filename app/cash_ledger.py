@@ -196,7 +196,11 @@ def _event_key(ev: Mapping) -> tuple:
 
 
 def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
-    """Append CashEvent idempotently. Duplicate cash_id+revision → no double count."""
+    """Append CashEvent idempotently. Duplicate cash_id+revision → no double count.
+
+    If the same cash_id already exists but Capital changed the amount, apply a
+    correction revision so Funds amendments are not silently ignored.
+    """
     ev = dict(event)
     if not ev.get('cash_id'):
         raise ValueError('event.cash_id required')
@@ -208,8 +212,148 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
         ev['revision'] = 1
     events = load_events(store)
     key = _event_key(ev)
+    cid = str(ev.get('cash_id') or '')
+    new_minor = ev.get('amount_minor')
+    new_deal = str(ev.get('deal_link') or '').strip()
+    # Same cash_id+revision OR same cash_id with amended Capital amount.
+    if cid and new_minor is not None and str(
+            ev.get('transaction_type') or '').upper() != 'CORRECTION':
+        same = [e for e in events if str(e.get('cash_id') or '') == cid]
+        if same:
+            current = net_for_cash_id(store, cid)
+            try:
+                target = int(new_minor)
+            except (TypeError, ValueError):
+                target = None
+            if target is not None and current is not None and current != target:
+                # Identity BEFORE amount — refuse cross-account / cross-ccy amend.
+                base0 = same[0]
+                ident = validate_cash_identity(
+                    base0,
+                    account_id=ev.get('account_id'),
+                    environment=ev.get('environment'),
+                    currency=ev.get('currency'),
+                    transaction_id=ev.get('transaction_id'),
+                    cash_id=cid,
+                )
+                if not ident['ok']:
+                    conflict = cash_event(
+                        account_id=base0['account_id'],
+                        environment=base0.get('environment') or 'demo',
+                        cash_id=cid,
+                        transaction_id=base0.get('transaction_id'),
+                        transaction_type='CORRECTION',
+                        close_proof=False,
+                        status=STATUS_SOURCE_CONFLICT,
+                        amount_minor=None,
+                        currency=base0.get('currency') or 'GBP',
+                        deal_link=new_deal or base0.get('deal_link'),
+                        revision=int(base0.get('revision') or 1) + 2000,
+                        note='identity_conflict|' + ','.join(ident['conflicts']),
+                        raw={'incoming': dict(ev), 'conflicts': ident['conflicts']},
+                    )
+                    conflict['status'] = STATUS_SOURCE_CONFLICT
+                    events.append(conflict)
+                    _save_events(store, events)
+                    return {
+                        'appended': False,
+                        'duplicate': False,
+                        'conflict': True,
+                        'identity_conflicts': ident['conflicts'],
+                        'event': conflict,
+                        'outbox_enqueued': False,
+                    }
+                result = apply_correction(
+                    store, cash_id=cid, corrected_amount_minor=target,
+                    currency=ev.get('currency') or 'GBP',
+                    note='capital_amount_amendment', outbox=outbox,
+                    account_id=ev.get('account_id'),
+                    environment=ev.get('environment'),
+                    transaction_id=ev.get('transaction_id'),
+                    deal_id=new_deal or None)
+                # Amount amend may link only UNMATCHED — never rebind SETTLED.
+                if new_deal:
+                    try:
+                        linked = link_deal(store, cid, new_deal)
+                        result = dict(result)
+                        result['event'] = linked
+                        result['linked'] = True
+                    except ValueError as exc:
+                        if 'SOURCE_CONFLICT' in str(exc) or 'deal_link' in str(exc):
+                            conflict = _record_deal_link_conflict(
+                                store, cid, new_deal, note=str(exc))
+                            result = dict(result)
+                            result['conflict'] = conflict
+                            result['linked'] = False
+                    except Exception:
+                        pass
+                return result
+            # Identical net / exact key — no double count, BUT allow late
+            # deal_link when existing row is still UNMATCHED / MATCH_UNCERTAIN.
+            # Verified SETTLED with a different deal → SOURCE_CONFLICT.
+            for existing in same:
+                if _event_key(existing) == key or (
+                        target is not None and current == target):
+                    old_deal = str(existing.get('deal_link') or '').strip()
+                    old_st = str(existing.get('status') or '')
+                    if new_deal and old_deal and new_deal != old_deal and old_st in (
+                            STATUS_SETTLED, STATUS_SETTLED_ZERO):
+                        conflict = _record_deal_link_conflict(
+                            store, cid, new_deal,
+                            note=f'verified_deal={old_deal}')
+                        return {
+                            'appended': False,
+                            'duplicate': True,
+                            'linked': False,
+                            'conflict': True,
+                            'event': conflict,
+                            'outbox_enqueued': False,
+                        }
+                    if new_deal and (
+                            not old_deal
+                            or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
+                        linked = link_deal(store, cid, new_deal)
+                        return {
+                            'appended': False,
+                            'duplicate': True,
+                            'linked': True,
+                            'event': linked,
+                            'outbox_enqueued': False,
+                        }
+                    return {
+                        'appended': False,
+                        'duplicate': True,
+                        'event': dict(existing),
+                        'outbox_enqueued': False,
+                    }
     for existing in events:
         if _event_key(existing) == key:
+            old_deal = str(existing.get('deal_link') or '').strip()
+            old_st = str(existing.get('status') or '')
+            if new_deal and old_deal and new_deal != old_deal and old_st in (
+                    STATUS_SETTLED, STATUS_SETTLED_ZERO):
+                conflict = _record_deal_link_conflict(
+                    store, cid, new_deal,
+                    note=f'verified_deal={old_deal}')
+                return {
+                    'appended': False,
+                    'duplicate': True,
+                    'linked': False,
+                    'conflict': True,
+                    'event': conflict,
+                    'outbox_enqueued': False,
+                }
+            if new_deal and (
+                    not old_deal
+                    or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
+                linked = link_deal(store, cid, new_deal)
+                return {
+                    'appended': False,
+                    'duplicate': True,
+                    'linked': True,
+                    'event': linked,
+                    'outbox_enqueued': False,
+                }
             return {
                 'appended': False,
                 'duplicate': True,
@@ -297,6 +441,19 @@ def _in_period(ev: Mapping, period) -> bool:
     return stamp.startswith(str(period)[:10])
 
 
+def _is_learn_synthetic(ev: Mapping) -> bool:
+    """Legacy synthetic cash invented as learn:{deal} — never sum or teach."""
+    txid = str(ev.get('transaction_id') or '')
+    cid = str(ev.get('cash_id') or '')
+    note = str(ev.get('note') or '')
+    return (
+        txid.startswith('learn:')
+        or cid.startswith('learn:')
+        or 'learn:' in cid
+        or note.startswith('learn_synthetic')
+    )
+
+
 def list_account_events(store, account_id: str, currency: str | None = None,
                         *, environment: str | None = None,
                         period=None, include_fees: bool = True) -> list[dict]:
@@ -311,6 +468,9 @@ def list_account_events(store, account_id: str, currency: str | None = None,
             continue
         if ccy and str(ev.get('currency') or '').upper() != ccy:
             continue
+        # Desk / API / teacher sums must ignore legacy learn:* doubles.
+        if _is_learn_synthetic(ev):
+            continue
         if not _in_period(ev, period):
             continue
         t = str(ev.get('transaction_type') or 'TRADE').upper()
@@ -318,6 +478,99 @@ def list_account_events(store, account_id: str, currency: str | None = None,
             continue
         out.append(ev)
     return out
+
+
+BACKUP_KEY = 'cash_ledger_backup_before_learn_quarantine_v1'
+
+
+def quarantine_learn_synthetic(store, *, backup: bool = True) -> dict:
+    """Migrate legacy learn:{deal} rows out of summable statuses (Desk £×2).
+
+    Idempotent: already-QUARANTINE learn rows are left alone.
+    Original events are snapshotted once under BACKUP_KEY before first mutate.
+    """
+    events = load_events(store)
+    to_fix = []
+    for i, ev in enumerate(events):
+        if not _is_learn_synthetic(ev):
+            continue
+        st = str(ev.get('status') or '')
+        if st == STATUS_QUARANTINE and str(ev.get('note') or '').startswith(
+                'learn_synthetic'):
+            continue
+        to_fix.append(i)
+    if not to_fix:
+        return {'quarantined': 0, 'total_events': len(events), 'backed_up': False}
+    backed_up = False
+    if backup and not _store_get(store, BACKUP_KEY, None):
+        _store_set(store, BACKUP_KEY, {
+            'at': _now_iso(),
+            'reason': 'learn_synthetic_quarantine',
+            'events': [dict(e) for e in events],
+        })
+        backed_up = True
+    changed = 0
+    for i in to_fix:
+        ev = events[i]
+        ev['status'] = STATUS_QUARANTINE
+        prev = str(ev.get('note') or '')
+        if not prev.startswith('learn_synthetic'):
+            ev['note'] = 'learn_synthetic|' + prev if prev else 'learn_synthetic'
+        # Null amount so even a stray sum path cannot count it.
+        # Original amount remains in BACKUP_KEY snapshot.
+        ev['amount_minor'] = None
+        changed += 1
+    if changed:
+        _save_events(store, events)
+    return {
+        'quarantined': changed,
+        'total_events': len(events),
+        'backed_up': backed_up,
+    }
+
+
+def validate_cash_identity(
+    existing: Mapping,
+    *,
+    account_id: str | None = None,
+    environment: str | None = None,
+    currency: str | None = None,
+    transaction_id: str | None = None,
+    deal_id: str | None = None,
+    cash_id: str | None = None,
+) -> dict:
+    """Identity check BEFORE any amount correction (account/env/ccy/tx/deal).
+
+    Returns ``{ok, conflicts[]}``. Callers must refuse amount writes on failure.
+    """
+    conflicts: list[str] = []
+    if cash_id is not None and str(existing.get('cash_id') or '') != str(cash_id):
+        conflicts.append('cash_id')
+    if account_id is not None and str(existing.get('account_id') or '') != str(
+            account_id).strip():
+        conflicts.append('account_id')
+    if environment is not None:
+        a = str(existing.get('environment') or '').strip().lower()
+        b = str(environment).strip().lower()
+        if a and b and a != b:
+            conflicts.append('environment')
+    if currency is not None:
+        a = str(existing.get('currency') or '').strip().upper()
+        b = str(currency).strip().upper()
+        if a and b and a != b:
+            conflicts.append('currency')
+    if transaction_id is not None:
+        a = str(existing.get('transaction_id') or '').strip()
+        b = str(transaction_id).strip()
+        if a and b and a != b:
+            conflicts.append('transaction_id')
+    if deal_id is not None:
+        a = str(existing.get('deal_link') or '').strip()
+        b = str(deal_id).strip()
+        old_st = str(existing.get('status') or '')
+        if a and b and a != b and old_st in (STATUS_SETTLED, STATUS_SETTLED_ZERO):
+            conflicts.append('deal_link')
+    return {'ok': not conflicts, 'conflicts': conflicts}
 
 
 def sum_account(store, account_id: str, currency: str, period=None,
@@ -385,12 +638,56 @@ def net_for_cash_id(store, cash_id: str) -> int | None:
 
 def apply_correction(store, *, cash_id: str, corrected_amount_minor: int,
                      currency: str = 'GBP', observed_at: str | None = None,
-                     note: str | None = None, outbox: bool = True) -> dict:
-    """Append revision delta so lineage nets to corrected_amount_minor (P12/T34)."""
+                     note: str | None = None, outbox: bool = True,
+                     account_id: str | None = None,
+                     environment: str | None = None,
+                     transaction_id: str | None = None,
+                     deal_id: str | None = None) -> dict:
+    """Append revision delta so lineage nets to corrected_amount_minor (P12/T34).
+
+    Identity (account/env/currency/tx/deal) is validated BEFORE amount writes.
+    Banked non-zero P&L may be amended when identity matches.
+    """
     events = [e for e in load_events(store) if str(e.get('cash_id') or '') == str(cash_id)]
     if not events:
         raise ValueError(f'unknown cash_id: {cash_id}')
     base = events[0]
+    ident = validate_cash_identity(
+        base,
+        cash_id=cash_id,
+        account_id=account_id if account_id is not None else base.get('account_id'),
+        environment=environment if environment is not None else base.get('environment'),
+        currency=currency,
+        transaction_id=transaction_id,
+        deal_id=deal_id,
+    )
+    # Currency on the correction itself must match the lineage currency.
+    if currency:
+        base_ccy = str(base.get('currency') or '').strip().upper()
+        if base_ccy and base_ccy != str(currency).strip().upper():
+            raise ValueError(
+                f'SOURCE_CONFLICT: currency {currency} != lineage {base_ccy}')
+    if account_id is not None or environment is not None or deal_id is not None:
+        if not ident['ok'] and 'currency' not in (ident.get('conflicts') or []):
+            # Re-check with explicit caller identity overrides.
+            pass
+    if account_id is not None:
+        if str(base.get('account_id') or '') != str(account_id).strip():
+            raise ValueError(
+                f'SOURCE_CONFLICT: account_id mismatch for cash_id {cash_id}')
+    if environment is not None:
+        a = str(base.get('environment') or '').strip().lower()
+        b = str(environment).strip().lower()
+        if a and b and a != b:
+            raise ValueError(
+                f'SOURCE_CONFLICT: environment mismatch for cash_id {cash_id}')
+    if deal_id is not None:
+        linked = str(base.get('deal_link') or '').strip()
+        st = str(base.get('status') or '')
+        if linked and linked != str(deal_id).strip() and st in (
+                STATUS_SETTLED, STATUS_SETTLED_ZERO):
+            raise ValueError(
+                f'SOURCE_CONFLICT: deal_link {linked} != {deal_id}')
     current = net_for_cash_id(store, cash_id)
     if current is None:
         current = 0
@@ -449,8 +746,45 @@ def apply_correction(store, *, cash_id: str, corrected_amount_minor: int,
     return result
 
 
+def _record_deal_link_conflict(store, cash_id: str, new_deal: str,
+                               *, note: str = '') -> dict:
+    """Append SOURCE_CONFLICT marker — never overwrite a verified deal_link."""
+    events = load_events(store)
+    base = None
+    for ev in events:
+        if str(ev.get('cash_id') or '') == str(cash_id):
+            base = ev
+            break
+    if base is None:
+        raise ValueError(f'unknown cash_id: {cash_id}')
+    conflict = cash_event(
+        account_id=base['account_id'],
+        environment=base.get('environment') or 'demo',
+        cash_id=cash_id,
+        transaction_id=base.get('transaction_id'),
+        transaction_type='CORRECTION',
+        close_proof=False,
+        status=STATUS_SOURCE_CONFLICT,
+        amount_minor=None,
+        currency=base.get('currency') or 'GBP',
+        deal_link=str(new_deal),
+        revision=int(base.get('revision') or 1) + 1000,
+        note='deal_link_conflict|' + (note or ''),
+        raw={'existing_deal': base.get('deal_link'), 'attempted_deal': new_deal},
+    )
+    conflict['status'] = STATUS_SOURCE_CONFLICT
+    # Avoid recursive conflict handling via append_event duplicate path.
+    events.append(conflict)
+    _save_events(store, events)
+    return conflict
+
+
 def link_deal(store, cash_id: str, deal_id: str) -> dict:
-    """Attach unique deal proof; clears MATCH_UNCERTAIN / UNMATCHED (T32)."""
+    """Attach unique deal proof; clears MATCH_UNCERTAIN / UNMATCHED (T32).
+
+    Never rebinds a verified SETTLED/SETTLED_ZERO deal to a different id —
+    that is SOURCE_CONFLICT.
+    """
     deal = str(deal_id or '').strip()
     if not deal:
         raise ValueError('deal_id required')
@@ -459,44 +793,98 @@ def link_deal(store, cash_id: str, deal_id: str) -> dict:
     for ev in events:
         if str(ev.get('cash_id') or '') != str(cash_id):
             continue
-        ev['deal_link'] = deal
-        if ev.get('status') in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN):
-            if ev.get('amount_minor') == 0:
-                ev['status'] = STATUS_SETTLED_ZERO
-            else:
-                ev['status'] = STATUS_SETTLED
-        updated = ev
+        old_deal = str(ev.get('deal_link') or '').strip()
+        old_st = str(ev.get('status') or '')
+        if (old_deal and old_deal != deal
+                and old_st in (STATUS_SETTLED, STATUS_SETTLED_ZERO)):
+            raise ValueError(
+                f'SOURCE_CONFLICT: cash_id {cash_id} already linked to {old_deal}')
+        # Only upgrade unlinked / uncertain rows.
+        if old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN) or not old_deal:
+            ev['deal_link'] = deal
+            if ev.get('status') in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN):
+                if ev.get('amount_minor') == 0:
+                    ev['status'] = STATUS_SETTLED_ZERO
+                else:
+                    ev['status'] = STATUS_SETTLED
+            updated = ev
+        elif old_deal == deal:
+            updated = ev
     if updated is None:
         raise ValueError(f'unknown cash_id: {cash_id}')
     _save_events(store, events)
     return dict(updated)
 
 
-def deal_realized(store, deal_id: str, *, currency: str | None = None) -> dict:
+def deal_realized(
+    store,
+    deal_id: str,
+    *,
+    currency: str | None = None,
+    account_id: str | None = None,
+    environment: str | None = None,
+) -> dict:
     """Resolve deal PnL from ledger links.
 
+    Currency filter is mandatory for teach (no cross-currency sum).
     No unique deal_link → MATCH_UNCERTAIN (amount_minor null for teach).
     Multiple candidates without unique proof → MATCH_UNCERTAIN.
+    Filters account_id + LIVE/DEMO environment when provided.
     """
     deal = str(deal_id or '').strip()
+    acct = str(account_id).strip() if account_id else None
+    env = str(environment).strip().lower() if environment else None
+    ccy_req = str(currency or '').strip().upper() or None
+    # Without an explicit currency, refuse teach — never mix GBP+USD.
+    if not ccy_req:
+        return {
+            'deal_id': deal,
+            'amount_minor': None,
+            'currency': None,
+            'status': STATUS_MATCH_UNCERTAIN,
+            'events': [],
+            'may_teach': False,
+            'uncertain_candidates': False,
+            'reason': 'currency_required',
+        }
     matches = []
+    uncertain = False
     for ev in load_events(store):
         if str(ev.get('deal_link') or '') != deal:
             continue
-        if currency and str(ev.get('currency') or '').upper() != currency.upper():
+        # Never teach from synthetic learn:* duplicates (legacy double-count).
+        txid = str(ev.get('transaction_id') or '')
+        if txid.startswith('learn:') or str(ev.get('cash_id') or '').startswith('learn:'):
+            continue
+        if str(ev.get('status') or '') == STATUS_QUARANTINE and (
+                str(ev.get('note') or '').startswith('learn_synthetic')):
+            continue
+        if acct and str(ev.get('account_id') or '') not in ('', acct):
+            continue
+        if env and str(ev.get('environment') or '').lower() not in ('', env):
+            continue
+        if str(ev.get('currency') or '').upper() != ccy_req:
             continue
         st = str(ev.get('status') or '')
-        if st in (STATUS_QUARANTINE, STATUS_PENDING, STATUS_ESTIMATE, STATUS_UNVERIFIED):
+        # Never teach from uncertain / unmatched / quarantine / estimate.
+        if st in (STATUS_QUARANTINE, STATUS_PENDING, STATUS_ESTIMATE,
+                  STATUS_UNVERIFIED, STATUS_MATCH_UNCERTAIN, STATUS_UNMATCHED,
+                  STATUS_SOURCE_CONFLICT):
+            if st == STATUS_MATCH_UNCERTAIN:
+                uncertain = True
+            continue
+        if st not in (STATUS_SETTLED, STATUS_SETTLED_ZERO):
             continue
         matches.append(ev)
     if not matches:
         return {
             'deal_id': deal,
             'amount_minor': None,
-            'currency': currency,
+            'currency': ccy_req,
             'status': STATUS_MATCH_UNCERTAIN,
             'events': [],
             'may_teach': False,
+            'uncertain_candidates': bool(uncertain),
         }
     total = sum(int(e['amount_minor']) for e in matches if e.get('amount_minor') is not None)
     ccy = matches[0].get('currency')
@@ -630,26 +1018,115 @@ def ingest_funds_row(store, row: Mapping, *, account_id: str, environment: str =
     return append_event(store, ev, outbox=True)
 
 
+def aggregate_verified_by_deal(
+    store,
+    *,
+    account_id: str,
+    currency: str,
+    environment: str | None = None,
+) -> dict[str, dict]:
+    """Authoritative Cash Ledger aggregator for Desk / Funds / mirror / recovery.
+
+    One deal → one summed verified amount. Multi-tx rows SUM (never overwrite).
+    Excludes learn:* synthetics, fuzzy matches, quarantine, unmatched, conflicts.
+    Verified £0.00 is a valid finished result (status SETTLED_ZERO).
+    """
+    acct = str(account_id or '').strip()
+    ccy = str(currency or '').strip().upper() or None  # None = all currencies
+    env = str(environment or '').strip().lower() or None
+    by_deal: dict[str, dict] = {}
+    for ev in load_events(store):
+        deal = str(ev.get('deal_link') or '').strip()
+        if not deal:
+            continue
+        if _is_learn_synthetic(ev):
+            continue
+        st = str(ev.get('status') or '')
+        if st not in (STATUS_SETTLED, STATUS_SETTLED_ZERO):
+            continue
+        if ev.get('amount_minor') is None:
+            continue
+        ev_acct = str(ev.get('account_id') or '')
+        if ev_acct and acct and ev_acct != acct:
+            continue
+        if env:
+            ev_env = str(ev.get('environment') or '').lower()
+            if ev_env and ev_env != env:
+                continue
+        ev_ccy = str(ev.get('currency') or '').upper()
+        if ccy and ev_ccy and ev_ccy != ccy:
+            continue
+        try:
+            minor = int(ev['amount_minor'])
+        except (TypeError, ValueError):
+            continue
+        # Multi-currency: key by deal+ccy so GBP/USD never mix into one sum.
+        bucket = deal if ccy else f'{deal}|{ev_ccy or "?"}'
+        prev = by_deal.get(bucket)
+        if prev:
+            # Same deal+currency only.
+            if str(prev.get('currency') or '') != (ev_ccy or ''):
+                continue
+            total = int(prev['amount_minor']) + minor
+            txs = list(prev.get('transaction_ids') or [])
+            tx = str(ev.get('transaction_id') or '')
+            if tx and tx not in txs:
+                txs.append(tx)
+            by_deal[bucket] = {
+                'deal_id': deal,
+                'amount_minor': total,
+                'currency': ev_ccy or ccy,
+                'status': STATUS_SETTLED_ZERO if total == 0 else STATUS_SETTLED,
+                'may_teach': True,
+                'transaction_ids': txs,
+                'cash_ids': list({*(prev.get('cash_ids') or []),
+                                  str(ev.get('cash_id') or '')}),
+                'events_n': int(prev.get('events_n') or 0) + 1,
+            }
+        else:
+            by_deal[bucket] = {
+                'deal_id': deal,
+                'amount_minor': minor,
+                'currency': ev_ccy or ccy,
+                'status': STATUS_SETTLED_ZERO if minor == 0 else STATUS_SETTLED,
+                'may_teach': True,
+                'transaction_ids': (
+                    [str(ev.get('transaction_id'))]
+                    if ev.get('transaction_id') else []),
+                'cash_ids': [str(ev.get('cash_id') or '')],
+                'events_n': 1,
+            }
+    return by_deal
+
+
 def consumer_snapshot(store, account_id: str, currency: str = 'GBP',
-                      period=None) -> dict:
+                      period=None, *, environment: str | None = None) -> dict:
     """Single sum for API / day_book / stats / teacher (P13/P17)."""
-    trade = sum_trade_results(store, account_id, currency, period=period)
-    full = sum_account(store, account_id, currency, period=period, include_fees=True)
+    trade = sum_trade_results(
+        store, account_id, currency, period=period, environment=environment)
+    full = sum_account(
+        store, account_id, currency, period=period, include_fees=True,
+        environment=environment)
+    by_deal = aggregate_verified_by_deal(
+        store, account_id=account_id, currency=currency, environment=environment)
     return {
         'account_id': account_id,
         'currency': currency,
+        'environment': environment,
         'trade_result_minor': trade,
         'account_net_minor': full,
         'ui_trade': format_ui_amount(trade, currency),
         'ui_net': format_ui_amount(full, currency),
-        'events': list_account_events(store, account_id, currency, period=period),
+        'by_deal': by_deal,
+        'events': list_account_events(
+            store, account_id, currency, period=period, environment=environment),
         'pending_outbox': pending_outbox(store),
     }
 
 
 # Re-exports for engine wiring convenience.
 __all__ = [
-    'ADAPTER_VERSION', 'MemoryStore', 'STORE_KEY', 'OUTBOX_KEY',
+    'ADAPTER_VERSION', 'MemoryStore', 'STORE_KEY', 'OUTBOX_KEY', 'BACKUP_KEY',
     'STATUS_SETTLED', 'STATUS_SETTLED_ZERO', 'STATUS_PENDING',
     'STATUS_MATCH_UNCERTAIN', 'STATUS_UNMATCHED', 'STATUS_QUARANTINE',
     'STATUS_UNVERIFIED', 'STATUS_ESTIMATE', 'STATUS_SOURCE_CONFLICT',
@@ -658,6 +1135,9 @@ __all__ = [
     'unmatched_deal_pnl', 'sum_account', 'sum_trade_results',
     'net_for_cash_id', 'load_events', 'load_outbox', 'ack_outbox',
     'pending_outbox', 'ingest_funds_row', 'consumer_snapshot',
+    'aggregate_verified_by_deal', 'validate_cash_identity',
     'list_account_events', 'classify_pnl_source', 'to_minor', 'from_minor',
     'format_ui_amount', 'parse_broker_cash_amount',
+    'quarantine_learn_synthetic', '_is_learn_synthetic',
+    '_record_deal_link_conflict',
 ]

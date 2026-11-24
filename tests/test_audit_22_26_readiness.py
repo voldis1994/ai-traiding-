@@ -196,14 +196,22 @@ def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic(
 
 def test_runtime_hub_exposes_separated_metrics():
     from app.runtime_hub import RuntimeHub
+    from app import cash_ledger
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         # Two closed broker cash rows.
         for i, pnl in enumerate((2.0, -1.0)):
+            deal = f'd{i}'
             store.db.execute(
                 '''INSERT INTO trades(deal_id,epic,direction,size,entry,exit,pnl,pnl_source,pnl_currency,opened,closed)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
-                (f'd{i}', 'SIM', 'BUY', '1', 1, 2, pnl, 'broker', 'GBP', 't0', 't1'))
+                (deal, 'SIM', 'BUY', '1', 1, 2, pnl, 'broker', 'GBP', 't0', 't1'))
+            cash_ledger.ingest_funds_row(
+                store, {'pnl': pnl, 'currency': 'GBP', 'transactionType': 'TRADE'},
+                account_id='1', environment='live', account_currency='GBP',
+                deal_link=deal, transaction_id=f'TX-{deal}')
         store.db.commit()
         # Build a minimal hub-like stats call.
         class _Fake:

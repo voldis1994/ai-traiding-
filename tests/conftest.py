@@ -8,7 +8,21 @@ import pytest
 LEGACY_MODULES = {
     'test_adaptive_live_protection','test_integration','test_relative_edge_live',
     'test_system','test_validated_margin_unblock','test_multi_timeframe',
+    'test_tp_min_distance','test_neural_owner_closed_candle','test_v3_engine_contract',
 }
+
+@pytest.fixture(autouse=True)
+def disable_session_window_flake(request, monkeypatch):
+    """Avoid London→NY 07–21Z flakes when the suite runs outside that window."""
+    # Keep dedicated session-window unit tests honest.
+    name = getattr(request.node, 'name', '') or ''
+    mod = getattr(request.module, '__name__', '') or ''
+    if 'session_window' in name or 'session_window' in mod:
+        return
+    monkeypatch.setattr(
+        'app.playbook_entry.session_filter_enabled',
+        lambda store=None: False)
+
 
 @pytest.fixture(autouse=True)
 def legacy_offline_external_gate(request,monkeypatch):

@@ -58,45 +58,35 @@ def _bootstrap_admin():
         platform.ensure_admin(user,password,sync_password=True)
 
 
-async def worker():
-    """Legacy single-engine loop — poll then guaranteed light ticks (same as hub)."""
+async def _legacy_heavy_loop():
+    """Heavy poll / reconcile — never blocks light UPL ticks (item 3/13)."""
     error_count=0
     while True:
         try:
             if engine.broker:
-                if store.unresolved():await engine.reconcile_outstanding()
+                if store.unresolved():
+                    await engine.reconcile_outstanding()
                 await engine.poll()
-                error_count=0;engine.last_error=None
+                error_count=0
+                engine.last_error=None
                 if RuntimeHub._can_rearm_after_read(engine):
-                    engine._paused_for_read=False;engine.armed=True;engine.execution_enabled=True
-                    store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                open_book=bool(engine.positions)
-                fast_entry=(bool(engine.mandate) and not open_book
-                            and hasattr(engine,'quote_entry_tick')
-                            and engine._wants_fast_entry_ticks())
-                light_n=18 if (open_book or fast_entry) else 12
-                for _ in range(light_n):
-                    await asyncio.sleep(0.025)
-                    if not engine.mandate:
-                        continue
-                    try:
-                        if open_book and hasattr(engine,'quote_upl_tick'):
-                            await engine.quote_upl_tick()
-                        else:
-                            if hasattr(engine,'_apply_stream_quote'):
-                                engine._apply_stream_quote()
-                            if fast_entry:
-                                await engine.quote_entry_tick()
-                    except Exception:
-                        break
+                    engine._paused_for_read=False
+                    engine.armed=True
+                    engine.execution_enabled=True
+                    store.event('recovery',
+                        'Read-only broker outage recovered; autonomous execution resumed')
+                await asyncio.sleep(0.05)
                 continue
-        except asyncio.CancelledError:raise
+            await asyncio.sleep(0.5 if error_count<3 else 3)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             engine.last_error=f'{type(exc).__name__}: {str(exc)[:180]}'
             error_count+=1
             frames=traceback.extract_tb(exc.__traceback__)
-            local=next((f for f in reversed(frames) if '/app/' in f.filename.replace('\\','/')),
-                frames[-1] if frames else None)
+            local=next((f for f in reversed(frames)
+                        if '/app/' in f.filename.replace('\\','/')),
+                       frames[-1] if frames else None)
             try:
                 store.event('error','Broker/engine cycle error',{
                     'type':type(exc).__name__,'count':error_count,
@@ -105,7 +95,6 @@ async def worker():
             except Exception:
                 pass
             if error_count>=3:
-                # Never auto-pause — only operator Pause freezes OPEN.
                 try:
                     store.event('warning',
                         'Repeated broker/engine errors; keeping execution live',
@@ -114,7 +103,51 @@ async def worker():
                     pass
                 if hasattr(engine,'_ensure_live_unless_operator_paused'):
                     engine._ensure_live_unless_operator_paused()
-        await asyncio.sleep(0.5 if error_count<3 else 3)
+            await asyncio.sleep(0.5 if error_count<3 else 3)
+
+
+async def _legacy_light_loop():
+    """Independent quote/UPL/entry ticks — never waits for heavy poll."""
+    while True:
+        try:
+            await asyncio.sleep(0.05)
+            if not engine.broker or not engine.mandate:
+                continue
+            open_book=bool(engine.positions)
+            fast_entry=(not open_book
+                        and hasattr(engine,'quote_entry_tick')
+                        and engine._wants_fast_entry_ticks())
+            try:
+                if open_book and hasattr(engine,'quote_upl_tick'):
+                    await engine.quote_upl_tick()
+                else:
+                    if hasattr(engine,'_apply_stream_quote'):
+                        engine._apply_stream_quote()
+                    if fast_entry:
+                        await engine.quote_entry_tick()
+            except Exception:
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+
+
+async def worker():
+    """Legacy single-engine loop — parallel heavy/light (same contract as hub)."""
+    heavy=asyncio.create_task(_legacy_heavy_loop(),name='legacy-heavy')
+    light=asyncio.create_task(_legacy_light_loop(),name='legacy-light')
+    try:
+        done,pending=await asyncio.wait(
+            {heavy,light},return_when=asyncio.FIRST_EXCEPTION)
+        for t in pending:
+            t.cancel()
+        for t in done:
+            exc=t.exception()
+            if exc:
+                raise exc
+    except asyncio.CancelledError:
+        heavy.cancel();light.cancel()
+        await asyncio.gather(heavy,light,return_exceptions=True)
+        raise
 
 @asynccontextmanager
 async def lifespan(app):

@@ -41,8 +41,8 @@ def test_order_fully_matched_open_multi_pos_by_confirm_deal():
             'PROTECT',{'stop':98.0,'profit':111.0},'a',{},None) is False
 
 
-def test_fuzzy_opposite_direction_close_binds():
-    """Closing TRADE is often opposite of open dir — still bind single epic/size hit."""
+def test_fuzzy_opposite_direction_close_does_not_invent_bind():
+    """P0-02: opposite-direction TRADE without exact deal id stays unmatched."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -54,13 +54,13 @@ def test_fuzzy_opposite_direction_close_binds():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.upsert_trade({'dealId':'uuid-opp','epic':'GOLD','size':'.02',
                                 'direction':'BUY','level':2650})
-            # Opposite close direction + Decimal size ".02" vs 0.02.
             broker.tx=[{'reference':'QQ11','instrumentName':'Gold Spot',
                         'size':'0.02','direction':'SELL',
                         'pnl':0.21,'currency':'GBP'}]
-            found=await e._pnl_fuzzy_instrument_cash('uuid-opp')
-            assert found is not None
-            assert found[0]==pytest.approx(0.21)
+            assert await e._pnl_fuzzy_instrument_cash('uuid-opp') is None
+            broker.tx=[{'dealId':'uuid-opp','pnl':0.21,'currency':'GBP'}]
+            found=await e._pnl_from_broker_history('uuid-opp',exact_deal=True)
+            assert found is not None and found[0]==pytest.approx(0.21)
     asyncio.run(scenario())
 
 
@@ -89,14 +89,16 @@ def test_late_broker_banks_day_book_after_ticks_learn():
             assert float(daily_before.get('realized_pnl') or 0)==0.0
             # Verified Capital cash — first neural teach + day book bank once.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-late1','reference':'TX-late1'})
             assert e._trade_already_learned('late1')
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.18)
             assert store.get('broker_cash_banked:late1')
             # Second late refine must not double-bank.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-late1','reference':'TX-late1'})
             daily2=db.load_daily(store,equity=10_000.0)
             assert float(daily2.get('realized_pnl') or 0)==pytest.approx(0.18)
     asyncio.run(scenario())
@@ -303,6 +305,17 @@ def test_ghost_recover_tries_all_open_deals():
 def test_trade_stats_multi_ccy_realized_none_not_zero():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
+        store.set('capital_account_id','1')
+        store.set('capital_environment','live')
+        from app import cash_ledger
+        cash_ledger.ingest_funds_row(
+            store,{'pnl':1.5,'currency':'GBP','transactionType':'TRADE'},
+            account_id='1',environment='live',account_currency='GBP',
+            deal_link='g1',transaction_id='g1-tx')
+        cash_ledger.ingest_funds_row(
+            store,{'pnl':2.0,'currency':'USD','transactionType':'TRADE'},
+            account_id='1',environment='live',account_currency='USD',
+            deal_link='u1',transaction_id='u1-tx')
         store.upsert_trade({'dealId':'g1','epic':'GOLD','size':'0.1',
                             'direction':'BUY','level':2000})
         store.close_trade('g1',2001,1.5,currency='GBP',source='broker',overwrite=True)
@@ -355,14 +368,24 @@ def test_fuzzy_cash_not_double_bound_across_pending():
                 {'deal_id':'a1','exit_level':2649,'attempts':1},
                 {'deal_id':'b1','exit_level':2649,'attempts':1},
             ])
-            # Single TRADE row — only one pending may consume it.
-            broker.tx=[{'reference':'ZZ99','instrumentName':'Gold Spot',
+            # Exact dealId only — no fuzzy bind of orphan reference to pending.
+            broker.tx=[{'dealId':'a1','reference':'ZZ99','instrumentName':'Gold Spot',
                         'size':'0.02','direction':'SELL','pnl':0.40,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             rows={t['deal_id']:t for t in store.trades(10)}
             cashed=[r for r in rows.values() if r.get('pnl_source')=='broker']
             assert len(cashed)==1
+            assert cashed[0]['deal_id']=='a1'
             assert cashed[0]['pnl']==pytest.approx(0.40)
+            # Orphan Funds without dealId must NOT bank onto the other pending.
+            broker.tx=[{'reference':'ORPHAN','instrumentName':'Gold Spot',
+                        'size':'0.02','pnl':0.99,'currency':'GBP'}]
+            store.set('pending_broker_pnl_deals',
+                      [{'deal_id':'b1','exit_level':2649,'attempts':1}])
+            await e._retry_pending_broker_pnl()
+            rows2={t['deal_id']:t for t in store.trades(10)}
+            b1=rows2['b1']
+            assert not (b1.get('pnl_source')=='broker' and abs(float(b1.get('pnl') or 0)-0.99)<1e-9)
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.40)
     asyncio.run(scenario())
@@ -385,14 +408,15 @@ def test_fuzzy_rejects_zero_open_trade_poison():
             e._mark_trade_learned('z1',mode='ticks',pnl=None,source='ticks_only')
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'z1','exit_level':2649,'attempts':2}])
+            # Orphan £0 reference must not fuzzy-bank onto pending z1.
             broker.tx=[{'reference':'OPEN0','instrumentName':'Gold Spot',
                         'size':'0.02','pnl':0.0,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             assert store.get('broker_cash_banked:z1') in (None,False,{})
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==0.0
-            # Later real close cash must still bank.
-            broker.tx=[{'reference':'CLOSE1','instrumentName':'Gold Spot',
+            # Later exact-deal Funds £ must still bank.
+            broker.tx=[{'dealId':'z1','reference':'CLOSE1','instrumentName':'Gold Spot',
                         'size':'0.02','pnl':-0.22,'currency':'GBP'}]
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'z1','exit_level':2649,'attempts':3}])
@@ -422,7 +446,8 @@ def test_late_cash_feeds_profit_learning():
             assert not e._trade_already_learned('pl1')
             assert list(e.profit_learning.broker_pnls())==[]
             e._learn_closed_trade('pl1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-pl1','reference':'TX-pl1'})
             assert e._trade_already_learned('pl1')
             assert float(db.load_daily(store,equity=10_000.0).get('realized_pnl') or 0)==pytest.approx(0.18)
             assert e.profit_learning.broker_pnls()[-1]==pytest.approx(0.18)
@@ -457,8 +482,8 @@ def test_stop_ticks_by_deal_shrinks_add_size():
         assert float(with_map['size'])<=float(bare['size'])
 
 
-def test_fuzzy_binds_signed_size_and_open_level():
-    """Capital uses signed size and often omits instrumentName — still bind cash."""
+def test_fuzzy_signed_size_requires_exact_deal_id():
+    """P0-02: signed size / openLevel proximity is not a deal link."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -475,17 +500,20 @@ def test_fuzzy_binds_signed_size_and_open_level():
             store.upsert_trade({'dealId':'uuid-b','epic':'GOLD','size':'0.02',
                                 'direction':'BUY','level':2660.0})
             store.close_trade('uuid-b',2655.0,source='upl_estimate',overwrite=True)
-            # Two Capital TRADE rows, no instrumentName, signed sizes.
             broker.tx=[
                 {'reference':'T1','size':'-0.02','openLevel':'2650','closeLevel':'2648',
                  'pnl':'-0.10','currency':'GBP','dateUtc':'2026-11-16T10:00:00Z'},
                 {'reference':'T2','size':'-0.02','openLevel':'2660','closeLevel':'2655',
                  'pnl':'0.11','currency':'GBP','dateUtc':'2026-11-16T11:00:00Z'},
             ]
-            found_a=await e._pnl_fuzzy_instrument_cash('uuid-a')
-            found_b=await e._pnl_fuzzy_instrument_cash('uuid-b')
-            assert found_a is not None and found_a[0]==pytest.approx(-0.10)
-            assert found_b is not None and found_b[0]==pytest.approx(0.11)
+            assert await e._pnl_fuzzy_instrument_cash('uuid-a') is None
+            assert await e._pnl_fuzzy_instrument_cash('uuid-b') is None
+            broker.tx=[
+                {'dealId':'uuid-a','pnl':-0.10,'currency':'GBP'},
+                {'dealId':'uuid-b','pnl':0.11,'currency':'GBP'},
+            ]
+            assert (await e._pnl_from_broker_history('uuid-a',exact_deal=True))[0]==pytest.approx(-0.10)
+            assert (await e._pnl_from_broker_history('uuid-b',exact_deal=True))[0]==pytest.approx(0.11)
     asyncio.run(scenario())
 
 

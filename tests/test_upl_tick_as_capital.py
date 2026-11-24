@@ -1,4 +1,4 @@
-"""Last registered UPL before close = Capital £; refresh UPL on quote ticks."""
+"""Last open UPL is ESTIMATE only (P0-06) — never teach-as-cash; Funds teaches."""
 import asyncio
 import tempfile
 from pathlib import Path
@@ -7,6 +7,7 @@ import pytest
 
 from app.autonomy import AutoEvolution
 from app.engine import SingleTradeEngine
+from app.realized_cash import classify_pnl_source, may_teach_live_cash
 from tests.test_broker_pnl_resolve import HistoryBroker
 from tests.test_learning_integrity import new_brain
 
@@ -23,7 +24,8 @@ def test_last_upl_as_realized_returns_snap():
         assert got[1] == 'GBP'
 
 
-def test_resolve_last_upl_is_capital_and_teachable():
+def test_resolve_last_upl_is_estimate_not_teachable():
+    """P0-06: missing Funds → pending; UPL stored as ESTIMATE; capital not cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -32,15 +34,21 @@ def test_resolve_last_upl_is_capital_and_teachable():
             e.account = {'accounts': [{'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
             store.set('last_upl:d2', {'upl': 0.45, 'currency': 'GBP'})
             pnl, src, ccy = await e._resolve_broker_pnl('d2', {})
-            assert pnl == pytest.approx(0.45)
-            assert src == 'capital'
+            assert pnl is None
+            assert src == 'pending_broker_pnl'
             assert ccy == 'GBP'
-            from app.realized_cash import may_teach_live_cash
-            assert may_teach_live_cash(src) is True
+            est = store.get('upl_estimate:d2')
+            assert est and est['status'] == 'ESTIMATE'
+            assert est['upl'] == pytest.approx(0.45)
+            assert classify_pnl_source('capital') == 'estimate'
+            assert may_teach_live_cash('capital') is False
+            assert may_teach_live_cash(src) is False
+            assert may_teach_live_cash('broker') is True
     asyncio.run(scenario())
 
 
-def test_vanish_teaches_from_last_upl_as_capital():
+def test_vanish_queues_estimate_then_funds_teaches():
+    """Vanish without Funds: pending + ESTIMATE; Funds £ teaches once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -68,22 +76,27 @@ def test_vanish_teaches_from_last_upl_as_capital():
             broker.open = []
             await e.sync()
             row = store.trades(1)[0]
-            assert row['pnl'] == pytest.approx(-0.32)
-            assert row['pnl_source'] == 'capital'
-            assert e._trade_already_learned('g01')
-            assert brain.trade_labeled >= labeled_before
-            # Funds later may refine without double-teaching.
+            assert row['pnl'] is None
+            assert row['pnl_source'] == 'pending_broker_pnl'
+            assert not e._trade_already_learned('g01')
+            assert brain.trade_labeled == labeled_before
+            est = store.get('upl_estimate:g01')
+            assert est and est['status'] == 'ESTIMATE'
+            assert est['upl'] == pytest.approx(-0.32)
+            pending = store.get('pending_broker_pnl_deals') or []
+            assert any(str(x.get('deal_id') if isinstance(x, dict) else x) == 'g01'
+                       for x in pending)
+            # Funds later settles and teaches once.
             broker.tx = [{'reference': 'g01', 'pnl': '-0.35', 'currency': 'GBP',
                           'transactionType': 'TRADE'}]
-            labeled_mid = brain.trade_labeled
             await e._retry_pending_broker_pnl()
             row = store.trades(1)[0]
             assert row['pnl'] == pytest.approx(-0.35)
             assert row['pnl_source'] == 'broker'
-            assert brain.trade_labeled == labeled_mid
+            assert e._trade_already_learned('g01')
+            assert brain.trade_labeled > labeled_before
             banked = store.get('broker_cash_banked:g01')
             assert banked.get('source') == 'broker'
-            assert banked.get('refined_from') in ('capital', 'upl_estimate')
     asyncio.run(scenario())
 
 
@@ -118,7 +131,8 @@ def test_quote_upl_tick_snapshots_fresh_upl():
     asyncio.run(scenario())
 
 
-def test_quote_upl_tick_vanished_settles_capital():
+def test_quote_upl_tick_vanished_stores_estimate_not_cash():
+    """Vanish on quote tick: pending + ESTIMATE — no teach until Funds."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -146,8 +160,11 @@ def test_quote_upl_tick_vanished_settles_capital():
                     'bid': 100.2, 'ask': 100.4})})()
             await e.quote_upl_tick()
             row = store.trades(1)[0]
-            assert row['pnl'] == pytest.approx(0.18)
-            assert row['pnl_source'] == 'capital'
-            assert e._trade_already_learned('v1')
+            assert row['pnl'] is None
+            assert row['pnl_source'] == 'pending_broker_pnl'
+            assert not e._trade_already_learned('v1')
+            est = store.get('upl_estimate:v1')
+            assert est and est['status'] == 'ESTIMATE'
+            assert est['upl'] == pytest.approx(0.18)
             assert e.positions == []
     asyncio.run(scenario())

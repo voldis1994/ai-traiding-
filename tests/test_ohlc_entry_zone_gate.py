@@ -55,7 +55,7 @@ def test_entry_evaluation_holds_until_confirmed_buy_zone():
         assert buy
         far = float(buy['hi']) + 8.0
         e = _ready_engine(d, store, brain, ask=far)
-        # Gate itself must wait outside the Demand box.
+        # Gate itself must wait outside the Demand box (no MTF break proof).
         gate_far = e._ohlc_entry_zone_gate('BUY')
         assert gate_far.get('allowed') is False
         assert 'wait' in (gate_far.get('reason') or '').lower()
@@ -70,36 +70,34 @@ def test_entry_evaluation_holds_until_confirmed_buy_zone():
         assert gate_in.get('reason') == 'ohlc_entry_zone_confirm'
         assert gate_in.get('trigger') == 'zone'
 
-        # Full eval: keep BUY proposal so zona gate is the wait reason when far.
+        # Soft eval far from zone without break-aligned MTF → soft note / wait.
         e.market = {
             'mid': far, 'ask': far, 'bid': far - 0.1,
             'tick': 0.1, 'spread': 0.2,
         }
-        with patch.object(e, '_ohlc_entry_zone_gate', side_effect=e._ohlc_entry_zone_gate):
-            # Force neural path to BUY so zona is the gate under test.
-            e.last_signal = {
-                'action': 'BUY',
-                'scores': {'BUY': 0.80, 'SELL': 0.10, 'HOLD': 0.10},
-                'confidence': 0.80,
-            }
-            with patch.object(
-                    e, '_mtf_momentum_analysis',
-                    return_value={
-                        'ready': True, 'enabled': True, 'mode': 'BUY',
-                        'preferred': 'BUY', 'confidence': 0.7, 'move_ok': True,
-                        'tf': {'m1': {'atr14': 1.0}},
-                    }):
-                out = e._entry_evaluation()
-        # Soft stack: neural BUY stays; zona notes soft_allowed=False while far.
+        e.last_signal = {
+            'action': 'BUY',
+            'scores': {'BUY': 0.80, 'SELL': 0.10, 'HOLD': 0.10},
+            'confidence': 0.80,
+        }
+        with patch.object(
+                e, '_mtf_momentum_analysis',
+                return_value={
+                    'ready': True, 'enabled': True, 'mode': 'HOLD',
+                    'preferred': 'HOLD', 'confidence': 0.2, 'move_ok': False,
+                    'tf': {'m1': {'atr14': 1.0}},
+                }):
+            out = e._entry_evaluation()
         zone = out.get('ohlc_entry_zone') or gate_far
         assert out.get('action') == 'BUY'
         assert zone.get('soft_allowed') is False or 'wait' in str(zone.get('reason') or '')
         assert any('zone' in str(n).lower() or 'wait' in str(n).lower()
+                   or 'break' in str(n).lower()
                    for n in (out.get('soft_notes') or [zone.get('reason')]))
 
 
 def test_entry_evaluation_playbook_hard_bans_outside_zone():
-    """Playbook hard ENTRY flips neural BUY → HOLD when outside Demand."""
+    """Playbook hard ENTRY flips neural BUY → HOLD when outside Demand (no break)."""
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         rows, _ = _seed_demand(store, confirm=True)
@@ -112,11 +110,12 @@ def test_entry_evaluation_playbook_hard_bans_outside_zone():
             'scores': {'BUY': 0.80, 'SELL': 0.10, 'HOLD': 0.10},
             'confidence': 0.80,
         }
+        # MTF not break-aligned — zone wait becomes hard OPEN ban.
         with patch.object(
                 e, '_mtf_momentum_analysis',
                 return_value={
-                    'ready': True, 'enabled': True, 'mode': 'BUY',
-                    'preferred': 'BUY', 'confidence': 0.7, 'move_ok': True,
+                    'ready': True, 'enabled': True, 'mode': 'HOLD',
+                    'preferred': 'HOLD', 'confidence': 0.2, 'move_ok': False,
                     'tf': {'m1': {'atr14': 1.0}},
                 }):
             out = e._entry_evaluation()

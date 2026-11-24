@@ -177,7 +177,8 @@ def test_broker_cash_after_pending_without_upl_estimate():
     asyncio.run(scenario())
 
 
-def test_fuzzy_single_gold_tx_binds_pending():
+def test_fuzzy_single_gold_tx_stays_pending_until_exact():
+    """P0-02: short Capital reference without deal UUID must not invent a bind."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -192,12 +193,17 @@ def test_fuzzy_single_gold_tx_binds_pending():
             store.set('entry_brain:uuid-no-ref',{
                 'epic':'GOLD','direction':'SELL','entry':2650,'tick_size':.1,
                 'transition':brain._json_transition(brain.core.last_transition)})
-            # Capital short reference does not contain deal UUID.
             broker.tx=[{'reference':'ZZ99','instrumentName':'Gold Spot',
                         'pnl':0.16,'currency':'GBP'}]
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'uuid-no-ref','exit_level':2649,'attempts':1,
                         'queued_at':'2026-10-29T10:00:00+00:00'}])
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            # Fuzzy must not settle the short-reference TRADE onto the UUID.
+            assert not (row.get('pnl_source')=='broker' and row.get('pnl')==pytest.approx(0.16))
+            # With exact dealId, settle works.
+            broker.tx=[{'dealId':'uuid-no-ref','pnl':0.16,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(0.16)

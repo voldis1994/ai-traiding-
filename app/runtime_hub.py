@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 273
+DESK_TRUTH_REV = 274
 
 
 def _finite_num(v):
@@ -381,18 +381,107 @@ class RuntimeHub:
     def _trade_stats(self,store: Store, account_currency: str|None=None,
                      open_upl: float|None=None) -> dict:
         acct=(account_currency or '').strip().upper() or None
-        # Fix historical GOLD→USD tags so admin P&L matches Capital account cash.
+        # Item 6: fill blank currency only — never rewrite proven tags blindly.
         if acct:
             try:store.repair_broker_pnl_currency(acct)
             except Exception:pass
-        # Full history — Admin P&L must NOT silently drop older closes past a
-        # trades(200) window (that made −13 look like −3).
+        # Item 5: ONE Cash Ledger aggregator for Desk / Funds / mirror / recovery.
+        ledger_by_deal={}
+        ledger_snap=None
+        acct_id=str(store.get('capital_account_id') or 'live')
+        ccy_l=acct  # None → aggregate all currencies (no invented GBP primary)
+        env_l=str(store.get('capital_environment') or 'live').lower()
+        try:
+            from . import cash_ledger
+            from .realized_cash import from_minor
+            snap_ccy=acct or 'GBP'
+            ledger_snap=cash_ledger.consumer_snapshot(
+                store,acct_id,currency=snap_ccy,environment=env_l)
+            # Authoritative per-deal map (all ccy when account currency unknown).
+            by_deal=cash_ledger.aggregate_verified_by_deal(
+                store,account_id=acct_id,currency=ccy_l or '',
+                environment=env_l)
+            for _key,agg in by_deal.items():
+                deal=str(agg.get('deal_id') or _key)
+                ev_ccy=str(agg.get('currency') or snap_ccy).upper()
+                if acct and ev_ccy and ev_ccy!=acct:
+                    continue
+                try:
+                    major=float(from_minor(int(agg['amount_minor']),ev_ccy))
+                except Exception:
+                    continue
+                # When multi-ccy, keep each deal once (deals are unique ids).
+                ledger_by_deal[deal]={
+                    'pnl':major,
+                    'pnl_currency':ev_ccy,
+                    'pnl_source':'broker',
+                    'ledger_status':agg.get('status') or cash_ledger.STATUS_SETTLED,
+                    'transaction_ids':list(agg.get('transaction_ids') or []),
+                }
+        except Exception:
+            ledger_by_deal={}
+            ledger_snap=None
         cols=('deal_id','epic','size','direction','opened','closed','entry','exit',
               'pnl','pnl_currency','pnl_source')
         closed_rows=[dict(zip(cols,r)) for r in store.db.execute(
             'SELECT deal_id,epic,size,direction,opened,closed,entry,exit,pnl,'
             'pnl_currency,pnl_source FROM trades WHERE closed IS NOT NULL '
             'ORDER BY closed DESC')]
+        # Overlay ledger amounts onto matching deals.
+        for t in closed_rows:
+            deal=str(t.get('deal_id') or '')
+            if deal in ledger_by_deal:
+                t['pnl']=ledger_by_deal[deal]['pnl']
+                t['pnl_currency']=ledger_by_deal[deal]['pnl_currency']
+                t['pnl_source']='broker'
+                t['ledger_status']=ledger_by_deal[deal]['ledger_status']
+            elif self._cash_pnl_source(t.get('pnl_source'))=='cash':
+                # Journal £ without ledger proof is NOT a second source of truth
+                # for account currency — foreign tags stay visible but unsized.
+                raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
+                if not (acct and raw_ccy and raw_ccy!=acct):
+                    t['pnl_source']='pending_broker_pnl'
+                    t['ledger_pending']=True
+        # UNMATCHED account cash (no deal_link yet) — show as ledger rows, never
+        # invent AI journal deals. Separates account £ from specific AI results.
+        unmatched_rows=[]
+        try:
+            from . import cash_ledger as _cl
+            from .realized_cash import from_minor as _fm
+            for ev in _cl.load_events(store):
+                if str(ev.get('status') or '')!=_cl.STATUS_UNMATCHED:
+                    continue
+                if ev.get('amount_minor') is None:
+                    continue
+                if _cl._is_learn_synthetic(ev):
+                    continue
+                ev_acct=str(ev.get('account_id') or '')
+                if ev_acct and ev_acct!=acct_id:
+                    continue
+                ev_env=str(ev.get('environment') or '').lower()
+                if ev_env and ev_env!=env_l:
+                    continue
+                ev_ccy=str(ev.get('currency') or '').upper() or (acct or 'GBP')
+                if acct and ev_ccy and ev_ccy!=acct:
+                    continue
+                try:
+                    major=float(_fm(int(ev['amount_minor']),ev_ccy))
+                except Exception:
+                    continue
+                cid=str(ev.get('cash_id') or ev.get('transaction_id') or '')
+                unmatched_rows.append({
+                    'deal_id':'unmatched:'+cid[:40],
+                    'epic':None,'size':None,'direction':None,
+                    'opened':ev.get('effective_at'),
+                    'closed':ev.get('effective_at') or ev.get('observed_at'),
+                    'entry':None,'exit':None,
+                    'pnl':major,'pnl_currency':ev_ccy,
+                    'pnl_source':'broker',
+                    'ledger_status':_cl.STATUS_UNMATCHED,
+                    'unmatched_cash':True,
+                })
+        except Exception:
+            unmatched_rows=[]
         open_n=int(store.db.execute(
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
@@ -426,7 +515,7 @@ class RuntimeHub:
             except Exception:
                 return True
 
-        for t in closed_rows:
+        for t in list(closed_rows)+list(unmatched_rows):
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
                 proxy_n+=1
@@ -436,30 +525,32 @@ class RuntimeHub:
             if t.get('pnl') is not None:
                 try:val=float(t['pnl'])
                 except (TypeError,ValueError):val=None
-            # Broker / legacy cash → account currency when known.
-            if kind=='cash' and acct:
-                ccy=acct
-            else:
-                ccy=raw_ccy or acct or '?'
+            # P0: never relabel proven USD as GBP. Use journal/ledger tag;
+            # account currency only fills blanks.
+            ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
+            # Foreign-currency cash is visible but not summed into account £.
+            if kind=='cash' and acct and raw_ccy and raw_ccy!=acct:
+                if len(recent)<80:
+                    recent.append({**row,'pnl_source':t.get('pnl_source') or 'broker',
+                                   'foreign_currency':True})
+                continue
             if val is not None and kind=='cash':
-                # Capital often journals broker £0 before Funds settles — hide
-                # from Desk until real £ arrives (no GAIDA / pending rows).
-                if abs(float(val))<1e-12:
-                    blank_n+=1
-                    pending_n+=1
-                else:
-                    cash_n+=1
-                    by_ccy.setdefault(ccy,[]).append(val)
+                # P0-08: verified broker £0.00 is SETTLED (scratch), not pending.
+                # Only blank/missing amounts stay pending — exact zero is cash.
+                cash_n+=1
+                by_ccy.setdefault(ccy,[]).append(val)
+                if not acct or ccy==acct:
+                    signed.append(val)
+                if _in_24h(t.get('closed')):
+                    cash_n_24h+=1
+                    by_ccy_24h.setdefault(ccy,[]).append(val)
                     if not acct or ccy==acct:
-                        signed.append(val)
-                    if _in_24h(t.get('closed')):
-                        cash_n_24h+=1
-                        by_ccy_24h.setdefault(ccy,[]).append(val)
-                        if not acct or ccy==acct:
-                            signed_24h.append(val)
-                    if len(recent)<80:
-                        recent.append({**row,'pnl_source':'broker'})
+                        signed_24h.append(val)
+                if abs(float(val))<1e-12:
+                    blank_n+=1  # settled-zero counter (still cash)
+                if len(recent)<80:
+                    recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
                 # Track for harvest / estimate counters — never NESEN Funds cash.
                 pending_n+=1
@@ -2251,19 +2342,37 @@ class RuntimeHub:
             and not engine.store.unresolved() and len(engine.positions)<=1)
 
     async def _worker(self,rt: AccountRuntime):
-        """Heavy poll, then a guaranteed light window — never back-to-back poll.
+        """P0-03: light market ticks run independently of heavy poll.
 
-        Gating poll by wall clock alone starved the event loop when poll() took
-        longer than the gap (common): no sleep, no Desk HTTP, mid/UPL frozen.
-        Always run ~0.35–0.5s of 25ms quote/UPL/entry ticks after each poll (~2×).
+        Heavy poll (sync/AI/history) and light UPL/quote ticks are concurrent
+        tasks. Order mutations stay serialized on engine.lock inside poll /
+        quote_upl_tick / submit paths.
         """
+        heavy=asyncio.create_task(self._heavy_loop(rt),name=f'heavy-{rt.client_id}')
+        light=asyncio.create_task(self._light_loop(rt),name=f'light-{rt.client_id}')
+        try:
+            done,pending=await asyncio.wait(
+                {heavy,light},return_when=asyncio.FIRST_EXCEPTION)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                exc=t.exception()
+                if exc:
+                    raise exc
+        except asyncio.CancelledError:
+            heavy.cancel();light.cancel()
+            await asyncio.gather(heavy,light,return_exceptions=True)
+            raise
+
+    async def _heavy_loop(self,rt: AccountRuntime):
         error_count=0
         engine=rt.engine
         store=rt.store
         while True:
             try:
                 if engine.broker:
-                    if store.unresolved():await engine.reconcile_outstanding()
+                    if store.unresolved():
+                        await engine.reconcile_outstanding()
                     await engine.poll()
                     error_count=0
                     rt.last_error=None
@@ -2272,28 +2381,17 @@ class RuntimeHub:
                         engine._paused_for_read=False
                         engine.armed=True
                         engine.execution_enabled=True
-                        store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                    open_book=bool(engine.positions)
-                    fast_entry=(bool(engine.mandate) and not open_book
-                                and hasattr(engine,'quote_entry_tick')
-                                and engine._wants_fast_entry_ticks())
-                    # Guaranteed yield window so Admin/Desk HTTP can run.
-                    light_n=18 if (open_book or fast_entry) else 12
-                    gap=0.025
-                    for _ in range(light_n):
-                        await asyncio.sleep(gap)
-                        if not engine.mandate:
-                            continue
-                        try:
-                            if open_book and hasattr(engine,'quote_upl_tick'):
-                                await engine.quote_upl_tick()
-                            else:
-                                if hasattr(engine,'_apply_stream_quote'):
-                                    engine._apply_stream_quote()
-                                if fast_entry:
-                                    await engine.quote_entry_tick()
-                        except Exception:
-                            break
+                        store.event('recovery',
+                            'Read-only broker outage recovered; autonomous execution resumed')
+                    try:
+                        from . import telemetry as _telem
+                        _telem.get_telemetry().note_loop_tick()
+                        # Persist on event-loop thread — Store.db is not thread-safe.
+                        _telem.get_telemetry().persist(store)
+                    except Exception:
+                        pass
+                    # Yield so light loop + Desk HTTP get the event loop.
+                    await asyncio.sleep(0.05)
                     continue
                 await asyncio.sleep(0.5 if error_count<3 else 3)
             except asyncio.CancelledError:
@@ -2303,7 +2401,8 @@ class RuntimeHub:
                 engine.last_error=rt.last_error
                 error_count+=1
                 frames=traceback.extract_tb(exc.__traceback__)
-                local=next((f for f in reversed(frames) if '/app/' in f.filename.replace('\\','/')),
+                local=next((f for f in reversed(frames)
+                            if '/app/' in f.filename.replace('\\','/')),
                            frames[-1] if frames else None)
                 try:
                     store.event('error','Broker/engine cycle error',{
@@ -2314,10 +2413,34 @@ class RuntimeHub:
                 except Exception:
                     pass
                 if error_count>=3:
-                    # Log only — never auto-pause (operator Pause is the only freeze).
                     store.event('warning',
                         'Repeated broker/engine errors; keeping execution live',
                         {'count':error_count,'client_id':rt.client_id})
                     if hasattr(engine,'_ensure_live_unless_operator_paused'):
                         engine._ensure_live_unless_operator_paused()
                 await asyncio.sleep(0.5 if error_count<3 else 3)
+
+    async def _light_loop(self,rt: AccountRuntime):
+        """Independent quote/UPL/entry ticks — never waits for heavy poll to finish."""
+        engine=rt.engine
+        while True:
+            try:
+                await asyncio.sleep(0.05)
+                if not engine.broker or not engine.mandate:
+                    continue
+                open_book=bool(engine.positions)
+                fast_entry=(not open_book
+                            and hasattr(engine,'quote_entry_tick')
+                            and engine._wants_fast_entry_ticks())
+                try:
+                    if open_book and hasattr(engine,'quote_upl_tick'):
+                        await engine.quote_upl_tick()
+                    else:
+                        if hasattr(engine,'_apply_stream_quote'):
+                            engine._apply_stream_quote()
+                        if fast_entry:
+                            await engine.quote_entry_tick()
+                except Exception:
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                raise

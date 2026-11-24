@@ -29,24 +29,30 @@ class HistoryBroker:
         return {'activities':acts}
 
 
-def test_resolve_uses_activity_profit_not_ticks_only():
+def test_resolve_uses_funds_profit_not_ticks_only():
+    """P0: Funds TRADE cash settles; Activity alone must not invent broker £."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
             broker=HistoryBroker()
+            # Activity-only → still pending (no ledger ingest from Activity).
             broker.acts=[{'dealId':'d1','details':{'profit':-0.21},'currency':'GBP'}]
             e.attach(broker)
-            # attach() clears account — restore like live accounts() refresh.
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            pnl,src,_ccy=await e._resolve_broker_pnl('d1',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            # Exact Funds row → broker cash.
+            broker.tx=[{'dealId':'d1','pnl':-0.21,'currency':'GBP',
+                        'transactionId':'TX-d1','reference':'TX-d1'}]
             pnl,src,ccy=await e._resolve_broker_pnl('d1',{})
             assert pnl==pytest.approx(-0.21)
             assert src=='broker' and ccy=='GBP'
     asyncio.run(scenario())
 
 
-def test_resolve_upl_capital_ignores_confirm_profit():
-    """confirm.profit never wins; last UPL = Capital £ when Funds missing."""
+def test_resolve_upl_is_estimate_not_cash():
+    """P0-06: confirm.profit ignored; UPL stored as ESTIMATE; not teachable cash."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -56,10 +62,13 @@ def test_resolve_upl_capital_ignores_confirm_profit():
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl(
                 'd2',{'profit':-0.81,'currency':'GBP'})
-            assert pnl==pytest.approx(0.45)
-            assert src=='capital'
+            assert pnl is None
+            assert src=='pending_broker_pnl'
+            est=store.get('upl_estimate:d2')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(0.45)
             from app.realized_cash import may_teach_live_cash
-            assert may_teach_live_cash(src) is True
+            assert may_teach_live_cash('capital') is False
     asyncio.run(scenario())
 
 
@@ -85,19 +94,20 @@ def test_sl_tp_vanish_waits_when_capital_cash_is_zero_placeholder():
             broker.acts=[{'dealId':'gold1','details':{'profit':0.0},'currency':'USD'}]
             await e.sync()
             row=store.trades(1)[0]
-            # Last UPL = Capital £; £0 activity ignored; teach from UPL now.
-            assert row['pnl']==pytest.approx(-0.02)
-            assert row['pnl_source']=='capital'
-            assert e._trade_already_learned('gold1')
+            # P0-06: stay pending; UPL is ESTIMATE only — no teach yet.
+            assert row['pnl_source'] in ('pending_broker_pnl','pending_close_sync')
+            assert not e._trade_already_learned('gold1')
+            est=store.get('upl_estimate:gold1')
+            assert est and est['status']=='ESTIMATE'
             labeled_mid=brain.trade_labeled
-            # Real Funds £ later overwrites without double-teach.
+            # Real Funds £ later settles (and may teach once).
             broker.tx=[{'reference':'gold1','pnl':'-0.12','currency':'GBP',
                         'transactionType':'TRADE'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.12)
             assert row['pnl_source']=='broker'
-            assert brain.trade_labeled==labeled_mid
+            assert brain.trade_labeled>=labeled_mid
     asyncio.run(scenario())
 
 

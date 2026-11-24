@@ -89,7 +89,7 @@ def test_t28_verified_funds_wins_over_confirm_upl_proxy():
     assert snap['trade_result_minor'] == 50
     assert snap['ui_trade'] == '£0.50'
     assert len(load_events(store)) == 1
-    assert deal_realized(store, 'deal-1')['amount_minor'] == 50
+    assert deal_realized(store, 'deal-1', currency='GBP')['amount_minor'] == 50
 
 
 def test_t29_sell_close_keeps_sign_ignores_proxy_and_quote_usd():
@@ -123,7 +123,7 @@ def test_t30_settled_zero_vs_pending_placeholder():
     assert r['event']['status'] == STATUS_SETTLED_ZERO
     assert r['event']['amount_minor'] == 0
     assert sum_account(store, 'acc-gbp', 'GBP') == 0
-    assert deal_realized(store, 'd-zero')['amount_minor'] == 0
+    assert deal_realized(store, 'd-zero', currency='GBP')['amount_minor'] == 0
 
     store2 = MemoryStore()
     r_open = ingest_funds_row(
@@ -200,12 +200,12 @@ def test_t32_two_closes_without_deal_link_match_uncertain():
     assert uncertain['label'] is None
 
     # Still no deal_realized until linked.
-    assert deal_realized(store, 'mystery')['status'] == STATUS_MATCH_UNCERTAIN
+    assert deal_realized(store, 'mystery', currency='GBP')['status'] == STATUS_MATCH_UNCERTAIN
 
     link_deal(store, a['event']['cash_id'], 'deal-gold-a')
     link_deal(store, b['event']['cash_id'], 'deal-gold-b')
-    assert deal_realized(store, 'deal-gold-a')['amount_minor'] == 50
-    assert deal_realized(store, 'deal-gold-b')['amount_minor'] == -30
+    assert deal_realized(store, 'deal-gold-a', currency='GBP')['amount_minor'] == 50
+    assert deal_realized(store, 'deal-gold-b', currency='GBP')['amount_minor'] == -30
 
 
 def test_t33_usd_or_unknown_currency_not_relabeled_gbp():
@@ -254,7 +254,7 @@ def test_t34_corrections_exact_pence_no_epsilon():
     c3 = apply_correction(store, cash_id=cid, corrected_amount_minor=48)
     assert c3['duplicate'] is True
     assert sum_account(store, 'acc-gbp', 'GBP') == 48
-    assert deal_realized(store, 'd-corr')['amount_minor'] == 48
+    assert deal_realized(store, 'd-corr', currency='GBP')['amount_minor'] == 48
 
 
 def test_t35_duplicate_restart_and_per_account_isolation():
@@ -292,7 +292,7 @@ def test_t36_fill_and_funds_are_independent():
     ingest_funds_row(
         store, _funds(Decimal('-0.50'), reference='FILL1'),
         account_id='acc-gbp', account_currency='GBP', deal_link='d-fill')
-    realized = deal_realized(store, 'd-fill')
+    realized = deal_realized(store, 'd-fill', currency='GBP')
     assert realized['amount_minor'] == -50
     # No path / proxy label for LIVE cash.
     assert classify_pnl_source('ticks_only') == 'proxy'
@@ -313,7 +313,7 @@ def test_t37_partials_and_separate_commission():
         store, _funds(Decimal('0.20'), reference='P1', transactionType='PARTIAL'),
         account_id='acc-gbp', account_currency='GBP', deal_link='d-part')
     assert sum_trade_results(store, 'acc-gbp', 'GBP') == 50
-    assert deal_realized(store, 'd-part')['amount_minor'] == 50
+    assert deal_realized(store, 'd-part', currency='GBP')['amount_minor'] == 50
 
     ingest_funds_row(
         store,

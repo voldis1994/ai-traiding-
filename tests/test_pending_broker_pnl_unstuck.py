@@ -39,7 +39,7 @@ def test_parse_cash_num_strips_currency():
 
 
 def test_vanish_waits_for_funds_then_teaches_once():
-    """Vanish without Funds: pending; Funds £ teaches once."""
+    """P0-06: vanish without Funds stays pending; Funds £ teaches once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -59,10 +59,13 @@ def test_vanish_waits_for_funds_then_teaches_once():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # Last UPL = Capital £ — teach now; Funds later refines.
-            assert row.get('pnl_source')=='capital'
-            assert row.get('pnl')==pytest.approx(-0.11)
-            assert e._trade_already_learned('g1')
+            # UPL is ESTIMATE only — no teach until broker Funds.
+            assert row.get('pnl_source')=='pending_broker_pnl'
+            assert row.get('pnl') is None
+            assert not e._trade_already_learned('g1')
+            est=store.get('upl_estimate:g1')
+            assert est and est['status']=='ESTIMATE'
+            assert est['upl']==pytest.approx(-0.11)
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)
             labeled=brain.trade_labeled
@@ -71,23 +74,21 @@ def test_vanish_waits_for_funds_then_teaches_once():
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.09)
             assert row['pnl_source']=='broker'
-            assert brain.trade_labeled==labeled
+            assert brain.trade_labeled>labeled
+            assert e._trade_already_learned('g1')
             assert not (store.get('pending_broker_pnl_deals') or [])
     asyncio.run(scenario())
 
 
-def test_activity_scan_without_deal_id_filter_finds_profit():
+def test_funds_exact_deal_id_finds_profit():
+    """Activity-only no longer settles; exact Funds dealId does."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
-            broker=HistoryBroker()
-            # dealId filter path empty; unfiltered window has the row.
             class Selective(HistoryBroker):
                 async def activity(self,*,last_period=600,from_time=None,to_time=None,
                                    detailed=True,deal_id=None):
-                    if deal_id:
-                        return {'activities':[]}
                     return {'activities':[
                         {'dealId':'deal-xyz','details':{'profit':'£-0.17'},'currency':'GBP'}]}
             broker=Selective()
@@ -95,6 +96,10 @@ def test_activity_scan_without_deal_id_filter_finds_profit():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.upsert_trade({'dealId':'deal-xyz','epic':'GOLD','size':'.02',
                                 'direction':'BUY','level':100})
+            pnl,src,_=await e._resolve_broker_pnl('deal-xyz',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            broker.tx=[{'dealId':'deal-xyz','pnl':-0.17,'currency':'GBP',
+                        'transactionId':'TX-xyz'}]
             pnl,src,ccy=await e._resolve_broker_pnl('deal-xyz',{})
             assert src=='broker' and pnl==pytest.approx(-0.17) and ccy=='GBP'
     asyncio.run(scenario())

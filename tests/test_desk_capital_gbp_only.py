@@ -11,7 +11,10 @@ from app.runtime_hub import RuntimeHub
 
 def test_trade_stats_recent_is_broker_gbp_only():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         now = datetime.now(timezone.utc)
         # Settled Funds £
         store.upsert_trade({
@@ -20,6 +23,10 @@ def test_trade_stats_recent_is_broker_gbp_only():
         })
         store.close_trade(
             'b1', 3601, -0.89, currency='GBP', source='broker', overwrite=True)
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': -0.89, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='b1', transaction_id='TX-b1')
         # Provisional ≈UPL — must not appear in recent_trades / ledger / working
         store.upsert_trade({
             'dealId': 'u1', 'epic': 'GOLD', 'size': '0.1',

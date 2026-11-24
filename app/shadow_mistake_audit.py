@@ -437,6 +437,248 @@ def promote_gate(store, fingerprint: str, mistakes, *, n=PROMOTE_N) -> dict:
     return out
 
 
+def build_fix_cycle_steps(diagnosis: dict | None, mem: dict | None,
+                            gate: dict | None, commit_result: dict | None,
+                            ready=None, *, apply_ohlc_penalties=True) -> list:
+    """Explicit CLOSE→ERROR→FIX steps for Desk CMD (what changed / what skipped)."""
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    mem = mem if isinstance(mem, dict) else {}
+    gate = gate if isinstance(gate, dict) else {}
+    commit_result = commit_result if isinstance(commit_result, dict) else {}
+    mistakes = [m for m in (diagnosis.get('mistakes') or []) if m]
+    proposed = diagnosis.get('proposed_fix') if isinstance(
+        diagnosis.get('proposed_fix'), dict) else None
+    if not proposed and isinstance(commit_result.get('proposed'), dict):
+        proposed = commit_result.get('proposed')
+    ctx = diagnosis.get('context') if isinstance(diagnosis.get('context'), dict) else {}
+    fp = str(ctx.get('fingerprint') or mem.get('fingerprint')
+             or gate.get('fingerprint') or '')
+    steps = []
+
+    # 1) Diagnose
+    if mistakes:
+        steps.append({
+            'step': 'diagnose', 'status': 'ok',
+            'detail': 'mistakes: ' + ' · '.join(str(m) for m in mistakes[:6]),
+            'changed': list(mistakes), 'skipped': [],
+        })
+    else:
+        steps.append({
+            'step': 'diagnose', 'status': 'skip',
+            'detail': 'no mistake class (scratch/win/flat)',
+            'changed': [], 'skipped': ['targeted_fix'],
+        })
+
+    # 2) Propose knobs
+    deltas = (proposed or {}).get('deltas') or {}
+    flags = (proposed or {}).get('flags') or {}
+    would = []
+    for k, d in deltas.items():
+        try:
+            would.append(f'{k}{float(d):+g}')
+        except (TypeError, ValueError):
+            would.append(str(k))
+    for k, v in flags.items():
+        would.append(f'{k}={v}')
+    if would:
+        steps.append({
+            'step': 'propose', 'status': 'ok',
+            'detail': 'would change: ' + ', '.join(would[:10]),
+            'changed': would, 'skipped': [],
+        })
+    elif mistakes:
+        steps.append({
+            'step': 'propose', 'status': 'skip',
+            'detail': 'no knobs mapped for this mistake class',
+            'changed': [], 'skipped': list(mistakes),
+        })
+    else:
+        steps.append({
+            'step': 'propose', 'status': 'skip',
+            'detail': 'nothing to propose',
+            'changed': [], 'skipped': ['deltas', 'flags'],
+        })
+
+    # 3) Scenario memory
+    if mem.get('saved'):
+        steps.append({
+            'step': 'memory', 'status': 'ok',
+            'detail': (f"fp={fp[:10] or '—'} seen={mem.get('seen')}"
+                       + (' · undone_prior' if mem.get('undone_prior') else '')),
+            'changed': ['scenario_bag'] if fp else [],
+            'skipped': ([] if fp else ['fingerprint']),
+        })
+    else:
+        steps.append({
+            'step': 'memory', 'status': 'skip',
+            'detail': str(mem.get('reason') or 'scenario memory not saved'),
+            'changed': [],
+            'skipped': ['fingerprint', 'scenario_bag'],
+        })
+
+    # 4) Promote gate
+    if mistakes and proposed:
+        cnt = int(gate.get('count') or 0)
+        need = int(gate.get('need') or PROMOTE_N)
+        if gate.get('already_committed'):
+            steps.append({
+                'step': 'promote', 'status': 'skip',
+                'detail': f'already_committed · gate {cnt}/{need}',
+                'changed': [], 'skipped': ['recommit'],
+            })
+        elif gate.get('ready'):
+            steps.append({
+                'step': 'promote', 'status': 'ok',
+                'detail': f'gate ready {cnt}/{need} — may commit',
+                'changed': [], 'skipped': [],
+            })
+        else:
+            steps.append({
+                'step': 'promote', 'status': 'wait',
+                'detail': f'gate {cnt}/{need} — need more same fingerprint+mistake',
+                'changed': [], 'skipped': ['commit'],
+            })
+    elif mistakes:
+        steps.append({
+            'step': 'promote', 'status': 'skip',
+            'detail': 'no proposal → promote gate idle',
+            'changed': [], 'skipped': ['promote_gate'],
+        })
+
+    # 5) Commit
+    applied = bool(commit_result.get('applied'))
+    changed = list(commit_result.get('changed') or [])
+    if applied:
+        committed_set = set(changed)
+        skipped_knobs = []
+        for item in would:
+            base = str(item).split('=')[0]
+            for ch in ('+', '-'):
+                if ch in base[1:]:
+                    base = base.split(ch)[0]
+                    break
+            if base not in committed_set and str(item) not in committed_set:
+                skipped_knobs.append(str(item))
+        steps.append({
+            'step': 'commit', 'status': 'ok',
+            'detail': 'COMMITTED knobs: ' + (', '.join(changed[:8]) or 'flags'),
+            'changed': changed,
+            'skipped': skipped_knobs[:8],
+        })
+    elif commit_result.get('pending'):
+        reason = []
+        if not apply_ohlc_penalties:
+            reason.append('ohlc_penalties_off')
+        if not gate.get('ready'):
+            reason.append('promote_gate_not_ready')
+        if not fp:
+            reason.append('no_fingerprint')
+        steps.append({
+            'step': 'commit', 'status': 'wait',
+            'detail': 'PENDING — ' + (', '.join(reason) or 'awaiting gate'),
+            'changed': [], 'skipped': would[:8],
+        })
+    elif mistakes and proposed:
+        reason = str(commit_result.get('reason') or '')
+        if not apply_ohlc_penalties:
+            reason = reason or 'ohlc_penalties_off'
+        elif not gate.get('ready'):
+            reason = reason or 'promote_gate_not_ready'
+        elif not fp:
+            reason = reason or 'no_fingerprint'
+        steps.append({
+            'step': 'commit', 'status': 'skip',
+            'detail': 'NOT committed — ' + (reason or 'unknown'),
+            'changed': [], 'skipped': would[:8],
+        })
+    else:
+        steps.append({
+            'step': 'commit', 'status': 'skip',
+            'detail': 'nothing to commit',
+            'changed': [], 'skipped': ['params'],
+        })
+
+    # 6) Ready LIVE
+    if isinstance(ready, dict) and ready.get('fingerprint') and not ready.get('already'):
+        steps.append({
+            'step': 'ready', 'status': 'ok',
+            'detail': 'ready_for_live stamped',
+            'changed': ['ready_queue'], 'skipped': [],
+        })
+    elif isinstance(ready, dict) and ready.get('already'):
+        steps.append({
+            'step': 'ready', 'status': 'skip',
+            'detail': 'already ready_for_live',
+            'changed': [], 'skipped': ['ready_queue'],
+        })
+    elif isinstance(ready, dict) and ready.get('need'):
+        steps.append({
+            'step': 'ready', 'status': 'wait',
+            'detail': (f"proof wins {ready.get('wins_after_fix') or 0}/"
+                       f"{ready.get('need')} after fix"),
+            'changed': [], 'skipped': ['ready_for_live'],
+        })
+    elif applied:
+        steps.append({
+            'step': 'ready', 'status': 'wait',
+            'detail': f'need {READY_N} proof win(s) on next same situation',
+            'changed': [], 'skipped': ['ready_for_live'],
+        })
+    else:
+        steps.append({
+            'step': 'ready', 'status': 'skip',
+            'detail': 'fix not committed — LIVE promote idle',
+            'changed': [], 'skipped': ['ready_for_live'],
+        })
+    return steps
+
+
+def journal_seed_fix_steps(audit_row: dict | None) -> list:
+    """Honest steps when Desk only has a Capital journal seed (no on_close yet)."""
+    a = audit_row if isinstance(audit_row, dict) else {}
+    mistakes = [m for m in (a.get('mistakes') or []) if m]
+    if not mistakes:
+        try:
+            pnl = float(a.get('pnl'))
+        except (TypeError, ValueError):
+            pnl = None
+        if pnl is not None and pnl < -0.02:
+            mistakes = ['outcome_hurt']
+    proposed = propose_fix(mistakes) if mistakes else None
+    deltas = (proposed or {}).get('deltas') or {}
+    flags = (proposed or {}).get('flags') or {}
+    would = [f'{k}{float(d):+g}' for k, d in deltas.items()] + [
+        f'{k}={v}' for k, v in flags.items()]
+    steps = [{
+        'step': 'diagnose', 'status': 'ok' if mistakes else 'skip',
+        'detail': ('journal seed · mistakes: ' + ' · '.join(mistakes)
+                   if mistakes else 'journal seed · no mistake'),
+        'changed': list(mistakes), 'skipped': [],
+    }, {
+        'step': 'propose', 'status': 'ok' if would else 'skip',
+        'detail': ('would change: ' + ', '.join(would[:10])
+                   if would else 'no knobs for class'),
+        'changed': would, 'skipped': [],
+    }, {
+        'step': 'memory', 'status': 'skip',
+        'detail': 'journal display only — no fingerprint / entry_brain',
+        'changed': [], 'skipped': ['fingerprint', 'scenario_bag'],
+    }, {
+        'step': 'promote', 'status': 'skip',
+        'detail': 'cannot promote without fingerprint from on_close',
+        'changed': [], 'skipped': ['promote_gate'],
+    }, {
+        'step': 'commit', 'status': 'wait',
+        'detail': 'WAITING backfill/on_close with OHLC context to COMMIT knobs',
+        'changed': [], 'skipped': would[:8],
+    }, {
+        'step': 'ready', 'status': 'skip',
+        'detail': 'LIVE promote idle until commit + proof win',
+        'changed': [], 'skipped': ['ready_for_live'],
+    }]
+    return steps
+
+
 def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
     """Apply proposed knobs only when commit=True (after promote_gate)."""
     proposed = diagnosis.get('proposed_fix') if isinstance(diagnosis, dict) else None
@@ -450,8 +692,11 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
                 'fingerprint': (diagnosis.get('context') or {}).get('fingerprint'),
                 'mistakes': diagnosis.get('mistakes'),
                 'committed': False,
+                'changed': [],
+                'why': proposed.get('why'),
             })
-        return {'applied': False, 'pending': True, 'proposed': proposed}
+        return {'applied': False, 'pending': True, 'proposed': proposed,
+                'reason': 'pending_gate'}
 
     params = ohlc_scenarios.load_params(store)
     deltas = proposed.get('deltas') or {}
@@ -621,6 +866,10 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if commit_result.get('applied') or diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
+    fix_steps = build_fix_cycle_steps(
+        diagnosis, mem, gate, commit_result, ready,
+        apply_ohlc_penalties=apply_ohlc_penalties)
+
     audited_at = _now_iso()
     # Trade close time for 24h windows — never confuse with audit runtime.
     closed_stamp = closed_at
@@ -633,6 +882,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
         'memory': mem,
         'promote_gate': gate,
         'fix': commit_result,
+        'fix_steps': fix_steps,
         'ready_for_live': ready,
         'at': audited_at,
         'audited_at': audited_at,
@@ -670,6 +920,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'price_pnl': price_n,
             'bumped_wins_after_fix': bool(
                 (mem or {}).get('bumped_wins_after_fix')),
+            'fix_steps': fix_steps,
         }
         # Durable narrative for Desk CMD log (loss → error → fix → outcome).
         if isinstance(commit_result, dict):
@@ -703,6 +954,7 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
                 'intermarket_status'),
             'proposed_fix': diagnosis.get('proposed_fix'),
             'fix_committed': bool(commit_result.get('applied')),
+            'fix_steps': fix_steps,
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
             'ready_for_live': bool(ready),
@@ -724,6 +976,9 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
                 'need': gate.get('need'),
                 'committed': bool(commit_result.get('applied')),
                 'deal_id': deal_s or None,
+                'fix_steps': [
+                    {'step': s.get('step'), 'status': s.get('status')}
+                    for s in fix_steps],
             })
     return out
 
@@ -824,6 +1079,48 @@ def flush_full_cycle(store) -> dict:
     return {'flushed': True, 'committed': committed, 'readied': readied}
 
 
+def _format_fix_step_lines(when: str, step: dict) -> list:
+    """One CMD line per cycle step — status + what changed / skipped."""
+    if not isinstance(step, dict):
+        return []
+    name = str(step.get('step') or 'step').upper()
+    status = str(step.get('status') or '?').lower()
+    detail = str(step.get('detail') or '')[:100]
+    level = {
+        'ok': 'fix',
+        'wait': 'wait',
+        'skip': 'note',
+    }.get(status, 'info')
+    tag = {
+        'ok': 'DONE',
+        'wait': 'WAIT',
+        'skip': 'SKIP',
+    }.get(status, status.upper())
+    lines = [{
+        'level': level,
+        'text': f'{when}  STEP   {name} · {tag} · {detail}',
+        'step': step.get('step'),
+        'status': status,
+    }]
+    skipped = [str(x) for x in (step.get('skipped') or []) if x][:6]
+    if skipped and status in ('skip', 'wait'):
+        lines.append({
+            'level': 'note',
+            'text': f'{when}  SKIP   {name}: ' + ', '.join(skipped),
+            'step': step.get('step'),
+            'status': 'skip',
+        })
+    changed = [str(x) for x in (step.get('changed') or []) if x][:6]
+    if changed and status == 'ok' and name in ('COMMIT', 'PROPOSE'):
+        lines.append({
+            'level': 'fix',
+            'text': f'{when}  CHANGE {name}: ' + ', '.join(changed),
+            'step': step.get('step'),
+            'status': 'ok',
+        })
+    return lines
+
+
 def build_learning_log(*, recent_audits=None, pending_fix=None,
                        scenarios=None, limit=48) -> list:
     """Human-readable CMD lines: CLOSE → ERROR → FIX → OUTCOME.
@@ -903,6 +1200,15 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
         bag_row = bag.get(fp) if fp and isinstance(bag.get(fp), dict) else {}
         if not changed and isinstance(bag_row.get('fix'), dict):
             changed = list((bag_row.get('fix') or {}).get('changed') or [])
+        fix_steps = [s for s in (a.get('fix_steps') or []) if isinstance(s, dict)]
+        src_l = str(a.get('source') or '').lower()
+        journalish = (
+            'journal' in src_l
+            or any('journal' in str(n).lower() for n in notes)
+            or str(a.get('scenario') or '') == 'LIVE_JOURNAL')
+        if not fix_steps and journalish and (
+                mistakes or (pnl is not None and pnl < -0.02)):
+            fix_steps = journal_seed_fix_steps(a)
         if committed or changed:
             ch = ', '.join(str(c) for c in changed[:8]) if changed else 'flags/knobs'
             lines.append({
@@ -914,6 +1220,8 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
                     'level': 'fix',
                     'text': f'{when}  FIX    why: {str(why)[:110]}',
                 })
+            for s in fix_steps:
+                lines.extend(_format_fix_step_lines(when, s))
             lines.append({
                 'level': 'out',
                 'text': (f'{when}  OUTCOME next same situation retests with new knobs'
@@ -927,8 +1235,24 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
                 gate = f' · promote {pc}/{pn}'
             lines.append({
                 'level': 'wait',
-                'text': f'{when}  WAIT   fix pending / diagnosing{gate}',
+                'text': (f'{when}  WAIT   diagnosing cycle'
+                         f'{gate} — steps below'),
             })
+            if fix_steps:
+                for s in fix_steps:
+                    lines.extend(_format_fix_step_lines(when, s))
+            else:
+                lines.append({
+                    'level': 'note',
+                    'text': (f'{when}  STEP   diagnose · ok · '
+                             + (' · '.join(str(m) for m in mistakes[:4])
+                                or 'outcome_hurt')),
+                })
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  STEP   commit · wait · '
+                             'no fix_steps stored — awaiting on_close'),
+                })
         if bag_row.get('ready_for_live'):
             lines.append({
                 'level': 'ok',
@@ -1060,6 +1384,11 @@ def lab_payload(store) -> dict:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            # Attach honest cycle steps so CMD never says only "fix pending".
+            if not j.get('fix_steps'):
+                j = dict(j)
+                j['fix_steps'] = journal_seed_fix_steps(j)
+                j['notes'] = list(j.get('notes') or []) + ['journal_ish_used']
             merged.append(j)
         # Newest first by trade close time (not audit runtime).
         def _at_key(r):
@@ -1153,6 +1482,10 @@ def lab_payload(store) -> dict:
             'at': pending.get('at'),
             'why': ((pending.get('proposed') or {}).get('why')
                     if isinstance(pending.get('proposed'), dict) else None),
+            'steps': (display_last.get('fix_steps')
+                      if isinstance(display_last, dict)
+                      and isinstance(display_last.get('fix_steps'), list)
+                      else None),
         },
         'top_scenarios': top_rows,
         'ready': ready[:6],

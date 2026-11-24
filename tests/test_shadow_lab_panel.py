@@ -21,7 +21,7 @@ def test_shadow_rail_and_view_exist():
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
     assert 'admin.css?v=139' in HTML
-    assert 'admin.js?v=172' in HTML
+    assert 'admin.js?v=173' in HTML
     assert 'live_news' in JS or 'Live today' in JS
     assert 'auditWindow24' in JS
     assert ('from_journal' in JS or 'Capital journal' in JS or 'from Capital' in JS)
@@ -31,6 +31,8 @@ def test_shadow_rail_and_view_exist():
     assert 'SCENARIO MEMORY' in JS
     assert 'SHADOW CMD LOG' in JS
     assert 'learning_log' in JS
+    assert 'fixSteps' in JS or 'fix_steps' in JS
+    assert 'DIAGNOSING' in JS
     assert 'shadow-cmd' in CSS
 
 

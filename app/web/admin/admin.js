@@ -453,12 +453,21 @@ function renderShadowLab(client){
   const winNet=win24.net!=null?Number(win24.net):null;
   const winNetTxt=winNet==null?'—'
     :((winNet>=0?'+':'')+num(winNet,2));
+  const promoteNeed=auditLast.promote_need!=null
+    ?auditLast.promote_need
+    :(audit.promote_n!=null?audit.promote_n:1);
   const gateTxt=(auditLast.promote_count!=null)
-    ?(`${auditLast.promote_count}/${auditLast.promote_need||3}`)
-    :'0/3';
+    ?(`${auditLast.promote_count}/${promoteNeed}`)
+    :(`0/${promoteNeed}`);
+  const fixSteps=Array.isArray(pendingFix.steps)?pendingFix.steps
+    :(Array.isArray(auditLast.fix_steps)?auditLast.fix_steps:[]);
+  const fixWaiting=fixSteps.some(s=>s&&s.status==='wait');
   const fixState=pendingFix.committed?'COMMITTED'
-    :(pendingFix.fingerprint?'PENDING':'—');
-  const fixCls=pendingFix.committed?'ok':(pendingFix.fingerprint?'neu':'');
+    :(fixWaiting?'DIAGNOSING'
+      :(pendingFix.fingerprint?'PENDING'
+        :(fixSteps.length?'DIAGNOSING':'IDLE')));
+  const fixCls=pendingFix.committed?'ok'
+    :(fixWaiting||pendingFix.fingerprint?'neu':'');
   const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,2).map(s=>{
     if(!s||typeof s!=='object')return '';
     const tag=s.ready_for_live?'READY':(s.fix_committed?'FIXED':'…');
@@ -567,6 +576,14 @@ function renderShadowLab(client){
           pendingFix.committed
             ?('Committed knobs: '+((pendingFix.changed||[]).join(', ')||'flags'))
             :(pendingFix.why||'First same mistake commits fix → ready LIVE immediately'))}</div>
+        ${(fixSteps.length?fixSteps.slice(0,6).map(s=>{
+          if(!s||typeof s!=='object')return '';
+          const st=String(s.status||'?');
+          const tag=st==='ok'?'DONE':(st==='wait'?'WAIT':'SKIP');
+          return `<div class="shadow-note">${esc(String(s.step||'step').toUpperCase())} · `
+            +`<b>${esc(tag)}</b> · ${esc(String(s.detail||'').slice(0,90))}</div>`;
+        }).filter(Boolean).join('')
+          :'<div class="shadow-note">No cycle steps yet — waiting for Capital / paper close</div>')}
       </div>
     </article>
     <article class="shadow-card">

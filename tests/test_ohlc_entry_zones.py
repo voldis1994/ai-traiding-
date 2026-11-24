@@ -28,6 +28,7 @@ def test_compute_entry_zones_builds_supply_from_base_impulse():
 
 
 def test_entry_allows_open_waits_until_confirm_in_demand_zone():
+    """Confirm OFF: far → wait; inside Demand → allow without pin/structure."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
@@ -39,26 +40,26 @@ def test_entry_allows_open_waits_until_confirm_in_demand_zone():
     assert gate['allowed'] is False
     assert 'wait' in (gate['reason'] or '')
 
-    # Inside band but no rejection / structure confirm → still wait.
+    # Inside band, confirm skipped → allow.
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
     gate_touch = oez.entry_allows_open(
         'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
         tick=0.1, spread=0.2)
-    assert gate_touch['allowed'] is False
-    assert 'confirm' in (gate_touch['reason'] or '')
+    assert gate_touch['allowed'] is True
+    assert gate_touch.get('trigger') == 'zone'
+    assert (gate_touch.get('confirm') or {}).get('reason') == 'confirm_skipped'
 
-    # With bullish rejection in zone → allow.
-    rows_ok, mid = demand_zone_path(confirm=True)
-    z2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)
-    buy2 = z2['buy_entry']
-    assert buy2
-    inside2 = (float(buy2['lo']) + float(buy2['hi'])) / 2
-    gate2 = oez.entry_allows_open(
-        'BUY', candles=rows_ok, mid=inside2, ask=inside2, bid=inside2 - 0.1,
-        tick=0.1, spread=0.2)
-    assert gate2['allowed'] is True
-    assert gate2['reason'] == 'ohlc_entry_zone_confirm'
-    assert gate2.get('trigger') == 'zone'
+    # Opt-in confirm still waits without pin/structure.
+    gate_need = oez.entry_allows_open(
+        'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
+        tick=0.1, spread=0.2,
+        params={**oez.load_params(None)})
+    # Force confirm via zone_confirm_allows path — store-less default is off;
+    # explicit require_confirm on helper covers opt-in.
+    conf = oez.zone_confirm_allows(
+        'BUY', candles=rows, zone=buy, tick=0.1, require_confirm=True)
+    assert conf['ok'] is False
+    assert 'confirm' in (conf.get('reason') or '')
 
 
 def test_entry_allows_open_on_structure_break_without_zone():
@@ -252,7 +253,7 @@ def test_z03_high_quality_invalidated_loses_to_valid_lower_quality():
 
 
 def test_z04_zone_confirm_requires_rejection_and_structure():
-    """Playbook hard: rejection AND microstructure; soft OR when require_both=0."""
+    """Confirm OFF by default; optional OR/AND when require_confirm=1."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
@@ -268,24 +269,31 @@ def test_z04_zone_confirm_requires_rejection_and_structure():
         'low': base_lo - 0.05, 'close': mid + 0.12,
     }
     pin_only = list(rows) + [pin]
-    # Soft OR still accepts pin alone.
+    # Default: confirm skipped — price-in-zone path does not wait on pin.
+    conf_off = oez.zone_confirm_allows(
+        'BUY', candles=pin_only, zone=buy, tick=0.1)
+    assert conf_off['ok'] is True
+    assert conf_off.get('reason') == 'confirm_skipped'
+    # Soft OR when confirm forced on.
     conf_or = oez.zone_confirm_allows(
-        'BUY', candles=pin_only, zone=buy, tick=0.1, require_both=False)
+        'BUY', candles=pin_only, zone=buy, tick=0.1,
+        require_confirm=True, require_both=False)
     assert conf_or['ok'] is True
     assert conf_or['rejection'].get('ok') is True
-    # Playbook AND: pin alone waits for structure.
+    # AND: pin alone waits for structure.
     conf_and = oez.zone_confirm_allows(
-        'BUY', candles=pin_only, zone=buy, tick=0.1, require_both=True)
+        'BUY', candles=pin_only, zone=buy, tick=0.1,
+        require_confirm=True, require_both=True)
     assert conf_and['ok'] is False
     assert conf_and['rejection'].get('ok') is True
     assert 'wait_structure' in (conf_and.get('reason') or '')
 
-    # Full confirm path has both evidence types → AND passes.
     rows_ok, _ = demand_zone_path(confirm=True)
     z2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)
     buy2 = z2['buy_entry']
     conf2 = oez.zone_confirm_allows(
-        'BUY', candles=rows_ok, zone=buy2, tick=0.1, require_both=True)
+        'BUY', candles=rows_ok, zone=buy2, tick=0.1,
+        require_confirm=True, require_both=True)
     assert conf2['ok'] is True
     assert conf2['rejection'].get('ok') is True
     assert conf2['structure'].get('ok') is True

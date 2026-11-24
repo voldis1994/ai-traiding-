@@ -211,9 +211,11 @@ DEFAULTS = {
     'flow_pillar_impact': 0.15,
     # OHLC chop/doji/impulse notes — soft by default (never OPEN ban).
     'ohlc_regime_gate_enabled': 0,
-    # 1m playbook hard ENTRY: AND confirm, mid-range veto, session, regime SL.
+    # 1m playbook hard ENTRY: mid-range veto, session, regime SL.
+    # Zone candle confirm OFF by default — regime + price-in-zone is enough.
     'playbook_hard_entry': 1,
-    'playbook_zone_confirm_and': 1,
+    'playbook_require_zone_confirm': 0,
+    'playbook_zone_confirm_and': 0,
     'playbook_session_filter': 1,
     # PR #181 restore: re-entry confirm off — was blocking most follow-on OPENs.
     'reentry_confirm_enabled': 0,
@@ -360,6 +362,7 @@ BOUNDS = {
     'flow_pillar_impact': (0.04, 0.40),
     'ohlc_regime_gate_enabled': (0, 1),
     'playbook_hard_entry': (0, 1),
+    'playbook_require_zone_confirm': (0, 1),
     'playbook_zone_confirm_and': (0, 1),
     'playbook_session_filter': (0, 1),
     'reentry_confirm_enabled': (0, 1),

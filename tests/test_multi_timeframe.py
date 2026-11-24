@@ -52,11 +52,11 @@ def test_current_green_candle_cannot_reverse_broad_downtrend():
 def test_short_gap_old_history_and_bad_price_rejected():
     history=bars(91,start=BASE-timedelta(minutes=90))
     assert not market_features(history[:30],now_utc=BASE+timedelta(minutes=1))['ready']
-    # Single missing M1 is carry-filled (Capital/ingest blip) — context stays ready.
+    # V3 D02: any missing M1 in the 60m window fails — no synthetic flat fill.
     gapped=[x for x in history if x['at']!=(BASE-timedelta(minutes=2)).isoformat()]
     filled=market_features(gapped,now_utc=BASE+timedelta(minutes=1),spread=.03)
-    assert filled['ready']
-    # Three consecutive missing minutes still fail-closed.
+    assert not filled['ready']
+    assert 'Missing MINUTE' in (filled.get('reason') or '')
     hole={ (BASE-timedelta(minutes=i)).isoformat() for i in (2,3,4) }
     big_gap=[x for x in history if x['at'] not in hole]
     assert not market_features(big_gap,now_utc=BASE+timedelta(minutes=1),spread=.03)['ready']

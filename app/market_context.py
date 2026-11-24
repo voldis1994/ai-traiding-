@@ -59,7 +59,8 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, 
     """Return a time-aligned feature snapshot or an explicit unavailable reason.
 
     Stored current-minute quote-derived OHLC is excluded. Bars must cover a
-    continuous 60 minute window. Gaps or stale API data cause a safe HOLD.
+    continuous 60 minute window with no synthetic gap-fill (V3 D02). Any
+    missing minute or stale API data causes a safe HOLD_DATA refusal.
 
     `approved`: optional registry specs → append dynamic OHLC formulas (past bars only).
     """
@@ -84,31 +85,12 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, 
     if len(by_minute)<MIN_BARS:return fail(f'Need at least {MIN_BARS} completed MINUTE candles ({len(by_minute)} available)')
     latest=max(by_minute)
     if cutoff-latest>timedelta(minutes=3):return fail('Historical MINUTE candles are stale')
-    # Exact minute spacing ensures a gap is not mistaken for a smaller timeframe.
-    # Capital / ingest occasionally drops 1–2 M1 rows; carry-forward fill keeps
-    # LIVE from freezing on "Missing MINUTE candles" while large holes still fail.
+    # Exact minute spacing — V3 D02 forbids synthetic flat OHLC gap-fill.
+    # Any missing minute in the 60m window → HOLD_DATA / Missing MINUTE candles.
     timeline=[latest-timedelta(minutes=i) for i in range(60,-1,-1)]
-    max_gap_fill=2
-    synth=dict(by_minute)
-    prev_bar=None
-    hole_run=0
-    filled=0
-    for t in timeline:
-        if t in synth:
-            prev_bar=synth[t]
-            hole_run=0
-            continue
-        if prev_bar is None:
-            return fail('Missing MINUTE candles in 60-minute context; waiting for contiguous history')
-        hole_run+=1
-        if hole_run>max_gap_fill:
-            return fail('Missing MINUTE candles in 60-minute context; waiting for contiguous history')
-        # Flat synthetic bar from last known close — no invented volatility.
-        c=float(prev_bar[3])
-        prev_bar=(c,c,c,c)
-        synth[t]=prev_bar
-        filled+=1
-    bars=[synth[t] for t in timeline]
+    if any(t not in by_minute for t in timeline):
+        return fail('Missing MINUTE candles in 60-minute context; waiting for contiguous history')
+    bars=[by_minute[t] for t in timeline]
     closes=np.array([b[3] for b in bars],dtype=float)
     c=float(closes[-1]);high60=max(b[1] for b in bars);low60=min(b[2] for b in bars)
     def ret(minutes):return float((c/closes[-1-minutes]-1.)*1000.)

@@ -7,6 +7,10 @@ TP1/TP2 ladder + scale-out is **BUY (long) only**:
 SELL (short) keeps a single structural ``profit_level`` (no TP1 rung,
 no scale-out). Still never invent mid ± κ — short TP is a real swing/
 zone/range level.
+
+V3 B01: if RR would require shrinking structural SL past invalidation
+(or soft-capping SL to hit RR), return not ready / ``HOLD_RR`` — refuse
+over invent.
 """
 from __future__ import annotations
 
@@ -432,32 +436,20 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 
     rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
-    # PR #181 restore: soft-cap SL toward entry when RR < 1 instead of hard refuse.
-    rr_capped = False
-    if rr_now + 1e-12 < 1.0:
-        capped = float(tp2_d) / 1.0
-        if floor > 0 and capped + 1e-12 < floor:
-            return dict(
-                out, reason='regime_rr_below_one',
-                stop_distance=float(stop_d), profit_distance=float(tp2_d),
-                stop_level=float(stop), profit_level=float(tp2),
-                tp1_level=float(tp1), tp2_level=float(tp2),
-                regime=name, rr=float(rr_now), min_rr=float(min_rr),
-                structural_tp=True, structural_rr=False)
-        if capped + 1e-12 < stop_d:
-            stop_d = float(capped)
-            stop = (entry_f - stop_d) if action == 'BUY' else (entry_f + stop_d)
-            rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
-            rr_capped = True
-            reason = str(reason or 'regime') + '+rr_cap_sl'
-        else:
-            return dict(
-                out, reason='regime_rr_below_one',
-                stop_distance=float(stop_d), profit_distance=float(tp2_d),
-                stop_level=float(stop), profit_level=float(tp2),
-                tp1_level=float(tp1), tp2_level=float(tp2),
-                regime=name, rr=float(rr_now), min_rr=float(min_rr),
-                structural_tp=True, structural_rr=False)
+    # V3 B01: never soft-cap / shrink structural SL past invalidation to hit RR.
+    # Prefer HOLD_RR refuse over inventing a tighter stop.
+    if rr_now + 1e-12 < float(min_rr):
+        return dict(
+            out, reason='HOLD_RR',
+            stop_distance=float(stop_d), profit_distance=float(tp2_d),
+            stop_level=float(stop), profit_level=float(tp2),
+            tp1_level=float(tp1), tp2_level=float(tp2),
+            regime=name, rr=float(rr_now), min_rr=float(min_rr),
+            structural_tp=True, structural_rr=False,
+            rr_capped=False,
+            trigger=trig or None,
+            zone_sl=bool(zone_sl),
+            buffer=float(buffer))
 
     # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
     return {
@@ -474,7 +466,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'tp2_distance': float(tp2_d),
         'swing_hi': float(tp2) if action == 'BUY' else float(stop),
         'swing_lo': float(stop) if action == 'BUY' else float(tp2),
-        'rr_capped': bool(rr_capped),
+        'rr_capped': False,
         'kappa': float(rr_now) if rr_now > 0 else min_rr,
         'min_rr': float(min_rr),
         'rr': float(rr_now),

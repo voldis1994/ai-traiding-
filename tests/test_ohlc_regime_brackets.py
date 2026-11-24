@@ -125,40 +125,51 @@ def test_regime_refuses_when_atr_floor_makes_tp_shorter_than_sl():
         spread=0.2, min_distance=0.5, atr=8.0)
     if br.get('ready'):
         assert float(br['profit_distance']) + 1e-9 >= float(br['stop_distance'])
-        assert float(br.get('rr') or 0) + 1e-9 >= 1.0
+        assert float(br.get('rr') or 0) + 1e-9 >= float(br.get('min_rr') or 1.0)
+        assert br.get('rr_capped') is not True
     else:
         assert br.get('reason') in (
-            'regime_rr_below_one', 'no_structural_tp',
+            'HOLD_RR', 'regime_rr_below_one', 'no_structural_tp',
             'regime_tp_below_broker_min', 'regime_sl_below_broker_min',
             'regime_tp_below_floor', 'regime_sl_below_floor',
             'no_structural_sl')
 
 
-def test_decide_soft_caps_regime_rr_below_one(monkeypatch):
-    """PR #181: regime RR<1 soft-caps SL — never invents TP, never ships TP<SL."""
+def test_regime_brackets_hold_rr_instead_of_soft_cap_sl():
+    """V3 B01: RR shortfall → HOLD_RR; structural SL must not move toward entry."""
     rows, mid = demand_zone_path(confirm=True)
     zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     buy = zones.get('buy_entry')
     entry = (float(buy['lo']) + float(buy['hi'])) / 2 if buy else mid
-    fake = {
-        'ready': True, 'source': 'regime_brackets', 'reason': 'fake_wide_sl',
-        'stop_distance': 8.0, 'profit_distance': 7.0,
-        'stop_level': entry - 8.0, 'profit_level': entry + 7.0,
-        'tp1_level': entry + 3.5, 'tp2_level': entry + 7.0,
-        'kappa': 7 / 8, 'min_rr': 1.0, 'rr': 7 / 8,
-        'structural_tp': True, 'structural_rr': False,
-        'zone_sl': True, 'zone_tp': True, 'regime': 'RETEST_UP',
-        'scale_out_frac': 0.5, 'tp_ladder': True,
+    # Force a wide structural SL with a near TP so RR < min_rr.
+    sc = {
+        'scenario': 'RETEST_UP',
+        'range': {'lo': entry - 10.0, 'hi': entry + 2.0},
     }
-    monkeypatch.setattr(orb, 'regime_brackets', lambda **kw: fake)
-    z = bracket_learn.zone_at_open(rows, multi_tf=True)
-    decided = bracket_learn.decide_brackets_from_ohlc(
-        z, tick=0.1, spread=0.2, min_distance=0.5, entry=entry, action='BUY',
-        candles=rows, atr=1.0, require_swing=True, entry_zone=buy,
-        scenario={'scenario': 'RETEST_UP'}, zones=zones, trigger='zone')
-    assert decided.get('ready') is True
-    assert float(decided['profit_distance']) + 1e-9 >= float(
-        decided['stop_distance'])
-    if decided.get('source') == 'regime_brackets':
-        assert float(decided.get('rr') or 0) + 1e-9 >= 1.0
-        assert decided.get('rr_capped') is True
+    # Put demand box far below entry so SL is wide.
+    wide_demand = {
+        'side': 'BUY', 'lo': entry - 10.0, 'hi': entry - 9.0,
+        'sl_anchor': entry - 10.0,
+    }
+    supply = zones.get('sell_entry') or {
+        'side': 'SELL', 'lo': entry + 1.5, 'hi': entry + 2.0,
+    }
+    br = orb.regime_brackets(
+        candles=rows, entry=entry, action='BUY', scenario=sc,
+        zones={'buy_entry': wide_demand, 'sell_entry': supply},
+        entry_zone=wide_demand, trigger='zone', tick=0.1,
+        spread=0.2, min_distance=0.5, atr=1.0, store=None)
+    if br.get('ready'):
+        # If structure luckily cleared min_rr, SL must still be structural (no cap).
+        assert br.get('rr_capped') is not True
+        assert float(br.get('rr') or 0) + 1e-9 >= float(br.get('min_rr') or 1.0)
+    else:
+        assert br.get('reason') in ('HOLD_RR', 'regime_rr_below_one',
+                                    'no_structural_tp', 'no_structural_sl',
+                                    'regime_sl_below_broker_min',
+                                    'regime_tp_below_broker_min')
+        if br.get('reason') == 'HOLD_RR':
+            assert br.get('rr_capped') is not True
+            # Structural stop kept at invalidation — not soft-capped toward entry.
+            assert float(br['stop_distance']) + 1e-9 >= 9.0
+            assert float(br.get('rr') or 0) + 1e-9 < float(br.get('min_rr') or 2.0)

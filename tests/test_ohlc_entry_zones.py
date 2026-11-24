@@ -307,3 +307,76 @@ def test_z04_invalidated_zone_confirm_refused():
     conf = oez.zone_confirm_allows('BUY', candles=[], zone=zone, tick=0.1)
     assert conf['ok'] is False
     assert conf['reason'] == 'zone_invalidated'
+
+
+def test_break_fires_on_one_green_m1_not_two():
+    """Default tape_need=1 — structure break is not one extra M1 late."""
+    rows, _ = demand_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    far = float(buy['hi']) + 5.0 if buy else float(rows[-1]['close']) + 5.0
+    t_last = rows[-1]
+    o = float(t_last['close'])
+    c = o + 0.6
+    rows = list(rows) + [{
+        'at': t_last['at'], 'open': o, 'high': c + 0.1, 'low': o - 0.05, 'close': c,
+    }]
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.55, 'structure_break': 'UP', 'move_ok': True,
+    }
+    br = oez.break_trigger_allows(
+        'BUY', price=far, zones=z, mtf=mtf, tick=0.1, candles=rows)
+    assert br['ok'] is True
+    assert br['tape_need'] == 1
+    assert br['tape_streak'] >= 1
+    assert br['reason'] == 'ohlc_break_structure'
+
+
+def test_range_break_live_mid_when_mtf_aligned():
+    """Live mid through range_hi fires early — do not wait for completed close."""
+    from datetime import timedelta
+    t0 = datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 2000.0
+    for i in range(30):
+        o, c = px, px + 0.05
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': c + 0.1, 'low': o - 0.1, 'close': c,
+        })
+        px = c
+    # Last completed close still inside range; live mid already clears hi.
+    range_hi = 2005.0
+    range_lo = 1998.0
+    # Keep last close below hi.
+    rows[-1] = dict(rows[-1], open=2003.5, high=2004.2, low=2003.0, close=2004.0)
+    # One green tape bar for early proof.
+    rows.append({
+        'at': (t0 + timedelta(minutes=30)).isoformat(),
+        'open': 2003.8, 'high': 2004.5, 'low': 2003.6, 'close': 2004.2,
+    })
+    zones = {
+        'ok': True, 'range_hi': range_hi, 'range_lo': range_lo,
+        'buy_entry': None, 'sell_entry': None,
+    }
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.62, 'structure_break': None, 'move_ok': True,
+    }
+    # Close still below hi → old path would wait; live mid clears → early.
+    live = range_hi + 0.3
+    br = oez.break_trigger_allows(
+        'BUY', price=live, zones=zones, mtf=mtf, tick=0.1, candles=rows)
+    assert br['ok'] is True
+    assert br['reason'] == 'ohlc_break_range_high_live'
+
+    # Without tape + strong conf, live mid alone must not chase.
+    weak = dict(mtf, confidence=0.2)
+    red = list(rows[:-1]) + [{
+        'at': (t0 + timedelta(minutes=30)).isoformat(),
+        'open': 2004.5, 'high': 2004.6, 'low': 2003.0, 'close': 2003.2,
+    }]
+    br_no = oez.break_trigger_allows(
+        'BUY', price=live, zones=zones, mtf=weak, tick=0.1, candles=red)
+    assert br_no['ok'] is False

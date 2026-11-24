@@ -10,8 +10,32 @@ from tests.ohlc_zone_path import demand_zone_path
 def test_load_params_defaults():
     p = oez.load_params(None)
     assert p['band_span_frac'] == 0.12
-    assert p['tape_need'] == 2
-    assert p['break_mtf_conf'] == 0.55
+    assert p['tape_need'] == 1
+    assert p['break_mtf_conf'] == 0.50
+
+
+def test_load_params_migrates_v1_late_tape_to_v2():
+    """v1 bags kept tape_need=2 (late); v2 resets break timing, keeps band."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'robot.sqlite3')
+        store.set(oez._STORE_KEY_LEGACY, {
+            'enabled': 1,
+            'band_span_frac': 0.15,
+            'band_atr_frac': 0.35,
+            'band_span_cap': 0.28,
+            'tape_need': 2,
+            'break_mtf_conf': 0.55,
+            'mtf_opposite_conf': 0.75,
+            'zone_wide_conf': 0.50,
+            'shift_block_conf': 0.60,
+        })
+        p = oez.load_params(store)
+        assert p['tape_need'] == 1
+        assert p['break_mtf_conf'] == 0.50
+        assert p['band_span_frac'] == 0.15
+        v2 = store.get(oez.STORE_KEY)
+        assert isinstance(v2, dict)
+        assert int(v2['tape_need']) == 1
 
 
 def test_observe_close_tightens_break_after_loss():

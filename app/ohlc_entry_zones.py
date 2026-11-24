@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from . import structure_memory
 
-STORE_KEY = 'ohlc_entry_gates_v1'
+STORE_KEY = 'ohlc_entry_gates_v2'
+_STORE_KEY_LEGACY = 'ohlc_entry_gates_v1'
 
 DEFAULTS = {
     'enabled': 1,
@@ -28,8 +29,10 @@ DEFAULTS = {
     'band_atr_frac': 0.35,
     'band_span_cap': 0.28,
     # Break tape / MTF agreement.
-    'tape_need': 2,
-    'break_mtf_conf': 0.55,
+    # tape_need=1: fire on the first confirming M1 body (was 2 → late by ~1m).
+    # break_mtf_conf slightly softer so aligned MTF unlocks early structure break.
+    'tape_need': 1,
+    'break_mtf_conf': 0.50,
     'mtf_opposite_conf': 0.75,
     'zone_wide_conf': 0.50,
     'shift_block_conf': 0.60,
@@ -85,6 +88,16 @@ def load_params(store=None) -> dict:
     except Exception:
         pass
     bag = store.get(STORE_KEY) if store is not None else None
+    migrated = False
+    if not isinstance(bag, dict):
+        # v1 bags kept tape_need=2 (late signal). Carry band geometry only;
+        # reset break timing knobs to the earlier-entry defaults.
+        legacy = store.get(_STORE_KEY_LEGACY) if store is not None else None
+        if isinstance(legacy, dict):
+            bag = dict(legacy)
+            bag['tape_need'] = int(DEFAULTS['tape_need'])
+            bag['break_mtf_conf'] = float(DEFAULTS['break_mtf_conf'])
+            migrated = True
     if isinstance(bag, dict):
         for k in out:
             if bag.get(k) is not None:
@@ -99,6 +112,11 @@ def load_params(store=None) -> dict:
         out[k] = _clip(k, out[k])
     out['tape_need'] = int(round(_clip('tape_need', out['tape_need'])))
     out['enabled'] = int(out.get('enabled') or 0)
+    if migrated:
+        try:
+            save_params(store, out)
+        except Exception:
+            pass
     return out
 
 
@@ -823,7 +841,7 @@ def _structure_break_side(mtf,zones):
     return None
 
 
-def m1_tape_agrees(action,candles,*,need=2):
+def m1_tape_agrees(action,candles,*,need=1):
     """Last ``need`` *completed* M1 bodies agree with action (BUY=green, SELL=red)."""
     action=(action or '').upper()
     need=max(1,int(need))
@@ -862,8 +880,8 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
     ``break_mtf_conf`` learn from closed £.
     """
     cfg=params if isinstance(params,dict) else DEFAULTS
-    tape_need=max(1,int(cfg.get('tape_need') or 2))
-    break_conf=float(cfg.get('break_mtf_conf') or 0.55)
+    tape_need=max(1,int(cfg.get('tape_need') or 1))
+    break_conf=float(cfg.get('break_mtf_conf') or 0.50)
     action=(action or '').upper()
     out={'ok':False,'reason':'no_break','side':None,'trigger':'break','tape_streak':0,
          'tape_need':tape_need}
@@ -901,8 +919,9 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
             return out
         out['reason']='break_needs_m1_or_mtf'
         return out
-    # Range break: completed close must already clear the swing — live mid alone
-    # is forming-bar chase against finished OHLC.
+    # Range break: prefer completed close past the swing. When MTF is aligned
+    # and M1 tape already agrees, allow live mid through the level mid-minute
+    # so the signal is not one closed bar late (extension_chase still blocks tip).
     if isinstance(zones,dict) and isinstance(mtf,dict) and mtf.get('ready'):
         hi=_finite(zones.get('range_hi'))
         lo=_finite(zones.get('range_lo'))
@@ -912,18 +931,30 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
         except (TypeError,ValueError):
             buf=0.01
         aligned=mtf_aligned or (mode=='SHIFT' and conf>=break_conf)
-        if (action=='BUY' and aligned and hi is not None and last_c is not None
-                and last_c>=(hi-buf) and p>=(hi-buf)
-                and (tape_ok or conf>=break_conf)):
-            out['ok']=True
-            out['reason']='ohlc_break_range_high'
-            return out
-        if (action=='SELL' and aligned and lo is not None and last_c is not None
-                and last_c<=(lo+buf) and p<=(lo+buf)
-                and (tape_ok or conf>=break_conf)):
-            out['ok']=True
-            out['reason']='ohlc_break_range_low'
-            return out
+        proof=tape_ok or conf>=break_conf
+        live_early=bool(aligned and tape_ok and conf>=break_conf)
+        if (action=='BUY' and aligned and hi is not None and p is not None
+                and p>=(hi-buf) and proof):
+            close_ok=last_c is not None and last_c>=(hi-buf)
+            if close_ok:
+                out['ok']=True
+                out['reason']='ohlc_break_range_high'
+                return out
+            if live_early and p>=hi:
+                out['ok']=True
+                out['reason']='ohlc_break_range_high_live'
+                return out
+        if (action=='SELL' and aligned and lo is not None and p is not None
+                and p<=(lo+buf) and proof):
+            close_ok=last_c is not None and last_c<=(lo+buf)
+            if close_ok:
+                out['ok']=True
+                out['reason']='ohlc_break_range_low'
+                return out
+            if live_early and p<=lo:
+                out['ok']=True
+                out['reason']='ohlc_break_range_low_live'
+                return out
     return out
 
 

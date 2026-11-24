@@ -25,8 +25,8 @@ LIVE_DECISION_BAR = 'completed_broker_M1'
 LIVE_ENTRY_PATH = 'intent_then_break_or_zone_trigger'
 # OHLC band/tape/MTF knobs adapt from closed £ (ohlc_entry_gates_v1).
 OHLC_GATES_LEARN = 'ohlc_entry_gates_v1_observe_close'
-POLL_SECONDS = 3
-FAST_ENTRY_TICK_SECONDS = 1
+POLL_SECONDS = 1  # heavy poll gated ~0.8–1.2s; light ticks at 50ms
+FAST_ENTRY_TICK_SECONDS = 0.05
 NEURAL_DT_SECONDS = 60
 DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight steps
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions

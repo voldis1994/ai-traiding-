@@ -2258,8 +2258,8 @@ class SingleTradeEngine:
         need=recommended_live_history_bars(self.store)
         have=self._historical_candle_count(self.mandate['epic'])
         # Eager: if history is thin, pull broker archive now — do not wait for M1 clock.
-        # ~5 polls (~15s) keeps QUOTE→HISTORICAL rewrite tight so MTF ADX/ATR
-        # do not flicker OFF while closed minutes still sit as QUOTE.
+        # ~5 heavy polls (~4–6s at ~1s cadence) keeps QUOTE→HISTORICAL rewrite
+        # tight so MTF ADX/ATR do not flicker OFF while closed minutes sit as QUOTE.
         due=(self.tick_count-self.last_candle_tick>=5) or (have<need)
         if not due:return
         self.last_candle_tick=self.tick_count
@@ -3290,8 +3290,8 @@ class SingleTradeEngine:
         triggers are not stuck on a 3s REST poll mid.
         """
         now_m=time.monotonic()
-        # ~0.8s — catch break/zone without waiting another closed M1 / 3s poll.
-        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<0.8:
+        # ~0.25s — catch break/zone on light ticks (was 0.8s; poll no longer 3s).
+        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<0.25:
             return
         reason=self.last_entry_reason or ''
         if not self._entry_wait_reason_retryable(reason) and not self._wants_fast_entry_ticks():
@@ -3787,7 +3787,7 @@ class SingleTradeEngine:
         if not ref:raise RuntimeError('No broker deal reference: order result uncertain')
         self.store.order_update(order_id,'PENDING',ref)
         status=None;confirmation={}
-        for delay in (0,.4,1.0,2.0):
+        for delay in (0,.2,.5,1.0):
             if delay:await asyncio.sleep(delay)
             confirmation=await self.broker.confirm(ref)
             status=confirmation.get('dealStatus')
@@ -3810,7 +3810,7 @@ class SingleTradeEngine:
             req=json.loads(self.store.db.execute('SELECT payload FROM orders WHERE id=?',(order_id,)).fetchone()[0])
         matched=self._order_fully_matched(kind,req,deal_id,confirmation,ref)
         if not matched:
-            for delay in (.5,1.,2.):
+            for delay in (.25,.5,1.0):
                 await asyncio.sleep(delay);await self.sync()
                 # Retries must re-check the FULL match (epic+direction+size+deal),
                 # never epic alone (audit #31).
@@ -7287,7 +7287,7 @@ class SingleTradeEngine:
                     raise RuntimeError('No reduce deal reference')
                 self.store.order_update(oid,'PENDING',ref)
                 conf={};status=None
-                for delay in (0,.4,1.0):
+                for delay in (0,.2,.5):
                     if delay:await asyncio.sleep(delay)
                     conf=await self.broker.confirm(ref)
                     status=conf.get('dealStatus')

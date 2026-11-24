@@ -135,14 +135,22 @@ def _validate_proof(cycle: dict, validate_proof: dict | None, *,
                 if not proof.get(key):
                     ok = False
                     reasons.append(f'missing_{key}')
-            if proof.get('weights_saved') is False:
+            # weights_saved must be explicitly True (missing ≡ fail).
+            if proof.get('weights_saved') is not True:
                 ok = False
                 reasons.append('weights_not_saved')
+            if not proof.get('learn_committed'):
+                ok = False
+                reasons.append('learn_not_committed')
     else:
         # Skipped learn still needs settle proof when cash was expected.
         if proof.get('pending'):
             ok = False
             reasons.append('settlement_still_pending')
+        # Actual skip reason required — never rubber-stamp empty skip.
+        if not str(proof.get('skip_reason') or '').strip():
+            ok = False
+            reasons.append('missing_skip_reason')
     proof['ok'] = ok
     proof['reasons'] = reasons
     return ok, proof

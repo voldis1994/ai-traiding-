@@ -87,9 +87,12 @@ def is_committed(store, deal_id: str) -> bool:
 
 
 def is_in_flight(store, deal_id: str) -> bool:
+    """True for active lease without needs_recovery — not a finished teach."""
     att = get_attempt(store, deal_id)
-    return bool(att and att.get('state') in (
-        STATE_CLAIMED, STATE_RUNNING, STATE_APPLIED))
+    if not att or att.get('needs_recovery'):
+        return False
+    return att.get('state') in (
+        STATE_CLAIMED, STATE_RUNNING, STATE_APPLIED)
 
 
 def claim(

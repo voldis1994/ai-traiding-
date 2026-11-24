@@ -29,12 +29,19 @@ def test_trade_stats_flags_closed_without_broker_cash():
 
 def test_trade_stats_broker_cash_ok():
     with tempfile.TemporaryDirectory() as d:
+        from app import cash_ledger
         store = Store(Path(d) / 'db.sqlite3')
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
         store.upsert_trade({
             'dealId': 'ok1', 'epic': 'GOLD', 'size': '0.1',
             'direction': 'BUY', 'level': 2000,
         })
         store.close_trade('ok1', 2001, 0.17, currency='GBP', source='broker')
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.17, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='ok1', transaction_id='TX-ok1')
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
         assert stats['cash_trades'] == 1

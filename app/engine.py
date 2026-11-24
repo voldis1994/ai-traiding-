@@ -5932,24 +5932,137 @@ class SingleTradeEngine:
         self._store_upl_estimate(deal_id)
         return None,'pending_broker_pnl',ccy
 
-    def _trade_already_learned(self,deal_id):
-        """True when COMMITTED, or in-flight lease blocks a second train (P0-13).
-
-        COMMITTED = finished. CLAIMED/RUNNING/APPLIED without ``needs_recovery``
-        also blocks re-entry in the same process (double-train guard). After a
-        crash, ``needs_recovery`` allows one replay — that is not ``already
-        learned``, so callers that only check this flag will re-enter claim.
-        """
+    def _trade_learn_committed(self,deal_id):
+        """True only for COMMITTED — never treat in-flight as finished teach."""
         from . import learn_attempt as _la
-        if _la.is_committed(self.store,deal_id):
-            return True
+        return bool(_la.is_committed(self.store,deal_id))
+
+    def _trade_learn_in_flight(self,deal_id):
+        """CLAIMED/RUNNING/APPLIED without needs_recovery (same-process guard)."""
+        from . import learn_attempt as _la
         att=_la.get_attempt(self.store,deal_id)
-        if not att:
-            return False
-        if att.get('needs_recovery'):
+        if not att or att.get('needs_recovery'):
             return False
         return att.get('state') in (
             _la.STATE_CLAIMED,_la.STATE_RUNNING,_la.STATE_APPLIED)
+
+    def _trade_learn_needs_recovery(self,deal_id):
+        """Incomplete neural learn after crash — teachers_settled must not block."""
+        from . import learn_attempt as _la
+        att=_la.get_attempt(self.store,deal_id)
+        if att and att.get('needs_recovery'):
+            return True
+        if att and att.get('state')==_la.STATE_APPLIED and not _la.is_committed(
+                self.store,deal_id):
+            return True
+        pending=self.store.get('learn_pending_commit:'+str(deal_id))
+        if isinstance(pending,dict) and not pending.get('weights_saved'):
+            return True
+        return False
+
+    def _trade_already_learned(self,deal_id):
+        """Double-train guard only — NOT proof of finished teach for DONE/COMPLETE.
+
+        Use ``_trade_learn_committed`` for work_queue DONE / FSM COMPLETE.
+        """
+        return (self._trade_learn_committed(deal_id)
+                or self._trade_learn_in_flight(deal_id))
+
+    def _weights_saved_for_attempt(self,deal_id,attempt_id=None):
+        """Idempotent proof that brain.save ran for this learn attempt_id."""
+        from . import learn_attempt as _la
+        att=_la.get_attempt(self.store,deal_id)
+        aid=str(attempt_id or (att or {}).get('attempt_id') or '')
+        if not aid:
+            return False
+        meta=self.store.get('learn_weights_saved:'+str(deal_id))
+        if isinstance(meta,dict) and meta.get('saved') and str(
+                meta.get('attempt_id') or '')==aid:
+            return True
+        # Sidecar next to weights (survives crash between save and store flag).
+        try:
+            path=self.brain._path_for(self.brain.epic) if getattr(
+                self.brain,'epic',None) else self.brain.path
+            stamp=Path(str(path)+'.attempt')
+            if stamp.exists() and stamp.read_text(encoding='utf-8').strip()==aid:
+                self.store.set('learn_weights_saved:'+str(deal_id),{
+                    'attempt_id':aid,'saved':True,'at':now(),'from_sidecar':True})
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _persist_learn_weights(self,deal_id):
+        """brain.save keyed by attempt_id — crash-safe, no double train on replay."""
+        from . import learn_attempt as _la
+        att=_la.get_attempt(self.store,deal_id)
+        aid=str((att or {}).get('attempt_id') or '')
+        if self._weights_saved_for_attempt(deal_id,aid):
+            pend=self.store.get('learn_pending_commit:'+str(deal_id))
+            if isinstance(pend,dict):
+                pend=dict(pend);pend['weights_saved']=True;pend['attempt_id']=aid
+                self.store.set('learn_pending_commit:'+str(deal_id),pend)
+            return True,aid
+        self.brain.save()
+        try:
+            path=self.brain._path_for(self.brain.epic) if getattr(
+                self.brain,'epic',None) else self.brain.path
+            Path(str(path)+'.attempt').write_text(aid or 'unknown',encoding='utf-8')
+        except Exception:
+            pass
+        self.store.set('learn_weights_saved:'+str(deal_id),{
+            'attempt_id':aid,'saved':True,'at':now()})
+        pend=self.store.get('learn_pending_commit:'+str(deal_id))
+        if isinstance(pend,dict):
+            pend=dict(pend);pend['weights_saved']=True;pend['attempt_id']=aid
+            self.store.set('learn_pending_commit:'+str(deal_id),pend)
+        return True,aid
+
+    def _complete_cycle_after_commit(self,deal_id,*,mode=None,pnl=None,
+                                    source=None,taught=True,skip_reason=None,
+                                    pending=False):
+        """VALIDATE/COMPLETE after COMMITTED (live path + restart recovery)."""
+        try:
+            from . import cycle_runtime as _cr
+            from . import learn_attempt as _la
+            cyc=_cr.load_by_deal(self.store,str(deal_id))
+            if not cyc or str(cyc.get('deal_id') or '') not in ('',str(deal_id)):
+                return None
+            if cyc.get('complete'):
+                return cyc
+            # Still waiting for Funds — do not VALIDATE/COMPLETE yet.
+            if pending or skip_reason=='awaiting_funds_ledger':
+                return cyc
+            att=_la.get_attempt(self.store,deal_id)
+            aid=str((att or {}).get('attempt_id') or '')
+            weights_ok=self._weights_saved_for_attempt(deal_id,aid)
+            committed=self._trade_learn_committed(deal_id)
+            teachers=bool(self.store.get('teachers_settled:'+str(deal_id)))
+            adaptive=bool(self.store.get('adaptive_done:'+str(deal_id)))
+            skipped=not taught
+            proof={
+                'deal_id':str(deal_id),
+                'pnl_source':source or 'broker',
+                'taught':bool(taught and committed),
+                'journal_persisted':True,
+                'teachers_settled':teachers,
+                'learn_committed':committed,
+                'adaptive_done':adaptive,
+                'bracket_done':teachers,
+                'weights_saved':bool(weights_ok),
+                'attempt_id':aid,
+                'mode':mode,'pnl':pnl,
+            }
+            if skipped:
+                proof['skip_reason']=skip_reason or 'neural_not_taught'
+            return _cr.mark_learned(
+                self.store,cyc,
+                model_version=str(getattr(self.brain,'model_version',0)),
+                skipped=skipped,validate_proof=proof)
+        except Exception as exc:
+            self.store.event('warning','Cycle COMPLETE after commit skipped',
+                             {'deal_id':str(deal_id),'type':type(exc).__name__})
+            return None
 
     def _claim_trade_learned(self,deal_id,*,source=None,pnl=None):
         """Durable CLAIMED lease before weight mutation (P0-13).
@@ -5997,16 +6110,20 @@ class SingleTradeEngine:
     def _mark_trade_applied(self,deal_id,*,mode=None,pnl=None,source=None):
         """APPLIED only — COMMITTED waits until brain.save() succeeds."""
         from . import learn_attempt as _la
+        att=_la.get_attempt(self.store,deal_id)
+        aid=str((att or {}).get('attempt_id') or '')
         _la.transition(
             self.store,deal_id,'APPLIED',pnl=pnl,source=source)
+        already=self._weights_saved_for_attempt(deal_id,aid)
         self.store.set('learn_pending_commit:'+str(deal_id),{
             'at':now(),'mode':mode,'pnl':pnl,'source':source,
-            'weights_saved':False,
+            'weights_saved':bool(already),'attempt_id':aid,
         })
         meta=self.store.get('learned_trade:'+str(deal_id)) or {}
         if isinstance(meta,dict):
             meta=dict(meta);meta['mode']=mode;meta['learned']=False
             meta['applied_pending_commit']=True
+            meta['attempt_id']=aid
             self.store.set('learned_trade:'+str(deal_id),meta)
 
     def _mark_trade_learned(self,deal_id,*,mode=None,pnl=None,source=None):
@@ -6032,7 +6149,11 @@ class SingleTradeEngine:
             self.store.set('learned_trade:'+str(deal_id),meta)
 
     def _recover_pending_learn_commits(self):
-        """Crash between save and COMMITTED: finish COMMITTED if weights saved."""
+        """Crash between save and COMMITTED: finish COMMITTED if weights saved.
+
+        Also finishes FSM VALIDATE/COMPLETE for that deal. If weights already
+        saved for the attempt_id, never re-train — only commit + complete.
+        """
         from . import learn_attempt as _la
         try:
             rows=self.store.db.execute(
@@ -6045,15 +6166,38 @@ class SingleTradeEngine:
             deal=str(deal_id)
             pending=self.store.get('learn_pending_commit:'+deal)
             att=_la.get_attempt(self.store,deal)
+            aid=str((att or {}).get('attempt_id')
+                    or (pending or {}).get('attempt_id') or '')
+            weights_ok=self._weights_saved_for_attempt(deal,aid)
             if not isinstance(pending,dict):
-                # APPLIED without COMMITTED after restart → needs recovery.
+                # APPLIED without COMMITTED after restart → needs recovery
+                # unless weights already on disk for this attempt.
                 if att and att.get('state')==_la.STATE_APPLIED:
-                    _la.recover_incomplete(self.store,deal)
+                    if weights_ok:
+                        self._mark_trade_learned(
+                            deal,mode=(att or {}).get('mode'),
+                            pnl=(att or {}).get('pnl'),
+                            source=(att or {}).get('source') or 'broker')
+                        self._complete_cycle_after_commit(
+                            deal,mode=(att or {}).get('mode'),
+                            pnl=(att or {}).get('pnl'),
+                            source=(att or {}).get('source') or 'broker',
+                            taught=True)
+                        n+=1
+                    else:
+                        _la.recover_incomplete(self.store,deal)
                 continue
-            if pending.get('weights_saved'):
+            if pending.get('weights_saved') or weights_ok:
+                if not pending.get('weights_saved') and weights_ok:
+                    pend=dict(pending);pend['weights_saved']=True
+                    pend['attempt_id']=aid
+                    self.store.set('learn_pending_commit:'+deal,pend)
                 self._mark_trade_learned(
                     deal,mode=pending.get('mode'),pnl=pending.get('pnl'),
                     source=pending.get('source') or 'broker')
+                self._complete_cycle_after_commit(
+                    deal,mode=pending.get('mode'),pnl=pending.get('pnl'),
+                    source=pending.get('source') or 'broker',taught=True)
                 n+=1
             else:
                 _la.recover_incomplete(self.store,deal)
@@ -6416,7 +6560,8 @@ class SingleTradeEngine:
                             (deal,)).fetchone()
                         jsrc=str((jrow or [None])[0] or '')
                         teachers=self.store.get('teachers_settled:'+deal)
-                        learned=bool(self._trade_already_learned(deal))
+                        # DONE needs COMMITTED — never in-flight / already_learned.
+                        learned=bool(self._trade_learn_committed(deal))
                         if (realized.get('may_teach')
                                 and jsrc in ('broker','live_funds_mirror')
                                 and (teachers or learned)):
@@ -6437,7 +6582,7 @@ class SingleTradeEngine:
                             except Exception:
                                 pass
                             teachers=self.store.get('teachers_settled:'+deal)
-                            learned=bool(self._trade_already_learned(deal))
+                            learned=bool(self._trade_learn_committed(deal))
                             settled=bool(teachers or learned)
                     except Exception:
                         settled=False
@@ -6833,7 +6978,6 @@ class SingleTradeEngine:
         hint_ccy=(confirmation.get('pnl_currency') or confirmation.get('currency') or '').strip().upper() or None
         # Allow overwrite when we finally have broker cash after a vanish guess.
         overwrite=(confirmation.get('source')!='position_disappeared') or broker_pnl is not None
-        already_learned=self._trade_already_learned(deal_id)
         teachers_settled=bool(self.store.get('teachers_settled:'+str(deal_id)))
         from . import realized_cash as _rc_learn
         raw_pref=str(confirmation.get('pnl_source') or '').strip().lower()
@@ -6863,7 +7007,12 @@ class SingleTradeEngine:
             confirmation.get('correction')
             or (isinstance(self.store.get('learn_correction:'+str(deal_id)),dict)
                 and self.store.get('learn_correction:'+str(deal_id)).get('status')=='QUEUED'))
-        if (already_learned or teachers_settled) and not correction_reteach:
+        neural_needs_recovery=self._trade_learn_needs_recovery(deal_id)
+        learn_committed=self._trade_learn_committed(deal_id)
+        # Incomplete neural recovery must NOT be blocked by finished teachers.
+        # Only COMMITTED (not in-flight) counts as finished teach for this gate.
+        if ((learn_committed or (teachers_settled and not neural_needs_recovery))
+                and not correction_reteach):
             if broker_pnl is not None:
                 currency=self._cash_currency(hint_ccy) or self._account_currency()
                 late_src=pref_src
@@ -7066,7 +7215,13 @@ class SingleTradeEngine:
                 pnl_source='broker'
                 currency=ccy_l
                 teach_like=True
-            # No synthetic learn: ingest / no non-ledger broker fallback.
+            elif (not realized.get('may_teach')
+                    and pnl_source=='broker' and pnl_value is not None):
+                # Explicit Capital broker £ in confirmation, no ledger row yet
+                # (and no invent learn:{deal}). Neural may teach once; Funds
+                # ingest later becomes ledger authority for corrections.
+                # Never UPL / estimate / blank.
+                teach_like=True
         except Exception:
             teach_like=False
         bank_like=teach_like
@@ -7127,12 +7282,21 @@ class SingleTradeEngine:
         # Critical #5: claim BEFORE weight mutation. Only claim when we will
         # actually train — null/zero-repeat must not burn once-only learn.
         claimed_neural=False
+        skip_delta_w=False  # weights already saved for this attempt_id
         if repeats>0 and label is not None:
             claimed_neural=bool(self._claim_trade_learned(
                 deal_id,source=pnl_source,pnl=pnl_value))
             if not claimed_neural:
                 # Already committed / forbidden source / in-flight — skip ΔW.
                 repeats=0
+            elif claimed_neural:
+                from . import learn_attempt as _la_chk
+                att_chk=_la_chk.get_attempt(self.store,deal_id)
+                aid_chk=str((att_chk or {}).get('attempt_id') or '')
+                if self._weights_saved_for_attempt(deal_id,aid_chk):
+                    # Crash replay: disk already has this attempt — no re-train.
+                    skip_delta_w=True
+                    repeats=0
         # Audit #17: trade-PnL via AdaptiveBrain.learn_from_trade — separate
         # counters/weights from minute-direction; does not bump minute labeled.
         # Real self-improvement: snapshot → learn → holdout £/acc gate →
@@ -7140,7 +7304,7 @@ class SingleTradeEngine:
         last_delta=None
         any_real_dw=False
         gate_decision=None
-        if repeats>0 and label is not None and claimed_neural:
+        if repeats>0 and label is not None and claimed_neural and not skip_delta_w:
             from . import learn_gate
             def _closed_trade_weight_steps():
                 local_losses=[];local_delta=None;local_dw=False
@@ -7263,7 +7427,8 @@ class SingleTradeEngine:
             'structure_at_open':structure_at_open,
             'structure_at_close':structure_at_close})
         # Joint system: cash/UPL peļņa teaches SL/TP + banks day-book once.
-        if teach_like:
+        # Neural recovery after crash must not re-run already-finished teachers.
+        if teach_like and not teachers_settled:
             bk=saved.get('bracket_kappa');bs=saved.get('bracket_sl_scale')
             if bk is None or bs is None:
                 cur=bracket_learn.load_params(self.store);bk,bs=cur['kappa'],cur['sl_scale']
@@ -7440,40 +7605,36 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Forward-live record skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
-        # Persist weights BEFORE COMMITTED/COMPLETE.
-        self.brain.save()
-        weights_saved=True
-        if pending_commit:
-            pend=self.store.get('learn_pending_commit:'+str(deal_id))
-            if isinstance(pend,dict):
-                pend=dict(pend);pend['weights_saved']=True
-                self.store.set('learn_pending_commit:'+str(deal_id),pend)
+        # Persist weights BEFORE COMMITTED/COMPLETE (attempt_id idempotent).
+        weights_saved=False
+        if pending_commit or claimed_neural or skip_delta_w:
+            weights_saved, _aid=self._persist_learn_weights(deal_id)
+        else:
+            # No neural claim — still flush brain for non-learn bookkeeping.
+            self.brain.save()
+            weights_saved=False
+        if pending_commit or (claimed_neural and weights_saved):
             self._mark_trade_learned(
                 deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
-        # COMPLETE only AFTER save + COMMITTED.
-        try:
-            from . import cycle_runtime as _cr
-            cyc=_cr.load_by_deal(self.store,str(deal_id))
-            if cyc and str(cyc.get('deal_id') or '') in ('',str(deal_id)):
-                committed=bool(self._trade_already_learned(deal_id))
-                teachers=self.store.get('teachers_settled:'+str(deal_id))
-                _cr.mark_learned(
-                    self.store,cyc,
-                    model_version=str(getattr(self.brain,'model_version',0)),
-                    skipped=not (claimed_neural and teach_like),
-                    validate_proof={
-                        'deal_id':str(deal_id),
-                        'pnl_source':persist_source,
-                        'taught':bool(claimed_neural and teach_like),
-                        'journal_persisted':True,
-                        'teachers_settled':bool(teachers),
-                        'learn_committed':committed,
-                        'adaptive_done':bool(adaptive_done),
-                        'bracket_done':bool(bracket_done),
-                        'weights_saved':weights_saved,
-                    })
-        except Exception:
-            pass
+        # COMPLETE only AFTER save + real COMMITTED (not in-flight).
+        taught_ok=bool(
+            claimed_neural and teach_like
+            and self._trade_learn_committed(deal_id) and weights_saved)
+        skip_reason=None
+        if not taught_ok:
+            if not teach_like:
+                skip_reason='awaiting_funds_ledger'
+            elif not claimed_neural:
+                skip_reason='neural_not_claimed'
+            elif not weights_saved:
+                skip_reason='weights_not_saved'
+            elif not self._trade_learn_committed(deal_id):
+                skip_reason='learn_not_committed'
+            else:
+                skip_reason='neural_not_taught'
+        self._complete_cycle_after_commit(
+            deal_id,mode=mode,pnl=pnl_value,source=persist_source,
+            taught=taught_ok,skip_reason=skip_reason)
         weights_updated=bool(repeats>0 and weights_moved and claimed_neural)
         gate_info=None
         if isinstance(gate_decision,dict):

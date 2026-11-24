@@ -230,23 +230,44 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
                     store, cash_id=cid, corrected_amount_minor=target,
                     currency=ev.get('currency') or 'GBP',
                     note='capital_amount_amendment', outbox=outbox)
-                # Amount amend must not block a late deal_link on UNMATCHED.
+                # Amount amend may link only UNMATCHED — never rebind SETTLED.
                 if new_deal:
                     try:
                         linked = link_deal(store, cid, new_deal)
                         result = dict(result)
                         result['event'] = linked
                         result['linked'] = True
+                    except ValueError as exc:
+                        if 'SOURCE_CONFLICT' in str(exc) or 'deal_link' in str(exc):
+                            conflict = _record_deal_link_conflict(
+                                store, cid, new_deal, note=str(exc))
+                            result = dict(result)
+                            result['conflict'] = conflict
+                            result['linked'] = False
                     except Exception:
                         pass
                 return result
             # Identical net / exact key — no double count, BUT allow late
             # deal_link when existing row is still UNMATCHED / MATCH_UNCERTAIN.
+            # Verified SETTLED with a different deal → SOURCE_CONFLICT.
             for existing in same:
                 if _event_key(existing) == key or (
                         target is not None and current == target):
                     old_deal = str(existing.get('deal_link') or '').strip()
                     old_st = str(existing.get('status') or '')
+                    if new_deal and old_deal and new_deal != old_deal and old_st in (
+                            STATUS_SETTLED, STATUS_SETTLED_ZERO):
+                        conflict = _record_deal_link_conflict(
+                            store, cid, new_deal,
+                            note=f'verified_deal={old_deal}')
+                        return {
+                            'appended': False,
+                            'duplicate': True,
+                            'linked': False,
+                            'conflict': True,
+                            'event': conflict,
+                            'outbox_enqueued': False,
+                        }
                     if new_deal and (
                             not old_deal
                             or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
@@ -268,6 +289,19 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
         if _event_key(existing) == key:
             old_deal = str(existing.get('deal_link') or '').strip()
             old_st = str(existing.get('status') or '')
+            if new_deal and old_deal and new_deal != old_deal and old_st in (
+                    STATUS_SETTLED, STATUS_SETTLED_ZERO):
+                conflict = _record_deal_link_conflict(
+                    store, cid, new_deal,
+                    note=f'verified_deal={old_deal}')
+                return {
+                    'appended': False,
+                    'duplicate': True,
+                    'linked': False,
+                    'conflict': True,
+                    'event': conflict,
+                    'outbox_enqueued': False,
+                }
             if new_deal and (
                     not old_deal
                     or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
@@ -560,8 +594,45 @@ def apply_correction(store, *, cash_id: str, corrected_amount_minor: int,
     return result
 
 
+def _record_deal_link_conflict(store, cash_id: str, new_deal: str,
+                               *, note: str = '') -> dict:
+    """Append SOURCE_CONFLICT marker — never overwrite a verified deal_link."""
+    events = load_events(store)
+    base = None
+    for ev in events:
+        if str(ev.get('cash_id') or '') == str(cash_id):
+            base = ev
+            break
+    if base is None:
+        raise ValueError(f'unknown cash_id: {cash_id}')
+    conflict = cash_event(
+        account_id=base['account_id'],
+        environment=base.get('environment') or 'demo',
+        cash_id=cash_id,
+        transaction_id=base.get('transaction_id'),
+        transaction_type='CORRECTION',
+        close_proof=False,
+        status=STATUS_SOURCE_CONFLICT,
+        amount_minor=None,
+        currency=base.get('currency') or 'GBP',
+        deal_link=str(new_deal),
+        revision=int(base.get('revision') or 1) + 1000,
+        note='deal_link_conflict|' + (note or ''),
+        raw={'existing_deal': base.get('deal_link'), 'attempted_deal': new_deal},
+    )
+    conflict['status'] = STATUS_SOURCE_CONFLICT
+    # Avoid recursive conflict handling via append_event duplicate path.
+    events.append(conflict)
+    _save_events(store, events)
+    return conflict
+
+
 def link_deal(store, cash_id: str, deal_id: str) -> dict:
-    """Attach unique deal proof; clears MATCH_UNCERTAIN / UNMATCHED (T32)."""
+    """Attach unique deal proof; clears MATCH_UNCERTAIN / UNMATCHED (T32).
+
+    Never rebinds a verified SETTLED/SETTLED_ZERO deal to a different id —
+    that is SOURCE_CONFLICT.
+    """
     deal = str(deal_id or '').strip()
     if not deal:
         raise ValueError('deal_id required')
@@ -570,13 +641,23 @@ def link_deal(store, cash_id: str, deal_id: str) -> dict:
     for ev in events:
         if str(ev.get('cash_id') or '') != str(cash_id):
             continue
-        ev['deal_link'] = deal
-        if ev.get('status') in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN):
-            if ev.get('amount_minor') == 0:
-                ev['status'] = STATUS_SETTLED_ZERO
-            else:
-                ev['status'] = STATUS_SETTLED
-        updated = ev
+        old_deal = str(ev.get('deal_link') or '').strip()
+        old_st = str(ev.get('status') or '')
+        if (old_deal and old_deal != deal
+                and old_st in (STATUS_SETTLED, STATUS_SETTLED_ZERO)):
+            raise ValueError(
+                f'SOURCE_CONFLICT: cash_id {cash_id} already linked to {old_deal}')
+        # Only upgrade unlinked / uncertain rows.
+        if old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN) or not old_deal:
+            ev['deal_link'] = deal
+            if ev.get('status') in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN):
+                if ev.get('amount_minor') == 0:
+                    ev['status'] = STATUS_SETTLED_ZERO
+                else:
+                    ev['status'] = STATUS_SETTLED
+            updated = ev
+        elif old_deal == deal:
+            updated = ev
     if updated is None:
         raise ValueError(f'unknown cash_id: {cash_id}')
     _save_events(store, events)
@@ -816,4 +897,5 @@ __all__ = [
     'list_account_events', 'classify_pnl_source', 'to_minor', 'from_minor',
     'format_ui_amount', 'parse_broker_cash_amount',
     'quarantine_learn_synthetic', '_is_learn_synthetic',
+    '_record_deal_link_conflict',
 ]

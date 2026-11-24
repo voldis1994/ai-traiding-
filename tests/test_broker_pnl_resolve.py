@@ -29,16 +29,22 @@ class HistoryBroker:
         return {'activities':acts}
 
 
-def test_resolve_uses_activity_profit_not_ticks_only():
+def test_resolve_uses_funds_profit_not_ticks_only():
+    """P0: Funds TRADE cash settles; Activity alone must not invent broker £."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
             broker=HistoryBroker()
+            # Activity-only → still pending (no ledger ingest from Activity).
             broker.acts=[{'dealId':'d1','details':{'profit':-0.21},'currency':'GBP'}]
             e.attach(broker)
-            # attach() clears account — restore like live accounts() refresh.
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+            pnl,src,_ccy=await e._resolve_broker_pnl('d1',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            # Exact Funds row → broker cash.
+            broker.tx=[{'dealId':'d1','pnl':-0.21,'currency':'GBP',
+                        'transactionId':'TX-d1','reference':'TX-d1'}]
             pnl,src,ccy=await e._resolve_broker_pnl('d1',{})
             assert pnl==pytest.approx(-0.21)
             assert src=='broker' and ccy=='GBP'

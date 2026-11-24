@@ -80,18 +80,15 @@ def test_vanish_waits_for_funds_then_teaches_once():
     asyncio.run(scenario())
 
 
-def test_activity_scan_without_deal_id_filter_finds_profit():
+def test_funds_exact_deal_id_finds_profit():
+    """Activity-only no longer settles; exact Funds dealId does."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
             e=SingleTradeEngine(store,brain)
-            broker=HistoryBroker()
-            # dealId filter path empty; unfiltered window has the row.
             class Selective(HistoryBroker):
                 async def activity(self,*,last_period=600,from_time=None,to_time=None,
                                    detailed=True,deal_id=None):
-                    if deal_id:
-                        return {'activities':[]}
                     return {'activities':[
                         {'dealId':'deal-xyz','details':{'profit':'£-0.17'},'currency':'GBP'}]}
             broker=Selective()
@@ -99,6 +96,10 @@ def test_activity_scan_without_deal_id_filter_finds_profit():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.upsert_trade({'dealId':'deal-xyz','epic':'GOLD','size':'.02',
                                 'direction':'BUY','level':100})
+            pnl,src,_=await e._resolve_broker_pnl('deal-xyz',{})
+            assert pnl is None and src=='pending_broker_pnl'
+            broker.tx=[{'dealId':'deal-xyz','pnl':-0.17,'currency':'GBP',
+                        'transactionId':'TX-xyz'}]
             pnl,src,ccy=await e._resolve_broker_pnl('deal-xyz',{})
             assert src=='broker' and pnl==pytest.approx(-0.17) and ccy=='GBP'
     asyncio.run(scenario())

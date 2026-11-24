@@ -861,3 +861,143 @@ def test_committed_only_after_weights_saved_flag():
         n2 = e._recover_pending_learn_commits()
         assert n2 >= 1
         assert la.is_committed(store, 'SV1')
+
+
+def test_teachers_settled_does_not_block_neural_recovery():
+    """P0: finished teachers must not block incomplete neural restart recovery."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        deal = 'REC1'
+        store.upsert_trade({
+            'dealId': deal, 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade(deal, 101, 1.5, currency='GBP', source='broker')
+        store.set('teachers_settled:' + deal, {'at': 'x', 'source': 'broker'})
+        from app import learn_attempt as la
+        assert la.claim(store, deal, source='broker', pnl=1.5) is not None
+        la.transition(store, deal, la.STATE_RUNNING)
+        e._mark_trade_applied(deal, mode='test', pnl=1.5, source='broker')
+        la.recover_incomplete(store, deal)
+        assert e._trade_learn_needs_recovery(deal) is True
+        assert e._trade_learn_committed(deal) is False
+        # Early gate uses committed / (teachers AND NOT recovery) — recovery wins.
+        assert e._trade_learn_needs_recovery(deal) and store.get(
+            'teachers_settled:' + deal)
+
+
+def test_in_flight_is_not_committed_proof():
+    """P0: work_queue DONE / COMPLETE must use COMMITTED, not in-flight."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        from app import learn_attempt as la
+        assert la.claim(store, 'IF1', source='broker', pnl=1.0) is not None
+        la.transition(store, 'IF1', la.STATE_RUNNING)
+        assert e._trade_already_learned('IF1') is True  # double-train guard
+        assert e._trade_learn_committed('IF1') is False
+        assert e._trade_learn_in_flight('IF1') is True
+        e._mark_trade_applied('IF1', mode='t', pnl=1.0, source='broker')
+        assert e._trade_learn_committed('IF1') is False
+        e._persist_learn_weights('IF1')
+        e._mark_trade_learned('IF1', mode='t', pnl=1.0, source='broker')
+        assert e._trade_learn_committed('IF1') is True
+
+
+def test_idempotent_weight_save_by_attempt_id():
+    """P0: crash between save and flag must not double-train on replay."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        from app import learn_attempt as la
+        att = la.claim(store, 'ID1', source='broker', pnl=2.0)
+        assert att is not None
+        aid = att['attempt_id']
+        la.transition(store, 'ID1', la.STATE_RUNNING)
+        e._mark_trade_applied('ID1', mode='t', pnl=2.0, source='broker')
+        ok1, a1 = e._persist_learn_weights('ID1')
+        assert ok1 and a1 == aid
+        meta = store.get('learn_weights_saved:ID1')
+        assert meta and meta.get('attempt_id') == aid
+        # Second call is idempotent — no error, same attempt.
+        ok2, a2 = e._persist_learn_weights('ID1')
+        assert ok2 and a2 == aid
+        assert e._weights_saved_for_attempt('ID1', aid) is True
+
+
+def test_validate_requires_weights_and_skip_reason():
+    """P0: VALIDATE needs weights_saved=True when taught; skip_reason when skipped."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cyc = cycle_runtime.begin_analysis_cycle(store, account_id='a')
+        cyc = cycle_runtime.mark_perceived(store, cyc, snapshot_id='b')
+        cyc = cycle_runtime.mark_analyzed(store, cyc)
+        cyc = cycle_runtime.decide(store, cyc, 'BUY', reason='edge')
+        cyc = cycle_runtime.mark_executed(store, cyc, deal_id='V1', deal_ref='R')
+        cycle_runtime.bind_deal(store, cyc, 'V1')
+        cyc = cycle_runtime.load_by_deal(store, 'V1')
+        cyc = cycle_runtime.mark_closed(store, cyc, close_proof='ok')
+        cyc = cycle_runtime.mark_settled(
+            store, cyc, funds_proof={'pnl': 1.0, 'source': 'broker'}, pending=False)
+        # taught without weights_saved → fail
+        bad = cycle_runtime.mark_learned(
+            store, dict(cyc), model_version='1',
+            validate_proof={
+                'deal_id': 'V1', 'pnl_source': 'broker',
+                'taught': True, 'journal_persisted': True,
+                'teachers_settled': True, 'learn_committed': True,
+                'adaptive_done': True, 'bracket_done': True,
+                # weights_saved missing
+            })
+        assert bad['complete'] is False
+        assert 'weights_not_saved' in (
+            (bad.get('stages') or {}).get('VALIDATE', {}).get('proof') or {}
+        ).get('reasons', [])
+        # skipped without skip_reason → fail
+        bad2 = cycle_runtime.mark_learned(
+            store, dict(cyc), model_version='1', skipped=True,
+            validate_proof={'deal_id': 'V1', 'journal_persisted': True})
+        assert bad2['complete'] is False
+        # skipped with reason → ok
+        ok = cycle_runtime.mark_learned(
+            store, cyc, model_version='1', skipped=True,
+            validate_proof={
+                'deal_id': 'V1', 'journal_persisted': True,
+                'skip_reason': 'neural_not_claimed',
+            })
+        assert ok['complete'] is True
+
+
+def test_ledger_no_rebind_verified_deal_source_conflict():
+    """P0: amount correction / ingest must not re-link SETTLED to another deal."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        out = cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 1.00, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='DEAL-A', transaction_id='TX-BIND')
+        assert (out.get('event') or out).get('status') == cash_ledger.STATUS_SETTLED
+        # Same cash_id, different deal → SOURCE_CONFLICT, keep DEAL-A.
+        out2 = cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 1.00, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'DEAL-B'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='DEAL-B', transaction_id='TX-BIND')
+        assert out2.get('conflict') is True or out2.get('linked') is False
+        events = cash_ledger.load_events(store)
+        settled = [e for e in events
+                   if e.get('status') == cash_ledger.STATUS_SETTLED
+                   and str(e.get('transaction_id') or '') == 'TX-BIND']
+        assert settled and settled[0].get('deal_link') == 'DEAL-A'
+        conflicts = [e for e in events
+                     if e.get('status') == cash_ledger.STATUS_SOURCE_CONFLICT]
+        assert conflicts
+        # link_deal refuse
+        cid = settled[0]['cash_id']
+        try:
+            cash_ledger.link_deal(store, cid, 'DEAL-B')
+            assert False, 'expected SOURCE_CONFLICT'
+        except ValueError as exc:
+            assert 'SOURCE_CONFLICT' in str(exc)

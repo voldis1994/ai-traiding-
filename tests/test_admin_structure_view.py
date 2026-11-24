@@ -268,4 +268,4 @@ def test_ohlc_page_splits_structure_and_decision_subtitle():
     assert 'lēmums:' in js
     assert '!inTrade&&view.swing_brackets' in js
     html = Path('app/web/admin/ohlc.html').read_text(encoding='utf-8')
-    assert 'ohlc-page.js?v=8' in html
+    assert 'ohlc-page.js?v=9' in html

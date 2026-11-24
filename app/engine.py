@@ -3920,9 +3920,16 @@ class SingleTradeEngine:
                 missing_tp=_broker_price_level(p.get('profitLevel')) is None
                 if missing_sl or missing_tp:
                     self.store.event('protection',
-                        'OPEN confirmed with incomplete brackets — queueing protect',
+                        'OPEN confirmed with incomplete brackets — force protect now',
                         {'deal_id':deal_s,'missing_sl':missing_sl,
                          'missing_tp':missing_tp})
+                    # Same-tick repair — do not wait for the next poll (Desk —/—).
+                    try:
+                        await self.protect_position(p,force=True)
+                    except Exception as exc:
+                        self.store.event('warning',
+                            'Force protect after OPEN failed — poll will retry',
+                            {'deal_id':deal_s,'type':type(exc).__name__})
         if kind=='PROTECT' and deal_id is not None:
             p=next((x for x in (self.positions or [])
                     if str(x.get('dealId'))==str(deal_id)),None)
@@ -7842,12 +7849,24 @@ class SingleTradeEngine:
         decided_sl=decided_tp=stop_lvl=profit_lvl=None
         source='swing_anchor'
         bp={}
-        # Prefer OHLC swing; if thin/unavailable, repair from OPEN snapshot
-        # (same distances Capital was sent) so a naked fill is never left bare.
+        # OPEN snapshot first when Capital left SL/TP Off — same distances we
+        # already POSTed. Waiting for swing recompute left Desk —/— for minutes.
         snap=self.store.get('open_brackets:'+deal_s) or {}
         snap_sl=_num(snap.get('stop_distance')) if isinstance(snap,dict) else None
         snap_tp=_num(snap.get('profit_distance')) if isinstance(snap,dict) else None
-        if len(candles)>=20:
+        robot_open=bool(self.store.get('robot_open:'+deal_s))
+        use_snap_first=(robot_open and snap_sl and snap_tp
+                        and float(snap_sl)>0 and float(snap_tp)>0
+                        and (live_sl is None or live_tp is None))
+        if use_snap_first:
+            decided_sl=float(snap_sl);decided_tp=float(snap_tp)
+            stop_lvl=level-sign*float(decided_sl)
+            profit_lvl=level+sign*float(decided_tp)
+            source='open_snapshot'
+            self.store.event('protection','Protect from OPEN bracket snapshot',{
+                'deal_id':deal_s,'stop_distance':decided_sl,
+                'profit_distance':decided_tp,'prefer':'snapshot_first'})
+        elif len(candles)>=20:
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             spread=float(self.market.get('spread') or 0)
@@ -7993,7 +8012,9 @@ class SingleTradeEngine:
             profit=float(profit)
         # One PUT per backoff window — blocks same-poll triple call (early /
         # after-candles / mid-manage) from hammering Capital.
-        self._mark_protect_runtime(p.get('dealId'),'IN_FLIGHT',wait_sec=8.0)
+        # Snapshot repair after OPEN: short cool-down so Desk SL/TP lands fast.
+        flight_wait=3.0 if source=='open_snapshot' else 8.0
+        self._mark_protect_runtime(p.get('dealId'),'IN_FLIGHT',wait_sec=flight_wait)
         manual=not bool(self.store.get('robot_open:'+str(p.get('dealId'))))
         order_id=self.store.order('PROTECT',p['dealId'],{'stop':stop,'profit':profit,'tick':tick})
         try:

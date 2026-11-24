@@ -2,9 +2,13 @@
 
 Never remaps LIVE broker £ onto the shadow vote. Each closed M1 bar the shadow
 neural core votes BUY/SELL/HOLD; this journal opens/closes a virtual position
-using the *same* execution rules as LIVE: spread fill, optional slip, fill
-delay and fixed SL/TP brackets (trail hard OFF). Opposite-signal flip exits
-are forbidden — LIVE closes only via SL/TP.
+using V3 B05–B08 / H03–H04 rules: bid/ask-side SL/TP triggers (BUY closes on
+bid, SELL on ask), optional slip, fill delay, fixed SL/TP (trail hard OFF),
+no invented high/low from mid, and conservative SL when both hit the same bar
+without tick sequence. Opposite-signal flip exits are forbidden.
+
+Optional zone/structure/entry gate kwargs veto paper OPEN when ``allowed`` is
+False. Paper cash stays separate from LIVE Funds.
 
 Price-unit moves are converted to account-currency cash via a scale estimated
 from recent LIVE broker trades (broker_£ / signed price move). Without that
@@ -17,11 +21,19 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .trade_costs import fill_price as _shared_fill_price, half_spread
+from .trade_costs import (
+    adverse_slip as _adverse_slip,
+    fill_price as _shared_fill_price,
+    half_spread,
+)
 
 STORE_KEY = 'shadow_paper_journal_v1'
 STATE_KEY = 'shadow_paper_state_v1'
 _SEED_MAX_ROWS = 400
+
+# V3 B08 / H04: when SL and TP both touch the same bar and tick order is
+# unknown, never take the optimistic TP — always close as stop-loss.
+SAME_BAR_BOTH_HIT_POLICY = 'conservative_sl'
 
 def _store_exec_defaults(store):
     """Operating friction comes from self_params Store — never frozen module constants."""
@@ -76,7 +88,11 @@ def cash_per_price_unit(live_rows, *, min_samples=3):
 
 
 def _bar_mid_hl(bar, *, default_spread=0.):
-    """Normalize a path bar dict/tuple to (mid, high, low, spread)."""
+    """Normalize a path bar dict/tuple to (mid, high, low, spread).
+
+    H03: never invent high/low from mid — missing extremes stay None so
+    callers can mark an incomplete path instead of fabricating range.
+    """
     if isinstance(bar,(list,tuple)):
         if len(bar)>=4:
             o,h,l,c=bar[0],bar[1],bar[2],bar[3]
@@ -95,8 +111,6 @@ def _bar_mid_hl(bar, *, default_spread=0.):
     low=_finite(bar.get('low')) if isinstance(bar,dict) else None
     sp=_finite(bar.get('spread')) if isinstance(bar,dict) else None
     if sp is None:sp=float(default_spread or 0)
-    if high is None:high=mid
-    if low is None:low=mid
     return mid,high,low,float(sp)
 
 
@@ -141,9 +155,9 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
     for i,bar in enumerate(bars):
         mid,hi,lo,sp_i=_bar_mid_hl(bar,default_spread=sp)
         if mid is None:continue
-        if hi is None:hi=mid
-        if lo is None:lo=mid
-        hi=max(hi,mid);lo=min(lo,mid)
+        # H03: incomplete OHLC → skip SL/TP this bar (do not invent H/L from mid).
+        if hi is None or lo is None:
+            continue
         sp_bar=float(sp_i if sp_i is not None else sp)
         if trail:
             # Mirror LIVE adaptive arm: BE lock once MFE covers trail_arm fraction.
@@ -174,7 +188,8 @@ def simulate_action_on_path(action, bars, *, spread=0., stop_distance=None,
             pnl=_close_price_pnl(action,entry,exit_px)
             return {'pnl':float(pnl),'reason':reason,'entry':float(entry),
                     'exit':float(exit_px),'bars_held':i+1,'path':True,
-                    'stop':float(stop),'profit':float(profit)}
+                    'stop':float(stop),'profit':float(profit),
+                    'same_bar_both_hit_policy':SAME_BAR_BOTH_HIT_POLICY}
     mid_l,_,_,sp_l=_bar_mid_hl(bars[-1],default_spread=sp)
     if mid_l is None:return None
     close_dir='SELL' if action=='BUY' else 'BUY'
@@ -282,24 +297,71 @@ def paper_trail_stop(direction, entry, stop, profit, *, high, low, mid, spread,
 
 
 def hit_sl_tp(direction, *, high, low, stop, profit, mid, spread, slip_bps=0.):
-    """Return (exit_px, reason) if SL or TP is touched this bar; SL wins if both."""
+    """Return (exit_px, reason) if SL/TP is touched on the executable close side.
+
+    V3 B05/B08: BUY closes on bid, SELL on ask. With mid bar extremes and full
+    spread ``s``, bid=mid−s/2 and ask=mid+s/2 — never test TP on the opposite
+    side of the spread (the mid-bar bug that treated BUY TP as ask / SELL TP as
+    bid).
+
+    Same-bar both-hit without tick sequence → ``SAME_BAR_BOTH_HIT_POLICY``
+    (``conservative_sl``): close as SL with gap-aware adverse fill, never
+    optimistic TP. Callers must pass real high/low; missing extremes → None
+    (H03: do not invent H/L from mid).
+
+    SL/TP fills apply gap-through extremes and adverse ``slip_bps``.
+    """
     high=_finite(high);low=_finite(low)
     stop=_finite(stop);profit=_finite(profit)
     if high is None or low is None:return None
     half=half_spread(spread)
+    mid_m=_finite(mid)
+    slip_ref=mid_m if mid_m is not None else (high+low)/2.
+    slip=_adverse_slip(slip_ref,slip_bps)
     if direction=='BUY':
-        if stop is not None and low-half<=stop:
-            return float(stop),'sl'
-        if profit is not None and high+half>=profit:
-            exit_px=_fill_price('SELL',profit,0.,slip_bps=slip_bps)
-            return float(exit_px),'tp'
+        # Executable bid extremes this bar (close side for BUY).
+        bid_hi=high-half
+        bid_lo=low-half
+        sl_hit=stop is not None and bid_lo<=stop
+        tp_hit=profit is not None and bid_hi>=profit
+        if sl_hit:
+            # Gap through SL → worse of stop and lowest bid; then adverse slip.
+            fill=min(float(stop),bid_lo)-slip
+            return float(fill),'sl'
+        if tp_hit:
+            # Conservative TP fill at level − adverse exit slip (no optimistic gap).
+            return float(profit)-slip,'tp'
     elif direction=='SELL':
-        if stop is not None and high+half>=stop:
-            return float(stop),'sl'
-        if profit is not None and low-half<=profit:
-            exit_px=_fill_price('BUY',profit,0.,slip_bps=slip_bps)
-            return float(exit_px),'tp'
+        # Executable ask extremes this bar (close side for SELL).
+        ask_hi=high+half
+        ask_lo=low+half
+        sl_hit=stop is not None and ask_hi>=stop
+        tp_hit=profit is not None and ask_lo<=profit
+        if sl_hit:
+            fill=max(float(stop),ask_hi)+slip
+            return float(fill),'sl'
+        if tp_hit:
+            return float(profit)+slip,'tp'
     return None
+
+
+def _gate_blocks_paper_open(*, entry_gate=None, zone_gate=None,
+                            structure_gate=None, entry_context=None):
+    """True when a provided zone/structure/entry gate vetoes paper OPEN.
+
+    Only blocks when a gate dict is supplied with ``allowed is False``.
+    Omitted gates are ignored (engine may still stamp diagnostic context
+    without wiring the veto — H02/H04 wiring is additive on this signature).
+    """
+    for g in (entry_gate,zone_gate,structure_gate):
+        if isinstance(g,dict) and g.get('allowed') is False:
+            return True
+    if isinstance(entry_context,dict):
+        for key in ('entry_gate','zone_gate','structure_gate','ohlc_entry'):
+            g=entry_context.get(key)
+            if isinstance(g,dict) and g.get('allowed') is False:
+                return True
+    return False
 
 
 class ShadowPaperJournal:
@@ -435,10 +497,16 @@ class ShadowPaperJournal:
                stop_distance=None, profit_distance=None,
                kappa=None, sl_scale=None,
                model_version=None, slip_bps=None, fill_delay_bars=None,
-               shadow_transition=None, entry_context=None):
+               shadow_transition=None, entry_context=None,
+               entry_gate=None, zone_gate=None, structure_gate=None):
         """Advance paper book one closed bar. Returns closed row or None.
 
-        Execution matches LIVE: SL/TP/trail only — never exit on opposite signal.
+        Execution: fixed SL/TP only (trail HARD OFF) — never exit on opposite
+        signal. Paper cash stays independent of LIVE Funds.
+
+        Optional ``entry_gate`` / ``zone_gate`` / ``structure_gate``: when a
+        dict with ``allowed is False`` is provided, paper OPEN is vetoed
+        (V3 H02/H04 zone parity). Omitted gates do not block.
         """
         mid=_finite(mid);sp=_finite(spread) or 0.
         if mid is None or mid<=0:return None
@@ -455,16 +523,14 @@ class ShadowPaperJournal:
             if fill_delay_bars is None:fill_delay_bars=d_delay
         slip=float(slip_bps)
         delay=max(0,int(fill_delay_bars))
+        # H03: never invent high/low from mid — incomplete path skips SL/TP.
         hi=_finite(high);lo=_finite(low)
-        if hi is None:hi=mid
-        if lo is None:lo=mid
-        hi=max(hi,mid);lo=min(lo,mid)
         closed=None
 
         pos=self.position
-        if pos is not None:
+        if pos is not None and hi is not None and lo is not None:
             direction=pos.get('direction')
-            # Trail HARD OFF — same as LIVE: fixed OHLC SL/TP only (no tip±gap).
+            # Trail HARD OFF — fixed OHLC SL/TP only (no tip±gap).
             hit=hit_sl_tp(direction,high=hi,low=lo,stop=pos.get('stop'),
                           profit=pos.get('profit'),mid=mid,spread=sp,slip_bps=slip)
             if hit is not None:
@@ -473,46 +539,62 @@ class ShadowPaperJournal:
                     reason='trail'
                 closed=self._close_row(pos,exit_px,bar_time=bar_time,spread=sp,reason=reason)
 
+        gate_block=_gate_blocks_paper_open(
+            entry_gate=entry_gate,zone_gate=zone_gate,
+            structure_gate=structure_gate,entry_context=entry_context)
+
         if self.position is None and self.pending is not None:
             pend=self.pending
-            due=int(pend.get('open_on_bar') or 0)
-            if self.bars_seen>=due and pend.get('direction') in ('BUY','SELL'):
-                self._open_position(
-                    pend['direction'],mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
-                    stop_distance=pend.get('stop_distance'),
-                    profit_distance=pend.get('profit_distance'),
-                    tick=pend.get('tick') or tick,
-                    min_distance=pend.get('min_distance') or min_distance,
-                    model_version=pend.get('model_version'),
-                    shadow_transition=pend.get('shadow_transition'),
-                    kappa=pend.get('kappa'),sl_scale=pend.get('sl_scale'),
-                    entry_context=pend.get('entry_context'))
+            # Re-check gate at fill time (H03 plan validity); cancel if vetoed.
+            pend_ctx=pend.get('entry_context')
+            pend_block=_gate_blocks_paper_open(
+                entry_gate=entry_gate,zone_gate=zone_gate,
+                structure_gate=structure_gate,entry_context=pend_ctx)
+            if pend_block or gate_block:
+                self.pending=None
+            else:
+                due=int(pend.get('open_on_bar') or 0)
+                if self.bars_seen>=due and pend.get('direction') in ('BUY','SELL'):
+                    self._open_position(
+                        pend['direction'],mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
+                        stop_distance=pend.get('stop_distance'),
+                        profit_distance=pend.get('profit_distance'),
+                        tick=pend.get('tick') or tick,
+                        min_distance=pend.get('min_distance') or min_distance,
+                        model_version=pend.get('model_version'),
+                        shadow_transition=pend.get('shadow_transition'),
+                        kappa=pend.get('kappa'),sl_scale=pend.get('sl_scale'),
+                        entry_context=pend.get('entry_context'))
 
         if self.position is None and self.pending is None and action in ('BUY','SELL'):
-            # No OHLC SL/TP → skip paper open (do not queue fantasy 2×tick brackets).
-            sd_ok=_finite(stop_distance);pd_ok=_finite(profit_distance)
-            if sd_ok is not None and sd_ok>0 and pd_ok is not None and pd_ok>0:
-                if delay<=0:
-                    self._open_position(
-                        action,mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
-                        stop_distance=stop_distance,profit_distance=profit_distance,
-                        tick=tick,min_distance=min_distance,
-                        model_version=model_version,
-                        shadow_transition=shadow_transition,
-                        kappa=kappa,sl_scale=sl_scale,
-                        entry_context=entry_context)
-                else:
-                    self.pending={
-                        'direction':action,
-                        'open_on_bar':self.bars_seen+delay,
-                        'stop_distance':stop_distance,'profit_distance':profit_distance,
-                        'tick':tick,'min_distance':min_distance,
-                        'model_version':model_version,
-                        'shadow_transition':shadow_transition,
-                        'kappa':kappa,'sl_scale':sl_scale,
-                        'signal_bar':bar_time,
-                        'entry_context':entry_context if isinstance(entry_context,dict) else None,
-                    }
+            # Zone/structure veto when provided — do not ignore (V3 H04).
+            if gate_block:
+                pass
+            else:
+                # No OHLC SL/TP → skip paper open (do not queue fantasy 2×tick brackets).
+                sd_ok=_finite(stop_distance);pd_ok=_finite(profit_distance)
+                if sd_ok is not None and sd_ok>0 and pd_ok is not None and pd_ok>0:
+                    if delay<=0:
+                        self._open_position(
+                            action,mid=mid,spread=sp,slip_bps=slip,bar_time=bar_time,
+                            stop_distance=stop_distance,profit_distance=profit_distance,
+                            tick=tick,min_distance=min_distance,
+                            model_version=model_version,
+                            shadow_transition=shadow_transition,
+                            kappa=kappa,sl_scale=sl_scale,
+                            entry_context=entry_context)
+                    else:
+                        self.pending={
+                            'direction':action,
+                            'open_on_bar':self.bars_seen+delay,
+                            'stop_distance':stop_distance,'profit_distance':profit_distance,
+                            'tick':tick,'min_distance':min_distance,
+                            'model_version':model_version,
+                            'shadow_transition':shadow_transition,
+                            'kappa':kappa,'sl_scale':sl_scale,
+                            'signal_bar':bar_time,
+                            'entry_context':entry_context if isinstance(entry_context,dict) else None,
+                        }
 
         self._persist()
         return closed

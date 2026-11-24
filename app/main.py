@@ -93,7 +93,7 @@ async def worker():
                     pass
                 if hasattr(engine,'_ensure_live_unless_operator_paused'):
                     engine._ensure_live_unless_operator_paused()
-        await asyncio.sleep(3 if error_count<3 else 10)
+        await asyncio.sleep(1.0 if error_count<3 else 5)
 
 @asynccontextmanager
 async def lifespan(app):

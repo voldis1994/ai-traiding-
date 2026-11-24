@@ -2197,29 +2197,30 @@ class RuntimeHub:
                         engine.armed=True
                         engine.execution_enabled=True
                         store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                    # Fast WS quote ticks while flat + intent — catch break/zone
-                    # without waiting the next heavy 3s poll.
-                    if (not engine.positions and engine.mandate
-                            and hasattr(engine,'quote_entry_tick')
-                            and engine._wants_fast_entry_ticks()):
-                        for _ in range(2):
-                            await asyncio.sleep(1)
+                    # Light quote loop between heavy polls — WS mid/UPL must
+                    # keep up with Capital ticks (was 2×1s or idle 3s).
+                    if engine.mandate:
+                        open_book=bool(engine.positions)
+                        fast_entry=(not open_book
+                                    and hasattr(engine,'quote_entry_tick')
+                                    and engine._wants_fast_entry_ticks())
+                        # ~1s of 250ms ticks after each poll → live feel.
+                        bursts=4 if (open_book or fast_entry) else 3
+                        gap=0.25
+                        for _ in range(bursts):
+                            await asyncio.sleep(gap)
                             try:
-                                await engine.quote_entry_tick()
+                                if open_book and hasattr(engine,'quote_upl_tick'):
+                                    await engine.quote_upl_tick()
+                                else:
+                                    if hasattr(engine,'_apply_stream_quote'):
+                                        engine._apply_stream_quote()
+                                    if fast_entry:
+                                        await engine.quote_entry_tick()
                             except Exception:
                                 break
                         continue
-                    # While open: refresh Capital UPL on every quote tick so the
-                    # last snap before close is Capital £ for settle/teach.
-                    if (engine.positions and hasattr(engine,'quote_upl_tick')):
-                        for _ in range(2):
-                            await asyncio.sleep(1)
-                            try:
-                                await engine.quote_upl_tick()
-                            except Exception:
-                                break
-                        continue
-                await asyncio.sleep(3 if error_count<3 else 10)
+                await asyncio.sleep(1.0 if error_count<3 else 5)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2244,4 +2245,4 @@ class RuntimeHub:
                         {'count':error_count,'client_id':rt.client_id})
                     if hasattr(engine,'_ensure_live_unless_operator_paused'):
                         engine._ensure_live_unless_operator_paused()
-                await asyncio.sleep(3 if error_count<3 else 10)
+                await asyncio.sleep(1.0 if error_count<3 else 5)

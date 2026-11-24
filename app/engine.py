@@ -4191,7 +4191,8 @@ class SingleTradeEngine:
         for p in list(self.positions or []):
             self._bump_upl_exit_hint(p)
         now_m=time.monotonic()
-        if now_m-float(getattr(self,'_upl_tick_mono',0) or 0)<0.85:
+        # Keep UPL REST near tick rate — old 850ms lag left Desk/settle cold.
+        if now_m-float(getattr(self,'_upl_tick_mono',0) or 0)<0.35:
             return
         self._upl_tick_mono=now_m
         try:

@@ -136,8 +136,10 @@ def test_desk_chart_footer_and_levels_readable():
     assert 'band(zones.buy_entry' in ohlc.replace(' ', '')
     assert 'metrics.join' in ohlc
     js = Path('app/web/admin/admin.js').read_text(encoding='utf-8')
-    assert "deskKv(client.id,'ATR'" in js.replace(' ', '') or "deskKv(client.id,'ATR'" in js
+    # ATR label includes epic (ATR M1 · GOLD) — never anonymous cross-epic paint.
+    assert 'deskKv(client.id,atrLabel' in js.replace(' ', '') or "deskKv(client.id,'ATR'" in js
     assert '<i>ATR</i>' in js
+    assert 'deskFocusEpic' in js
     assert "String(t).slice(0,120)" not in js
 
 

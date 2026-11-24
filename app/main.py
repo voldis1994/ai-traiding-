@@ -59,30 +59,26 @@ def _bootstrap_admin():
 
 
 async def worker():
-    """Legacy single-engine loop — same light-first cadence as RuntimeHub."""
-    import time as _time
+    """Legacy single-engine loop — poll then guaranteed light ticks (same as hub)."""
     error_count=0
-    last_heavy=0.0
     while True:
         try:
             if engine.broker:
+                if store.unresolved():await engine.reconcile_outstanding()
+                await engine.poll()
+                error_count=0;engine.last_error=None
+                if RuntimeHub._can_rearm_after_read(engine):
+                    engine._paused_for_read=False;engine.armed=True;engine.execution_enabled=True
+                    store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
                 open_book=bool(engine.positions)
                 fast_entry=(bool(engine.mandate) and not open_book
                             and hasattr(engine,'quote_entry_tick')
                             and engine._wants_fast_entry_ticks())
-                heavy_gap=0.80 if (open_book or fast_entry) else 1.20
-                now_m=_time.monotonic()
-                if (now_m-last_heavy)>=heavy_gap:
-                    if store.unresolved():await engine.reconcile_outstanding()
-                    await engine.poll()
-                    last_heavy=_time.monotonic()
-                    error_count=0;engine.last_error=None
-                    if RuntimeHub._can_rearm_after_read(engine):
-                        engine._paused_for_read=False;engine.armed=True;engine.execution_enabled=True
-                        store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                    continue
-                await asyncio.sleep(0.05)
-                if engine.mandate:
+                light_n=14 if (open_book or fast_entry) else 10
+                for _ in range(light_n):
+                    await asyncio.sleep(0.05)
+                    if not engine.mandate:
+                        continue
                     try:
                         if open_book and hasattr(engine,'quote_upl_tick'):
                             await engine.quote_upl_tick()
@@ -92,7 +88,7 @@ async def worker():
                             if fast_entry:
                                 await engine.quote_entry_tick()
                     except Exception:
-                        pass
+                        break
                 continue
         except asyncio.CancelledError:raise
         except Exception as exc:
@@ -572,8 +568,9 @@ async def admin_clients(_:dict=Depends(require_admin)):
 
 @app.get('/api/admin/overview')
 async def admin_overview(_:dict=Depends(require_admin)):
+    # Never let Funds/peers mirror block Desk paint — 400ms poll must stay live.
     try:
-        await hub.refresh_live_truth()
+        await asyncio.wait_for(hub.refresh_live_truth(),timeout=0.4)
     except Exception:
         pass
     return {'ok':True,**hub.admin_overview()}

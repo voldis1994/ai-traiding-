@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 263
+DESK_TRUTH_REV = 264
 
 
 def _finite_num(v):
@@ -2182,54 +2181,49 @@ class RuntimeHub:
             and not engine.store.unresolved() and len(engine.positions)<=1)
 
     async def _worker(self,rt: AccountRuntime):
-        """Light ticks dominate; heavy poll is gated — not every cycle.
+        """Heavy poll, then a guaranteed light window — never back-to-back poll.
 
-        poll() holds the engine lock through sync+candles+brain. Running it
-        every loop made the whole robot feel laggy even when Desk poll was fast.
-        Continuous 50ms quote/UPL/entry ticks keep mid+triggers live; heavy
-        poll only every ~0.8–1.2s.
+        Gating poll by wall clock alone starved the event loop when poll() took
+        longer than the gap (common): no sleep, no Desk HTTP, mid/UPL frozen.
+        Always run ~0.5–0.7s of 50ms quote/UPL/entry ticks after each poll.
         """
         error_count=0
         engine=rt.engine
         store=rt.store
-        last_heavy=0.0
         while True:
             try:
                 if engine.broker:
+                    if store.unresolved():await engine.reconcile_outstanding()
+                    await engine.poll()
+                    error_count=0
+                    rt.last_error=None
+                    engine.last_error=None
+                    if self._can_rearm_after_read(engine):
+                        engine._paused_for_read=False
+                        engine.armed=True
+                        engine.execution_enabled=True
+                        store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
                     open_book=bool(engine.positions)
                     fast_entry=(bool(engine.mandate) and not open_book
                                 and hasattr(engine,'quote_entry_tick')
                                 and engine._wants_fast_entry_ticks())
-                    # Heavy cadence: open/fast entry ~0.8s; flat idle ~1.2s.
-                    heavy_gap=0.80 if (open_book or fast_entry) else 1.20
-                    now_m=time.monotonic()
-                    if (now_m-last_heavy)>=heavy_gap:
-                        if store.unresolved():await engine.reconcile_outstanding()
-                        await engine.poll()
-                        last_heavy=time.monotonic()
-                        error_count=0
-                        rt.last_error=None
-                        engine.last_error=None
-                        if self._can_rearm_after_read(engine):
-                            engine._paused_for_read=False
-                            engine.armed=True
-                            engine.execution_enabled=True
-                            store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                        continue
-                    # Continuous light path between heavy polls.
-                    await asyncio.sleep(0.05)
-                    if not engine.mandate:
-                        continue
-                    try:
-                        if open_book and hasattr(engine,'quote_upl_tick'):
-                            await engine.quote_upl_tick()
-                        else:
-                            if hasattr(engine,'_apply_stream_quote'):
-                                engine._apply_stream_quote()
-                            if fast_entry:
-                                await engine.quote_entry_tick()
-                    except Exception:
-                        pass
+                    # Guaranteed yield window so Admin/Desk HTTP can run.
+                    light_n=14 if (open_book or fast_entry) else 10
+                    gap=0.05
+                    for _ in range(light_n):
+                        await asyncio.sleep(gap)
+                        if not engine.mandate:
+                            continue
+                        try:
+                            if open_book and hasattr(engine,'quote_upl_tick'):
+                                await engine.quote_upl_tick()
+                            else:
+                                if hasattr(engine,'_apply_stream_quote'):
+                                    engine._apply_stream_quote()
+                                if fast_entry:
+                                    await engine.quote_entry_tick()
+                        except Exception:
+                            break
                     continue
                 await asyncio.sleep(0.5 if error_count<3 else 3)
             except asyncio.CancelledError:

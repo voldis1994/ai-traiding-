@@ -128,10 +128,12 @@ def test_admin_recent_trades_lists_pending_cash_bind():
         store.close_trade('new1',99.5,source='pending_broker_pnl',overwrite=True)
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP')
-        # Realized £ still only broker cash.
+        # Realized £ / NESEN still only broker cash; pending tracked separately.
         assert stats['realized_pnl']==pytest.approx(0.14)
         ids=[t['deal_id'] for t in stats['recent_trades']]
-        assert 'new1' in ids and 'old' in ids
+        assert ids==['old']
+        assert 'new1' not in ids
+        assert stats['pending_cash_trades']>=1
 
 
 def test_open_position_keeps_scores_when_market_context_not_ready():

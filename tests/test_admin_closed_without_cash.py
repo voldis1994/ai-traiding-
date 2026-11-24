@@ -43,7 +43,7 @@ def test_trade_stats_broker_cash_ok():
 
 
 def test_upl_estimate_counts_as_working_not_broker_cash():
-    """≈UPL is tracked but never becomes Kopējais / working Capital £."""
+    """≈UPL is tracked but never becomes Kopējais / NESEN Capital £."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         store.upsert_trade({
@@ -59,8 +59,9 @@ def test_upl_estimate_counts_as_working_not_broker_cash():
         assert stats['realized_pnl'] is None
         assert stats['pnl_status'] == 'upl_estimate_pending'
         assert stats['working_pnl'] is None
-        assert stats['working_pnl_source'] == 'upl_estimate'
-        assert stats['recent_trades'][0]['pnl_source'] == 'upl_estimate'
+        assert stats['working_pnl_source'] in ('none', 'empty')
+        assert stats['recent_trades'] == []
+        assert stats['estimate_recent'][0]['pnl_source'] == 'upl_estimate'
         assert stats['display_wins'] == 0
         assert stats['display_losses'] == 0
 
@@ -79,13 +80,17 @@ def test_working_pnl_and_wl_from_mixed_upl_peļņa():
         assert stats['cash_trades'] == 0
         assert stats['estimate_trades'] == 4
         assert stats['working_pnl'] is None
-        assert stats['working_pnl_source'] == 'upl_estimate'
+        assert stats['working_pnl_source'] in ('none', 'empty')
         assert stats['estimate_pnl'] == pytest.approx(-0.28)
         assert stats['realized_pnl'] is None
         assert stats['display_wins'] == 0
         assert stats['display_losses'] == 0
         assert stats['wins'] == 0
-        ledger = stats['pnl_ledger']
-        assert len(ledger) == 4
-        assert all(row['source'] == 'upl_estimate' for row in ledger)
-        assert sum(row['pnl'] for row in ledger) == pytest.approx(-0.28)
+        # Funds ledger stays empty; estimates listed separately.
+        assert stats['pnl_ledger'] == []
+        assert stats['recent_trades'] == []
+        assert len(stats['estimate_recent']) == 4
+        assert all(
+            row.get('pnl_source') == 'upl_estimate'
+            for row in stats['estimate_recent'])
+        assert sum(float(row['pnl']) for row in stats['estimate_recent']) == pytest.approx(-0.28)

@@ -117,29 +117,36 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
 
 
 def test_admin_trade_stats_sums_beyond_200_and_legacy_blank_source():
-    """P&L must include full history + blank pnl_source cash (not only last 200)."""
+    """Full history sums broker cash; blank source is NOT cash (V3 P05/T38)."""
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
-        total=0.0
+        broker_total=0.0
+        blank_n=0
         for i in range(250):
             pnl=-0.04
-            total+=pnl
             store.upsert_trade({'dealId':f'old{i}','epic':'GOLD','size':'0.1',
                                 'direction':'SELL','level':2000})
-            # Half legacy blank source, half broker — both are account cash.
+            # Half broker cash, half legacy blank — blank ≠ Funds £.
             src='broker' if i%2==0 else None
             store.close_trade(f'old{i}',1999,pnl,currency='GBP',source=src)
             if src is None:
+                blank_n+=1
                 store.db.execute(
                     "UPDATE trades SET pnl_source=NULL WHERE deal_id=?",(f'old{i}',))
                 store.db.commit()
+            else:
+                broker_total+=pnl
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP',open_upl=-0.57)
-        assert stats['cash_trades']==250
-        assert stats['realized_pnl']==pytest.approx(total)
+        assert stats['cash_trades']==125
+        assert stats['blank_pnl_trades']==blank_n
+        assert stats['realized_pnl']==pytest.approx(broker_total)
         assert stats['open_upl']==pytest.approx(-0.57)
-        assert stats['equity_pnl']==pytest.approx(total-0.57)
-        assert stats['losses']==250 and stats['wins']==0
+        # Equity = settled Funds £ only (open UPL stays on position cards).
+        assert stats['equity_pnl']==pytest.approx(broker_total)
+        assert stats['losses']==125 and stats['wins']==0
+        assert RuntimeHub._cash_pnl_source(None)=='unverified'
+        assert RuntimeHub._cash_pnl_source('')=='unverified'
 
 
 def test_shadow_rollback_restores_when_recent_pound_worse():

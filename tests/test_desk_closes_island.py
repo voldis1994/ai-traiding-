@@ -41,6 +41,7 @@ def test_close_trade_updates_existing_without_duplicate():
 
 
 def test_trade_stats_falls_back_to_edge_hist_when_journal_empty():
+    """Edge hist must never invent NESEN / Funds cash rows (V3 P13)."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         store.set(unified_cycle.EDGE_OUTCOME_HIST_KEY, [
@@ -52,12 +53,10 @@ def test_trade_stats_falls_back_to_edge_hist_when_journal_empty():
         hub = RuntimeHub.__new__(RuntimeHub)
         stats = hub._trade_stats(store, 'GBP')
         assert stats['closed_trades'] == 0
-        recent = stats['recent_trades']
-        assert len(recent) == 2
-        assert recent[0]['from_edge_hist'] is True
-        # Edge hist must NOT pretend to be Capital Funds broker £.
-        assert recent[0]['pnl_source'] == 'edge_hist'
-        assert {r['pnl'] for r in recent} == {0.30, -0.13}
+        assert stats['cash_trades'] == 0
+        assert stats['recent_trades'] == []
+        assert stats['pnl_ledger'] == []
+        assert stats['working_pnl'] is None
 
 
 def test_desk_samples_active_n_follows_strategy_cards():

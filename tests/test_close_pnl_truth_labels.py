@@ -13,6 +13,9 @@ def test_cash_pnl_source_classifies_upl_as_estimate():
     assert RuntimeHub._cash_pnl_source('upl_estimate') == 'estimate'
     assert RuntimeHub._cash_pnl_source('pending_broker_pnl') == 'pending'
     assert RuntimeHub._cash_pnl_source('ticks_only') == 'proxy'
+    # V3 P05/T38: blank / empty is never Capital Funds cash.
+    assert RuntimeHub._cash_pnl_source('') == 'unverified'
+    assert RuntimeHub._cash_pnl_source(None) == 'unverified'
 
 
 def test_mixed_broker_and_upl_keeps_sources_honest():
@@ -36,12 +39,13 @@ def test_mixed_broker_and_upl_keeps_sources_honest():
         assert stats['working_pnl'] == pytest.approx(0.14)
         assert stats['working_pnl_source'] == 'broker'
         assert stats['pnl_status'] == 'broker_cash_partial'
+        # NESEN = Funds cash only; estimate listed separately.
         by_src = {t['deal_id']: t['pnl_source'] for t in stats['recent_trades']}
-        assert by_src['b1'] == 'broker'
-        assert by_src['u1'] == 'upl_estimate'
-        # Journal still holds ≈UPL for harvest; Admin UI must not paint it as £.
-        est = next(t for t in stats['recent_trades'] if t['deal_id'] == 'u1')
+        assert by_src == {'b1': 'broker'}
+        assert 'u1' not in by_src
+        est = next(t for t in stats['estimate_recent'] if t['deal_id'] == 'u1')
         assert est['pnl'] == pytest.approx(-0.77)
+        assert est['pnl_source'] == 'upl_estimate'
 
 
 def test_fuzzy_accepts_exact_open_level_among_similar_gold():

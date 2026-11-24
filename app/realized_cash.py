@@ -31,6 +31,8 @@ FORBIDDEN_LIVE_REALIZED_SOURCES = frozenset({
 _CASH_SOURCES = frozenset({
     'broker', 'funds', 'capital', 'live_funds_mirror', 'cash_ledger',
     'capital_funds', 'verified_funds',
+    # Already-classified kind from pick_live_realized / classify_pnl_source.
+    'cash',
 })
 _PENDING_SOURCES = frozenset({
     'pending_close_sync', 'pending_broker_pnl', 'pending_upl_teach',

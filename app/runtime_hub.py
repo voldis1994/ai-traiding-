@@ -370,20 +370,13 @@ class RuntimeHub:
 
     @staticmethod
     def _cash_pnl_source(src) -> str:
-        """Classify journal source: cash | pending | estimate | proxy."""
-        s=(src or '').strip().lower()
-        if s in ('ticks_only','price_size','position_disappeared'):
-            return 'proxy'
-        if s in ('pending_close_sync','pending_broker_pnl','pending_upl_teach'):
-            return 'pending'
-        # Last live UPL is provisional — never count as Capital.com cash.
-        # Admin must label these ESTIMATE until history refines to broker.
-        if s in ('upl_estimate',):
-            return 'estimate'
-        # Explicit broker / Funds mirror, or legacy blank source with cash £.
-        if s in ('broker','funds','capital','live_funds_mirror','') or not s:
-            return 'cash'
-        return 'other'
+        """Classify journal source via V3 P05–P13 (blank ≠ cash).
+
+        Delegates to ``realized_cash.classify_pnl_source`` so Desk/NESEN
+        share the same cash|pending|estimate|proxy|unverified|other map.
+        """
+        from .realized_cash import classify_pnl_source
+        return classify_pnl_source(src)
 
     def _trade_stats(self,store: Store, account_currency: str|None=None,
                      open_upl: float|None=None) -> dict:
@@ -468,7 +461,7 @@ class RuntimeHub:
                     if len(recent)<80:
                         recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
-                # Track for harvest; may fill NESEN if Funds mirror has not upgraded yet.
+                # Track for harvest / estimate counters — never NESEN Funds cash.
                 pending_n+=1
                 if val is None or abs(float(val))<1e-12:
                     blank_n+=1
@@ -490,14 +483,13 @@ class RuntimeHub:
                     estimate_signed_24h.append(float(val))
                 if len(estimate_rows)<80:
                     estimate_rows.append(row)
-            elif kind=='other' or (kind=='cash' and val is None):
+            elif kind in ('other','unverified') or (kind=='cash' and val is None):
+                # Blank / unverified ≠ Capital Funds cash (V3 P05 / T38).
+                blank_n+=1
                 if kind=='cash' and val is None:
-                    blank_n+=1
                     pending_n+=1
-        # Desk NESEN was empty while SHADOW CAPITAL 24h already counted journal
-        # upl_estimate / pending rows — surface them until Funds upgrades to broker.
-        if not recent and estimate_rows:
-            recent=list(estimate_rows[:80])
+        # NESEN / recent_trades = Funds/broker cash only. Estimates stay in
+        # estimate_* aggregates (and estimate_rows) — never fill as cash totals.
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         est_wins=sum(1 for p in estimate_signed if p>0)
@@ -629,7 +621,10 @@ class RuntimeHub:
             'win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
+            # NESEN: Capital Funds / broker cash only (V3 P13).
             'recent_trades':recent[:80],
+            # Separate estimate listing — never mixed into Funds cash totals.
+            'estimate_recent':estimate_rows[:80],
             # Compact ledger for Admin — Capital Funds £ only.
             'pnl_ledger':[
                 {'pnl':float(v),'source':'broker'} for v in signed
@@ -1089,6 +1084,7 @@ class RuntimeHub:
                 'working_pnl':None,'working_pnl_source':'empty',
                 'pnl_currency':None,'pnl_by_currency':{},
                 'wins':0,'losses':0,'win_rate':0.0,'recent_trades':[],
+                'estimate_recent':[],
             },
             'account_currency':None,
         }

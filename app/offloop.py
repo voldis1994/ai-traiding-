@@ -15,15 +15,15 @@ from typing import Any, Callable
 
 
 _EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
-_CPU_LOCK = threading.Lock()  # serialize brain.tick / weight mutation across workers
+_CPU_LOCK = threading.Lock()  # only for brain.tick / weight mutation
 
 
 def _pool() -> concurrent.futures.ThreadPoolExecutor:
     global _EXECUTOR
     if _EXECUTOR is None:
-        # Few workers; CPU_LOCK serializes brain mutation across clients.
+        # Parallel non-brain CPU; brain paths opt into serialize=True.
         _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix='nta-offloop')
+            max_workers=3, thread_name_prefix='nta-offloop')
     return _EXECUTOR
 
 
@@ -32,16 +32,36 @@ def _guarded(fn: Callable[..., Any], *args, **kwargs) -> Any:
         return fn(*args, **kwargs)
 
 
-async def run_sync(fn: Callable[..., Any], *args, timeout: float | None = 30.0, **kwargs) -> Any:
-    """Run blocking CPU fn in thread pool; optional timeout. No SQLite here."""
+async def run_sync(
+    fn: Callable[..., Any],
+    *args,
+    timeout: float | None = 30.0,
+    serialize: bool = True,
+    **kwargs,
+) -> Any:
+    """Run blocking CPU fn in thread pool; optional timeout. No SQLite here.
+
+    serialize=True (default): hold CPU_LOCK for brain/weight safety.
+    serialize=False: allow parallel feature/candle work across clients.
+    """
     loop = asyncio.get_running_loop()
-    bound = partial(_guarded, fn, *args, **kwargs)
+    bound = (
+        partial(_guarded, fn, *args, **kwargs)
+        if serialize else partial(fn, *args, **kwargs))
     fut = loop.run_in_executor(_pool(), bound)
     if timeout is None:
         return await fut
     return await asyncio.wait_for(fut, timeout=timeout)
 
 
-def schedule(fn: Callable[..., Any], *args, **kwargs) -> concurrent.futures.Future:
+def schedule(
+    fn: Callable[..., Any],
+    *args,
+    serialize: bool = False,
+    **kwargs,
+) -> concurrent.futures.Future:
     """Fire-and-forget CPU work. Caller must not pass Store.db operations."""
-    return _pool().submit(partial(_guarded, fn, *args, **kwargs))
+    bound = (
+        partial(_guarded, fn, *args, **kwargs)
+        if serialize else partial(fn, *args, **kwargs))
+    return _pool().submit(bound)

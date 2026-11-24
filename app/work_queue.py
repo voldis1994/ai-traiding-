@@ -221,6 +221,31 @@ def deal_in_backoff(store, deal_id: str) -> bool:
     return False
 
 
+def store_open_settle_payloads(store) -> list[dict[str, Any]]:
+    """Open settle job payloads for Desk mirror (no Capital I/O)."""
+    ensure_schema(store)
+    rows = store.db.execute(
+        "SELECT payload,status,attempts,next_attempt_at,last_error FROM work_queue "
+        "WHERE kind=? AND status IN ('PENDING','FAILED','RUNNING') "
+        "ORDER BY id ASC LIMIT 500",
+        (KIND_SETTLE_PNL,)).fetchall()
+    out: list[dict[str, Any]] = []
+    for payload, status, attempts, nxt, err in rows:
+        try:
+            data = json.loads(payload or '{}')
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {'deal_id': str(data)}
+        data = dict(data)
+        data['queue_status'] = status
+        data['attempts'] = int(attempts or 0)
+        data['next_attempt_at'] = nxt
+        data['error'] = err
+        out.append(data)
+    return out
+
+
 def migrate_legacy_pending_pnl(store) -> int:
     """Move legacy pending_broker_pnl_deals JSON into durable queue once."""
     ensure_schema(store)

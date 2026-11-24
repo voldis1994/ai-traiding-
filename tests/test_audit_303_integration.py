@@ -547,3 +547,91 @@ def test_rest_priority_heap_drops_cancelled_waiter():
         await m._acquire_token(priority=capital_rest.PRIORITY_ACCOUNT)
 
     asyncio.run(run())
+
+
+def test_rest_priority_load_order_before_history():
+    """Under load, ORDER acquires before HISTORY waiters (priority heap)."""
+    async def run():
+        m = capital_rest.CapitalRestManager(
+            identity='prio-load', rps=50.0, burst=2)
+        # Seed heap: HISTORY queued first, then ORDER — ORDER must pop first.
+        loop = asyncio.get_running_loop()
+        fut_hist = loop.create_future()
+        fut_ord = loop.create_future()
+        import heapq
+        m._waiter_seq = 0
+        m._waiter_seq += 1
+        heapq.heappush(
+            m._waiter_heap,
+            (capital_rest.PRIORITY_HISTORY, m._waiter_seq, fut_hist))
+        m._waiter_seq += 1
+        heapq.heappush(
+            m._waiter_heap,
+            (capital_rest.PRIORITY_ORDER, m._waiter_seq, fut_ord))
+        assert m._waiter_heap[0][2] is fut_ord
+        # Cancel history waiter — must not jam ORDER at head.
+        fut_hist.cancel()
+        m._drop_waiter(fut_hist)
+        assert all(w[2] is not fut_hist for w in m._waiter_heap)
+        assert m._waiter_heap[0][2] is fut_ord
+        assert int(m.stats.get('waiter_cancelled') or 0) >= 1
+
+    asyncio.run(run())
+
+
+def test_pending_desk_mirror_does_not_double_drain_capital():
+    """Legacy pending list is Desk-only; Capital settle is work_queue path."""
+    async def run():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            calls = {'n': 0}
+
+            async def counted(*a, **k):
+                calls['n'] += 1
+                return (1.0, 'GBP')
+
+            e._pnl_from_broker_history = counted
+            # Avoid heavy Funds/Shadow side paths in this unit check.
+            e._reconcile_orphan_open_trades = lambda: asyncio.sleep(0)
+            e._mirror_capital_funds_closes = lambda **kw: asyncio.sleep(0)
+            e._shadow_mirror_live_open = lambda *a, **k: None
+            e._learn_closed_trade = lambda *a, **k: None
+            e._teach_pending_ticks = lambda *a, **k: None
+            e.attach(broker)
+            e.account = {
+                'accounts': [{'preferred': True, 'currency': 'GBP',
+                              'accountId': '1'}]}
+            for deal in ('d1', 'd2'):
+                store.upsert_trade({
+                    'dealId': deal, 'epic': 'GOLD', 'size': '0.1',
+                    'direction': 'BUY', 'level': 100})
+                store.close_trade(
+                    deal, 100, None, source='pending_broker_pnl')
+                e._queue_pending_pnl(deal)
+            # Put both deals also in legacy list (would previously double-hit).
+            store.set('pending_broker_pnl_deals', [
+                {'deal_id': 'd1'}, {'deal_id': 'd2'},
+            ])
+            await e._retry_pending_broker_pnl()
+            # Exactly one history call per due settle job (≤2), not 4.
+            assert calls['n'] == 2
+            mirror = store.get('pending_broker_pnl_deals') or []
+            assert isinstance(mirror, list)
+
+    asyncio.run(run())
+
+
+def test_shadow_flush_not_inline_every_settle():
+    """Heavy Shadow is enqueued — not run on every pending drain."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        work_queue.ensure_schema(store)
+        work_queue.enqueue(
+            store, work_queue.KIND_SHADOW_FLUSH, {'limit': 10},
+            dedupe_key='shadow_flush:engine', delay_s=0.0)
+        due = work_queue.claim_due(
+            store, kinds=[work_queue.KIND_SHADOW_FLUSH], limit=1)
+        assert len(due) == 1
+        assert due[0]['kind'] == work_queue.KIND_SHADOW_FLUSH

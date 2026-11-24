@@ -6136,8 +6136,52 @@ class SingleTradeEngine:
              'pnl_source':src or 'pending_broker_pnl'})
         return False
 
+    def _sync_pending_desk_mirror(self):
+        """Desk mirror of open settle jobs — never a second Capital drain path."""
+        try:
+            from . import work_queue as _wq
+            _wq.ensure_schema(self.store)
+            rows=_wq.store_open_settle_payloads(self.store)
+        except Exception:
+            rows=[]
+        # Preserve any legacy entries not yet migrated (migration owns enqueue).
+        legacy=list(self.store.get('pending_broker_pnl_deals') or [])
+        by_deal={}
+        for item in legacy:
+            base=item if isinstance(item,dict) else {'deal_id':item}
+            deal=str(base.get('deal_id') or '')
+            if deal:
+                by_deal[deal]=base
+        for payload in rows:
+            deal=str((payload or {}).get('deal_id') or '')
+            if deal:
+                by_deal[deal]=dict(payload)
+        open_q=[]
+        for deal,base in by_deal.items():
+            banked=self.store.get('broker_cash_banked:'+deal)
+            settled=(isinstance(banked,dict)
+                     and str(banked.get('source') or '')=='broker')
+            if settled:
+                continue
+            try:
+                row=self.store.db.execute(
+                    'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
+                if row and str(row[0] or '')=='broker':
+                    continue
+            except Exception:
+                pass
+            open_q.append(base if isinstance(base,dict) else {'deal_id':deal})
+        if len(open_q)>500:
+            self.store.event('warning','Pending P&L queue large',
+                             {'size':len(open_q)})
+        self.store.set('pending_broker_pnl_deals',open_q)
+
     async def _retry_pending_broker_pnl(self):
-        """Re-request pending cash P&L via durable queue + legacy list (item 10)."""
+        """Settle pending cash P&L via durable work_queue only (audit perf).
+
+        Legacy ``pending_broker_pnl_deals`` is a Desk mirror — it must not
+        issue a second Capital history drain alongside the queue.
+        """
         if not self.broker:return
         # Re-arm journal rows stuck pending / old upl_estimate every poll.
         try:
@@ -6145,17 +6189,33 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Unsettled cash requeue failed',
                              {'type':type(exc).__name__})
-        # Drain durable settle jobs (backoff / diagnostics).
         try:
             from . import work_queue as _wq
             from . import learn_correction as _lc
             _wq.ensure_schema(self.store)
+            # One-shot migrate + keep enqueueing any leftover legacy ids.
+            try:
+                _wq.migrate_legacy_pending_pnl(self.store)
+            except Exception:
+                pass
+            for item in list(self.store.get('pending_broker_pnl_deals') or []):
+                base=item if isinstance(item,dict) else {'deal_id':item}
+                deal=str(base.get('deal_id') or '')
+                if not deal:
+                    continue
+                _wq.enqueue(
+                    self.store,_wq.KIND_SETTLE_PNL,dict(base),
+                    dedupe_key='settle:'+deal)
             # Crash recovery: RUNNING left behind → PENDING with backoff.
             try:
                 _wq.requeue_stale_running(self.store,older_than_s=120.0)
             except Exception:
                 pass
-            due=_wq.claim_due(self.store,kinds=[_wq.KIND_SETTLE_PNL,_wq.KIND_LEARN_RECOVERY],limit=12)
+            # Capital history / teach — ONLY via work_queue (single path).
+            due=_wq.claim_due(
+                self.store,
+                kinds=[_wq.KIND_SETTLE_PNL,_wq.KIND_LEARN_RECOVERY],
+                limit=8)
             for job in due:
                 payload=job.get('payload') or {}
                 deal=str(payload.get('deal_id') or '')
@@ -6168,12 +6228,27 @@ class SingleTradeEngine:
                         continue
                     if not deal:
                         _wq.complete(self.store,job['id']);continue
-                    # Keep in legacy list AND attempt exact Funds settle now.
-                    self._queue_pending_pnl(deal,exit_level=payload.get('exit_level'))
+                    # CLOSE confirm still owns first teach.
+                    if self.pending_close:
+                        _wq.fail(self.store,job['id'],'pending_close',
+                                 attempts=max(0,attempts-1),base_delay_s=1.0)
+                        continue
+                    try:
+                        row=self.store.db.execute(
+                            'SELECT pnl_source FROM trades WHERE deal_id=?',
+                            (deal,)).fetchone()
+                    except Exception:
+                        row=None
+                    if row and str(row[0] or '')=='pending_close_sync':
+                        _wq.fail(self.store,job['id'],'pending_close_sync',
+                                 attempts=max(0,attempts-1),base_delay_s=1.0)
+                        continue
                     found=await self._pnl_from_broker_history(
                         deal,queued_at=payload.get('queued_at'),exact_deal=True)
                     if found is None:
-                        # Not settled yet — backoff; do NOT mark DONE (audit §4).
+                        if attempts<=2:
+                            self._teach_pending_ticks(
+                                deal,payload.get('exit_level'))
                         _wq.fail(self.store,job['id'],'funds_pending',
                                  attempts=attempts)
                         continue
@@ -6183,65 +6258,38 @@ class SingleTradeEngine:
                           'pnl_currency':ccy,'source':'work_queue_settle',
                           'pnl_source':'broker'}
                     self._learn_closed_trade(deal,conf)
+                    self.store.set('last_upl:'+deal,None)
                     _wq.complete(self.store,job['id'])
                 except Exception as exc:
                     _wq.fail(self.store,job['id'],type(exc).__name__,
                              attempts=attempts)
+            # Desk mirror only — no Capital history from this list.
+            self._sync_pending_desk_mirror()
+            # Heavy Shadow off settle path: enqueue deferred job, drain ≤1.
+            tick=int(getattr(self,'_pending_drain_n',0) or 0)+1
+            self._pending_drain_n=tick
+            if tick%20==1:
+                _wq.enqueue(
+                    self.store,_wq.KIND_SHADOW_FLUSH,{'limit':120,'hours':24},
+                    dedupe_key='shadow_flush:engine',delay_s=2.0)
+            shadow_due=_wq.claim_due(
+                self.store,kinds=[_wq.KIND_SHADOW_FLUSH],limit=1)
+            for job in shadow_due:
+                await asyncio.sleep(0)  # yield UPL/settle first
+                try:
+                    payload=job.get('payload') or {}
+                    self._backfill_mistake_audits_from_journal(
+                        limit=int(payload.get('limit') or 120),
+                        hours=int(payload.get('hours') or 24))
+                    from . import shadow_mistake_audit as sma
+                    sma.flush_full_cycle(self.store)
+                    _wq.complete(self.store,job['id'])
+                except Exception as exc:
+                    _wq.fail(self.store,job['id'],type(exc).__name__,
+                             attempts=int(job.get('attempts') or 0))
         except Exception as exc:
             self.store.event('warning','work_queue drain failed',
                              {'type':type(exc).__name__})
-        pending=list(self.store.get('pending_broker_pnl_deals') or [])
-        remaining=[]
-        for item in pending:
-            base=item if isinstance(item,dict) else {'deal_id':item}
-            deal=str(base.get('deal_id'))
-            queued=base.get('queued_at')
-            attempts=int(base.get('attempts') or 0)+1
-            exit_level=base.get('exit_level')
-            # Respect durable work_queue backoff — do not double-hit Capital.
-            try:
-                from . import work_queue as _wq
-                if _wq.deal_in_backoff(self.store,deal):
-                    nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
-                    remaining.append(nxt)
-                    continue
-            except Exception:
-                pass
-            # CLOSE confirm still owns the first teach — harvest must not UPL-teach
-            # (or claim neural) while pending_close / pending_close_sync is active.
-            if self.pending_close:
-                nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
-                remaining.append(nxt)
-                continue
-            try:
-                row=self.store.db.execute(
-                    'SELECT pnl_source FROM trades WHERE deal_id=?',(deal,)).fetchone()
-            except Exception:
-                row=None
-            if row and str(row[0] or '')=='pending_close_sync':
-                # Confirm still in flight — keep waiting; no UPL invent.
-                nxt=dict(base);nxt['attempts']=max(0,attempts-1);nxt['deal_id']=deal
-                remaining.append(nxt)
-                continue
-            # Pass queued_at so history lookback is not stuck on last 30 minutes.
-            # P0-02: exact deal id only — never fuzzy epic/size bind.
-            found=await self._pnl_from_broker_history(
-                deal,queued_at=queued,exact_deal=True)
-            # P0-01: verified £0.00 is a settle (found[0]==0.0), not "still pending".
-            if not found:
-                if attempts<=2:
-                    self._teach_pending_ticks(deal,exit_level)
-                nxt=dict(base);nxt['attempts']=attempts;nxt['deal_id']=deal
-                remaining.append(nxt)
-                continue
-            pnl,hist_ccy=found
-            ccy=self._cash_currency(hist_ccy)
-            # Verified Capital Funds £ only (including honest scratch £0.00).
-            conf={'level':exit_level,'profit':float(pnl),'pnl_currency':ccy,
-                  'source':'pending_pnl_retry','pnl_source':'broker'}
-            self._learn_closed_trade(deal,conf)
-            self.store.set('last_upl:'+deal,None)
-        self.store.set('pending_broker_pnl_deals',remaining)
         # Also harvest Capital cash for open SQLite rows whose deal vanished
         # before we queued pending (restart / missed sync). Sibling-safe.
         await self._reconcile_orphan_open_trades()
@@ -6251,24 +6299,7 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Capital Funds mirror skipped',
                              {'type':type(exc).__name__})
-        # Heavy Shadow / journal backfill: throttle + yield so UPL/settle stay first.
-        # Stay on the event-loop thread (Store.db is not thread-safe).
-        tick=int(getattr(self,'_pending_drain_n',0) or 0)+1
-        self._pending_drain_n=tick
-        if tick%10==1:
-            await asyncio.sleep(0)
-            try:
-                self._backfill_mistake_audits_from_journal(limit=200,hours=24)
-            except Exception as exc:
-                self.store.event('warning','Mistake-audit backfill skipped',
-                                 {'type':type(exc).__name__})
-            try:
-                from . import shadow_mistake_audit as sma
-                sma.flush_full_cycle(self.store)
-            except Exception as exc:
-                self.store.event('warning','SHADOW full-cycle flush skipped',
-                                 {'type':type(exc).__name__})
-        # Also mirror any currently open LIVE deals into paper (once).
+        # Light open-position paper mirror only (no heavy journal scan here).
         try:
             for p in list(self.positions or []):
                 did=p.get('dealId')

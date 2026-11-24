@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 274
+DESK_TRUTH_REV = 275
 
 
 def _finite_num(v):
@@ -773,57 +773,49 @@ class RuntimeHub:
             sp_live = None
             if store is not None:
                 eng = getattr(rt, 'engine', None) if rt is not None else None
-                # Desk poll = boot: SHADOW learns ALL closed trades BEFORE paper restore.
-                if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
-                    try:
-                        eng._backfill_mistake_audits_from_journal(limit=2000, hours=0)
-                    except Exception:
-                        pass
-                # Prefer awaited mirror via refresh_live_truth(); keep a
-                # best-effort schedule here if desk path ran without await.
-                if eng is not None and hasattr(eng, '_mirror_capital_funds_closes'):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(eng._mirror_capital_funds_closes())
-                    except RuntimeError:
-                        pass
-                    except Exception:
-                        pass
-                # Shadow neural must not stay "off / booting" on Desk while LIVE runs.
+                # NEVER sync-scan journal audits / Funds mirror on Desk paint —
+                # that freezes the event loop (~1m then UI sticks). Backfill +
+                # mirror are scheduled from refresh_live_truth (to_thread / bg).
                 if eng is not None and hasattr(eng, '_ensure_shadow_brain'):
                     try:
                         eng._ensure_shadow_brain()
                     except Exception:
                         pass
+                # Paper summary is read-only on poll. One-shot restore if empty.
                 if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
                     try:
-                        # Empty journal + surviving *shadow* audit hist → restore.
-                        # Never seed Capital LIVE £ into independent Paper Book.
-                        eng.shadow_paper.purge_capital_journal_rows()
-                        eng.shadow_paper.backfill_from_mistake_audits()
+                        sp_live = eng.shadow_paper.summary()
+                        trades_n = int((sp_live or {}).get('trades') or 0)
+                        if trades_n <= 0 and not store.get('shadow_paper_restored_v1'):
+                            eng.shadow_paper.purge_capital_journal_rows()
+                            eng.shadow_paper.backfill_from_mistake_audits()
+                            live = getattr(
+                                getattr(eng, 'profit_learning', None), 'history', None) or []
+                            eng.shadow_paper.update_cash_scale(live)
+                            store.set('shadow_paper_restored_v1', {'ok': True})
+                            sp_live = eng.shadow_paper.summary()
                     except Exception:
-                        pass
-                    try:
-                        # Re-scale price-only paper closes from LIVE broker £.
-                        live = getattr(
-                            getattr(eng, 'profit_learning', None), 'history', None) or []
-                        eng.shadow_paper.update_cash_scale(live)
-                    except Exception:
-                        pass
-                    sp_live = eng.shadow_paper.summary()
+                        sp_live = None
                 else:
                     from .shadow_paper import ShadowPaperJournal
                     jp = ShadowPaperJournal(store)
                     try:
-                        jp.purge_capital_journal_rows()
-                        jp.backfill_from_mistake_audits()
+                        sp_live = jp.summary()
+                        if (int((sp_live or {}).get('trades') or 0) <= 0
+                                and not store.get('shadow_paper_restored_v1')):
+                            jp.purge_capital_journal_rows()
+                            jp.backfill_from_mistake_audits()
+                            try:
+                                jp.update_cash_scale([])
+                            except Exception:
+                                pass
+                            store.set('shadow_paper_restored_v1', {'ok': True})
+                            sp_live = jp.summary()
                     except Exception:
-                        pass
-                    try:
-                        jp.update_cash_scale([])
-                    except Exception:
-                        pass
-                    sp_live = jp.summary()
+                        try:
+                            sp_live = jp.summary()
+                        except Exception:
+                            sp_live = None
             def _shadow_richer(a, b):
                 if not isinstance(a, dict):
                     return b if isinstance(b, dict) else {}
@@ -1082,15 +1074,7 @@ class RuntimeHub:
         if store is not None:
             try:
                 from . import shadow_mistake_audit as sma
-                # Ensure SHADOW has every closed Capital row even mid-boot.
-                eng_ma = getattr(rt, 'engine', None) if rt is not None else None
-                if eng_ma is not None and hasattr(
-                        eng_ma, '_backfill_mistake_audits_from_journal'):
-                    try:
-                        eng_ma._backfill_mistake_audits_from_journal(
-                            limit=2000, hours=0)
-                    except Exception:
-                        pass
+                # Read-only on Desk paint — never sync backfill here (UI freeze).
                 mistake_audit = sma.lab_payload(store)
             except Exception:
                 mistake_audit = {'ok': False}

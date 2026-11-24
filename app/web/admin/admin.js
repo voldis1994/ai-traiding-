@@ -2611,17 +2611,18 @@ function cardContentKey(c){
   const pos=Array.isArray(a.positions)?a.positions:(a.position?[a.position]:[]);
   const sb=scoreboard(r);
   const mtf=a.mtf_momentum||{};
+  const mid=a.market_mid!=null?Number(a.market_mid).toFixed(2):'';
   return [
     c.id,c.robot_running?1:0,c.operator_paused?1:0,c.action||'',c.proposal||'',
     a.entry_intent||'',a.entry_trigger||'',String(a.entry_wait||'').slice(0,40),
     pos.map(p=>[p.dealId,p.direction,p.size,p.level,p.stopLevel,p.profitLevel,
       p.has_sl,p.has_tp,p.trail_phase,Number(p.upl).toFixed(2),p.epic].join('/')).join('|'),
     (a.day_book&&a.day_book.phase)||'',
-    (a.mandate&&a.mandate.size)||'',a.market||'',
+    (a.mandate&&a.mandate.size)||'',a.market||'',mid,a.tick_count||0,
     mtf.mode||'',mtf.preferred||'',mtf.stop_hint_atr14??'',
     e.neurons,e.steps,e.learning_generation??e.generation,
     sb.pnl,sb.wins,sb.losses,sb.src,
-    r.pending_broker_pnl,r.pending_trades,
+    r.pending_broker_pnl,r.pending_trades,r.cash_trades,r.realized_pnl,
     a.entry_block_reason||a.error||c.last_start_error||'',
     (a.protection&&a.protection.status)||'',
     JSON.stringify(c.scores||{}),

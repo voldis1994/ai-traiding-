@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 264
+DESK_TRUTH_REV = 265
 
 
 def _finite_num(v):
@@ -1639,12 +1639,16 @@ class RuntimeHub:
                 'resistance':ez.get('resistance'),
                 'buy_entry':buy_zone,
                 'sell_entry':sell_zone,
+                'ok':bool(ez.get('ok')),
+                'reason':ez.get('reason'),
             },
             'entry_zone_source':'ohlc_entry_zones',
+            'entry_zone_reason':ez.get('reason'),
             'info_stack':ez.get('info_stack') or 'ohlc_base_impulse',
             'zone_structure':ez.get('structure'),
             'demand_zones':ez.get('demand_zones') or [],
             'supply_zones':ez.get('supply_zones') or [],
+            'candles_n':len(candles_full or candles or []),
             'scenario':ohlc_scenarios.classify(
                 candles_full or candles,mid=mid,zones=ez,tick=tick,store=store),
             'entry_path':(getattr(eng,'_entry_path',None) if eng is not None else None),

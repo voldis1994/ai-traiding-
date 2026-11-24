@@ -2869,9 +2869,13 @@ class SingleTradeEngine:
                 structure_edge=edge_advice,structure_nudge=nudge_meta,
                 forecast_advice=f_advice,forecast_nudge=forecast_meta,
                 mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
-        # V3 L01: decide from scores_raw / base_scores — never nudged_scores.
+        # V3 L01: scores_raw = neural vote. Soft flow/MTF nudges stay diagnostic.
+        # Learned £ graves (structure_edge toxic / both≤0) may damp the decide
+        # path so after minuses the machine avoids what already failed.
+        decide_scores,learned_meta=structure_edge.apply_learned_memory(
+            base_scores,nudged_scores,edge_advice)
         result=self.policy.evaluate_neural_entry(
-            base_scores,
+            decide_scores,
             returns_bps=ctx.get('returns_bps'),
             trend=ctx.get('trend'),
             regime=ctx.get('regime'),
@@ -2884,7 +2888,14 @@ class SingleTradeEngine:
                     day_book=db_snap,day_conviction=conv_meta,
                     day_phase_nudge=phase_meta,scores=dict(nudged_scores),
                     scores_raw=dict(base_scores),
+                    scores_decide=dict(decide_scores),
+                    learned_structure_gate=learned_meta,
                     mtf_momentum=mtf_analysis,mtf_nudge=mtf_meta)
+        if isinstance(self.last_signal,dict):
+            self.last_signal=dict(
+                self.last_signal,
+                scores_decide=dict(decide_scores),
+                learned_structure_gate=learned_meta)
         # Flow consensus may HOLD (block) a fight; never rewrite BUY↔SELL (L01).
         try:
             from . import flow_consensus

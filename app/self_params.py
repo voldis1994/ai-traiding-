@@ -90,8 +90,9 @@ DEFAULTS = {
     'trail_fallback_frac': 0.65,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
     # Louder seed so library graves (e.g. TREND_DOWN×BUY) actually move the vote.
-    'structure_edge_min_samples': 5,
-    'structure_edge_nudge': 0.12,
+    # First same-structure loss already marks a grave (self-teach, not hard ban).
+    'structure_edge_min_samples': 1,
+    'structure_edge_nudge': 0.16,
     # Trail self-arm — audit: 19 GOLD trades hit ≥0.8×TP then full SL (−£9.46).
     # Arm earlier so winners can lock; still require both R and TP progress.
     'trail_arm_mfe_frac': 0.80,
@@ -287,7 +288,7 @@ BOUNDS = {
     'trail_min_mult': (1.0, 4.0),
     'trail_open_gap_frac': (0.30, 0.80),
     'trail_fallback_frac': (0.40, 0.85),
-    'structure_edge_min_samples': (3, 30),
+    'structure_edge_min_samples': (1, 30),
     'structure_edge_nudge': (0.02, 0.35),
     'trail_arm_mfe_frac': (0.70, 1.0),
     'trail_arm_tp_frac': (0.25, 0.70),

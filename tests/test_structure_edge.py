@@ -276,3 +276,44 @@ def test_propose_early_arm_skips_when_be_violates_min_distance():
         # Either None (skipped) or stop >= entry — never below entry.
         if out is not None:
             assert out['stop_level'] >= 100.0 - 1e-9
+
+
+def test_first_loss_marks_toxic_and_learned_decide_damps():
+    """One SELL loss in BREAKOUT_UP → toxic; neural SELL decide uses damped scores."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='BREAKOUT_UP', direction='SELL',
+                   total_pnl=-0.54, samples=1, wins=0, losses=1)
+        advice = se.compare_frame(s, epic='GOLD', structure='BREAKOUT_UP')
+        assert advice.get('toxic_opposite') == 'SELL'
+        assert advice['advice'] is None  # opposite unproven — damp grave only
+        raw = {'BUY': 0.20, 'SELL': 0.70, 'HOLD': 0.10}
+        nudged, nmeta = se.soft_nudge_scores(raw, advice, store=s)
+        assert nmeta.get('nudged') is True
+        assert nudged['SELL'] < raw['SELL']
+        decide, meta = se.apply_learned_memory(raw, nudged, advice)
+        assert meta.get('applied') is True
+        assert meta.get('reason') == 'damp_toxic_side'
+        assert decide['SELL'] <= nudged['SELL'] + 1e-12
+        # Soft cosmetic nudge without toxic must NOT flip decide.
+        decide2, meta2 = se.apply_learned_memory(
+            raw, {'BUY': 0.10, 'SELL': 0.10, 'HOLD': 0.80},
+            {'advice': None, 'confidence': 0.0})
+        assert meta2.get('applied') is False
+        assert decide2 == raw
+
+
+def test_both_negative_learned_decide_allows_hold():
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='RANGE', direction='BUY',
+                   total_pnl=-2.0, samples=3, wins=0, losses=3)
+        _seed_side(s, structure='RANGE', direction='SELL',
+                   total_pnl=-1.0, samples=3, wins=0, losses=3)
+        advice = se.compare_frame(s, epic='GOLD', structure='RANGE')
+        assert advice['advice'] == 'HOLD'
+        raw = {'BUY': 0.55, 'SELL': 0.30, 'HOLD': 0.15}
+        nudged, _ = se.soft_nudge_scores(raw, advice, store=s)
+        decide, meta = se.apply_learned_memory(raw, nudged, advice)
+        assert meta.get('applied') is True
+        assert decide['HOLD'] >= raw['HOLD']

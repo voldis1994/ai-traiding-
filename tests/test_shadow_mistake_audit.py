@@ -65,6 +65,12 @@ def test_first_loss_commits_targeted_fix():
         assert after != before or r1['fix'].get('changed')
         pending = store.get(sma.PENDING_FIX_KEY) or {}
         assert pending.get('committed') is True
+        lab = sma.lab_payload(store)
+        log = lab.get('learning_log') or []
+        text = '\n'.join(str(x.get('text') or '') for x in log)
+        assert 'CLOSE' in text and 'ERROR' in text
+        assert 'FIX' in text and 'COMMITTED' in text
+        assert 'OUTCOME' in text
 
 
 def test_ready_for_live_after_one_proof_win():

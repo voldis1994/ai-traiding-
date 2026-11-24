@@ -499,7 +499,17 @@ function renderShadowLab(client){
       <strong class="pnl ${pcls}">${esc(ptxt)}</strong>
     </div>`;
   }).join('')||'<div class="psx-empty">No audits yet — closes feed this loop</div>';
+  const logLines=Array.isArray(audit.learning_log)?audit.learning_log:[];
+  const cmdHtml=logLines.length?logLines.map(L=>{
+    if(!L||typeof L!=='object')return '';
+    const lv=String(L.level||'info');
+    return `<div class="shadow-cmd-line ${esc(lv)}">${esc(String(L.text||''))}</div>`;
+  }).join(''):'<div class="shadow-cmd-line wait">waiting for Capital / paper closes — nothing audited yet</div>';
   stableHtml(board,`
+    <article class="shadow-card cmdlog">
+      <div class="psx-h"><h2>SHADOW CMD LOG</h2><span class="psx-src">CLOSE→ERROR→FIX</span><span class="psx-live">● LIVE</span></div>
+      <div class="body"><div class="shadow-cmd" id="shadowCmdLog">${cmdHtml}</div></div>
+    </article>
     <article class="shadow-card">
       <div class="psx-h"><h2>MISTAKE AUDIT</h2><span class="psx-src">DIAGNOSE</span></div>
       <div class="body">

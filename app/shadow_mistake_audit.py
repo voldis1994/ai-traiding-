@@ -671,6 +671,15 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'bumped_wins_after_fix': bool(
                 (mem or {}).get('bumped_wins_after_fix')),
         }
+        # Durable narrative for Desk CMD log (loss → error → fix → outcome).
+        if isinstance(commit_result, dict):
+            entry_row['fix_applied'] = bool(commit_result.get('applied'))
+            entry_row['fix_changed'] = list(commit_result.get('changed') or [])
+            prop = commit_result.get('proposed') or diagnosis.get('proposed_fix')
+            if isinstance(prop, dict):
+                entry_row['fix_why'] = prop.get('why')
+                entry_row['fix_deltas'] = prop.get('deltas')
+                entry_row['fix_flags'] = prop.get('flags')
         # Re-audit after Funds £ correction must REPLACE the prior row for this
         # deal — otherwise hist doubles and scenario repeat counters inflate.
         if deal_s:
@@ -813,6 +822,141 @@ def flush_full_cycle(store) -> dict:
             'committed': committed, 'readied': readied,
             'promote_n': PROMOTE_N, 'ready_n': READY_N})
     return {'flushed': True, 'committed': committed, 'readied': readied}
+
+
+def build_learning_log(*, recent_audits=None, pending_fix=None,
+                       scenarios=None, limit=48) -> list:
+    """Human-readable CMD lines: CLOSE → ERROR → FIX → OUTCOME.
+
+    Newest first so Desk operators see the latest minus and what SHADOW did.
+    """
+    rows = [r for r in (recent_audits or []) if isinstance(r, dict)]
+    bag = scenarios if isinstance(scenarios, dict) else {}
+    pending = pending_fix if isinstance(pending_fix, dict) else {}
+    lines = []
+    lines.append({
+        'level': 'head',
+        'text': 'SHADOW LEARN LOG — closed trades → mistake → fix → next OPEN',
+    })
+    if not rows and not pending.get('fingerprint'):
+        lines.append({
+            'level': 'wait',
+            'text': 'waiting for Capital / paper closes — nothing audited yet',
+        })
+        return lines
+
+    shown = 0
+    for a in rows:
+        if shown >= max(1, int(limit)):
+            break
+        when = str(a.get('closed_at') or a.get('at') or '')
+        when = when.replace('T', ' ').replace('+00:00', '').replace('Z', '')
+        when = (when[11:19] if len(when) >= 19 else when[:16]) or '——:——'
+        try:
+            pnl = float(a.get('pnl'))
+        except (TypeError, ValueError):
+            pnl = None
+        direction = str(a.get('direction') or '?').upper()
+        arrow = '▲BUY' if direction == 'BUY' else (
+            '▼SELL' if direction == 'SELL' else direction)
+        src = str(a.get('source') or '?')
+        scen = str(a.get('scenario') or a.get('fingerprint') or '—')[:28]
+        deal = str(a.get('deal_id') or '')[:14]
+        pnl_txt = '£—' if pnl is None else f"£{pnl:+.2f}"
+        lines.append({
+            'level': 'close',
+            'text': (f'{when}  CLOSE  {arrow}  {pnl_txt}  [{src}]  '
+                     f'{scen}' + (f'  deal={deal}' if deal else '')),
+            'pnl': pnl,
+        })
+        mistakes = [m for m in (a.get('mistakes') or []) if m]
+        notes = [n for n in (a.get('notes') or []) if n]
+        if mistakes:
+            lines.append({
+                'level': 'error',
+                'text': f'{when}  ERROR  ' + ' · '.join(str(m) for m in mistakes[:6]),
+            })
+        elif pnl is not None and pnl < -0.02:
+            lines.append({
+                'level': 'error',
+                'text': f'{when}  ERROR  outcome_hurt (no tagged class yet)',
+            })
+        elif pnl is not None and pnl > 0.02:
+            lines.append({
+                'level': 'ok',
+                'text': f'{when}  OK     useful win — no mistake class',
+            })
+        else:
+            lines.append({
+                'level': 'info',
+                'text': f'{when}  INFO   scratch / flat — light teach only',
+            })
+        for note in notes[:3]:
+            lines.append({
+                'level': 'note',
+                'text': f'{when}  NOTE   {str(note)[:110]}',
+            })
+        changed = list(a.get('fix_changed') or [])
+        why = a.get('fix_why')
+        committed = bool(a.get('committed') or a.get('fix_applied'))
+        fp = str(a.get('fingerprint') or '')
+        bag_row = bag.get(fp) if fp and isinstance(bag.get(fp), dict) else {}
+        if not changed and isinstance(bag_row.get('fix'), dict):
+            changed = list((bag_row.get('fix') or {}).get('changed') or [])
+        if committed or changed:
+            ch = ', '.join(str(c) for c in changed[:8]) if changed else 'flags/knobs'
+            lines.append({
+                'level': 'fix',
+                'text': f'{when}  FIX    COMMITTED · {ch}',
+            })
+            if why:
+                lines.append({
+                    'level': 'fix',
+                    'text': f'{when}  FIX    why: {str(why)[:110]}',
+                })
+            lines.append({
+                'level': 'out',
+                'text': (f'{when}  OUTCOME next same situation retests with new knobs'
+                         + (f' · fp={fp[:10]}' if fp else '')),
+            })
+        elif mistakes or (pnl is not None and pnl < -0.02):
+            pc = a.get('promote_count')
+            pn = a.get('promote_need')
+            gate = ''
+            if pc is not None and pn is not None:
+                gate = f' · promote {pc}/{pn}'
+            lines.append({
+                'level': 'wait',
+                'text': f'{when}  WAIT   fix pending / diagnosing{gate}',
+            })
+        if bag_row.get('ready_for_live'):
+            lines.append({
+                'level': 'ok',
+                'text': f'{when}  READY  fingerprint marked ready_for_live',
+            })
+        lines.append({'level': 'sep', 'text': '─' * 64})
+        shown += 1
+
+    if pending.get('fingerprint'):
+        st = 'COMMITTED' if pending.get('committed') else 'PENDING'
+        ch = ', '.join(str(c) for c in (pending.get('changed') or [])[:8]) or '—'
+        lines.append({
+            'level': 'fix',
+            'text': (f'LATEST FIX  {st}  fp={str(pending.get("fingerprint"))[:10]}  '
+                     f'changed={ch}'),
+        })
+        if pending.get('why'):
+            lines.append({
+                'level': 'fix',
+                'text': f'LATEST FIX  why: {str(pending.get("why"))[:120]}',
+            })
+        miss = pending.get('mistakes') or []
+        if miss:
+            lines.append({
+                'level': 'error',
+                'text': 'LATEST FIX  mistakes: ' + ' · '.join(str(m) for m in miss[:6]),
+            })
+    return lines
 
 
 def lab_payload(store) -> dict:
@@ -1013,6 +1157,20 @@ def lab_payload(store) -> dict:
         'top_scenarios': top_rows,
         'ready': ready[:6],
         'recent_audits': recent_audits,
+        'learning_log': build_learning_log(
+            recent_audits=recent_audits,
+            pending_fix={
+                'committed': bool(pending.get('committed')),
+                'fingerprint': pending.get('fingerprint'),
+                'mistakes': pending.get('mistakes'),
+                'changed': pending.get('changed'),
+                'why': ((pending.get('proposed') or {}).get('why')
+                        if isinstance(pending.get('proposed'), dict)
+                        else pending.get('why')),
+            },
+            scenarios=bag,
+            limit=12,
+        ),
         'respect_news_window': bool(audit.get('respect_news_window')),
         'respect_intermarket_veto': bool(audit.get('respect_intermarket_veto')),
     }

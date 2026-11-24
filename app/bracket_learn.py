@@ -1277,8 +1277,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 rr_fix = apply_min_rr(
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-                    floor=mn, min_rr=min_rr_need, store=store,
-                    highs=highs_r, lows=lows_r, allow_soft_shrink=False)
+                    floor=mn, min_rr=min_rr_need, store=store)
                 if rr_fix.get('ok'):
                     stop_d = float(rr_fix['stop_distance'])
                     profit_d = float(rr_fix['profit_distance'])
@@ -1398,9 +1397,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 rr_fix = apply_min_rr(
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
-                    floor=mn, min_rr=min_rr_need, store=store,
-                    highs=piv.get('swing_highs'), lows=piv.get('swing_lows'),
-                    allow_soft_shrink=False)
+                    floor=mn, min_rr=min_rr_need, store=store)
                 if not rr_fix.get('ok'):
                     return {
                         'stop_distance': float(stop_d),

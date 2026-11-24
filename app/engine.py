@@ -6118,13 +6118,21 @@ class SingleTradeEngine:
                     kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
             except (TypeError,AttributeError):
                 kama_hint=None
-            # tighten∈(0,1] shrinks SL/TP toward entry — break needs a closer stop.
-            break_tighten=0.85 if zone_gate.get('trigger')=='break' else 1.0
+            # Regime SL/TP owns break/zone geometry — no invented break tighten.
+            entry_zone=zone_gate.get('zone') if isinstance(zone_gate,dict) else None
+            scenario=(zone_gate.get('scenario')
+                      if isinstance(zone_gate,dict) else None)
+            zones_card=(zone_gate.get('zones')
+                        if isinstance(zone_gate,dict) else None)
+            trigger_name=(zone_gate.get('trigger')
+                          if isinstance(zone_gate,dict) else None)
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0)*break_tighten,
+                tighten=float(pkg.get('tighten') or 1.0),
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=True,store=self.store)
+                kama=kama_hint,require_swing=True,store=self.store,
+                entry_zone=entry_zone,scenario=scenario,zones=zones_card,
+                trigger=trigger_name)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:

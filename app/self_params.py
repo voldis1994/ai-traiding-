@@ -167,6 +167,11 @@ DEFAULTS = {
     'mtf_kama_slow': 30,
     'mtf_semivar_bars': 30,
     'mtf_mode_preset': 'trend_follow',  # trend_follow | fast_shift | noise_hold
+    # 1m playbook (zones / scenarios / SL·TP regimes)
+    'playbook_hard_entry': 1,
+    'playbook_require_zone_confirm': 1,
+    'playbook_zone_confirm_and': 1,
+    'playbook_session_filter': 1,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -274,6 +279,10 @@ BOUNDS = {
     'mtf_kama_fast': (2, 5),
     'mtf_kama_slow': (20, 40),
     'mtf_semivar_bars': (10, 120),
+    'playbook_hard_entry': (0, 1),
+    'playbook_require_zone_confirm': (0, 1),
+    'playbook_zone_confirm_and': (0, 1),
+    'playbook_session_filter': (0, 1),
 }
 
 IMMUTABLE_NOTE = (

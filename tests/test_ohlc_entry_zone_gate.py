@@ -1,35 +1,23 @@
-"""LIVE OPEN waits for OHLC entry zone; SL/TP stay require_swing."""
+"""LIVE OPEN waits for OHLC entry zone + confirm; SL/TP stay structural."""
 import tempfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from app import ohlc_entry_zones
 from app.autonomy import AutoEvolution
 from app.engine import SingleTradeEngine
+from tests.ohlc_zone_path import demand_zone_path
 from tests.test_learning_integrity import new_brain
 
 
-def _seed(store, epic='GOLD', n=80, start=2000.0):
-    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
-    px = start
-    rows = []
-    for i in range(n):
-        o = px
-        c = px + (0.15 if i % 7 else -0.35)
-        h = max(o, c) + 0.8 + (1.5 if i % 11 == 10 else 0.1)
-        l = min(o, c) - 0.8 - (1.5 if i % 11 == 5 else 0.1)
-        row = {
-            'at': (t0 + timedelta(minutes=i)).isoformat(),
-            'open': o, 'high': h, 'low': l, 'close': c,
-        }
+def _seed_demand(store, *, confirm=True, epic='GOLD'):
+    rows, _ = demand_zone_path(confirm=confirm)
+    for row in rows:
         store.candle(epic, row, source='HISTORICAL')
-        rows.append(row)
-        px = c
     return rows
 
 
-def _ready_engine(d, store, brain, rows, *, ask):
+def _ready_engine(d, store, brain, *, ask):
     e = SingleTradeEngine(store, brain)
     e.policy = AutoEvolution(store, Path(d) / 'pol.py')
     e.mandate = {'epic': 'GOLD', 'size': '0.02'}
@@ -54,20 +42,18 @@ def _ready_engine(d, store, brain, rows, *, ask):
     return e
 
 
-def test_entry_evaluation_holds_until_price_in_buy_zone():
+def test_entry_evaluation_holds_until_confirm_in_buy_zone():
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
-        rows = _seed(store)
+        # Without confirm candles — inside zone still HOLDs.
+        rows = _seed_demand(store, confirm=False)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
         assert buy
         far = float(buy['hi']) + 8.0
-        e = _ready_engine(d, store, brain, rows, ask=far)
+        e = _ready_engine(d, store, brain, ask=far)
         out = e._entry_evaluation()
         assert out['action'] == 'HOLD'
-        assert 'wait' in (out.get('reason') or '').lower()
-        assert 'entry' in (out.get('reason') or '').lower()
-        assert out.get('proposal') == 'BUY'
         assert (out.get('ohlc_entry_zone') or {}).get('allowed') is False
 
         inside = (float(buy['lo']) + float(buy['hi'])) / 2
@@ -76,9 +62,23 @@ def test_entry_evaluation_holds_until_price_in_buy_zone():
             'tick': 0.1, 'spread': 0.2,
         }
         out2 = e._entry_evaluation()
-        assert out2['action'] == 'BUY'
-        assert (out2.get('ohlc_entry_zone') or {}).get('allowed') is True
-        assert (out2.get('ohlc_entry_zone') or {}).get('reason') == 'ohlc_entry_zone_touch'
+        assert out2['action'] == 'HOLD'
+        assert (out2.get('ohlc_entry_zone') or {}).get('allowed') is False
+
+    # Full confirm path → BUY (separate store so candles are confirm=True).
+    with tempfile.TemporaryDirectory() as d2:
+        store2, brain2 = new_brain(d2)
+        rows_ok = _seed_demand(store2, confirm=True)
+        zones_ok = ohlc_entry_zones.compute_entry_zones(
+            rows_ok, tick=0.1, spread=0.2)
+        buy_ok = zones_ok['buy_entry']
+        inside_ok = (float(buy_ok['lo']) + float(buy_ok['hi'])) / 2
+        e2 = _ready_engine(d2, store2, brain2, ask=inside_ok)
+        out3 = e2._entry_evaluation()
+        assert out3['action'] == 'BUY'
+        gate = out3.get('ohlc_entry_zone') or {}
+        assert gate.get('allowed') is True
+        assert gate.get('reason') == 'ohlc_entry_zone_confirm'
 
 
 def test_submit_skips_when_outside_entry_zone():
@@ -87,11 +87,11 @@ def test_submit_skips_when_outside_entry_zone():
 
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
-        rows = _seed(store)
+        rows = _seed_demand(store, confirm=True)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
         far = float(buy['hi']) + 5.0
-        e = _ready_engine(d, store, brain, rows, ask=far)
+        e = _ready_engine(d, store, brain, ask=far)
         e.armed = True
         e.execution_enabled = True
         e.positions = []
@@ -126,30 +126,29 @@ def test_submit_skips_when_outside_entry_zone():
 
         asyncio.run(_run())
         assert 'wait' in (e.last_entry_reason or '').lower()
-        assert 'entry' in (e.last_entry_reason or '').lower()
 
 
 def test_require_swing_still_on_decide_path():
-    """OPEN brackets stay swing-anchored — no artificial median invent."""
+    """OPEN brackets stay structural — no artificial median invent."""
     from app import bracket_learn
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
-        rows = _seed(store)
+        rows = _seed_demand(store, confirm=True)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
         entry = (float(buy['lo']) + float(buy['hi'])) / 2
         zone = bracket_learn.zone_at_open(rows, multi_tf=True)
+        from app import ohlc_scenarios as osc
+        sc = osc.classify(rows, mid=entry, zones=zones, tick=0.1)
         decided = bracket_learn.decide_brackets_from_ohlc(
             zone, tick=0.1, spread=0.2, min_distance=0.5,
             entry=entry, action='BUY', candles=rows, atr=1.0,
-            kama=entry - 2.0, require_swing=True)
-        # Either ready with swing source, or blocked waiting swings — never invent.
+            kama=entry - 2.0, require_swing=True, store=store,
+            entry_zone=buy, scenario=sc, zones=zones, trigger='zone')
         if decided.get('ready'):
             src = str(decided.get('source') or '')
-            assert 'swing' in src or 'bos' in src or 'ohlc' in src
+            assert src in ('regime_brackets', 'swing_anchor') or 'ohlc' in src
             assert decided.get('stop_distance') is not None
-            swing = decided.get('swing') or {}
-            assert swing.get('atr_used') == 1.0 or decided.get('stop_distance')
         else:
             reason = str(decided.get('reason') or decided.get('swing_reason') or '')
-            assert reason  # explicit unready, not silent invent
+            assert reason

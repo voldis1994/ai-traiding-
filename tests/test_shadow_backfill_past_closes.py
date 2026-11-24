@@ -127,3 +127,33 @@ def test_shadow_mirrors_live_open_into_paper():
         assert pos.get('direction') == 'BUY'
         assert abs(pos['entry'] - pos['stop']) == 5.0 or abs(
             abs(pos['entry'] - pos['stop']) - 5.0) < 1.0
+
+
+def test_ohlc_learn_archive_survives_entry_brain_clear():
+    """Backfill must still see OPEN OHLC after entry_brain wipe."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        eng = _engine(store)
+        deal = 'arch1'
+        brain = {
+            'direction': 'BUY',
+            'entry': 100.0,
+            'entry_spread': 0.1,
+            'epic': 'IX.D.FTSE.IFM.IP',
+            'ohlc_entry': {
+                'action': 'BUY',
+                'trigger': 'break',
+                'reason': 'blind_break',
+                'zone': {'lo': 99.0, 'hi': 100.0},
+                'scenario': {'scenario': 'RANGE', 'confidence': True},
+            },
+        }
+        store.set('entry_brain:' + deal, brain)
+        payload = eng._archive_ohlc_for_shadow(deal, brain)
+        assert payload and payload.get('ohlc_entry', {}).get('trigger') == 'break'
+        store.set('entry_brain:' + deal, None)
+        assert store.get('entry_brain:' + deal) is None
+        loaded = eng._load_ohlc_learn_context(deal)
+        assert loaded.get('ohlc_entry', {}).get('scenario', {}).get('scenario') == 'RANGE'
+        meta = eng._shadow_ohlc_meta_for_learn(loaded.get('ohlc_entry'))
+        assert meta.get('trigger') == 'break'

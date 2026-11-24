@@ -5122,10 +5122,11 @@ class SingleTradeEngine:
                 return None
         try:
             from . import shadow_mistake_audit as sma
-            key='entry_brain:'+str(deal_id)
-            saved=self.store.get(key) if self.store else None
-            ohlc_meta=(saved.get('ohlc_entry')
-                       if isinstance(saved,dict) else None)
+            saved=self._load_ohlc_learn_context(deal_id)
+            raw_ohlc=(saved.get('ohlc_entry')
+                      if isinstance(saved,dict) else None)
+            # Same trigger recovery as gate learn — diagnose sees break|zone too.
+            ohlc_meta=self._shadow_ohlc_meta_for_learn(raw_ohlc)
             sc_meta=(ohlc_meta.get('scenario')
                      if isinstance(ohlc_meta,dict) else None)
             direction_r=(direction if direction in ('BUY','SELL')
@@ -5223,6 +5224,43 @@ class SingleTradeEngine:
             # Unknown path — still teach break knobs so SHADOW never skips a £.
             meta['trigger']='break'
         return meta
+
+    def _ohlc_learn_key(self,deal_id):
+        return 'ohlc_learn:'+str(deal_id)
+
+    def _archive_ohlc_for_shadow(self,deal_id,saved=None):
+        """Keep OPEN OHLC stamps after entry_brain clear so backfill can diagnose."""
+        if self.store is None or deal_id is None:
+            return None
+        meta=saved if isinstance(saved,dict) else (
+            self.store.get('entry_brain:'+str(deal_id)) or {})
+        if not isinstance(meta,dict) or not meta:
+            return None
+        ohlc=meta.get('ohlc_entry') if isinstance(meta.get('ohlc_entry'),dict) else None
+        if not ohlc:
+            return None
+        payload={
+            'ohlc_entry':ohlc,
+            'direction':meta.get('direction'),
+            'entry':meta.get('entry'),
+            'entry_spread':meta.get('entry_spread'),
+            'epic':meta.get('epic'),
+            'pnl_currency':meta.get('pnl_currency'),
+            'at':now(),
+            'from':'entry_brain',
+        }
+        self.store.set(self._ohlc_learn_key(deal_id),payload)
+        return payload
+
+    def _load_ohlc_learn_context(self,deal_id):
+        """entry_brain first; durable ohlc_learn archive after brain wipe."""
+        if self.store is None or deal_id is None:
+            return {}
+        saved=self.store.get('entry_brain:'+str(deal_id))
+        if isinstance(saved,dict) and saved:
+            return saved
+        arch=self.store.get(self._ohlc_learn_key(deal_id))
+        return arch if isinstance(arch,dict) else {}
 
     def _backfill_mistake_audits_from_journal(self,*,limit=2000,hours=0):
         """SHADOW learns from ALL closed journal trades — no time/source blocks.
@@ -6411,6 +6449,7 @@ class SingleTradeEngine:
             # a later tick-heal / currency resolve can still teach.
             pending=self.store.get('pending_broker_pnl') or {}
             if not (isinstance(pending,dict) and str(deal_id) in pending):
+                self._archive_ohlc_for_shadow(deal_id,self.store.get(key))
                 self.store.set(key,None)
             return
         sign=1 if direction=='BUY' else -1
@@ -6956,6 +6995,7 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Post-close hold_shadow resolve skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
+        self._archive_ohlc_for_shadow(deal_id,self.store.get(key))
         self.store.set(key,None)
 
     def _trail_structure_label(self,p,candles=None):

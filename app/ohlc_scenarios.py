@@ -449,7 +449,9 @@ def audit_close(store, *, scenario_meta=None, ohlc_meta=None,
     if stamped.startswith('BREAKOUT') and live == 'FAKEOUT' and hurt:
         mistakes.append('fakeout_missed')
         notes.append('breakout_was_fakeout')
-    if stamped == 'RANGE' and meta_o.get('trigger') == 'break' and hurt:
+    regime = stamped or live
+    trig = str(meta_o.get('trigger') or '').lower()
+    if regime in ('RANGE', 'COMPRESSION') and trig == 'break' and hurt:
         mistakes.append('mid_range_mistake')
         notes.append('blind_break_in_range')
     if stamped.startswith('RETEST') and hurt and useful is False:

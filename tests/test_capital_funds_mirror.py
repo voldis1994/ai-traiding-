@@ -487,3 +487,78 @@ def test_mirror_commits_24h_before_slow_history_pages():
             # Prior 24h row remains.
             assert len(store.trades(5)) == 1
     asyncio.run(scenario())
+
+
+def test_row_cash_pnl_prefers_phone_amount_over_usd_profit():
+    """Capital Amount +£1.26 wins over USD profit / size 0.77 (Desk bug)."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        e.account = {'accounts': [
+            {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+        tx = {
+            'instrumentName': 'Gold',
+            'currency': 'USD',
+            'size': 0.77,
+            'profit': 1.67,
+            'pnl': 1.67,
+            'amount': 1.26,
+            'conversionRate': 0.75669579,
+            'openLevel': 3563.79,
+            'closeLevel': 3561.62,
+        }
+        assert e._row_cash_pnl(tx) == pytest.approx(1.26)
+
+
+def test_row_cash_pnl_rejects_size_as_cash_and_fx_converts():
+    """If only USD profit is present, convert via rate — never use lot size."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        e.account = {'accounts': [
+            {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+        # profit accidentally equals size — reject; no other cash field → None.
+        assert e._row_cash_pnl({
+            'currency': 'USD', 'size': 0.77, 'profit': 0.78,
+        }) is None
+        # USD profit + rate → account £.
+        assert e._row_cash_pnl({
+            'currency': 'USD', 'size': 0.77, 'profit': 1.67,
+            'conversionRate': 0.75669579,
+        }) == pytest.approx(1.67 * 0.75669579)
+
+
+def test_mirror_upgrades_size_poison_broker_to_phone_amount():
+    """Journal +0.78 (≈ size 0.77) marked broker must become Funds +£1.26."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(3600, .05, .01, 'GOLD')
+            e = SingleTradeEngine(store, brain)
+            e.mandate = {'epic': 'GOLD', 'size': '0.77'}
+            e.account = {'accounts': [
+                {'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({
+                'dealId': 'deal-size-poison', 'epic': 'GOLD', 'size': '0.77',
+                'direction': 'SELL', 'level': 3563.79,
+            })
+            store.close_trade(
+                'deal-size-poison', 3561.62, 0.78, currency='GBP',
+                source='broker', overwrite=True)
+            broker = FundsBroker([{
+                'dealId': 'deal-size-poison', 'instrumentName': 'Gold',
+                'currency': 'USD', 'size': -0.77,
+                'profit': 1.67, 'amount': 1.26,
+                'conversionRate': 0.75669579,
+                'openLevel': 3563.79, 'closeLevel': 3561.62,
+                'dateUtc': '2026-11-24T18:37:00Z',
+            }])
+            e.attach(broker)
+            n = await e._mirror_capital_funds_closes()
+            assert n >= 1
+            row = next(
+                r for r in store.trades(5)
+                if r['deal_id'] == 'deal-size-poison')
+            assert row['pnl'] == pytest.approx(1.26)
+            assert row['pnl_source'] == 'broker'
+    asyncio.run(scenario())

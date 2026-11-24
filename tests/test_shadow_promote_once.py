@@ -1,13 +1,10 @@
-"""Anti-repeat shadow promote: same evidence must not promote again."""
+"""Anti-repeat shadow promote evidence; V5 H01 — never rewrite LIVE weights."""
 import tempfile
 from pathlib import Path
-
-import pytest
 
 from app.autonomy import AutoEvolution
 from app.core import NeuralCore
 from app.engine import AdaptiveBrain, SingleTradeEngine, Store
-from app.learning_generation import counters, current
 from app.self_params import DEFAULTS, save
 
 
@@ -34,6 +31,34 @@ def _seed_histories(engine, *, n=24, model_version=1):
     engine.shadow_paper._persist()
 
 
+def test_shadow_promote_never_rewrites_live_weights():
+    """V5 H01: promote signal OK; LIVE core weights must stay unchanged."""
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save(store,{**DEFAULTS,'shadow_min_broker_trades':8,'model_min_oos':8,
+                    'val_oos_frac':0.5},reason='test')
+        brain=AdaptiveBrain(store,data_dir=d)
+        e=SingleTradeEngine(store,brain)
+        e.policy=AutoEvolution(store,Path(d)/'policy.py')
+        shadow=e._ensure_shadow_brain()
+        assert shadow is not brain.core
+        live_before=AutoEvolution.weight_checksum(brain.core)
+        _seed_histories(e,n=24,model_version=1)
+        shadow.P[:]+=0.01
+        shadow.model_version=max(1,int(getattr(shadow,'model_version',0) or 0))
+        out1=e.policy.shadow_self_dev_tick(e)
+        assert out1 is not None
+        assert out1.get('weights_promoted') is not True
+        assert out1.get('live_rewrite') is not True
+        assert AutoEvolution.weight_checksum(brain.core)==live_before
+        # Same-evidence guard still records so we do not spam promote signals.
+        if out1.get('promote_signal') or out1.get('promote'):
+            checksum=e.policy.weight_checksum(shadow)
+            assert e.policy._promote_blocked_same_evidence(
+                e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum) or (
+                store.get(AutoEvolution.LAST_PROMOTE_KEY) is not None)
+
+
 def test_second_promote_blocked_without_new_evidence():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
@@ -45,35 +70,24 @@ def test_second_promote_blocked_without_new_evidence():
         shadow=e._ensure_shadow_brain()
         assert shadow is not brain.core
         _seed_histories(e,n=24,model_version=1)
-        # Nudge SHADOW weights so promote checksum sees a change.
         shadow.P[:]+=0.01
         shadow.model_version=max(1,int(getattr(shadow,'model_version',0) or 0))
         out1=e.policy.shadow_self_dev_tick(e)
         assert out1 is not None
-        last=store.get(AutoEvolution.LAST_PROMOTE_KEY)
-        if out1.get('weights_promoted'):
-            assert last and last.get('weight_checksum')
-            gen_after=current(store)
-            out2=e.policy.shadow_self_dev_tick(e)
-            assert out2 is not None
-            assert out2.get('weights_promoted') is not True
-            assert 'same model/checksum' in (out2.get('reason') or e.policy.last_reason)
-            assert current(store)==gen_after
-            assert counters(store)['verified_candidate_promotes']>=1
-        else:
-            checksum=e.policy.weight_checksum(shadow)
-            e.policy._record_promote_evidence(
-                e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
-            assert e.policy._promote_blocked_same_evidence(
-                e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
-            e.shadow_paper.history.append({
-                'paper_pnl':0.5,'unit':'account_currency','direction':'BUY',
-                'source':'shadow_paper','exit_reason':'tp',
-                'at':'2024-01-01T01:00:00+00:00',
-                'bar_time':'2024-01-01T01:00:00+00:00','model_version':1})
-            e.shadow_paper._persist()
-            assert not e.policy._promote_blocked_same_evidence(
-                e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
+        assert out1.get('weights_promoted') is not True
+        checksum=e.policy.weight_checksum(shadow)
+        e.policy._record_promote_evidence(
+            e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
+        assert e.policy._promote_blocked_same_evidence(
+            e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
+        e.shadow_paper.history.append({
+            'paper_pnl':0.5,'unit':'account_currency','direction':'BUY',
+            'source':'shadow_paper','exit_reason':'tp',
+            'at':'2024-01-01T01:00:00+00:00',
+            'bar_time':'2024-01-01T01:00:00+00:00','model_version':1})
+        e.shadow_paper._persist()
+        assert not e.policy._promote_blocked_same_evidence(
+            e,e.profit_learning.history,e.shadow_paper.paper_rows(),checksum)
 
 
 def test_weight_checksum_stable_and_sensitive():

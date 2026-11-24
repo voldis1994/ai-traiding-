@@ -213,8 +213,8 @@ def test_fusion_gap_reason_names_liquidity_block(tmp_path):
         base, peers, 'GOLD', cal, ['USD'], now=BASE, liquidity_path=liq) is None
 
 
-def test_fusion_gap_blocks_new_entry_not_open_protection(tmp_path):
-    """Item 14: after fusion transition, gap blocks entry; open position still managed."""
+def test_fusion_gap_does_not_block_entry_open_protection_independent(tmp_path):
+    """V5 D08: fusion gap is diagnostic — does not HOLD OPEN; protection still runs."""
     from app.engine import SingleTradeEngine, AdaptiveBrain, Store
 
     st = Store(tmp_path / 'db.sqlite3')
@@ -225,7 +225,6 @@ def test_fusion_gap_blocks_new_entry_not_open_protection(tmp_path):
         'ready': True, 'bar_time': BASE.isoformat(), 'trend': 'RANGE',
         'regime': 'RANGE', 'features': [0.0] * FEATURE_DIM, 'close': 4000.0,
     }
-    # Simulate completed fusion-model transition.
     brain.feature_schema = brain.fusion_schema
     brain.core.d = brain.fusion_dim
     eng.latest_fusion_ready = False
@@ -233,24 +232,19 @@ def test_fusion_gap_blocks_new_entry_not_open_protection(tmp_path):
     eng.last_closed_step = 0
     eng.armed = True
     eng.execution_enabled = True
-    eng.last_signal = {'scores': [0.9, 0.05, 0.05], 'action': 'BUY'}  # stale
+    eng.last_signal = {'scores': [0.9, 0.05, 0.05], 'action': 'BUY'}
 
-    assert eng._fusion_entry_blocked() is True
+    assert eng._fusion_entry_blocked() is False
     ev = eng._entry_evaluation()
-    assert ev['action'] == 'HOLD'
-    assert 'fusion gap' in ev['reason'].lower()
-    assert 'liquidity' in ev['reason'].lower()
+    assert 'fusion gap' not in (ev.get('reason') or '').lower()
+    assert ev.get('fusion_gap') is not True
     snap = eng.snapshot()
-    assert snap['entry_can_submit_now'] is False
-    assert 'liquidity' in (snap['entry_block_reason'] or '').lower()
     assert snap['fusion_block_reason'].startswith('liquidity:')
 
-    # Open position: protection path is independent — fusion gap does not disarm.
     eng.positions = [{'dealId': 'd1', 'direction': 'BUY', 'epic': 'GOLD',
                       'level': 4000.0, 'size': '1', 'stopLevel': 3990.0}]
-    assert eng._fusion_entry_blocked() is True  # still blocks *new* entry
+    assert eng._fusion_entry_blocked() is False
     assert eng.armed and eng.execution_enabled
-    # Snapshot reports existing position (not fusion) as the flat-entry N/A reason.
     assert 'Existing open position' in (eng.snapshot()['entry_block_reason'] or '')
 
 

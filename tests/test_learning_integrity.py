@@ -170,7 +170,7 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         store.set('entry_brain:loss1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
         # BUY that exited lower → loss → counterfactual SELL (path evidence, not forced HOLD).
-        engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5})
+        engine._learn_closed_trade('loss1',{'level':99.0,'profit':-12.5,'pnl_source':'broker'})
         last=[e for e in store.recent()
               if 'updated LIVE neural weights' in e['message']][0]
         detail=json.loads(last['details'])
@@ -202,7 +202,7 @@ def test_scratch_loss_does_not_spam_hold_into_core():
         store.upsert_trade({'dealId':'scratch1','epic':'GOLD','size':'1','direction':'BUY','level':100})
         store.set('entry_brain:scratch1',{'epic':'GOLD','direction':'BUY','entry':100,
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
-        engine._learn_closed_trade('scratch1',{'level':100.0,'profit':-0.02})
+        engine._learn_closed_trade('scratch1',{'level':100.0,'profit':-0.02,'pnl_source':'broker'})
         last=[e for e in store.recent()
               if 'without weight update' in e['message']][0]
         detail=json.loads(last['details'])

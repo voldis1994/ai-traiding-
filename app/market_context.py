@@ -59,8 +59,8 @@ def market_features(rows, *, now_utc=None, spread=0., epic=None, approved=None, 
     """Return a time-aligned feature snapshot or an explicit unavailable reason.
 
     Stored current-minute quote-derived OHLC is excluded. Bars must cover a
-    continuous 60 minute window with no synthetic gap-fill (V3 D02). Any
-    missing minute or stale API data causes a safe HOLD_DATA refusal.
+    continuous 60 minute window with no synthetic gap-fill (V5 D02/T01). Any
+    missing minute or stale API data leaves context unready — never invent OHLC.
 
     `approved`: optional registry specs → append dynamic OHLC formulas (past bars only).
     """

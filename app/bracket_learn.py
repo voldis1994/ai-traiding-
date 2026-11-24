@@ -957,7 +957,7 @@ def cap_far_swing_sl(*, action, entry, stop_level, stop_d, floor, atr=None,
 
 def apply_min_rr(*, action, entry, stop_level, profit_level, stop_d, profit_d,
                  floor, min_rr=None, store=None, atr_locked=False, atr=None,
-                 highs=None, lows=None, allow_soft_shrink=True) -> dict:
+                 highs=None, lows=None, allow_soft_shrink=False) -> dict:
     """Enforce ``profit_d / stop_d >= min_rr`` without inventing fantasy TP.
 
     PR #181 baseline (temporary restore while OPEN is too blocked):
@@ -1262,13 +1262,13 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     stop_level=stop_level, profit_level=profit_level,
                     kama_stop=out.get('kama_stop'))
 
-    # PR #181 restore: combine swing SL with min RR — soft-cap SL toward entry
-    # (never invent TP). Prefer farther structural TP first when available.
+    # V5 B01/T09: never soft-cap SL toward entry for RR. Extend structural TP
+    # or refuse (ready=False) — keep swing invalidation intact.
     rr = apply_min_rr(
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
         floor=floor, store=store, atr=atr_v, highs=highs, lows=lows,
-        allow_soft_shrink=True)
+        allow_soft_shrink=False)
     if not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
                     stop_distance=float(stop_d), profit_distance=float(profit_d),
@@ -1437,7 +1437,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             min_rr_need = float(regime.get('min_rr') or _min_rr(store))
             min_rr_need = max(0.5, min(3.0, min_rr_need))
             rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
-            # PR #181 restore: soft-cap SL when RR short — never invent TP.
+            # V5 B01/T09: keep structural SL; extend TP or skip — never soft-cap SL.
             # Prefer structural OHLC when RR already clears min_rr or is structural.
             rr_capped = False
             if rr_now + 1e-12 >= min_rr_need:
@@ -1459,7 +1459,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                     action=action, entry=e, stop_level=stop_level,
                     profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
                     floor=mn, min_rr=min_rr_need, store=store,
-                    highs=highs_r, lows=lows_r, allow_soft_shrink=True)
+                    highs=highs_r, lows=lows_r, allow_soft_shrink=False)
                 if rr_fix.get('ok'):
                     stop_d = float(rr_fix['stop_distance'])
                     profit_d = float(rr_fix['profit_distance'])
@@ -1535,8 +1535,8 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
             store=store, entry_zone=entry_zone)
         if swing.get('ready'):
-            # Swing SL/TP — no cosmetic tighten. PR #181: after snap, soft-cap
-            # SL toward entry if RR short (never invent formula TP).
+            # Swing SL/TP — no cosmetic tighten. V5: after snap, extend TP or
+            # refuse — never soft-cap SL toward entry for RR.
             from .math_rules import (
                 snap_distance_to_tick, distances_meet_broker_min, _min_ticks)
             from decimal import Decimal as _Dec
@@ -1568,7 +1568,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 raised = True
             stop_level = e - sign * stop_d
             profit_level = e + sign * profit_d
-            # Re-check min RR AFTER snap — extend TP or soft-cap SL (#181).
+            # Re-check min RR AFTER snap — extend structural TP only (V5 T09).
             min_rr_need = float(swing.get('min_rr') or _min_rr(store))
             min_rr_need = max(0.5, min(3.0, min_rr_need))
             rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
@@ -1581,7 +1581,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                     profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
                     floor=mn, min_rr=min_rr_need, store=store,
                     highs=piv.get('swing_highs'), lows=piv.get('swing_lows'),
-                    allow_soft_shrink=True)
+                    allow_soft_shrink=False)
                 if not rr_fix.get('ok'):
                     return {
                         'stop_distance': float(stop_d),

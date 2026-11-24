@@ -180,8 +180,11 @@ function esc(s){
 function icon(name){return `<svg class="ico" aria-hidden="true"><use href="#i-${esc(name)}"></use></svg>`}
 
 function isCapitalFundsSrc(src){
-  const s=String(src||'').toLowerCase();
-  return s==='broker'||s==='funds'||s==='capital'||s==='live_funds_mirror'||s===''||!s;
+  // V5 T38: blank / empty is NOT Capital Funds £.
+  const s=String(src||'').trim().toLowerCase();
+  if(!s)return false;
+  return s==='broker'||s==='funds'||s==='capital'||s==='live_funds_mirror'
+    ||s==='cash_ledger'||s==='capital_funds'||s==='verified_funds'||s==='cash';
 }
 /** Rows Desk may list in NESEN / CLIENT CLOSES (Funds £ or journal waiting for Funds). */
 function isDeskListableClose(src){
@@ -192,17 +195,17 @@ function isDeskListableClose(src){
 }
 function sourceLabel(src){
   if(isCapitalFundsSrc(src))return 'Capital £';
-  const s=String(src||'').toLowerCase();
+  const s=String(src||'').trim().toLowerCase();
+  if(!s||s==='none'||s==='empty'||s==='blank'||s==='unverified')return 'nav Capital £';
   if(s==='upl_estimate'||s.startsWith('pending'))return 'sync Funds £';
-  if(s==='none'||s==='empty')return 'nav Capital £';
-  return 'Capital £';
+  return 'nav Capital £';
 }
 function closePnlSrcBadge(src,_pending){
-  // Desk badges: CAPITAL for Funds £; SYNC while journal waits for mirror upgrade.
+  // Desk badges: CAPITAL for Funds £; SYNC while journal waits; never blank→CAPITAL.
   if(isCapitalFundsSrc(src))return {cls:'psx-pnl-src ok',text:'CAPITAL'};
   const s=String(src||'').toLowerCase();
   if(s==='upl_estimate'||s.startsWith('pending'))return {cls:'psx-pnl-src est',text:'SYNC'};
-  return {cls:'psx-pnl-src ok',text:'CAPITAL'};
+  return {cls:'psx-pnl-src est',text:'NAV'};
 }
 function closeTimeLabel(t){
   const raw=(t&&(t.closed||t.closed_at||t.updated_at||t.at))||'';

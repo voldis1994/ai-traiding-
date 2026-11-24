@@ -418,11 +418,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         return dict(out, reason='no_structural_tp',
                     stop_distance=stop_d, stop_level=float(stop), regime=name)
 
-    # Long-only ladder: shorts collapse to a single structural TP (far target).
-    long_ladder = action == 'BUY'
-    if not long_ladder:
-        tp1 = tp2
-
+    # V5 B03: TP1/TP2 ladder for both BUY and SELL (structural levels).
     if action == 'BUY':
         tp1_d = tp1 - entry_f
         tp2_d = tp2 - entry_f
@@ -437,7 +433,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
     rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
     # V5 B01/B04/T09: never soft-cap / shrink structural SL past invalidation
     # to hit RR, and never invent HOLD_RR as an OPEN veto. RR is context.
-    # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
+    # V5 B03: TP1/TP2 ladder + scale-out for both sides.
     return {
         'ready': True,
         'reason': reason,
@@ -446,9 +442,9 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'profit_distance': float(tp2_d),
         'stop_level': float(stop),
         'profit_level': float(tp2),
-        'tp1_level': float(tp1) if long_ladder else float(tp2),
+        'tp1_level': float(tp1),
         'tp2_level': float(tp2),
-        'tp1_distance': float(tp1_d) if long_ladder else float(tp2_d),
+        'tp1_distance': float(tp1_d),
         'tp2_distance': float(tp2_d),
         'swing_hi': float(tp2) if action == 'BUY' else float(stop),
         'swing_lo': float(stop) if action == 'BUY' else float(tp2),
@@ -456,8 +452,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'kappa': float(rr_now) if rr_now > 0 else min_rr,
         'min_rr': float(min_rr),
         'rr': float(rr_now),
-        'rr_tp1': (float(tp1_d / stop_d) if (long_ladder and stop_d > 1e-12)
-                   else None),
+        'rr_tp1': (float(tp1_d / stop_d) if stop_d > 1e-12 else None),
         'regime': name,
         'trigger': trig or None,
         'zone_sl': bool(zone_sl),
@@ -468,6 +463,6 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'atr_used': float(atr_v) if atr_v is not None else None,
         'bos_event': sc.get('event'),
         'bos_bias': sc.get('bias'),
-        'scale_out_frac': 0.5 if long_ladder else 0.0,
-        'tp_ladder': bool(long_ladder),
+        'scale_out_frac': 0.5,
+        'tp_ladder': True,
     }

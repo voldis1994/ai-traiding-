@@ -381,14 +381,12 @@ def test_swing_anchor_brackets_not_symmetric_entry_plus_minus():
     assert swing['swing_lo'] == pytest.approx(103.0, abs=0.05)
     assert swing['swing_hi'] >= entry
     assert swing['stop_level'] < entry < swing['profit_level']
-    # PR #181: SL may be RR-capped toward entry; otherwise stays below swing low.
-    if not swing.get('rr_capped'):
+    # V5 T09: never soft-cap SL; either keep structural SL or refuse ready.
+    assert swing.get('rr_capped') is not True
+    assert '+rr_cap_sl' not in str(swing.get('reason') or '')
+    if swing.get('ready'):
         assert swing['stop_level'] < swing['swing_lo']
-        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.5
-    else:
         assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
-        assert '+rr_cap_sl' in str(swing.get('reason') or '')
-    assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
@@ -484,18 +482,31 @@ def test_decide_brackets_snaps_tick_without_stop_take_rewrite():
         entry + decided['profit_distance'], abs=1e-9)
 
 
-def test_apply_min_rr_caps_wide_sl_toward_entry():
-    """PR #181: Gold-style ~21pt SL vs ~3pt TP → SL capped to profit/min_rr."""
-    from app.bracket_learn import apply_min_rr, levels_correct_side
+def test_apply_min_rr_default_refuses_soft_cap_v5():
+    """V5 T09: default allow_soft_shrink=False — keep far SL, do not cap toward entry."""
+    from app.bracket_learn import apply_min_rr
     entry, stop_d, profit_d = 2650.0, 21.0, 3.0
     out = apply_min_rr(
         action='SELL', entry=entry, stop_level=entry + stop_d,
         profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
         floor=1.0, min_rr=1.0)
+    assert out['ok'] is False
+    assert out.get('capped') is not True
+    assert out['reason'] == 'rr_need_farther_tp_keep_swing'
+    assert out['stop_distance'] == pytest.approx(21.0, abs=1e-9)
+
+
+def test_apply_min_rr_explicit_soft_shrink_still_available_for_tests():
+    """Opt-in soft shrink remains for diagnostics — LIVE paths pass False."""
+    from app.bracket_learn import apply_min_rr, levels_correct_side
+    entry, stop_d, profit_d = 2650.0, 21.0, 3.0
+    out = apply_min_rr(
+        action='SELL', entry=entry, stop_level=entry + stop_d,
+        profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
+        floor=1.0, min_rr=1.0, allow_soft_shrink=True)
     assert out['ok'] is True
     assert out['capped'] is True
     assert out['stop_distance'] == pytest.approx(3.0, abs=1e-9)
-    assert out['rr'] == pytest.approx(1.0, abs=1e-9)
     assert levels_correct_side(
         action='SELL', entry=entry, stop_level=out['stop_level'],
         profit_level=out['profit_level'])
@@ -524,8 +535,9 @@ def test_atr_locked_rr_refuses_hairline_sl_instead_of_swap():
         profit_level=entry - profit_d, stop_d=stop_d, profit_d=profit_d,
         floor=2.5, min_rr=1.5, atr_locked=True, atr=5.0)
     assert out['ok'] is False
-    assert out['reason'] == 'rr_need_farther_tp'
-    # Would need SL=2 to hit RR — blocked by 1×ATR soft floor.
+    assert out['reason'] in (
+        'rr_need_farther_tp', 'rr_need_farther_tp_keep_swing')
+    # Would need SL=2 to hit RR — soft-cap refused; structural SL kept.
     assert out['stop_distance'] == pytest.approx(10.0, abs=1e-9)
 
 
@@ -546,13 +558,20 @@ def test_apply_min_rr_extends_structural_tp_before_shrinking_sl():
 
 
 def test_apply_min_rr_refuses_when_floor_blocks_cap():
-    """If SL cannot shrink to hit RR without going below ATR floor → refuse."""
+    """V5: soft shrink off by default → keep swing / refuse farther TP."""
     from app.bracket_learn import apply_min_rr
     out = apply_min_rr(
         action='BUY', entry=100.0, stop_level=90.0, profit_level=101.0,
         stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.5, atr_locked=False)
     assert out['ok'] is False
-    assert out['reason'] == 'rr_unachievable_vs_floor'
+    assert out['reason'] in (
+        'rr_unachievable_vs_floor', 'rr_need_farther_tp_keep_swing')
+    soft = apply_min_rr(
+        action='BUY', entry=100.0, stop_level=90.0, profit_level=101.0,
+        stop_d=10.0, profit_d=1.0, floor=5.0, min_rr=1.5, atr_locked=False,
+        allow_soft_shrink=True)
+    assert soft['ok'] is False
+    assert soft['reason'] == 'rr_unachievable_vs_floor'
 
 
 def test_cap_far_swing_sl_uses_closer_pivot_not_atr_invent():
@@ -590,8 +609,8 @@ def test_cap_far_swing_sl_keeps_far_swing_without_atr_invent():
     assert far['stop_level'] == pytest.approx(stop_level, abs=1e-9)
 
 
-def test_swing_anchor_applies_min_rr_on_wide_sl_pr181():
-    """PR #181: wide protective swing vs tight TP gets RR-capped SL (still ready)."""
+def test_swing_anchor_refuses_soft_cap_on_wide_sl_v5():
+    """V5 T09: wide protective swing vs tight TP must not soft-cap SL."""
     from app.bracket_learn import swing_anchor_brackets, levels_correct_side
     # Deep swing low far under entry; nearest high only a few pts above.
     seq = [
@@ -608,19 +627,18 @@ def test_swing_anchor_applies_min_rr_on_wide_sl_pr181():
     swing = swing_anchor_brackets(
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
+    assert swing.get('rr_capped') is not True
+    assert '+rr_cap_sl' not in str(swing.get('reason') or '')
     if swing.get('ready'):
         assert levels_correct_side(
             action='BUY', entry=entry, stop_level=swing['stop_level'],
             profit_level=swing['profit_level'])
         assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
-        assert swing['stop_distance'] + 1e-9 <= swing['profit_distance'] / float(
-            swing.get('min_rr') or 1.0) + 1e-6
-        if swing.get('rr_capped'):
-            assert '+rr_cap_sl' in str(swing.get('reason') or '')
     else:
         assert swing.get('reason') in (
             'rr_unachievable_vs_floor', 'rr_unachievable', 'rr_fail',
-            'rr_need_farther_tp', 'swing_distances_below_floor',
+            'rr_need_farther_tp', 'rr_need_farther_tp_keep_swing',
+            'swing_distances_below_floor',
             'no_structural_swings_for_entry')
 
 

@@ -16,7 +16,7 @@ from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 
 # Pipeline: F_learn ∘ F_broker ∘ F_order ∘ F_decision ∘ F_neuron
 # Neural argmax proposes side; promoted policy.py decide() confirms or HOLDs
-# when self_params.policy_live_execute=1 (default ON with policy_evolve_enabled).
+# when self_params.policy_live_execute=1 (default OFF — research until operator enables).
 LIVE_DECISION_RULE = 'neural_argmax_then_evolved_policy_gate'
 LIVE_DECISION_BAR = 'completed_broker_M1'
 # Perceive on completed M1; trigger OPEN on WS mid (break|zone) between polls.

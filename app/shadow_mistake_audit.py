@@ -607,8 +607,15 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
     if diagnosis.get('mistakes') and diagnosis.get('proposed_fix'):
         fp = (diagnosis.get('context') or {}).get('fingerprint')
         gate = promote_gate(store, fp, diagnosis['mistakes'])
+        # V5 H01/F18: SHADOW audit must not commit LIVE ohlc_scenarios / news knobs.
+        # Always stage as pending — operator/promote path owns LIVE apply.
         if apply_ohlc_penalties and gate.get('ready'):
-            commit_result = apply_targeted_fix(store, diagnosis, commit=True)
+            commit_result = apply_targeted_fix(store, diagnosis, commit=False)
+            if isinstance(commit_result, dict):
+                commit_result = dict(commit_result, pending=True,
+                                     live_commit=False,
+                                     reason=(commit_result.get('reason') or '')
+                                     + '+shadow_no_live_commit')
         else:
             commit_result = apply_targeted_fix(store, diagnosis, commit=False)
 

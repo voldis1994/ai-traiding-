@@ -69,13 +69,15 @@ def test_promote_gate_needs_three_repeats():
 
         r3 = sma.on_close(store, **kwargs)
         assert r3['promote_gate']['count'] == 3
-        assert r3['fix'].get('applied') is True
+        assert r3['fix'].get('applied') is False
+        assert r3['fix'].get('pending') is True
+        assert r3['fix'].get('live_commit') is False
         after = osc.load_params(store)['penalty_range']
-        assert after > before
-        assert osc.load_params(store)['block_mid_range'] == 1
-        # READY_N≥3 → not ready_for_live on commit alone.
+        assert after == before
+        pending = store.get(sma.PENDING_FIX_KEY) or {}
+        assert pending.get('proposed', {}).get('flags', {}).get('block_mid_range') == 1
+        assert pending.get('committed') is False
         assert sma.lab_payload(store)['ready_count'] == 0
-        assert sma.lab_payload(store)['pending_fix'].get('committed') is True
 
 
 def test_ready_for_live_requires_proof_wins():
@@ -94,7 +96,9 @@ def test_ready_for_live_requires_proof_wins():
         )
         for _ in range(sma.PROMOTE_N):
             out = sma.on_close(store, **loss_kw)
-        assert out['fix'].get('applied') is True
+        assert out['fix'].get('applied') is False
+        assert out['fix'].get('pending') is True
+        assert out['fix'].get('live_commit') is False
         lab = sma.lab_payload(store)
         assert lab['ready_n'] >= 3
         assert lab['ready_count'] == 0

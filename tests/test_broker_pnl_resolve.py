@@ -112,7 +112,8 @@ def test_confirm_close_fills_missing_profit_from_transactions():
             broker.tx=[{'reference':'c1','pnl':'-0.06','currency':'USD','transactionType':'TRADE'}]
             pnl,src,ccy=await e._resolve_broker_pnl('c1',{'level':99.8,'dealStatus':'ACCEPTED'})
             assert pnl==pytest.approx(-0.06) and src=='broker' and ccy=='GBP'
-            e._learn_closed_trade('c1',{'level':99.8,'profit':pnl,'pnl_currency':ccy})
+            e._learn_closed_trade('c1',{'level':99.8,'profit':pnl,'pnl_currency':ccy,
+                                         'pnl_source':src})
             row=store.trades(1)[0]
             assert row['pnl_source']=='broker'
             assert row['pnl']==pytest.approx(-0.06)

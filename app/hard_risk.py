@@ -72,8 +72,8 @@ def load(store) -> dict:
 def save_operator(store, params: dict, *, reason: str = '') -> dict:
     """Persist operator-chosen limits. Missing keys keep previous; None/0 clears.
 
-    Clearing a limit is allowed but OPEN then blocks until reconfigured — never
-    silently replaced with invented surrogate numbers.
+    Clearing a limit is allowed; OPEN is never blocked by hard-risk (V5 R02) —
+    never silently replaced with invented surrogate numbers.
     """
     if store is None:
         return dict(DEFAULTS)

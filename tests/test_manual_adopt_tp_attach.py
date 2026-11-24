@@ -14,6 +14,14 @@ from app.engine import AdaptiveBrain, SingleTradeEngine, Store, _broker_price_le
 from tests.test_tp_min_distance import _OpenCaptureBroker
 
 
+def _open_bracket_snapshot(store, pos, *, stop=2.0, profit=3.0):
+    entry = float(pos['level'])
+    store.set('open_brackets:' + str(pos['dealId']), {
+        'stop_distance': stop, 'profit_distance': profit,
+        'direction': pos['direction'], 'entry': entry,
+    })
+
+
 def test_needs_protect_when_manual_tp_off():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 's.db')
@@ -121,6 +129,7 @@ def test_protect_ignores_foreign_unresolved_orders():
                 'spread': 0.5, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
             }
             pos = engine.positions[0]
+            _open_bracket_snapshot(store, pos)
             await engine.protect_position(pos)
             protects = [r for r in broker.requests if r[0] == 'PROTECT']
             assert protects, 'foreign unresolved must not block LV manual TP'
@@ -267,6 +276,7 @@ def test_protect_restores_sl_when_tp_only_left():
                 'spread': 0.4, 'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE',
             }
             pos = engine.positions[0]
+            _open_bracket_snapshot(store, pos, profit=2.06)
             assert engine._needs_protect_brackets(pos) is True
             await engine.protect_position(pos)
             protects = [r for r in broker.requests if r[0] == 'PROTECT']

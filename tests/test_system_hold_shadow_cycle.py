@@ -212,6 +212,8 @@ def test_system_would_be_brackets_match_stop_take_shape():
         e.mandate = {'epic': 'SIM', 'size': '0.25', 'initial_deal_id': 'm1'}
         rows = _seed_hist_candles(store, 'SIM', n=100, start_px=200.0)
         mid = float(rows[-1]['close'])
+        from tests.test_integration import seed_swing_candles
+        seed_swing_candles(store, 'SIM', n=90, start_px=mid)
         e.market = {
             'mid': mid, 'spread': 0.30, 'bid': mid - 0.15, 'ask': mid + 0.15,
             'tick': 0.1, 'epic': 'SIM', 'status': 'TRADEABLE', 'min_distance': 0.5,

@@ -39,7 +39,8 @@ def test_closed_trade_event_honest_when_scratch_skips_weights():
             'epic':'GOLD','direction':'BUY','entry':100,'tick_size':.01,
             'transition':brain._json_transition(brain.core.last_transition)})
         before=brain.core.snapshot_weights()
-        e._learn_closed_trade('scr',{'level':100.0,'profit':-0.02,'pnl_currency':'GBP'})
+        e._learn_closed_trade('scr',{'level':100.0,'profit':-0.02,'pnl_currency':'GBP',
+                                      'pnl_source':'broker'})
         after=brain.core.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)==pytest.approx(0)
         # Latest learning event must NOT claim weights updated.
@@ -67,7 +68,8 @@ def test_closed_trade_win_updates_weights_and_bumps_generation():
         gen0=gen_current(store)
         steps0=gen_counters(store)['training_steps']
         before=brain.core.snapshot_weights()
-        e._learn_closed_trade('win1',{'level':101.0,'profit':2.0,'pnl_currency':'GBP'})
+        e._learn_closed_trade('win1',{'level':101.0,'profit':2.0,'pnl_currency':'GBP',
+                                       'pnl_source':'broker'})
         after=brain.core.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)>0
         assert gen_current(store)==gen0+1

@@ -30,7 +30,8 @@ STORE_BLOCK_KEY = 'flow_consensus_block_fights'
 STORE_BLOCK_MIN_KEY = 'flow_consensus_block_min_agree'
 STORE_LEDGER_KEY = 'flow_consensus_ledger_v1'
 DEFAULT_NUDGE = 0.18
-DEFAULT_BLOCK_FIGHTS = 1
+# V5 A03: seed OFF — flow is context/nudge, not a separate OPEN veto.
+DEFAULT_BLOCK_FIGHTS = 0
 DEFAULT_BLOCK_MIN_AGREE = 2
 # Block OPEN only when this many pillars agree against the proposed side.
 BLOCK_MIN_AGREE = 2

@@ -36,6 +36,13 @@ class CapitalQuoteStream:
                             if bid is not None and ask is not None and float(bid)>0 and float(ask)>=float(bid):
                                 self.quote={'epic':epic,'bid':float(bid),'ask':float(ask),'at':time.monotonic(),
                                             'timestamp':payload.get('timestamp')}
+                                # Push into engine.market immediately — do not wait
+                                # for the next 1–3s worker poll (Desk felt dead).
+                                try:
+                                    if hasattr(engine,'_apply_stream_quote'):
+                                        engine._apply_stream_quote()
+                                except Exception:
+                                    pass
                         except (ValueError,TypeError):continue
             except asyncio.CancelledError:raise
             except Exception as exc:self.last_error=type(exc).__name__

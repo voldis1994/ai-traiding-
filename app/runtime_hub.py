@@ -385,54 +385,38 @@ class RuntimeHub:
         if acct:
             try:store.repair_broker_pnl_currency(acct)
             except Exception:pass
-        # Item 5: Cash Ledger is authoritative for realized £; journal is derived.
+        # Item 5: ONE Cash Ledger aggregator for Desk / Funds / mirror / recovery.
         ledger_by_deal={}
         ledger_snap=None
         acct_id=str(store.get('capital_account_id') or 'live')
-        ccy_l=acct or 'GBP'
+        ccy_l=acct  # None → aggregate all currencies (no invented GBP primary)
         env_l=str(store.get('capital_environment') or 'live').lower()
         try:
             from . import cash_ledger
             from .realized_cash import from_minor
+            snap_ccy=acct or 'GBP'
             ledger_snap=cash_ledger.consumer_snapshot(
-                store,acct_id,currency=ccy_l)
-            for ev in cash_ledger.load_events(store):
-                deal=str(ev.get('deal_link') or '')
-                st=str(ev.get('status') or '')
-                if not deal or ev.get('amount_minor') is None:
-                    continue
-                # Same filter as deal_realized — never Desk-sum learn:* doubles.
-                if cash_ledger._is_learn_synthetic(ev):
-                    continue
-                # Isolate by account + environment; never mix LIVE/DEMO.
-                ev_acct=str(ev.get('account_id') or '')
-                if ev_acct and ev_acct!=acct_id:
-                    continue
-                ev_env=str(ev.get('environment') or '').lower()
-                if ev_env and ev_env!=env_l:
-                    continue
-                # P0-03: only verified SETTLED / SETTLED_ZERO — never MATCH_UNCERTAIN.
-                if st not in (cash_ledger.STATUS_SETTLED,cash_ledger.STATUS_SETTLED_ZERO):
-                    continue
-                ev_ccy=str(ev.get('currency') or '').upper() or ccy_l
-                # Do not fold foreign-currency cash into account GBP sum.
+                store,acct_id,currency=snap_ccy,environment=env_l)
+            # Authoritative per-deal map (all ccy when account currency unknown).
+            by_deal=cash_ledger.aggregate_verified_by_deal(
+                store,account_id=acct_id,currency=ccy_l or '',
+                environment=env_l)
+            for _key,agg in by_deal.items():
+                deal=str(agg.get('deal_id') or _key)
+                ev_ccy=str(agg.get('currency') or snap_ccy).upper()
                 if acct and ev_ccy and ev_ccy!=acct:
                     continue
                 try:
-                    major=float(from_minor(int(ev['amount_minor']),ev_ccy))
+                    major=float(from_minor(int(agg['amount_minor']),ev_ccy))
                 except Exception:
                     continue
-                # Sum multiple cash rows per deal (fees/partials) — never overwrite.
-                prev=ledger_by_deal.get(deal)
-                if prev:
-                    major=float(prev['pnl'])+major
-                    st=(cash_ledger.STATUS_SETTLED_ZERO if abs(major)<1e-12
-                        else cash_ledger.STATUS_SETTLED)
+                # When multi-ccy, keep each deal once (deals are unique ids).
                 ledger_by_deal[deal]={
                     'pnl':major,
                     'pnl_currency':ev_ccy,
                     'pnl_source':'broker',
-                    'ledger_status':st,
+                    'ledger_status':agg.get('status') or cash_ledger.STATUS_SETTLED,
+                    'transaction_ids':list(agg.get('transaction_ids') or []),
                 }
         except Exception:
             ledger_by_deal={}
@@ -477,7 +461,9 @@ class RuntimeHub:
                 ev_env=str(ev.get('environment') or '').lower()
                 if ev_env and ev_env!=env_l:
                     continue
-                ev_ccy=str(ev.get('currency') or '').upper() or ccy_l
+                ev_ccy=str(ev.get('currency') or '').upper() or (acct or 'GBP')
+                if acct and ev_ccy and ev_ccy!=acct:
+                    continue
                 try:
                     major=float(_fm(int(ev['amount_minor']),ev_ccy))
                 except Exception:

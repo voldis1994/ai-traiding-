@@ -125,6 +125,11 @@ def flag_for_replay(store, deal_id: str, info: dict[str, Any]) -> dict:
         })
         # Allow re-teach past teachers_settled gate.
         store.set('teachers_settled:' + str(deal_id), None)
+        try:
+            from . import teacher_proofs as _tp
+            _tp.clear(store, deal_id)
+        except Exception:
+            pass
     store.event('learning', 'Learn correction queued', payload)
     return payload
 
@@ -170,6 +175,11 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
             flag['rewind_refused'] = 'newer_committed_exists'
         # Clear gates that would skip re-teach.
         store.set('teachers_settled:' + str(deal_id), None)
+        try:
+            from . import teacher_proofs as _tp
+            _tp.clear(store, deal_id)
+        except Exception:
+            pass
         store.set('learned_trade:' + str(deal_id), {
             'claimed': False, 'learned': False, 'at': _utc_now(),
             'correction': True,

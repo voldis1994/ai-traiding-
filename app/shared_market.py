@@ -61,11 +61,15 @@ def publish_mtf(epic, analysis, *, bars_m1=None, last_at=None, source=None) -> d
         if prev is not None:
             prev_bars = int(prev.get('bars_m1') or 0)
             prev_at = prev.get('last_at')
-            # Prefer more bars; if equal bars, prefer same/newer last_at.
-            if prev_bars > bars:
-                return dict(prev['analysis'], shared=True, shared_kept='richer_peer')
-            if prev_bars == bars and prev_at and at and str(prev_at) > str(at):
-                return dict(prev['analysis'], shared=True, shared_kept='newer_peer')
+            # Fresher tape head ALWAYS beats richer-but-stale peer data.
+            fresher = bool(at and prev_at and str(at) > str(prev_at))
+            if not fresher:
+                if prev_bars > bars:
+                    return dict(prev['analysis'], shared=True,
+                                shared_kept='richer_peer')
+                if prev_bars == bars and prev_at and at and str(prev_at) > str(at):
+                    return dict(prev['analysis'], shared=True,
+                                shared_kept='newer_peer')
         _mtf[epic] = payload
         out = dict(payload['analysis'])
         out['shared'] = True

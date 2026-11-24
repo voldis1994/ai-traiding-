@@ -7733,21 +7733,28 @@ class SingleTradeEngine:
             size=seed_size
             size_plan=None
             grid=_deal_grid(market,mandate_size=seed_size)
+            day_params=day_book.load_params(self.store)
+            fixed_mandate=int(day_params.get('size_fixed_mandate') or 0)==1
             try:
                 size_plan=day_book.propose_size(
                     mandate_size=seed_size,
                     equity=self._account_equity(),
                     daily=day_book.load_daily(self.store,equity=self._account_equity()),
-                    params=day_book.load_params(self.store),
+                    params=day_params,
                     stop_ticks=brackets.get('stop_ticks'),
                     tick_value=tick_val,
                     positions=self.positions,
                     score_edge=open_edge,
                     market=market,
                     size_grid=grid if grid.get('ok') else None)
-                if (size_plan.get('allowed') and size_plan.get('size') is not None
+                # Fixed mandate (default): OPEN lot = first-trade size only.
+                # Adaptive resize only when operator turns day_size_fixed_mandate off.
+                if (not fixed_mandate
+                        and size_plan.get('allowed') and size_plan.get('size') is not None
                         and Decimal(str(size_plan['size']))>0):
                     size=Decimal(str(size_plan['size']))
+                else:
+                    size=seed_size
                 self.store.set('last_open_size_plan',{
                     k:(str(v) if isinstance(v,Decimal) else v)
                     for k,v in (size_plan or {}).items()})

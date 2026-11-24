@@ -444,13 +444,14 @@ def test_stop_ticks_by_deal_shrinks_add_size():
         market={'dealingRules':{
             'minDealSize':{'value':'0.1'},'minSizeIncrement':{'value':'0.1'},
             'maxDealSize':{'value':'50'}}}
+        params=dict(db.load_params(None),size_fixed_mandate=0,size_full_balance=0)
         with_map=db.propose_size(
             mandate_size='1.0',equity=10_000.0,daily={'realized_pnl':0},
-            params=db.load_params(None),stop_ticks=10,tick_value=1.0,
+            params=params,stop_ticks=10,tick_value=1.0,
             positions=e.positions,stop_ticks_by_deal=ticks,market=market)
         bare=db.propose_size(
             mandate_size='1.0',equity=10_000.0,daily={'realized_pnl':0},
-            params=db.load_params(None),stop_ticks=10,tick_value=1.0,
+            params=params,stop_ticks=10,tick_value=1.0,
             positions=e.positions,stop_ticks_by_deal=None,market=market)
         assert with_map.get('committed_risk',0)>0
         assert float(with_map['size'])<=float(bare['size'])

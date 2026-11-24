@@ -85,7 +85,9 @@ def load_params(store):
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
         'open_slices': max(3, int(sp.get('day_open_slices', 5))),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
-        'size_full_balance': int(sp.get('day_size_full_balance', 1)),
+        # Fixed mandate lot = first manual OPEN size on every later robot OPEN.
+        'size_fixed_mandate': int(sp.get('day_size_fixed_mandate', 1)),
+        'size_full_balance': int(sp.get('day_size_full_balance', 0)),
         # Vestigial — OPEN never blocked by day phase (operator: no risk regimes).
         'risk_gates': 0,
     }
@@ -425,11 +427,32 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
     p = params or load_params(None)
     b = budgets(equity=equity, params=p, daily=daily)
     rpt = _finite(b.get('risk_per_trade'))
+    fixed_mandate = int(p.get('size_fixed_mandate') or 0) == 1
     full_bal = int(p.get('size_full_balance') or 0) == 1
     minimum = grid['min']
     step = grid['step']
     want = max(3, int(p.get('open_slices') or 5))
     strength = _signal_strength(score_edge)
+    # Operator lot lock: keep the first-trade mandate on every later OPEN
+    # (0.25 stays 0.25 — never shrink to full-balance min-pack 0.05).
+    if fixed_mandate:
+        return {
+            'size': seed,
+            'reason': 'fixed_mandate_lot',
+            'allowed': True,
+            'budgets': b,
+            'estimated_risk': None,
+            'scale': 1.0,
+            'size_fixed_mandate': True,
+            'size_full_balance': False,
+            'signal_strength': strength,
+            'score_edge': _finite(score_edge),
+            'size_grid': {
+                'min': str(grid['min']), 'step': str(grid['step']),
+                'max': str(grid['max']) if grid.get('max') is not None else None,
+                'source': grid.get('source'),
+            },
+        }
     # Full-balance + missing pip value must NOT glue to mandate (that left LIVE
     # on a single tiny/seed lot while cash-risk budget was the whole £ balance).
     # Deploy an edge-scaled N×minDealSize pack so flat OPEN still multi-tickets.

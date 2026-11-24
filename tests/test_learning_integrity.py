@@ -178,7 +178,7 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         assert detail['target']==1
         from app.self_params import DEFAULTS as _sp
         assert detail['learn_repeats']==int(_sp['learn_loss_repeats'])
-        assert detail['scratch_hold_skip'] is False
+        assert detail.get('scratch_light_teach') is False
         assert detail['weights_updated'] is True
         assert detail['broker_pnl']==-12.5
         assert detail['pnl']==-12.5
@@ -187,11 +187,8 @@ def test_losing_trade_regrets_opposite_action_with_stronger_update():
         assert store.get('entry_brain:loss1') is None
 
 
-def test_scratch_loss_does_not_spam_hold_into_core():
-    """Penny-loss closes must not train any class into the core (HOLD trap).
-
-    Also must NOT burn the once-only learn slot — later CF/broker retry can teach.
-    """
+def test_scratch_loss_teaches_light_not_hold_trap():
+    """Penny loss still teaches lightly — never forces HOLD into the core."""
     with tempfile.TemporaryDirectory() as directory:
         store,brain=new_brain(directory)
         brain.tick(100,.05,.01,'GOLD')
@@ -204,16 +201,14 @@ def test_scratch_loss_does_not_spam_hold_into_core():
             'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
         engine._learn_closed_trade('scratch1',{'level':100.0,'profit':-0.02,'pnl_source':'broker'})
         last=[e for e in store.recent()
-              if 'without weight update' in e['message']][0]
+              if 'updated LIVE neural weights' in e['message']
+              or 'without weight update' in e['message']][0]
         detail=json.loads(last['details'])
-        assert detail['learn_repeats']==0
-        assert detail['scratch_hold_skip'] is True
-        assert detail['weights_updated'] is False
-        assert detail['mode'].endswith('_scratch_no_neural')
-        assert np.array_equal(before,brain.core.P)
+        assert detail.get('scratch_light_teach') is True
+        assert 'scratch_light_teach' in str(detail.get('mode') or '')
+        # Light teach may keep or update weights — never HOLD-trap label.
+        assert detail.get('label') != 2
         assert store.get('entry_brain:scratch1') is None
-        # Once-only slot not burned — deal can still be taught later.
-        assert not store.get('learned_trade:scratch1')
 
 
 def test_mismatched_broker_trade_outcome_never_trains():

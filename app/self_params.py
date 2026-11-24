@@ -202,6 +202,8 @@ DEFAULTS = {
     'flow_pillar_vol_z': 0.20,
     'flow_pillar_imbalance': 0.18,
     'flow_pillar_impact': 0.15,
+    # OHLC chop/doji/impulse notes — soft by default (never OPEN ban).
+    'ohlc_regime_gate_enabled': 0,
     # PR #181 restore: re-entry confirm off — was blocking most follow-on OPENs.
     'reentry_confirm_enabled': 0,
     'reentry_raw_strong': 0.20,
@@ -344,6 +346,7 @@ BOUNDS = {
     'flow_pillar_vol_z': (0.05, 0.50),
     'flow_pillar_imbalance': (0.05, 0.45),
     'flow_pillar_impact': (0.04, 0.40),
+    'ohlc_regime_gate_enabled': (0, 1),
     'reentry_confirm_enabled': (0, 1),
     'reentry_raw_strong': (0.12, 0.28),
     'reentry_raw_medium': (0.06, 0.18),

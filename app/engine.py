@@ -2920,6 +2920,7 @@ class SingleTradeEngine:
                     flow_consensus=flow_dec.get('desk'),
                     flow_decision=result.get('flow_decision'))
             if flow_dec.get('blocked'):
+                # Soft evidence only — never rewrite neural BUY/SELL to HOLD.
                 try:
                     from . import flow_consensus as _fc_block
                     mid_now=_num((self.market or {}).get('mid'))
@@ -2935,28 +2936,32 @@ class SingleTradeEngine:
                         epic=epic_as,
                         reason=flow_dec.get('reason'))
                     self.store.event(
-                        'gate','M1 flow consensus blocked OPEN',
+                        'gate','M1 flow consensus soft note (no HOLD ban)',
                         result.get('flow_decision'))
                 except Exception:
                     pass
-                return dict(
-                    result,action='HOLD',
+                result=dict(
+                    result,
                     proposal=result.get('proposal') or result.get('action'),
-                    reason=flow_dec.get('reason') or 'flow_consensus_blocked',
-                    flow_blocked=True)
+                    soft_reason=flow_dec.get('reason') or 'flow_consensus_soft',
+                    flow_blocked=False,flow_soft=True)
             # V3 L01: never flip action from consensus — scores_raw stay authority.
         except Exception as exc:
             result=dict(result,flow_decision={
                 'effect': 'error', 'reason': type(exc).__name__})
         if result['action'] in ('BUY','SELL'):
+            # Soft evidence stack — neural BUY/SELL stays. Broker physics + Pause
+            # alone may stop POST in submit(); no strategy HOLD bans here.
+            soft_notes=[]
             gates=self.live_open_gates(result['action'])
-            if not gates['allowed']:
-                return dict(result,action='HOLD',reason=gates['reason'],
-                            readiness=gates.get('readiness'))
+            result=dict(result,readiness_gate=gates)
+            if not gates.get('allowed'):
+                soft_notes.append(gates.get('reason') or 'readiness_soft')
             safety=self._external_entry_check(result['action'])
-            if not safety['entry_allowed']:
-                return dict(result,action='HOLD',reason=safety['reason'],external_veto=safety['status'])
-            # Robot day book: multi-pos / day phase capacity (equity risk).
+            result=dict(result,external_safety=safety)
+            if not safety.get('entry_allowed'):
+                soft_notes.append(safety.get('reason') or safety.get('status')
+                                  or 'external_soft')
             score_edge=result.get('score_edge')
             if score_edge is None and hasattr(self.policy,'score_edge'):
                 score_edge=self.policy.score_edge(base_scores)
@@ -2967,25 +2972,20 @@ class SingleTradeEngine:
                 score_edge=score_edge)
             result=dict(result,day_book_gate=book)
             if not book.get('allowed'):
-                return dict(result,action='HOLD',reason=book.get('reason') or 'day_book_blocked')
-            # One machine: after £ loss streak, weak neural edge → HOLD (same gate as submit).
+                soft_notes.append(book.get('reason') or 'day_book_soft')
             edge=unified_cycle.edge_allows_open(
                 base_scores,result,
                 unified_cycle.load_state(self.store))
-            if not edge['allowed']:
-                return dict(result,action='HOLD',reason=edge['reason'],
-                            unified_cycle=edge)
-            result=dict(result,unified_cycle=edge)
-            # Adaptive re-entry: raw neural strength + new tape proof (ATR/structure/M1).
+            result=dict(result,unified_cycle=dict(edge,soft=True,
+                allowed=True,hard_allowed=bool(edge.get('allowed'))))
+            if not edge.get('allowed'):
+                soft_notes.append(edge.get('reason') or 'edge_soft')
             reentry=self._reentry_confirm_gate(
                 result['action'],scores_raw=base_scores,mtf_analysis=mtf_analysis)
-            result=dict(result,reentry_confirm=reentry)
-            if not reentry.get('allowed',True):
-                return dict(result,action='HOLD',
-                            reason=reentry.get('reason') or 'reentry_confirm_hold',
-                            proposal=result.get('proposal') or result['action'])
-            # OHLC regime: chop / low vol / doji / impulse / chaos → do not OPEN.
-            # Replaces eternal M1 colour-confirm HOLD as the candle-quality veto.
+            result=dict(result,reentry_confirm=dict(reentry or {},allowed=True,
+                soft_allowed=bool((reentry or {}).get('allowed',True))))
+            if not (reentry or {}).get('allowed',True):
+                soft_notes.append((reentry or {}).get('reason') or 'reentry_soft')
             from . import ohlc_regime_gate
             candles_rg=self._decision_candles()
             atr_rg=_num((mtf_analysis or {}).get('stop_hint_atr14'))
@@ -2995,30 +2995,20 @@ class SingleTradeEngine:
                 candles=candles_rg,mid=_num(self.market.get('mid')),
                 spread=_num(self.market.get('spread')),atr=atr_rg,
                 structure=struct_rg,store=self.store)
-            result=dict(result,ohlc_regime=regime_gate)
-            if not regime_gate.get('allowed',True):
-                return dict(result,action='HOLD',
-                            reason=regime_gate.get('reason') or 'no_trade_ohlc',
-                            proposal=result.get('proposal') or result['action'])
-            # OHLC entry zone + MTF (KAMA/ADX/ATR): neural side only fires when
-            # price is IN the structural band AND the indicator stack agrees.
+            result=dict(result,ohlc_regime=dict(regime_gate or {},allowed=True,
+                soft_allowed=bool((regime_gate or {}).get('allowed',True))))
+            if not (regime_gate or {}).get('allowed',True):
+                soft_notes.append((regime_gate or {}).get('reason') or 'regime_soft')
             zone_gate=self._ohlc_entry_zone_gate(
                 result['action'],mtf_analysis=mtf_analysis)
-            result=dict(result,ohlc_entry_zone=zone_gate)
-            if not zone_gate.get('allowed'):
-                return dict(result,action='HOLD',
-                            reason=zone_gate.get('reason') or 'wait_entry_zone',
-                            proposal=result.get('proposal') or result['action'])
-            # Signal must match OHLC swing + min RR — same brackets LIVE OPEN uses.
-            # Never advertise BUY/SELL when structure cannot place SL/TP yet.
+            result=dict(result,ohlc_entry_zone=dict(zone_gate or {},allowed=True,
+                soft_allowed=bool((zone_gate or {}).get('allowed'))))
+            if not (zone_gate or {}).get('allowed'):
+                soft_notes.append((zone_gate or {}).get('reason') or 'zone_soft')
             swing_br=self._would_be_brackets(result['action'])
             result=dict(result,ohlc_swing_brackets=swing_br)
             if not swing_br:
-                return dict(result,action='HOLD',
-                            reason='wait_ohlc_swing_rr',
-                            proposal=result.get('proposal') or result['action'])
-            # GOLD audit strategies: soft teach by default (hard_block optional).
-            # Correct approach = BOS/library preferred side — neurons still vote.
+                soft_notes.append('wait_ohlc_swing_rr_soft')
             from . import gold_strategies
             epic_gs=(self.mandate or {}).get('epic') or getattr(self.brain,'epic',None)
             score_edge=result.get('score_edge')
@@ -3030,14 +3020,12 @@ class SingleTradeEngine:
                 structure=struct_rg,score_edge=score_edge,store=self.store,
                 brackets=swing_br if isinstance(swing_br,dict) else None)
             result=dict(result,gold_strategies=gold_gate)
-            # Hard veto only when operator enables gold_strat_hard_block.
             if (gold_gate.get('applies') and gold_gate.get('hard_block')
                     and not gold_gate.get('allowed',True)):
-                return dict(result,action='HOLD',
-                            reason=gold_gate.get('reason') or 'gold_strategy_hold',
-                            proposal=result.get('proposal') or result['action'])
-            # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
-            # LIVE executes neural vote; shadow teaches weights after SL closes.
+                soft_notes.append(gold_gate.get('reason') or 'gold_soft')
+            if soft_notes:
+                result=dict(result,soft_notes=soft_notes,
+                            soft_reason=soft_notes[0])
             result=dict(result,structure_shadow=self._structure_shadow_advice(
                 result['action']))
         else:
@@ -6182,22 +6170,19 @@ class SingleTradeEngine:
                     and struct_ctx['structure_frame_advice'].get('toxic_opposite')
                     == direction):
                 repeats=int(repeats)+1
-        # Penny losses used to skip entirely (repeats=0) while still claiming the
-        # deal — same bad entry repeated with no ΔW. Teach light HOLD instead.
+        # Penny losses still teach — light ΔW so the same situation can improve.
+        # Never force a HOLD label (HOLD-trap); use the loss counterfactual path.
         scratch_band=float(sp['scratch_pnl_abs'])
-        scratch_hold=False
+        scratch_loss=False
         if pnl_value is not None:
             try:
                 cash=float(pnl_value)
-                scratch_hold=(-scratch_band<=cash<0.)
+                scratch_loss=(-scratch_band<=cash<0.)
             except (TypeError,ValueError):
-                scratch_hold=False
-        if scratch_hold:
-            # Penny closes: do NOT teach HOLD into the core (HOLD-trap) and do
-            # NOT burn the once-only learn slot — brackets/cycle still settle.
-            label=None
-            repeats=0
-            mode=str(mode)+'_scratch_no_neural'
+                scratch_loss=False
+        if scratch_loss and label is not None:
+            repeats=max(1,min(int(repeats or 1),2))
+            mode=str(mode)+'_scratch_light_teach'
         learn_lr=float(sp['learn_lr'])
         transition=saved['transition']
         losses=[]
@@ -6504,7 +6489,7 @@ class SingleTradeEngine:
                  'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
                  'broker_pnl':broker_pnl,
                  'realized_directional_ticks':realized_ticks,'target':label,
-                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'learn_repeats':repeats,'scratch_light_teach':scratch_loss,
                  'last_loss':losses[-1] if losses else None,
                  'weights_updated':True,'tick_size':tick,
                  'learn_gate':gate_info,
@@ -6516,7 +6501,7 @@ class SingleTradeEngine:
             self.store.event('learning','Closed-trade recorded without weight update',
                 {'deal_id':deal_id,'epic':epic,'direction':direction,'mode':mode,
                  'pnl':pnl_value,'pnl_source':pnl_source,'pnl_currency':currency,
-                 'learn_repeats':repeats,'scratch_hold_skip':scratch_hold,
+                 'learn_repeats':repeats,'scratch_light_teach':scratch_loss,
                  'target':label,'weights_updated':False,
                  'learn_gate':gate_info,
                  'learning_generation':learning_generation.current(self.store)})
@@ -7542,19 +7527,23 @@ class SingleTradeEngine:
             return
         # Never submit when the learned market context is stale/incomplete.
         if not self.market_context.get('ready'):return
-        # After fusion transition: never open on a stale signal during EXTERNAL gap.
-        if self._fusion_entry_blocked():return
-        if not self._external_entry_check(action)['entry_allowed']:return
-        # Audit #22–#23: prep/eval readiness + hard_risk (utility via evaluate_neural_entry).
+        # Soft notes only — fusion/external/readiness never ban neural OPEN.
+        if self._fusion_entry_blocked():
+            self.store.event('entry','Fusion soft note (OPEN not banned)',{
+                'reason':self.fusion_block_reason})
+        ext=self._external_entry_check(action)
+        if not ext.get('entry_allowed'):
+            self.store.event('entry','External soft note (OPEN not banned)',{
+                'status':ext.get('status'),'reason':ext.get('reason')})
         gates=self.live_open_gates(action)
         if not gates.get('allowed'):
-            self.last_entry_reason=gates.get('reason') or 'LIVE OPEN blocked by readiness'
-            return
+            self.store.event('entry','Readiness soft note (OPEN not banned)',{
+                'reason':gates.get('reason')})
         # V3 A03: never swap champion weights between plan and POST.
         self.pending_order=True
         try:
             await self.sync()
-            if self.positions or not self._external_entry_check(action)['entry_allowed']:return
+            if self.positions:return
             market=broker_market or await self.broker.market(self.mandate['epic'])
             snap=market.get('snapshot',{});tick=self._tick(market)
             # Prefer fresh broker/stream prices after sync — not stale self.market.
@@ -7586,23 +7575,18 @@ class SingleTradeEngine:
                 structure=(self.market_context or {}).get('structure'),
                 store=self.store)
             if not regime_sub.get('allowed',True):
-                self.last_entry_reason=regime_sub.get('reason') or 'no_trade_ohlc'
-                self.store.event('entry','OPEN skipped — OHLC regime veto',{
-                    'reason':self.last_entry_reason,'action':action,
+                self.store.event('entry','OHLC regime soft note (OPEN not banned)',{
+                    'reason':regime_sub.get('reason'),'action':action,
                     'flags':regime_sub.get('flags')})
-                return
-            # Defense in depth: OHLC+MTF zona *and* shared fleet side (same as eval).
             zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
             if not zone_gate.get('allowed'):
-                self.last_entry_reason=zone_gate.get('reason') or 'wait_entry_zone'
-                self.store.event('entry','OPEN skipped — waiting OHLC entry zona',{
-                    'reason':self.last_entry_reason,'action':action,
+                self.store.event('entry','OHLC zone soft note (OPEN not banned)',{
+                    'reason':zone_gate.get('reason'),'action':action,
                     'price':zone_gate.get('price'),'zone':zone_gate.get('zone'),
                     'mtf_ok':zone_gate.get('mtf_ok'),
                     'trigger':zone_gate.get('trigger'),
                     'shared_side':zone_gate.get('shared_side'),
                     'source':zone_gate.get('source')})
-                return
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
@@ -7625,12 +7609,25 @@ class SingleTradeEngine:
                 action=action,scores=scores,evaluation=evaluation,zone=zone,
                 learned=learned,cycle_state=cycle_state,base_sl=base_sl,
                 max_tp=zone.get('max_tp'))
+            # Edge soft: if compose HOLDs, still build brackets from shape helpers.
             if pkg.get('blocked') or pkg.get('action') not in ('BUY','SELL'):
-                self.last_entry_reason=pkg.get('reason') or 'Unified cycle HOLD'
-                self.store.event('entry','OPEN skipped — unified cycle edge gate',{
-                    'reason':self.last_entry_reason,'decision':pkg.get('decision'),
+                self.store.event('entry','Unified cycle soft note (OPEN not banned)',{
+                    'reason':pkg.get('reason'),'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
-                return
+                swing_fb=self._would_be_brackets(action)
+                if isinstance(swing_fb,dict) and swing_fb.get('stop_distance'):
+                    pkg=dict(pkg or {},action=action,blocked=False,
+                             stop_distance=swing_fb.get('stop_distance'),
+                             profit_distance=swing_fb.get('profit_distance'),
+                             kappa=swing_fb.get('ohlc_kappa'),
+                             sl_scale=swing_fb.get('sl_scale') or 1.0)
+                else:
+                    # Last resort: broker min distance × learned κ — neural still posts.
+                    k=float((learned or {}).get('kappa') or 1.5)
+                    pkg=dict(pkg or {},action=action,blocked=False,
+                             stop_distance=base_sl,
+                             profit_distance=max(base_sl*k,float(minimum)+buffer),
+                             kappa=k,sl_scale=float((learned or {}).get('sl_scale') or 1.0))
             atr_hint=self._bracket_atr_hint(mtf_live,candles)
             kama_hint=None
             try:
@@ -7648,27 +7645,28 @@ class SingleTradeEngine:
                         if isinstance(zone_gate,dict) else None)
             trigger=(zone_gate.get('trigger')
                      if isinstance(zone_gate,dict) else None)
+            # Prefer swing anchors; if tape has none, fall back to zone/median
+            # so neural OPEN is not banned waiting forever for structure.
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
                 tighten=1.0,
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=True,store=self.store,
+                kama=kama_hint,require_swing=False,store=self.store,
                 entry_zone=entry_zone,scenario=scenario,zones=zones_card,
                 trigger=trigger)
-            # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:
-                self.last_entry_reason=(
-                    f"OPEN skipped — no OHLC swing SL/TP "
-                    f"({decided.get('reason') or decided.get('swing_reason') or 'unready'})")
-                self.store.event('entry','OPEN skipped — swing brackets unavailable',{
-                    'reason':self.last_entry_reason,
-                    'source':decided.get('source'),
-                    'swing_reason':decided.get('swing_reason') or decided.get('reason'),
-                    'bos_event':decided.get('bos_event'),
-                    'swing_hi':decided.get('swing_hi'),
-                    'swing_lo':decided.get('swing_lo')})
-                return
+                # Broker still needs numeric SL/TP — use compose/pkg or min×κ.
+                fb_sl=float(pkg.get('stop_distance') or base_sl)
+                fb_tp=float(pkg.get('profit_distance')
+                            or max(fb_sl*float((learned or {}).get('kappa') or 1.5),
+                                   float(minimum)+buffer))
+                decided=dict(decided or {},ready=True,source='neural_min_fallback',
+                             stop_distance=fb_sl,profit_distance=fb_tp,
+                             kappa=pkg.get('kappa') or (learned or {}).get('kappa'),
+                             reason='fallback_no_swing')
+                self.store.event('entry','OPEN brackets fallback (no swing ban)',{
+                    'stop_distance':fb_sl,'profit_distance':fb_tp,'action':action})
             sign=1 if action=='BUY' else -1
             sd=float(decided['stop_distance']);pd=float(decided['profit_distance'])
             stop_level=decided.get('stop_level')

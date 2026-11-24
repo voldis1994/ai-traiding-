@@ -86,14 +86,16 @@ def test_entry_evaluation_holds_until_confirmed_buy_zone():
                         'tf': {'m1': {'atr14': 1.0}},
                     }):
                 out = e._entry_evaluation()
-        # Either still waiting on zona, or already HOLD for another gate —
-        # zona must report not allowed while price is far.
-        assert (out.get('ohlc_entry_zone') or gate_far).get('allowed') is False or \
-               out.get('action') == 'HOLD'
+        # Soft stack: neural BUY stays; zona notes soft_allowed=False while far.
+        zone = out.get('ohlc_entry_zone') or gate_far
+        assert out.get('action') == 'BUY'
+        assert zone.get('soft_allowed') is False or 'wait' in str(zone.get('reason') or '')
+        assert any('zone' in str(n).lower() or 'wait' in str(n).lower()
+                   for n in (out.get('soft_notes') or [zone.get('reason')]))
 
 
-def test_submit_skips_when_outside_entry_zone():
-    """Defense-in-depth: submit() must not market-chase outside the zona."""
+def test_submit_soft_note_when_outside_entry_zone():
+    """Outside zona is a soft note — neural OPEN is not banned by zone hardcode."""
     import asyncio
 
     with tempfile.TemporaryDirectory() as d:
@@ -136,11 +138,12 @@ def test_submit_skips_when_outside_entry_zone():
                                         })
 
         asyncio.run(_run())
-        reason=(e.last_entry_reason or '').lower()
-        assert 'wait' in reason
-        # Outside zone / mid-range / scenario gate — any HOLD that refused OPEN.
-        assert ('entry' in reason or 'zone' in reason or 'mid_range' in reason
-                or 'scenario' in reason)
+        # Soft note logged; zone must not force last_entry_reason wait-ban.
+        soft = [ev for ev in store.recent()
+                if 'soft note' in (ev.get('message') or '').lower()]
+        assert soft
+        reason = (e.last_entry_reason or '').lower()
+        assert 'wait_entry_zone' not in reason
 
 
 def test_require_swing_still_on_decide_path():

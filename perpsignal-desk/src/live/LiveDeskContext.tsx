@@ -21,12 +21,26 @@ export function LiveDeskProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let dead = false;
+    let inFlight: Promise<void> | null = null;
     const tick = async () => {
-      const snap = await fetchLiveDesk();
-      if (!dead) setLive(snap);
+      // Coalesce — a slow /overview must not stack and freeze the Desk.
+      if (inFlight) return inFlight;
+      inFlight = (async () => {
+        try {
+          const snap = await fetchLiveDesk();
+          if (!dead) setLive(snap);
+        } catch {
+          /* keep last snap */
+        } finally {
+          inFlight = null;
+        }
+      })();
+      return inFlight;
     };
     tick();
-    const id = setInterval(tick, POLL_MS);
+    const id = setInterval(() => {
+      tick();
+    }, POLL_MS);
     return () => {
       dead = true;
       clearInterval(id);

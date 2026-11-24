@@ -1751,7 +1751,7 @@ class SingleTradeEngine:
             self.store.event('trade','Deal closed pending broker confirm P&L',
                              {'dealId':prev_id,'exit_guess':exit_guess})
             return None,'pending_close_sync',None
-        # SL/TP/manual vanish: only settle on Capital history/Funds cash.
+        # SL/TP/manual vanish: Capital £ when available; UPL Desk-only until Funds.
         if exit_guess is None:
             snap=self.store.get('last_upl:'+str(prev_id)) or {}
             exit_guess=_num(snap.get('exit_hint'))
@@ -1760,8 +1760,18 @@ class SingleTradeEngine:
         if pnl is not None and src=='broker':
             conf['profit']=pnl
             if ccy:conf['pnl_currency']=ccy
-            conf['pnl_source']=src
+            conf['pnl_source']='broker'
             self._learn_closed_trade(prev_id,conf)
+        elif pnl is not None and src=='upl_estimate':
+            self.store.close_trade(
+                prev_id,exit_guess,pnl,
+                currency=ccy or self._account_currency(),
+                source='upl_estimate',overwrite=True)
+            self._queue_pending_pnl(prev_id,exit_level=exit_guess)
+            self.store.event('trade',
+                'Deal closed; provisional UPL on Desk — waiting Capital £',
+                {'dealId':prev_id,'exit_guess':exit_guess,'pnl':pnl,
+                 'pnl_source':'upl_estimate'})
         else:
             self.store.close_trade(prev_id,exit_guess,source='pending_broker_pnl',overwrite=True)
             self._queue_pending_pnl(prev_id,exit_level=exit_guess)
@@ -1875,8 +1885,9 @@ class SingleTradeEngine:
             self.position_age=0
         self.last_closed_step=self.brain.core.steps
         self.latest_close_id=deal
+        # History cash is Capital Funds/activity — stamp broker so learn banks £.
         conf={'level':exit_guess,'profit':float(pnl),'pnl_currency':self._cash_currency(ccy),
-              'source':source}
+              'source':source,'pnl_source':'broker'}
         self._learn_closed_trade(deal,conf)
         self.store.event('reconcile',
             'Open deal settled from Capital history cash',
@@ -3820,19 +3831,27 @@ class SingleTradeEngine:
                 # SL/TP may arrive on a later PUT — enroll trail then if OPEN lacked TP.
                 self._enroll_adaptive_protection(p)
         if kind=='CLOSE':
-            # Only Capital history/Funds £ — never invent from confirm.profit / UPL.
+            # Capital £ when available; UPL only provisional on Desk; never invent.
             pnl,src,_ccy=await self._resolve_broker_pnl(deal_id,confirmation)
+            exit_lvl=_num(confirmation.get('level'))
             if pnl is not None and src=='broker':
-                confirmation={**confirmation,'profit':pnl,'pnl_source':src}
+                confirmation={**confirmation,'profit':pnl,'pnl_source':'broker'}
                 if _ccy and not confirmation.get('pnl_currency'):
                     confirmation={**confirmation,'pnl_currency':_ccy}
                 self._learn_closed_trade(deal_id,confirmation)
+            elif pnl is not None and src=='upl_estimate':
+                # Show Capital's last UPL now; harvest upgrades to Funds £ later.
+                self.store.close_trade(deal_id,exit_lvl,pnl,currency=_ccy or self._account_currency(),
+                                       source='upl_estimate',overwrite=True)
+                self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
+                self.store.event('learning',
+                    'Close: provisional UPL on Desk — waiting Capital Funds/activity £',
+                    {'deal_id':deal_id,'pnl':pnl,'pnl_source':'upl_estimate'})
             else:
-                exit_lvl=_num(confirmation.get('level'))
                 self.store.close_trade(deal_id,exit_lvl,source='pending_broker_pnl',overwrite=True)
                 self._queue_pending_pnl(deal_id,exit_level=exit_lvl)
                 self._teach_pending_ticks(deal_id,exit_lvl)
-                self.store.event('warning','Close confirmed; waiting for Capital Funds £',
+                self.store.event('warning','Close confirmed; waiting for Capital £',
                                  {'deal_id':deal_id,'reference':ref,'pnl_source':src})
             # Confirmed close must leave the robot armed for the next OPEN.
             self._release_execution_after_flat(deal_id)
@@ -5271,17 +5290,27 @@ class SingleTradeEngine:
         return closed
 
     def _last_upl_as_realized(self,deal_id):
-        """V3 P05: UPL must never teach or settle as realized cash — always None."""
+        """UPL must never teach as realized cash — always None."""
         return None
 
-    async def _resolve_broker_pnl(self,deal_id,confirmation=None):
-        """Capital history/Funds cash only — never confirm.profit or UPL invent.
+    def _provisional_upl_cash(self,deal_id):
+        """Last open-position UPL snap for Desk display only (not teach)."""
+        snap=self.store.get('last_upl:'+str(deal_id)) or {}
+        if not isinstance(snap,dict):
+            return None
+        return self._parse_cash_num(snap.get('upl') if snap.get('upl') is not None
+                                    else snap.get('pnl'))
 
-        Confirm often disagrees with Funds by pence. Desk stays
-        ``pending_broker_pnl`` until activity/transactions return real £.
-        V3 P05: only ``may_teach_live_cash`` sources settle as broker cash.
+    async def _resolve_broker_pnl(self,deal_id,confirmation=None):
+        """Take the £ Capital.com already sends — no invented paths.
+
+        Order (same as phone):
+          1) GET /history/transactions TRADE ``pnl``/``cash`` (Funds)
+          2) GET /history/activity ``profitAndLoss`` (when Funds not posted yet)
+          3) else last open UPL as ``upl_estimate`` for Desk only — never teach
+        Never invent mid×size. Never treat confirm.profit as Funds.
+        Fuzzy bind stays on the Funds-mirror harvest, not on every close.
         """
-        from . import realized_cash
         confirmation=confirmation or {}
         ccy=self._cash_currency(confirmation.get('pnl_currency') or confirmation.get('currency'))
         queued=None
@@ -5290,32 +5319,15 @@ class SingleTradeEngine:
                 queued=item.get('queued_at');break
         found=await self._pnl_from_broker_history(deal_id,queued_at=queued)
         if not found and (hasattr(self.broker,'activity') or hasattr(self.broker,'transactions')):
-            await asyncio.sleep(.8)
+            await asyncio.sleep(.5)
             found=await self._pnl_from_broker_history(deal_id,queued_at=queued)
-        if not found:
-            try:
-                found=await self._pnl_fuzzy_instrument_cash(deal_id,queued_at=queued)
-            except Exception as exc:
-                self.store.event('warning','Fuzzy resolve P&L failed',
-                                 {'deal_id':deal_id,'type':type(exc).__name__})
         if found:
             pnl,hist_ccy=found
-            picked=realized_cash.pick_live_realized(
-                funds=pnl,confirm_profit=confirmation.get('profit'),
-                last_upl=None,source='broker')
-            if picked.get('status')!='OK' or not realized_cash.may_teach_live_cash(
-                    picked.get('source')):
-                return None,'pending_broker_pnl',ccy
-            # Ignore Capital £0 placeholders — wait for real Funds settlement
-            # unless settled_zero is explicitly accepted.
-            if abs(float(pnl))<1e-12 and not picked.get('settled_zero'):
-                return None,'pending_broker_pnl',ccy
-            return float(pnl),'broker',self._cash_currency(
-                picked.get('currency') or hist_ccy)
-        # Explicitly ignore UPL / confirm.profit via pick_live_realized.
-        realized_cash.pick_live_realized(
-            funds=None,confirm_profit=confirmation.get('profit'),
-            last_upl=None,source='pending')
+            # Capital's number — take it (including honest £0 scratch from Funds).
+            return float(pnl),'broker',self._cash_currency(hist_ccy) or ccy
+        upl=self._provisional_upl_cash(deal_id)
+        if upl is not None and math.isfinite(float(upl)):
+            return float(upl),'upl_estimate',ccy
         return None,'pending_broker_pnl',ccy
 
     def _trade_already_learned(self,deal_id):
@@ -5502,16 +5514,17 @@ class SingleTradeEngine:
         return True
 
     def _teach_pending_ticks(self,deal_id,exit_level=None):
-        """Keep journal pending until Capital Funds £ — no UPL/tick invent."""
+        """Keep journal pending/provisional until Capital £ — never teach from UPL."""
         deal=str(deal_id)
         if self._trade_already_learned(deal):
             return False
         row=self.store.db.execute(
             'SELECT pnl_source,pnl FROM trades WHERE deal_id=?',(deal,)).fetchone()
         src=str(row[0] or '') if row else ''
-        if src=='pending_close_sync':
+        # Leave confirm-in-flight and Desk provisional UPL alone — Funds overwrites later.
+        if src in ('pending_close_sync','upl_estimate'):
             self.store.event('learning',
-                'Pending Capital Funds £ — neural teach deferred',
+                'Pending Capital £ — neural teach deferred',
                 {'deal_id':deal,'exit_level':exit_level,'pnl_source':src})
             return False
         self.store.close_trade(deal,exit_level,source='pending_broker_pnl',overwrite=True)

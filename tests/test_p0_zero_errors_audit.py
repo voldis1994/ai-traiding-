@@ -266,8 +266,9 @@ def test_settle_history_cash_keeps_sibling_multi_pos():
             assert 'gone' not in e._open_deal_ids
             row=next(t for t in store.trades(5) if t['deal_id']=='gone')
             assert row['closed'] is not None
-            assert row['pnl_source']=='pending_broker_pnl'
-            assert row['pnl'] is None
+            # Exact history cash → take Capital £ as broker.
+            assert row['pnl_source']=='broker'
+            assert row['pnl']==pytest.approx(0.11)
     asyncio.run(scenario())
 
 

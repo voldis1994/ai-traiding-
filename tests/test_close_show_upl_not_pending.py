@@ -26,7 +26,7 @@ def test_snapshot_parses_pound_string_upl():
         assert snap['currency']=='GBP'
 
 
-def test_vanish_without_funds_stays_pending_not_upl():
+def test_vanish_without_funds_shows_provisional_upl_then_funds():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -47,19 +47,21 @@ def test_vanish_without_funds_stays_pending_not_upl():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row['pnl'] is None
-            assert row['pnl_source']=='pending_broker_pnl'
+            # Desk shows last Capital UPL; neural waits for Funds £.
+            assert row['pnl']==pytest.approx(0.01)
+            assert row['pnl_source']=='upl_estimate'
             assert not e._trade_already_learned('g01')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='g01'
                        for x in pending)
-            # Real Funds £ settles.
+            # Real Funds £ overwrites + teaches.
             broker.tx=[{'reference':'g01','pnl':'0.01','currency':'GBP',
                         'transactionType':'TRADE'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(0.01)
             assert row['pnl_source']=='broker'
+            assert e._trade_already_learned('g01')
     asyncio.run(scenario())
 
 
@@ -91,7 +93,7 @@ def test_pending_close_sync_waits_without_upl_invent():
     asyncio.run(scenario())
 
 
-def test_teach_pending_clears_legacy_upl_estimate_to_pending():
+def test_teach_pending_keeps_provisional_upl_estimate():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -100,4 +102,5 @@ def test_teach_pending_clears_legacy_upl_estimate_to_pending():
         store.close_trade('u1',100.1,0.01,currency='GBP',source='upl_estimate',overwrite=True)
         e._teach_pending_ticks('u1',100.1)
         row=store.trades(1)[0]
-        assert row['pnl_source']=='pending_broker_pnl'
+        assert row['pnl_source']=='upl_estimate'
+        assert row['pnl']==pytest.approx(0.01)

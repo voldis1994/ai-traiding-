@@ -54,8 +54,9 @@ def test_close_waits_for_funds_before_neural_teach():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row['pnl'] is None
-            assert row['pnl_source']=='pending_broker_pnl'
+            # Provisional UPL on Desk; neural must wait for Capital Funds £.
+            assert row['pnl']==pytest.approx(-0.11)
+            assert row['pnl_source']=='upl_estimate'
             assert not e._trade_already_learned('learn1')
             assert brain.trade_labeled==labeled_before
             pending=store.get('pending_broker_pnl_deals') or []

@@ -45,9 +45,9 @@ def test_positions_api_error_clears_ghost_when_history_has_cash():
             assert snap['entry_block_reason']!='Existing open position'
             row=store.trades(1)[0]
             assert row['closed'] is not None
-            # V5: history cash without pnl_source=broker defers teach, not invented £.
-            assert row['pnl_source']=='pending_broker_pnl'
-            assert row['pnl'] is None
+            # Capital history £ on ghost recover → take it and stamp broker.
+            assert row['pnl_source']=='broker'
+            assert row['pnl']==pytest.approx(-0.08)
             # Open-book score wipe must not apply after ghost clear; signal kept
             # until flat+not-ready path (market_context still default-ready here).
             assert e.last_signal is not None

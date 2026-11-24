@@ -45,8 +45,8 @@ def test_resolve_uses_activity_profit_not_ticks_only():
     asyncio.run(scenario())
 
 
-def test_resolve_ignores_upl_and_confirm_waits_for_funds():
-    """No UPL / confirm.profit invent — wait for Capital Funds/history £."""
+def test_resolve_upl_provisional_ignores_confirm_profit():
+    """confirm.profit never wins; UPL is Desk-only until Capital history £."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -56,8 +56,10 @@ def test_resolve_ignores_upl_and_confirm_waits_for_funds():
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl(
                 'd2',{'profit':-0.81,'currency':'GBP'})
-            assert pnl is None
-            assert src=='pending_broker_pnl'
+            assert pnl==pytest.approx(0.45)
+            assert src=='upl_estimate'
+            from app.realized_cash import may_teach_live_cash
+            assert may_teach_live_cash(src) is False
     asyncio.run(scenario())
 
 
@@ -83,15 +85,18 @@ def test_sl_tp_vanish_waits_when_capital_cash_is_zero_placeholder():
             broker.acts=[{'dealId':'gold1','details':{'profit':0.0},'currency':'USD'}]
             await e.sync()
             row=store.trades(1)[0]
-            assert row['pnl'] is None
-            assert row['pnl_source']=='pending_broker_pnl'
-            # Real Funds £ later settles.
+            # Desk shows last open UPL; £0 activity does not teach.
+            assert row['pnl']==pytest.approx(-0.02)
+            assert row['pnl_source']=='upl_estimate'
+            assert not e._trade_already_learned('gold1')
+            # Real Funds £ later overwrites + teaches.
             broker.tx=[{'reference':'gold1','pnl':'-0.12','currency':'GBP',
                         'transactionType':'TRADE'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.12)
             assert row['pnl_source']=='broker'
+            assert e._trade_already_learned('gold1')
     asyncio.run(scenario())
 
 

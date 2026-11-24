@@ -2812,7 +2812,8 @@ class SingleTradeEngine:
             # Item 15: stage/API telemetry snapshot (off event-loop write).
             try:
                 _telem.get_telemetry().note_loop_tick()
-                _off.schedule(_telem.get_telemetry().persist,self.store)
+                # Persist on event-loop thread — Store.db is not thread-safe.
+                _telem.get_telemetry().persist(self.store)
             except Exception:
                 pass
 
@@ -4072,6 +4073,31 @@ class SingleTradeEngine:
             self._release_execution_after_flat(deal_id)
         self.store.event('order','Broker order confirmed and reconciled',{'kind':kind,'reference':ref,'deal_id':confirmation.get('dealId')})
         return True
+    def _capital_account_id(self):
+        """Ledger / teach account identity — never the bare account blob."""
+        stored=self.store.get('capital_account_id')
+        if stored:
+            return str(stored)
+        self._account_currency()  # may persist from preferred account
+        stored=self.store.get('capital_account_id')
+        if stored:
+            return str(stored)
+        account_blob=getattr(self,'account',None)
+        accounts=account_blob.get('accounts',[]) if isinstance(account_blob,dict) else []
+        preferred=next((a for a in accounts if a.get('preferred')),None)
+        active=preferred or (accounts[0] if accounts else {})
+        if isinstance(active,dict) and active.get('accountId') is not None:
+            return str(active.get('accountId'))
+        return 'live'
+
+    def _capital_environment(self):
+        stored=self.store.get('capital_environment')
+        if stored:
+            return str(stored).lower()
+        if getattr(self,'broker',None) is not None:
+            return 'live' if getattr(self.broker,'live',True) else 'demo'
+        return 'live'
+
     def _account_currency(self):
         """P0-09: prefer currentAccountId exact match over first preferred."""
         account_blob=getattr(self,'account',None)
@@ -4663,7 +4689,11 @@ class SingleTradeEngine:
         if not self.broker or not deal_id:return None
         deal=str(deal_id)
         look=self._history_lookback(deal,queued_at=queued_at)
-        # 1) Capital Funds TRADE cash — matches phone Closed Positions £.
+        acct=self._capital_account_id()
+        env=self._capital_environment()
+        ccy_default=self._account_currency() or 'GBP'
+        matched=[]  # (val, ccy, row)
+        # 1) Capital Funds TRADE cash — SUM all exact matches (fees/partials).
         if hasattr(self.broker,'transactions'):
             try:
                 kwargs=self._history_kwargs(look,tx_type='TRADE')
@@ -4677,12 +4707,15 @@ class SingleTradeEngine:
                     if not self._transaction_matches_deal(row,deal,exact=True):continue
                     val=self._row_cash_pnl(row,prefer_funds=True)
                     if val is not None:
-                        return float(val),self._cash_currency(row.get('currency'))
+                        matched.append((
+                            float(val),
+                            self._cash_currency(row.get('currency')) or ccy_default,
+                            row))
             except Exception as exc:
                 self.store.event('warning','Transaction history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
-        # 2) Activity fallback — exact dealId only.
-        if hasattr(self.broker,'activity'):
+        # 2) Activity fallback — exact dealId only (when Funds empty).
+        if not matched and hasattr(self.broker,'activity'):
             try:
                 kwargs=self._history_kwargs(look,for_activity=True,deal_id=deal)
                 payload=await self.broker.activity(**kwargs)
@@ -4700,12 +4733,37 @@ class SingleTradeEngine:
                     details=row.get('details') if isinstance(row.get('details'),dict) else {}
                     val=self._row_cash_pnl(row,details,prefer_funds=False)
                     if val is not None:
-                        return float(val),self._cash_currency(
-                            row.get('currency') or details.get('currency'))
+                        matched.append((
+                            float(val),
+                            self._cash_currency(
+                                row.get('currency') or details.get('currency'))
+                            or ccy_default,
+                            row))
             except Exception as exc:
                 self.store.event('warning','Activity history P&L lookup failed',
                                  {'type':type(exc).__name__,'deal_id':deal})
-        return None
+        if not matched:
+            return None
+        # Ingest each Funds row with REAL broker transaction id (never learn:).
+        try:
+            from . import cash_ledger as _cl
+            for val,ccy,row in matched:
+                tx_id=str(
+                    row.get('transactionId') or row.get('reference')
+                    or row.get('dealReference') or '')
+                if not tx_id or tx_id.startswith('learn:'):
+                    continue
+                _cl.ingest_funds_row(
+                    self.store,dict(row),
+                    account_id=acct,environment=env,
+                    account_currency=ccy or ccy_default,
+                    deal_link=deal,transaction_id=tx_id,close_proof=True)
+        except Exception as exc:
+            self.store.event('warning','History→ledger ingest skipped',
+                             {'type':type(exc).__name__,'deal_id':deal})
+        total=sum(v for v,_,_ in matched)
+        ccy=matched[0][1]
+        return float(total),ccy
 
     @staticmethod
     def _parse_broker_ts(raw):
@@ -6249,8 +6307,11 @@ class SingleTradeEngine:
                         if attempts<=2:
                             self._teach_pending_ticks(
                                 deal,payload.get('exit_level'))
+                        # Immediate retry window while Funds catch up (first
+                        # attempts); later exponential backoff.
                         _wq.fail(self.store,job['id'],'funds_pending',
-                                 attempts=attempts)
+                                 attempts=attempts,
+                                 base_delay_s=0.0 if attempts < 3 else 2.0)
                         continue
                     pnl,hist_ccy=found
                     ccy=self._cash_currency(hist_ccy)
@@ -6259,24 +6320,65 @@ class SingleTradeEngine:
                           'pnl_source':'broker'}
                     self._learn_closed_trade(deal,conf)
                     self.store.set('last_upl:'+deal,None)
-                    _wq.complete(self.store,job['id'])
+                    # DONE only when journal shows broker cash — not merely that
+                    # teach returned / ticks already burned the learn slot.
+                    settled=False
+                    try:
+                        jrow=self.store.db.execute(
+                            'SELECT pnl_source FROM trades WHERE deal_id=?',
+                            (deal,)).fetchone()
+                        jsrc=str((jrow or [None])[0] or '')
+                        settled=jsrc in ('broker','live_funds_mirror')
+                        if not settled and found is not None:
+                            # Force journal upgrade when Funds £ is known but
+                            # learn was skipped (already ticks-learned).
+                            ccy2=self._cash_currency(hist_ccy) or ccy
+                            self.store.close_trade(
+                                deal,payload.get('exit_level'),float(pnl),
+                                currency=ccy2,source='broker',overwrite=True)
+                            try:
+                                self._bank_broker_cash_side_effects(
+                                    deal,float(pnl),currency=ccy2,
+                                    source='broker')
+                            except Exception:
+                                pass
+                            settled=True
+                    except Exception:
+                        settled=False
+                    if settled:
+                        _wq.complete(self.store,job['id'])
+                    else:
+                        _wq.fail(self.store,job['id'],'teach_incomplete',
+                                 attempts=attempts)
                 except Exception as exc:
                     _wq.fail(self.store,job['id'],type(exc).__name__,
                              attempts=attempts)
             # Desk mirror only — no Capital history from this list.
             self._sync_pending_desk_mirror()
-            # Heavy Shadow off settle path: enqueue deferred job, drain ≤1.
+            # Orphan + Funds mirror via work_queue (not free-running Capital drains).
             tick=int(getattr(self,'_pending_drain_n',0) or 0)+1
             self._pending_drain_n=tick
+            if tick%5==1:
+                _wq.enqueue(
+                    self.store,_wq.KIND_FUNDS_MIRROR,{'days':1},
+                    dedupe_key='funds_mirror:engine',delay_s=0.5)
             if tick%20==1:
                 _wq.enqueue(
                     self.store,_wq.KIND_SHADOW_FLUSH,{'limit':120,'hours':24},
                     dedupe_key='shadow_flush:engine',delay_s=2.0)
-            shadow_due=_wq.claim_due(
-                self.store,kinds=[_wq.KIND_SHADOW_FLUSH],limit=1)
-            for job in shadow_due:
+            aux=_wq.claim_due(
+                self.store,
+                kinds=[_wq.KIND_FUNDS_MIRROR,_wq.KIND_SHADOW_FLUSH],
+                limit=2)
+            for job in aux:
                 await asyncio.sleep(0)  # yield UPL/settle first
                 try:
+                    if job.get('kind')==_wq.KIND_FUNDS_MIRROR:
+                        await self._reconcile_orphan_open_trades()
+                        days=int((job.get('payload') or {}).get('days') or 1)
+                        await self._mirror_capital_funds_closes(days=days)
+                        _wq.complete(self.store,job['id'])
+                        continue
                     payload=job.get('payload') or {}
                     self._backfill_mistake_audits_from_journal(
                         limit=int(payload.get('limit') or 120),
@@ -6289,15 +6391,6 @@ class SingleTradeEngine:
                              attempts=int(job.get('attempts') or 0))
         except Exception as exc:
             self.store.event('warning','work_queue drain failed',
-                             {'type':type(exc).__name__})
-        # Also harvest Capital cash for open SQLite rows whose deal vanished
-        # before we queued pending (restart / missed sync). Sibling-safe.
-        await self._reconcile_orphan_open_trades()
-        # Desk ↔ Capital Funds: journal any TRADE £ still missing from CLIENT CLOSES.
-        try:
-            await self._mirror_capital_funds_closes()
-        except Exception as exc:
-            self.store.event('warning','Capital Funds mirror skipped',
                              {'type':type(exc).__name__})
         # Light open-position paper mirror only (no heavy journal scan here).
         try:
@@ -6829,34 +6922,41 @@ class SingleTradeEngine:
             path_mfe=struct_ctx.get('path_mfe'),
             path_mae=struct_ctx.get('path_mae'),
             structure_frame_advice=struct_ctx.get('structure_frame_advice'))
-        # Item 5: Cash Ledger is the ONLY teach authority — no broker fallback.
+        # Item 5: Cash Ledger is the ONLY teach authority.
+        # May ingest once with a REAL broker transaction id when ledger empty —
+        # never invent learn:{deal_id} (that double-counts Funds cash).
         teach_like=False
         try:
             from . import cash_ledger as _cl
             from .realized_cash import from_minor as _from_minor
-            # Ensure this Funds settle is on the ledger before teaching.
-            if pnl_source=='broker' and pnl_value is not None and confirmation:
-                try:
-                    acct=str(self.store.get('capital_account_id')
-                             or (getattr(self,'account',None) or {}).get('accountId')
-                             or 'live')
-                    env=str(self.store.get('capital_environment') or 'live')
-                    _cl.ingest_funds_row(
-                        self.store,
-                        {'pnl':float(pnl_value),
-                         'currency':currency or self._account_currency() or 'GBP',
-                         'transactionType':'TRADE','dealId':str(deal_id)},
-                        account_id=acct,environment=env,
-                        account_currency=currency or self._account_currency() or 'GBP',
-                        deal_link=str(deal_id),
-                        transaction_id=str(
-                            confirmation.get('transactionId')
-                            or confirmation.get('reference')
-                            or f'learn:{deal_id}'),
-                        close_proof=True)
-                except Exception:
-                    pass
-            realized=_cl.deal_realized(self.store,str(deal_id))
+            acct=self._capital_account_id()
+            env=self._capital_environment()
+            realized=_cl.deal_realized(
+                self.store,str(deal_id),account_id=acct,environment=env)
+            if (not realized.get('may_teach')
+                    and pnl_source=='broker' and pnl_value is not None
+                    and confirmation):
+                tx_id=str(
+                    confirmation.get('transactionId')
+                    or confirmation.get('reference')
+                    or confirmation.get('dealReference') or '')
+                # Never invent learn:{deal} — that double-counts Funds cash.
+                if tx_id and not tx_id.startswith('learn:'):
+                    try:
+                        _cl.ingest_funds_row(
+                            self.store,
+                            {'pnl':float(pnl_value),
+                             'currency':currency or self._account_currency() or 'GBP',
+                             'transactionType':'TRADE','dealId':str(deal_id),
+                             'transactionId':tx_id,'reference':tx_id},
+                            account_id=acct,environment=env,
+                            account_currency=currency or self._account_currency() or 'GBP',
+                            deal_link=str(deal_id),transaction_id=tx_id,
+                            close_proof=True)
+                        realized=_cl.deal_realized(
+                            self.store,str(deal_id),account_id=acct,environment=env)
+                    except Exception:
+                        pass
             st=str(realized.get('status') or '')
             if (realized.get('may_teach')
                     and realized.get('amount_minor') is not None
@@ -6867,7 +6967,7 @@ class SingleTradeEngine:
                 pnl_source='broker'
                 currency=ccy_l
                 teach_like=True
-            # No elif broker fallback — Desk/AI must share ledger truth.
+            # No synthetic learn: ingest / no non-ledger broker fallback.
         except Exception:
             teach_like=False
         bank_like=teach_like
@@ -7202,29 +7302,6 @@ class SingleTradeEngine:
         elif claimed_neural:
             # Claimed but no train steps — still finalize so crash cannot double-claim.
             self._mark_trade_learned(deal_id,mode=mode,pnl=pnl_value,source=pnl_source)
-        # COMPLETE only AFTER adaptive/SLTP/teachers + LEARN COMMITTED (audit P0).
-        try:
-            from . import cycle_runtime as _cr
-            cyc=_cr.load_by_deal(self.store,str(deal_id))
-            if cyc and str(cyc.get('deal_id') or '') in ('',str(deal_id)):
-                committed=bool(self._trade_already_learned(deal_id))
-                teachers=self.store.get('teachers_settled:'+str(deal_id))
-                _cr.mark_learned(
-                    self.store,cyc,
-                    model_version=str(getattr(self.brain,'model_version',0)),
-                    skipped=not (claimed_neural and teach_like),
-                    validate_proof={
-                        'deal_id':str(deal_id),
-                        'pnl_source':persist_source,
-                        'taught':bool(claimed_neural and teach_like),
-                        'journal_persisted':True,
-                        'teachers_settled':bool(teachers),
-                        'learn_committed':committed,
-                        'adaptive_done':True,
-                        'bracket_done':bool(teach_like),
-                    })
-        except Exception:
-            pass
         # Forward-live diagnostics (slip / hairline SL / false signals / regime).
         try:
             from . import forward_live
@@ -7258,7 +7335,33 @@ class SingleTradeEngine:
         except Exception as exc:
             self.store.event('warning','Forward-live record skipped',
                              {'type':type(exc).__name__,'deal_id':deal_id})
+        # Persist weights BEFORE COMPLETE — crash after COMPLETE must not lose ΔW.
         self.brain.save()
+        weights_saved=True
+        # COMPLETE only AFTER save + adaptive/SLTP/teachers + LEARN COMMITTED.
+        try:
+            from . import cycle_runtime as _cr
+            cyc=_cr.load_by_deal(self.store,str(deal_id))
+            if cyc and str(cyc.get('deal_id') or '') in ('',str(deal_id)):
+                committed=bool(self._trade_already_learned(deal_id))
+                teachers=self.store.get('teachers_settled:'+str(deal_id))
+                _cr.mark_learned(
+                    self.store,cyc,
+                    model_version=str(getattr(self.brain,'model_version',0)),
+                    skipped=not (claimed_neural and teach_like),
+                    validate_proof={
+                        'deal_id':str(deal_id),
+                        'pnl_source':persist_source,
+                        'taught':bool(claimed_neural and teach_like),
+                        'journal_persisted':True,
+                        'teachers_settled':bool(teachers),
+                        'learn_committed':committed,
+                        'adaptive_done':True,
+                        'bracket_done':bool(teach_like),
+                        'weights_saved':weights_saved,
+                    })
+        except Exception:
+            pass
         weights_updated=bool(repeats>0 and weights_moved and claimed_neural)
         gate_info=None
         if isinstance(gate_decision,dict):

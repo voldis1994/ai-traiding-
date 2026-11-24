@@ -89,14 +89,16 @@ def test_late_broker_banks_day_book_after_ticks_learn():
             assert float(daily_before.get('realized_pnl') or 0)==0.0
             # Verified Capital cash — first neural teach + day book bank once.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-late1','reference':'TX-late1'})
             assert e._trade_already_learned('late1')
             daily=db.load_daily(store,equity=10_000.0)
             assert float(daily.get('realized_pnl') or 0)==pytest.approx(0.18)
             assert store.get('broker_cash_banked:late1')
             # Second late refine must not double-bank.
             e._learn_closed_trade('late1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-late1','reference':'TX-late1'})
             daily2=db.load_daily(store,equity=10_000.0)
             assert float(daily2.get('realized_pnl') or 0)==pytest.approx(0.18)
     asyncio.run(scenario())
@@ -303,6 +305,17 @@ def test_ghost_recover_tries_all_open_deals():
 def test_trade_stats_multi_ccy_realized_none_not_zero():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
+        store.set('capital_account_id','1')
+        store.set('capital_environment','live')
+        from app import cash_ledger
+        cash_ledger.ingest_funds_row(
+            store,{'pnl':1.5,'currency':'GBP','transactionType':'TRADE'},
+            account_id='1',environment='live',account_currency='GBP',
+            deal_link='g1',transaction_id='g1-tx')
+        cash_ledger.ingest_funds_row(
+            store,{'pnl':2.0,'currency':'USD','transactionType':'TRADE'},
+            account_id='1',environment='live',account_currency='USD',
+            deal_link='u1',transaction_id='u1-tx')
         store.upsert_trade({'dealId':'g1','epic':'GOLD','size':'0.1',
                             'direction':'BUY','level':2000})
         store.close_trade('g1',2001,1.5,currency='GBP',source='broker',overwrite=True)
@@ -433,7 +446,8 @@ def test_late_cash_feeds_profit_learning():
             assert not e._trade_already_learned('pl1')
             assert list(e.profit_learning.broker_pnls())==[]
             e._learn_closed_trade('pl1',{
-                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker'})
+                'level':2649,'profit':0.18,'pnl_currency':'GBP','pnl_source':'broker',
+                'transactionId':'TX-pl1','reference':'TX-pl1'})
             assert e._trade_already_learned('pl1')
             assert float(db.load_daily(store,equity=10_000.0).get('realized_pnl') or 0)==pytest.approx(0.18)
             assert e.profit_learning.broker_pnls()[-1]==pytest.approx(0.18)

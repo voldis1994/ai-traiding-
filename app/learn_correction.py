@@ -171,10 +171,21 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
             'claimed': False, 'learned': False, 'at': _utc_now(),
             'correction': True,
         })
+        # Compensatory delta: opposite of (taught − ledger) when sign/material
+        # error — still not full unlearning, but cancels the bad cash label.
+        taught_pnl = flag.get('taught_pnl')
+        try:
+            taught_f = float(taught_pnl) if taught_pnl is not None else None
+        except (TypeError, ValueError):
+            taught_f = None
+        compensatory_delta = None
+        if taught_f is not None:
+            compensatory_delta = float(pnl) - taught_f
         conf = {
             'profit': pnl, 'pnl_currency': ccy, 'pnl_source': 'broker',
             'source': 'learn_correction', 'level': None,
             'correction': True,
+            'compensatory_delta': compensatory_delta,
         }
         before = la.get_attempt(store, str(deal_id))
         before_state = (before or {}).get('state')
@@ -203,7 +214,9 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
             flag['status'] = 'APPLIED'
             flag['applied_at'] = _utc_now()
             flag['ledger_pnl'] = pnl
+            flag['compensatory_delta'] = compensatory_delta
             flag['committed'] = committed
+            flag['mode'] = 'compensatory'
             applied.append(flag)
             store.event('learning', 'Learn correction applied', flag)
         else:

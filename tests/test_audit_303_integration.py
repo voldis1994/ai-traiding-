@@ -58,6 +58,9 @@ def test_cycle_runtime_live_path_execute_settle_learn():
             validate_proof={
                 'deal_id': 'D1', 'pnl_source': 'broker',
                 'taught': True, 'journal_persisted': True,
+                'teachers_settled': True, 'learn_committed': True,
+                'adaptive_done': True, 'bracket_done': True,
+                'weights_saved': True,
             })
         assert cyc['complete'] is True
         assert cyc['stages']['LEARN']['status'] == trade_cycle_fsm.STATUS_DONE
@@ -474,6 +477,14 @@ def test_complete_requires_learn_validate_proof():
             store, cyc, funds_proof={'pnl': 1.0, 'source': 'broker'}, pending=False)
         # Journal saved / settle done — still incomplete without learn proof.
         assert cyc.get('complete') is not True
+        # Missing new proofs → VALIDATE fail (not rubber-stamp COMPLETE).
+        incomplete = cycle_runtime.mark_learned(
+            store, dict(cyc), model_version='9',
+            validate_proof={
+                'deal_id': 'C1', 'pnl_source': 'broker',
+                'taught': True, 'journal_persisted': True,
+            })
+        assert incomplete['complete'] is not True
         done = cycle_runtime.mark_learned(
             store, cyc, model_version='9',
             validate_proof={
@@ -481,6 +492,7 @@ def test_complete_requires_learn_validate_proof():
                 'taught': True, 'journal_persisted': True,
                 'teachers_settled': True, 'learn_committed': True,
                 'adaptive_done': True, 'bracket_done': True,
+                'weights_saved': True,
             })
         assert done['complete'] is True
 
@@ -635,3 +647,113 @@ def test_shadow_flush_not_inline_every_settle():
             store, kinds=[work_queue.KIND_SHADOW_FLUSH], limit=1)
         assert len(due) == 1
         assert due[0]['kind'] == work_queue.KIND_SHADOW_FLUSH
+
+
+def test_no_double_count_learn_synthetic_vs_funds():
+    """Learn must not create learn:{deal} cash alongside Funds broker id."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 3.50, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'D50'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='D50', transaction_id='BROKER-TX-50')
+        # Synthetic learn id must be ignored by deal_realized.
+        cash_ledger.append_event(store, cash_ledger.cash_event(
+            account_id='1', environment='live',
+            transaction_id='learn:D50', transaction_type='TRADE',
+            close_proof=True, status=cash_ledger.STATUS_SETTLED,
+            amount_minor=350, currency='GBP', deal_link='D50'))
+        realized = cash_ledger.deal_realized(
+            store, 'D50', account_id='1', environment='live')
+        assert realized['may_teach'] is True
+        assert realized['amount_minor'] == 350  # not 700
+
+
+def test_ledger_capital_amount_amendment_creates_correction():
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 1.00, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'A1'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='A1', transaction_id='TX-A1')
+        # Same cash_id, amended Capital amount → correction revision.
+        out = cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 0.80, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'A1'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='A1', transaction_id='TX-A1')
+        assert out.get('delta_minor') == -20 or out.get('appended')
+        assert cash_ledger.net_for_cash_id(
+            store, out['event']['cash_id'] if out.get('event')
+            else cash_ledger.make_cash_id(
+                environment='live', account_id='1', transaction_id='TX-A1')
+        ) == 80
+
+
+def test_deal_realized_filters_account_and_environment():
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 1.0, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='live-1', environment='live', account_currency='GBP',
+            deal_link='X1', transaction_id='L1')
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 9.0, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='demo-1', environment='demo', account_currency='GBP',
+            deal_link='X1', transaction_id='D1')
+        live = cash_ledger.deal_realized(
+            store, 'X1', account_id='live-1', environment='live')
+        demo = cash_ledger.deal_realized(
+            store, 'X1', account_id='demo-1', environment='demo')
+        assert live['amount_minor'] == 100
+        assert demo['amount_minor'] == 900
+
+
+def test_rest_hard_sliding_window_max_10_per_second():
+    async def run():
+        clock = {'t': 0.0}
+
+        def now():
+            return clock['t']
+
+        m = capital_rest.CapitalRestManager(
+            identity='win', rps=100.0, burst=20, clock=now)
+        # Fill 10 grants in the same second.
+        for _ in range(10):
+            await m._acquire_token(priority=capital_rest.PRIORITY_ACCOUNT)
+        assert m._calls_in_window(1.0) == 10
+        # 11th must wait until window slides.
+        t = asyncio.create_task(
+            m._acquire_token(priority=capital_rest.PRIORITY_ACCOUNT))
+        await asyncio.sleep(0.05)
+        assert not t.done()
+        clock['t'] += 1.05
+        m._grant_event.set()
+        await asyncio.wait_for(t, timeout=2.0)
+        assert m._calls_in_window(1.0) <= 10
+
+    asyncio.run(run())
+
+
+def test_desk_journal_without_ledger_is_not_cash_truth():
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
+        store.upsert_trade({
+            'dealId': 'J1', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade('J1', 101, 5.0, currency='GBP', source='broker')
+        from app.runtime_hub import RuntimeHub
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        # No ledger row → journal demoted; not authoritative cash.
+        assert stats.get('cash_trades', 0) == 0 or stats.get('realized_pnl') in (
+            None, 0, 0.0)

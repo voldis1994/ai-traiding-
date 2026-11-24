@@ -196,7 +196,11 @@ def _event_key(ev: Mapping) -> tuple:
 
 
 def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
-    """Append CashEvent idempotently. Duplicate cash_id+revision → no double count."""
+    """Append CashEvent idempotently. Duplicate cash_id+revision → no double count.
+
+    If the same cash_id already exists but Capital changed the amount, apply a
+    correction revision so Funds amendments are not silently ignored.
+    """
     ev = dict(event)
     if not ev.get('cash_id'):
         raise ValueError('event.cash_id required')
@@ -208,6 +212,33 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
         ev['revision'] = 1
     events = load_events(store)
     key = _event_key(ev)
+    cid = str(ev.get('cash_id') or '')
+    new_minor = ev.get('amount_minor')
+    # Same cash_id+revision OR same cash_id with amended Capital amount.
+    if cid and new_minor is not None and str(
+            ev.get('transaction_type') or '').upper() != 'CORRECTION':
+        same = [e for e in events if str(e.get('cash_id') or '') == cid]
+        if same:
+            current = net_for_cash_id(store, cid)
+            try:
+                target = int(new_minor)
+            except (TypeError, ValueError):
+                target = None
+            if target is not None and current is not None and current != target:
+                return apply_correction(
+                    store, cash_id=cid, corrected_amount_minor=target,
+                    currency=ev.get('currency') or 'GBP',
+                    note='capital_amount_amendment', outbox=outbox)
+            # Identical net / exact key — no double count.
+            for existing in same:
+                if _event_key(existing) == key or (
+                        target is not None and current == target):
+                    return {
+                        'appended': False,
+                        'duplicate': True,
+                        'event': dict(existing),
+                        'outbox_enqueued': False,
+                    }
     for existing in events:
         if _event_key(existing) == key:
             return {
@@ -472,17 +503,35 @@ def link_deal(store, cash_id: str, deal_id: str) -> dict:
     return dict(updated)
 
 
-def deal_realized(store, deal_id: str, *, currency: str | None = None) -> dict:
+def deal_realized(
+    store,
+    deal_id: str,
+    *,
+    currency: str | None = None,
+    account_id: str | None = None,
+    environment: str | None = None,
+) -> dict:
     """Resolve deal PnL from ledger links.
 
     No unique deal_link → MATCH_UNCERTAIN (amount_minor null for teach).
     Multiple candidates without unique proof → MATCH_UNCERTAIN.
+    Filters account_id + LIVE/DEMO environment when provided.
     """
     deal = str(deal_id or '').strip()
+    acct = str(account_id).strip() if account_id else None
+    env = str(environment).strip().lower() if environment else None
     matches = []
     uncertain = False
     for ev in load_events(store):
         if str(ev.get('deal_link') or '') != deal:
+            continue
+        # Never teach from synthetic learn:* duplicates (legacy double-count).
+        txid = str(ev.get('transaction_id') or '')
+        if txid.startswith('learn:'):
+            continue
+        if acct and str(ev.get('account_id') or '') not in ('', acct):
+            continue
+        if env and str(ev.get('environment') or '').lower() not in ('', env):
             continue
         if currency and str(ev.get('currency') or '').upper() != currency.upper():
             continue

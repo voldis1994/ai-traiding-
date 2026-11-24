@@ -19,6 +19,7 @@ from typing import Any, Callable, Awaitable
 # Stay under Capital's 10 req/s with headroom for concurrent clients.
 DEFAULT_RPS = 7.0
 DEFAULT_BURST = 8
+MAX_PER_SECOND = 10  # hard sliding-window cap (any 1s interval)
 SESSION_POST_MIN_INTERVAL = 1.05
 
 # Lower number = higher priority.
@@ -79,8 +80,15 @@ class CapitalRestManager:
         heapq.heapify(self._waiter_heap)
         self.stats['waiter_cancelled'] += 1
 
+    def _calls_in_window(self, window: float = 1.0) -> int:
+        now = self._clock()
+        return sum(1 for t in self._recent if now - t <= window)
+
     async def _acquire_token(self, *, priority: int = PRIORITY_DEFAULT) -> None:
-        """Grant tokens in priority order — ORDER always before HISTORY."""
+        """Grant tokens in priority order — ORDER always before HISTORY.
+
+        Also enforces a hard ≤MAX_PER_SECOND sliding 1s window (Capital limit).
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         async with self._lock:
@@ -92,8 +100,12 @@ class CapitalRestManager:
                 async with self._lock:
                     self._refill()
                     self._purge_done_waiters()
+                    now = self._clock()
+                    in_window = sum(1 for t in self._recent if now - t <= 1.0)
+                    window_ok = in_window < int(MAX_PER_SECOND)
                     if (
                         self._tokens >= 1.0
+                        and window_ok
                         and self._waiter_heap
                         and self._waiter_heap[0][2] is fut
                     ):
@@ -107,9 +119,13 @@ class CapitalRestManager:
                         self._grant_event.set()
                         self._grant_event.clear()
                         return
-                    need = (
-                        max(0.01, (1.0 - self._tokens) / self.rps)
-                        if self._tokens < 1.0 else 0.01)
+                    if not window_ok and self._recent:
+                        oldest = min(t for t in self._recent if now - t <= 1.0)
+                        need = max(0.01, 1.01 - (now - oldest))
+                    else:
+                        need = (
+                            max(0.01, (1.0 - self._tokens) / self.rps)
+                            if self._tokens < 1.0 else 0.01)
                 try:
                     await asyncio.wait_for(self._grant_event.wait(), timeout=need)
                 except asyncio.TimeoutError:

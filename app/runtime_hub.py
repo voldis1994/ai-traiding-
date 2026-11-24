@@ -448,6 +448,13 @@ class RuntimeHub:
                 t['pnl_currency']=ledger_by_deal[deal]['pnl_currency']
                 t['pnl_source']='broker'
                 t['ledger_status']=ledger_by_deal[deal]['ledger_status']
+            elif self._cash_pnl_source(t.get('pnl_source'))=='cash':
+                # Journal £ without ledger proof is NOT a second source of truth
+                # for account currency — foreign tags stay visible but unsized.
+                raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
+                if not (acct and raw_ccy and raw_ccy!=acct):
+                    t['pnl_source']='pending_broker_pnl'
+                    t['ledger_pending']=True
         # UNMATCHED account cash (no deal_link yet) — show as ledger rows, never
         # invent AI journal deals. Separates account £ from specific AI results.
         unmatched_rows=[]
@@ -2387,9 +2394,9 @@ class RuntimeHub:
                             'Read-only broker outage recovered; autonomous execution resumed')
                     try:
                         from . import telemetry as _telem
-                        from . import offloop as _off
                         _telem.get_telemetry().note_loop_tick()
-                        _off.schedule(_telem.get_telemetry().persist,store)
+                        # Persist on event-loop thread — Store.db is not thread-safe.
+                        _telem.get_telemetry().persist(store)
                     except Exception:
                         pass
                     # Yield so light loop + Desk HTTP get the event loop.

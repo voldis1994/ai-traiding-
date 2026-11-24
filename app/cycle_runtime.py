@@ -107,7 +107,7 @@ def mark_settled(store, cycle: dict, *, funds_proof: Any = None,
 
 def _validate_proof(cycle: dict, validate_proof: dict | None, *,
                     skipped: bool) -> tuple[bool, dict]:
-    """Real VALIDATE — require deal identity + journal/teach evidence."""
+    """Real VALIDATE — require deal identity + full teach/save evidence."""
     proof = dict(validate_proof or {})
     deal = str(cycle.get('deal_id') or '')
     ok = True
@@ -128,6 +128,16 @@ def _validate_proof(cycle: dict, validate_proof: dict | None, *,
             # Still settling — cannot COMPLETE.
             ok = False
             reasons.append('pnl_not_broker')
+        # Full-cycle proofs required for LIVE teach COMPLETE.
+        if proof.get('taught'):
+            for key in ('learn_committed', 'teachers_settled',
+                        'adaptive_done', 'bracket_done'):
+                if not proof.get(key):
+                    ok = False
+                    reasons.append(f'missing_{key}')
+            if proof.get('weights_saved') is False:
+                ok = False
+                reasons.append('weights_not_saved')
     else:
         # Skipped learn still needs settle proof when cash was expected.
         if proof.get('pending'):

@@ -375,77 +375,16 @@ function renderShadowLab(client){
     return;
   }
   const lab=shadowLab(client);
-  const paper=lab.paper||{};
-  const hold=lab.hold_shadow||{};
-  const struct=lab.structure_shadow||{};
-  const trial=lab.trial||{};
-  const last=lab.self_dev_last||{};
-  const evo=lab.evolution||{};
   const audit=lab.mistake_audit||{};
   const auditLast=audit.last||{};
   const pendingFix=audit.pending_fix||{};
-  const truthInfo=lab.truth||{};
   const pulse=lab.pulse||'IDLE';
   if(pulseEl){
     pulseEl.textContent='● '+pulse;
     pulseEl.className='psx-live shadow-pulse-pill '+pulse;
   }
-  if(truth){
-    const hundred=truthInfo.hundred_variations===true;
-    stableHtml(truth,
-      `<strong>100 variations?</strong> <b>${hundred?'YES':'NO'}</b> · `
-      +`<b>One neural core</b> LIVE+SHADOW · paper SL/TP · audit→fix→LIVE · `
-      +`Focus <b>#${esc(client.id)} ${esc(client.display_name||client.username||'')}</b>`
-      +(lab.shadow_active?' · shared neurons <b>ON</b>':' · neural <b>off</b>'));
-  }
-  // Shadow paper Desk: cash £ only — never price pts as P&L.
-  const cashTrades=Number(paper.cash_trades||0)||0;
-  const net=cashTrades>0&&paper.paper_net!=null?Number(paper.paper_net)
-    :(cashTrades>0&&paper.display_net!=null&&String(paper.unit||'')!=='price'
-      ?Number(paper.display_net):null);
-  const netCls=net==null?'neu':(net>=0?'ok':'bad');
-  const netTxt=net==null?'—':((net>=0?'+':'')+num(net,2));
-  const paperTrades=cashTrades;
-  const open=paper.open&&typeof paper.open==='object'?paper.open:null;
-  const pending=paper.pending_fill&&typeof paper.pending_fill==='object'?paper.pending_fill:null;
-  const recent=(Array.isArray(paper.recent)?paper.recent:[]).filter(r=>{
-    if(!r||typeof r!=='object')return false;
-    if(String(r.unit||'')==='price')return false;
-    return r.paper_pnl!=null&&Number.isFinite(Number(r.paper_pnl));
-  }).slice(0,5);
-  const openSl=open?(open.sl!=null?open.sl:(open.stop!=null?open.stop:null)):null;
-  const openTp=open?(open.tp!=null?open.tp:(open.profit!=null?open.profit:null)):null;
-  const openTxt=open
-    ?(`${String(open.direction||'?').toUpperCase()} @ ${num(open.entry,2)} · SL ${openSl!=null?num(openSl,2):'—'} · TP ${openTp!=null?num(openTp,2):'—'}`)
-    :(pending?`${String(pending.direction||'?').toUpperCase()} (fill)`:'flat');
-  const rowsHtml=recent.length?recent.map(r=>{
-    const dir=String(r.direction||'?').toUpperCase();
-    const dcls=(dir==='BUY'||dir==='LONG')?'buy':'sell';
-    const pnl=Number(r.paper_pnl);
-    const pcls=pnl>=0?'ok':'bad';
-    const pnlTxt=(pnl>=0?'+':'')+num(pnl,2);
-    const when=r.at?String(r.at).replace('T',' ').slice(0,16):'—';
-    return `<div class="shadow-row">
-      <span class="dir ${dcls}">${dir==='BUY'||dir==='LONG'?'▲ BUY':'▼ SELL'}</span>
-      <span class="mut">${esc(r.exit_reason||'close')} · ${esc(when)}</span>
-      <span class="mut">${esc(num(r.entry,2))}→${esc(num(r.exit,2))}</span>
-      <strong class="pnl ${pcls}">${esc(pnlTxt)}</strong>
-    </div>`;
-  }).join(''):'<div class="psx-empty">No paper closes yet — waiting for shadow fills</div>';
-  const top=(struct.top||[]).slice(0,2).map(b=>{
-    if(!b||typeof b!=='object')return '';
-    return `<div class="shadow-note">${esc(b.key||b.structure||'bucket')} · SL ${esc(b.sl_count||0)} / n ${esc(b.samples||b.n||0)}</div>`;
-  }).filter(Boolean).join('')||'<div class="shadow-note">No structure graves yet</div>';
-  const advice=struct.last_advice&&typeof struct.last_advice==='object'
-    ?`${struct.last_advice.structure||'—'} × ${struct.last_advice.side||struct.last_advice.direction||'—'} → ${struct.last_advice.action||struct.last_advice.advice||'—'}`
-    :'—';
-  const promoteCls=last.promote?'ok':(last.rollback?'bad':'neu');
-  const promoteTxt=last.promote?'PROMOTE':(last.rollback?'ROLLBACK':(last.reason?'HOLD':'—'));
-  const miss=Array.isArray(auditLast.mistakes)?auditLast.mistakes:[];
-  const missTxt=miss.length?miss.join(', '):'none';
-  const missCls=miss.length?'bad':'ok';
-  const auditPnl=auditLast.pnl!=null?Number(auditLast.pnl):null;
-  const auditPnlTxt=auditPnl==null?'—':((auditPnl>=0?'+':'')+num(auditPnl,2));
+  // SHADOW view = CMD only (no duplicate side panels).
+  if(truth)stableHtml(truth,'');
   const win24=auditWindow24(audit,client);
   const winN=Number(win24.n)||0;
   const winW=Number(win24.wins)||0;
@@ -466,57 +405,15 @@ function renderShadowLab(client){
     :(fixWaiting?'DIAGNOSING'
       :(pendingFix.fingerprint?'PENDING'
         :(fixSteps.length?'DIAGNOSING':'IDLE')));
-  const fixCls=pendingFix.committed?'ok'
-    :(fixWaiting||pendingFix.fingerprint?'neu':'');
-  const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,2).map(s=>{
-    if(!s||typeof s!=='object')return '';
-    const tag=s.ready_for_live?'READY':(s.fix_committed?'FIXED':'…');
-    return `<div class="shadow-note">${esc(s.scenario||s.fingerprint||'?')} · `
-      +`${esc(s.direction||'?')} · hits ${esc(s.mistake_hits||0)}/${esc(s.seen||0)} · `
-      +`<b>${esc(tag)}</b></div>`;
-  }).filter(Boolean).join('')
-    ||(winN
-      ?`<div class="shadow-note">Capital 24h · ${esc(winN)} closes — rebuilding fingerprints</div>`
-      :'<div class="shadow-note">No scenario fingerprints yet — waiting for Capital / shadow closes</div>');
-  const readyRows=(Array.isArray(audit.ready)?audit.ready:[]).slice(0,2).map(r=>{
-    if(!r||typeof r!=='object')return '';
-    return `<div class="shadow-note ok-line">${esc(r.scenario||r.fingerprint||'?')} · `
-      +`${esc(r.direction||'?')} · wins@fix ${esc(r.wins_after_fix||0)}</div>`;
-  }).filter(Boolean).join('')
-    ||'<div class="shadow-note">None ready LIVE yet</div>';
-  const auditSrcTag=src=>{
-    const s=String(src||'?').toLowerCase();
-    if(s==='live'||s==='live_close')return 'LIVE';
-    if(s.includes('journal'))return 'JRN';
-    if(s.includes('backfill'))return 'BKF';
-    if(s.includes('paper')||s.includes('shadow'))return 'SH';
-    return s.slice(0,4).toUpperCase();
-  };
-  const auditRows=(Array.isArray(audit.recent_audits)?audit.recent_audits:[]).slice(0,5).map(a=>{
-    if(!a||typeof a!=='object')return '';
-    const m=(a.mistakes&&a.mistakes.length)?a.mistakes.join('+'):'ok';
-    const p=a.pnl!=null?Number(a.pnl):null;
-    const pcls=p==null?'':(p>=0?'ok':'bad');
-    const ptxt=p==null?'—':((p>=0?'+':'')+num(p,2));
-    const when=a.at?String(a.at).replace('T',' ').slice(11,16):'—';
-    const srcRaw=String(a.source||'?');
-    const liveish=/live/i.test(srcRaw);
-    return `<div class="shadow-row">
-      <span class="dir ${liveish?'buy':'sell'}" title="${esc(srcRaw)}">${esc(auditSrcTag(srcRaw))}</span>
-      <span class="mut">${esc(m)} · ${esc(when)}</span>
-      <span class="mut">${esc(String(a.scenario||a.fingerprint||'—').slice(0,18))}</span>
-      <strong class="pnl ${pcls}">${esc(ptxt)}</strong>
-    </div>`;
-  }).join('')||'<div class="psx-empty">No audits yet — closes feed this loop</div>';
   const logLines=Array.isArray(audit.learning_log)?audit.learning_log:[];
   const cmdHtml=logLines.length?logLines.map(L=>{
     if(!L||typeof L!=='object')return '';
     const lv=String(L.level||'info');
     return `<div class="shadow-cmd-line ${esc(lv)}">${esc(String(L.text||''))}</div>`;
   }).join(''):'<div class="shadow-cmd-line wait">waiting for Capital / paper closes — nothing audited yet</div>';
-  // Compact strip — only numbers not already spelled out in CMD MAP/WRITE.
   const cmdMeta=(
     `<div class="shadow-cmd-meta">`
+    +`<span><b>#${esc(client.id)}</b> ${esc(client.display_name||client.username||'')}</span>`
     +`<span><b>24h</b> ${esc(winN?(`${winW}/${winL}`):'0/0')} · ${esc(winNetTxt)}</span>`
     +`<span><b>gate</b> ${esc(gateTxt)}</span>`
     +`<span><b>fix</b> ${esc(fixState)}</span>`
@@ -525,113 +422,12 @@ function renderShadowLab(client){
     +`</div>`
   );
   stableHtml(board,`
-    <article class="shadow-card cmdlog">
+    <article class="shadow-card cmdlog cmdlog-only">
       <div class="psx-h"><h2>SHADOW CMD LOG</h2><span class="psx-src">CLOSE→MAP→WRITE</span><span class="psx-live">● LIVE</span></div>
       <div class="body">
         ${cmdMeta}
         <div class="shadow-cmd" id="shadowCmdLog">${cmdHtml}</div>
       </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>SCENARIO MEMORY</h2><span class="psx-src">FINGERPRINTS</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Scenarios',audit.scenarios!=null?audit.scenarios:0)}
-          ${_shadowKv('Ready LIVE',audit.ready_count!=null?audit.ready_count:0,audit.ready_count?'ok':'neu')}
-          ${_shadowKv('Promote gate',gateTxt)}
-          ${_shadowKv('Audits',audit.hist_n!=null?audit.hist_n:0)}
-        </div>
-        ${scenRows}
-        ${readyRows}
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>${(!paperTrades && winN)?'CAPITAL 24h':'PAPER BOOK'}</h2>
-        <span class="psx-src">${(!paperTrades && winN)?'FROM CAPITAL':'SHADOW £'}</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${(!paperTrades && winN)
-            ?(_shadowKv('Capital £',winNetTxt,winNet==null?'neu':(winNet>=0?'ok':'bad'))
-              +_shadowKv('Closes',winN)
-              +_shadowKv('W / L',`${winW} / ${winL}`)
-              +_shadowKv('Open',openTxt))
-            :(_shadowKv('Paper £',netTxt,netCls)
-              +_shadowKv('Closes',paperTrades)
-              +_shadowKv('W / L',`${paper.wins||0} / ${paper.losses||0}`)
-              +_shadowKv('Open',openTxt))}
-        </div>
-        <div class="shadow-note">${esc(
-          paper.audit_backfill
-            ?('Restored from SHADOW audit hist — journal was empty after bag clear ('+(paperTrades)+' closes)')
-            :(paperTrades>0
-              ?('Independent Paper SL/TP cash £ · Capital LIVE stays in CLIENT CLOSES')
-              :(winN
-                ?('Capital.com 24h Funds £ · Paper cash book still empty')
-                :('No Capital Funds £ / paper cash yet'))))}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>SELF-DEV</h2><span class="psx-src">WEIGHTS</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Last decision',promoteTxt,promoteCls)}
-          ${_shadowKv('Shadow n',last.shadow_neurons!=null?last.shadow_neurons:'—')}
-          ${_shadowKv('Paper samples',last.paper_cash_samples!=null?last.paper_cash_samples:'—')}
-          ${_shadowKv('Live samples',last.live_samples!=null?last.live_samples:'—')}
-        </div>
-        <div class="shadow-note">${esc(last.reason||evo.last_reason||'Self-dev runs on Capital + paper closes — not news events')}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>PARAM TRIAL</h2><span class="psx-src">SELF PARAMS</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Trial',trial.active?'ACTIVE':'off',trial.active?'ok':'neu')}
-          ${_shadowKv('Trial id',trial.trial_id||'—')}
-          ${_shadowKv('Horizon',trial.horizon!=null?trial.horizon:'—')}
-          ${_shadowKv('Queued events',trial.pending_events!=null?trial.pending_events:0)}
-        </div>
-        <div class="shadow-note">${esc(trial.draft&&trial.draft.note?trial.draft.note:(trial.active?'Frozen knobs under evaluation':'No active param trial'))}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>POLICY SEARCH</h2><span class="psx-src">~30</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Attempts',evo.attempts!=null?evo.attempts:0)}
-          ${_shadowKv('Candidates',evo.policy_candidates_approx!=null?evo.policy_candidates_approx:30)}
-          ${_shadowKv('Mode',(evo.mode||'paper + variants').split(' ')[0])}
-          ${_shadowKv('Neural',lab.shadow_active?'ON':'off',lab.shadow_active?'ok':'neu')}
-        </div>
-        <div class="shadow-note">${esc(evo.last_reason||'Policy evolve waits for enough BUY/SELL labels')}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>HOLD SHADOW</h2><span class="psx-src">OPPOSITE</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Pending',hold.pending!=null?hold.pending:0)}
-          ${_shadowKv('Resolved',hold.resolved!=null?hold.resolved:0)}
-          ${_shadowKv('Taught opp',hold.taught_opposite!=null?hold.taught_opposite:0)}
-          ${_shadowKv('Opp TP rate',hold.opposite_tp_rate!=null?num(Number(hold.opposite_tp_rate)*100,0)+'%':'—')}
-        </div>
-        <div class="shadow-note">${esc(hold.strategy_hint||'When LIVE HOLDs a BUY/SELL proposal, shadow replays the opposite path')}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>STRUCTURE</h2><span class="psx-src">GRAVES</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Buckets',struct.buckets!=null?struct.buckets:0)}
-          ${_shadowKv('Snapshots',struct.snapshots!=null?struct.snapshots:0)}
-        </div>
-        <div class="shadow-note">Last advice: ${esc(advice)}</div>
-        ${top}
-      </div>
-    </article>
-    <article class="shadow-card wide">
-      <div class="psx-h"><h2>RECENT PAPER CLOSES</h2><span class="psx-src">JOURNAL</span><span class="psx-live">● LIVE</span></div>
-      <div class="body"><div class="shadow-rows">${rowsHtml}</div></div>
     </article>
   `);
 }

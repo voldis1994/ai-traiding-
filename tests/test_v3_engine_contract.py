@@ -214,5 +214,8 @@ def test_cold_start_grant_does_not_force_ready():
         })
         out = mr.grant_cold_start_open(store, brain, reason='test')
         assert out.get('cold_start_open') is True
-        assert out.get('ready') is True
-        assert brain.trading_readiness()['ready'] is True
+        assert out.get('ready') is False
+        assert brain.trading_readiness()['ready'] is False
+        assert brain.trading_readiness()['cold_start_open'] is True
+        gates = SingleTradeEngine(store, brain).live_open_gates('BUY')
+        assert gates['allowed'] is True

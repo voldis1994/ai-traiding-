@@ -269,6 +269,16 @@ def decide_keep(score_before, score_after, *, cash=None, store=None,
     if loss_in_red:
         need=max(need,float(LOSS_IN_RED_CASH_MIN_LIFT))
     lift=after-before
+    # After a warm Capital book, thin accuracy KEEP must not ignore red OOS £.
+    # Large lifts (loss-in-red floor etc.) still pass; this catches lukewarm KEEP.
+    if (lift>=need and trade_count>=20 and isinstance(cash,dict)
+            and cash.get('ok') and cash.get('mean') is not None
+            and float(cash['mean'])<0 and lift<0.05):
+        return {'keep':False,
+                'reason':(f'acc_lift_but_cash_oos_red mean={float(cash["mean"]):.4f} '
+                          f'lift={lift:.4f}'),
+                'before':score_before,'after':score_after,'cash':cash,
+                'degradation':deg,'trade_pnl':closed_pnl,'lift':lift}
     if lift>=need:
         return {'keep':True,'reason':f'holdout_acc +{lift:.4f} ≥ {need:.4f}',
                 'before':score_before,'after':score_after,'cash':cash,

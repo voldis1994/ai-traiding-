@@ -60,7 +60,8 @@ def side_stats(store, epic, structure, direction):
 def compare_frame(store, *, epic, structure):
     """BUY vs SELL evidence in one layout — robot's adaptive edge read."""
     cfg = _cfg(store)
-    need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
+    # First Capital £ loss in a frame can mark the grave (self-teach).
+    need = max(1, int(cfg.get('structure_edge_min_samples', 1)))
     buy = side_stats(store, epic, structure, 'BUY')
     sell = side_stats(store, epic, structure, 'SELL')
     out = {
@@ -139,6 +140,53 @@ def compare_frame(store, *, epic, structure):
     out['confidence'] = min(0.7, 0.35 + 0.03 * best_n)
     out['nudge_scale'] = 1.4
     return out
+
+
+def apply_learned_memory(base_scores, nudged_scores, advice, *, min_conf=0.35):
+    """After £ losses, damp a toxic structure×side in the LIVE decide path.
+
+    Cosmetic soft nudges (flow/MTF) stay diagnostic on ``scores``. When the
+    structure library has already marked the neural side as a grave (or both
+    sides ≤0), OPEN decides from the memory-damped simplex — still not a
+    hardcoded regime ban, only self-taught from closed Capital £.
+    """
+    if not isinstance(base_scores, dict):
+        return base_scores, {'applied': False, 'reason': 'no_scores'}
+    base = {k: float(base_scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+    if not isinstance(advice, dict):
+        return base, {'applied': False, 'reason': 'no_advice'}
+    try:
+        conf = float(advice.get('confidence') or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if conf < float(min_conf):
+        return base, {'applied': False, 'reason': 'weak_confidence', 'confidence': conf}
+    toxic = advice.get('toxic_opposite')
+    target = advice.get('advice')
+    try:
+        neural = max(('BUY', 'SELL', 'HOLD'), key=lambda a: float(base.get(a, 0)))
+    except Exception:
+        return base, {'applied': False, 'reason': 'bad_scores'}
+    nudged = nudged_scores if isinstance(nudged_scores, dict) else None
+    # Neural wants a proven grave → decide from damped scores.
+    if toxic in ('BUY', 'SELL') and neural == toxic and nudged is not None:
+        out = {k: float(nudged.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        return out, {
+            'applied': True, 'reason': 'damp_toxic_side',
+            'toxic': toxic, 'neural': neural, 'confidence': conf,
+            'advice': target,
+        }
+    # Both sides ≤0 in this frame → let HOLD rise via damped scores.
+    if target == 'HOLD' and neural in ('BUY', 'SELL') and nudged is not None:
+        out = {k: float(nudged.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        return out, {
+            'applied': True, 'reason': 'both_sides_negative',
+            'neural': neural, 'confidence': conf, 'advice': target,
+        }
+    return base, {
+        'applied': False, 'reason': 'neural_ok_or_no_grave',
+        'neural': neural, 'advice': target, 'toxic': toxic, 'confidence': conf,
+    }
 
 
 def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):

@@ -4,11 +4,12 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger: price in zone (confirm OFF by default). Optional pin/structure
-    when ``playbook_require_zone_confirm=1`` (AND if ``playbook_zone_confirm_and=1``)
+  • Zone trigger: live ask/bid in zone (confirm OFF by default) — OPEN on WS
+    tick, not on M1 candle close. Optional pin/structure when
+    ``playbook_require_zone_confirm=1`` (AND if ``playbook_zone_confirm_and=1``)
   • Invalidated zones (close through) are never selected (V3 Z03)
 
-Also: break trigger (structure/range break + M1 tape) when not waiting pullback.
+Also: break trigger (structure/range break + M1 tape) on live mid when aligned.
 
 Gate knobs learn from closed broker £ via ``observe_close``.
 Never invent mid ± κ.

@@ -74,9 +74,9 @@ async def worker():
                 fast_entry=(bool(engine.mandate) and not open_book
                             and hasattr(engine,'quote_entry_tick')
                             and engine._wants_fast_entry_ticks())
-                light_n=14 if (open_book or fast_entry) else 10
+                light_n=18 if (open_book or fast_entry) else 12
                 for _ in range(light_n):
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.025)
                     if not engine.mandate:
                         continue
                     try:
@@ -570,7 +570,7 @@ async def admin_clients(_:dict=Depends(require_admin)):
 async def admin_overview(_:dict=Depends(require_admin)):
     # Never let Funds/peers mirror block Desk paint — 400ms poll must stay live.
     try:
-        await asyncio.wait_for(hub.refresh_live_truth(),timeout=0.4)
+        await asyncio.wait_for(hub.refresh_live_truth(),timeout=0.2)
     except Exception:
         pass
     return {'ok':True,**hub.admin_overview()}

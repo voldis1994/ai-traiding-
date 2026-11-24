@@ -3284,8 +3284,8 @@ class SingleTradeEngine:
         triggers are not stuck on a 3s REST poll mid.
         """
         now_m=time.monotonic()
-        # ~0.25s — catch break/zone on light ticks (was 0.8s; poll no longer 3s).
-        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<0.25:
+        # ~0.12s — catch break/zone on 25ms light ticks (~2× vs 0.25s).
+        if now_m-float(getattr(self,'_entry_zone_retry_mono',0) or 0)<0.12:
             return
         reason=self.last_entry_reason or ''
         if not self._entry_wait_reason_retryable(reason) and not self._wants_fast_entry_ticks():
@@ -4186,7 +4186,7 @@ class SingleTradeEngine:
             self._bump_upl_exit_hint(p)
         now_m=time.monotonic()
         # UPL REST near Capital tick — keep sub-200ms when open.
-        if now_m-float(getattr(self,'_upl_tick_mono',0) or 0)<0.15:
+        if now_m-float(getattr(self,'_upl_tick_mono',0) or 0)<0.07:
             return
         self._upl_tick_mono=now_m
         try:

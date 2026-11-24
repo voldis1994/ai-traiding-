@@ -129,7 +129,7 @@ def snapshot_context(*, candles=None, scenario_meta=None, ohlc_meta=None,
     zone = meta_o.get('zone') if isinstance(meta_o.get('zone'), dict) else None
     if zone is None and isinstance(meta_o.get('entry_zone'), dict):
         zone = meta_o.get('entry_zone')
-    trigger = meta_o.get('trigger')
+    trigger = meta_o.get('trigger') or _infer_trigger(meta_o)
     zside = _zone_side(zone, mid=mid)
     news_status = str(news.get('status') or 'UNCONFIGURED')
     im_status = str(intermarket.get('status') or 'WAITING')
@@ -176,6 +176,29 @@ def snapshot_context(*, candles=None, scenario_meta=None, ohlc_meta=None,
     }
 
 
+def _infer_trigger(ohlc_meta) -> str | None:
+    """Recover break|zone when entry meta omitted trigger but left clues."""
+    meta = ohlc_meta if isinstance(ohlc_meta, dict) else {}
+    trig = str(meta.get('trigger') or '').lower()
+    if trig in ('break', 'zone'):
+        return trig
+    reason = str(meta.get('reason') or '').lower()
+    if 'break' in reason or str(meta.get('break_reason') or ''):
+        return 'break'
+    if isinstance(meta.get('zone'), dict) or isinstance(meta.get('entry_zone'), dict):
+        return 'zone'
+    return None
+
+
+def _ready_stamped_now(ready) -> bool:
+    """True only when this close actually stamped ready_for_live."""
+    return bool(
+        isinstance(ready, dict)
+        and ready.get('ready_at')
+        and not ready.get('need')
+        and not ready.get('already'))
+
+
 def diagnose(*, pnl, spread=0.0, candles=None, scenario_meta=None,
              ohlc_meta=None, news=None, intermarket=None, direction=None,
              mid=None, entry=None, store=None, source='shadow') -> dict:
@@ -215,9 +238,15 @@ def diagnose(*, pnl, spread=0.0, candles=None, scenario_meta=None,
     if stamped.startswith('BREAKOUT') and live == 'FAKEOUT' and hurt:
         mistakes.append('fakeout_missed')
         notes.append('breakout_was_fakeout')
-    if stamped == 'RANGE' and ctx.get('trigger') == 'break' and hurt:
+    # Prefer OPEN stamp; fall back to live regime so CMD matches diagnose.
+    # COMPRESSION is a tight RANGE — same mid-box / blind-break class.
+    regime = stamped or live
+    trig = ctx.get('trigger') or _infer_trigger(ohlc_meta)
+    if regime in ('RANGE', 'COMPRESSION') and trig == 'break' and hurt:
         mistakes.append('mid_range_mistake')
         notes.append('blind_break_in_range')
+        if not stamped and live in ('RANGE', 'COMPRESSION'):
+            notes.append('regime_from_live_classify')
     if stamped.startswith('RETEST') and hurt and not useful:
         if 'zone_fail' not in mistakes:
             mistakes.append('retest_fail')
@@ -806,12 +835,13 @@ def build_fix_cycle_steps(diagnosis: dict | None, mem: dict | None,
             'changed': [], 'skipped': ['params'],
         })
 
-    # 6) Ready LIVE
-    if isinstance(ready, dict) and ready.get('fingerprint') and not ready.get('already'):
+    # 6) Ready LIVE — check wait/already BEFORE any fingerprint success claim.
+    if isinstance(ready, dict) and ready.get('need') is not None:
         steps.append({
-            'step': 'ready', 'status': 'ok',
-            'detail': 'ready_for_live stamped',
-            'changed': ['ready_queue'], 'skipped': [],
+            'step': 'ready', 'status': 'wait',
+            'detail': (f"proof wins {ready.get('wins_after_fix') or 0}/"
+                       f"{ready.get('need')} after fix"),
+            'changed': [], 'skipped': ['ready_for_live'],
         })
     elif isinstance(ready, dict) and ready.get('already'):
         steps.append({
@@ -819,12 +849,11 @@ def build_fix_cycle_steps(diagnosis: dict | None, mem: dict | None,
             'detail': 'already ready_for_live',
             'changed': [], 'skipped': ['ready_queue'],
         })
-    elif isinstance(ready, dict) and ready.get('need'):
+    elif _ready_stamped_now(ready):
         steps.append({
-            'step': 'ready', 'status': 'wait',
-            'detail': (f"proof wins {ready.get('wins_after_fix') or 0}/"
-                       f"{ready.get('need')} after fix"),
-            'changed': [], 'skipped': ['ready_for_live'],
+            'step': 'ready', 'status': 'ok',
+            'detail': 'ready_for_live stamped',
+            'changed': ['ready_queue'], 'skipped': [],
         })
     elif applied:
         steps.append({
@@ -963,12 +992,19 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
         row = dict(bag[fp])
         row['fix_committed'] = True
         row['fix_at'] = _now_iso()
+        # New fix must re-earn proof wins — never inherit stale READY.
+        row['wins_after_fix'] = 0
+        row['ready_for_live'] = False
         row['fix'] = {
             'deltas': deltas, 'flags': flags, 'changed': changed,
             'mutations': preview.get('mutations'),
         }
         bag[fp] = row
         store.set(SCENARIOS_KEY, bag)
+        ready_q = [
+            r for r in (store.get(READY_KEY) or [])
+            if isinstance(r, dict) and r.get('fingerprint') != fp]
+        store.set(READY_KEY, ready_q)
 
     # Persist soft news/intermarket respect flags on audit store.
     audit = dict(before_audit)
@@ -1135,13 +1171,14 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             commit_result = dict(commit_result, live_commit=True)
 
     ready = None
-    # V04: ready_for_live only after READY_N proof wins post-fix — never on commit alone.
-    if commit_result.get('applied') or diagnosis.get('useful'):
+    # V04: ready_for_live only after a proof win — never on loss commit alone.
+    if diagnosis.get('useful'):
         ready = _update_ready(store, diagnosis)
 
     fix_steps = build_fix_cycle_steps(
         diagnosis, mem, gate, commit_result, ready,
         apply_ohlc_penalties=apply_ohlc_penalties, store=store)
+    ready_now = _ready_stamped_now(ready)
 
     audited_at = _now_iso()
     # Trade close time for 24h windows — never confuse with audit runtime.
@@ -1156,7 +1193,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
         'promote_gate': gate,
         'fix': commit_result,
         'fix_steps': fix_steps,
-        'ready_for_live': ready,
+        'ready_for_live': ready if ready_now else None,
+        'ready_stamped_this_close': ready_now,
         'at': audited_at,
         'audited_at': audited_at,
         'closed_at': closed_stamp,
@@ -1197,6 +1235,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'fix_mutations': list(commit_result.get('mutations') or []),
             'fix_untouched': list(commit_result.get('untouched') or [])[:16],
             'fix_map_lines': list(commit_result.get('map_lines') or []),
+            'ready_stamped_this_close': ready_now,
+            'ready_for_live': ready_now,
         }
         # Durable narrative for Desk CMD log (loss → error → fix → outcome).
         if isinstance(commit_result, dict):
@@ -1237,7 +1277,8 @@ def on_close(store, *, pnl, spread=0.0, candles=None, scenario_meta=None,
             'fix_map_lines': list(commit_result.get('map_lines') or []),
             'promote_count': gate.get('count'),
             'promote_need': gate.get('need'),
-            'ready_for_live': bool(ready),
+            'ready_for_live': ready_now,
+            'ready_stamped_this_close': ready_now,
             'deal_id': deal_s or None,
             'unit': unit_s,
             'currency': ccy_s,
@@ -1567,10 +1608,20 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
                     'text': (f'{when}  STEP   commit · wait · '
                              'no fix_steps stored — awaiting on_close'),
                 })
-        if bag_row.get('ready_for_live'):
+        # READY only when THIS close stamped it — not sticky bag state on losses.
+        if a.get('ready_stamped_this_close') or (
+                isinstance(a.get('ready_for_live'), bool)
+                and a.get('ready_for_live')
+                and a.get('bumped_wins_after_fix')):
             lines.append({
                 'level': 'ok',
                 'text': f'{when}  READY  fingerprint marked ready_for_live',
+            })
+        elif bag_row.get('ready_for_live') and (
+                pnl is not None and pnl > 0.02):
+            lines.append({
+                'level': 'ok',
+                'text': f'{when}  READY  fingerprint already ready_for_live',
             })
         lines.append({'level': 'sep', 'text': '─' * 64})
         shown += 1
@@ -1693,25 +1744,41 @@ def lab_payload(store) -> dict:
     # not only the last few audited fingerprints.
     recent_audits = list(reversed(hist[-16:]))
     if journal_24h.get('recent'):
-        seen_keys = set()
+        # Prefer deal_id alone — audited_at ≠ closed was duplicating live_backfill
+        # + live_journal blocks for the same Capital trade.
+        seen_deals = set()
+        seen_fallback = set()
         for a in recent_audits:
             if not isinstance(a, dict):
                 continue
-            key = (str(a.get('deal_id') or ''), round(float(a.get('pnl') or 0), 4),
-                   str(a.get('at') or '')[:16])
-            seen_keys.add(key)
+            did = str(a.get('deal_id') or '')
+            if did:
+                seen_deals.add(did)
+            else:
+                try:
+                    ap = round(float(a.get('pnl') or 0), 4)
+                except (TypeError, ValueError):
+                    ap = None
+                seen_fallback.add((
+                    ap, str(a.get('closed_at') or a.get('at') or '')[:16]))
         merged = list(recent_audits)
         for j in journal_24h['recent']:
             if not isinstance(j, dict):
+                continue
+            did = str(j.get('deal_id') or '')
+            if did and did in seen_deals:
                 continue
             try:
                 jp = round(float(j.get('pnl') or 0), 4)
             except (TypeError, ValueError):
                 continue
-            key = (str(j.get('deal_id') or ''), jp, str(j.get('at') or '')[:16])
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
+            if not did:
+                fb = (jp, str(j.get('at') or '')[:16])
+                if fb in seen_fallback:
+                    continue
+                seen_fallback.add(fb)
+            else:
+                seen_deals.add(did)
             # Attach honest cycle steps so CMD never says only "fix pending".
             if not j.get('fix_steps'):
                 j = dict(j)

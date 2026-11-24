@@ -112,3 +112,139 @@ def test_flush_respects_promote_and_ready_n():
         gate = sma.promote_gate(store, fp, ['zone_entry'])
         assert gate['ready'] is True
         assert gate['need'] == 1
+
+
+def test_loss_commit_does_not_lie_about_ready():
+    """First loss commits fix but CMD must WAIT for proof win — not READY DONE."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        out = sma.on_close(
+            store,
+            pnl=-1.0, spread=0.1, candles=_candles(),
+            scenario_meta={'scenario': 'RANGE'},
+            ohlc_meta={'action': 'BUY', 'trigger': 'break',
+                       'zone': {'lo': 90.0, 'hi': 91.0}},
+            news={'status': 'CLEAR', 'entry_allowed': True},
+            intermarket={'status': 'WAITING'},
+            direction='BUY', entry=95.0, source='live',
+            deal_id='loss-ready', apply_ohlc_penalties=True,
+        )
+        assert out['fix'].get('applied') is True
+        ready_steps = [s for s in (out.get('fix_steps') or [])
+                       if s.get('step') == 'ready']
+        assert ready_steps
+        assert ready_steps[0]['status'] == 'wait'
+        assert 'stamped' not in (ready_steps[0].get('detail') or '')
+        last = store.get(sma.LAST_KEY) or {}
+        assert last.get('ready_for_live') is False
+        assert last.get('ready_stamped_this_close') is False
+        lab = sma.lab_payload(store)
+        assert lab.get('ready_count') == 0
+        text = '\n'.join(str(x.get('text') or '')
+                         for x in (lab.get('learning_log') or []))
+        assert 'READY  fingerprint marked ready_for_live' not in text
+
+
+def test_mid_range_from_live_when_stamp_missing():
+    """CMD RANGE from live classify must still teach range knobs."""
+    # Flat path → live classify prefers RANGE; stamped empty.
+    out = sma.diagnose(
+        pnl=-0.5, spread=0.1, candles=_candles(),
+        scenario_meta={},
+        ohlc_meta={'action': 'BUY', 'trigger': 'break',
+                   'zone': {'lo': 90.0, 'hi': 91.0}},
+        news={'status': 'CLEAR', 'entry_allowed': True},
+        intermarket={'status': 'WAITING'},
+        direction='BUY', entry=95.0, source='live_backfill')
+    assert out['audited']
+    live = out['context'].get('live_scenario') or ''
+    stamped = out['context'].get('stamped_scenario') or ''
+    assert (live in ('RANGE', 'COMPRESSION')
+            or stamped in ('RANGE', 'COMPRESSION'))
+    assert 'mid_range_mistake' in out['mistakes']
+    assert 'outcome_hurt' not in out['mistakes']
+    deltas = (out.get('proposed_fix') or {}).get('deltas') or {}
+    assert float(deltas.get('penalty_range') or 0) > 0
+
+
+def test_new_fix_commit_resets_stale_wins_after():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        # Seed bag with orphan wins_after_fix so recommit cannot fake READY.
+        diag = sma.diagnose(
+            pnl=-1.0, spread=0.1, candles=_candles(),
+            scenario_meta={'scenario': 'RANGE'},
+            ohlc_meta={'action': 'BUY', 'trigger': 'break'},
+            news={'status': 'CLEAR', 'entry_allowed': True},
+            intermarket={'status': 'WAITING'},
+            direction='BUY', entry=95.0, source='live')
+        fp = diag['context']['fingerprint']
+        store.set(sma.SCENARIOS_KEY, {
+            fp: {
+                'fingerprint': fp, 'seen': 2, 'fix_committed': False,
+                'wins_after_fix': 3, 'ready_for_live': True,
+                'mistake_counts': {'mid_range_mistake': 1},
+            }
+        })
+        store.set(sma.READY_KEY, [{'fingerprint': fp, 'ready_at': 'old'}])
+        out = sma.on_close(
+            store,
+            pnl=-1.0, spread=0.1, candles=_candles(),
+            scenario_meta={'scenario': 'RANGE'},
+            ohlc_meta={'action': 'BUY', 'trigger': 'break'},
+            news={'status': 'CLEAR', 'entry_allowed': True},
+            intermarket={'status': 'WAITING'},
+            direction='BUY', entry=95.0, source='live',
+            deal_id='reset-waf', apply_ohlc_penalties=True,
+        )
+        assert out['fix'].get('applied') is True
+        bag = store.get(sma.SCENARIOS_KEY) or {}
+        row = bag.get(fp) or {}
+        assert int(row.get('wins_after_fix') or 0) == 0
+        assert row.get('ready_for_live') is False
+        ready = store.get(sma.READY_KEY) or []
+        assert not any(r.get('fingerprint') == fp for r in ready
+                       if isinstance(r, dict))
+
+
+def test_journal_merge_dedupes_by_deal_id():
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        store.set(sma.HIST_KEY, [{
+            'at': '2026-11-24T13:00:00+00:00',
+            'audited_at': '2026-11-24T13:00:00+00:00',
+            'closed_at': '2026-11-24T12:00:00+00:00',
+            'pnl': -0.15, 'direction': 'BUY',
+            'source': 'live_backfill',
+            'mistakes': ['mid_range_mistake'],
+            'deal_id': 'same-deal',
+            'scenario': 'RANGE',
+            'fix_steps': [],
+        }])
+        # Journal row same deal, different clock → must not duplicate.
+        journal = {
+            'n': 1, 'wins': 0, 'losses': 1, 'scratch': 0, 'net': -0.15,
+            'recent': [{
+                'at': '2026-11-24T12:00:00+00:00',
+                'source': 'live_journal', 'pnl': -0.15,
+                'direction': 'BUY', 'deal_id': 'same-deal',
+                'mistakes': ['outcome_hurt'],
+                'notes': ['journal_24h_seed'],
+                'scenario': 'LIVE_JOURNAL',
+            }],
+        }
+        original = sma._journal_window_stats
+
+        def _fake(store_arg, hours=24):
+            return journal
+
+        sma._journal_window_stats = _fake
+        try:
+            lab = sma.lab_payload(store)
+        finally:
+            sma._journal_window_stats = original
+        recent = lab.get('recent_audits') or []
+        same = [r for r in recent
+                if str(r.get('deal_id') or '') == 'same-deal']
+        assert len(same) == 1
+        assert same[0].get('source') == 'live_backfill'

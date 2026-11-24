@@ -20,6 +20,21 @@ def test_refresh_live_truth_schedules_backfill_not_sync():
     assert 'eng._backfill_mistake_audits_from_journal(' not in body
 
 
+def test_desk_system_payload_no_sync_journal_backfill():
+    """Overview paints _desk_system_payload every poll — must not scan 2000 closes."""
+    src = Path('app/runtime_hub.py').read_text(encoding='utf-8')
+    desk = src.split('def _desk_system_payload')[1].split(
+        'def _shadow_lab_payload')[0]
+    assert '_backfill_mistake_audits_from_journal' not in desk
+    assert 'limit=2000' not in desk
+    lab = src.split('def _shadow_lab_payload')[1].split(
+        'def admin_client_card')[0]
+    assert '_backfill_mistake_audits_from_journal' not in lab
+    assert 'limit=2000' not in lab
+    # Only the background helper may call the journal scanner sync.
+    assert src.count('_backfill_mistake_audits_from_journal(') <= 2
+
+
 def test_backfill_event_only_when_new_work():
     eng_src = Path('app/engine.py').read_text(encoding='utf-8')
     chunk = eng_src.split('def _backfill_mistake_audits_from_journal')[1].split(

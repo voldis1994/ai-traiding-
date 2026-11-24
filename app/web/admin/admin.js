@@ -576,14 +576,26 @@ function renderShadowLab(client){
           pendingFix.committed
             ?('Committed knobs: '+((pendingFix.changed||[]).join(', ')||'flags'))
             :(pendingFix.why||'First same mistake commits fix → ready LIVE immediately'))}</div>
-        ${(fixSteps.length?fixSteps.slice(0,6).map(s=>{
+        ${((Array.isArray(pendingFix.map_lines)?pendingFix.map_lines:[]).slice(0,6).map(ml=>
+          `<div class="shadow-note"><b>MAP</b> · ${esc(String(ml).slice(0,110))}</div>`
+        ).join('')
+          +((Array.isArray(pendingFix.mutations)?pendingFix.mutations:[])
+            .filter(m=>m&&m.line).slice(0,6).map(m=>
+              `<div class="shadow-note"><b>${pendingFix.committed?'WRITE':'VALUE'}</b> · `
+              +`${esc(String(m.line).slice(0,110))}</div>`
+            ).join(''))
+          +((Array.isArray(pendingFix.untouched)?pendingFix.untouched:[])
+            .filter(u=>u&&u.line).slice(0,4).map(u=>
+              `<div class="shadow-note"><b>KEEP</b> · ${esc(String(u.line).slice(0,110))}</div>`
+            ).join(''))
+          ||(fixSteps.length?fixSteps.slice(0,6).map(s=>{
           if(!s||typeof s!=='object')return '';
           const st=String(s.status||'?');
           const tag=st==='ok'?'DONE':(st==='wait'?'WAIT':'SKIP');
           return `<div class="shadow-note">${esc(String(s.step||'step').toUpperCase())} · `
             +`<b>${esc(tag)}</b> · ${esc(String(s.detail||'').slice(0,90))}</div>`;
         }).filter(Boolean).join('')
-          :'<div class="shadow-note">No cycle steps yet — waiting for Capital / paper close</div>')}
+          :'<div class="shadow-note">No cycle steps yet — waiting for Capital / paper close</div>'))}
       </div>
     </article>
     <article class="shadow-card">

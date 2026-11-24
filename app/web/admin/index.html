@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/static/admin.css?v=141">
+  <link rel="stylesheet" href="/admin/static/admin.css?v=142">
   <script>
   /* Paint Desk immediately on Windows loopback — never flash Operatora ieeja. */
   (function(){
@@ -183,13 +183,13 @@
 
       <div class="term-body">
         <nav class="psx-rail term-rail" aria-label="Modules">
-          <button type="button" class="psx-rail-btn on" data-view="desk" title="Terminal"><b>2</b><i></i><span>TERMINAL</span></button>
-          <button type="button" class="psx-rail-btn" data-view="shadow" title="Shadow lab"><b>S</b><i></i><span>SHADOW</span></button>
-          <button type="button" class="psx-rail-btn" data-view="overview" title="Global"><b>3</b><i></i><span>GLOBAL</span></button>
-          <button type="button" class="psx-rail-btn" data-view="trades" title="Flow"><b>4</b><i></i><span>FLOW-LIQ</span></button>
-          <button type="button" class="psx-rail-btn" data-view="risks" title="OI Fund"><b>5</b><i></i><span>OI-FUND</span></button>
-          <button type="button" class="psx-rail-btn" data-view="clients" title="Research"><b>7</b><i></i><span>RESEARCH</span></button>
-          <button type="button" class="psx-rail-btn" data-view="settings" title="Practice"><b>10</b><i></i><span>PRACTICE</span></button>
+          <button type="button" class="psx-rail-btn on" data-view="desk" title="Treidinga galds"><b>1</b><i></i><span>DESK</span></button>
+          <button type="button" class="psx-rail-btn" data-view="shadow" title="Shadow mācība"><b>2</b><i></i><span>ĒNA</span></button>
+          <button type="button" class="psx-rail-btn" data-view="overview" title="Visi konti"><b>3</b><i></i><span>VISI</span></button>
+          <button type="button" class="psx-rail-btn" data-view="trades" title="Atvērtie + slēgtie"><b>4</b><i></i><span>TREIDI</span></button>
+          <button type="button" class="psx-rail-btn" data-view="risks" title="Riski"><b>5</b><i></i><span>RISKS</span></button>
+          <button type="button" class="psx-rail-btn" data-view="clients" title="Robotu kartes"><b>6</b><i></i><span>ROBOTI</span></button>
+          <button type="button" class="psx-rail-btn" data-view="settings" title="Iestatījumi"><b>7</b><i></i><span>ADMIN</span></button>
         </nav>
 
         <div class="term-main">
@@ -318,8 +318,8 @@
       <section class="view" data-view="overview">
         <div class="term-view">
           <div class="term-view-head">
-            <h1>GLOBAL</h1>
-            <p>Fleet command · all accounts</p>
+            <h1>VISI KONTI</h1>
+            <p>Equity · atvērtie treidi · W/L — viens skats</p>
             <span class="psx-live">● LIVE</span>
           </div>
           <div id="summary" class="stat-grid" aria-label="Kopsavilkums"></div>
@@ -327,13 +327,10 @@
             <div class="overview-main">
               <article class="card chart-card">
                 <div class="card-head">
-                  <div>
-                    <h2>PERFORMANCE</h2>
-                    <div class="perf-row">
-                      <strong id="perfValue">—</strong>
-                      <span id="perfDelta" class="trend-pill">—</span>
-                    </div>
-                    <div id="perfClients" class="perf-clients" aria-label="Konti atsevišķi"></div>
+                  <h2>Equity</h2>
+                  <div class="perf-row">
+                    <strong id="perfValue">—</strong>
+                    <span id="perfDelta" class="trend-pill">—</span>
                   </div>
                   <div class="range-tabs" role="tablist" aria-label="Laika periods">
                     <button type="button" class="range-tab" data-range="1D">1D</button>
@@ -342,7 +339,8 @@
                     <button type="button" class="range-tab" data-range="ALL">Visi</button>
                   </div>
                 </div>
-                <canvas id="perfChart" width="800" height="180" aria-label="Veiktspējas grafiks"></canvas>
+                <div id="perfClients" class="perf-clients" aria-label="Konti atsevišķi"></div>
+                <canvas id="perfChart" width="800" height="120" aria-label="Veiktspējas grafiks"></canvas>
               </article>
               <article class="card grow">
                 <div class="card-head">
@@ -354,12 +352,12 @@
             </div>
             <aside class="overview-side">
               <article class="card grow">
-                <div class="card-head"><h2>Top klienti</h2></div>
+                <div class="card-head"><h2>Konti</h2></div>
                 <div id="topClients" class="rank-list fill-scroll"></div>
               </article>
               <article class="card grow">
                 <div class="card-head">
-                  <h2>Riska brīdinājumi</h2>
+                  <h2>Brīdinājumi</h2>
                   <svg class="ico warn"><use href="#i-warn"></use></svg>
                 </div>
                 <div id="riskAlerts" class="alert-list fill-scroll"></div>
@@ -483,6 +481,6 @@
   </div>
 
   <script src="/admin/static/ohlc-chart.js?v=13"></script>
-  <script src="/admin/static/admin.js?v=178"></script>
+  <script src="/admin/static/admin.js?v=179"></script>
 </body>
 </html>

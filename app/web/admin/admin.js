@@ -1971,7 +1971,8 @@ function drawPerfChart(clients){
   const perfKey=chartRange+'|'+pts.map(p=>p.t+':'+p.v).join(',');
   const dpr=window.devicePixelRatio||1;
   const cssW=canvas.clientWidth||800;
-  const cssH=220;
+  // Match CSS #perfChart height — never paint 220px over client chips.
+  const cssH=Math.min(100,canvas.clientHeight||100);
   const bw=Math.floor(cssW*dpr),bh=Math.floor(cssH*dpr);
   if(perfKey===lastPerfKey&&canvas.width===bw&&canvas.height===bh)return;
   lastPerfKey=perfKey;

@@ -106,8 +106,17 @@ def test_desk_panels_have_readable_spacing():
     assert 'min-height:22px' in css.replace(' ', '') or 'min-height:34px' in css.replace(' ', '')
     assert '.psx-score-row' in css
     assert '.psx-ind-kv .desk-kv' in css
-    # Rail wide enough for TERMINAL / RESEARCH / PRACTICE (44px clipped).
+    # Rail fits short labels (DESK / VISI / TREIDI) — was 44px clipped soup.
     assert 'grid-template-columns:78px' in css.replace(' ', '')
+    html = Path('app/web/admin/index.html').read_text(encoding='utf-8')
+    assert '>DESK</span>' in html
+    assert '>VISI</span>' in html
+    assert '>TREIDI</span>' in html
+    assert 'Fleet command' not in html
+    assert 'id="perfClients"' in html
+    # Client chips live outside 24px card-head so chart cannot cover them.
+    assert html.index('id="perfClients"') < html.index('id="perfChart"')
+    assert 'id="perfClients"' in html.split('chart-card')[1].split('perfChart')[0]
     # Intel reasons wrap — no 4-line clamp ellipsis.
     assert '-webkit-line-clamp:4' not in css
     # Short indicator labels — values dominate; no ellipsis clipping names.

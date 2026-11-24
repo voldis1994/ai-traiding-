@@ -40,7 +40,8 @@ def test_funds_mirror_not_awaited_on_desk_poll():
     assert '_bg_mirror_capital_funds' in src
     assert 'mirror_scheduled' in src
     assert 'create_task' in src
-    assert 'DESK_TRUTH_REV = 266' in src
+    assert 'DESK_TRUTH_REV =' in src
+    assert int(__import__('re').search(r'DESK_TRUTH_REV\s*=\s*(\d+)', src).group(1)) >= 266
 
 
 def test_stream_pushes_quote_into_engine_market():

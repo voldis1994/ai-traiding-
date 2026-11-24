@@ -40,12 +40,15 @@ def test_dealing_size_grid_from_capital_rules():
     assert sized == Decimal('0.2')
 
 
-def test_mandate_fallback_when_rules_missing():
+def test_mandate_fallback_when_rules_missing_is_not_ok():
+    """V3 R02: missing Capital step/min → ok=False (HOLD_RISK), not silent success."""
     g = dealing_size_grid({}, mandate_size='0.25')
-    assert g['ok'] is True
+    assert g['ok'] is False
     assert g['source'] == 'mandate_fallback'
+    assert 'HOLD_RISK' in (g.get('reason') or '')
+    # Diagnostic fields still echo mandate for callers that inspect min/step.
     assert g['step'] == Decimal('0.25')
-    assert snap_deal_size('0.7', min_size=g['min'], step=g['step']) == Decimal('0.5')
+    assert g['min'] == Decimal('0.25')
 
 
 def test_broker_wire_number_no_float_dust():

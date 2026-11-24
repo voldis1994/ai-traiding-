@@ -52,11 +52,13 @@ def _rule_value(rules, *names):
 
 
 def dealing_size_grid(market=None, *, mandate_size=None):
-    """Capital.com lot grid from GET /markets/{epic} dealingRules.
+    """Capital.com lot grid from GET /markets/{epic} dealingRules (V3 R02).
 
     Fields (Capital): minDealSize, maxDealSize, minSizeIncrement.
-    If Capital omits the grid, fall back to the adopted mandate size as the
-    only legal step/min — never invent a fractional lot.
+    When Capital omits step/min, do **not** silently succeed via mandate —
+    return ``ok=False`` with a clear reason so callers can HOLD_RISK. Mandate
+    seed is still echoed in min/step for diagnostics (backward-compatible
+    fields) but ``source`` is ``mandate_fallback`` and ``ok`` is False.
     """
     market = market or {}
     rules = market.get('dealingRules') if isinstance(market, dict) else None
@@ -74,24 +76,48 @@ def dealing_size_grid(market=None, *, mandate_size=None):
                 seed = None
         except Exception:
             seed = None
-    source = 'capital_dealing_rules'
-    if step is None and seed is not None:
-        step = seed
-        source = 'mandate_fallback'
-    if min_size is None and seed is not None:
-        min_size = seed
-    if min_size is None and step is not None:
-        min_size = step
-    if step is None and min_size is not None:
-        step = min_size
-    if max_size is not None and min_size is not None and max_size < min_size:
-        max_size = min_size
+    capital_ok = bool(min_size is not None and step is not None and step > 0)
+    if capital_ok:
+        if max_size is not None and min_size is not None and max_size < min_size:
+            max_size = min_size
+        return {
+            'min': min_size,
+            'max': max_size,
+            'step': step,
+            'source': 'capital_dealing_rules',
+            'ok': True,
+            'reason': 'ok',
+        }
+    # Missing Capital grid — echo mandate for diagnostics only; fail closed.
+    diag_min = min_size if min_size is not None else seed
+    diag_step = step if step is not None else seed
+    if diag_min is None and diag_step is not None:
+        diag_min = diag_step
+    if diag_step is None and diag_min is not None:
+        diag_step = diag_min
+    if max_size is not None and diag_min is not None and max_size < diag_min:
+        max_size = diag_min
+    missing = []
+    if min_size is None:
+        missing.append('minDealSize')
+    if step is None and _rule_value(
+            rules, 'minSizeIncrement', 'dealSizeStep', 'minDealSize') is None:
+        # step was never published by Capital (mandate seed does not count).
+        if _rule_value(rules, 'minSizeIncrement', 'dealSizeStep') is None:
+            missing.append('minSizeIncrement')
+    if not missing:
+        missing.append('dealingRules')
     return {
-        'min': min_size,
+        'min': diag_min,
         'max': max_size,
-        'step': step,
-        'source': source,
-        'ok': bool(min_size is not None and step is not None and step > 0),
+        'step': diag_step,
+        'source': 'mandate_fallback' if seed is not None else 'missing_capital_grid',
+        'ok': False,
+        'reason': (
+            'HOLD_RISK: Capital dealingRules missing '
+            + ','.join(missing)
+            + ' — refuse size grid rather than invent mandate step'),
+        'missing': missing,
     }
 
 

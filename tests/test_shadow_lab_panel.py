@@ -20,8 +20,8 @@ def test_shadow_rail_and_view_exist():
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
-    assert 'admin.css?v=138' in HTML
-    assert 'admin.js?v=171' in HTML
+    assert 'admin.css?v=139' in HTML
+    assert 'admin.js?v=172' in HTML
     assert 'live_news' in JS or 'Live today' in JS
     assert 'auditWindow24' in JS
     assert ('from_journal' in JS or 'Capital journal' in JS or 'from Capital' in JS)
@@ -29,6 +29,9 @@ def test_shadow_rail_and_view_exist():
     assert 'display_net' in JS
     assert 'MISTAKE AUDIT' in JS or 'mistake_audit' in JS
     assert 'SCENARIO MEMORY' in JS
+    assert 'SHADOW CMD LOG' in JS
+    assert 'learning_log' in JS
+    assert 'shadow-cmd' in CSS
 
 
 def test_shadow_lab_payload_honest_about_100():
@@ -74,3 +77,4 @@ def test_shadow_lab_payload_honest_about_100():
         assert lab['self_dev_last']['paper_cash_samples'] == 2
         assert lab['mistake_audit']['ok'] is True
         assert lab['mistake_audit']['last']['mistakes'] == ['zone_fail']
+        assert isinstance(lab['mistake_audit'].get('learning_log'), list)

@@ -858,13 +858,30 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
   flex:1;min-height:0;overflow:hidden;padding:0;
   display:grid;gap:4px;
   grid-template-columns:repeat(6,minmax(0,1fr));
-  grid-template-rows:repeat(3,minmax(0,1fr)) minmax(0,1.15fr);
+  grid-template-rows:minmax(140px,1.35fr) repeat(3,minmax(0,1fr)) minmax(0,1.05fr);
   align-content:stretch}
 .shadow-card{
   grid-column:span 2;
   border:1px solid var(--desk-border,#49464a);background:var(--desk-panel,#0a101d);
   border-radius:2px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .shadow-card.wide{grid-column:span 3}
+.shadow-card.cmdlog{grid-column:1 / -1;grid-row:1}
+.shadow-cmd{
+  flex:1;min-height:0;overflow:auto;padding:6px 8px;
+  background:#020805;border:1px solid #0d2a18;border-radius:2px;
+  font-family:"IBM Plex Mono","Consolas","Courier New",monospace;
+  font-size:10px;line-height:1.35;color:#8fd9a8;white-space:pre-wrap;
+  scrollbar-width:thin}
+.shadow-cmd-line{margin:0 0 1px;word-break:break-word}
+.shadow-cmd-line.head{color:#e9bc65;font-weight:800;letter-spacing:.02em;margin-bottom:4px}
+.shadow-cmd-line.close{color:#d5d9e3}
+.shadow-cmd-line.error{color:#ef6875;font-weight:700}
+.shadow-cmd-line.fix{color:#76a0de;font-weight:700}
+.shadow-cmd-line.out{color:#31d59a;font-weight:700}
+.shadow-cmd-line.ok{color:#31d59a}
+.shadow-cmd-line.note,.shadow-cmd-line.info{color:#8c95a6}
+.shadow-cmd-line.wait{color:#e9bc65}
+.shadow-cmd-line.sep{color:#1a3a28;margin:3px 0}
 .shadow-card .psx-h{flex:0 0 auto;min-height:22px;height:22px;padding:0 6px}
 .shadow-card .psx-h h2{font-size:9px}
 .shadow-card .body{padding:4px 6px 6px;display:flex;flex-direction:column;gap:3px;min-height:0;flex:1;overflow:hidden}

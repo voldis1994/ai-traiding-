@@ -2622,15 +2622,10 @@ class SingleTradeEngine:
                 if any(self._needs_protect_brackets(pos)
                        for pos in (self.positions or [])):
                     return
-                # Reverse exit: evaluate each new M1 from *manage* scores (fresh
-                # perception), not the frozen OPEN vote. Confirmed opposite +
-                # aligned 5/15m returns → market CLOSE so we stop fighting the
-                # move and can learn / re-enter the other side next flat bar.
-                # Broker SL/TP stay on OHLC brackets; trail is disabled.
+                # Exits: broker SL/TP + long-only TP1 scale-out. Neural reverse
+                # is diagnostic only — never market-CLOSE (operator: TP1/TP2 only).
                 manage_bar=(self._manage_signal or {}).get('bar_time')
                 exit_bar=manage_bar or self.market_context.get('bar_time')
-                # Prefer fresh manage scores; frozen OPEN last_signal is fallback.
-                # Adopt/sync can clear last_signal — reverse exit must still run.
                 scores=((self._manage_signal or {}).get('scores')
                         if isinstance((self._manage_signal or {}).get('scores'),dict)
                         else None) or (
@@ -2658,18 +2653,17 @@ class SingleTradeEngine:
                             opposite_streak=streak,need_streak=need_streak,
                             store=self.store)
                         if intent=='CLOSE':
+                            # Desk/Admin only — do not send market CLOSE.
                             self.store.event('exit',
-                                'Neural CLOSE on confirmed reverse — market exit',
+                                'Neural CLOSE diagnostic only — broker SL/TP/TP1',
                                 {'deal_id':p['dealId'],'direction':p['direction'],
                                  'vote':vote,'streak':streak,
                                  'need_streak':need_streak,
                                  'mtf_mode':(mtf_live or {}).get('mode'),
                                  'returns_bps':self.market_context.get('returns_bps'),
                                  'manage_bar':manage_bar,
-                                 'neural_market_exit':True})
-                            await self.exit_position(p['dealId'])
-                            return
-                # TP1 scale-out (structural OHLC) before trail/protect adapt.
+                                 'neural_market_exit':False})
+                # TP1 scale-out — long (BUY) only; shorts keep broker TP2.
                 for pos in list(self.positions or []):
                     await self._maybe_scale_out_tp1(pos)
                 for pos in list(self.positions or []):
@@ -7192,10 +7186,10 @@ class SingleTradeEngine:
         return True
 
     async def _maybe_scale_out_tp1(self,p):
-        """BUY-only: at structural TP1 reduce ~½, then SL→BE, keep TP2.
+        """Long-only: at structural TP1 reduce ~½, then SL→BE, keep TP2.
 
-        Shorts use a single structural TP — no TP1 ladder / scale-out.
-        Capital supports one profitLevel — broker TP stays at TP2 on longs.
+        BUY and SELL both get TP1/TP2 OHLC levels (broker profitLevel = TP2).
+        Robot scale-out (partial close) is allowed only when long.
         """
         if self.pending_order or self.pending_close or not self.execution_enabled:
             return
@@ -7207,11 +7201,11 @@ class SingleTradeEngine:
         if not isinstance(brain,dict) or brain.get('scale_out_done') or brain.get('scale_out_pending'):
             return
         direction=p.get('direction')
-        # TP1/TP2 scale-out is long-only by desk rule.
+        # Scale-out only when long — shorts wait for broker SL/TP2.
         if direction!='BUY':
             if isinstance(brain,dict) and not brain.get('scale_out_done'):
                 brain['scale_out_done']=True
-                brain['scale_out_skip']='short_no_tp_ladder'
+                brain['scale_out_skip']='scale_out_long_only'
                 self.store.set(key,brain)
             return
         tp1=_num(brain.get('tp1_level'))
@@ -8169,7 +8163,10 @@ class SingleTradeEngine:
                 'profit_level':float(profit_level),
                 'tp1_level':float(tp1_level) if tp1_level is not None else None,
                 'tp2_level':float(tp2_level) if tp2_level is not None else None,
-                'scale_out_frac':float(decided.get('scale_out_frac') or 0.5),
+                'scale_out_frac':float(
+                    decided['scale_out_frac']
+                    if decided.get('scale_out_frac') is not None
+                    else (0.5 if action=='BUY' else 0.0)),
                 'stop_ticks':decided.get('stop_ticks'),
                 'profit_ticks':decided.get('profit_ticks'),
                 'kappa':decided.get('kappa'),'sl_scale':1.0,
@@ -8697,12 +8694,12 @@ class SingleTradeEngine:
                 'threshold_unit':'neural_argmax_no_zone_hardcode',
                 'neural_decision_bar':self.last_decision_bar,
                 'neural_entry_rule':'neural argmax proposes; evolved policy.py confirms or HOLDs when policy_live_execute=1; readiness+utility separate',
-                # Confirmed reverse (fresh manage scores + streak + 5/15m) may market-exit.
-                'neural_market_exit':True,
-                'neural_close_diagnostic_only':False,
-                'neural_close_executable':True,
+                # Neural reverse is Desk-only; live exits = SL/TP2 + long TP1 scale-out.
+                'neural_market_exit':False,
+                'neural_close_diagnostic_only':True,
+                'neural_close_executable':False,
                 'neural_exit_intent':raw_exit_intent,
-                'neural_exit_rule':'confirmed opposite manage vote + aligned 5/15m → market CLOSE; else broker SL/TP/trail',
+                'neural_exit_rule':'broker SL/TP2; long-only TP1 scale-out; neural CLOSE diagnostic only',
                 'manage_signal':self._manage_signal,
                 'mtf_momentum':self._mtf_snapshot_for_ui(),
                 'hard_risk':hr_snap,'day_book':db_snap,

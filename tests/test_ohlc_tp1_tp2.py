@@ -120,8 +120,8 @@ def test_broker_reduce_position_posts_opposite_without_brackets():
     assert 'profitDistance' not in payload
 
 
-def test_sell_has_tp_ladder_like_buy():
-    """V5: shorts use TP1/TP2 scale-out ladder (same as BUY)."""
+def test_sell_has_tp1_tp2_levels_but_no_scale_out():
+    """SELL gets TP1/TP2 OHLC levels; robot scale-out is long-only."""
     rows, mid = supply_zone_path(confirm=True)
     zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     sell = zones['sell_entry']
@@ -134,7 +134,7 @@ def test_sell_has_tp_ladder_like_buy():
         min_distance=0.5, atr=1.0)
     assert br['ready'] is True
     assert br.get('tp_ladder') is True
-    assert float(br.get('scale_out_frac') or 0) == pytest.approx(0.5)
+    assert float(br.get('scale_out_frac') or 0) == pytest.approx(0.0)
     assert float(br['profit_level']) < entry
     assert br.get('tp1_level') is not None and br.get('tp2_level') is not None
     assert float(br['tp2_level']) <= float(br['tp1_level']) + 1e-9

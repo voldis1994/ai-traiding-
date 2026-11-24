@@ -140,24 +140,26 @@ def test_confirmed_reverse_market_closes(monkeypatch):
                 await e.poll()
                 if exits:
                     break
-            assert exits, 'confirmed reverse must market-close'
+            assert not exits, 'neural reverse must NOT market-close'
             events = store.recent(40)
             assert any(
                 ev.get('kind') == 'exit'
-                and 'confirmed reverse' in str(ev.get('message', '')).lower()
+                and 'diagnostic' in str(ev.get('message', '')).lower()
                 for ev in events)
             snap = e.snapshot()
-            assert snap.get('neural_market_exit') is True
+            assert snap.get('neural_market_exit') is False
+            assert snap.get('neural_close_executable') is False
 
     asyncio.run(scenario())
 
 
-def test_snapshot_advertises_executable_neural_exit():
+def test_snapshot_advertises_diagnostic_only_neural_exit():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         brain = AdaptiveBrain(store, data_dir=d)
         e = SingleTradeEngine(store, brain)
         e.policy = AutoEvolution(store, Path(d) / 'policy.py')
         snap = e.snapshot()
-        assert snap.get('neural_market_exit') is True
-        assert snap.get('neural_close_executable') is True
+        assert snap.get('neural_market_exit') is False
+        assert snap.get('neural_close_executable') is False
+        assert snap.get('neural_close_diagnostic_only') is True

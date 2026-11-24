@@ -317,7 +317,8 @@ class AutoEvolution:
                              need_streak=None,store=None):
         """Score a CLOSE intent from manage scores + multi-bar confirmation.
 
-        Live engine market-closes when this returns CLOSE (confirmed reverse).
+        Desk/Admin diagnostic only — live engine does not market-CLOSE.
+        Exits are broker SL/TP2 + long-only TP1 scale-out.
         need_streak comes from self_params (robot-owned), not a frozen default.
         """
         if need_streak is None:

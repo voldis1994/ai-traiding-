@@ -1,12 +1,11 @@
 """Regime-aware SL + TP from *real* OHLC structure only.
 
-TP1/TP2 ladder + scale-out is **BUY (long) only**:
+TP1/TP2 ladder for **both BUY and SELL**:
   • Capital allows one ``profitLevel`` → broker TP = TP2
-  • TP1 (near structural) → robot scale-out ~½ + SL→BE
+  • TP1 is the near structural rung (chart + long scale-out)
 
-SELL (short) keeps a single structural ``profit_level`` (no TP1 rung,
-no scale-out). Still never invent mid ± κ — short TP is a real swing/
-zone/range level.
+Robot scale-out (~½ at TP1, SL→BE, keep TP2) is **long (BUY) only**.
+Shorts keep TP1/TP2 levels but wait for broker SL/TP2 — no reduce.
 
 V5 B01/B04/T09: never soft-cap structural SL past invalidation to hit RR,
 and never invent HOLD_RR — RR is reported as context only.
@@ -457,7 +456,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
     rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
     # V5 B01/B04/T09: never soft-cap / shrink structural SL past invalidation
     # to hit RR, and never invent HOLD_RR as an OPEN veto. RR is context.
-    # V5 B03: TP1/TP2 ladder + scale-out for both sides.
+    # TP1/TP2 levels both sides; scale-out frac only when long.
     return {
         'ready': True,
         'reason': reason,
@@ -487,6 +486,6 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'atr_used': float(atr_v) if atr_v is not None else None,
         'bos_event': sc.get('event'),
         'bos_bias': sc.get('bias'),
-        'scale_out_frac': 0.5,
+        'scale_out_frac': 0.5 if action == 'BUY' else 0.0,
         'tp_ladder': True,
     }

@@ -430,11 +430,12 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
 
 
 def grant_cold_start_open(store, brain, *, reason=None) -> dict:
-    """V3 V04: mark SHADOW/demo cold-start — never force LIVE OPEN readiness.
+    """Unblock LIVE OPEN after first manual close (V5 T24 / #270).
 
-    First manual close may enable research/SHADOW flags, but ``ready`` stays
-    False until chronological prep/eval (or online labeled path) actually
-    validates the model. Cold-start must not unlock LIVE OPEN as if validated.
+    Zero-start flow: operator opens one manual trade → it closes → robot must be
+    allowed to OPEN. A failed chronological holdout must not freeze the session
+    forever while online minute labels are still near zero. Candidate validation
+    must not invent HOLD_MODEL against the existing LIVE cycle.
     """
     epic = getattr(brain, 'epic', None)
     if not epic:
@@ -445,27 +446,25 @@ def grant_cold_start_open(store, brain, *, reason=None) -> dict:
     fl = floors(store)
     labeled = int(getattr(brain, 'labeled', 0) or 0)
     online_need = int(fl['min_online_labeled'])
-    # Warm path with enough labels: let trading_readiness decide (may promote).
+    # If warm path already has enough labels, let trading_readiness promote —
+    # do not override a real holdout failure on a warm brain.
     if labeled >= online_need:
         return trading_readiness(store, brain)
     msg = (reason or
-           'Cold-start SHADOW/demo flag after first manual close — '
-           'LIVE OPEN still requires prep/eval readiness (V3 V04)')
+           'Cold-start OPEN after first manual close — live £ teaches; '
+           'prep holdout no longer hard-blocks this session')
     state = dict(state)
     state.update({
-        'ready': False,
-        'stage': state.get('stage') or 'blocked',
+        'ready': True,
+        'stage': 'ready',
         'cold_start_open': True,
-        'shadow_demo_enabled': True,
         'reason': msg,
     })
     save_state(store, epic, state)
     if store is not None:
-        store.event('learning',
-                    'Cold-start SHADOW/demo flag — LIVE OPEN NOT unlocked',
+        store.event('learning', 'Cold-start prep release — LIVE OPEN permitted',
                     {'epic': epic, 'online_labeled': labeled,
-                     'online_need': online_need, 'reason': msg,
-                     'ready': False})
+                     'online_need': online_need, 'reason': msg})
     return state
 
 

@@ -8,9 +8,8 @@ SELL (short) keeps a single structural ``profit_level`` (no TP1 rung,
 no scale-out). Still never invent mid ± κ — short TP is a real swing/
 zone/range level.
 
-V3 B01: if RR would require shrinking structural SL past invalidation
-(or soft-capping SL to hit RR), return not ready / ``HOLD_RR`` — refuse
-over invent.
+V5 B01/B04/T09: never soft-cap structural SL past invalidation to hit RR,
+and never invent HOLD_RR — RR is reported as context only.
 """
 from __future__ import annotations
 
@@ -436,21 +435,8 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 
     rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
-    # V3 B01: never soft-cap / shrink structural SL past invalidation to hit RR.
-    # Prefer HOLD_RR refuse over inventing a tighter stop.
-    if rr_now + 1e-12 < float(min_rr):
-        return dict(
-            out, reason='HOLD_RR',
-            stop_distance=float(stop_d), profit_distance=float(tp2_d),
-            stop_level=float(stop), profit_level=float(tp2),
-            tp1_level=float(tp1), tp2_level=float(tp2),
-            regime=name, rr=float(rr_now), min_rr=float(min_rr),
-            structural_tp=True, structural_rr=False,
-            rr_capped=False,
-            trigger=trig or None,
-            zone_sl=bool(zone_sl),
-            buffer=float(buffer))
-
+    # V5 B01/B04/T09: never soft-cap / shrink structural SL past invalidation
+    # to hit RR, and never invent HOLD_RR as an OPEN veto. RR is context.
     # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
     return {
         'ready': True,

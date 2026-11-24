@@ -156,14 +156,17 @@ def test_policy_live_uses_calibrated_edge_floor_as_cycle():
     """Policy MIN_EDGE override == cycle min_open_margin after calibration."""
     with sandbox() as d:
         from app.autonomy import AutoEvolution, TEMPLATES
+        from app import self_params as sp
         store = Store(Path(d) / 'db.sqlite3')
+        sp.save(store, {**sp.load(store), 'policy_live_execute': 1},
+                reason='test_policy_cycle')
         path = Path(d) / 'policy.py'
         path.write_text(
             TEMPLATES['edge'].format(
                 confidence=0.60, reversal=0.30, min_hold=3, margin=0.02),
             encoding='utf8')
         policy = AutoEvolution(store, path)
-        # No history → seed ~0.06; weak edge HOLDs.
+        # No history → seed ~0.06; weak edge HOLDs when policy LIVE execute is on.
         scores = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}  # edge 0.05
         out = policy.evaluate_neural_entry(scores, readiness={'ready': True})
         assert out['action'] == 'HOLD'

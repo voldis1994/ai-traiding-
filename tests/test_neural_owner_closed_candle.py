@@ -21,7 +21,11 @@ def sandbox():
 
 def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
     with sandbox() as d:
-        p=AutoEvolution(Store(Path(d)/'db.sqlite3'), Path(d)/'active_policy.py')
+        from app import self_params as sp
+        store=Store(Path(d)/'db.sqlite3')
+        sp.save(store,{**sp.load(store),'policy_live_execute':1},
+                reason='test_neural_owner')
+        p=AutoEvolution(store, Path(d)/'active_policy.py')
         # 38%: previously forbidden by 60% and by 8.1pp margin
         score={'BUY':.32, 'SELL':.38, 'HOLD':.30}
         assert p.neural_decision(score)=='SELL'

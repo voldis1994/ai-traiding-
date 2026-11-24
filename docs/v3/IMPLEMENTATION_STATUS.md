@@ -1,5 +1,9 @@
 # V3 Capital Funds — implementation status
 
+> **Superseded by V5.0** — see `docs/v5/IMPLEMENTATION_STATUS.md`.
+> V5 replaces V1–V4: hard_risk/day_risk stay informational (#270); no new
+> HOLD_RISK / HOLD_RR / HOLD_MODEL / REQUIRED→HOLD OPEN gates.
+
 Snapshot for P0 modules + acceptance coverage (T01–T39). Engine / runtime_hub full wire-up remains partial.
 
 ## Done (this change)

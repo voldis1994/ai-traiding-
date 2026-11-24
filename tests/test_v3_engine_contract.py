@@ -54,15 +54,17 @@ def test_shadow_learn_does_not_change_live_weight_hash():
 
 
 def test_live_open_gates_blocks_when_hard_risk_missing_limits():
+    """V5 R02: missing hard_risk limits must NOT block LIVE OPEN."""
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         e = SingleTradeEngine(store, brain)
         brain._activate('GOLD')
         brain.mark_prep_ready(reason='fixture')
         gates = e.live_open_gates('BUY')
-        assert gates['allowed'] is False
+        assert gates['allowed'] is True
         assert gates.get('hard_risk') is not None
-        assert gates['hard_risk'].get('allowed') is False
+        assert gates['hard_risk'].get('allowed') is True
+        assert gates['hard_risk'].get('open_gated') is False
         hard_risk.save_operator(store, _op_limits(), reason='op')
         gates2 = e.live_open_gates('BUY')
         assert gates2['allowed'] is True
@@ -197,6 +199,7 @@ def test_policy_live_execute_default_is_research_only():
 
 
 def test_cold_start_grant_does_not_force_ready():
+    """V5 T24: cold-start after manual close unlocks LIVE — no HOLD_MODEL freeze."""
     from app import model_readiness as mr
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
@@ -207,6 +210,5 @@ def test_cold_start_grant_does_not_force_ready():
         })
         out = mr.grant_cold_start_open(store, brain, reason='test')
         assert out.get('cold_start_open') is True
-        assert out.get('shadow_demo_enabled') is True
-        assert out.get('ready') is False
-        assert brain.trading_readiness()['ready'] is False
+        assert out.get('ready') is True
+        assert brain.trading_readiness()['ready'] is True

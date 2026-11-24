@@ -91,14 +91,28 @@ def last_good_ttl_expired(stamp, *, now=None, source=None):
     return age > max_age
 
 
-def last_good_values(stamp, *, now=None, source=None):
-    """Return values only if stamp is present and within TTL; else None."""
-    if last_good_ttl_expired(stamp, now=now, source=source):
+def last_good_values(stamp, *, now=None, source=None, require_fresh=False):
+    """Return stamped last-good values with honest age (V5 D08 / T04).
+
+    Stale last-good is still usable context — TTL expiry must not invent a
+    REQUIRED→HOLD gate. When ``require_fresh`` is True, expired stamps yield
+    None (diagnostics only). Legacy bare lists are returned as-is (no fake
+    freshness).
+    """
+    if stamp is None:
         return None
-    if isinstance(stamp, dict):
-        vals = stamp.get('values')
-        return list(vals) if isinstance(vals, (list, tuple)) else None
-    return None
+    if isinstance(stamp, (list, tuple)):
+        if require_fresh:
+            return None
+        return list(stamp)
+    if not isinstance(stamp, dict) or stamp.get('values') is None:
+        return None
+    if source is not None and stamp.get('source') not in (None, source):
+        return None
+    if require_fresh and last_good_ttl_expired(stamp, now=now, source=source):
+        return None
+    vals = stamp.get('values')
+    return list(vals) if isinstance(vals, (list, tuple)) else None
 
 
 def peer_features(state, bar_time, *, max_lag_seconds=0):
@@ -235,23 +249,16 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
     if len(ohlc) != need:
         return f'ohlc: feature dim {len(ohlc)} != expected {need}'
     peers = peer_features(intermarket, base.get('bar_time'))
+    # V5 D08/T04: stale last-good stays usable; never REQUIRED→HOLD on TTL alone.
     peers_fb = last_good_values(peers_fallback, now=now, source='peers')
     if peers is None and not _peer_vector_ok(peers_fb):
         status = (intermarket or {}).get('status') if isinstance(intermarket, dict) else None
         detail = (intermarket or {}).get('reason') if isinstance(intermarket, dict) else None
-        ttl_note = ''
-        if peers_fallback is not None and last_good_ttl_expired(
-                peers_fallback, now=now, source='peers'):
-            ttl_note = ' (last-good TTL expired)'
-        return 'peers: ' + (detail or status or 'aligned peer features unavailable') + ttl_note
+        return 'peers: ' + (detail or status or 'aligned peer features unavailable')
     news = news_features(epic, calendar_path, currencies, now=now)
     news_fb = last_good_values(news_fallback, now=now, source='news')
     if news is None and not _news_vector_ok(news_fb):
-        ttl_note = ''
-        if news_fallback is not None and last_good_ttl_expired(
-                news_fallback, now=now, source='news'):
-            ttl_note = ' (last-good TTL expired)'
-        return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW' + ttl_note
+        return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW'
     liq_fb = last_good_values(liquidity_fallback, now=now, source='liquidity')
     if liquidity_path is None and not _liquidity_vector_ok(liq_fb):
         return 'liquidity: path not configured'
@@ -261,12 +268,8 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
             liquidity_path, base.get('bar_time'), now=now, epic=epic)
     live_ok = bool(obs and obs.get('ok') and obs.get('features') is not None)
     if not live_ok and not _liquidity_vector_ok(liq_fb):
-        ttl_note = ''
-        if liquidity_fallback is not None and last_good_ttl_expired(
-                liquidity_fallback, now=now, source='liquidity'):
-            ttl_note = ' (last-good TTL expired)'
         return 'liquidity: ' + ((obs or {}).get('reason')
-                                or 'volume/DOM observation unavailable') + ttl_note
+                                or 'volume/DOM observation unavailable')
     return None
 
 

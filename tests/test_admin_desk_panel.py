@@ -25,7 +25,7 @@ def test_desk_js_uses_live_endpoints_not_fake_curve():
     assert 'POLL_DESK_MS' in js
     assert '/api/admin/markets-ohlc' in js
     assert 'structure-view' in js
-    assert 'Nav broker cash closes' in js
+    assert 'Nav Capital Funds £ closes' in js or 'Nav Capital £ closes' in js
     # Placeholder equity seed removed.
     assert 'seed=[0,12,8,22' not in js
 

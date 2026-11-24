@@ -124,19 +124,21 @@ def test_regime_refuses_when_atr_floor_makes_tp_shorter_than_sl():
         entry_zone=zones.get('buy_entry'), trigger='zone', tick=0.1,
         spread=0.2, min_distance=0.5, atr=8.0)
     if br.get('ready'):
-        assert float(br['profit_distance']) + 1e-9 >= float(br['stop_distance'])
-        assert float(br.get('rr') or 0) + 1e-9 >= float(br.get('min_rr') or 1.0)
         assert br.get('rr_capped') is not True
+        # V5: RR may be below min_rr — reported as context, not a soft-cap/HOLD.
+        assert float(br['stop_distance']) > 0
+        assert float(br['profit_distance']) > 0
     else:
         assert br.get('reason') in (
-            'HOLD_RR', 'regime_rr_below_one', 'no_structural_tp',
+            'no_structural_tp',
             'regime_tp_below_broker_min', 'regime_sl_below_broker_min',
             'regime_tp_below_floor', 'regime_sl_below_floor',
             'no_structural_sl')
+        assert br.get('reason') != 'HOLD_RR'
 
 
 def test_regime_brackets_hold_rr_instead_of_soft_cap_sl():
-    """V3 B01: RR shortfall → HOLD_RR; structural SL must not move toward entry."""
+    """V5 B01/T09: RR shortfall keeps structural SL; no soft-cap; no HOLD_RR veto."""
     rows, mid = demand_zone_path(confirm=True)
     zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     buy = zones.get('buy_entry')
@@ -159,17 +161,9 @@ def test_regime_brackets_hold_rr_instead_of_soft_cap_sl():
         zones={'buy_entry': wide_demand, 'sell_entry': supply},
         entry_zone=wide_demand, trigger='zone', tick=0.1,
         spread=0.2, min_distance=0.5, atr=1.0, store=None)
+    assert br.get('reason') != 'HOLD_RR'
+    assert br.get('rr_capped') is not True
     if br.get('ready'):
-        # If structure luckily cleared min_rr, SL must still be structural (no cap).
-        assert br.get('rr_capped') is not True
-        assert float(br.get('rr') or 0) + 1e-9 >= float(br.get('min_rr') or 1.0)
-    else:
-        assert br.get('reason') in ('HOLD_RR', 'regime_rr_below_one',
-                                    'no_structural_tp', 'no_structural_sl',
-                                    'regime_sl_below_broker_min',
-                                    'regime_tp_below_broker_min')
-        if br.get('reason') == 'HOLD_RR':
-            assert br.get('rr_capped') is not True
-            # Structural stop kept at invalidation — not soft-capped toward entry.
-            assert float(br['stop_distance']) + 1e-9 >= 9.0
-            assert float(br.get('rr') or 0) + 1e-9 < float(br.get('min_rr') or 2.0)
+        # Structural stop kept at invalidation — not soft-capped toward entry.
+        assert float(br['stop_distance']) + 1e-9 >= 9.0
+        assert float(br['stop_level']) < entry - 8.0

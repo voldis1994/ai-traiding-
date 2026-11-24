@@ -252,12 +252,12 @@ def test_z03_high_quality_invalidated_loses_to_valid_lower_quality():
 
 
 def test_z04_zone_confirm_requires_rejection_and_structure():
-    """V3 T06: pin without microstructure → HOLD; both → confirm."""
+    """V5 T06: rejection OR microstructure; evidence kept separate (no AND filter)."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     assert buy
-    # Append bullish pin only — rejection without micro structure.
+    # Append bullish pin only — rejection without micro structure is enough.
     from datetime import datetime, timedelta
     last = rows[-1]
     base_lo, base_hi = float(buy['lo']), float(buy['hi'])
@@ -270,10 +270,9 @@ def test_z04_zone_confirm_requires_rejection_and_structure():
     }
     pin_only = list(rows) + [pin]
     conf = oez.zone_confirm_allows('BUY', candles=pin_only, zone=buy, tick=0.1)
-    assert conf['ok'] is False
+    assert conf['ok'] is True
     assert conf['rejection'].get('ok') is True
-    assert conf['structure'].get('ok') is False
-    assert 'wait_structure' in (conf.get('reason') or '')
+    assert 'rejection' in (conf.get('reason') or '')
 
     # Full confirm path has both evidence types.
     rows_ok, _ = demand_zone_path(confirm=True)

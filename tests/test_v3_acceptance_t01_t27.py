@@ -1,12 +1,13 @@
-"""V3.0 acceptance tests T01–T27 (fixtures / mocks only — no live Capital).
+"""V5.0 acceptance tests T01–T27 (fixtures / mocks only — no live Capital).
 
-Spec: docs/v3/SISTEMAS_LIGUMS_V3_Capital_Funds_LV.txt chapters 21–22.
-Assert against current P0 module behaviour; xfail only when truly unwired.
+Spec: docs/v5/LIVE_V5_esosas_sistemas_labojumi_LV.txt chapters 21–22.
+V5 supersedes V1–V4: fix existing LIVE; no new HOLD_* OPEN gates.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -169,7 +170,7 @@ def test_t03_m5_aggregation_complete_vs_gap():
 
 
 def test_t04_last_good_ttl_expiry():
-    """T04: last-good external source past TTL → REQUIRED HOLD; no timestamp refresh."""
+    """T04 V5: stale/missing external → keep time+status; use compatible context; no REQUIRED→HOLD."""
     from datetime import datetime, timezone, timedelta
     from app import market_fusion
 
@@ -182,9 +183,14 @@ def test_t04_last_good_ttl_expiry():
     stale = market_fusion.stamp_last_good(
         [0.1] * 6, source='peers', now=now - timedelta(seconds=200), max_age=120)
     assert market_fusion.last_good_ttl_expired(stale, now=now, source='peers') is True
-    assert market_fusion.last_good_values(stale, now=now, source='peers') is None
-    # Legacy bare list has no provenance → expired (must re-observe).
+    # Stale last-good remains usable context — not a REQUIRED→HOLD gate.
+    assert market_fusion.last_good_values(stale, now=now, source='peers') == [0.1] * 6
+    # require_fresh keeps diagnostics able to drop expired stamps.
+    assert market_fusion.last_good_values(
+        stale, now=now, source='peers', require_fresh=True) is None
+    # Legacy bare list has no provenance stamp → expired flag, but values usable.
     assert market_fusion.last_good_ttl_expired([0.1] * 6, now=now) is True
+    assert market_fusion.last_good_values([0.1] * 6, now=now) == [0.1] * 6
     # Re-read must not refresh observed_at.
     assert stale['observed_at'] == (now - timedelta(seconds=200)).isoformat()
 
@@ -211,7 +217,7 @@ def test_t05_zone_invalidation_close_through():
 
 
 def test_t06_zone_and_confirm_pin_and_microstructure():
-    """T06: pin without microstructure → HOLD; both → confirmed."""
+    """T06 V5: rejection and microstructure stay separate evidence; no universal AND."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
@@ -226,9 +232,10 @@ def test_t06_zone_and_confirm_pin_and_microstructure():
         'low': base_lo - 0.05, 'close': mid + 0.12,
     }
     conf = oez.zone_confirm_allows('BUY', candles=list(rows) + [pin], zone=buy, tick=0.1)
-    assert conf['ok'] is False
+    # Pin alone is enough under OR confirm (no new AND filter).
+    assert conf['ok'] is True
     assert conf['rejection'].get('ok') is True
-    assert conf['structure'].get('ok') is False
+    assert 'rejection' in (conf.get('reason') or '')
 
     rows_ok, _ = demand_zone_path(confirm=True)
     buy2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)['buy_entry']
@@ -301,10 +308,10 @@ def test_t08_range_mid_hold_and_unknown_hold_scenario():
 # --- T09–T12: SL/TP & decision integrity -------------------------------------
 
 def test_t09_hold_rr_not_sl_move():
-    """T09: BUY inv 95, buffer 0.5, entry 100, TP short → HOLD_RR; SL stays 94.5."""
+    """T09 V5: BUY inv 95, buffer 0.5, entry 100, TP 104 → SL=94.5; no soft-cap; no HOLD_RR."""
     sl = _ohlc_stop('BUY', 95.0, entry=100.0, buffer=0.5)
     assert sl == pytest.approx(94.5)
-    # Bruto RR with TP=104: 4 / 5.5 ≈ 0.727 → below min; must HOLD_RR not SL=96.
+    # Bruto RR with TP=104: 4 / 5.5 ≈ 0.727 — context only, not a veto.
     bruto_rr = 4.0 / 5.5
     assert bruto_rr < 1.5
 
@@ -323,12 +330,13 @@ def test_t09_hold_rr_not_sl_move():
         entry_zone={'side': 'BUY', 'lo': 95.0, 'hi': 96.0, 'sl_anchor': 95.0},
         trigger='zone', tick=0.25, spread=0.0, min_distance=0.5, atr=None,
         store=None)
-    assert br.get('ready') is False
-    assert br.get('reason') == 'HOLD_RR'
+    assert br.get('ready') is True
+    assert br.get('reason') != 'HOLD_RR'
     assert br.get('rr_capped') is not True
     assert float(br['stop_level']) == pytest.approx(94.5)
     # Must not soft-cap SL toward entry (96).
     assert float(br['stop_level']) < 96.0 - 1e-9
+    assert float(br.get('rr') or 0) == pytest.approx(bruto_rr, rel=1e-3)
 
 
 def test_t10_fakeout_sl_below_sweep():
@@ -487,8 +495,8 @@ def test_t15_uncertain_blocks_second_open():
 # --- T17–T20: risk & result truth --------------------------------------------
 
 def test_t17_hold_risk_size_budget():
-    """T17: budget £10, £25/min-lot → HOLD_RISK; missing tick_value → HOLD_RISK."""
-    # Min lot 0.5 at £25 risk exceeds £10 budget → size 0.
+    """T17 V5: hard_risk/day_risk informational; no new HOLD_RISK from limits/grid."""
+    # Min lot 0.5 at £25 risk exceeds £10 budget → size 0 (math), not HOLD_RISK gate.
     sized = position_size(10, 0, 50, 1, '.1', '.5', 10)
     assert sized['size'] == Decimal('0')
     assert float(cash_risk(Decimal('0.5'), 50, 1)) == pytest.approx(25.0)
@@ -501,23 +509,21 @@ def test_t17_hold_risk_size_budget():
             'equity_drawdown_limit': 100.0,
             'trading_halted': False,
         }, reason='t17')
-        # Over budget at min pack.
         over = hard_risk.entry_allowed(store, proposed_risk=25.0)
-        assert over['allowed'] is False
-        assert 'exceeds max risk' in (over.get('reason') or '')
-        # Missing tick / cash risk → refuse (not mandate fallback).
+        assert over['allowed'] is True
+        assert over.get('open_gated') is False
         missing = hard_risk.entry_allowed(store, proposed_risk=None)
-        assert missing['allowed'] is False
-        assert 'tick' in (missing.get('reason') or '').lower() or 'cash risk' in (
-            missing.get('reason') or '').lower()
-        # Pause / emergency halt blocks new OPEN.
+        assert missing['allowed'] is True
         hard_risk.halt(store, 'emergency')
         halt = hard_risk.entry_allowed(store, proposed_risk=5.0)
-        assert halt['allowed'] is False
+        # Halt flag is bookkeeping for Admin; OPEN stays allowed (operator Pause separate).
+        assert halt['allowed'] is True
+        assert hard_risk.load(store).get('trading_halted') is True
 
     grid = dealing_size_grid({}, mandate_size='0.5')
-    assert grid['ok'] is False
-    assert 'HOLD_RISK' in (grid.get('reason') or '')
+    assert grid['ok'] is True
+    assert grid['source'] == 'mandate_fallback'
+    assert 'HOLD_RISK' not in (grid.get('reason') or '')
 
 
 def test_t18_funds_pending_vs_settled_zero():
@@ -658,7 +664,7 @@ def test_t21_shadow_learn_does_not_change_live_weights():
 
 
 def test_t24_cold_start_does_not_make_live_ready():
-    """T24: cold-start / failed readiness → not LIVE ready; no champion shortcut."""
+    """T24 V5: manual close + unfinished candidate → LIVE cycle continues; no HOLD_MODEL."""
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         brain._activate('GOLD')
@@ -668,10 +674,13 @@ def test_t24_cold_start_does_not_make_live_ready():
         })
         out = mr.grant_cold_start_open(store, brain, reason='manual close')
         assert out.get('cold_start_open') is True
-        assert out.get('ready') is False
-        assert brain.trading_readiness()['ready'] is False
+        assert out.get('ready') is True
+        assert brain.trading_readiness()['ready'] is True
         gates = SingleTradeEngine(store, brain).live_open_gates('BUY')
-        assert gates['allowed'] is False
+        assert gates['allowed'] is True
+        # Champion must not activate as a plan-time HOLD_MODEL substitute.
+        src = inspect.getsource(SingleTradeEngine.submit)
+        assert 'maybe_activate' not in src
 
 
 # --- T26–T27: cycle & isolation ----------------------------------------------

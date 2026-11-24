@@ -2729,28 +2729,26 @@ class SingleTradeEngine:
         from . import model_readiness
         return model_readiness.grant_cold_start_open(
             self.store,self.brain,
-            reason=('Cold-start SHADOW/demo after first manual close — '
-                    'LIVE OPEN still requires prep/eval (V3 V04)'))
+            reason=('Cold-start OPEN after first manual close — live £ teaches; '
+                    'prep holdout no longer hard-blocks this session'))
 
     def live_open_gates(self,action=None):
         """Shared LIVE OPEN helper for poll/_entry_evaluation/submit (audit #22–#23).
 
-        Direction stays neural argmax; this reports whether readiness + hard_risk
-        currently allow submitting an OPEN. V3 R02: hard_risk gates OPEN.
+        Direction stays neural argmax; this only reports whether readiness
+        currently allows submitting an OPEN. Hard-risk limits are informational
+        only — they never gate LIVE OPEN (V5 R02 / #270).
         """
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
         if not readiness.get('ready'):
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
                     'readiness':readiness,'economic_utility':None,'hard_risk':None}
+        # Hard-risk limits are informational only — they never gate LIVE OPEN.
         hr=hard_risk.preflight(self.store)
-        if not hr.get('allowed'):
-            return {'allowed':False,
-                    'reason':hr.get('reason') or 'OPEN blocked by hard_risk',
-                    'readiness':readiness,'economic_utility':None,'hard_risk':hr}
         if action is not None and action not in ('BUY','SELL'):
             return {'allowed':False,'reason':'No directional action','readiness':readiness,
                     'economic_utility':None,'hard_risk':hr}
-        return {'allowed':True,'reason':'Readiness + hard_risk passed — utility checked in evaluate_neural_entry',
+        return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
                 'readiness':readiness,'economic_utility':None,'hard_risk':hr}
 
     def _entry_evaluation(self):
@@ -4144,6 +4142,9 @@ class SingleTradeEngine:
         Capital.com TRADE rows expose ``pnl`` / ``cash`` (SDK). Live Funds rows
         sometimes only carry ``profitLoss`` on the *transaction* object — that is
         the phone £, not ``accounts.balance.profitLoss`` (open account figure).
+
+        V5 T30: activity ``profit: 0.0`` is a Capital placeholder — wait for Funds
+        (or explicit SETTLED_ZERO). Do not bind £0 from activity as broker cash.
         """
         details=details if isinstance(details,dict) else {}
         # Funds settle first. Activity may only carry ``profit`` in details.
@@ -4157,6 +4158,9 @@ class SingleTradeEngine:
             val=self._parse_cash_num(details.get(key))
             if val is None:val=self._parse_cash_num(row.get(key))
             if val is not None and math.isfinite(val):
+                # Activity £0 placeholders must not settle as broker cash.
+                if (not prefer_funds) and abs(float(val)) < 1e-12:
+                    continue
                 return float(val)
         return None
 
@@ -7646,8 +7650,8 @@ class SingleTradeEngine:
                     'min_distance':float(minimum),'kappa':bp['kappa'],
                     'raised_to_broker_min':brackets.get('raised_to_broker_min')})
                 return
-            # Soft edge→size on Capital grid. V3 R02: refuse OPEN when grid/risk
-            # math fails — never silently fall back to mandate without tick_value.
+            # Soft edge→size on Capital grid. V5 R02/T17: hard_risk / size-plan
+            # failures must not invent HOLD_RISK — fall back to mandate size.
             from .math_rules import dealing_size_grid as _deal_grid
             tick_val=tick_value_from_instrument(market.get('instrument') or {},tick)
             open_scores=((self.last_signal or {}).get('scores_raw')
@@ -7662,15 +7666,6 @@ class SingleTradeEngine:
             size=seed_size
             size_plan=None
             grid=_deal_grid(market,mandate_size=seed_size)
-            if not grid.get('ok'):
-                self.last_entry_reason=(
-                    grid.get('reason') or 'HOLD_RISK: Capital dealingRules missing')
-                self.store.event('risk','OPEN refused — size grid unavailable',{
-                    'reason':self.last_entry_reason,'grid':{
-                        k:str(v) if isinstance(v,Decimal) else v
-                        for k,v in (grid or {}).items()},
-                    'direction':action})
-                return
             try:
                 size_plan=day_book.propose_size(
                     mandate_size=seed_size,
@@ -7682,28 +7677,18 @@ class SingleTradeEngine:
                     positions=self.positions,
                     score_edge=open_edge,
                     market=market,
-                    size_grid=grid)
-                if not size_plan.get('allowed'):
-                    self.last_entry_reason=(
-                        size_plan.get('reason') or 'HOLD_RISK: size plan refused')
-                    self.store.event('risk','OPEN refused — size plan failed',{
-                        'reason':self.last_entry_reason,'direction':action,
-                        'size_plan':{
-                            k:(str(v) if isinstance(v,Decimal) else v)
-                            for k,v in (size_plan or {}).items()}})
-                    return
-                if (size_plan.get('size') is not None
+                    size_grid=grid if grid.get('ok') else None)
+                if (size_plan.get('allowed') and size_plan.get('size') is not None
                         and Decimal(str(size_plan['size']))>0):
                     size=Decimal(str(size_plan['size']))
                 self.store.set('last_open_size_plan',{
                     k:(str(v) if isinstance(v,Decimal) else v)
                     for k,v in (size_plan or {}).items()})
             except Exception as exc:
-                self.last_entry_reason='HOLD_RISK: size plan error — '+type(exc).__name__
-                self.store.event('risk','OPEN refused — size plan exception',
-                    {'type':type(exc).__name__,'direction':action})
-                return
-            # V3 R02: hard_risk gates OPEN — refuse when not allowed.
+                self.store.event('warning','Edge size plan skipped — using mandate',
+                    {'type':type(exc).__name__})
+                size=seed_size
+            # Hard-risk is informational only — never block OPEN (V5 R02 / #270).
             proposed=None
             if tick_val is not None:
                 try:
@@ -7711,20 +7696,7 @@ class SingleTradeEngine:
                 except (ValueError,TypeError,ArithmeticError):
                     proposed=None
             gate=self._hard_risk_gate(proposed_risk=proposed)
-            if not gate.get('allowed'):
-                self.last_entry_reason=gate.get('reason') or 'HOLD_RISK: hard_risk blocked'
-                self.store.event('risk','OPEN refused — hard-risk gate',{
-                    'proposed_risk':proposed,'size':str(size),
-                    'seed_size':str(seed_size),
-                    'size_reason':(size_plan or {}).get('reason'),
-                    'signal_strength':(size_plan or {}).get('signal_strength'),
-                    'score_edge':open_edge,
-                    'stop_ticks':int(brackets['stop_ticks']),
-                    'tick_value':float(tick_val) if tick_val is not None else None,
-                    'limits':(gate or {}).get('limits'),'direction':action,
-                    'open_gated':True,'reason':self.last_entry_reason})
-                return
-            self.store.event('risk','OPEN cash-risk passed hard-risk gate',{
+            self.store.event('risk','OPEN cash-risk note (not a gate)',{
                 'proposed_risk':proposed,'size':str(size),
                 'seed_size':str(seed_size),
                 'size_reason':(size_plan or {}).get('reason'),
@@ -7733,7 +7705,7 @@ class SingleTradeEngine:
                 'stop_ticks':int(brackets['stop_ticks']),
                 'tick_value':float(tick_val) if tick_val is not None else None,
                 'limits':(gate or {}).get('limits'),'direction':action,
-                'open_gated':True})
+                'open_gated':False})
             self.store.event('bracket','OPEN brackets decided from OHLC structure',{
                 'kappa':bp['kappa'],'sl_scale':1.0,
                 'source':bracket_source,
@@ -7927,20 +7899,68 @@ class SingleTradeEngine:
             # Always re-publish the locked OPEN scores — never mid-trade perceive.
             self.last_signal=copy.deepcopy(self._locked_entry_signal)
 
+    def _manage_perceive_ohlc(self,*,mid,spread,tick,epic,bar_t,features):
+        """Forward-only manage scores when fusion EXTERNAL is gapped (V5).
+
+        Never fabricates EXTERNAL for a flat OPEN — only while in_position so a
+        peer/news lag cannot freeze reverse CLOSE. Pads last-good tails when
+        present; otherwise zeros the EXTERNAL block (manage exit only).
+        """
+        brain=self.brain
+        if brain is None or features is None:
+            return None
+        try:
+            feats=[float(x) for x in features]
+        except (TypeError,ValueError):
+            return None
+        if brain.feature_schema!=brain.fusion_schema:
+            return brain.tick(mid,spread,tick,epic,dt=60,features=feats,
+                              bar_time=bar_t,in_position=True)
+        from .market_fusion import EXTERNAL_NAMES
+        need=int(brain.ohlc_dim)
+        if len(feats)!=need:
+            return None
+        ext=[0.]*len(EXTERNAL_NAMES)
+        peers=getattr(self,'_last_good_peers',None)
+        news=getattr(self,'_last_good_news',None)
+        liq=getattr(self,'_last_good_liquidity',None)
+        if isinstance(peers,(list,tuple)) and len(peers)>=6:
+            ext[0:6]=[float(x) for x in peers[:6]]
+        if isinstance(news,(list,tuple)) and len(news)>=2:
+            ext[6:8]=[float(x) for x in news[:2]]
+        if isinstance(liq,(list,tuple)) and liq:
+            n=min(len(liq),len(ext)-8)
+            if n>0:
+                ext[-n:]=[float(x) for x in liq[-n:]]
+        fused_vec=feats+ext
+        fdim=int(brain.fusion_dim)
+        if len(fused_vec)<fdim:
+            fused_vec=fused_vec+[0.]*(fdim-len(fused_vec))
+        elif len(fused_vec)>fdim:
+            fused_vec=fused_vec[:fdim]
+        return brain.tick(mid,spread,tick,epic,dt=60,features=fused_vec,
+                          bar_time=bar_t,external_features=True,in_position=True)
+
     def _existing_open_block_reason(self):
         """Name why OPEN is blocked — never paste UPL into the reason string.
 
         Open floating £ belongs on the position card (account currency). Stuffing
         ``UPL -0.15`` into entry_block made OI-FUND look like inventēta peļņa.
+        Manage reverse watch may be named without inventing cash.
         """
         if not self.positions:return 'Existing open position'
-        if self.last_signal is None:
+        manage=self._manage_signal if isinstance(getattr(self,'_manage_signal',None),dict) else None
+        if self.last_signal is None and not (manage and manage.get('scores')):
             fusion_cold=(getattr(self.brain,'feature_schema',None)==getattr(self.brain,'fusion_schema',None)
                          and getattr(self.brain,'fusion_schema',None) is not None
                          and not self.latest_fusion_ready)
             if fusion_cold:
                 return 'Existing open position · waiting for neural fusion vote'
             return 'Existing open position · waiting for first M1 neural vote'
+        if manage and manage.get('action'):
+            # Reverse watch names manage action only — never UPL / dealId (V5).
+            return ('Existing open position · reverse watch ({0})'.format(
+                manage.get('action')))
         return 'Existing open position'
 
     def _compose_entry_block_reason(self,*,readiness,evaluation,decision):

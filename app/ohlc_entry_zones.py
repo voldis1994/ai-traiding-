@@ -654,9 +654,10 @@ def micro_structure_confirm(action, candles, zone, *, tick=0.01):
 
 
 def zone_confirm_allows(action, *, candles, zone, tick=0.01):
-    """Zone OPEN needs rejection candle AND micro structure change (V3 Z04).
+    """Zone OPEN needs rejection candle OR micro structure change (V5 Z04/T06).
 
-    Prior OR allowed pin-only entries; contract requires both evidence types.
+    Rejection and microstructure stay as separate evidence; no universal AND
+    filter. Invalidated zones are never confirmed (Z03).
     """
     # Never confirm an already-invalidated zone (Z03).
     if isinstance(zone, dict) and (
@@ -678,20 +679,15 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01):
         }
     rej = rejection_candle(action, candles, zone, tick=tick)
     st = micro_structure_confirm(action, candles, zone, tick=tick)
-    ok = bool(rej.get('ok') and st.get('ok'))
-    if ok:
-        reason = f"rejection+{rej.get('kind')}+{st.get('reason')}"
-    elif rej.get('ok') and not st.get('ok'):
-        reason = f"wait_structure_after_rejection ({st.get('reason')})"
-    elif st.get('ok') and not rej.get('ok'):
-        reason = f"wait_rejection_after_structure ({rej.get('reason')})"
-    else:
-        reason = 'wait_zone_confirm'
+    ok = bool(rej.get('ok') or st.get('ok'))
     return {
         'ok': ok,
         'rejection': rej,
         'structure': st,
-        'reason': reason,
+        'reason': (
+            'rejection+' + str(rej.get('kind')) if rej.get('ok')
+            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
+        ),
     }
 
 

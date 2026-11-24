@@ -49,7 +49,7 @@ def test_admin_js_auto_boots_localhost():
     assert "console.warn('loadBrokers'" in js
     assert "console.warn('loadOverview'" in js
     html = open('app/web/admin/index.html', encoding='utf-8').read()
-    assert 'admin.js?v=152' in html
+    assert 'admin.js?v=171' in html
     assert 'nta-local' in html
     assert 'html.nta-local #login' in html
 

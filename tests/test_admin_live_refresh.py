@@ -10,6 +10,7 @@ from app.runtime_hub import RuntimeHub
 
 
 def test_trade_stats_no_closes_keeps_working_pnl_none_and_open_upl():
+    """V5 P05: open UPL is shown on cards; Desk equity stays Funds-only (blank ≠ cash)."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         hub = RuntimeHub.__new__(RuntimeHub)
@@ -18,7 +19,8 @@ def test_trade_stats_no_closes_keeps_working_pnl_none_and_open_upl():
         assert stats['working_pnl'] is None
         assert stats['working_pnl_source'] == 'empty'
         assert stats['open_upl'] == pytest.approx(0.24)
-        assert stats['equity_pnl'] == pytest.approx(0.24)
+        # Equity / Kopējais must not invent cash from UPL.
+        assert stats['equity_pnl'] is None
         assert stats['realized_pnl'] is None
 
 

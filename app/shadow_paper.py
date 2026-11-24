@@ -434,11 +434,15 @@ class ShadowPaperJournal:
             n+=1
         return n
 
-    def _close_row(self, pos, exit_px, *, bar_time, spread, reason):
+    def _close_row(self, pos, exit_px, *, bar_time, spread, reason,
+                   paper_pnl=None, live_deal_id=None):
         direction=pos['direction']
         price_pnl=_close_price_pnl(direction,float(pos['entry']),float(exit_px))
         scale=_finite(self.cash_scale)
-        cash=float(price_pnl*scale) if scale is not None else None
+        # Explicit LIVE £ wins over scale×price (mirror settle on Capital close).
+        cash=_finite(paper_pnl)
+        if cash is None and scale is not None:
+            cash=float(price_pnl*scale)
         closed={
             'at':datetime.now(timezone.utc).isoformat(),
             'bar_time':bar_time,
@@ -449,15 +453,49 @@ class ShadowPaperJournal:
             'cash_scale':scale,
             'unit':'account_currency' if cash is not None else 'price',
             'spread':float(spread or 0),
-            'exit_reason':reason,  # sl | tp | trail — never 'flip'
+            'exit_reason':reason,  # sl | tp | trail | live_mirror — never 'flip'
             'source':'shadow_paper',
             'model_version':pos.get('model_version'),
             'stop_level':pos.get('stop'),'profit_level':pos.get('profit'),
             'shadow_transition':pos.get('shadow_transition'),
             'entry_context':pos.get('entry_context'),
         }
+        ctx=pos.get('entry_context') if isinstance(pos.get('entry_context'),dict) else {}
+        deal=live_deal_id or ctx.get('live_deal_id')
+        if deal is not None:
+            closed['live_deal_id']=str(deal)
         self.history.append(closed)
         self.position=None
+        self.pending=None
+        return closed
+
+    def force_close_live_mirror(self, *, exit_px, paper_pnl=None, spread=0.,
+                                bar_time=None, live_deal_id=None,
+                                reason='live_mirror'):
+        """Settle open paper when LIVE closes — do not wait forever for SL/TP bars.
+
+        Matches mirrored LIVE OPEN (entry_context.live_deal_id) or any open
+        paper position so Desk paper book completes the same cycle as Capital.
+        """
+        pos=self.position
+        if not isinstance(pos,dict):
+            return None
+        ctx=pos.get('entry_context') if isinstance(pos.get('entry_context'),dict) else {}
+        mirrored=str(ctx.get('live_deal_id') or '')
+        want=str(live_deal_id or '')
+        # Prefer matching deal; if caller names a deal and paper is unrelated, skip.
+        if want and mirrored and want!=mirrored:
+            return None
+        px=_finite(exit_px)
+        if px is None:
+            px=_finite(pos.get('entry'))
+        if px is None:
+            return None
+        closed=self._close_row(
+            pos,float(px),bar_time=bar_time or datetime.now(timezone.utc).isoformat(),
+            spread=spread,reason=reason or 'live_mirror',
+            paper_pnl=paper_pnl,live_deal_id=want or mirrored or None)
+        self._persist()
         return closed
 
     def _open_position(self, action, *, mid, spread, slip_bps, bar_time,

@@ -5277,6 +5277,240 @@ class SingleTradeEngine:
                               'trigger':ohlc.get('trigger')})
         return closed
 
+    def _teach_shadow_paper_close(self,closed,*,spread=0.,slip_bps=None):
+        """Apply paper close → SHADOW weights + gates + mistake-audit (one path)."""
+        if not isinstance(closed,dict) or self.store is None:
+            return None
+        from .self_params import load as load_self_params
+        sp=load_self_params(self.store)
+        if slip_bps is None:
+            slip_bps=float(sp.get('exec_slip_bps') or 0.)
+        pnl=closed.get('paper_pnl')
+        if pnl is None:
+            pnl=closed.get('price_pnl')
+        label=None
+        teach_mode=None
+        if pnl is not None:
+            try:
+                cash=float(pnl)
+                direction=closed.get('direction')
+                entry=_num(closed.get('entry'))
+                exit_px=_num(closed.get('exit') or closed.get('exit_px'))
+                try:
+                    trade_spread=float(closed.get('spread')
+                                       if closed.get('spread') is not None
+                                       else (spread or 0))
+                except (TypeError,ValueError):
+                    trade_spread=float(spread or 0)
+                if not math.isfinite(trade_spread) or trade_spread<0:
+                    trade_spread=0.
+                hist=list((self.shadow_paper.history if self.shadow_paper else []) or [])
+                prev=hist[-2] if len(hist)>=2 else None
+                flip_after_loss=False
+                if (cash<0 and isinstance(prev,dict)
+                        and prev.get('direction') in ('BUY','SELL')
+                        and prev.get('direction')!=direction):
+                    prev_pnl=prev.get('paper_pnl')
+                    if prev_pnl is None:
+                        prev_pnl=prev.get('price_pnl')
+                    try:
+                        flip_after_loss=float(prev_pnl)<0
+                    except (TypeError,ValueError):
+                        flip_after_loss=False
+                from .profit_learning import label_from_profit
+                decision=label_from_profit(
+                    direction,cash,flip_after_loss=flip_after_loss,
+                    entry=entry,exit_level=exit_px,
+                    spread=trade_spread,slip_bps=slip_bps)
+                label=decision.get('label')
+                teach_mode=decision.get('mode')
+                if label is not None:
+                    label=int(label)
+            except (TypeError,ValueError):
+                label=None
+                teach_mode=None
+        if label is not None:
+            self._shadow_learn(closed.get('shadow_transition'),label)
+            try:
+                self.store.event('shadow_paper','Shadow paper taught from close',{
+                    'direction':closed.get('direction'),
+                    'paper_pnl':pnl,'label':label,'mode':teach_mode,
+                    'spread':closed.get('spread'),
+                    'exit_reason':closed.get('exit_reason'),
+                    'live_deal_id':closed.get('live_deal_id')})
+            except Exception:
+                pass
+        ctx=closed.get('entry_context') if isinstance(
+            closed.get('entry_context'),dict) else {}
+        ohlc_meta=ctx.get('ohlc_entry') if isinstance(
+            ctx.get('ohlc_entry'),dict) else {}
+        paper_id=(closed.get('fingerprint') or closed.get('deal_id')
+                  or closed.get('live_deal_id')
+                  or ('paper:'+str(closed.get('at') or '')
+                      +':'+str(closed.get('direction') or '')
+                      +':'+str(closed.get('exit_reason') or '')))
+        trade_sp=(closed.get('spread')
+                  if closed.get('spread') is not None else spread)
+        self._observe_entry_gates_once(
+            paper_id,ohlc_meta=ohlc_meta,broker_pnl=pnl,
+            spread=trade_sp,source='shadow_paper')
+        try:
+            from . import shadow_mistake_audit as sma
+            sc_meta=ctx.get('scenario') if isinstance(
+                ctx.get('scenario'),dict) else {}
+            audit_rows=(self.store.candles(
+                self.mandate['epic'],n=80,historical_only=True)
+                        if self.mandate else [])
+            unit=str(closed.get('unit') or '').strip() or None
+            if unit not in ('price','account_currency'):
+                unit=('account_currency'
+                      if closed.get('paper_pnl') is not None else 'price')
+            ccy=(self._account_currency()
+                 if unit=='account_currency' else None)
+            sma.on_close(
+                self.store,
+                pnl=pnl,
+                spread=closed.get('spread') if closed.get('spread') is not None
+                else spread,
+                candles=audit_rows,
+                scenario_meta=sc_meta,
+                ohlc_meta=ohlc_meta,
+                news=ctx.get('news') if isinstance(ctx.get('news'),dict)
+                else self._news_risk(),
+                intermarket=ctx.get('intermarket') if isinstance(
+                    ctx.get('intermarket'),dict)
+                else dict(self.intermarket.state or {}),
+                direction=closed.get('direction'),
+                entry=_num(closed.get('entry')),
+                exit=_num(closed.get('exit') or closed.get('exit_px')),
+                exit_reason=closed.get('exit_reason'),
+                source='shadow',
+                deal_id=paper_id,
+                unit=unit,
+                currency=ccy,
+                paper_pnl=_num(closed.get('paper_pnl')),
+                price_pnl=_num(closed.get('price_pnl')),
+                closed_at=closed.get('at') or closed.get('bar_time'),
+                apply_ohlc_penalties=True,
+            )
+        except Exception as exc:
+            self.store.event('warning','Shadow mistake-audit skipped',
+                             {'type':type(exc).__name__})
+        return {'taught':label is not None,'label':label,'mode':teach_mode}
+
+    def _shadow_queue_loss_retest(self,*,live_direction,spread=0.):
+        """After a LIVE minus: open paper opposite so SHADOW retests the fix."""
+        if self.shadow_paper is None or live_direction not in ('BUY','SELL'):
+            return None
+        if self.shadow_paper.position is not None or self.shadow_paper.pending is not None:
+            return None
+        opposite='SELL' if live_direction=='BUY' else 'BUY'
+        wb=self._would_be_brackets(opposite)
+        if not isinstance(wb,dict):
+            return None
+        sd=_num(wb.get('stop_distance'));pd=_num(wb.get('profit_distance'))
+        if sd is None or sd<=0 or pd is None or pd<=0:
+            return None
+        mkt=self.market or {}
+        mid=_num(mkt.get('mid'))
+        if mid is None:
+            return None
+        tick=_num(mkt.get('tick')) or _num(wb.get('tick')) or max(
+            abs(float(spread or 0))/2.,1e-4)
+        from .self_params import load as load_self_params
+        sp=load_self_params(self.store)
+        shadow=self.shadow_brain
+        shadow_tr=None
+        if shadow is not None and getattr(shadow,'last_transition',None):
+            try:
+                shadow_tr=self.brain._json_transition(shadow.last_transition)
+            except Exception:
+                shadow_tr=None
+        closed=self.shadow_paper.on_bar(
+            opposite,mid=mid,spread=spread or _num(mkt.get('spread')) or 0.,
+            bar_time=now(),high=mid,low=mid,tick=tick,
+            min_distance=_num(mkt.get('min_distance')) or tick,
+            stop_distance=float(sd),profit_distance=float(pd),
+            kappa=_num(wb.get('ohlc_kappa')),
+            sl_scale=1.0,
+            model_version=int(getattr(shadow,'model_version',0) or 0),
+            slip_bps=float(sp.get('exec_slip_bps') or 0.),
+            fill_delay_bars=0,
+            shadow_transition=shadow_tr,
+            entry_context={
+                'mirrored_from':'loss_retest',
+                'live_direction':live_direction,
+                'ohlc_entry':{'trigger':'break','reason':'shadow_loss_retest'},
+            })
+        if self.shadow_paper.position is not None:
+            self.store.event('shadow_paper',
+                             'SHADOW retest OPEN after LIVE loss (opposite)',
+                             {'live_direction':live_direction,
+                              'paper_direction':opposite,
+                              'stop_distance':sd,'profit_distance':pd})
+        return closed
+
+    def _shadow_full_cycle_on_live_close(self,deal_id,*,pnl,direction=None,
+                                         entry=None,exit_level=None,spread=0.):
+        """Finish SHADOW cycle on LIVE settle — especially on a minus.
+
+        LIVE OPEN mirrors into paper, but paper used to wait for SL/TP bars while
+        Capital already closed → Desk ``No paper closes yet``. On LIVE close:
+          1) force-close mirrored paper with live exit + Capital £
+          2) teach SHADOW + mistake-audit from that paper close
+          3) flush_full_cycle (commit pending / ready after proof)
+          4) on loss: queue opposite paper retest so the fix is tested
+        """
+        if self.store is None or deal_id is None:
+            return None
+        self._ensure_shadow_brain()
+        if self.shadow_paper is None:
+            return None
+        out={'deal_id':str(deal_id),'paper_closed':False,'flushed':None,
+             'retest':False,'pnl':_num(pnl)}
+        pnl_n=_num(pnl)
+        # Prefer Capital £ for paper cash so Desk shows real account units.
+        closed=None
+        try:
+            closed=self.shadow_paper.force_close_live_mirror(
+                exit_px=exit_level if exit_level is not None else entry,
+                paper_pnl=pnl_n,spread=spread or 0.,
+                bar_time=now(),live_deal_id=deal_id,
+                reason='live_mirror_sl' if (pnl_n is not None and pnl_n<0)
+                else 'live_mirror_tp')
+        except Exception as exc:
+            self.store.event('warning','SHADOW live-mirror force-close skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
+            closed=None
+        if isinstance(closed,dict):
+            out['paper_closed']=True
+            try:
+                self._teach_shadow_paper_close(closed,spread=spread or 0.)
+            except Exception as exc:
+                self.store.event('warning','SHADOW paper teach after mirror skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
+        try:
+            from . import shadow_mistake_audit as sma
+            out['flushed']=sma.flush_full_cycle(self.store)
+        except Exception as exc:
+            self.store.event('warning','SHADOW full-cycle flush skipped',
+                             {'type':type(exc).__name__,'deal_id':deal_id})
+        # Minus → retest opposite in paper (fix already committed on first loss).
+        if pnl_n is not None and pnl_n<0 and direction in ('BUY','SELL'):
+            try:
+                re=self._shadow_queue_loss_retest(
+                    live_direction=direction,spread=spread or 0.)
+                out['retest']=bool(
+                    re is not None or (self.shadow_paper.position is not None
+                                       and (self.shadow_paper.position.get(
+                                           'entry_context') or {}).get(
+                                           'mirrored_from')=='loss_retest'))
+            except Exception as exc:
+                self.store.event('warning','SHADOW loss retest skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
+        self.store.event('shadow_paper','SHADOW full cycle on LIVE close',out)
+        return out
+
     def _last_upl_as_realized(self,deal_id):
         """UPL must never teach as realized cash — always None."""
         return None
@@ -6374,6 +6608,17 @@ class SingleTradeEngine:
                 entry=_num((saved or {}).get('entry')
                            if isinstance(saved,dict) else None),
                 source='live')
+            # SHADOW full cycle: force paper settle + flush + loss retest.
+            # Without this, mirrored paper waited forever → empty paper book.
+            try:
+                self._shadow_full_cycle_on_live_close(
+                    deal_id,pnl=pnl_value,direction=direction,
+                    entry=_num((saved or {}).get('entry')
+                               if isinstance(saved,dict) else None),
+                    exit_level=exit_level,spread=spread_cost)
+            except Exception as exc:
+                self.store.event('warning','SHADOW full cycle on LIVE close skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None
                 if isinstance(saved,dict):
@@ -8738,122 +8983,11 @@ class SingleTradeEngine:
             slip_bps=slip_bps,fill_delay_bars=fill_delay_bars,
             shadow_transition=shadow_tr,
             entry_context=entry_context)
-        if closed is not None and closed.get('exit_reason') in ('sl','tp','trail'):
-            # CRITICAL: shadow paper must use the SAME loss teacher as LIVE
-            # (label_from_profit). Old path called best_action_from_counterfactual
-            # raw → false flip labels with missing/tiny spread, then promote
-            # copied those poisoned weights into LIVE (Gold flip_loss churn).
-            pnl=closed.get('paper_pnl')
-            if pnl is None:pnl=closed.get('price_pnl')
-            label=None
-            teach_mode=None
-            if pnl is not None:
-                try:
-                    cash=float(pnl)
-                    direction=closed.get('direction')
-                    entry=_num(closed.get('entry'))
-                    exit_px=_num(closed.get('exit') or closed.get('exit_px'))
-                    # Prefer the trade's own spread (stored at close), not bar mid.
-                    try:
-                        trade_spread=float(closed.get('spread')
-                                           if closed.get('spread') is not None
-                                           else (spread or 0))
-                    except (TypeError,ValueError):
-                        trade_spread=float(spread or 0)
-                    if not math.isfinite(trade_spread) or trade_spread<0:
-                        trade_spread=0.
-                    # flip_after_loss audit: prior *paper* loss + direction change.
-                    hist=list(self.shadow_paper.history or [])
-                    prev=hist[-2] if len(hist)>=2 else None
-                    flip_after_loss=False
-                    if (cash<0 and isinstance(prev,dict)
-                            and prev.get('direction') in ('BUY','SELL')
-                            and prev.get('direction')!=direction):
-                        prev_pnl=prev.get('paper_pnl')
-                        if prev_pnl is None:prev_pnl=prev.get('price_pnl')
-                        try:
-                            flip_after_loss=float(prev_pnl)<0
-                        except (TypeError,ValueError):
-                            flip_after_loss=False
-                    from .profit_learning import label_from_profit
-                    decision=label_from_profit(
-                        direction,cash,flip_after_loss=flip_after_loss,
-                        entry=entry,exit_level=exit_px,
-                        spread=trade_spread,slip_bps=slip_bps)
-                    label=decision.get('label')
-                    teach_mode=decision.get('mode')
-                    if label is not None:label=int(label)
-                except (TypeError,ValueError):
-                    label=None;teach_mode=None
-            if label is not None:
-                self._shadow_learn(closed.get('shadow_transition'),label)
-                try:
-                    self.store.event('shadow_paper','Shadow paper taught from close',{
-                        'direction':closed.get('direction'),
-                        'paper_pnl':pnl,'label':label,'mode':teach_mode,
-                        'spread':closed.get('spread'),
-                        'exit_reason':closed.get('exit_reason')})
-                except Exception:
-                    pass
-            # Break|zone knobs learn from paper cash too — not only LIVE Funds £.
-            ctx=closed.get('entry_context') if isinstance(
-                closed.get('entry_context'),dict) else {}
-            ohlc_meta=ctx.get('ohlc_entry') if isinstance(
-                ctx.get('ohlc_entry'),dict) else {}
-            paper_id=(closed.get('fingerprint') or closed.get('deal_id')
-                      or ('paper:'+str(closed.get('at') or '')
-                          +':'+str(closed.get('direction') or '')
-                          +':'+str(closed.get('exit_reason') or '')))
-            trade_sp=(closed.get('spread')
-                      if closed.get('spread') is not None else spread)
-            self._observe_entry_gates_once(
-                paper_id,ohlc_meta=ohlc_meta,broker_pnl=pnl,
-                spread=trade_sp,source='shadow_paper')
-            # Mistake-audit loop: diagnose → scenario memory → targeted fix → promote.
-            try:
-                from . import shadow_mistake_audit as sma
-                sc_meta=ctx.get('scenario') if isinstance(
-                    ctx.get('scenario'),dict) else {}
-                audit_rows=candles if candles is not None else (
-                    self.store.candles(self.mandate['epic'],n=80,historical_only=True)
-                    if self.mandate else [])
-                unit=str(closed.get('unit') or '').strip() or None
-                if unit not in ('price','account_currency'):
-                    # Prefer cash when paper_pnl present; else price pts.
-                    unit=('account_currency'
-                          if closed.get('paper_pnl') is not None
-                          else 'price')
-                ccy=(self._account_currency()
-                     if unit=='account_currency' else None)
-                sma.on_close(
-                    self.store,
-                    pnl=pnl,
-                    spread=closed.get('spread') if closed.get('spread') is not None
-                    else spread,
-                    candles=audit_rows,
-                    scenario_meta=sc_meta,
-                    ohlc_meta=ohlc_meta,
-                    news=ctx.get('news') if isinstance(ctx.get('news'),dict)
-                    else self._news_risk(),
-                    intermarket=ctx.get('intermarket') if isinstance(
-                        ctx.get('intermarket'),dict)
-                    else dict(self.intermarket.state or {}),
-                    direction=closed.get('direction'),
-                    entry=_num(closed.get('entry')),
-                    exit=_num(closed.get('exit') or closed.get('exit_px')),
-                    exit_reason=closed.get('exit_reason'),
-                    source='shadow',
-                    deal_id=paper_id,
-                    unit=unit,
-                    currency=ccy,
-                    paper_pnl=_num(closed.get('paper_pnl')),
-                    price_pnl=_num(closed.get('price_pnl')),
-                    closed_at=closed.get('at') or closed.get('bar_time'),
-                    apply_ohlc_penalties=True,
-                )
-            except Exception as exc:
-                self.store.event('warning','Shadow mistake-audit skipped',
-                                 {'type':type(exc).__name__})
+        if closed is not None and closed.get('exit_reason') in (
+                'sl','tp','trail','live_mirror','live_mirror_sl','live_mirror_tp'):
+            # Same teacher as LIVE (label_from_profit) — shared with mirror settle.
+            self._teach_shadow_paper_close(
+                closed,spread=spread,slip_bps=slip_bps)
         return closed
 
     def restore_neural_weights(self, version_meta_or_path):

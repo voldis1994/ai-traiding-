@@ -5551,7 +5551,9 @@ class SingleTradeEngine:
                 spread=spread or 0.,source='live_backfill')
             if gate and gate.get('adapted'):
                 gates_n+=1
-        if n or scanned or gates_n:
+        # Only log when something new was written — spam on every Desk poll
+        # used to fill events and freeze Admin after ~1 minute.
+        if n or gates_n:
             self.store.event('shadow_mistake_audit',
                              'Backfilled mistake audits from journal '
                              '(all closes)',

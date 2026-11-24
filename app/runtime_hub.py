@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 272
+DESK_TRUTH_REV = 273
 
 
 def _finite_num(v):
@@ -1955,12 +1955,38 @@ class RuntimeHub:
                         out['skipped'] += 1
             elif not do_mirror:
                 out['skipped'] += 1
+            # NEVER run journal backfill sync on Desk overview — it scans up to
+            # 2000 closes with no await and freezes the event loop (~1m then stick).
+            # Schedule a rare background pass instead.
             if hasattr(eng, '_backfill_mistake_audits_from_journal'):
-                try:
-                    eng._backfill_mistake_audits_from_journal(limit=2000, hours=0)
-                except Exception:
-                    pass
+                if not hasattr(self, '_backfill_bg_last'):
+                    self._backfill_bg_last = {}
+                if not hasattr(self, '_backfill_bg_tasks'):
+                    self._backfill_bg_tasks = {}
+                last_bf = float(self._backfill_bg_last.get(cid) or 0)
+                prev_bf = self._backfill_bg_tasks.get(cid)
+                if (force or (now_m - last_bf) >= 60.0) and (
+                        prev_bf is None or prev_bf.done()):
+                    self._backfill_bg_last[cid] = now_m
+                    self._backfill_bg_tasks[cid] = asyncio.create_task(
+                        self._bg_backfill_mistake_audits(eng, cid))
+                    out['backfill_scheduled'] = int(
+                        out.get('backfill_scheduled') or 0) + 1
         return out
+
+    async def _bg_backfill_mistake_audits(self, eng, client_id: int) -> None:
+        """Off the Desk poll path — yield so light ticks / overview stay live."""
+        await asyncio.sleep(0)
+        try:
+            # Small batch; full history is not needed every minute.
+            n = await asyncio.to_thread(
+                lambda: eng._backfill_mistake_audits_from_journal(
+                    limit=80, hours=0))
+            if n:
+                log.info('backfill audits client=%s n=%s', client_id, n)
+        except Exception as exc:
+            log.warning('backfill audits client=%s failed: %s',
+                        client_id, type(exc).__name__)
 
     def admin_overview(self) -> dict:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]

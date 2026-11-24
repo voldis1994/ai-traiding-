@@ -8,6 +8,9 @@ let lastSyncAt=null;
 let deskFocusId=null;
 let deskStructure=null;
 let deskStructureInFlight=null;
+let deskHeavyInFlight=null;
+let deskHeavyDirty=false;
+let deskHeavyLastMono=0;
 let lastDeskChartKey='';
 const deskPrevFields=new Map(); // clientId → {field: previous string}
 const deskPrevTicks=new Map();  // clientId → {tick, at}
@@ -16,6 +19,8 @@ const deskPrevTicks=new Map();  // clientId → {tick, at}
 const POLL_IDLE_MS=2000;
 const POLL_LIVE_MS=400;
 const POLL_DESK_MS=120;
+// Heavy OHLC board: coalesce + ≥1s gap — was stacking every 120ms until UI stuck.
+const DESK_HEAVY_MIN_MS=1000;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
 const OHLC_REFRESH_MS=250;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
@@ -1641,56 +1646,80 @@ function renderDeskLight(data,focus){
 }
 
 async function renderDeskHeavy(focus,demoFx){
-  let markets=[];
-  let view=null;
-  if(demoFx){
-    markets=demoFx.markets||[];
-    view=demoFx.view||null;
-  }else{
+  // Coalesce: one heavy at a time; mark dirty so the next run covers skipped polls.
+  if(deskHeavyInFlight){
+    deskHeavyDirty=true;
+    return deskHeavyInFlight;
+  }
+  const now=Date.now();
+  if(deskHeavyLastMono && (now-deskHeavyLastMono)<DESK_HEAVY_MIN_MS){
+    deskHeavyDirty=true;
+    return null;
+  }
+  deskHeavyLastMono=now;
+  deskHeavyInFlight=(async()=>{
+    let markets=[];
+    let view=null;
     try{
-      const board=await api('/api/admin/markets-ohlc?n=90');
-      markets=board.markets||[];
-    }catch(_){markets=[]}
-    if(focus){
-      const epic=((focus.activity||{}).market)
-        ||(((focus.activity||{}).mandate)||{}).epic;
-      view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
-        &&(m.client_ids||[]).map(String).includes(String(focus.id)))
-        ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
-        ||null;
-      if(!view||!(view.candles||[]).length){
-        view=await loadDeskStructure(focus.id);
+      if(demoFx){
+        markets=demoFx.markets||[];
+        view=demoFx.view||null;
+      }else{
+        try{
+          const board=await api('/api/admin/markets-ohlc?n=90');
+          markets=board.markets||[];
+        }catch(_){markets=[]}
+        if(focus){
+          const epic=((focus.activity||{}).market)
+            ||(((focus.activity||{}).mandate)||{}).epic;
+          view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
+            &&(m.client_ids||[]).map(String).includes(String(focus.id)))
+            ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
+            ||null;
+          if(!view||!(view.candles||[]).length){
+            view=await loadDeskStructure(focus.id);
+          }
+        }
+      }
+      renderDeskTape(markets,focus);
+      renderDeskWatch(markets,focus);
+      renderDeskSignal(focus,markets);
+      view=enrichViewOpenLevels(view,focus);
+      if(view)deskStructure=view;
+      const titleEl=$('deskChartTitle');
+      if(titleEl){
+        const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'INSTRUMENT';
+        titleEl.textContent=`${ep} CHART`;
+      }
+      const epicTitle=$('deskEpicTitle');
+      if(epicTitle){
+        const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
+        epicTitle.textContent=ep;
+      }
+      renderDeskQuote(view,focus);
+      renderDeskLevels(view,focus);
+      renderDeskIndicators(focus,view);
+      renderDeskCheck(focus,view);
+      renderDeskBook(focus,view);
+      renderDeskIndCharts(focus,view);
+      requestAnimationFrame(()=>{
+        deskAutoFit();
+        drawDeskChart(view);
+      });
+    }finally{
+      deskHeavyInFlight=null;
+      if(deskHeavyDirty){
+        deskHeavyDirty=false;
+        // One catch-up pass — still respects DESK_HEAVY_MIN_MS via lastMono.
+        const again=focus;
+        const fx=demoFx;
+        setTimeout(()=>{
+          renderDeskHeavy(again,fx).catch(err=>console.warn('desk-heavy',err));
+        }, Math.max(50, DESK_HEAVY_MIN_MS-(Date.now()-deskHeavyLastMono)));
       }
     }
-  }
-  renderDeskTape(markets,focus);
-  renderDeskWatch(markets,focus);
-  renderDeskSignal(focus,markets);
-  view=enrichViewOpenLevels(view,focus);
-  if(view)deskStructure=view;
-  const titleEl=$('deskChartTitle');
-  if(titleEl){
-    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'INSTRUMENT';
-    titleEl.textContent=`${ep} CHART`;
-  }
-  const epicTitle=$('deskEpicTitle');
-  if(epicTitle){
-    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
-    epicTitle.textContent=ep;
-  }
-  renderDeskQuote(view,focus);
-  renderDeskLevels(view,focus);
-  renderDeskIndicators(focus,view);
-  renderDeskCheck(focus,view);
-  renderDeskBook(focus,view);
-  renderDeskIndCharts(focus,view);
-  lastDeskChartKey='';
-  requestAnimationFrame(()=>{
-    deskAutoFit();
-    lastDeskChartKey='';
-    drawDeskChart(view);
-    requestAnimationFrame(()=>{lastDeskChartKey='';drawDeskChart(view);});
-  });
+  })();
+  return deskHeavyInFlight;
 }
 
 async function renderDesk(data){

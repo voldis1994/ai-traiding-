@@ -19,6 +19,8 @@ CURRENCY_EXPONENT: dict[str, int] = {
 # Explicit LIVE realized forgeries (P07). Matching is case-insensitive.
 FORBIDDEN_LIVE_REALIZED_SOURCES = frozenset({
     'upl', 'upl_estimate', 'last_upl', 'open_upl',
+    # P0-06: legacy stamp for last open UPL — never LIVE realized cash.
+    'capital',
     'accounts.balance.profitloss', 'profitloss', 'balance_profitloss',
     'confirm.profit', 'confirm_profit', 'confirmation.profit',
     'mid_x_size', 'mid×size', 'midxsize', 'mid_proxy', 'price_size',
@@ -29,7 +31,8 @@ FORBIDDEN_LIVE_REALIZED_SOURCES = frozenset({
 })
 
 _CASH_SOURCES = frozenset({
-    'broker', 'funds', 'capital', 'live_funds_mirror', 'cash_ledger',
+    # P0-06: ``capital`` (last UPL) is NOT cash — see _ESTIMATE_SOURCES.
+    'broker', 'funds', 'live_funds_mirror', 'cash_ledger',
     'capital_funds', 'verified_funds',
     # Already-classified kind from pick_live_realized / classify_pnl_source.
     'cash',
@@ -44,7 +47,7 @@ _PROXY_SOURCES = frozenset({
 })
 _ESTIMATE_SOURCES = frozenset({
     'upl_estimate', 'estimate', 'diagnostic_estimate', 'fx_estimate',
-    'currency_estimate', 'scratch',
+    'currency_estimate', 'scratch', 'capital',  # legacy UPL stamp
 })
 _UNVERIFIED_SOURCES = frozenset({
     'unverified', 'legacy', 'legacy_broker', 'blank', 'none', 'null',

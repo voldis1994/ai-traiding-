@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 273
+DESK_TRUTH_REV = 274
 
 
 def _finite_num(v):
@@ -443,23 +443,21 @@ class RuntimeHub:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
             if val is not None and kind=='cash':
-                # Capital often journals broker £0 before Funds settles — hide
-                # from Desk until real £ arrives (no GAIDA / pending rows).
-                if abs(float(val))<1e-12:
-                    blank_n+=1
-                    pending_n+=1
-                else:
-                    cash_n+=1
-                    by_ccy.setdefault(ccy,[]).append(val)
+                # P0-08: verified broker £0.00 is SETTLED (scratch), not pending.
+                # Only blank/missing amounts stay pending — exact zero is cash.
+                cash_n+=1
+                by_ccy.setdefault(ccy,[]).append(val)
+                if not acct or ccy==acct:
+                    signed.append(val)
+                if _in_24h(t.get('closed')):
+                    cash_n_24h+=1
+                    by_ccy_24h.setdefault(ccy,[]).append(val)
                     if not acct or ccy==acct:
-                        signed.append(val)
-                    if _in_24h(t.get('closed')):
-                        cash_n_24h+=1
-                        by_ccy_24h.setdefault(ccy,[]).append(val)
-                        if not acct or ccy==acct:
-                            signed_24h.append(val)
-                    if len(recent)<80:
-                        recent.append({**row,'pnl_source':'broker'})
+                        signed_24h.append(val)
+                if abs(float(val))<1e-12:
+                    blank_n+=1  # settled-zero counter (still cash)
+                if len(recent)<80:
+                    recent.append({**row,'pnl_source':'broker'})
             elif kind=='pending':
                 # Track for harvest / estimate counters — never NESEN Funds cash.
                 pending_n+=1
@@ -2251,19 +2249,37 @@ class RuntimeHub:
             and not engine.store.unresolved() and len(engine.positions)<=1)
 
     async def _worker(self,rt: AccountRuntime):
-        """Heavy poll, then a guaranteed light window — never back-to-back poll.
+        """P0-03: light market ticks run independently of heavy poll.
 
-        Gating poll by wall clock alone starved the event loop when poll() took
-        longer than the gap (common): no sleep, no Desk HTTP, mid/UPL frozen.
-        Always run ~0.35–0.5s of 25ms quote/UPL/entry ticks after each poll (~2×).
+        Heavy poll (sync/AI/history) and light UPL/quote ticks are concurrent
+        tasks. Order mutations stay serialized on engine.lock inside poll /
+        quote_upl_tick / submit paths.
         """
+        heavy=asyncio.create_task(self._heavy_loop(rt),name=f'heavy-{rt.client_id}')
+        light=asyncio.create_task(self._light_loop(rt),name=f'light-{rt.client_id}')
+        try:
+            done,pending=await asyncio.wait(
+                {heavy,light},return_when=asyncio.FIRST_EXCEPTION)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                exc=t.exception()
+                if exc:
+                    raise exc
+        except asyncio.CancelledError:
+            heavy.cancel();light.cancel()
+            await asyncio.gather(heavy,light,return_exceptions=True)
+            raise
+
+    async def _heavy_loop(self,rt: AccountRuntime):
         error_count=0
         engine=rt.engine
         store=rt.store
         while True:
             try:
                 if engine.broker:
-                    if store.unresolved():await engine.reconcile_outstanding()
+                    if store.unresolved():
+                        await engine.reconcile_outstanding()
                     await engine.poll()
                     error_count=0
                     rt.last_error=None
@@ -2272,28 +2288,10 @@ class RuntimeHub:
                         engine._paused_for_read=False
                         engine.armed=True
                         engine.execution_enabled=True
-                        store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                    open_book=bool(engine.positions)
-                    fast_entry=(bool(engine.mandate) and not open_book
-                                and hasattr(engine,'quote_entry_tick')
-                                and engine._wants_fast_entry_ticks())
-                    # Guaranteed yield window so Admin/Desk HTTP can run.
-                    light_n=18 if (open_book or fast_entry) else 12
-                    gap=0.025
-                    for _ in range(light_n):
-                        await asyncio.sleep(gap)
-                        if not engine.mandate:
-                            continue
-                        try:
-                            if open_book and hasattr(engine,'quote_upl_tick'):
-                                await engine.quote_upl_tick()
-                            else:
-                                if hasattr(engine,'_apply_stream_quote'):
-                                    engine._apply_stream_quote()
-                                if fast_entry:
-                                    await engine.quote_entry_tick()
-                        except Exception:
-                            break
+                        store.event('recovery',
+                            'Read-only broker outage recovered; autonomous execution resumed')
+                    # Yield so light loop + Desk HTTP get the event loop.
+                    await asyncio.sleep(0.05)
                     continue
                 await asyncio.sleep(0.5 if error_count<3 else 3)
             except asyncio.CancelledError:
@@ -2303,7 +2301,8 @@ class RuntimeHub:
                 engine.last_error=rt.last_error
                 error_count+=1
                 frames=traceback.extract_tb(exc.__traceback__)
-                local=next((f for f in reversed(frames) if '/app/' in f.filename.replace('\\','/')),
+                local=next((f for f in reversed(frames)
+                            if '/app/' in f.filename.replace('\\','/')),
                            frames[-1] if frames else None)
                 try:
                     store.event('error','Broker/engine cycle error',{
@@ -2314,10 +2313,34 @@ class RuntimeHub:
                 except Exception:
                     pass
                 if error_count>=3:
-                    # Log only — never auto-pause (operator Pause is the only freeze).
                     store.event('warning',
                         'Repeated broker/engine errors; keeping execution live',
                         {'count':error_count,'client_id':rt.client_id})
                     if hasattr(engine,'_ensure_live_unless_operator_paused'):
                         engine._ensure_live_unless_operator_paused()
                 await asyncio.sleep(0.5 if error_count<3 else 3)
+
+    async def _light_loop(self,rt: AccountRuntime):
+        """Independent quote/UPL/entry ticks — never waits for heavy poll to finish."""
+        engine=rt.engine
+        while True:
+            try:
+                await asyncio.sleep(0.05)
+                if not engine.broker or not engine.mandate:
+                    continue
+                open_book=bool(engine.positions)
+                fast_entry=(not open_book
+                            and hasattr(engine,'quote_entry_tick')
+                            and engine._wants_fast_entry_ticks())
+                try:
+                    if open_book and hasattr(engine,'quote_upl_tick'):
+                        await engine.quote_upl_tick()
+                    else:
+                        if hasattr(engine,'_apply_stream_quote'):
+                            engine._apply_stream_quote()
+                        if fast_entry:
+                            await engine.quote_entry_tick()
+                except Exception:
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                raise

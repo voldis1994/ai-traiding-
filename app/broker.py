@@ -1,11 +1,15 @@
 """Capital.com LIVE REST broker adapter, modelled on https://open-api.capital.com/.
 Never automatically retry non-idempotent requests. Credentials stay in RAM.
+
+Audit rebuild: all HTTP goes through CapitalRestManager (rate budget, 429,
+single-flight 401 relogin). Orders are never blindly retried.
 """
-import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import quote
 import httpx
+
+from .capital_rest import manager_for
 
 LIVE='https://api-capital.backend-capital.com'
 DEMO='https://demo-api-capital.backend-capital.com'
@@ -47,28 +51,54 @@ class CapitalBroker:
         self.base=LIVE if live else DEMO
         self.client=client or httpx.AsyncClient(base_url=self.base, timeout=15.0, follow_redirects=False)
         self.cst=None;self.security=None
-        self._relogin=asyncio.Lock()
+        # Identity = API key + login — shared budget across this session.
+        self._rest=manager_for(f'{api_key}:{identifier}')
 
-    async def connect(self):
-        # Non-encrypted password is sent over HTTPS per broker session API.
+    async def _connect_raw(self):
+        """Session POST only — manager owns rate slot + generation bump."""
         response=await self.client.post('/api/v1/session',headers={'X-CAP-API-KEY':self.api_key},
             json={'identifier':self.identifier,'password':self.password,'encryptedPassword':False})
+        self._rest.note_status(response.status_code)
         response.raise_for_status()
         self.cst=response.headers.get('CST');self.security=response.headers.get('X-SECURITY-TOKEN')
         if not self.cst or not self.security:raise RuntimeError('Broker session tokens missing')
-        return response.json()
+        self._last_session_body=response.json()
+        return self._last_session_body
+
+    async def connect(self):
+        # Public entry: single-flight so parallel callers share one POST /session.
+        await self._rest.single_flight_relogin(self._connect_raw)
+        return getattr(self,'_last_session_body',None) or {}
 
     def headers(self):
         if not self.cst or not self.security:raise RuntimeError('Not authenticated')
         return {'CST':self.cst,'X-SECURITY-TOKEN':self.security,'X-CAP-API-KEY':self.api_key}
 
     async def _request(self,method,path,*,params=None,json=None):
-        response=await self.client.request(method,path,headers=self.headers(),params=params,json=json)
-        # Relogin only for reads. Retrying an order on network error is not safe.
-        if response.status_code==401 and method=='GET':
-            async with self._relogin:
-                await self.connect()
-            response=await self.client.request(method,path,headers=self.headers(),params=params,json=json)
+        method_u=str(method or 'GET').upper()
+        coalesce=None
+        if method_u=='GET':
+            coalesce=f'{path}?{sorted((params or {}).items())}'
+
+        async def do_once():
+            return await self.client.request(
+                method_u,path,headers=self.headers(),params=params,json=json)
+
+        # Capture generation before send for single-flight 401 handling.
+        gen_before=self._rest.token_generation
+
+        async def do_request():
+            response=await do_once()
+            # Relogin only for reads. Retrying an order on network error is not safe.
+            if response.status_code==401 and method_u=='GET':
+                await self._rest.single_flight_relogin(
+                    self._connect_raw, observed_generation=gen_before)
+                response=await do_once()
+            return response
+
+        response=await self._rest.request(
+            method_u,path,do_request=do_request,coalesce_key=coalesce,
+            allow_retry_get=(method_u=='GET'))
         response.raise_for_status()
         return response.json()
 
@@ -150,3 +180,6 @@ class CapitalBroker:
                 pass
         self.cst=None;self.security=None
         await self.client.aclose()
+
+    def rest_metrics(self):
+        return self._rest.snapshot_metrics()

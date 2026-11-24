@@ -48,11 +48,19 @@ export type LiveDeskSnapshot = {
   whales: Array<{ side: "BUY" | "SELL"; price: string; value: string; ago: string }>;
   watchlist: Array<{ symbol: string; price: string; change: number; spark: number[] }>;
   funding: Array<{ symbol: string; rate: string }>;
-  crowd: { longPct: number; shortPct: number };
-  fear: { value: number; label: string };
+  crowd: { longPct: number | null; shortPct: number | null; unavailable?: boolean };
+  fear: { value: number | null; label: string; unavailable?: boolean };
   signals: Array<{ symbol: string; agree: number; side: "SHORT" | "LONG" | "HOLD" }>;
-  rsi: number;
-  macd: number;
+  rsi: number | null;
+  macd: number | null;
+  dataQuality?: {
+    syntheticMarked?: boolean;
+    funding?: string;
+    crowd?: string;
+    fear?: string;
+    rsi?: string;
+    macd?: string;
+  };
   robotOn: boolean;
   clientLabel: string;
 };
@@ -181,11 +189,19 @@ export function emptyLive(message: string, auth = false): LiveDeskSnapshot {
     whales: [],
     watchlist: [],
     funding: [],
-    crowd: { longPct: 50, shortPct: 50 },
-    fear: { value: 50, label: "Neutral" },
+    crowd: { longPct: null, shortPct: null, unavailable: true },
+    fear: { value: null, label: "N/A", unavailable: true },
     signals: [],
-    rsi: 50,
-    macd: 0,
+    rsi: null,
+    macd: null,
+    dataQuality: {
+      syntheticMarked: true,
+      funding: "unavailable",
+      crowd: "unavailable",
+      fear: "unavailable",
+      rsi: "unavailable",
+      macd: "unavailable",
+    },
     robotOn: false,
     clientLabel: "",
   };
@@ -294,16 +310,28 @@ export async function fetchLiveDesk(): Promise<LiveDeskSnapshot> {
 
     const results = ((focus && focus.results) as Record<string, unknown>) || {};
     const recent = (results.recent_trades as Array<Record<string, unknown>>) || [];
-    const whales = recent.slice(0, 8).map((t, i) => {
+    // P1-17: closed trades are Capital journal rows — show real pnl/currency/time.
+    // Never invent "$" labels, abs() sign wipe, or fake "Ns ago" cadence.
+    const whales = recent.slice(0, 8).map((t) => {
       const dir = String(t.direction || t.side || "SELL").toUpperCase();
       const sideW: "BUY" | "SELL" = dir.includes("BUY") || dir === "LONG" ? "BUY" : "SELL";
-      const px = Number(t.close ?? t.price ?? t.level ?? mid);
-      const pnl = Number(t.pnl ?? t.profit ?? 0);
+      const px = Number(t.close ?? t.exit ?? t.price ?? t.level ?? mid);
+      const pnl = Number(t.pnl ?? t.profit);
+      const ccy = String(t.pnl_currency || t.currency || "").toUpperCase();
+      const src = String(t.pnl_source || "");
+      const closed = String(t.closed || t.at || "");
+      let value = "N/A";
+      if (Number.isFinite(pnl) && (src === "broker" || src === "funds" || src === "cash_ledger")) {
+        const sym = ccy === "GBP" ? "£" : ccy === "EUR" ? "€" : ccy === "USD" ? "$" : ccy ? `${ccy} ` : "";
+        value = `${sym}${pnl.toFixed(2)}`;
+      } else if (Number.isFinite(pnl)) {
+        value = `EST ${pnl.toFixed(2)}`;
+      }
       return {
         side: sideW,
         price: Number.isFinite(px) ? fmtPrice(px, 1) : "—",
-        value: Number.isFinite(pnl) ? `$${Math.abs(pnl).toFixed(0)}` : "—",
-        ago: `${(i + 1) * 17}s ago`,
+        value,
+        ago: closed ? closed.slice(11, 19) || closed : "N/A",
       };
     });
 
@@ -360,34 +388,31 @@ export async function fetchLiveDesk(): Promise<LiveDeskSnapshot> {
     }
 
     const mtf = (activity.mtf_momentum as Record<string, unknown>) || {};
+    // P1-17: only show Capital/engine fields that exist; invent nothing as LIVE.
+    const hasMtf = Object.keys(mtf).length > 0;
     const metrics = [
-      { k: "TREND STRUCTURE", v: side === "SHORT" ? "BEAR" : side === "LONG" ? "BULL" : "NEUT" },
-      { k: "TREND PERSISTENCE", v: hold > 0.45 ? "NEUT" : side === "SHORT" ? "BEAR" : "BULL" },
-      { k: "MOMENTUM", v: Number(mtf["5"] ?? mtf.m5) < 0 ? "BEAR" : "BULL" },
-      { k: "MOMENTUM PERSIST", v: Number(mtf["15"] ?? mtf.m15) < 0 ? "BEAR" : "BULL" },
-      { k: "FLOW 1M", v: Number(mtf["1"] ?? mtf.m1) < 0 ? "BEAR" : "BULL" },
-      { k: "FLOW CONFIRM", v: side === "HOLD" ? "NEUT" : side === "SHORT" ? "BEAR" : "BULL" },
-      { k: "BOOK BALANCE", v: "NEUT" },
-      { k: "LIQUIDITY QUALITY", v: "NEUT" },
-      { k: "FUNDING / OI", v: side === "SHORT" ? "BEAR" : "BULL" },
-      { k: "OI / CROWD", v: side === "SHORT" ? "BEAR" : "BULL" },
+      { k: "AI SIDE", v: side === "SHORT" ? "BEAR" : side === "LONG" ? "BULL" : "NEUT" },
+      {
+        k: "MTF 5M",
+        v: hasMtf ? (Number(mtf["5"] ?? mtf.m5) < 0 ? "BEAR" : "BULL") : "N/A",
+      },
+      {
+        k: "MTF 15M",
+        v: hasMtf ? (Number(mtf["15"] ?? mtf.m15) < 0 ? "BEAR" : "BULL") : "N/A",
+      },
+      {
+        k: "MTF 1M",
+        v: hasMtf ? (Number(mtf["1"] ?? mtf.m1) < 0 ? "BEAR" : "BULL") : "N/A",
+      },
+      { k: "FUNDING / OI", v: "N/A" },
+      { k: "OI / CROWD", v: "N/A" },
+      { k: "BOOK BALANCE", v: "N/A" },
+      { k: "LIQUIDITY QUALITY", v: "N/A" },
     ];
 
-    const rb = (activity.returns_bps as Record<string, number>) || {};
-    const r1 = Number(rb["1"] ?? rb["1m"] ?? 0);
-    const rsi = Math.round(Math.max(5, Math.min(95, 50 + r1 / 2)));
-    const macd = Number(rb["15"] ?? rb["15m"] ?? r1) / 10;
-
-    const longPct = Math.round(Math.max(5, Math.min(95, 50 + (buy - sell) * 40)));
-    const fear = Math.round(
-      Math.max(0, Math.min(100, hold * 100 * 0.85 + (act === "HOLD" ? 12 : 0) - Math.abs(buy - sell) * 42)),
-    );
-    let fearLabel = "Neutral";
-    if (fear <= 20) fearLabel = "Extreme Fear";
-    else if (fear <= 40) fearLabel = "Fear";
-    else if (fear <= 60) fearLabel = "Neutral";
-    else if (fear <= 80) fearLabel = "Greed";
-    else fearLabel = "Extreme Greed";
+    // No Capital RSI/MACD/funding/fear feed — mark N/A (do not synthesize).
+    const rsi: number | null = null;
+    const macd: number | null = null;
 
     return {
       ok: true,
@@ -406,7 +431,7 @@ export async function fetchLiveDesk(): Promise<LiveDeskSnapshot> {
         regime: side === "SHORT" ? "BEAR REGIME" : side === "LONG" ? "BULL REGIME" : "HOLD REGIME",
         ring,
         strength: Math.max(strength, ring),
-        coverage: Math.min(99, 70 + Math.round(candles.length / 4)),
+        coverage: candles.length > 0 ? Math.min(99, candles.length) : 0,
         scorePos,
         metrics,
       },
@@ -416,10 +441,10 @@ export async function fetchLiveDesk(): Promise<LiveDeskSnapshot> {
       watchlist,
       funding: watchlist.slice(0, 5).map((w) => ({
         symbol: w.symbol.split(/[./]/)[0].slice(0, 6),
-        rate: `${w.change >= 0 ? "+" : ""}${(w.change * 0.01).toFixed(4)}%`,
+        rate: "N/A",
       })),
-      crowd: { longPct, shortPct: 100 - longPct },
-      fear: { value: fear, label: fearLabel },
+      crowd: { longPct: null, shortPct: null, unavailable: true },
+      fear: { value: null, label: "N/A", unavailable: true },
       signals: watchlist.slice(0, 4).map((w) => ({
         symbol: w.symbol.split(/[./]/)[0].slice(0, 6),
         agree: ring,
@@ -427,6 +452,14 @@ export async function fetchLiveDesk(): Promise<LiveDeskSnapshot> {
       })),
       rsi,
       macd,
+      dataQuality: {
+        syntheticMarked: true,
+        funding: "unavailable",
+        crowd: "unavailable",
+        fear: "unavailable",
+        rsi: "unavailable",
+        macd: "unavailable",
+      },
       robotOn: Boolean(focus && focus.robot_running),
       clientLabel: focus
         ? `#${focus.id} ${String(focus.display_name || focus.username || "")}`

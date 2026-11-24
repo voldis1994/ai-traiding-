@@ -2204,9 +2204,9 @@ class RuntimeHub:
                         fast_entry=(not open_book
                                     and hasattr(engine,'quote_entry_tick')
                                     and engine._wants_fast_entry_ticks())
-                        # ~1s of 250ms ticks after each poll → live feel.
-                        bursts=4 if (open_book or fast_entry) else 3
-                        gap=0.25
+                        # ~0.6–0.8s of 100ms ticks after each poll.
+                        bursts=8 if (open_book or fast_entry) else 6
+                        gap=0.10
                         for _ in range(bursts):
                             await asyncio.sleep(gap)
                             try:
@@ -2220,7 +2220,7 @@ class RuntimeHub:
                             except Exception:
                                 break
                         continue
-                await asyncio.sleep(1.0 if error_count<3 else 5)
+                await asyncio.sleep(0.5 if error_count<3 else 3)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2245,4 +2245,4 @@ class RuntimeHub:
                         {'count':error_count,'client_id':rt.client_id})
                     if hasattr(engine,'_ensure_live_unless_operator_paused'):
                         engine._ensure_live_unless_operator_paused()
-                await asyncio.sleep(1.0 if error_count<3 else 5)
+                await asyncio.sleep(0.5 if error_count<3 else 3)

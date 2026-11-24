@@ -2384,16 +2384,22 @@ class SingleTradeEngine:
                     self.fusion_block_reason=None
                     # Remember live (or carried) EXTERNAL so a lagging feed
                     # cannot freeze the next M1 OPEN while the move finishes.
+                    # V3 D08: stamp last-good with observed_at — never refresh age on re-read.
+                    from .market_fusion import stamp_last_good
                     odim=self.brain.ohlc_dim
+                    stamp_now=clock()
                     tail=fusion_liquidity_tail(fused,ohlc_dim=odim)
                     if tail is not None:
-                        self._last_good_liquidity=tail
+                        self._last_good_liquidity=stamp_last_good(
+                            tail,source='liquidity',now=stamp_now)
                     peers=fusion_peers_tail(fused,ohlc_dim=odim)
                     if peers is not None:
-                        self._last_good_peers=peers
+                        self._last_good_peers=stamp_last_good(
+                            peers,source='peers',now=stamp_now)
                     news=fusion_news_tail(fused,ohlc_dim=odim)
                     if news is not None:
-                        self._last_good_news=news
+                        self._last_good_news=stamp_last_good(
+                            news,source='news',now=stamp_now)
                 else:
                     # Name the EXTERNAL source that blocks a new fused decision.
                     self.fusion_block_reason=fusion_gap_reason(

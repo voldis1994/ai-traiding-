@@ -168,15 +168,25 @@ def test_t03_m5_aggregation_complete_vs_gap():
     assert resample_m1_ohlc(gapped, 5) == []
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason='V3 pending: market_fusion last-good TTL expiry / REQUIRED HOLD not exposed')
 def test_t04_last_good_ttl_expiry():
     """T04: last-good external source past TTL → REQUIRED HOLD; no timestamp refresh."""
+    from datetime import datetime, timezone, timedelta
     from app import market_fusion
-    # Spec requires configured TTL on last-good carry-forward. Current fusion
-    # accepts peers/news/liquidity fallbacks without an expiry clock.
-    assert hasattr(market_fusion, 'last_good_ttl_expired')  # noqa: B101 — pending API
+
+    now = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+    fresh = market_fusion.stamp_last_good(
+        [0.1] * 6, source='peers', now=now - timedelta(seconds=30), max_age=120)
+    assert market_fusion.last_good_ttl_expired(fresh, now=now, source='peers') is False
+    assert market_fusion.last_good_values(fresh, now=now, source='peers') is not None
+
+    stale = market_fusion.stamp_last_good(
+        [0.1] * 6, source='peers', now=now - timedelta(seconds=200), max_age=120)
+    assert market_fusion.last_good_ttl_expired(stale, now=now, source='peers') is True
+    assert market_fusion.last_good_values(stale, now=now, source='peers') is None
+    # Legacy bare list has no provenance → expired (must re-observe).
+    assert market_fusion.last_good_ttl_expired([0.1] * 6, now=now) is True
+    # Re-read must not refresh observed_at.
+    assert stale['observed_at'] == (now - timedelta(seconds=200)).isoformat()
 
 
 # --- T05–T08: zones & scenarios ----------------------------------------------

@@ -18,7 +18,8 @@ Tur ir:
 
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
 Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`  
-**Pilnā sistēmas karte (full map):** [`SISTEMAS_ARHITEKTURA_LV.md`](SISTEMAS_ARHITEKTURA_LV.md)
+**Pilnā sistēmas karte (full map):** [`SISTEMAS_ARHITEKTURA_LV.md`](SISTEMAS_ARHITEKTURA_LV.md)  
+**V3.0 sistēmas līgums (mērķa ieviešana):** [`docs/v3/`](docs/v3/) — PDF + statuss `IMPLEMENTATION_STATUS.md`
 
 ## Portāli (stabilie ceļi)
 

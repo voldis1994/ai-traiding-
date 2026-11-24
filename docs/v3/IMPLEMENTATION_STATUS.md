@@ -28,7 +28,7 @@ Snapshot for P0 modules + acceptance coverage (T01–T39). Engine / runtime_hub 
 | T01 | Gap → HOLD_DATA / no synthetic | **PASS** | `market_features` unready + `features=None` |
 | T02 | Forming bar ≠ mutate context | **PASS** | `market_features` + `drop_forming_minute` |
 | T03 | M5 aggregation complete vs gap | **PASS** | `resample_m1_ohlc` |
-| T04 | Last-good TTL expiry | **XFAIL** | Fusion carry-forward has no TTL clock API yet |
+| T04 | Last-good TTL expiry | **PASS** | `stamp_last_good` / `last_good_ttl_expired` |
 | T05 | Zone invalidation | **PASS** | `zone_invalidation_status` / `_pick_best_zone` |
 | T06 | Zone AND confirm | **PASS** | `zone_confirm_allows` |
 | T07 | Scenario tags (regimes) | **PASS** | Fixtures + `classify` / `open_meta_from_scenario` |
@@ -65,17 +65,21 @@ Snapshot for P0 modules + acceptance coverage (T01–T39). Engine / runtime_hub 
 | T38 | Forbidden LIVE sources | **PASS** | |
 | T39 | Consumer snapshot / outbox | **PASS** | |
 
-**Suite run (fixture):** `42 passed, 2 xfailed` for  
-`tests/test_v3_acceptance_t01_t27.py` + `tests/test_v3_funds_t28_t39.py` + `tests/test_v3_engine_contract.py`.
+**Suite run (fixture):** `56+ passed, 1 xfailed (T14)` for V3 suites + related.
 
-## Remaining gaps
+## Remaining gaps (honest)
 
-- **T04** — expose last-good TTL on fusion REQUIRED/OPTIONAL feeds.
 - **T14** — re-validate neto RR at pending fill; cancel without rewriting absolute SL/TP.
 - **T16 / T22 / T23 / T25 / T26** — DEMO / crash / validation / full-cycle harnesses.
-- **P16** live DEMO Funds statement verification — **NOT RUN**.
-- Engine consumers still partially on legacy PnL paths (P17).
+- **P16** live DEMO Funds statement verification — **NOT RUN** (no Capital credentials in this environment).
+- Full Capital `ingest_funds_row` on every transactions poll — partially wired via `realized_cash` helpers; continuous ledger rebuild (P15) needs DEMO verification.
+- Soft-nudge modules still compute diagnostics; LIVE action uses `scores_raw` (L01).
 
-## Engine wiring (later)
+## Release gate (nodaļa 23/30)
 
-Call `ingest_funds_row` / `append_event` from the Capital transactions adapter; resolve LIVE teach via `deal_realized` + `may_teach_live_cash`; replace Desk sums with `consumer_snapshot` / `sum_account`.
+| Kritērijs | Statuss |
+|-----------|---------|
+| P0 structural contract in code | Mostly DONE |
+| T01–T39 offline fixtures | T14 XFAIL; T16/T22/T23/T25/T26 PENDING |
+| DEMO Capital Funds reconcile | **NOT RUN** |
+| LIVE activation | **BLOCKED** until DEMO + remaining harnesses |

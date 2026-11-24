@@ -45,6 +45,10 @@ def _ready_engine(d, store, brain, *, ask):
 def test_entry_evaluation_holds_until_confirmed_buy_zone():
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
+        # Soft mode: keep neural BUY + soft_notes when far from zone.
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'playbook_hard_entry': 0},
+                reason='test_soft')
         rows, _ = _seed_demand(store, confirm=True)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
@@ -94,12 +98,42 @@ def test_entry_evaluation_holds_until_confirmed_buy_zone():
                    for n in (out.get('soft_notes') or [zone.get('reason')]))
 
 
+def test_entry_evaluation_playbook_hard_bans_outside_zone():
+    """Playbook hard ENTRY flips neural BUY → HOLD when outside Demand."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        rows, _ = _seed_demand(store, confirm=True)
+        zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
+        buy = zones['buy_entry']
+        far = float(buy['hi']) + 8.0
+        e = _ready_engine(d, store, brain, ask=far)
+        e.last_signal = {
+            'action': 'BUY',
+            'scores': {'BUY': 0.80, 'SELL': 0.10, 'HOLD': 0.10},
+            'confidence': 0.80,
+        }
+        with patch.object(
+                e, '_mtf_momentum_analysis',
+                return_value={
+                    'ready': True, 'enabled': True, 'mode': 'BUY',
+                    'preferred': 'BUY', 'confidence': 0.7, 'move_ok': True,
+                    'tf': {'m1': {'atr14': 1.0}},
+                }):
+            out = e._entry_evaluation()
+        assert out.get('action') == 'HOLD'
+        assert out.get('playbook_hard_ban') is True
+        assert 'wait' in str(out.get('reason') or '').lower()
+
+
 def test_submit_soft_note_when_outside_entry_zone():
-    """Outside zona is a soft note — neural OPEN is not banned by zone hardcode."""
+    """Outside zona is a soft note only when playbook_hard_entry=0."""
     import asyncio
 
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'playbook_hard_entry': 0},
+                reason='test_soft')
         rows, _ = _seed_demand(store, confirm=True)
         zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
         buy = zones['buy_entry']
@@ -144,6 +178,61 @@ def test_submit_soft_note_when_outside_entry_zone():
         assert soft
         reason = (e.last_entry_reason or '').lower()
         assert 'wait_entry_zone' not in reason
+
+
+def test_submit_playbook_hard_bans_outside_zone():
+    """Playbook hard: submit refuses OPEN outside Demand (no soft chase)."""
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        rows, _ = _seed_demand(store, confirm=True)
+        zones = ohlc_entry_zones.compute_entry_zones(rows, tick=0.1, spread=0.2)
+        buy = zones['buy_entry']
+        far = float(buy['hi']) + 5.0
+        e = _ready_engine(d, store, brain, ask=far)
+        e.armed = True
+        e.execution_enabled = True
+        e.positions = []
+        e.pending_order = False
+        e.pending_close = False
+        e.last_closed_step = 10
+        e.last_entry_reason = None
+
+        async def _fake_sync():
+            return None
+
+        async def _run():
+            with patch.object(e, 'sync', new=_fake_sync):
+                with patch.object(
+                        e, '_external_entry_check',
+                        return_value={'entry_allowed': True}):
+                    with patch.object(
+                            e, 'live_open_gates',
+                            return_value={'allowed': True}):
+                        with patch.object(e, '_fusion_entry_blocked',
+                                         return_value=False):
+                            with patch.object(e, '_tick', return_value=0.1):
+                                with patch.object(
+                                        e, '_min_distance', return_value=0.5):
+                                    with patch(
+                                            'app.playbook_entry.session_allows_open',
+                                            return_value={
+                                                'allowed': True,
+                                                'reason': 'session_ok'}):
+                                        await e.submit(
+                                            'BUY',
+                                            broker_market={
+                                                'snapshot': {
+                                                    'marketStatus': 'TRADEABLE'},
+                                                'dealingRules': {},
+                                            })
+
+        asyncio.run(_run())
+        hard = [ev for ev in store.recent()
+                if 'playbook hard' in (ev.get('message') or '').lower()]
+        assert hard
+        assert 'wait' in (e.last_entry_reason or '').lower()
 
 
 def test_require_swing_still_on_decide_path():

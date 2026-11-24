@@ -233,10 +233,22 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
     candidates = []
     reason = 'regime'
 
+    # Playbook SL helpers: break-candle extreme, HL/LH tags, sweep wick.
+    try:
+        from . import playbook_entry as _pb
+        break_ext = _pb.break_candle_extreme(action, path)
+        hl_anchor = _pb.tagged_hl_lh_anchor(action, path)
+        sweep_ext = _pb.sweep_wick_extreme(action, path, lookback=6)
+    except Exception:
+        break_ext = hl_anchor = sweep_ext = None
+
     # ----- SL + TP candidate pool per regime (all candidates = real OHLC) -----
     if trig == 'break' or name in ('BREAKOUT_UP', 'BREAKOUT_DOWN'):
         if action == 'BUY':
-            br = r_hi
+            # Prefer break-candle low, then broken level / range edge.
+            br = break_ext
+            if br is None:
+                br = r_hi
             if br is None and isinstance(supply, dict):
                 br = _finite(supply.get('lo'))
             if br is None and highs:
@@ -252,7 +264,9 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             candidates.extend(swings)
             reason = 'breakout_buy'
         else:
-            br = r_lo
+            br = break_ext
+            if br is None:
+                br = r_lo
             if br is None and isinstance(demand, dict):
                 br = _finite(demand.get('hi'))
             if br is None and lows:
@@ -338,7 +352,11 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
 
     elif name == 'FAKEOUT':
         if action == 'BUY':
+            # SL behind deepest sweep — min(range.lo, recent wick).
             edge = r_lo
+            if sweep_ext is not None:
+                edge = (min(float(edge), float(sweep_ext))
+                        if edge is not None else float(sweep_ext))
             if edge is None and lows:
                 edge = float(min(lows, key=lambda s: float(s['price']))['price'])
             if edge is not None:
@@ -349,6 +367,9 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             reason = 'fakeout_fade_buy'
         else:
             edge = r_hi
+            if sweep_ext is not None:
+                edge = (max(float(edge), float(sweep_ext))
+                        if edge is not None else float(sweep_ext))
             if edge is None and highs:
                 edge = float(max(highs, key=lambda s: float(s['price']))['price'])
             if edge is not None:
@@ -359,9 +380,12 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
             reason = 'fakeout_fade_sell'
 
     else:
-        # TREND / zone pullback — SL behind HL/LH zone; TP prior HH/LL + next.
+        # TREND / zone pullback — SL behind HL/LH tag, then zone, then swing.
         box = demand if action == 'BUY' else supply
-        stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
+        if hl_anchor is not None:
+            stop = _ohlc_stop(action, hl_anchor, entry=entry_f, buffer=buffer)
+        if stop is None:
+            stop = _sl_behind_box(action, entry_f, box, buffer=buffer, floor=floor)
         zone_sl = stop is not None
         if stop is None:
             if action == 'BUY' and lows:

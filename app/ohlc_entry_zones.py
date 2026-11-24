@@ -4,7 +4,8 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger needs price in zone + rejection OR micro structure change (V5 Z04/T06)
+  • Zone trigger needs price in zone + rejection AND micro structure (playbook hard)
+    — soft OR remains when ``playbook_hard_entry=0`` / ``playbook_zone_confirm_and=0``
   • Invalidated zones (close through) are never selected (V3 Z03)
 
 Also: break trigger (structure/range break + M1 tape) when not waiting pullback.
@@ -552,7 +553,7 @@ def _candle_interacted_zone(bar, zone, *, buffer=0.0):
 
 
 def rejection_candle(action, candles, zone, *, tick=0.01):
-    """1m confirmation: pin / engulf rejecting the zone (guide step 3)."""
+    """1m confirmation: pin / engulf / impulse rejecting the zone (guide step 3)."""
     action = (action or '').upper()
     rows = list(candles or [])
     out = {'ok': False, 'reason': 'no_bar', 'kind': None}
@@ -574,6 +575,17 @@ def rejection_candle(action, candles, zone, *, tick=0.01):
     body = abs(c - o)
     upper = h - max(o, c)
     lower = min(o, c) - l
+    # Impulse leave-zone (playbook "spēcīga impulsa svece").
+    try:
+        from . import playbook_entry as _pb
+        imp = _pb.impulse_from_level(action, rows, zone, tick=tick_f)
+        if imp.get('ok'):
+            out['ok'] = True
+            out['kind'] = imp.get('kind')
+            out['reason'] = imp.get('kind')
+            return out
+    except Exception:
+        pass
     if action == 'BUY':
         # Bullish pin: long lower wick, close in upper half.
         pin = lower >= 0.45 * span and c >= (l + 0.55 * span) and lower >= 1.2 * max(body, tick_f)
@@ -653,11 +665,12 @@ def micro_structure_confirm(action, candles, zone, *, tick=0.01):
     return out
 
 
-def zone_confirm_allows(action, *, candles, zone, tick=0.01):
-    """Zone OPEN needs rejection candle OR micro structure change (V5 Z04/T06).
+def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
+                        require_both=None):
+    """Zone OPEN confirm — playbook AND (rejection + structure) by default.
 
-    Rejection and microstructure stay as separate evidence; no universal AND
-    filter. Invalidated zones are never confirmed (Z03).
+    Soft OR when ``playbook_hard_entry=0`` / ``playbook_zone_confirm_and=0``.
+    Invalidated zones are never confirmed (Z03).
     """
     # Never confirm an already-invalidated zone (Z03).
     if isinstance(zone, dict) and (
@@ -679,15 +692,37 @@ def zone_confirm_allows(action, *, candles, zone, tick=0.01):
         }
     rej = rejection_candle(action, candles, zone, tick=tick)
     st = micro_structure_confirm(action, candles, zone, tick=tick)
-    ok = bool(rej.get('ok') or st.get('ok'))
+    and_mode = require_both
+    if and_mode is None:
+        try:
+            from . import playbook_entry as _pb
+            and_mode = _pb.zone_confirm_require_both(store)
+        except Exception:
+            and_mode = True
+    if and_mode:
+        ok = bool(rej.get('ok') and st.get('ok'))
+        if ok:
+            reason = (
+                'rejection+' + str(rej.get('kind'))
+                + '+structure+' + str(st.get('reason') or 'ok'))
+        elif not rej.get('ok') and not st.get('ok'):
+            reason = 'wait_zone_confirm'
+        elif not rej.get('ok'):
+            reason = 'wait_rejection (' + str(st.get('reason') or 'structure_ok') + ')'
+        else:
+            reason = 'wait_structure (' + str(rej.get('kind') or 'rejection_ok') + ')'
+    else:
+        ok = bool(rej.get('ok') or st.get('ok'))
+        reason = (
+            'rejection+' + str(rej.get('kind')) if rej.get('ok')
+            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
+        )
     return {
         'ok': ok,
         'rejection': rej,
         'structure': st,
-        'reason': (
-            'rejection+' + str(rej.get('kind')) if rej.get('ok')
-            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
-        ),
+        'require_both': bool(and_mode),
+        'reason': reason,
     }
 
 
@@ -990,7 +1025,8 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         else:
             meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
         return meta
-    confirm=zone_confirm_allows(action,candles=candles,zone=zone,tick=tick)
+    confirm=zone_confirm_allows(
+        action,candles=candles,zone=zone,tick=tick,store=store)
     meta['confirm']=confirm
     if confirm.get('ok'):
         sc_ok=ohlc_scenarios.scenario_allows_trigger(
@@ -1003,5 +1039,5 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         meta['trigger']='zone'
         meta['reason']='ohlc_entry_zone_confirm'
         return meta
-    meta['reason']=f"wait_zone_confirm ({confirm.get('reason') or 'rejection_or_structure'})"
+    meta['reason']=f"wait_zone_confirm ({confirm.get('reason') or 'rejection_and_structure'})"
     return meta

@@ -57,7 +57,8 @@ export type LiveDeskSnapshot = {
   clientLabel: string;
 };
 
-const POLL_MS = 2500;
+/** Match Admin Desk — sub-second feel vs phone live quotes. */
+const POLL_MS = 800;
 
 async function api<T>(path: string): Promise<T> {
   const r = await fetch(path, { credentials: "include", headers: { Accept: "application/json" } });

@@ -2757,7 +2757,8 @@ class SingleTradeEngine:
         only — they never gate LIVE OPEN (V5 R02 / #270).
         """
         readiness=self.brain.trading_readiness() if hasattr(self.brain,'trading_readiness') else {'ready':False,'reason':'No readiness API'}
-        if not readiness.get('ready'):
+        open_ok=bool(readiness.get('ready') or readiness.get('cold_start_open'))
+        if not open_ok:
             return {'allowed':False,'reason':readiness.get('reason') or 'Model prep/eval not ready',
                     'readiness':readiness,'economic_utility':None,'hard_risk':None}
         # Hard-risk limits are informational only — they never gate LIVE OPEN.
@@ -2765,7 +2766,10 @@ class SingleTradeEngine:
         if action is not None and action not in ('BUY','SELL'):
             return {'allowed':False,'reason':'No directional action','readiness':readiness,
                     'economic_utility':None,'hard_risk':hr}
-        return {'allowed':True,'reason':'Readiness passed — utility checked in evaluate_neural_entry',
+        why=('Prep/eval PASSED — utility checked in evaluate_neural_entry'
+             if readiness.get('ready') else
+             'Cold-start OPEN permitted — prep not PASSED; live £ teaches')
+        return {'allowed':True,'reason':why,
                 'readiness':readiness,'economic_utility':None,'hard_risk':hr}
 
     def _entry_evaluation(self):

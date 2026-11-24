@@ -98,10 +98,12 @@ def test_forecast_hold_does_not_suppress_trade():
 def test_maybe_refit_and_shadow():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 't.sqlite3')
-        _seed_resolved(store, n=30, dim=6)
+        # Floor raised to 40 resolved rows before LIVE soft nudge / refit.
+        _seed_resolved(store, n=45, dim=6)
         out = forecast_bridge.maybe_refit_and_advise(
             store, epic='GOLD', features=[0.1] * 6,
             neural_scores={'BUY': 0.4, 'SELL': 0.3, 'HOLD': 0.3})
-        assert out['resolved'] >= 30
+        assert out['resolved'] >= 40
         assert out['refit'] and out['refit'].get('fitted')
         assert out['shadow'] is not None
+        assert out['shadow'].get('horizons')

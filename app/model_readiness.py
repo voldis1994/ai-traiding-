@@ -430,12 +430,11 @@ def run_prep_eval(store, brain, candles, *, tick_size=0.01, spread_fallback=0.0)
 
 
 def grant_cold_start_open(store, brain, *, reason=None) -> dict:
-    """Unblock LIVE OPEN after first manual close (V5 T24 / #270).
+    """Permit provisional LIVE OPEN after first manual close — without prep PASSED.
 
-    Zero-start flow: operator opens one manual trade → it closes → robot must be
-    allowed to OPEN. A failed chronological holdout must not freeze the session
-    forever while online minute labels are still near zero. Candidate validation
-    must not invent HOLD_MODEL against the existing LIVE cycle.
+    Zero-start: operator closes one manual trade → robot may OPEN so live £ can
+    teach. ``cold_start_open`` is NOT ``ready`` — chronological holdout still
+    failed / pending. UI and gates must treat them separately.
     """
     epic = getattr(brain, 'epic', None)
     if not epic:
@@ -452,19 +451,23 @@ def grant_cold_start_open(store, brain, *, reason=None) -> dict:
         return trading_readiness(store, brain)
     msg = (reason or
            'Cold-start OPEN after first manual close — live £ teaches; '
-           'prep holdout no longer hard-blocks this session')
+           'prep holdout still not PASSED (ready=False)')
     state = dict(state)
+    # Keep stage as blocked/evaluated — never claim ready/PASSED here.
+    if state.get('stage') in (None, '', 'idle'):
+        state['stage'] = 'blocked'
     state.update({
-        'ready': True,
-        'stage': 'ready',
+        'ready': False,
         'cold_start_open': True,
         'reason': msg,
     })
     save_state(store, epic, state)
     if store is not None:
-        store.event('learning', 'Cold-start prep release — LIVE OPEN permitted',
+        store.event('learning',
+                    'Cold-start OPEN permitted (prep not PASSED)',
                     {'epic': epic, 'online_labeled': labeled,
-                     'online_need': online_need, 'reason': msg})
+                     'online_need': online_need, 'ready': False,
+                     'cold_start_open': True, 'reason': msg})
     return state
 
 

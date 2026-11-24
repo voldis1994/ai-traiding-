@@ -294,7 +294,15 @@ _OHLC_DELTA_KEYS = (
 _OHLC_FLAG_KEYS = ('block_mid_range', 'prefer_retest_over_blind_break')
 _AUDIT_DELTA_KEYS = ('news_block_weight', 'intermarket_veto_weight')
 _AUDIT_FLAG_KEYS = ('respect_news_window', 'respect_intermarket_veto')
+# Full-system soft levers (neural decide path) — not OHLC-only.
+_SELF_DELTA_KEYS = (
+    'structure_edge_nudge',
+    'situation_memory_nudge',
+    'forecast_bridge_nudge',
+    'mtf_momentum_nudge',
+)
 _ALL_TRACKED_OHLC = _OHLC_DELTA_KEYS + _OHLC_FLAG_KEYS
+_ALL_TRACKED_SELF = _SELF_DELTA_KEYS
 
 
 def _knob_path(key: str) -> str:
@@ -303,6 +311,8 @@ def _knob_path(key: str) -> str:
         return f'ohlc_scenarios_v1.{key}'
     if key in _AUDIT_DELTA_KEYS or key in _AUDIT_FLAG_KEYS:
         return f'{STORE_KEY}.{key}'
+    if key in _SELF_DELTA_KEYS:
+        return f'self_params_v1.{key}'
     return f'unknown.{key}'
 
 
@@ -347,9 +357,16 @@ def propose_fix(mistakes) -> dict | None:
             routes.append({'mistake': m, 'knob': 'penalty_retest', 'delta': 0.06,
                            'path': _knob_path('penalty_retest')})
         elif m == 'outcome_hurt':
-            deltas['penalty_zone'] = deltas.get('penalty_zone', 0) + 0.03
-            routes.append({'mistake': m, 'knob': 'penalty_zone', 'delta': 0.03,
-                           'path': _knob_path('penalty_zone')})
+            # Catch-all £ loss: teach the FULL decide stack (structure graves,
+            # situation memory, forecast bridge, MTF) — never invent zone-only.
+            for knob, delta in (
+                    ('structure_edge_nudge', 0.02),
+                    ('situation_memory_nudge', 0.02),
+                    ('forecast_bridge_nudge', 0.01),
+                    ('mtf_momentum_nudge', 0.01)):
+                deltas[knob] = deltas.get(knob, 0) + delta
+                routes.append({'mistake': m, 'knob': knob, 'delta': delta,
+                               'path': _knob_path(knob)})
         elif m == 'news_risk_ignored':
             flags['respect_news_window'] = 1
             deltas['news_block_weight'] = deltas.get('news_block_weight', 0) + 0.1
@@ -379,8 +396,10 @@ def propose_fix(mistakes) -> dict | None:
 def describe_fix_mutations(store, proposed: dict | None, *,
                              applied=False, before_params=None,
                              after_params=None, before_audit=None,
-                             after_audit=None) -> dict:
+                             after_audit=None, before_self=None,
+                             after_self=None) -> dict:
     """Concrete before→after for every knob in the proposal + untouched peers."""
+    from . import self_params as sp
     proposed = proposed if isinstance(proposed, dict) else {}
     deltas = proposed.get('deltas') or {}
     flags = proposed.get('flags') or {}
@@ -389,8 +408,11 @@ def describe_fix_mutations(store, proposed: dict | None, *,
         ohlc_scenarios.load_params(store))
     audit_before = dict(before_audit) if isinstance(before_audit, dict) else (
         dict(store.get(STORE_KEY) or {}) if store is not None else {})
+    self_before = dict(before_self) if isinstance(before_self, dict) else (
+        sp.load(store) if store is not None else dict(sp.DEFAULTS))
     params_after = dict(after_params) if isinstance(after_params, dict) else None
     audit_after = dict(after_audit) if isinstance(after_audit, dict) else None
+    self_after = dict(after_self) if isinstance(after_self, dict) else None
 
     mutations = []
     touched = set()
@@ -407,6 +429,12 @@ def describe_fix_mutations(store, proposed: dict | None, *,
             return f'{f:.4g}'
         except (TypeError, ValueError):
             return str(v)
+
+    def _clip_self(key, before, delta):
+        try:
+            return float(sp._clip(key, float(before) + float(delta)))
+        except Exception:
+            return float(before) + float(delta)
 
     for k, d in deltas.items():
         path = _knob_path(k)
@@ -427,6 +455,18 @@ def describe_fix_mutations(store, proposed: dict | None, *,
             before = float(audit_before.get(k) or 0)
             after = (_clip01(before + float(d)) if audit_after is None
                      else float(audit_after.get(k) or 0))
+            mutations.append({
+                'knob': k, 'path': path, 'kind': 'delta',
+                'before': before, 'after': after, 'delta': float(d),
+                'applied': bool(applied),
+                'line': (f'{path}  {_fmt(before)} → {_fmt(after)}  '
+                         f'(Δ{float(d):+g})'
+                         + ('  [WRITTEN]' if applied else '  [PROPOSED]')),
+            })
+        elif k in _SELF_DELTA_KEYS:
+            before = float(self_before.get(k) or 0)
+            after = (_clip_self(k, before, d) if self_after is None
+                     else float(self_after.get(k) or 0))
             mutations.append({
                 'knob': k, 'path': path, 'kind': 'delta',
                 'before': before, 'after': after, 'delta': float(d),
@@ -461,24 +501,39 @@ def describe_fix_mutations(store, proposed: dict | None, *,
             })
 
     untouched = []
-    for k in _ALL_TRACKED_OHLC:
-        if k in touched:
-            continue
-        path = _knob_path(k)
-        cur = params_before.get(k)
-        untouched.append({
-            'knob': k, 'path': path, 'value': cur,
-            'line': f'{path}  = {_fmt(cur)}  [UNTOUCHED]',
-        })
-    for k in _AUDIT_DELTA_KEYS + _AUDIT_FLAG_KEYS:
-        if k in touched:
-            continue
-        path = _knob_path(k)
-        cur = audit_before.get(k)
-        untouched.append({
-            'knob': k, 'path': path, 'value': cur,
-            'line': f'{path}  = {_fmt(cur) if cur is not None else "0"}  [UNTOUCHED]',
-        })
+    touched_ohlc = any(k in _ALL_TRACKED_OHLC for k in touched)
+    touched_self = any(k in _SELF_DELTA_KEYS for k in touched)
+    # System-review (self_params only): do not spam OHLC KEEP noise.
+    if touched_ohlc or not touched_self:
+        for k in _ALL_TRACKED_OHLC:
+            if k in touched:
+                continue
+            path = _knob_path(k)
+            cur = params_before.get(k)
+            untouched.append({
+                'knob': k, 'path': path, 'value': cur,
+                'line': f'{path}  = {_fmt(cur)}  [UNTOUCHED]',
+            })
+        for k in _AUDIT_DELTA_KEYS + _AUDIT_FLAG_KEYS:
+            if k in touched:
+                continue
+            path = _knob_path(k)
+            cur = audit_before.get(k)
+            untouched.append({
+                'knob': k, 'path': path, 'value': cur,
+                'line': (f'{path}  = {_fmt(cur) if cur is not None else "0"}'
+                         f'  [UNTOUCHED]'),
+            })
+    if touched_self:
+        for k in _ALL_TRACKED_SELF:
+            if k in touched:
+                continue
+            path = _knob_path(k)
+            cur = self_before.get(k)
+            untouched.append({
+                'knob': k, 'path': path, 'value': cur,
+                'line': f'{path}  = {_fmt(cur)}  [UNTOUCHED]',
+            })
 
     map_lines = []
     for r in routes:
@@ -871,42 +926,33 @@ def build_fix_cycle_steps(diagnosis: dict | None, mem: dict | None,
 
 
 def journal_seed_fix_steps(audit_row: dict | None, store=None) -> list:
-    """Honest steps when Desk only has a Capital journal seed (no on_close yet)."""
+    """Honest wait steps — never invent a fake MAP to one OHLC knob."""
     a = audit_row if isinstance(audit_row, dict) else {}
-    mistakes = [m for m in (a.get('mistakes') or []) if m]
-    if not mistakes:
-        try:
-            pnl = float(a.get('pnl'))
-        except (TypeError, ValueError):
-            pnl = None
-        if pnl is not None and pnl < -0.02:
-            mistakes = ['outcome_hurt']
-    proposed = propose_fix(mistakes) if mistakes else None
-    mut = describe_fix_mutations(store, proposed, applied=False) if proposed else {}
-    mut_lines = [m.get('line') for m in (mut.get('mutations') or [])
-                 if isinstance(m, dict) and m.get('line')]
-    map_lines = list(mut.get('map_lines') or [])
-    unt_lines = [u.get('line') for u in (mut.get('untouched') or [])
-                 if isinstance(u, dict) and u.get('line')]
-    would = list(map_lines) or [
-        f'{_knob_path(k)} Δ{float(d):+g}'
-        for k, d in ((proposed or {}).get('deltas') or {}).items()
+    try:
+        pnl = float(a.get('pnl'))
+    except (TypeError, ValueError):
+        pnl = None
+    hurt = pnl is not None and pnl < -0.02
+    need = [
+        'ohlc_entry/scenario stamp',
+        'structure frame',
+        'news + peers',
+        'neural scores at OPEN',
+        'fingerprint from on_close',
     ]
-    steps = [{
-        'step': 'diagnose', 'status': 'ok' if mistakes else 'skip',
-        'detail': ('journal seed · mistakes: ' + ' · '.join(mistakes)
-                   if mistakes else 'journal seed · no mistake'),
-        'changed': list(mistakes), 'skipped': [],
+    detail_diag = (
+        'Capital £ only — full diagnose needs OHLC+structure+news+peers+neural'
+        if hurt else 'Capital £ scratch/flat — waiting on_close context')
+    return [{
+        'step': 'diagnose', 'status': 'wait',
+        'detail': detail_diag,
+        'changed': [], 'skipped': ['mistakes'],
     }, {
-        'step': 'propose', 'status': 'ok' if would else 'skip',
-        'detail': ('; '.join(map_lines[:3]) if map_lines
-                   else ('no knobs for class')),
-        'changed': would, 'skipped': [],
-        'mutations': mut.get('mutations') or [],
-        'map_lines': map_lines,
-        'untouched': mut.get('untouched') or [],
-        'mutation_lines': mut_lines,
-        'untouched_lines': unt_lines[:12],
+        'step': 'propose', 'status': 'skip',
+        'detail': 'no MAP until on_close — no invented knobs',
+        'changed': [], 'skipped': ['knobs'],
+        'mutations': [], 'map_lines': [], 'untouched': [],
+        'mutation_lines': [], 'untouched_lines': [],
     }, {
         'step': 'memory', 'status': 'skip',
         'detail': 'journal display only — no fingerprint / entry_brain',
@@ -917,19 +963,15 @@ def journal_seed_fix_steps(audit_row: dict | None, store=None) -> list:
         'changed': [], 'skipped': ['promote_gate'],
     }, {
         'step': 'commit', 'status': 'wait',
-        'detail': 'WAITING backfill/on_close — knobs NOT written yet',
-        'changed': [], 'skipped': would[:8],
-        'mutations': mut.get('mutations') or [],
-        'map_lines': map_lines,
-        'untouched': mut.get('untouched') or [],
-        'mutation_lines': mut_lines,
-        'untouched_lines': unt_lines[:12],
+        'detail': 'WAITING backfill/on_close — needs: ' + ' · '.join(need[:4]),
+        'changed': [], 'skipped': list(need),
+        'mutations': [], 'map_lines': [], 'untouched': [],
+        'mutation_lines': [], 'untouched_lines': [],
     }, {
         'step': 'ready', 'status': 'skip',
-        'detail': 'LIVE promote idle until commit + proof win',
+        'detail': 'LIVE promote idle until real commit + proof win',
         'changed': [], 'skipped': ['ready_for_live'],
     }]
-    return steps
 
 
 def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
@@ -942,11 +984,14 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
         rebuilt = propose_fix(proposed.get('mistakes'))
         if isinstance(rebuilt, dict):
             proposed = {**proposed, 'routes': rebuilt.get('routes') or []}
+    from . import self_params as sp
     before_params = ohlc_scenarios.load_params(store)
     before_audit = dict(store.get(STORE_KEY) or {}) if store is not None else {}
+    before_self = sp.load(store) if store is not None else dict(sp.DEFAULTS)
     preview = describe_fix_mutations(
         store, proposed, applied=False,
-        before_params=before_params, before_audit=before_audit)
+        before_params=before_params, before_audit=before_audit,
+        before_self=before_self)
     if not commit:
         if store is not None:
             store.set(PENDING_FIX_KEY, {
@@ -971,20 +1016,31 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
         }
 
     params = dict(before_params)
+    self_p = dict(before_self)
     deltas = proposed.get('deltas') or {}
     flags = proposed.get('flags') or {}
     changed = []
+    ohlc_changed = False
+    self_changed = False
     for k, d in deltas.items():
         if k in _OHLC_DELTA_KEYS:
             params[k] = _clip01(float(params.get(k) or 0) + float(d))
             changed.append(k)
+            ohlc_changed = True
+        elif k in _SELF_DELTA_KEYS:
+            self_p[k] = sp._clip(k, float(self_p.get(k) or 0) + float(d))
+            changed.append(k)
+            self_changed = True
         # news / intermarket weights live in audit bag (not ohlc_scenarios).
     for k, v in flags.items():
         if k in _OHLC_FLAG_KEYS:
             params[k] = int(v)
             changed.append(k)
-    if changed:
+            ohlc_changed = True
+    if ohlc_changed:
         ohlc_scenarios.save_params(store, params)
+    if self_changed and store is not None:
+        sp.save(store, self_p, reason='shadow_mistake_outcome_hurt')
 
     bag = _scenario_bag(store)
     fp = str((diagnosis.get('context') or {}).get('fingerprint') or '')
@@ -1029,7 +1085,8 @@ def apply_targeted_fix(store, diagnosis: dict, *, commit=False) -> dict:
     written = describe_fix_mutations(
         store, proposed, applied=True,
         before_params=before_params, after_params=params,
-        before_audit=before_audit, after_audit=audit)
+        before_audit=before_audit, after_audit=audit,
+        before_self=before_self, after_self=self_p)
     if store is not None:
         audit['last_commit_at'] = _now_iso()
         store.set(STORE_KEY, audit)
@@ -1508,7 +1565,29 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
         })
         mistakes = [m for m in (a.get('mistakes') or []) if m]
         notes = [n for n in (a.get('notes') or []) if n]
-        if mistakes:
+        src_l = str(a.get('source') or '').lower()
+        journalish = (
+            'journal' in src_l
+            or any('journal' in str(n).lower() for n in notes)
+            or str(a.get('scenario') or '') == 'LIVE_JOURNAL')
+        if journalish and (not mistakes or mistakes == ['outcome_hurt']):
+            if pnl is not None and pnl < -0.02:
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  WAIT   Capital £ loss — full audit pending '
+                             f'(OHLC+structure+news+peers+neural)'),
+                })
+            elif pnl is not None and pnl > 0.02:
+                lines.append({
+                    'level': 'ok',
+                    'text': f'{when}  OK     Capital £ win — audit pending',
+                })
+            else:
+                lines.append({
+                    'level': 'info',
+                    'text': f'{when}  INFO   Capital £ flat — audit pending',
+                })
+        elif mistakes:
             lines.append({
                 'level': 'error',
                 'text': f'{when}  ERROR  ' + ' · '.join(str(m) for m in mistakes[:6]),
@@ -1541,11 +1620,6 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
         if not changed and isinstance(bag_row.get('fix'), dict):
             changed = list((bag_row.get('fix') or {}).get('changed') or [])
         fix_steps = [s for s in (a.get('fix_steps') or []) if isinstance(s, dict)]
-        src_l = str(a.get('source') or '').lower()
-        journalish = (
-            'journal' in src_l
-            or any('journal' in str(n).lower() for n in notes)
-            or str(a.get('scenario') or '') == 'LIVE_JOURNAL')
         if not fix_steps and journalish and (
                 mistakes or (pnl is not None and pnl < -0.02)):
             fix_steps = journal_seed_fix_steps(a, store=store)
@@ -1588,15 +1662,22 @@ def build_learning_log(*, recent_audits=None, pending_fix=None,
             gate = ''
             if pc is not None and pn is not None:
                 gate = f' · promote {pc}/{pn}'
-            lines.append({
-                'level': 'wait',
-                'text': (f'{when}  WAIT   full path below'
-                         f'{gate} — MAP / VALUE / KEEP'),
-            })
+            if journalish:
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  WAIT   Capital £ only — full path after '
+                             f'on_close{gate}'),
+                })
+            else:
+                lines.append({
+                    'level': 'wait',
+                    'text': (f'{when}  WAIT   full path below'
+                             f'{gate} — MAP / VALUE / KEEP'),
+                })
             if fix_steps:
                 for s in fix_steps:
                     lines.extend(_format_fix_step_lines(when, s))
-            else:
+            elif not journalish:
                 lines.append({
                     'level': 'note',
                     'text': (f'{when}  STEP   diagnose · ok · '
@@ -2039,8 +2120,9 @@ def _journal_window_stats(store, *, hours=24) -> dict:
                 'entry': entry,
                 'exit': exit_px,
                 'pnl_source': src_s or 'broker',
-                'mistakes': ['outcome_hurt'] if pnl_n < -0.02 else [],
-                'notes': ['journal_24h_seed'],
+                # No invented mistake class — on_close owns diagnose/MAP.
+                'mistakes': [],
+                'notes': ['journal_24h_seed', 'awaiting_full_audit'],
                 'scenario': 'LIVE_JOURNAL',
                 'deal_id': deal_id,
             })

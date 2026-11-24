@@ -106,7 +106,11 @@ def load_model(store):
 
 
 def shadow_advice(store, features, *, neural_scores=None):
-    """h=1 forecast action vs neural argmax — for UI + soft nudge."""
+    """Multi-horizon forecast vs neural argmax — for UI + soft nudge.
+
+    Uses h=1,3,5,15. Primary advice is majority vote among BUY/SELL (HOLD
+    ignored for vote). ``agree`` is True only when majority matches neural.
+    """
     if not isinstance(features,(list,tuple,np.ndarray)):
         return {'advice':None,'reason':'no_features'}
     model=load_model(store)
@@ -117,13 +121,41 @@ def shadow_advice(store, features, *, neural_scores=None):
         return {'advice':None,'reason':'feature_dim_mismatch',
                 'need_dim':model.dim,'got':int(x.size)}
     try:
-        pred=model.predict_dict(x).get(1)
+        preds=model.predict_dict(x)
     except Exception as exc:
         return {'advice':None,'reason':f'predict_failed:{type(exc).__name__}'}
-    if pred is None:
-        return {'advice':None,'reason':'no_h1'}
-    action=max(pred.p_hat,key=pred.p_hat.get)
-    conf=float(pred.p_hat.get(action) or 0)
+    by_h={}
+    votes={'BUY':0,'SELL':0}
+    conf_sum={'BUY':0.0,'SELL':0.0}
+    for h in HORIZONS:
+        pred=preds.get(h) if isinstance(preds,dict) else None
+        if pred is None:
+            continue
+        action=max(pred.p_hat,key=pred.p_hat.get)
+        conf=float(pred.p_hat.get(action) or 0)
+        by_h[int(h)]={
+            'advice':action,'confidence':conf,
+            'sigma_hat':float(pred.sigma_hat),'r_hat':float(pred.r_hat),
+            'p_hat':dict(pred.p_hat),
+        }
+        if action in ('BUY','SELL'):
+            votes[action]+=1
+            conf_sum[action]+=conf
+    if not by_h:
+        return {'advice':None,'reason':'no_horizons'}
+    # Prefer multi-horizon majority; fall back to h=1.
+    if votes['BUY'] or votes['SELL']:
+        if votes['BUY']!=votes['SELL']:
+            action='BUY' if votes['BUY']>votes['SELL'] else 'SELL'
+        else:
+            action='BUY' if conf_sum['BUY']>=conf_sum['SELL'] else 'SELL'
+        n_vote=max(1,votes[action])
+        conf=conf_sum[action]/n_vote
+    else:
+        h1=by_h.get(1) or next(iter(by_h.values()))
+        action=h1['advice']
+        conf=float(h1['confidence'])
+    pred1=(preds.get(1) if isinstance(preds,dict) else None)
     neural=None
     if isinstance(neural_scores,dict):
         try:
@@ -131,16 +163,25 @@ def shadow_advice(store, features, *, neural_scores=None):
                        key=lambda a:float(neural_scores.get(a,0)))
         except (TypeError,ValueError):
             neural=None
+    agree_n=sum(1 for v in by_h.values()
+                if neural and v.get('advice')==neural)
+    conflict_n=sum(1 for v in by_h.values()
+                   if neural and v.get('advice') in ('BUY','SELL')
+                   and v.get('advice')!=neural)
     out={
         'advice':action,
         'confidence':conf,
-        'sigma_hat':float(pred.sigma_hat),
-        'r_hat':float(pred.r_hat),
-        'p_hat':dict(pred.p_hat),
+        'sigma_hat':float(pred1.sigma_hat) if pred1 is not None else None,
+        'r_hat':float(pred1.r_hat) if pred1 is not None else None,
+        'p_hat':dict(pred1.p_hat) if pred1 is not None else {},
         'neural_argmax':neural,
         'agree':(neural==action) if neural else None,
         'horizon':1,
-        'reason':(f'forecast h=1 {action} p={conf:.2f} σ={pred.sigma_hat:.3f}'
+        'horizons':by_h,
+        'agree_horizons':agree_n,
+        'conflict_horizons':conflict_n,
+        'reason':(f'forecast majority {action} p={conf:.2f} '
+                  f'(agree={agree_n}/{len(by_h)} conflict={conflict_n})'
                   + (f'; neural={neural}' if neural else '')),
     }
     store.set(STORE_SHADOW,out)
@@ -148,10 +189,10 @@ def shadow_advice(store, features, *, neural_scores=None):
 
 
 def soft_nudge_scores(scores, advice, *, store=None):
-    """Boost only when forecast h=1 **agrees** with neural BUY/SELL.
+    """Boost when multi-horizon forecast **agrees** with neural BUY/SELL.
 
-    Never pushes HOLD and never flips the neural side on conflict — that would
-    turn the book into perpetual HOLD. Conflict / forecast-HOLD = log only.
+    Never flips the neural side. When horizons conflict with neural, damp the
+    neural side slightly (still no flip). Forecast-HOLD = log only.
     """
     if not isinstance(scores,dict):
         return scores,{'nudged':False,'reason':'no_scores'}
@@ -170,13 +211,15 @@ def soft_nudge_scores(scores, advice, *, store=None):
         return dict(scores),{'nudged':False,'reason':'bad_side'}
     if conf<0.40:
         return dict(scores),{'nudged':False,'reason':'low_confidence','advice':advice}
-    # Only reinforce an already-proposed trade side.
+    agree_h=int(advice.get('agree_horizons') or 0)
+    conflict_h=int(advice.get('conflict_horizons') or 0)
+    # Reinforce when majority agrees; louder when several horizons align.
     if agree is True and side in ('BUY','SELL'):
-        delta=strength*min(1.0,conf)
+        scale=1.0+0.25*max(0,agree_h-1)
+        delta=strength*min(1.0,conf)*min(1.75,scale)
         out[side]+=delta
         opp='SELL' if side=='BUY' else 'BUY'
         out[opp]=max(0.0,out[opp]-0.35*delta)
-        # Do not inflate HOLD when reinforcing a trade.
         for k in out:
             out[k]=max(0.0,min(1.0,out[k]))
         s=sum(out.values())
@@ -184,14 +227,37 @@ def soft_nudge_scores(scores, advice, *, store=None):
             return dict(scores),{'nudged':False,'reason':'degenerate'}
         out={k:out[k]/s for k in out}
         return out,{'nudged':True,'delta':delta,'advice':side,'agree':True,
-                    'confidence':conf,'reason':advice.get('reason')}
-    # Conflict, forecast HOLD, or no neural compare → leave scores alone.
+                    'agree_horizons':agree_h,'confidence':conf,
+                    'reason':advice.get('reason')}
+    # Multi-horizon conflict: damp neural side slightly — never flip.
+    neural=str(advice.get('neural_argmax') or '').upper()
+    if (agree is False and conflict_h>=2 and neural in ('BUY','SELL')
+            and side in ('BUY','SELL') and side!=neural):
+        delta=0.5*strength*min(1.0,conf)
+        out[neural]=max(0.0,out[neural]-delta)
+        out['HOLD']=min(1.0,out.get('HOLD',0)+0.5*delta)
+        for k in out:
+            out[k]=max(0.0,min(1.0,out[k]))
+        s=sum(out.values())
+        if s<=1e-12:
+            return dict(scores),{'nudged':False,'reason':'degenerate'}
+        out={k:out[k]/s for k in out}
+        # Guard: neural side must still beat the opposite after damp.
+        opp='SELL' if neural=='BUY' else 'BUY'
+        if out[neural]+1e-9<out[opp]:
+            return dict(scores),{'nudged':False,'reason':'conflict_damp_would_flip',
+                                 'advice':side,'agree':False,
+                                 'conflict_horizons':conflict_h}
+        return out,{'nudged':True,'delta':-delta,'advice':side,'agree':False,
+                    'conflict_horizons':conflict_h,'damp':neural,
+                    'reason':'multi_horizon_conflict_damp'}
     return dict(scores),{
         'nudged':False,
         'reason':('conflict_no_hold_push' if agree is False
                   else ('forecast_hold_ignored' if side=='HOLD'
                         else 'no_agree_boost')),
         'advice':side,'agree':agree,'confidence':conf,
+        'agree_horizons':agree_h,'conflict_horizons':conflict_h,
     }
 
 

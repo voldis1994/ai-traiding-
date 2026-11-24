@@ -154,14 +154,16 @@ def test_cold_start_first_manual_close_releases_prep_block():
         engine.last_closed_step = 10  # first manual already closed
         engine.positions = []
         released = engine._maybe_release_cold_start_prep()
-        assert released and released['ready'] is True
-        assert released.get('cold_start_open') is True
-        assert brain.trading_readiness()['ready'] is True
+        assert released and released.get('cold_start_open') is True
+        assert released.get('ready') is False
+        assert brain.trading_readiness()['ready'] is False
+        assert brain.trading_readiness()['cold_start_open'] is True
         gates = engine.live_open_gates('BUY')
         assert gates['allowed'] is True
-        # Flat re-arm path also grants (idempotent).
+        # Flat re-arm path also grants (idempotent) — still not prep PASSED.
         engine._release_execution_after_flat('m1')
-        assert brain.trading_readiness()['ready'] is True
+        assert brain.trading_readiness()['cold_start_open'] is True
+        assert brain.trading_readiness()['ready'] is False
 
 
 def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic():

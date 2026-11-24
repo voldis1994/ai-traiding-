@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.engine import Store
 from app import ohlc_scenarios as osc
+from app import self_params as sp
 from app import shadow_mistake_audit as sma
 from tests.test_shadow_mistake_audit import _candles
 
@@ -44,22 +45,21 @@ def test_on_close_writes_concrete_before_after_path():
         assert 'fix pending / diagnosing' not in text
 
 
-def test_journal_seed_shows_proposed_path_not_written():
+def test_journal_seed_waits_for_full_audit_no_fake_map():
+    """Capital £ alone must NOT invent MAP → penalty_zone + KEEP spam."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         steps = sma.journal_seed_fix_steps({
-            'pnl': -0.32, 'mistakes': ['outcome_hurt'],
+            'pnl': -0.32, 'mistakes': [],
             'source': 'live_journal', 'notes': ['journal_24h_seed'],
         }, store=store)
         propose = next(s for s in steps if s['step'] == 'propose')
-        assert propose['status'] == 'ok'
-        assert any('ohlc_scenarios_v1.penalty_zone' in str(x)
-                   for x in (propose.get('map_lines') or propose.get('changed') or []))
-        muts = propose.get('mutations') or []
-        assert muts
-        assert muts[0]['path'] == 'ohlc_scenarios_v1.penalty_zone'
-        assert '[PROPOSED]' in muts[0]['line']
-        # Not written yet — params stay at default.
+        assert propose['status'] == 'skip'
+        assert not (propose.get('map_lines') or [])
+        assert not (propose.get('mutations') or [])
+        commit = next(s for s in steps if s['step'] == 'commit')
+        assert commit['status'] == 'wait'
+        assert 'on_close' in (commit.get('detail') or '')
         assert osc.load_params(store)['penalty_zone'] == 0.0
 
         log = sma.build_learning_log(
@@ -68,8 +68,8 @@ def test_journal_seed_shows_proposed_path_not_written():
                 'closed_at': '2026-11-24T12:15:32+00:00',
                 'pnl': -0.32, 'direction': 'SELL',
                 'source': 'live_journal',
-                'mistakes': ['outcome_hurt'],
-                'notes': ['journal_24h_seed'],
+                'mistakes': [],
+                'notes': ['journal_24h_seed', 'awaiting_full_audit'],
                 'scenario': 'LIVE_JOURNAL',
                 'deal_id': 'j1',
             }],
@@ -79,23 +79,43 @@ def test_journal_seed_shows_proposed_path_not_written():
             store=store,
         )
         text = '\n'.join(str(x.get('text') or '') for x in log)
-        assert 'MAP' in text
-        assert 'ohlc_scenarios_v1.penalty_zone' in text
-        assert '0 →' in text or '0→' in text or '→' in text
-        assert 'PROPOSED' in text or 'WAITING' in text
+        assert 'full audit pending' in text.lower() or 'WAITING' in text or 'WAIT' in text
+        assert 'ohlc_scenarios_v1.penalty_zone' not in text
+        assert 'outcome_hurt' not in text
 
 
-def test_describe_mutations_lists_untouched_peers():
+def test_outcome_hurt_teaches_full_system_not_zone_only():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
+        before = sp.load(store)
         proposed = sma.propose_fix(['outcome_hurt'])
         pack = sma.describe_fix_mutations(store, proposed, applied=False)
         knobs = {m['knob'] for m in pack['mutations']}
-        assert knobs == {'penalty_zone'}
+        assert 'structure_edge_nudge' in knobs
+        assert 'situation_memory_nudge' in knobs
+        assert 'forecast_bridge_nudge' in knobs
+        assert 'mtf_momentum_nudge' in knobs
+        assert 'penalty_zone' not in knobs
+        # OHLC KEEP spam must not dominate a system-review proposal.
         untouched = {u['knob'] for u in pack['untouched']}
-        assert 'penalty_trend' in untouched
-        assert 'penalty_range' in untouched
+        assert 'penalty_trend' not in untouched
         assert 'penalty_zone' not in untouched
+
+        out = sma.on_close(
+            store,
+            pnl=-0.55, spread=0.1, candles=_candles(drift=0.5),
+            scenario_meta={'scenario': 'UNKNOWN'},
+            ohlc_meta={'action': 'BUY', 'trigger': 'zone'},
+            news={'status': 'CLEAR', 'entry_allowed': True},
+            intermarket={'status': 'WAITING'},
+            direction='BUY', entry=100.0, source='live',
+            deal_id='sys1', apply_ohlc_penalties=True,
+        )
+        # Drifted path may still tag structure — either system review or richer class.
+        if 'outcome_hurt' in (out.get('mistakes') or []):
+            after = sp.load(store)
+            assert after['structure_edge_nudge'] > before['structure_edge_nudge']
+            assert osc.load_params(store)['penalty_zone'] == 0.0
 
 
 def test_lab_pending_exposes_mutation_lines():
@@ -116,5 +136,8 @@ def test_lab_pending_exposes_mutation_lines():
         pending = lab.get('pending_fix') or {}
         assert pending.get('committed') is True
         assert pending.get('mutations')
-        assert pending['mutations'][0]['path'].startswith('ohlc_scenarios_v1.')
+        path0 = pending['mutations'][0]['path']
+        assert (path0.startswith('ohlc_scenarios_v1.')
+                or path0.startswith('self_params_v1.')
+                or path0.startswith('shadow_mistake_audit'))
         assert pending.get('map_lines')

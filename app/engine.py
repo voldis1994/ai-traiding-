@@ -4286,30 +4286,67 @@ class SingleTradeEngine:
     def _row_cash_pnl(self,row,details=None,*,prefer_funds=True):
         """Closed-trade cash £ from Capital history — never UPL / SL-TP invent.
 
-        Capital.com TRADE rows expose ``pnl`` / ``cash`` (SDK). Live Funds rows
-        sometimes only carry ``profitLoss`` on the *transaction* object — that is
-        the phone £, not ``accounts.balance.profitLoss`` (open account figure).
+        Phone Funds shows **Amount** in account currency (e.g. +£1.26) even when
+        the TRADE row is tagged USD with a conversion rate. Prefer ``amount`` /
+        ``netAmount`` over quote-currency ``profit``/``pnl``. Never treat lot
+        **size** (0.77) as cash — Desk used to show +0.78 GBP ≈ size.
 
-        V5 T30: activity ``profit: 0.0`` is a Capital placeholder — wait for Funds
-        (or explicit SETTLED_ZERO). Do not bind £0 from activity as broker cash.
+        V5 T30: activity ``profit: 0.0`` is a Capital placeholder — wait for Funds.
         """
         details=details if isinstance(details,dict) else {}
-        # Funds settle first. Activity may only carry ``profit`` in details.
+        size_abs=None
+        for sk in ('size','quantity'):
+            sn=self._parse_cash_num(row.get(sk))
+            if sn is None:
+                sn=self._parse_cash_num(details.get(sk))
+            if sn is not None and abs(float(sn))>1e-9:
+                size_abs=abs(float(sn))
+                break
+        # Funds: Amount first (account £ on the phone). Activity: profit first.
         if prefer_funds:
-            keys=('pnl','cash','profitLoss','profitAndLoss','profit','realizedPnl',
-                  'pl','netAmount','netProfit','grossProfit','amount')
+            keys=('amount','netAmount','pnl','cash','profitLoss','profitAndLoss',
+                  'profit','realizedPnl','pl','netProfit','grossProfit')
         else:
             keys=('profit','pnl','cash','profitLoss','profitAndLoss','pl',
                   'realizedPnl','netAmount','netProfit','grossProfit','amount')
+        account_ccy=(self._account_currency() or '').upper()
+        row_ccy=str(
+            row.get('currency') or details.get('currency') or '').strip().upper()
+        rate=self._parse_cash_num(
+            row.get('exchangeRate') or row.get('conversionRate')
+            or row.get('rate') or details.get('exchangeRate')
+            or details.get('conversionRate') or details.get('rate'))
+        picked=[]
         for key in keys:
             val=self._parse_cash_num(details.get(key))
-            if val is None:val=self._parse_cash_num(row.get(key))
-            if val is not None and math.isfinite(val):
-                # Activity £0 placeholders must not settle as broker cash.
-                if (not prefer_funds) and abs(float(val)) < 1e-12:
-                    continue
-                return float(val)
-        return None
+            if val is None:
+                val=self._parse_cash_num(row.get(key))
+            if val is None or not math.isfinite(val):
+                continue
+            # Activity £0 placeholders must not settle as broker cash.
+            if (not prefer_funds) and abs(float(val))<1e-12:
+                continue
+            # Lot size is not account money (GOLD 0.77 lot ≠ £0.78).
+            # Tight: only near-exact size clones (≤2p), not real £0.12 on 0.1 lot.
+            if (size_abs is not None and size_abs>=0.2
+                    and abs(abs(float(val))-size_abs)<=0.02):
+                continue
+            picked.append((key,float(val)))
+        if not picked:
+            return None
+        # Prefer phone Amount when Capital posts both quote profit and Amount.
+        for prefer_key in ('amount','netAmount'):
+            for key,val in picked:
+                if key==prefer_key:
+                    return val
+        key,val=picked[0]
+        # Quote-currency profit → account £ via Capital conversion rate.
+        if (rate is not None and float(rate)>0 and account_ccy=='GBP'
+                and row_ccy in ('USD','EUR') and row_ccy!=account_ccy
+                and key in ('pnl','cash','profitLoss','profitAndLoss','profit',
+                            'realizedPnl','pl','netProfit','grossProfit')):
+            return float(val)*float(rate)
+        return val
 
     def _transaction_matches_deal(self,row,deal,*,exact=False):
         """Capital tx.reference is often a short id, not the UUID dealId."""
@@ -4434,7 +4471,7 @@ class SingleTradeEngine:
         """
         try:
             rows=self.store.db.execute(
-                "SELECT deal_id,exit,opened,closed,pnl_source,pnl FROM trades "
+                "SELECT deal_id,exit,opened,closed,pnl_source,pnl,size FROM trades "
                 "WHERE closed IS NOT NULL AND (pnl_source IS NULL OR pnl_source IN "
                 "('pending_broker_pnl','pending_close_sync',"
                 "'ticks_only','price_size','position_disappeared',"
@@ -4443,13 +4480,17 @@ class SingleTradeEngine:
         except Exception:
             return 0
         n=0
-        for deal_id,exit_lvl,_opened,_closed,src,pnl in rows:
+        for row in rows:
+            deal_id,exit_lvl,_opened,_closed,src,pnl=row[:6]
+            size=row[6] if len(row)>6 else None
             deal=str(deal_id)
             src_s=str(src or '')
             pnl_n=_num(pnl)
             zero_broker=(src_s=='broker' and (
                 pnl_n is None or abs(float(pnl_n))<1e-12))
-            if src_s=='broker' and not zero_broker:
+            size_poison=(src_s=='broker' and pnl_n is not None
+                         and self._pnl_looks_like_lot_size(pnl_n,size))
+            if src_s=='broker' and not zero_broker and not size_poison:
                 continue
             banked=self.store.get('broker_cash_banked:'+deal)
             if isinstance(banked,dict) and str(banked.get('source') or '')=='broker':
@@ -4643,6 +4684,16 @@ class SingleTradeEngine:
         if old_pnl is None or abs(float(old_pnl))<1e-12:
             return True  # zero-poison
         return abs(float(old_pnl)-float(funds_pnl))>=self.FUNDS_PNL_EPS
+
+    def _pnl_looks_like_lot_size(self,pnl,size):
+        """True when journal £ ≈ lot size (Desk bug: +0.78 for size 0.77)."""
+        try:
+            p=abs(float(pnl));s=abs(float(size))
+        except (TypeError,ValueError):
+            return False
+        if not math.isfinite(p) or not math.isfinite(s) or s<0.2:
+            return False
+        return abs(p-s)<=0.02
 
     def _epic_family_match(self,a,b):
         """GOLD ↔ USCGC ↔ XAU family; otherwise exact-ish."""

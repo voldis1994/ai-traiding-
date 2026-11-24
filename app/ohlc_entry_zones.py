@@ -1,18 +1,25 @@
 """OHLC structural entry — unified intent + trigger for Admin chart and LIVE OPEN.
 
-Intent comes from neural + MTF. Trigger is either:
-  • zone  — pullback into discount (BUY) / premium (SELL) band, or
-  • break — structure / range break in the neural side (do not wait for pullback).
+1:1 zone reading (1m Supply/Demand):
+  • Zone box = base (consolidation) High→Low immediately before impulse
+  • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
+  • Structure filter: HH+HL → Demand; LH+LL → Supply
+  • Zone trigger: live ask/bid in zone + confirmation (pin/engulf/impulse AND
+    structure) — OPEN on WS tick after confirm. Defaults follow 1m guide
+    (``playbook_require_zone_confirm=1``, ``playbook_zone_confirm_and=1``).
+  • Invalidated zones (close through) are never selected (V3 Z03)
 
-Gate knobs (band width, tape need, MTF conf) learn from closed broker £ via
-``observe_close`` — same pattern as reentry_confirm / bracket_learn.
+Also: break trigger (structure/range break + M1 tape) on live mid when aligned.
+
+Gate knobs learn from closed broker £ via ``observe_close``.
 Never invent mid ± κ.
 """
 from __future__ import annotations
 
 from . import structure_memory
 
-STORE_KEY = 'ohlc_entry_gates_v1'
+STORE_KEY = 'ohlc_entry_gates_v2'
+_STORE_KEY_LEGACY = 'ohlc_entry_gates_v1'
 
 DEFAULTS = {
     'enabled': 1,
@@ -23,8 +30,10 @@ DEFAULTS = {
     'band_atr_frac': 0.35,
     'band_span_cap': 0.28,
     # Break tape / MTF agreement.
-    'tape_need': 2,
-    'break_mtf_conf': 0.55,
+    # tape_need=1: fire on the first confirming M1 body (was 2 → late by ~1m).
+    # break_mtf_conf slightly softer so aligned MTF unlocks early structure break.
+    'tape_need': 1,
+    'break_mtf_conf': 0.50,
     'mtf_opposite_conf': 0.75,
     'zone_wide_conf': 0.50,
     'shift_block_conf': 0.60,
@@ -80,6 +89,16 @@ def load_params(store=None) -> dict:
     except Exception:
         pass
     bag = store.get(STORE_KEY) if store is not None else None
+    migrated = False
+    if not isinstance(bag, dict):
+        # v1 bags kept tape_need=2 (late signal). Carry band geometry only;
+        # reset break timing knobs to the earlier-entry defaults.
+        legacy = store.get(_STORE_KEY_LEGACY) if store is not None else None
+        if isinstance(legacy, dict):
+            bag = dict(legacy)
+            bag['tape_need'] = int(DEFAULTS['tape_need'])
+            bag['break_mtf_conf'] = float(DEFAULTS['break_mtf_conf'])
+            migrated = True
     if isinstance(bag, dict):
         for k in out:
             if bag.get(k) is not None:
@@ -94,6 +113,11 @@ def load_params(store=None) -> dict:
         out[k] = _clip(k, out[k])
     out['tape_need'] = int(round(_clip('tape_need', out['tape_need'])))
     out['enabled'] = int(out.get('enabled') or 0)
+    if migrated:
+        try:
+            save_params(store, out)
+        except Exception:
+            pass
     return out
 
 
@@ -117,6 +141,8 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
     """Persist on entry_brain so close can teach OHLC gate knobs."""
     if not isinstance(gate, dict):
         return {}
+    from . import ohlc_scenarios
+    sc = gate.get('scenario') if isinstance(gate.get('scenario'), dict) else {}
     return {
         'action': action,
         'trigger': gate.get('trigger'),
@@ -125,6 +151,8 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
         'params': gate.get('params'),
         'break_reason': (gate.get('break') or {}).get('reason')
                         if isinstance(gate.get('break'), dict) else None,
+        'zone': gate.get('zone'),
+        'scenario': ohlc_scenarios.open_meta_from_scenario(sc),
     }
 
 
@@ -252,13 +280,122 @@ def _mtf_kama(mtf):
     return None
 
 
+def zone_invalidation_status(zone, candles, *, tick=0.01):
+    """V3 Z03: Demand close < lo−tick / Supply close > hi+tick → INVALIDATED.
+
+    Wick sweep alone is not close-invalidation. Invalidated zones keep their
+    quality score but must never be selected for entry (Z03/Z04).
+    """
+    out = {
+        'invalidated': False,
+        'state': 'ACTIVE',
+        'invalidated_at': None,
+        'invalidation_reason': None,
+    }
+    if not isinstance(zone, dict):
+        out['state'] = 'INVALIDATED'
+        out['invalidated'] = True
+        out['invalidation_reason'] = 'bad_zone'
+        return out
+    lo = _finite(zone.get('lo'))
+    hi = _finite(zone.get('hi'))
+    if lo is None or hi is None:
+        out['state'] = 'INVALIDATED'
+        out['invalidated'] = True
+        out['invalidation_reason'] = 'bad_bounds'
+        return out
+    if hi < lo:
+        lo, hi = hi, lo
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    kind = str(zone.get('kind') or '').lower()
+    side = str(zone.get('side') or '').upper()
+    if not kind:
+        kind = 'demand' if side == 'BUY' else ('supply' if side == 'SELL' else '')
+    # Only bars after the impulse (zone exists) can invalidate.
+    rows = list(candles or [])
+    start_i = 0
+    impulse_end = zone.get('impulse_i1')
+    try:
+        if impulse_end is not None:
+            start_i = max(0, int(impulse_end) + 1)
+    except (TypeError, ValueError):
+        start_i = 0
+    for bar in rows[start_i:]:
+        if not isinstance(bar, dict):
+            continue
+        c = _finite(bar.get('close'))
+        if c is None:
+            continue
+        if kind == 'demand' and c < (lo - tick_f):
+            out['invalidated'] = True
+            out['state'] = 'INVALIDATED'
+            out['invalidated_at'] = bar.get('at')
+            out['invalidation_reason'] = 'demand_close_below'
+            return out
+        if kind == 'supply' and c > (hi + tick_f):
+            out['invalidated'] = True
+            out['state'] = 'INVALIDATED'
+            out['invalidated_at'] = bar.get('at')
+            out['invalidation_reason'] = 'supply_close_above'
+            return out
+    # Touch / confirm lifecycle hints (observability only).
+    touches = int(zone.get('touches') or 0)
+    if touches > 0:
+        out['state'] = 'TOUCHED'
+    return out
+
+
+def _annotate_zone_lifecycle(zone, candles, *, tick=0.01):
+    """Copy zone + Z03 identity/state fields (never mutates caller dict)."""
+    if not isinstance(zone, dict):
+        return None
+    z = dict(zone)
+    inv = zone_invalidation_status(z, candles, tick=tick)
+    z['invalidated'] = bool(inv.get('invalidated'))
+    z['state'] = inv.get('state') or 'ACTIVE'
+    z['invalidated_at'] = inv.get('invalidated_at')
+    z['invalidation_reason'] = inv.get('invalidation_reason')
+    if not z.get('zone_id'):
+        kind = str(z.get('kind') or z.get('side') or 'zone')
+        at = z.get('at') or z.get('impulse_i1') or z.get('base_i0') or ''
+        z['zone_id'] = f"{kind}:{z.get('lo')}:{z.get('hi')}:{at}"
+    return z
+
+
+def _pick_best_zone(cands, *, mid=None, candles=None, tick=0.01):
+    """Prefer high-quality, fresh base; never select INVALIDATED (V3 Z03)."""
+    rows = []
+    for raw in (cands or []):
+        if not isinstance(raw, dict):
+            continue
+        z = _annotate_zone_lifecycle(raw, candles, tick=tick)
+        if not z or z.get('invalidated') or z.get('state') == 'INVALIDATED':
+            continue
+        rows.append(z)
+    if not rows:
+        return None
+    m = _finite(mid)
+
+    def _key(z):
+        q = float(z.get('quality') or 0)
+        if m is None:
+            return (-q, int(z.get('touches') or 0))
+        mid_z = 0.5 * (float(z['lo']) + float(z['hi']))
+        return (-q, abs(mid_z - m), int(z.get('touches') or 0))
+
+    rows.sort(key=_key)
+    return rows[0]
+
+
 def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
                         store=None,params=None):
-    """Return structural BUY/SELL entry bands from OHLC swings / BOS + MTF.
+    """Return Demand/Supply entry boxes from base→impulse OHLC (1:1 guide).
 
-    Same geometry Admin draws and LIVE waits for. ATR widens/narrows the band
-    from real volatility; KAMA can tighten the wait edge when inside the range.
-    Band fractions come from learned ``params`` (store) when present.
+    Same geometry Admin draws and LIVE waits for. Structure HH/HL/LH/LL picks
+    which side is active. Legacy discount/premium swing bands are gone.
     """
     cfg=params if isinstance(params,dict) else load_params(store)
     out={
@@ -268,7 +405,9 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
         'range_lo':None,'range_hi':None,'band':None,
         'bias':None,'event':None,
         'atr14':None,'kama':None,'mtf_mode':None,'mtf_preferred':None,
-        'info_stack':'ohlc_swing',
+        'info_stack':'ohlc_base_impulse',
+        'structure':None,
+        'demand_zones':[],'supply_zones':[],
         'params':{
             'band_span_frac':cfg.get('band_span_frac'),
             'band_atr_frac':cfg.get('band_atr_frac'),
@@ -278,67 +417,127 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
     if not candles or len(candles)<20:
         return out
     bos=structure_memory.bos_choch(candles,left=2,right=2) or {}
+    struct=structure_memory.label_swing_structure(candles,left=2,right=2) or {}
     live=structure_memory.snapshot_live(candles=candles,mid=mid) or {}
-    lo=_finite(bos.get('range_lo'))
-    hi=_finite(bos.get('range_hi'))
-    out['bias']=bos.get('bias') or live.get('live_bias')
-    out['event']=bos.get('event') or live.get('live_event')
-    out['range_lo']=lo
-    out['range_hi']=hi
     atr=_entry_band_atr(mtf,candles)
     kama=_mtf_kama(mtf)
     out['atr14']=atr
     out['kama']=kama
+    out['structure']={
+        'bias':struct.get('bias'),
+        'last_high_tag':struct.get('last_high_tag'),
+        'last_low_tag':struct.get('last_low_tag'),
+        'hh_count':struct.get('hh_count'),
+        'hl_count':struct.get('hl_count'),
+        'lh_count':struct.get('lh_count'),
+        'll_count':struct.get('ll_count'),
+    }
+    out['bias']=struct.get('bias') or bos.get('bias') or live.get('live_bias')
+    out['event']=bos.get('event') or live.get('live_event')
     if isinstance(mtf,dict) and mtf.get('ready'):
         out['mtf_mode']=mtf.get('mode')
         out['mtf_preferred']=mtf.get('preferred')
-        out['info_stack']='ohlc_swing+kama_adx_atr'
-    if lo is None or hi is None or not (hi>lo):
-        out['reason']='no_swing_range'
-        return out
-    try:
-        tick_f=max(float(tick or 0.01),1e-9)
-    except (TypeError,ValueError):
-        tick_f=0.01
-    try:
-        spread_f=max(float(spread or 0),0.)
-    except (TypeError,ValueError):
-        spread_f=0.
-    span=hi-lo
-    # M1 ATR (same candles as swings) — not M5 stop_hint. Fractions learn
-    # from closed £ (observe_close). Cap keeps discount/premium disjoint.
-    span_frac=float(cfg.get('band_span_frac') or 0.12)
-    atr_frac=float(cfg.get('band_atr_frac') or 0.35)
-    span_cap=float(cfg.get('band_span_cap') or 0.28)
-    band=max(span*span_frac,tick_f*8,spread_f*2)
-    if atr is not None:
-        band=max(band,atr_frac*atr)
-    band=min(band,span*span_cap)  # never swallow the swing mid
-    out['band']=band
-    out['support']={'lo':lo,'hi':lo,'label':'Support / swing low'}
-    out['resistance']={'lo':hi,'hi':hi,'label':'Resistance / swing high'}
-    buy_hi=lo+band
-    sell_lo=hi-band
-    # Dead mid: structural mid-range is NOT a pullback for either side.
-    mid_r=0.5*(lo+hi)
-    gap=max(tick_f*4,span*0.06)
-    buy_hi=min(buy_hi,mid_r-gap)
-    sell_lo=max(sell_lo,mid_r+gap)
-    # KAMA inside range tightens the wait edge toward adaptive trend.
-    if kama is not None and lo<kama<hi:
-        buy_hi=min(buy_hi,max(lo+tick_f,kama))
-        sell_lo=max(sell_lo,min(hi-tick_f,kama))
-    out['mid_dead']={'lo':buy_hi,'hi':sell_lo,'mid':mid_r}
-    if buy_hi>lo:
+        out['info_stack']='ohlc_base_impulse+kama_adx_atr'
+    det=structure_memory.detect_base_impulse_zones(candles,atr=atr,limit=80)
+    demand=[_annotate_zone_lifecycle(z,candles,tick=tick)
+            for z in (det.get('demand') or []) if isinstance(z,dict)]
+    supply=[_annotate_zone_lifecycle(z,candles,tick=tick)
+            for z in (det.get('supply') or []) if isinstance(z,dict)]
+    demand=[z for z in demand if z]
+    supply=[z for z in supply if z]
+    out['demand_zones']=demand
+    out['supply_zones']=supply
+    out['invalidated_zones']=[
+        z for z in (demand+supply)
+        if z.get('invalidated') or z.get('state')=='INVALIDATED'
+    ]
+    bias=str(out.get('bias') or 'RANGE').upper()
+    # Structure filter — UP trades Demand; DOWN trades Supply; RANGE keeps both.
+    allow_buy = bias in ('UP', 'RANGE') or str(out.get('event') or '').endswith('_UP')
+    allow_sell = bias in ('DOWN', 'RANGE') or str(out.get('event') or '').endswith('_DOWN')
+    # CHOCH flips character: allow the new side even if last tags lag.
+    event=str(out.get('event') or '').upper()
+    if event in ('CHOCH_UP', 'BOS_UP'):
+        allow_buy = True
+    if event in ('CHOCH_DOWN', 'BOS_DOWN'):
+        allow_sell = True
+    buy_raw=_pick_best_zone(demand,mid=mid,candles=candles,tick=tick) if allow_buy else None
+    sell_raw=_pick_best_zone(supply,mid=mid,candles=candles,tick=tick) if allow_sell else None
+    src=out['info_stack']
+    if buy_raw:
         out['buy_entry']={
-            'lo':lo,'hi':buy_hi,'label':'BUY entry zona','side':'BUY',
-            'source':out['info_stack']}
-    if sell_lo<hi:
+            'lo':float(buy_raw['lo']),'hi':float(buy_raw['hi']),
+            'label':'Demand zona (base→impulse UP)','side':'BUY',
+            'source':src,'kind':'demand',
+            'quality':buy_raw.get('quality'),
+            'touches':buy_raw.get('touches'),
+            'base_len':buy_raw.get('base_len'),
+            'impulse_len':buy_raw.get('impulse_len'),
+            'impulse_move':buy_raw.get('impulse_move'),
+            'impulse_i1':buy_raw.get('impulse_i1'),
+            'sl_anchor':float(buy_raw['lo']),
+            'zone_id':buy_raw.get('zone_id'),
+            'state':buy_raw.get('state') or 'ACTIVE',
+            'invalidated':False,
+            'invalidated_at':None,
+            'invalidation_reason':None,
+        }
+        out['support']={
+            'lo':float(buy_raw['lo']),'hi':float(buy_raw['hi']),
+            'label':'Demand / base support'}
+    if sell_raw:
         out['sell_entry']={
-            'lo':sell_lo,'hi':hi,'label':'SELL entry zona','side':'SELL',
-            'source':out['info_stack']}
+            'lo':float(sell_raw['lo']),'hi':float(sell_raw['hi']),
+            'label':'Supply zona (base→impulse DOWN)','side':'SELL',
+            'source':src,'kind':'supply',
+            'quality':sell_raw.get('quality'),
+            'touches':sell_raw.get('touches'),
+            'base_len':sell_raw.get('base_len'),
+            'impulse_len':sell_raw.get('impulse_len'),
+            'impulse_move':sell_raw.get('impulse_move'),
+            'impulse_i1':sell_raw.get('impulse_i1'),
+            'sl_anchor':float(sell_raw['hi']),
+            'zone_id':sell_raw.get('zone_id'),
+            'state':sell_raw.get('state') or 'ACTIVE',
+            'invalidated':False,
+            'invalidated_at':None,
+            'invalidation_reason':None,
+        }
+        out['resistance']={
+            'lo':float(sell_raw['lo']),'hi':float(sell_raw['hi']),
+            'label':'Supply / base resistance'}
+    # range_lo/hi = active structural box (for break + chart context).
+    if out['buy_entry'] and out['sell_entry']:
+        out['range_lo']=float(out['buy_entry']['lo'])
+        out['range_hi']=float(out['sell_entry']['hi'])
+    elif out['buy_entry']:
+        out['range_lo']=float(out['buy_entry']['lo'])
+        out['range_hi']=float(out['buy_entry']['hi'])
+    elif out['sell_entry']:
+        out['range_lo']=float(out['sell_entry']['lo'])
+        out['range_hi']=float(out['sell_entry']['hi'])
+    else:
+        # Fallback swing range so break path still has levels.
+        lo=_finite(bos.get('range_lo'));hi=_finite(bos.get('range_hi'))
+        out['range_lo']=lo;out['range_hi']=hi
+    if out['buy_entry']:
+        out['band']=float(out['buy_entry']['hi'])-float(out['buy_entry']['lo'])
+    elif out['sell_entry']:
+        out['band']=float(out['sell_entry']['hi'])-float(out['sell_entry']['lo'])
+    # Dead mid between demand top and supply bottom when both exist.
+    if out['buy_entry'] and out['sell_entry']:
+        out['mid_dead']={
+            'lo':float(out['buy_entry']['hi']),
+            'hi':float(out['sell_entry']['lo']),
+            'mid':0.5*(float(out['range_lo'] or 0)+float(out['range_hi'] or 0)),
+        }
     out['ok']=bool(out['buy_entry'] or out['sell_entry'])
-    out['reason']='swing_levels' if out['ok'] else 'empty_bands'
+    if out['ok']:
+        out['reason']='base_impulse'
+    elif not det.get('ready'):
+        out['reason']=det.get('reason') or 'no_base_impulse'
+    else:
+        out['reason']='structure_filtered'
     return out
 
 
@@ -358,6 +557,215 @@ def price_in_zone(zone,price,*,buffer=0.0):
     except (TypeError,ValueError):
         buf=0.
     return (lo-buf)<=p<=(hi+buf)
+
+
+def _candle_interacted_zone(bar, zone, *, buffer=0.0):
+    if not isinstance(bar, dict) or not isinstance(zone, dict):
+        return False
+    lo = _finite(zone.get('lo')); hi = _finite(zone.get('hi'))
+    bh = _finite(bar.get('high')); bl = _finite(bar.get('low'))
+    if None in (lo, hi, bh, bl):
+        return False
+    try:
+        buf = max(float(buffer or 0), 0.)
+    except (TypeError, ValueError):
+        buf = 0.
+    return bl <= (hi + buf) and bh >= (lo - buf)
+
+
+def rejection_candle(action, candles, zone, *, tick=0.01):
+    """1m confirmation: pin / engulf / impulse rejecting the zone (guide step 3)."""
+    action = (action or '').upper()
+    rows = list(candles or [])
+    out = {'ok': False, 'reason': 'no_bar', 'kind': None}
+    if action not in ('BUY', 'SELL') or len(rows) < 1 or not zone:
+        return out
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    last = rows[-1]
+    o = _finite(last.get('open')); h = _finite(last.get('high'))
+    l = _finite(last.get('low')); c = _finite(last.get('close'))
+    if None in (o, h, l, c):
+        return out
+    if not _candle_interacted_zone(last, zone, buffer=tick_f):
+        out['reason'] = 'no_zone_touch_on_bar'
+        return out
+    span = max(h - l, tick_f)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    # Impulse leave-zone (playbook "spēcīga impulsa svece").
+    try:
+        from . import playbook_entry as _pb
+        imp = _pb.impulse_from_level(action, rows, zone, tick=tick_f)
+        if imp.get('ok'):
+            out['ok'] = True
+            out['kind'] = imp.get('kind')
+            out['reason'] = imp.get('kind')
+            return out
+    except Exception:
+        pass
+    if action == 'BUY':
+        # Bullish pin: long lower wick, close in upper half.
+        pin = lower >= 0.45 * span and c >= (l + 0.55 * span) and lower >= 1.2 * max(body, tick_f)
+        engulf = False
+        if len(rows) >= 2:
+            prev = rows[-2]
+            po = _finite(prev.get('open')); pc = _finite(prev.get('close'))
+            if po is not None and pc is not None and pc < po:
+                engulf = c > o and c >= po and o <= pc
+        if pin or engulf:
+            out['ok'] = True
+            out['kind'] = 'pin_bull' if pin else 'engulf_bull'
+            out['reason'] = out['kind']
+            return out
+        out['reason'] = 'no_buy_rejection'
+        return out
+    # SELL — bearish pin / engulf
+    pin = upper >= 0.45 * span and c <= (h - 0.55 * span) and upper >= 1.2 * max(body, tick_f)
+    engulf = False
+    if len(rows) >= 2:
+        prev = rows[-2]
+        po = _finite(prev.get('open')); pc = _finite(prev.get('close'))
+        if po is not None and pc is not None and pc > po:
+            engulf = c < o and c <= po and o >= pc
+    if pin or engulf:
+        out['ok'] = True
+        out['kind'] = 'pin_bear' if pin else 'engulf_bear'
+        out['reason'] = out['kind']
+        return out
+    out['reason'] = 'no_sell_rejection'
+    return out
+
+
+def micro_structure_confirm(action, candles, zone, *, tick=0.01):
+    """Structure change on 1m while reacting in/near the zone (guide step 3)."""
+    action = (action or '').upper()
+    rows = list(candles or [])
+    out = {'ok': False, 'reason': 'no_structure', 'event': None}
+    if action not in ('BUY', 'SELL') or len(rows) < 12 or not zone:
+        return out
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    # Last few bars must still be interacting with the zone context.
+    near = False
+    for b in rows[-4:]:
+        if _candle_interacted_zone(b, zone, buffer=tick_f * 3):
+            near = True
+            break
+    if not near:
+        out['reason'] = 'structure_away_from_zone'
+        return out
+    bos = structure_memory.bos_choch(rows[-24:], left=2, right=2) or {}
+    event = str(bos.get('event') or '').upper()
+    struct = structure_memory.label_swing_structure(rows[-24:], left=2, right=2) or {}
+    out['event'] = event or None
+    out['bias'] = struct.get('bias')
+    if action == 'BUY' and event in ('CHOCH_UP', 'BOS_UP'):
+        out['ok'] = True
+        out['reason'] = event.lower()
+        return out
+    if action == 'SELL' and event in ('CHOCH_DOWN', 'BOS_DOWN'):
+        out['ok'] = True
+        out['reason'] = event.lower()
+        return out
+    # Soft: last tags flipped into our side (HL after LL for BUY, LH after HH for SELL).
+    if action == 'BUY' and struct.get('last_low_tag') == 'HL' and struct.get('bias') in ('UP', 'RANGE'):
+        out['ok'] = True
+        out['reason'] = 'hl_printed'
+        return out
+    if action == 'SELL' and struct.get('last_high_tag') == 'LH' and struct.get('bias') in ('DOWN', 'RANGE'):
+        out['ok'] = True
+        out['reason'] = 'lh_printed'
+        return out
+    out['reason'] = 'wait_structure_change'
+    return out
+
+
+def zone_confirm_allows(action, *, candles, zone, tick=0.01, store=None,
+                        require_both=None, require_confirm=None):
+    """Zone OPEN confirm — ON by default (1m guide: wait for confirmation).
+
+    Default AND: pin/engulf/impulse + structure. Invalidated zones never pass (Z03).
+    """
+    # Never confirm an already-invalidated zone (Z03).
+    if isinstance(zone, dict) and (
+            zone.get('invalidated') or str(zone.get('state') or '').upper() == 'INVALIDATED'):
+        return {
+            'ok': False,
+            'rejection': {'ok': False, 'reason': 'zone_invalidated', 'kind': None},
+            'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
+            'reason': 'zone_invalidated',
+            'confirm_required': False,
+        }
+    inv = zone_invalidation_status(zone, candles, tick=tick)
+    if inv.get('invalidated'):
+        return {
+            'ok': False,
+            'rejection': {'ok': False, 'reason': 'zone_invalidated', 'kind': None},
+            'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
+            'reason': 'zone_invalidated',
+            'invalidation': inv,
+            'confirm_required': False,
+        }
+    need_confirm = require_confirm
+    if need_confirm is None:
+        try:
+            from . import playbook_entry as _pb
+            need_confirm = _pb.zone_confirm_required(store)
+        except Exception:
+            need_confirm = True
+    if not need_confirm:
+        # Confirm off — still report candle evidence for Desk, but do not wait.
+        rej = rejection_candle(action, candles, zone, tick=tick)
+        st = micro_structure_confirm(action, candles, zone, tick=tick)
+        return {
+            'ok': True,
+            'rejection': rej,
+            'structure': st,
+            'require_both': False,
+            'confirm_required': False,
+            'reason': 'confirm_skipped',
+        }
+    rej = rejection_candle(action, candles, zone, tick=tick)
+    st = micro_structure_confirm(action, candles, zone, tick=tick)
+    and_mode = require_both
+    if and_mode is None:
+        try:
+            from . import playbook_entry as _pb
+            and_mode = _pb.zone_confirm_require_both(store)
+        except Exception:
+            and_mode = True
+    if and_mode:
+        ok = bool(rej.get('ok') and st.get('ok'))
+        if ok:
+            reason = (
+                'rejection+' + str(rej.get('kind'))
+                + '+structure+' + str(st.get('reason') or 'ok'))
+        elif not rej.get('ok') and not st.get('ok'):
+            reason = 'wait_zone_confirm'
+        elif not rej.get('ok'):
+            reason = 'wait_rejection (' + str(st.get('reason') or 'structure_ok') + ')'
+        else:
+            reason = 'wait_structure (' + str(rej.get('kind') or 'rejection_ok') + ')'
+    else:
+        ok = bool(rej.get('ok') or st.get('ok'))
+        reason = (
+            'rejection+' + str(rej.get('kind')) if rej.get('ok')
+            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
+        )
+    return {
+        'ok': ok,
+        'rejection': rej,
+        'structure': st,
+        'require_both': bool(and_mode),
+        'confirm_required': True,
+        'reason': reason,
+    }
 
 
 def _mtf_allows_side(action,mtf,params=None):
@@ -435,7 +843,7 @@ def _structure_break_side(mtf,zones):
     return None
 
 
-def m1_tape_agrees(action,candles,*,need=2):
+def m1_tape_agrees(action,candles,*,need=1):
     """Last ``need`` *completed* M1 bodies agree with action (BUY=green, SELL=red)."""
     action=(action or '').upper()
     need=max(1,int(need))
@@ -474,8 +882,8 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
     ``break_mtf_conf`` learn from closed £.
     """
     cfg=params if isinstance(params,dict) else DEFAULTS
-    tape_need=max(1,int(cfg.get('tape_need') or 2))
-    break_conf=float(cfg.get('break_mtf_conf') or 0.55)
+    tape_need=max(1,int(cfg.get('tape_need') or 1))
+    break_conf=float(cfg.get('break_mtf_conf') or 0.50)
     action=(action or '').upper()
     out={'ok':False,'reason':'no_break','side':None,'trigger':'break','tape_streak':0,
          'tape_need':tape_need}
@@ -513,8 +921,9 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
             return out
         out['reason']='break_needs_m1_or_mtf'
         return out
-    # Range break: completed close must already clear the swing — live mid alone
-    # is forming-bar chase against finished OHLC.
+    # Range break: prefer completed close past the swing. When MTF is aligned
+    # and M1 tape already agrees, allow live mid through the level mid-minute
+    # so the signal is not one closed bar late (extension_chase still blocks tip).
     if isinstance(zones,dict) and isinstance(mtf,dict) and mtf.get('ready'):
         hi=_finite(zones.get('range_hi'))
         lo=_finite(zones.get('range_lo'))
@@ -524,18 +933,30 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
         except (TypeError,ValueError):
             buf=0.01
         aligned=mtf_aligned or (mode=='SHIFT' and conf>=break_conf)
-        if (action=='BUY' and aligned and hi is not None and last_c is not None
-                and last_c>=(hi-buf) and p>=(hi-buf)
-                and (tape_ok or conf>=break_conf)):
-            out['ok']=True
-            out['reason']='ohlc_break_range_high'
-            return out
-        if (action=='SELL' and aligned and lo is not None and last_c is not None
-                and last_c<=(lo+buf) and p<=(lo+buf)
-                and (tape_ok or conf>=break_conf)):
-            out['ok']=True
-            out['reason']='ohlc_break_range_low'
-            return out
+        proof=tape_ok or conf>=break_conf
+        live_early=bool(aligned and tape_ok and conf>=break_conf)
+        if (action=='BUY' and aligned and hi is not None and p is not None
+                and p>=(hi-buf) and proof):
+            close_ok=last_c is not None and last_c>=(hi-buf)
+            if close_ok:
+                out['ok']=True
+                out['reason']='ohlc_break_range_high'
+                return out
+            if live_early and p>=hi:
+                out['ok']=True
+                out['reason']='ohlc_break_range_high_live'
+                return out
+        if (action=='SELL' and aligned and lo is not None and p is not None
+                and p<=(lo+buf) and proof):
+            close_ok=last_c is not None and last_c<=(lo+buf)
+            if close_ok:
+                out['ok']=True
+                out['reason']='ohlc_break_range_low'
+                return out
+            if live_early and p<=lo:
+                out['ok']=True
+                out['reason']='ohlc_break_range_low_live'
+                return out
     return out
 
 
@@ -562,14 +983,20 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         return meta
     mtf_ok,mtf_reason=_mtf_allows_side(action,mtf,params=cfg)
     meta['mtf_ok']=mtf_ok
+    from . import ohlc_scenarios
     if not mtf_ok:
         meta['reason']=mtf_reason
         meta['zones']=compute_entry_zones(
             candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
+        meta['scenario']=ohlc_scenarios.classify(
+            candles,mid=mid,zones=meta['zones'],tick=tick,store=store)
         return meta
     zones=compute_entry_zones(
         candles,mid=mid,tick=tick,spread=spread,mtf=mtf,store=store,params=cfg)
     meta['zones']=zones
+    scenario=ohlc_scenarios.classify(
+        candles,mid=mid,zones=zones,tick=tick,store=store)
+    meta['scenario']=scenario
     if not zones.get('ok'):
         meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
         return meta
@@ -587,15 +1014,42 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if price is None:
         meta['reason']='wait_entry_zone (no_price)'
         return meta
-    # --- Trigger A: break (catch the move — do not wait for pullback) ---
+    # --- Trigger A: break (structure) — scenario may veto blind range break ---
     br=break_trigger_allows(
         action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles,
         params=cfg)
     meta['break']=br
     if br.get('ok'):
-        meta['allowed']=True
-        meta['trigger']='break'
-        meta['reason']=br.get('reason') or 'ohlc_break_trigger'
+        # MTF/structure break already confirmed → treat as BREAKOUT tag so
+        # RANGE "prefer retest" does not veto a real BOS.
+        sc_for_break=dict(scenario or {})
+        mtf_br=None
+        if isinstance(mtf,dict):
+            mtf_br=mtf.get('structure_break')
+        if mtf_br in ('UP','DOWN') or str(br.get('reason') or '').startswith('ohlc_break'):
+            tags=list(sc_for_break.get('scenarios') or [])
+            tag=('BREAKOUT_UP' if action=='BUY' else 'BREAKOUT_DOWN')
+            if tag not in tags:
+                tags.append(tag)
+            sc_for_break['scenarios']=tags
+            if str(sc_for_break.get('scenario') or '') in ('RANGE','COMPRESSION','UNKNOWN'):
+                sc_for_break['scenario']=tag
+                sc_for_break['entry_hint']='BUY' if action=='BUY' else 'SELL'
+        sc_ok=ohlc_scenarios.scenario_allows_trigger(
+            action,sc_for_break,'break',store=store)
+        meta['scenario_gate']=sc_ok
+        if sc_ok.get('ok'):
+            meta['allowed']=True
+            meta['trigger']='break'
+            meta['reason']=br.get('reason') or 'ohlc_break_trigger'
+            return meta
+        # Fall through to zone/retest wait instead of chasing.
+        meta['break_blocked_by_scenario']=sc_ok.get('reason')
+    # Guide: never open zone-path in the middle of a range / compression box.
+    mid_block,mid_reason=ohlc_scenarios.mid_range_blocked(
+        action,scenario,price,tick=tick)
+    if mid_block:
+        meta['reason']=mid_reason or 'wait_mid_range'
         return meta
     if not zone:
         meta['reason']=f'wait_entry_zone (no_{action.lower()}_band)'
@@ -616,17 +1070,29 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if pref==action and conf>=wide_conf:
         buf=max(buf,float(tick or 0.01)*1.5)
         meta['wide_ohlc_touch']=True
-    # --- Trigger B: pullback zone (cheaper entry into structure) ---
-    if price_in_zone(zone,price,buffer=buf):
+    # --- Trigger B: pullback into Demand/Supply base + 1m confirm ---
+    if not price_in_zone(zone,price,buffer=buf):
+        lo=_finite(zone['lo']);hi=_finite(zone['hi'])
+        if action=='BUY' and price>hi:
+            meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
+        elif action=='SELL' and price<lo:
+            meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
+        else:
+            meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+        return meta
+    confirm=zone_confirm_allows(
+        action,candles=candles,zone=zone,tick=tick,store=store)
+    meta['confirm']=confirm
+    if confirm.get('ok'):
+        sc_ok=ohlc_scenarios.scenario_allows_trigger(
+            action,scenario,'zone',store=store)
+        meta['scenario_gate']=sc_ok
+        if not sc_ok.get('ok'):
+            meta['reason']=sc_ok.get('reason') or 'wait_scenario'
+            return meta
         meta['allowed']=True
         meta['trigger']='zone'
-        meta['reason']='ohlc_entry_zone_touch'
+        meta['reason']='ohlc_entry_zone_confirm'
         return meta
-    lo=_finite(zone['lo']);hi=_finite(zone['hi'])
-    if action=='BUY' and price>hi:
-        meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
-    elif action=='SELL' and price<lo:
-        meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
-    else:
-        meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+    meta['reason']=f"wait_zone_confirm ({confirm.get('reason') or 'rejection_and_structure'})"
     return meta

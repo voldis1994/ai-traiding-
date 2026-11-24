@@ -2063,6 +2063,45 @@ class SingleTradeEngine:
             "ORDER BY at ASC LIMIT 1",(epic,)).fetchone()
         return row[0] if row else None
 
+    def _market_context_needs_m1_pull(self):
+        """True when LIVE is blocked on candle history (not policy/fusion HOLD)."""
+        ctx=self.market_context or {}
+        if ctx.get('ready'):
+            return False
+        reason=str(ctx.get('reason') or '')
+        markers=(
+            'Missing MINUTE','Need at least','stale','contiguous',
+            'Invalid recent completed OHLC','Waiting for complete multi-timeframe',
+            'Waiting for completed candles',
+        )
+        return any(m in reason for m in markers)
+
+    def _recent_m1_has_hole(self,epic,minutes=61):
+        """Local store: last completed M1 window short, stale, or non-contiguous."""
+        from .market_context import MIN_BARS
+        rows=self.store.candles(epic,n=int(minutes)+10,historical_only=False) or []
+        cutoff=clock().replace(second=0,microsecond=0)
+        by={}
+        for raw in rows:
+            dt=candle_time(raw.get('at'))
+            if dt is None or dt>=cutoff:
+                continue
+            try:
+                o,h,l,c=(float(raw[k]) for k in ('open','high','low','close'))
+            except (TypeError,ValueError,KeyError):
+                continue
+            if not all(math.isfinite(v) for v in (o,h,l,c)) or min(o,h,l,c)<=0:
+                continue
+            by[dt]=True
+        if len(by)<min(int(MIN_BARS),int(minutes)):
+            return True
+        latest=max(by)
+        if cutoff-latest>timedelta(minutes=3):
+            return True
+        # Same window as market_features (61 bars ending at latest).
+        timeline=[latest-timedelta(minutes=i) for i in range(int(minutes)-1,-1,-1)]
+        return any(t not in by for t in timeline)
+
     def _ingest_broker_price_rows(self,epic,prices):
         """Persist completed broker M1 bars as HISTORICAL (never the forming bucket)."""
         current_bucket=candle_bucket(now())
@@ -2151,15 +2190,37 @@ class SingleTradeEngine:
                 self.repair_broker_pnl_currencies()
             except Exception as exc:self.store.event('warning','Account refresh unsuccessful',{'type':type(exc).__name__})
         if not self.mandate or not hasattr(self.broker,'prices'):return
+        epic=self.mandate['epic']
         need=recommended_live_history_bars(self.store)
-        have=self._historical_candle_count(self.mandate['epic'])
-        # Eager: if history is thin, pull broker archive now — do not wait for M1 clock.
-        # ~5 polls (~15s) keeps QUOTE→HISTORICAL rewrite tight so MTF ADX/ATR
-        # do not flicker OFF while closed minutes still sit as QUOTE.
-        due=(self.tick_count-self.last_candle_tick>=5) or (have<need)
+        have=self._historical_candle_count(epic)
+        # One-shot bootstrap flag; afterwards sparse delta — unless 60m has a hole.
+        boot_key='candle_bootstrap_done:'+str(epic)
+        boot_done=bool(self.store.get(boot_key))
+        hole=(self._market_context_needs_m1_pull()
+              or self._recent_m1_has_hole(epic))
+        if (not boot_done and have<need) or hole:
+            # Contiguous 60m hole or thin hist → pull FULL need from Capital NOW.
+            # Do not wait for live M1 accumulation ("Gaida Missing MINUTE" while
+            # broker already has the bars). 2-tick floor only avoids hammering
+            # Capital every poll if the broker itself still lacks a minute.
+            if (self.last_candle_tick is not None
+                    and (self.tick_count-self.last_candle_tick)<2
+                    and hole and boot_done):
+                return
+            self.last_candle_tick=self.tick_count
+            after=await self._bootstrap_historical_candles(epic,need=need)
+            if after>=need and not self._recent_m1_has_hole(epic):
+                self.store.set(boot_key,{'at':now(),'need':need,'have':after})
+            elif hole and boot_done:
+                # Count-based "done" lied — keep forcing full pulls until contiguous.
+                self.store.set(boot_key,None)
+            return
+        # Delta: at most every ~60 heavy polls once bootstrapped (or if thin again).
+        gap=60 if boot_done else 5
+        due=(self.tick_count-self.last_candle_tick>=gap) or (have<need)
         if not due:return
         self.last_candle_tick=self.tick_count
-        await self._bootstrap_historical_candles(self.mandate['epic'],need=need)
+        await self._bootstrap_historical_candles(epic,need=need)
     async def poll(self):
         async with self.lock:
             await self.sync()
@@ -6118,13 +6179,21 @@ class SingleTradeEngine:
                     kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
             except (TypeError,AttributeError):
                 kama_hint=None
-            # tighten∈(0,1] shrinks SL/TP toward entry — break needs a closer stop.
-            break_tighten=0.85 if zone_gate.get('trigger')=='break' else 1.0
+            # Regime SL/TP owns break/zone geometry — no invented break tighten.
+            entry_zone=zone_gate.get('zone') if isinstance(zone_gate,dict) else None
+            scenario=(zone_gate.get('scenario')
+                      if isinstance(zone_gate,dict) else None)
+            zones_card=(zone_gate.get('zones')
+                        if isinstance(zone_gate,dict) else None)
+            trigger_name=(zone_gate.get('trigger')
+                          if isinstance(zone_gate,dict) else None)
             decided=bracket_learn.decide_brackets_from_ohlc(
                 zone,tick=tick,spread=spread,min_distance=minimum,
-                tighten=float(pkg.get('tighten') or 1.0)*break_tighten,
+                tighten=float(pkg.get('tighten') or 1.0),
                 entry=entry,action=action,candles=candles,atr=atr_hint,
-                kama=kama_hint,require_swing=True,store=self.store)
+                kama=kama_hint,require_swing=True,store=self.store,
+                entry_zone=entry_zone,scenario=scenario,zones=zones_card,
+                trigger=trigger_name)
             # Live OPEN must use OHLC swing SL/TP — never invent median ±distance.
             if not decided.get('ready') or decided.get('stop_distance') is None \
                     or decided.get('profit_distance') is None:

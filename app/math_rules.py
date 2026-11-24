@@ -251,6 +251,24 @@ def _min_ticks(minimum, tick):
     return n if n >= 1 else 1
 
 
+def snap_distance_to_tick(distance, tick_size):
+    """Ceil a price distance onto the broker tick grid (no min inflate)."""
+    try:
+        d = D(str(distance)) if not isinstance(distance, Decimal) else D(distance)
+    except Exception:
+        d = D(distance)
+    tick = D(str(tick_size)) if not isinstance(tick_size, Decimal) else D(tick_size)
+    if tick <= 0:
+        raise ValueError('tick must be positive')
+    if d <= 0 or not d.is_finite():
+        raise ValueError('distance must be positive')
+    ratio = d / tick
+    ticks = int((ratio - D('1e-9')).to_integral_value(rounding=ROUND_CEILING))
+    if ticks < 1:
+        ticks = 1
+    return float(tick * ticks), int(ticks)
+
+
 def distances_meet_broker_min(stop_distance, profit_distance, min_distance, eps=None):
     """True iff both SL and TP distances meet broker min after all rounding.
 

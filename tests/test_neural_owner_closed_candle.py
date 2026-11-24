@@ -237,10 +237,11 @@ def test_position_exit_market_closes_on_confirmed_reverse(monkeypatch):
                 clock[0]+=timedelta(minutes=1)
                 await e.poll()
                 if exits:break
-            assert exits  # confirmed reverse must leave the wrong side
+            assert not exits  # neural reverse is diagnostic — broker SL/TP/TP1 only
             snap=e.snapshot()
-            assert snap.get('neural_market_exit') is True
+            assert snap.get('neural_market_exit') is False
+            assert snap.get('neural_close_executable') is False
             events=store.recent(50)
-            assert any(ev.get('kind')=='exit' and 'confirmed reverse' in str(ev.get('message','')).lower()
+            assert any(ev.get('kind')=='exit' and 'diagnostic' in str(ev.get('message','')).lower()
                        for ev in events)
     asyncio.run(scenario())

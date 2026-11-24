@@ -185,9 +185,9 @@ def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic(
         assert snap['minute_direction_accuracy'] == pytest.approx(0.4)
         assert snap['trade_win_rate'] == pytest.approx(1.0)
         assert snap['model_score_is_calibrated_profit_probability'] is False
-        assert snap['neural_close_diagnostic_only'] is False
-        assert snap['neural_market_exit'] is True
-        assert snap['neural_close_executable'] is True
+        assert snap['neural_close_diagnostic_only'] is True
+        assert snap['neural_market_exit'] is False
+        assert snap['neural_close_executable'] is False
         assert 'evolved policy' in snap['neural_entry_rule'].lower()
         assert 'policy_live_execute' in snap['neural_entry_rule']
         assert snap['metric_labels']['minute_direction_accuracy']

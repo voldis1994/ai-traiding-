@@ -6,9 +6,9 @@ Default ON via ``self_params.playbook_hard_entry``. When hard:
   • Flow fight can hard-block
   • Regime SL prefers HL/LH tags, break-candle extreme, sweep wick
 
-Zone candle confirm (pin/engulf/structure) is ON by default —
-``playbook_require_zone_confirm=1`` + ``playbook_zone_confirm_and=1``:
-rejection (pin/engulf/impulse) AND structure change required (1m guide).
+Zone candle confirm (pin/engulf/structure) is OFF by default —
+``playbook_require_zone_confirm=0``: price touch/cross of the entry zone
+is enough for OPEN (no wait for a special confirm candle).
 """
 from __future__ import annotations
 
@@ -63,12 +63,12 @@ def session_allows_open(*, now=None, store=None) -> dict:
 
 
 def zone_confirm_required(store=None) -> bool:
-    """Guide default ON: wait for pin/engulf/impulse (+ structure when AND)."""
+    """When False (default), zone touch/cross opens — no pin/structure wait."""
     try:
         from .self_params import get as sp_get
-        return int(sp_get(store, 'playbook_require_zone_confirm', 1)) == 1
+        return int(sp_get(store, 'playbook_require_zone_confirm', 0)) == 1
     except Exception:
-        return True
+        return False
 
 
 def zone_confirm_require_both(store=None) -> bool:
@@ -79,9 +79,9 @@ def zone_confirm_require_both(store=None) -> bool:
         return False
     try:
         from .self_params import get as sp_get
-        return int(sp_get(store, 'playbook_zone_confirm_and', 1)) == 1
+        return int(sp_get(store, 'playbook_zone_confirm_and', 0)) == 1
     except Exception:
-        return True
+        return False
 
 
 def break_candle_extreme(action, candles):

@@ -11,12 +11,12 @@ let deskStructureInFlight=null;
 let lastDeskChartKey='';
 const deskPrevFields=new Map(); // clientId → {field: previous string}
 const deskPrevTicks=new Map();  // clientId → {tick, at}
-// Desk must feel live vs phone — Capital quotes tick; UI was 2.5–10s poll-only.
-const POLL_IDLE_MS=5000;
-const POLL_LIVE_MS=1500;
-const POLL_DESK_MS=800;
+// Desk near tick rate — Capital WS is live; UI poll must not lag far behind.
+const POLL_IDLE_MS=3000;
+const POLL_LIVE_MS=800;
+const POLL_DESK_MS=400;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
-const OHLC_REFRESH_MS=1000;
+const OHLC_REFRESH_MS=500;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();

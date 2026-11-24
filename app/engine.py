@@ -2258,6 +2258,45 @@ class SingleTradeEngine:
             "ORDER BY at ASC LIMIT 1",(epic,)).fetchone()
         return row[0] if row else None
 
+    def _market_context_needs_m1_pull(self):
+        """True when LIVE is blocked on candle history (not policy/fusion HOLD)."""
+        ctx=self.market_context or {}
+        if ctx.get('ready'):
+            return False
+        reason=str(ctx.get('reason') or '')
+        markers=(
+            'Missing MINUTE','Need at least','stale','contiguous',
+            'Invalid recent completed OHLC','Waiting for complete multi-timeframe',
+            'Waiting for completed candles',
+        )
+        return any(m in reason for m in markers)
+
+    def _recent_m1_has_hole(self,epic,minutes=61):
+        """Local store: last completed M1 window short, stale, or non-contiguous."""
+        from .market_context import MIN_BARS
+        rows=self.store.candles(epic,n=int(minutes)+10,historical_only=False) or []
+        cutoff=clock().replace(second=0,microsecond=0)
+        by={}
+        for raw in rows:
+            dt=candle_time(raw.get('at'))
+            if dt is None or dt>=cutoff:
+                continue
+            try:
+                o,h,l,c=(float(raw[k]) for k in ('open','high','low','close'))
+            except (TypeError,ValueError,KeyError):
+                continue
+            if not all(math.isfinite(v) for v in (o,h,l,c)) or min(o,h,l,c)<=0:
+                continue
+            by[dt]=True
+        if len(by)<min(int(MIN_BARS),int(minutes)):
+            return True
+        latest=max(by)
+        if cutoff-latest>timedelta(minutes=3):
+            return True
+        # Same window as market_features (61 bars ending at latest).
+        timeline=[latest-timedelta(minutes=i) for i in range(int(minutes)-1,-1,-1)]
+        return any(t not in by for t in timeline)
+
     def _ingest_broker_price_rows(self,epic,prices):
         """Persist completed broker M1 bars as HISTORICAL (never the forming bucket)."""
         current_bucket=candle_bucket(now())
@@ -2354,11 +2393,23 @@ class SingleTradeEngine:
         # P1-05: one-shot bootstrap; afterwards only sparse delta / gap fill.
         boot_key='candle_bootstrap_done:'+str(epic)
         boot_done=bool(self.store.get(boot_key))
-        if not boot_done and have<need:
+        hole=(self._market_context_needs_m1_pull()
+              or self._recent_m1_has_hole(epic))
+        if (not boot_done and have<need) or hole:
+            # Contiguous 60m hole or thin hist → pull FULL need from Capital NOW.
+            # Do not wait ~60 heavy polls / live M1 accumulation (user-facing
+            # "Gaida Missing MINUTE" while broker already has the bars).
+            # 2-tick floor only avoids hammering Capital every 1s if the broker
+            # itself still lacks a minute (session gap) — never a 60s starve.
+            if self.last_candle_tick and (self.tick_count-self.last_candle_tick)<2 and hole and boot_done:
+                return
             self.last_candle_tick=self.tick_count
             after=await self._bootstrap_historical_candles(epic,need=need)
-            if after>=need:
+            if after>=need and not self._recent_m1_has_hole(epic):
                 self.store.set(boot_key,{'at':now(),'need':need,'have':after})
+            elif hole and boot_done:
+                # Count-based "done" lied — keep forcing full pulls until contiguous.
+                self.store.set(boot_key,None)
             return
         # Delta: at most every ~60 heavy polls once bootstrapped (or if thin again).
         gap=60 if boot_done else 5

@@ -75,3 +75,31 @@ def test_account_and_candles_eager_when_history_thin():
         asyncio.run(eng._account_and_candles())
         assert eng._historical_candle_count('GOLD') >= need
         assert len(eng.broker.calls) >= 1
+
+
+def test_account_and_candles_forces_full_pull_on_missing_minute_gap():
+    """After bootstrap_done, a 60m hole must re-download NOW — not wait 60 polls."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'db.sqlite3')
+        brain = AdaptiveBrain(store, data_dir=d)
+        eng = SingleTradeEngine(store, brain)
+        need = recommended_live_history_bars(store)
+        eng.broker = FakeBroker(n=max(400, need + 50))
+        eng.mandate = {'epic': 'GOLD', 'size': '0.1'}
+        # Pretend bootstrap already finished (count-based) and sparse cadence
+        # would skip (last pull was this tick).
+        store.set('candle_bootstrap_done:GOLD', {'at': '2026-11-15T12:00:00+00:00',
+                                                 'need': need, 'have': need})
+        # Mid sparse window (gap=60): OLD path would skip; hole must force pull.
+        eng.tick_count = 100
+        eng.last_candle_tick = 50
+        eng.last_account_tick = 100
+        eng.market_context = {
+            'ready': False,
+            'reason': 'Missing MINUTE candles in 60-minute context; waiting for contiguous history',
+        }
+        before = len(eng.broker.calls)
+        asyncio.run(eng._account_and_candles())
+        assert len(eng.broker.calls) > before
+        assert eng.broker.calls[-1]['maximum'] == need
+        assert eng._historical_candle_count('GOLD') >= need

@@ -1961,14 +1961,31 @@ class SingleTradeEngine:
                         hlen=-1
                     if hlen==getattr(self.brain.core,'n',None):
                         tick_sz=_num((self.market or {}).get('tick'))
-                        self.store.set(key,{
+                        # Stamp OHLC zone/scenario even when OPEN was not from
+                        # a zone touch — close teachers (observe/audit) still
+                        # need the box so neurons improve on £ outcomes.
+                        ohlc_meta={}
+                        try:
+                            gate=self._ohlc_entry_zone_gate(
+                                p.get('direction'),
+                                mtf_analysis=(self._mtf_momentum_analysis()
+                                              if hasattr(self,'_mtf_momentum_analysis')
+                                              else None))
+                            ohlc_meta=ohlc_entry_zones.open_meta_from_gate(
+                                gate,action=p.get('direction'))
+                        except Exception:
+                            ohlc_meta={}
+                        payload={
                             'epic':p['epic'],'direction':p.get('direction'),
                             'entry':p.get('level'),'tick_size':tick_sz,
                             'entry_spread':_num((self.market or {}).get('spread')),
                             'transition':self.brain._json_transition(tr),
                             'scores':(self.last_signal or {}).get('scores'),
                             'shadow_scores':self._shadow_scores_now(),
-                            'captured':'manual_adopt'})
+                            'captured':'manual_adopt'}
+                        if ohlc_meta:
+                            payload['ohlc_entry']=ohlc_meta
+                        self.store.set(key,payload)
                 if fresh_session and open_in_flight:
                     self._supersede_stale_open_orders(deal_id)
                 self.store.event('adoption','Live broker position adopted for this session',
@@ -2860,15 +2877,19 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=regime_gate.get('reason') or 'no_trade_ohlc',
                             proposal=result.get('proposal') or result['action'])
-            # OHLC entry zone + MTF (KAMA/ADX/ATR): neural side only fires when
-            # price is IN the structural band AND the indicator stack agrees.
+            # OHLC entry zone + MTF (KAMA/ADX/ATR): LIVE OPEN waits for the
+            # structural band, but neural side is still recognized (proposal /
+            # neural_side) so close teachers + UI see the vote even outside zone.
             zone_gate=self._ohlc_entry_zone_gate(
                 result['action'],mtf_analysis=mtf_analysis)
-            result=dict(result,ohlc_entry_zone=zone_gate)
+            neural_side=result.get('action')
+            result=dict(result,ohlc_entry_zone=zone_gate,
+                        neural_side=neural_side)
             if not zone_gate.get('allowed'):
                 return dict(result,action='HOLD',
                             reason=zone_gate.get('reason') or 'wait_entry_zone',
-                            proposal=result.get('proposal') or result['action'])
+                            proposal=result.get('proposal') or neural_side,
+                            neural_side=neural_side)
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(
@@ -5202,6 +5223,23 @@ class SingleTradeEngine:
                     broker_pnl=pnl_value,spread=spread_cost)
             except Exception as exc:
                 self.store.event('warning','OHLC entry gates learn skipped',
+                                 {'type':type(exc).__name__,'deal_id':deal_id})
+            try:
+                from . import ohlc_scenarios
+                ohlc_meta=(saved.get('ohlc_entry')
+                           if isinstance(saved,dict) else None)
+                sc_meta=None
+                if isinstance(ohlc_meta,dict):
+                    sc_meta=ohlc_meta.get('scenario')
+                ohlc_scenarios.audit_close(
+                    self.store,
+                    scenario_meta=sc_meta if isinstance(sc_meta,dict) else None,
+                    ohlc_meta=ohlc_meta if isinstance(ohlc_meta,dict) else None,
+                    candles=self._decision_candles(epic),
+                    broker_pnl=pnl_value,spread=spread_cost,
+                    entry=entry,exit_px=exit_level,action=direction)
+            except Exception as exc:
+                self.store.event('warning','OHLC scenario audit skipped',
                                  {'type':type(exc).__name__,'deal_id':deal_id})
             try:
                 edge_meta=None

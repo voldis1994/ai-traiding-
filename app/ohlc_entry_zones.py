@@ -157,13 +157,26 @@ def open_meta_from_gate(gate: dict, *, action) -> dict:
 
 
 def observe_close(store, *, ohlc_meta=None, broker_pnl=None, spread=0.0):
-    """Adapt band / break knobs from break|zone OPEN outcomes (after costs)."""
+    """Adapt band / break knobs from OPEN outcomes (after costs).
+
+    Neurons / gate teachers must still learn when the deal was *not* stamped
+    as a pure zone|break OPEN (manual adopt, orphan meta, blank trigger) —
+    if a Demand/Supply box or neural side is on the meta, treat losses as
+    zone-selectivity feedback so the robot improves on £ minuses.
+    """
     meta = ohlc_meta if isinstance(ohlc_meta, dict) else {}
     if not meta:
         return {'adapted': False, 'reason': 'no_ohlc_meta'}
     trigger = str(meta.get('trigger') or '').lower()
+    has_zone = isinstance(meta.get('zone'), dict) and (
+        meta['zone'].get('lo') is not None or meta['zone'].get('hi') is not None)
+    neural_side = str(meta.get('action') or '').upper() in ('BUY', 'SELL')
     if trigger not in ('break', 'zone'):
-        return {'adapted': False, 'reason': 'no_trigger'}
+        # Non-zone / blank trigger: still teach from the stamped box or side.
+        if has_zone or neural_side or meta.get('allowed'):
+            trigger = 'zone'
+        else:
+            return {'adapted': False, 'reason': 'no_trigger'}
     pnl = _finite(broker_pnl)
     if pnl is None:
         return {'adapted': False, 'reason': 'no_pnl'}

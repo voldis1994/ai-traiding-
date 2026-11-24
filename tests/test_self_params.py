@@ -69,7 +69,7 @@ def test_learn_lr_only_two_decimal_places():
         raw=store.get(STORE_KEY)
         assert raw['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
         assert raw['learn_win_repeats'] <= 3
-        assert raw['learn_loss_repeats'] <= 3
+        assert raw['learn_loss_repeats'] <= 5
         assert migrate_soft_ceilings(store) is None  # idempotent
         # Meaningful loss calms LR by exactly one hundredth (no amplify-mistakes).
         before=get(store,'learn_lr')
@@ -90,10 +90,12 @@ def test_scratch_loss_does_not_ratchet_hold_repeats():
         before=load(store)['learn_loss_repeats']
         evolve_from_feedback(store,broker_pnl=-0.02)
         assert load(store)['learn_loss_repeats']==before
+        # Meaningful £ minus bumps loss repeats so neurons improve (asymmetric).
         evolve_from_feedback(store,broker_pnl=-1.5)
         after=load(store)['learn_loss_repeats']
         win=load(store)['learn_win_repeats']
-        assert after<=win  # loss repeats never exceed win path
+        assert after == before + 1
+        assert after >= win  # loss teacher may exceed win path
 
 
 def test_exec_friction_evolves_from_broker_and_shadow():

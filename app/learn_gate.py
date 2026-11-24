@@ -180,9 +180,10 @@ def recent_cash_degradation(store=None, *, history=None, window=5,
     }
 
 
-# Live dump smoking gun: KEEP on −£ trades with tiny minute-holdout lifts
-# (+0.0417) while cash OOS was already red. Demand a clear lift instead.
-LOSS_IN_RED_CASH_MIN_LIFT = 0.08
+# Live dump smoking gun: KEEP on −£ trades with *noise* minute-holdout lifts
+# while cash OOS was already red. Still demand a real lift — but not so high
+# that loss ΔW never sticks (neurons must improve on £ minuses).
+LOSS_IN_RED_CASH_MIN_LIFT = 0.03
 
 
 def decide_keep(score_before, score_after, *, cash=None, store=None,

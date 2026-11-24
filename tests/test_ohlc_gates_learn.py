@@ -87,3 +87,21 @@ def test_scratch_pnl_does_not_adapt():
             broker_pnl=0.01, spread=0.2)
         assert out['adapted'] is False
         assert out['reason'] == 'scratch_band'
+
+
+def test_observe_close_learns_loss_without_zone_trigger():
+    """Manual / blank-trigger opens still teach gate knobs on £ minuses."""
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(Path(d) / 'robot.sqlite3')
+        before = oez.load_params(store)
+        out = oez.observe_close(
+            store,
+            ohlc_meta={
+                'trigger': None, 'action': 'BUY', 'allowed': False,
+                'zone': {'lo': 100.0, 'hi': 100.5, 'side': 'BUY'},
+            },
+            broker_pnl=-1.8, spread=0.1)
+        assert out['adapted'] is True, out
+        assert 'narrow_zone_after_loss' in (out.get('notes') or [])
+        after = oez.load_params(store)
+        assert after['band_span_frac'] < before['band_span_frac']

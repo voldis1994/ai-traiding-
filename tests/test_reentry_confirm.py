@@ -118,12 +118,15 @@ def test_engine_reentry_gate_blocks_amplified_buy_without_ohlc():
     """Engine helper: raw SELL vs nudged BUY → HOLD when OHLC is quiet."""
     from app.autonomy import AutoEvolution
     from app.engine import SingleTradeEngine
+    from app.self_params import DEFAULTS, save
     from tests.test_learning_integrity import new_brain
 
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         brain.tick(100, .05, .01, 'GOLD')
         e = SingleTradeEngine(store, brain)
+        # After engine boot (PR #181 forces gate OFF) — opt in for this path.
+        save(store, {**DEFAULTS, 'reentry_confirm_enabled': 1}, reason='test')
         e.policy = AutoEvolution(store, Path(d) / 'policy.py')
         e.mandate = {'epic': 'GOLD', 'size': '0.02'}
         e.market_context = {'trend': 'MIXED', 'close': 2655}
@@ -143,12 +146,14 @@ def test_engine_reentry_gate_ohlc_overrides_cross():
     """Strong OHLC BUY overrides raw SELL cross — entry allowed."""
     from app.autonomy import AutoEvolution
     from app.engine import SingleTradeEngine
+    from app.self_params import DEFAULTS, save
     from tests.test_learning_integrity import new_brain
 
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         brain.tick(100, .05, .01, 'GOLD')
         e = SingleTradeEngine(store, brain)
+        save(store, {**DEFAULTS, 'reentry_confirm_enabled': 1}, reason='test')
         e.policy = AutoEvolution(store, Path(d) / 'policy.py')
         e.mandate = {'epic': 'GOLD', 'size': '0.02'}
         e.market_context = {'trend': 'UP', 'close': 2655}

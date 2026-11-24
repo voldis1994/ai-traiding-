@@ -202,7 +202,8 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
 
     buffer, tick_f, _sp, atr_v = _buf(tick, spread, atr)
     floor = _floor(min_distance, buffer, atr_v)
-    min_rr = max(1.5, float(out['min_rr'] or DEFAULT_MIN_RR))
+    # PR #181 restore: honor Store/seed min_rr (1.0), not a hard 1.5 floor.
+    min_rr = max(1.0, float(out['min_rr'] or DEFAULT_MIN_RR))
     sc = scenario if isinstance(scenario, dict) else {}
     name = str(sc.get('scenario') or 'UNKNOWN').upper()
     trig = str(trigger or '').lower()
@@ -431,16 +432,32 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
                     tp1_level=tp1, tp2_level=tp2, regime=name)
 
     rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
-    # ATR/broker floor can widen SL past the structural TP — that is inverted
-    # risk (TP shorter than SL). Refuse; caller may try swing or skip OPEN.
+    # PR #181 restore: soft-cap SL toward entry when RR < 1 instead of hard refuse.
+    rr_capped = False
     if rr_now + 1e-12 < 1.0:
-        return dict(
-            out, reason='regime_rr_below_one',
-            stop_distance=float(stop_d), profit_distance=float(tp2_d),
-            stop_level=float(stop), profit_level=float(tp2),
-            tp1_level=float(tp1), tp2_level=float(tp2),
-            regime=name, rr=float(rr_now), min_rr=float(min_rr),
-            structural_tp=True, structural_rr=False)
+        capped = float(tp2_d) / 1.0
+        if floor > 0 and capped + 1e-12 < floor:
+            return dict(
+                out, reason='regime_rr_below_one',
+                stop_distance=float(stop_d), profit_distance=float(tp2_d),
+                stop_level=float(stop), profit_level=float(tp2),
+                tp1_level=float(tp1), tp2_level=float(tp2),
+                regime=name, rr=float(rr_now), min_rr=float(min_rr),
+                structural_tp=True, structural_rr=False)
+        if capped + 1e-12 < stop_d:
+            stop_d = float(capped)
+            stop = (entry_f - stop_d) if action == 'BUY' else (entry_f + stop_d)
+            rr_now = (float(tp2_d) / float(stop_d)) if stop_d > 1e-12 else 0.0
+            rr_capped = True
+            reason = str(reason or 'regime') + '+rr_cap_sl'
+        else:
+            return dict(
+                out, reason='regime_rr_below_one',
+                stop_distance=float(stop_d), profit_distance=float(tp2_d),
+                stop_level=float(stop), profit_level=float(tp2),
+                tp1_level=float(tp1), tp2_level=float(tp2),
+                regime=name, rr=float(rr_now), min_rr=float(min_rr),
+                structural_tp=True, structural_rr=False)
 
     # Broker profit = TP2 (long) / single TP (short). Scale-out only on BUY.
     return {
@@ -457,6 +474,7 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         'tp2_distance': float(tp2_d),
         'swing_hi': float(tp2) if action == 'BUY' else float(stop),
         'swing_lo': float(stop) if action == 'BUY' else float(tp2),
+        'rr_capped': bool(rr_capped),
         'kappa': float(rr_now) if rr_now > 0 else min_rr,
         'min_rr': float(min_rr),
         'rr': float(rr_now),

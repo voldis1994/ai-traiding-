@@ -62,7 +62,7 @@ def load_params(store=None) -> dict:
         return out
     try:
         from .self_params import get as sp_get
-        out['enabled'] = int(sp_get(store, 'reentry_confirm_enabled', 1))
+        out['enabled'] = int(sp_get(store, 'reentry_confirm_enabled', 0))
         out['raw_strong'] = float(sp_get(store, 'reentry_raw_strong', DEFAULTS['raw_strong']))
         out['raw_medium'] = float(sp_get(store, 'reentry_raw_medium', DEFAULTS['raw_medium']))
         out['raw_weak'] = float(sp_get(store, 'reentry_raw_weak', DEFAULTS['raw_weak']))

@@ -25,7 +25,12 @@ def test_swing_sl_uses_ohlc_candle_not_atr_formula():
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=atr, zone=zone)
     assert swing.get('ready') is True
-    assert float(swing['stop_level']) <= 108.5 + 1e-6
+    # Structural pivot ~108.5; PR #181 may soft-cap SL closer for min RR.
+    if not swing.get('rr_capped'):
+        assert float(swing['stop_level']) <= 108.5 + 1e-6
+    else:
+        assert float(swing['stop_level']) < entry
+        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
     assert abs(float(swing['stop_level']) - (entry - 0.5 * atr)) > 0.05
 
 

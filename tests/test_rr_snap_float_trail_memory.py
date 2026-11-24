@@ -38,8 +38,8 @@ def test_rr_rechecked_after_tick_snap_example():
     # LIVE decide_brackets must NOT apply that invented distance (see below).
 
 
-def test_swing_after_snap_refuses_formula_tp_not_ohlc_pivot(monkeypatch):
-    """After snap, RR shortfall must NOT invent entry+stop×min_rr as TP."""
+def test_swing_after_snap_soft_caps_sl_never_invents_tp(monkeypatch):
+    """After snap, RR shortfall soft-caps SL (#181) — never invents formula TP."""
     from app import bracket_learn
 
     # Swing ready with RR=1.6; large broker min forces SL raise → RR collapses.
@@ -48,7 +48,7 @@ def test_swing_after_snap_refuses_formula_tp_not_ohlc_pivot(monkeypatch):
         'stop_distance': 1.0, 'profit_distance': 1.6,
         'stop_level': 99.0, 'profit_level': 101.6,
         'swing_hi': 101.6, 'swing_lo': 99.0,
-        'rr': 1.6, 'min_rr': 1.5, 'kappa': 1.6,
+        'rr': 1.6, 'min_rr': 1.0, 'kappa': 1.6,
     }
     monkeypatch.setattr(bracket_learn, 'swing_anchor_brackets', lambda **kw: fake)
     # No farther pivots available → structural extend must fail.
@@ -62,14 +62,16 @@ def test_swing_after_snap_refuses_formula_tp_not_ohlc_pivot(monkeypatch):
     out = bracket_learn.decide_brackets_from_ohlc(
         zone, tick=0.1, spread=0.0, min_distance=2.0, tighten=1.0,
         entry=100.0, action='BUY', candles=candles, require_swing=True)
-    # SL raised to broker min (2.0); TP stays 1.6 → RR 0.8 < 1.5.
-    # Must refuse — never ship invented TP=3.0 (2.0×1.5).
+    # SL raised to broker min (2.0); TP stays 1.6 → need SL≤1.6 for RR≥1.
+    # Floor 2.0 blocks soft-cap → refuse. Never invent TP=2.0 (or 3.0).
     assert out['source'] == 'swing_anchor'
     assert out.get('ready') is False
     assert out.get('reason') in (
-        'rr_below_min_after_snap', 'below_broker_min_after_snap')
+        'rr_unachievable_vs_floor', 'rr_below_min_after_snap',
+        'below_broker_min_after_snap')
     if out.get('profit_distance') is not None:
         assert abs(float(out['profit_distance']) - 3.0) > 1e-9
+        assert abs(float(out['profit_distance']) - 2.0) > 1e-9
 
 
 def test_decide_brackets_ignores_cosmetic_tighten_on_swing(monkeypatch):

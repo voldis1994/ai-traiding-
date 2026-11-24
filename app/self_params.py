@@ -117,9 +117,8 @@ DEFAULTS = {
     'bracket_scratch_kappa_step': 0.97,
     'bracket_batch_raise_step': 1.08,
     'bracket_batch_cut_step': 0.92,
-    # Min reward:risk — after far-SL ATR cap, SL may shrink further so TP/SL >= this.
-    # Seed >1 so we never celebrate equal SL=TP mirrors.
-    'bracket_min_rr': 1.5,
+    # PR #181 baseline (temporary restore): min RR 1.0 + soft-cap SL, not invent TP.
+    'bracket_min_rr': 1.0,
     # Swing SL beyond this × ATR is "unrealistically far" — pull toward entry.
     'bracket_sl_max_atr': 2.0,
     # LIVE OPEN prep/eval floors (seeds) — robot-owned, not frozen module consts.
@@ -192,18 +191,18 @@ DEFAULTS = {
     'gold_strat_chop_hold': 0,
     'gold_strat_chop_min_edge': 0.18,
     'gold_strat_soft_nudge': 0.18,
-    # M1 multi-source Order Flow + Liquidity + Impact — affects LIVE OPEN.
+    # M1 multi-source Order Flow + Liquidity + Impact — soft nudge only.
     'flow_consensus_nudge': 0.18,
-    # 1 = HOLD when ≥N free sources agree against the proposed side.
-    'flow_consensus_block_fights': 1,
+    # PR #181 restore: do not hard-HOLD when flow fights the neural side.
+    'flow_consensus_block_fights': 0,
     'flow_consensus_block_min_agree': 2,
     # Pillar vote thresholds (bounded liquidity features) — tunable, not frozen.
     'flow_pillar_impulse': 0.12,
     'flow_pillar_vol_z': 0.20,
     'flow_pillar_imbalance': 0.18,
     'flow_pillar_impact': 0.15,
-    # Re-entry confirm — audit: <1min same-dir re-open after loss −£14.24 / 176.
-    'reentry_confirm_enabled': 1,
+    # PR #181 restore: re-entry confirm off — was blocking most follow-on OPENs.
+    'reentry_confirm_enabled': 0,
     'reentry_raw_strong': 0.20,
     'reentry_raw_medium': 0.12,
     'reentry_raw_weak': 0.07,
@@ -302,7 +301,7 @@ BOUNDS = {
     'bracket_scratch_kappa_step': (0.85, 0.99),
     'bracket_batch_raise_step': (1.02, 1.2),
     'bracket_batch_cut_step': (0.8, 0.98),
-    'bracket_min_rr': (1.0, 2.5),
+    'bracket_min_rr': (0.6, 2.5),
     'bracket_sl_max_atr': (1.0, 4.0),
     'min_prep_candles': (64, 240),
     'train_frac': (0.55, 0.85),

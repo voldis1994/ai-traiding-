@@ -2960,6 +2960,15 @@ class SingleTradeEngine:
         except Exception as exc:
             result=dict(result,flow_decision={
                 'effect': 'error', 'reason': type(exc).__name__})
+        # Neural HOLD waits for the next closed M1. If live mid already touches
+        # Demand/Supply or breaks the range, promote now — candle close is not
+        # the OPEN clock (side still needs MTF/score lean).
+        if result.get('action') not in ('BUY','SELL'):
+            promoted=self._try_live_ohlc_open(
+                result,base_scores=base_scores,nudged_scores=nudged_scores,
+                mtf_analysis=mtf_analysis)
+            if promoted is not None:
+                result=promoted
         if result['action'] in ('BUY','SELL'):
             # Soft evidence stack — neural BUY/SELL stays. Broker physics + Pause
             # alone may stop POST in submit(); no strategy HOLD bans here.
@@ -3010,8 +3019,11 @@ class SingleTradeEngine:
                 soft_allowed=bool((regime_gate or {}).get('allowed',True))))
             if not (regime_gate or {}).get('allowed',True):
                 soft_notes.append((regime_gate or {}).get('reason') or 'regime_soft')
-            zone_gate=self._ohlc_entry_zone_gate(
-                result['action'],mtf_analysis=mtf_analysis)
+            # Live promote already stamped an allowed zone/break gate — reuse it.
+            zone_gate=result.get('ohlc_entry_zone') if result.get('live_ohlc_promote') else None
+            if not isinstance(zone_gate,dict) or not zone_gate.get('allowed'):
+                zone_gate=self._ohlc_entry_zone_gate(
+                    result['action'],mtf_analysis=mtf_analysis)
             from . import playbook_entry as _pb_entry
             playbook_hard=_pb_entry.hard_entry_enabled(self.store)
             if playbook_hard:
@@ -3076,6 +3088,58 @@ class SingleTradeEngine:
                 nudged_scores,result,
                 unified_cycle.load_state(self.store)))
         return result
+
+    def _try_live_ohlc_open(self,result,*,base_scores,nudged_scores,mtf_analysis):
+        """HOLD → BUY/SELL when live WS mid touches zone or breaks through.
+
+        Side comes from MTF preferred and/or score lean (not a blind coin-flip).
+        Timing comes from live OHLC — never wait for the forming M1 to close.
+        """
+        if self.positions:
+            return None
+        scores=dict(nudged_scores or base_scores or {})
+        try:
+            buy=float(scores.get('BUY') or 0)
+            sell=float(scores.get('SELL') or 0)
+            hold=float(scores.get('HOLD') or 0)
+        except (TypeError,ValueError):
+            return None
+        mtf=mtf_analysis if isinstance(mtf_analysis,dict) else {}
+        pref=str(mtf.get('preferred') or '').upper()
+        mode=str(mtf.get('mode') or '').upper()
+        try:
+            conf=float(mtf.get('confidence') or 0)
+        except (TypeError,ValueError):
+            conf=0.0
+        need=float(unified_cycle.entry_edge_floor(self.store))
+        candidates=[]
+        for side,sc,other in (('BUY',buy,sell),('SELL',sell,buy)):
+            mtf_ok=((pref==side) or (mode==side)) and conf>=0.45
+            lean=sc-hold
+            # Prefer the side that beats HOLD (and the other side), or strong MTF.
+            if not mtf_ok and not (sc>=other and lean>=need):
+                continue
+            candidates.append((side,bool(mtf_ok),float(lean)))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda row:(row[1],row[2]),reverse=True)
+        for side,_mtf_ok,_lean in candidates:
+            gate=self._ohlc_entry_zone_gate(side,mtf_analysis=mtf)
+            if not isinstance(gate,dict) or not gate.get('allowed'):
+                continue
+            trig=str(gate.get('trigger') or '')
+            if trig not in ('zone','break'):
+                continue
+            return dict(
+                result,
+                action=side,
+                proposal=side,
+                live_ohlc_promote=True,
+                live_ohlc_trigger=trig,
+                ohlc_entry_zone=gate,
+                reason=f'live_{trig}_no_candle_wait',
+                score_edge=_lean)
+        return None
 
     def _decision_candles(self,epic=None,*,n=None):
         """Completed M1 only — never the forming QUOTE minute for entry/SL/TP."""
@@ -3142,9 +3206,13 @@ class SingleTradeEngine:
         return True
 
     def _wants_fast_entry_ticks(self):
-        """Accelerate quote→trigger loop while flat with directional intent."""
+        """Accelerate quote→trigger loop while flat — live zone/break, not candle close."""
         if self.positions or self.operator_paused or not self.mandate:
             return False
+        # Flat + armed signal: always probe WS mid for zone touch / range break.
+        # Candle close must not be the OPEN clock (live_ohlc_promote path).
+        if self.last_signal and self.last_closed_step>=0:
+            return True
         if self._entry_wait_reason_retryable(self.last_entry_reason):
             return True
         ls=self.last_signal if isinstance(self.last_signal,dict) else {}

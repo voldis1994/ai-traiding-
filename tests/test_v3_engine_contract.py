@@ -185,12 +185,16 @@ def test_submit_does_not_call_champion_maybe_activate():
             act.assert_not_called()
 
 
-def test_last_upl_as_realized_always_none():
+def test_last_upl_as_realized_returns_capital_snap():
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)
         e = SingleTradeEngine(store, brain)
+        e.account = {'accounts': [{'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
         store.set('last_upl:d1', {'upl': -1.25, 'currency': 'GBP'})
-        assert e._last_upl_as_realized('d1') is None
+        got = e._last_upl_as_realized('d1')
+        assert got is not None
+        assert got[0] == -1.25
+        assert got[1] == 'GBP'
 
 
 def test_policy_live_execute_default_is_research_only():

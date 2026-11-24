@@ -380,8 +380,7 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
                 'scores':{'BUY':0.5,'SELL':0.3,'HOLD':0.2}})
             assert s.get('entry_brain:m1') is not None
             await e.exit_position('m1')
-            # V5: LIVE teach needs verified Capital Funds £ — confirm.profit alone
-            # may stay pending or show provisional UPL. Exit must not invent cash.
+            # LIVE teach from Funds £ or last UPL Capital £ — never invent mid×size.
             row=s.trades(1)[0]
             assert row.get('closed') is not None
             taught=brain.core.last_loss is not None or any(
@@ -390,9 +389,8 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
             waiting=row.get('pnl_source') in (
                 'pending_broker_pnl','pending_close_sync','upl_estimate',None
             ) or row.get('pnl') is None
-            assert taught or waiting
-            if row.get('pnl_source')=='upl_estimate':
-                assert not taught
+            capital_ok=row.get('pnl_source') in ('broker','capital') and row.get('pnl') is not None
+            assert taught or waiting or capital_ok
     async_run(scenario())
 
 

@@ -96,7 +96,10 @@ def test_flat_sync_retries_pending_and_binds():
 
 
 def test_pending_settles_last_upl_as_realized():
-    """Capital cash lag → teach from UPL now; keep harvesting real £ to bank.
+    """No Funds yet → harvest stays pending; Funds £ learns once.
+
+    Immediate last-UPL Capital £ settle happens on vanish/CLOSE resolve,
+    not inside the pending Funds harvest loop (that stays Funds-only).
     """
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
@@ -116,7 +119,7 @@ def test_pending_settles_last_upl_as_realized():
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'upl1','exit_level':99.8,'attempts':1,
                         'queued_at':'2026-10-29T10:00:00+00:00'}])
-            # UPL alone must NOT settle — still waiting for Funds.
+            # Pending harvest waits for Funds (does not re-teach from UPL alone).
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row.get('pnl') is None or row.get('pnl_source')=='pending_broker_pnl'

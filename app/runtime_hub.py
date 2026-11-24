@@ -2209,6 +2209,16 @@ class RuntimeHub:
                             except Exception:
                                 break
                         continue
+                    # While open: refresh Capital UPL on every quote tick so the
+                    # last snap before close is Capital £ for settle/teach.
+                    if (engine.positions and hasattr(engine,'quote_upl_tick')):
+                        for _ in range(2):
+                            await asyncio.sleep(1)
+                            try:
+                                await engine.quote_upl_tick()
+                            except Exception:
+                                break
+                        continue
                 await asyncio.sleep(3 if error_count<3 else 10)
             except asyncio.CancelledError:
                 raise

@@ -232,25 +232,55 @@ def diagnose(*, pnl, spread=0.0, candles=None, scenario_meta=None,
                 mistakes.append('zone_fail')
                 notes.append('price_closed_through_supply')
 
-    if stamped.startswith('TREND') and live.startswith('CHOCH') and hurt:
-        mistakes.append('scenario_fail')
-        notes.append(f'trend_stamped_but_{live}')
-    if stamped.startswith('BREAKOUT') and live == 'FAKEOUT' and hurt:
-        mistakes.append('fakeout_missed')
-        notes.append('breakout_was_fakeout')
     # Prefer OPEN stamp; fall back to live regime so CMD matches diagnose.
     # COMPRESSION is a tight RANGE — same mid-box / blind-break class.
     regime = stamped or live
     trig = ctx.get('trigger') or _infer_trigger(ohlc_meta)
+
+    if stamped.startswith('TREND') and live.startswith('CHOCH') and hurt:
+        mistakes.append('scenario_fail')
+        notes.append(f'trend_stamped_but_{live}')
+    # Fakeout: OPEN stamped FAKEOUT, live flipped to FAKEOUT, or break→fake.
+    # Desk often stamps FAKEOUT already — old rule only caught BREAKOUT→FAKEOUT
+    # and every FAKEOUT £ loss fell through to outcome_hurt (same 4 nudges).
+    if hurt and (
+            stamped == 'FAKEOUT'
+            or live == 'FAKEOUT'
+            or (stamped.startswith('BREAKOUT') and live == 'FAKEOUT')):
+        if 'fakeout_missed' not in mistakes:
+            mistakes.append('fakeout_missed')
+        if stamped == 'FAKEOUT':
+            notes.append('fakeout_stamp_loss')
+        elif stamped.startswith('BREAKOUT') and live == 'FAKEOUT':
+            notes.append('breakout_was_fakeout')
+        else:
+            notes.append('live_fakeout_loss')
     if regime in ('RANGE', 'COMPRESSION') and trig == 'break' and hurt:
         mistakes.append('mid_range_mistake')
         notes.append('blind_break_in_range')
         if not stamped and live in ('RANGE', 'COMPRESSION'):
             notes.append('regime_from_live_classify')
-    if stamped.startswith('RETEST') and hurt and not useful:
-        if 'zone_fail' not in mistakes:
+    if (stamped.startswith('RETEST') or live.startswith('RETEST')) and hurt:
+        if 'zone_fail' not in mistakes and 'retest_fail' not in mistakes:
             mistakes.append('retest_fail')
             notes.append('retest_did_not_hold')
+    # CHOCH / TREND stamped losses without a finer tag → scenario_fail (OHLC
+    # penalty_trend), not the catch-all self_params quartet.
+    if hurt and not mistakes:
+        if stamped.startswith('CHOCH') or live.startswith('CHOCH'):
+            mistakes.append('scenario_fail')
+            notes.append('choch_stamp_loss')
+        elif stamped.startswith('TREND') or (
+                not stamped and live.startswith('TREND')):
+            mistakes.append('scenario_fail')
+            notes.append('trend_stamp_loss')
+        elif stamped.startswith('BREAKOUT') or (
+                not stamped and live.startswith('BREAKOUT')):
+            mistakes.append('fakeout_missed')
+            notes.append('breakout_stamp_loss')
+        elif regime in ('RANGE', 'COMPRESSION'):
+            mistakes.append('mid_range_mistake')
+            notes.append('range_stamp_loss')
 
     if ctx.get('news_block') and hurt:
         mistakes.append('news_risk_ignored')
@@ -274,8 +304,10 @@ def diagnose(*, pnl, spread=0.0, candles=None, scenario_meta=None,
             'proposed_fix': None,
         }
     if not mistakes and hurt:
+        # Last resort only when regime/stamp truly unknown — never for FAKEOUT.
         mistakes.append('outcome_hurt')
         notes.append('loss_without_clear_structure_miss')
+        notes.append('regime=' + (regime or 'UNK'))
 
     proposed = propose_fix(mistakes)
     return {

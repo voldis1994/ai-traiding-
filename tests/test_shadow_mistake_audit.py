@@ -167,6 +167,23 @@ def test_mid_range_from_live_when_stamp_missing():
     assert float(deltas.get('penalty_range') or 0) > 0
 
 
+def test_fakeout_stamp_is_not_outcome_hurt():
+    """Stamped FAKEOUT loss → fakeout_missed (OHLC), never catch-all quartet."""
+    out = sma.diagnose(
+        pnl=-0.12, spread=0.1, candles=_candles(),
+        scenario_meta={'scenario': 'FAKEOUT'},
+        ohlc_meta={'action': 'SELL', 'trigger': 'break'},
+        news={'status': 'CLEAR', 'entry_allowed': True},
+        intermarket={'status': 'WAITING'},
+        direction='SELL', entry=99.5, source='live')
+    assert 'fakeout_missed' in out['mistakes']
+    assert 'outcome_hurt' not in out['mistakes']
+    assert 'fakeout_stamp_loss' in (out.get('notes') or [])
+    deltas = (out.get('proposed_fix') or {}).get('deltas') or {}
+    assert float(deltas.get('penalty_breakout') or 0) > 0
+    assert 'structure_edge_nudge' not in deltas
+
+
 def test_new_fix_commit_resets_stale_wins_after():
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')

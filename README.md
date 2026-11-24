@@ -17,7 +17,8 @@ Tur ir:
 - kas ir LIVE lēmums vs kas ir tikai shadow
 
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
-Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
+Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`  
+**Pilnā sistēmas karte (full map):** [`SISTEMAS_ARHITEKTURA_LV.md`](SISTEMAS_ARHITEKTURA_LV.md)
 
 ## Portāli (stabilie ceļi)
 

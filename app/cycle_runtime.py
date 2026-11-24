@@ -1,6 +1,7 @@
 """Wire trade_cycle_fsm into LIVE / HOLD execution (audit item 1).
 
 Engine calls these helpers at each real stage — not unit-test-only.
+COMPLETE requires real VALIDATE proof (not a rubber-stamp).
 """
 from __future__ import annotations
 
@@ -48,7 +49,6 @@ def decide(store, cycle: dict, action: str, *, reason: str | None = None) -> dic
         telem.get_telemetry().note_cycle(complete=True)
         return cycle
     cycle = fsm.set_decision(cycle, action_u, reason=reason)
-    # set_decision for non-HOLD does not skip execute path
     cycle = fsm.finish_stage(cycle, 'DECIDE', proof=reason or action_u)
     cycle = fsm.start_stage(cycle, 'EXECUTE')
     fsm.persist(store, cycle)
@@ -105,8 +105,43 @@ def mark_settled(store, cycle: dict, *, funds_proof: Any = None,
     return cycle
 
 
+def _validate_proof(cycle: dict, validate_proof: dict | None, *,
+                    skipped: bool) -> tuple[bool, dict]:
+    """Real VALIDATE — require deal identity + journal/teach evidence."""
+    proof = dict(validate_proof or {})
+    deal = str(cycle.get('deal_id') or '')
+    ok = True
+    reasons = []
+    if not deal:
+        ok = False
+        reasons.append('missing_deal_id')
+    proof_deal = str(proof.get('deal_id') or '')
+    if deal and proof_deal and proof_deal != deal:
+        ok = False
+        reasons.append('deal_mismatch')
+    if not skipped:
+        if not proof.get('taught') and not proof.get('journal_persisted'):
+            ok = False
+            reasons.append('no_teach_or_persist_proof')
+        src = str(proof.get('pnl_source') or '')
+        if src and src not in ('broker', 'funds', 'cash_ledger', 'live_funds_mirror'):
+            # Still settling — cannot COMPLETE.
+            ok = False
+            reasons.append('pnl_not_broker')
+    else:
+        # Skipped learn still needs settle proof when cash was expected.
+        if proof.get('pending'):
+            ok = False
+            reasons.append('settlement_still_pending')
+    proof['ok'] = ok
+    proof['reasons'] = reasons
+    return ok, proof
+
+
 def mark_learned(store, cycle: dict, *, model_version: str | None = None,
-                 skipped: bool = False) -> dict:
+                 skipped: bool = False,
+                 validate_proof: dict | None = None) -> dict:
+    """LEARN then real VALIDATE — never rubber-stamp COMPLETE."""
     if skipped:
         cycle = fsm.finish_stage(
             cycle, 'LEARN', status=fsm.STATUS_SKIPPED, proof='no_teach')
@@ -114,10 +149,19 @@ def mark_learned(store, cycle: dict, *, model_version: str | None = None,
         cycle = fsm.finish_stage(
             cycle, 'LEARN', result_version=model_version)
     cycle = fsm.start_stage(cycle, 'VALIDATE')
-    cycle = fsm.finish_stage(cycle, 'VALIDATE', proof='ok')
-    cycle = fsm.mark_complete(cycle)
+    ok, proof = _validate_proof(cycle, validate_proof, skipped=skipped)
+    if ok:
+        cycle = fsm.finish_stage(cycle, 'VALIDATE', proof=proof)
+        cycle = fsm.mark_complete(cycle)
+        telem.get_telemetry().note_cycle(complete=bool(cycle.get('complete')))
+    else:
+        cycle = fsm.finish_stage(
+            cycle, 'VALIDATE', status=fsm.STATUS_FAILED,
+            error_code='validate_failed', proof=proof)
+        cycle = dict(cycle)
+        cycle['complete'] = False
+        telem.get_telemetry().note_cycle(complete=False)
     fsm.persist(store, cycle)
-    telem.get_telemetry().note_cycle(complete=bool(cycle.get('complete')))
     st = (cycle.get('stages') or {}).get('LEARN') or {}
     telem.get_telemetry().note_stage('LEARN', st.get('duration_ms'))
     return cycle
@@ -135,7 +179,14 @@ def bind_deal(store, cycle: dict, deal_id: str) -> dict:
 
 
 def load_by_deal(store, deal_id: str) -> dict | None:
+    """Load cycle for this deal only — never fall back to another trade's cycle."""
     ptr = store.get(f'trade_cycle:by_deal:{deal_id}')
     if not isinstance(ptr, dict) or not ptr.get('cycle_id'):
         return None
-    return fsm.load(store, str(ptr['cycle_id']))
+    cyc = fsm.load(store, str(ptr['cycle_id']))
+    if not cyc:
+        return None
+    bound = str(cyc.get('deal_id') or '')
+    if bound and bound != str(deal_id):
+        return None
+    return cyc

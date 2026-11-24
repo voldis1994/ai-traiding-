@@ -82,7 +82,8 @@ def test_mapped_open_position_currency_is_account_not_gold_usd():
         assert enriched[0]['currency']=='GBP'
 
 
-def test_repair_relabels_usd_broker_rows_to_gbp():
+def test_repair_fills_blank_currency_only_never_rewrites():
+    """P0-04: blank → account ccy; existing USD tag must NOT be rewritten to GBP."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -90,13 +91,13 @@ def test_repair_relabels_usd_broker_rows_to_gbp():
         store.upsert_trade({'dealId':'a','epic':'GOLD','size':'0.1','direction':'BUY','level':100})
         store.close_trade('a',101,0.26,currency='USD',source='broker')
         store.upsert_trade({'dealId':'b','epic':'GOLD','size':'0.1','direction':'BUY','level':100})
-        store.close_trade('b',99,-0.30,currency='USD',source='broker')
+        store.close_trade('b',99,-0.30,currency=None,source='broker')
         store.upsert_trade({'dealId':'c','epic':'GOLD','size':'0.1','direction':'BUY','level':100})
         store.close_trade('c',100.5,0.05,currency='GBP',source='broker')
         n=e.repair_broker_pnl_currencies()
-        assert n==2
+        assert n==1  # only blank row b
         rows={r['deal_id']:r for r in store.trades(10)}
-        assert rows['a']['pnl_currency']=='GBP'
+        assert rows['a']['pnl_currency']=='USD'  # preserved — no blind FX rewrite
         assert rows['b']['pnl_currency']=='GBP'
         assert rows['c']['pnl_currency']=='GBP'
 
@@ -108,15 +109,14 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
         for i,pnl in enumerate([0.26,-0.30,0.14,0.17,0.20]):
             store.upsert_trade({'dealId':f't{i}','epic':'GOLD','size':'0.1',
                                 'direction':'BUY','level':100})
-            # Mis-tagged as USD (the live bug).
-            store.close_trade(f't{i}',101,pnl,currency='USD',source='broker')
+            # Account-currency broker cash (correct identity).
+            store.close_trade(f't{i}',101,pnl,currency='GBP',source='broker')
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP')
         assert stats['pnl_currency']=='GBP'
         assert stats['realized_pnl']==pytest.approx(0.47)
         assert stats['wins']==4 and stats['losses']==1
         assert all(t['pnl_currency']=='GBP' for t in stats['recent_trades'])
-        assert 'USD' not in (stats.get('pnl_by_currency') or {})
 
 
 def test_admin_trade_stats_sums_beyond_200_and_legacy_blank_source():

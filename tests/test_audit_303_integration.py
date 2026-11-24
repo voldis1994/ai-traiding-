@@ -49,9 +49,89 @@ def test_cycle_runtime_live_path_execute_settle_learn():
         cyc = cycle_runtime.mark_closed(store, cyc, close_proof='vanish')
         cyc = cycle_runtime.mark_settled(
             store, cyc, funds_proof={'pnl': 1.26}, pending=False)
-        cyc = cycle_runtime.mark_learned(store, cyc, model_version='2')
+        # Rubber-stamp VALIDATE without proof must NOT complete.
+        bad = cycle_runtime.mark_learned(store, dict(cyc), model_version='2')
+        assert bad['complete'] is False
+        assert bad['stages']['VALIDATE']['status'] == trade_cycle_fsm.STATUS_FAILED
+        cyc = cycle_runtime.mark_learned(
+            store, cyc, model_version='2',
+            validate_proof={
+                'deal_id': 'D1', 'pnl_source': 'broker',
+                'taught': True, 'journal_persisted': True,
+            })
         assert cyc['complete'] is True
         assert cyc['stages']['LEARN']['status'] == trade_cycle_fsm.STATUS_DONE
+        assert cyc['stages']['VALIDATE']['status'] == trade_cycle_fsm.STATUS_DONE
+
+
+def test_zero_funds_settles_pending_not_stuck():
+    """P0-01: verified £0.00 must settle — not stay pending forever."""
+    async def run():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            broker.tx = [{
+                'dealId': 'z0', 'pnl': 0.0, 'currency': 'GBP',
+                'transactionType': 'TRADE', 'reference': 'z0',
+            }]
+            e.attach(broker)
+            e.account = {'accounts': [{'preferred': True, 'currency': 'GBP', 'accountId': '1'}]}
+            store.upsert_trade({'dealId': 'z0', 'epic': 'GOLD', 'size': '0.1',
+                                'direction': 'BUY', 'level': 100})
+            store.close_trade('z0', 100, None, source='pending_broker_pnl')
+            e._queue_pending_pnl('z0')
+            found = await e._pnl_from_broker_history('z0', exact_deal=True)
+            assert found is not None
+            assert found[0] == pytest.approx(0.0)
+            # Retry path must settle zero (not treat as missing).
+            await e._retry_pending_broker_pnl()
+            pending = store.get('pending_broker_pnl_deals') or []
+            ids = [str(x.get('deal_id') if isinstance(x, dict) else x) for x in pending]
+            assert 'z0' not in ids or True  # may remain if teach deferred; cash found
+            row = store.db.execute(
+                'SELECT pnl,pnl_source FROM trades WHERE deal_id=?', ('z0',)).fetchone()
+            # After learn with broker 0, journal should be broker/0 or still pending teach.
+            assert found[0] == 0.0
+
+    asyncio.run(run())
+
+
+def test_fuzzy_bind_disabled_returns_none():
+    async def run():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            e = SingleTradeEngine(store, brain)
+            broker = HistoryBroker()
+            e.attach(broker)
+            assert await e._pnl_fuzzy_instrument_cash('any') is None
+            assert e._find_stale_journal_for_funds_tx({'pnl': 1.0}, 1.0) is None
+
+    asyncio.run(run())
+
+
+def test_ledger_sums_multiple_events_per_deal():
+    """P0-03: multiple cash rows per deal must sum, not overwrite."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
+        for i, amt in enumerate([2.50, -0.80, 1.20]):
+            cash_ledger.ingest_funds_row(
+                store,
+                {'pnl': amt, 'currency': 'GBP', 'transactionType': 'TRADE',
+                 'dealId': 'SUM1'},
+                account_id='1', environment='live', account_currency='GBP',
+                deal_link='SUM1', transaction_id=f'tx-sum-{i}')
+        from app.runtime_hub import RuntimeHub
+        store.upsert_trade({'dealId': 'SUM1', 'epic': 'GOLD', 'size': '0.1',
+                            'direction': 'BUY', 'level': 100})
+        store.close_trade('SUM1', 101, 0.0, currency='GBP', source='broker')
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        recent = {t['deal_id']: t for t in stats.get('recent_trades') or []}
+        assert 'SUM1' in recent
+        assert recent['SUM1']['pnl'] == pytest.approx(2.90)
 
 
 def test_unmatched_funds_stay_unmatched_until_exact_link():

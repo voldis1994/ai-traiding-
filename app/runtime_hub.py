@@ -394,21 +394,27 @@ class RuntimeHub:
             acct_id=str(store.get('capital_account_id') or 'live')
             ccy_l=acct or 'GBP'
             ledger_snap=cash_ledger.consumer_snapshot(
-                store,acct_id,currency=ccy_l,
-                environment=str(store.get('capital_environment') or 'live'))
+                store,acct_id,currency=ccy_l)
             for ev in cash_ledger.load_events(store):
                 deal=str(ev.get('deal_link') or '')
                 st=str(ev.get('status') or '')
                 if not deal or ev.get('amount_minor') is None:
                     continue
-                if st not in (cash_ledger.STATUS_SETTLED,cash_ledger.STATUS_SETTLED_ZERO,
-                              cash_ledger.STATUS_MATCH_UNCERTAIN):
+                # P0-03: only verified SETTLED / SETTLED_ZERO — never MATCH_UNCERTAIN.
+                if st not in (cash_ledger.STATUS_SETTLED,cash_ledger.STATUS_SETTLED_ZERO):
                     continue
                 try:
                     major=float(from_minor(int(ev['amount_minor']),
                                            str(ev.get('currency') or ccy_l)))
                 except Exception:
                     continue
+                # Sum multiple cash rows per deal (fees/partials) — never overwrite.
+                prev=ledger_by_deal.get(deal)
+                if prev:
+                    major=float(prev['pnl'])+major
+                    # Prefer SETTLED_ZERO only when aggregate is exactly zero.
+                    st=(cash_ledger.STATUS_SETTLED_ZERO if abs(major)<1e-12
+                        else cash_ledger.STATUS_SETTLED)
                 ledger_by_deal[deal]={
                     'pnl':major,
                     'pnl_currency':str(ev.get('currency') or ccy_l).upper(),

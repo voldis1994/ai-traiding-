@@ -41,8 +41,8 @@ def test_order_fully_matched_open_multi_pos_by_confirm_deal():
             'PROTECT',{'stop':98.0,'profit':111.0},'a',{},None) is False
 
 
-def test_fuzzy_opposite_direction_close_binds():
-    """Closing TRADE is often opposite of open dir — still bind single epic/size hit."""
+def test_fuzzy_opposite_direction_close_does_not_invent_bind():
+    """P0-02: opposite-direction TRADE without exact deal id stays unmatched."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -54,13 +54,13 @@ def test_fuzzy_opposite_direction_close_binds():
             e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
             store.upsert_trade({'dealId':'uuid-opp','epic':'GOLD','size':'.02',
                                 'direction':'BUY','level':2650})
-            # Opposite close direction + Decimal size ".02" vs 0.02.
             broker.tx=[{'reference':'QQ11','instrumentName':'Gold Spot',
                         'size':'0.02','direction':'SELL',
                         'pnl':0.21,'currency':'GBP'}]
-            found=await e._pnl_fuzzy_instrument_cash('uuid-opp')
-            assert found is not None
-            assert found[0]==pytest.approx(0.21)
+            assert await e._pnl_fuzzy_instrument_cash('uuid-opp') is None
+            broker.tx=[{'dealId':'uuid-opp','pnl':0.21,'currency':'GBP'}]
+            found=await e._pnl_from_broker_history('uuid-opp',exact_deal=True)
+            assert found is not None and found[0]==pytest.approx(0.21)
     asyncio.run(scenario())
 
 
@@ -457,8 +457,8 @@ def test_stop_ticks_by_deal_shrinks_add_size():
         assert float(with_map['size'])<=float(bare['size'])
 
 
-def test_fuzzy_binds_signed_size_and_open_level():
-    """Capital uses signed size and often omits instrumentName — still bind cash."""
+def test_fuzzy_signed_size_requires_exact_deal_id():
+    """P0-02: signed size / openLevel proximity is not a deal link."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -475,17 +475,20 @@ def test_fuzzy_binds_signed_size_and_open_level():
             store.upsert_trade({'dealId':'uuid-b','epic':'GOLD','size':'0.02',
                                 'direction':'BUY','level':2660.0})
             store.close_trade('uuid-b',2655.0,source='upl_estimate',overwrite=True)
-            # Two Capital TRADE rows, no instrumentName, signed sizes.
             broker.tx=[
                 {'reference':'T1','size':'-0.02','openLevel':'2650','closeLevel':'2648',
                  'pnl':'-0.10','currency':'GBP','dateUtc':'2026-11-16T10:00:00Z'},
                 {'reference':'T2','size':'-0.02','openLevel':'2660','closeLevel':'2655',
                  'pnl':'0.11','currency':'GBP','dateUtc':'2026-11-16T11:00:00Z'},
             ]
-            found_a=await e._pnl_fuzzy_instrument_cash('uuid-a')
-            found_b=await e._pnl_fuzzy_instrument_cash('uuid-b')
-            assert found_a is not None and found_a[0]==pytest.approx(-0.10)
-            assert found_b is not None and found_b[0]==pytest.approx(0.11)
+            assert await e._pnl_fuzzy_instrument_cash('uuid-a') is None
+            assert await e._pnl_fuzzy_instrument_cash('uuid-b') is None
+            broker.tx=[
+                {'dealId':'uuid-a','pnl':-0.10,'currency':'GBP'},
+                {'dealId':'uuid-b','pnl':0.11,'currency':'GBP'},
+            ]
+            assert (await e._pnl_from_broker_history('uuid-a',exact_deal=True))[0]==pytest.approx(-0.10)
+            assert (await e._pnl_from_broker_history('uuid-b',exact_deal=True))[0]==pytest.approx(0.11)
     asyncio.run(scenario())
 
 

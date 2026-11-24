@@ -48,8 +48,8 @@ def test_mixed_broker_and_upl_keeps_sources_honest():
         assert est['pnl_source'] == 'upl_estimate'
 
 
-def test_fuzzy_accepts_exact_open_level_among_similar_gold():
-    """Many GOLD micros used to leave harvest stuck on ≈UPL forever."""
+def test_fuzzy_bind_disabled_keeps_cash_unmatched():
+    """P0-02: epic/size proximity must not invent a deal link."""
     import asyncio
     from app.engine import SingleTradeEngine
     from tests.test_broker_pnl_resolve import HistoryBroker
@@ -69,20 +69,19 @@ def test_fuzzy_accepts_exact_open_level_among_similar_gold():
             store.close_trade('g-exact', 3572.0, -0.69, currency='GBP',
                               source='upl_estimate', overwrite=True)
             broker.tx = [
-                {'reference': 'other1', 'pnl': -0.77, 'currency': 'GBP',
-                 'instrumentName': 'Gold', 'size': '0.02',
-                 'openLevel': 3571.0, 'closeLevel': 3573.0,
-                 'dateUtc': '2026-11-20T14:00:00'},
                 {'reference': 'hit', 'pnl': -0.87, 'currency': 'GBP',
                  'instrumentName': 'Gold', 'size': '0.02',
                  'openLevel': 3570.0, 'closeLevel': 3572.0,
                  'dateUtc': '2026-11-20T14:10:00'},
             ]
-            found = await e._pnl_fuzzy_instrument_cash('g-exact')
-            assert found is not None
-            pnl, ccy = found
-            assert pnl == pytest.approx(-0.87)
-            assert ccy == 'GBP'
+            assert await e._pnl_fuzzy_instrument_cash('g-exact') is None
+            # Exact dealId on the Funds row still resolves.
+            broker.tx = [
+                {'dealId': 'g-exact', 'pnl': -0.87, 'currency': 'GBP',
+                 'transactionType': 'TRADE'},
+            ]
+            found = await e._pnl_from_broker_history('g-exact', exact_deal=True)
+            assert found is not None and found[0] == pytest.approx(-0.87)
     asyncio.run(scenario())
 
 

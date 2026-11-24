@@ -222,8 +222,8 @@ def test_mirror_upgrades_stale_broker_pence_to_funds():
     asyncio.run(scenario())
 
 
-def test_mirror_fuzzy_binds_funds_onto_uuid_when_ref_misses():
-    """Funds reference ≠ UUID — still overwrite stale confirm £ on the robot deal."""
+def test_mirror_unmatched_when_ref_misses_keeps_uuid_and_ledger():
+    """P0-02: Funds ref ≠ UUID → UNMATCHED ledger; UUID stays until exact link."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -239,11 +239,6 @@ def test_mirror_fuzzy_binds_funds_onto_uuid_when_ref_misses():
             store.close_trade(
                 'uuid-abc-111', 4187.9, -0.81, currency='GBP',
                 source='broker', overwrite=True)
-            # Force closed stamp near Funds time so fuzzy scores.
-            store.db.execute(
-                "UPDATE trades SET closed=? WHERE deal_id=?",
-                ('2026-11-23T15:49:05Z', 'uuid-abc-111'))
-            store.db.commit()
             broker = FundsBroker([{
                 'reference': 'DIFFFF', 'instrumentName': 'Gold',
                 'pnl': -0.89, 'currency': 'GBP', 'size': -0.1,
@@ -251,18 +246,19 @@ def test_mirror_fuzzy_binds_funds_onto_uuid_when_ref_misses():
                 'dateUtc': '2026-11-23T15:49:00Z',
             }])
             e.attach(broker)
-            n = await e._mirror_capital_funds_closes()
-            assert n >= 1
+            await e._mirror_capital_funds_closes()
             row = next(r for r in store.trades(8) if r['deal_id'] == 'uuid-abc-111')
-            assert row['pnl'] == pytest.approx(-0.89)
-            # Must not leave Desk "last" as a separate orphan with the same £
-            # while UUID stays stale — UUID is the operator's last close.
-            assert row['pnl_source'] == 'broker'
+            # No fuzzy overwrite of the UUID row.
+            assert row['pnl'] == pytest.approx(-0.81)
+            from app import cash_ledger
+            unmatched = [ev for ev in cash_ledger.load_events(store)
+                         if ev.get('status') == cash_ledger.STATUS_UNMATCHED]
+            assert unmatched, 'orphan Funds must land as UNMATCHED'
     asyncio.run(scenario())
 
 
-def test_mirror_pence_cousin_when_levels_drift():
-    """Funds −0.89 vs Desk −0.81 with drifted levels must still upgrade UUID."""
+def test_mirror_exact_deal_id_upgrades_uuid():
+    """Exact dealId on Funds row upgrades the journal (no fuzzy needed)."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store, brain = new_brain(d)
@@ -278,13 +274,9 @@ def test_mirror_pence_cousin_when_levels_drift():
             store.close_trade(
                 'uuid-drift', 3662.5, -0.81, currency='GBP',
                 source='broker', overwrite=True)
-            store.db.execute(
-                "UPDATE trades SET closed=? WHERE deal_id=?",
-                ('2026-11-23T15:50:00Z', 'uuid-drift'))
-            store.db.commit()
-            # Levels off by >1.5 — old fuzzy gate would orphan and leave −0.81.
             broker = FundsBroker([{
-                'reference': 'NOUUID', 'instrumentName': 'Gold Spot',
+                'dealId': 'uuid-drift', 'reference': 'NOUUID',
+                'instrumentName': 'Gold Spot',
                 'pnl': -0.89, 'currency': 'GBP', 'size': -0.1,
                 'openLevel': 3665.0, 'closeLevel': 3664.0,
                 'dateUtc': '2026-11-23T15:50:10Z',
@@ -294,10 +286,6 @@ def test_mirror_pence_cousin_when_levels_drift():
             assert n >= 1
             row = next(r for r in store.trades(8) if r['deal_id'] == 'uuid-drift')
             assert row['pnl'] == pytest.approx(-0.89)
-            orphans = [r for r in store.trades(20)
-                       if str(r['deal_id']).startswith('cap:')
-                       and abs(float(r['pnl'])+0.89)<1e-9]
-            assert not orphans, 'must upgrade UUID, not leave −0.81 + orphan −0.89'
     asyncio.run(scenario())
 
 

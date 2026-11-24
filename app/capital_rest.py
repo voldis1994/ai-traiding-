@@ -2,7 +2,7 @@
 
 Per-identity budget (API key + login + LIVE/DEMO environment):
 - shared rate limit under Capital's 10 req/s
-- priority lanes: ORDER > POSITION/UPL > ACCOUNT > HISTORY/AI
+- true priority queue: ORDER > POSITION/UPL > ACCOUNT > HISTORY/AI
 - 429 exponential backoff (GET only; never blind order retry)
 - single-flight 401 relogin
 - GET coalescing
@@ -10,6 +10,7 @@ Per-identity budget (API key + login + LIVE/DEMO environment):
 from __future__ import annotations
 
 import asyncio
+import heapq
 import time
 from collections import defaultdict, deque
 from typing import Any, Callable, Awaitable
@@ -50,7 +51,10 @@ class CapitalRestManager:
         self._last_session_post = 0.0
         self._inflight_get: dict[str, asyncio.Future] = {}
         self._recent: deque[float] = deque(maxlen=400)
-        self._waiters: list[tuple[int, float, asyncio.Future]] = []
+        # True priority queue: (priority, seq, Future)
+        self._waiter_heap: list[tuple[int, int, asyncio.Future]] = []
+        self._waiter_seq = 0
+        self._grant_event = asyncio.Event()
         self.stats: dict[str, Any] = defaultdict(int)
         self.latency_ms: deque[float] = deque(maxlen=200)
         self.stats['environment'] = self.environment
@@ -61,23 +65,43 @@ class CapitalRestManager:
         self._last_refill = now
         self._tokens = min(float(self.burst), self._tokens + elapsed * self.rps)
 
+    def _purge_done_waiters(self) -> None:
+        while self._waiter_heap and self._waiter_heap[0][2].done():
+            heapq.heappop(self._waiter_heap)
+
     async def _acquire_token(self, *, priority: int = PRIORITY_DEFAULT) -> None:
+        """Grant tokens in priority order — ORDER always before HISTORY."""
         loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        async with self._lock:
+            self._waiter_seq += 1
+            heapq.heappush(self._waiter_heap, (int(priority), self._waiter_seq, fut))
+            self.stats['queued'] += 1
         while True:
             async with self._lock:
                 self._refill()
-                if self._tokens >= 1.0:
-                    # Prefer higher priority if waiters exist with better prio
-                    # that arrived earlier — still grant if we are best waiting.
+                self._purge_done_waiters()
+                if (
+                    self._tokens >= 1.0
+                    and self._waiter_heap
+                    and self._waiter_heap[0][2] is fut
+                ):
+                    heapq.heappop(self._waiter_heap)
                     self._tokens -= 1.0
                     self._recent.append(self._clock())
                     self.stats['acquired'] += 1
                     self.stats[f'prio_{int(priority)}'] += 1
+                    if not fut.done():
+                        fut.set_result(True)
+                    # Wake next waiter if tokens remain.
+                    self._grant_event.set()
+                    self._grant_event.clear()
                     return
-                need = (1.0 - self._tokens) / self.rps
-            # Yield longer for low-priority history under pressure.
-            sleep_s = max(0.01, need * (1.0 + 0.25 * max(0, priority - 1)))
-            await asyncio.sleep(sleep_s)
+                need = max(0.01, (1.0 - self._tokens) / self.rps) if self._tokens < 1.0 else 0.01
+            try:
+                await asyncio.wait_for(self._grant_event.wait(), timeout=need)
+            except asyncio.TimeoutError:
+                pass
 
     def calls_per_second(self, window: float = 1.0) -> float:
         now = self._clock()
@@ -185,7 +209,6 @@ class CapitalRestManager:
                 status = getattr(response, 'status_code', None)
                 if status is not None:
                     self.note_status(int(status))
-                # Never auto-retry non-GET (orders) on 429 — surface to caller.
                 if status == 429 and method_u == 'GET' and allow_retry_get:
                     attempt += 1
                     if attempt > max_429_retries:
@@ -228,6 +251,7 @@ class CapitalRestManager:
             'environment': self.environment,
             'calls_per_s': round(self.calls_per_second(), 3),
             'token_generation': self._token_generation,
+            'waiter_depth': len(self._waiter_heap),
             'stats': dict(self.stats),
             'latency_ms': {'p50': pct(0.50), 'p95': pct(0.95), 'p99': pct(0.99)},
         }

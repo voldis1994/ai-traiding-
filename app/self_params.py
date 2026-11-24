@@ -47,7 +47,8 @@ DEFAULTS = {
     'model_max_dd_ratio': 1.15,
     'model_stability_slack': 0.08,
     # Low enough that shadow↔LIVE promote can resolve within a trading day.
-    'shadow_min_broker_trades': 6,
+    # SHADOW vs LIVE compare needs enough Capital £ — 6 was noise-prone.
+    'shadow_min_broker_trades': 12,
     'shadow_rollback_window': 8,
     'shadow_rollback_delta': 0.35,
     # Learning — moderate pace for sparse broker £ feedback.
@@ -140,7 +141,8 @@ DEFAULTS = {
     # Soft LIVE nudge from fitted multi-horizon head (NeuralCore still proposes).
     'forecast_bridge_enabled': 1,
     'forecast_bridge_nudge': 0.06,
-    'forecast_bridge_min_resolved': 24,
+    # Forecast head needs denser resolved rows before LIVE soft nudge.
+    'forecast_bridge_min_resolved': 40,
     'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
     # Faster first trial commit — 20 froze physical evo for days of thin GOLD £.
@@ -242,7 +244,7 @@ BOUNDS = {
     'model_min_oos': (8, 80),
     'model_max_dd_ratio': (1.0, 2.0),
     'model_stability_slack': (0.0, 0.2),
-    'shadow_min_broker_trades': (6, 60),
+    'shadow_min_broker_trades': (8, 60),
     'shadow_rollback_window': (5, 40),
     'shadow_rollback_delta': (0.05, 5.0),
     'learn_lr': (0.01, 0.50),
@@ -322,7 +324,7 @@ BOUNDS = {
     'forecast_memory_enabled': (0, 1),
     'forecast_bridge_enabled': (0, 1),
     'forecast_bridge_nudge': (0.0, 0.15),
-    'forecast_bridge_min_resolved': (12, 80),
+    'forecast_bridge_min_resolved': (24, 120),
     'forecast_bridge_refit_every': (4, 40),
     'self_params_horizon_trades': (8, 80),
     'mtf_momentum_enabled': (0, 1),

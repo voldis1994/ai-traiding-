@@ -697,8 +697,9 @@ def test_t24_cold_start_does_not_make_live_ready():
         })
         out = mr.grant_cold_start_open(store, brain, reason='manual close')
         assert out.get('cold_start_open') is True
-        assert out.get('ready') is True
-        assert brain.trading_readiness()['ready'] is True
+        assert out.get('ready') is False
+        assert brain.trading_readiness()['ready'] is False
+        assert brain.trading_readiness()['cold_start_open'] is True
         gates = SingleTradeEngine(store, brain).live_open_gates('BUY')
         assert gates['allowed'] is True
         # Champion must not activate as a plan-time HOLD_MODEL substitute.

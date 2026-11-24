@@ -457,7 +457,10 @@ class AutoEvolution:
                     'reason':(f'Neural HOLD dominates {direction} '
                               f'({hold:.1%} > {strength:.1%})')}
         # --- Separate gate: model prep/eval readiness (audit #22) ---
-        if isinstance(readiness,dict) and readiness.get('ready') is False:
+        # cold_start_open permits provisional OPEN; ready=True means prep PASSED.
+        open_ok=(isinstance(readiness,dict) and (
+            readiness.get('ready') or readiness.get('cold_start_open')))
+        if isinstance(readiness,dict) and not open_ok:
             return {**base,'action':'HOLD',
                     'reason':'Model prep/eval not ready for LIVE OPEN: '+(
                         readiness.get('reason') or 'readiness gate')}
@@ -497,6 +500,16 @@ class AutoEvolution:
                     }
                     base['economic_utility']=economic
                     evidence['economic_utility']=economic
+                elif isinstance(readiness,dict) and readiness.get('cold_start_open'):
+                    economic={
+                        'allowed':True,'source':'cold_start_open_fallback',
+                        'online_utility_failed':True,
+                        'online_reason':economic.get('reason'),
+                        'reason':('Online utility weak; cold-start OPEN stands in '
+                                  '(prep not PASSED)'),
+                    }
+                    base['economic_utility']=economic
+                    evidence['economic_utility']=economic
                 else:
                     return {**base,'action':'HOLD',
                             'reason':('Argmax '+direction+' but no cost-adjusted economic utility: '
@@ -511,6 +524,16 @@ class AutoEvolution:
                 'holdout_net_bps_mean':readiness.get('holdout_net_bps_mean'),
                 'reason':'Prep/eval holdout stands in for economic utility; '
                          'score edge is not calibrated profit probability',
+            }
+            base['economic_utility']=economic
+            evidence['economic_utility']=economic
+        elif isinstance(readiness,dict) and readiness.get('cold_start_open'):
+            # Provisional OPEN after first manual close — live £ teaches;
+            # not a prep PASSED claim.
+            economic={
+                'allowed':True,'source':'cold_start_open',
+                'samples':readiness.get('eval_samples'),
+                'reason':'Cold-start OPEN — prep holdout not PASSED; live £ teaches',
             }
             base['economic_utility']=economic
             evidence['economic_utility']=economic
@@ -1354,8 +1377,8 @@ class AutoEvolution:
         evolve_from_feedback(self.store,shadow_promote=bool(decision.get('promote')),
                              commit=False)
         maybe_commit_long_horizon(self.store,engine.profit_learning.broker_pnls())
-        # V5 H01: SHADOW may research / signal promote, but must NEVER rewrite LIVE W.
-        # Record evidence + event only — operator/manual path owns any LIVE adopt.
+        # Validated SHADOW→LIVE adopt: compare_models promote + snapshot + copy.
+        # Same-evidence / dim mismatch still block. Never blind-copy without promote.
         if decision.get('promote') and getattr(engine,'shadow_brain',None) is not None:
             brain=getattr(engine,'brain',None)
             shadow=engine.shadow_brain
@@ -1367,26 +1390,56 @@ class AutoEvolution:
                               reason=self.last_reason)
             elif (brain is not None and shadow is not None and
                     getattr(brain,'core',None) is not None and shadow.d==brain.core.d):
-                self._record_promote_evidence(
-                    engine,live_hist,shadow_rows,checksum)
-                from .learning_generation import bump as bump_generation
-                bumped=bump_generation(
-                    self.store,'shadow_promote_signal_no_live_rewrite',
-                    kind='verified_candidate_promotes',
-                    weight_checksum=checksum)
-                self.last_reason=(
-                    'Shadow beat LIVE on paper £ — promote signal only '
-                    '(V5 H01: LIVE weights not rewritten)')
-                self.store.set('neural_adapt_reason',self.last_reason)
-                self.store.event('learning','Shadow promote signal (LIVE W unchanged)',
-                    {'shadow_neurons':getattr(shadow,'n',None),
-                     'live_neurons':brain.core.n,
-                     'weight_checksum':checksum,'learning_generation':bumped,
-                     'weights_promoted':False,'live_rewrite':False})
-                decision=dict(decision,weights_promoted=False,
-                              weight_checksum=checksum,
-                              promote_signal=True,live_rewrite=False,
-                              reason=self.last_reason)
+                snap=self._push_model_snapshot(
+                    engine,note='pre_shadow_adopt')
+                try:
+                    brain.core.copy_weights_from(
+                        shadow,adopt_architecture=True)
+                    if hasattr(brain,'save'):
+                        brain.save()
+                except Exception as exc:
+                    restore=getattr(engine,'restore_neural_weights',None)
+                    if restore is not None and snap is not None:
+                        try:
+                            restore(snap)
+                        except Exception:
+                            pass
+                    self.last_reason=(
+                        'Shadow adopt failed — LIVE restored from snapshot: '
+                        +type(exc).__name__)
+                    self.store.event('warning','Shadow LIVE adopt failed',
+                        {'type':type(exc).__name__,'weight_checksum':checksum})
+                    decision=dict(decision,promote=False,weights_promoted=False,
+                                  live_rewrite=False,reason=self.last_reason)
+                else:
+                    self._record_promote_evidence(
+                        engine,live_hist,shadow_rows,checksum)
+                    from .learning_generation import bump as bump_generation
+                    bumped=bump_generation(
+                        self.store,'shadow_weights_promoted_to_live',
+                        kind='verified_candidate_promotes',
+                        weight_checksum=checksum)
+                    try:
+                        brain.model_version=int(
+                            getattr(brain,'model_version',0) or 0)+1
+                    except Exception:
+                        pass
+                    self.last_reason=(
+                        'Shadow beat LIVE on validated £ window — '
+                        'LIVE weights adopted (snapshot saved)')
+                    self.store.set('neural_adapt_reason',self.last_reason)
+                    self.store.event('learning',
+                        'Shadow weights adopted onto LIVE',
+                        {'shadow_neurons':getattr(shadow,'n',None),
+                         'live_neurons':brain.core.n,
+                         'weight_checksum':checksum,
+                         'learning_generation':bumped,
+                         'weights_promoted':True,'live_rewrite':True,
+                         'snapshot':bool(snap)})
+                    decision=dict(decision,weights_promoted=True,
+                                  weight_checksum=checksum,
+                                  promote_signal=True,live_rewrite=True,
+                                  reason=self.last_reason)
         if len(live_hist)>=win*2:
             recent=sum(r['actual_pnl'] for r in live_hist[-win:])
             prior=sum(r['actual_pnl'] for r in live_hist[-2*win:-win])

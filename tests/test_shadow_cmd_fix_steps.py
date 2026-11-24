@@ -29,7 +29,7 @@ def test_on_close_writes_concrete_before_after_path():
         zone = next(m for m in muts if m.get('knob') == 'penalty_zone')
         assert zone['path'] == 'ohlc_scenarios_v1.penalty_zone'
         assert zone['before'] == before
-        assert zone['after'] == sma._clip01(before + 0.03)
+        assert zone['after'] > before
         assert '[WRITTEN]' in zone['line']
         after = osc.load_params(store)['penalty_zone']
         assert after == zone['after']

@@ -4,7 +4,8 @@
   • Zone box = base (consolidation) High→Low immediately before impulse
   • Impulse UP → Demand (BUY); impulse DOWN → Supply (SELL)
   • Structure filter: HH+HL → Demand; LH+LL → Supply
-  • Zone trigger needs price in zone + rejection / micro structure change
+  • Zone trigger needs price in zone + rejection AND micro structure change (V3 Z04)
+  • Invalidated zones (close through) are never selected (V3 Z03)
 
 Also: break trigger (structure/range break + M1 tape) when not waiting pullback.
 
@@ -259,9 +260,101 @@ def _mtf_kama(mtf):
     return None
 
 
-def _pick_best_zone(cands, *, mid=None):
-    """Prefer high-quality, fresh base; break ties by proximity to mid."""
-    rows = [z for z in (cands or []) if isinstance(z, dict)]
+def zone_invalidation_status(zone, candles, *, tick=0.01):
+    """V3 Z03: Demand close < lo−tick / Supply close > hi+tick → INVALIDATED.
+
+    Wick sweep alone is not close-invalidation. Invalidated zones keep their
+    quality score but must never be selected for entry (Z03/Z04).
+    """
+    out = {
+        'invalidated': False,
+        'state': 'ACTIVE',
+        'invalidated_at': None,
+        'invalidation_reason': None,
+    }
+    if not isinstance(zone, dict):
+        out['state'] = 'INVALIDATED'
+        out['invalidated'] = True
+        out['invalidation_reason'] = 'bad_zone'
+        return out
+    lo = _finite(zone.get('lo'))
+    hi = _finite(zone.get('hi'))
+    if lo is None or hi is None:
+        out['state'] = 'INVALIDATED'
+        out['invalidated'] = True
+        out['invalidation_reason'] = 'bad_bounds'
+        return out
+    if hi < lo:
+        lo, hi = hi, lo
+    try:
+        tick_f = max(float(tick or 0.01), 1e-9)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    kind = str(zone.get('kind') or '').lower()
+    side = str(zone.get('side') or '').upper()
+    if not kind:
+        kind = 'demand' if side == 'BUY' else ('supply' if side == 'SELL' else '')
+    # Only bars after the impulse (zone exists) can invalidate.
+    rows = list(candles or [])
+    start_i = 0
+    impulse_end = zone.get('impulse_i1')
+    try:
+        if impulse_end is not None:
+            start_i = max(0, int(impulse_end) + 1)
+    except (TypeError, ValueError):
+        start_i = 0
+    for bar in rows[start_i:]:
+        if not isinstance(bar, dict):
+            continue
+        c = _finite(bar.get('close'))
+        if c is None:
+            continue
+        if kind == 'demand' and c < (lo - tick_f):
+            out['invalidated'] = True
+            out['state'] = 'INVALIDATED'
+            out['invalidated_at'] = bar.get('at')
+            out['invalidation_reason'] = 'demand_close_below'
+            return out
+        if kind == 'supply' and c > (hi + tick_f):
+            out['invalidated'] = True
+            out['state'] = 'INVALIDATED'
+            out['invalidated_at'] = bar.get('at')
+            out['invalidation_reason'] = 'supply_close_above'
+            return out
+    # Touch / confirm lifecycle hints (observability only).
+    touches = int(zone.get('touches') or 0)
+    if touches > 0:
+        out['state'] = 'TOUCHED'
+    return out
+
+
+def _annotate_zone_lifecycle(zone, candles, *, tick=0.01):
+    """Copy zone + Z03 identity/state fields (never mutates caller dict)."""
+    if not isinstance(zone, dict):
+        return None
+    z = dict(zone)
+    inv = zone_invalidation_status(z, candles, tick=tick)
+    z['invalidated'] = bool(inv.get('invalidated'))
+    z['state'] = inv.get('state') or 'ACTIVE'
+    z['invalidated_at'] = inv.get('invalidated_at')
+    z['invalidation_reason'] = inv.get('invalidation_reason')
+    if not z.get('zone_id'):
+        kind = str(z.get('kind') or z.get('side') or 'zone')
+        at = z.get('at') or z.get('impulse_i1') or z.get('base_i0') or ''
+        z['zone_id'] = f"{kind}:{z.get('lo')}:{z.get('hi')}:{at}"
+    return z
+
+
+def _pick_best_zone(cands, *, mid=None, candles=None, tick=0.01):
+    """Prefer high-quality, fresh base; never select INVALIDATED (V3 Z03)."""
+    rows = []
+    for raw in (cands or []):
+        if not isinstance(raw, dict):
+            continue
+        z = _annotate_zone_lifecycle(raw, candles, tick=tick)
+        if not z or z.get('invalidated') or z.get('state') == 'INVALIDATED':
+            continue
+        rows.append(z)
     if not rows:
         return None
     m = _finite(mid)
@@ -326,10 +419,18 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
         out['mtf_preferred']=mtf.get('preferred')
         out['info_stack']='ohlc_base_impulse+kama_adx_atr'
     det=structure_memory.detect_base_impulse_zones(candles,atr=atr,limit=80)
-    demand=list(det.get('demand') or [])
-    supply=list(det.get('supply') or [])
+    demand=[_annotate_zone_lifecycle(z,candles,tick=tick)
+            for z in (det.get('demand') or []) if isinstance(z,dict)]
+    supply=[_annotate_zone_lifecycle(z,candles,tick=tick)
+            for z in (det.get('supply') or []) if isinstance(z,dict)]
+    demand=[z for z in demand if z]
+    supply=[z for z in supply if z]
     out['demand_zones']=demand
     out['supply_zones']=supply
+    out['invalidated_zones']=[
+        z for z in (demand+supply)
+        if z.get('invalidated') or z.get('state')=='INVALIDATED'
+    ]
     bias=str(out.get('bias') or 'RANGE').upper()
     # Structure filter — UP trades Demand; DOWN trades Supply; RANGE keeps both.
     allow_buy = bias in ('UP', 'RANGE') or str(out.get('event') or '').endswith('_UP')
@@ -340,8 +441,8 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
         allow_buy = True
     if event in ('CHOCH_DOWN', 'BOS_DOWN'):
         allow_sell = True
-    buy_raw=_pick_best_zone(demand,mid=mid) if allow_buy else None
-    sell_raw=_pick_best_zone(supply,mid=mid) if allow_sell else None
+    buy_raw=_pick_best_zone(demand,mid=mid,candles=candles,tick=tick) if allow_buy else None
+    sell_raw=_pick_best_zone(supply,mid=mid,candles=candles,tick=tick) if allow_sell else None
     src=out['info_stack']
     if buy_raw:
         out['buy_entry']={
@@ -352,7 +453,13 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
             'touches':buy_raw.get('touches'),
             'base_len':buy_raw.get('base_len'),
             'impulse_len':buy_raw.get('impulse_len'),
+            'impulse_i1':buy_raw.get('impulse_i1'),
             'sl_anchor':float(buy_raw['lo']),
+            'zone_id':buy_raw.get('zone_id'),
+            'state':buy_raw.get('state') or 'ACTIVE',
+            'invalidated':False,
+            'invalidated_at':None,
+            'invalidation_reason':None,
         }
         out['support']={
             'lo':float(buy_raw['lo']),'hi':float(buy_raw['hi']),
@@ -366,7 +473,13 @@ def compute_entry_zones(candles,*,mid=None,tick=0.01,spread=0.0,mtf=None,
             'touches':sell_raw.get('touches'),
             'base_len':sell_raw.get('base_len'),
             'impulse_len':sell_raw.get('impulse_len'),
+            'impulse_i1':sell_raw.get('impulse_i1'),
             'sl_anchor':float(sell_raw['hi']),
+            'zone_id':sell_raw.get('zone_id'),
+            'state':sell_raw.get('state') or 'ACTIVE',
+            'invalidated':False,
+            'invalidated_at':None,
+            'invalidation_reason':None,
         }
         out['resistance']={
             'lo':float(sell_raw['lo']),'hi':float(sell_raw['hi']),
@@ -541,18 +654,44 @@ def micro_structure_confirm(action, candles, zone, *, tick=0.01):
 
 
 def zone_confirm_allows(action, *, candles, zone, tick=0.01):
-    """Zone OPEN needs rejection candle OR micro structure change (1:1)."""
+    """Zone OPEN needs rejection candle AND micro structure change (V3 Z04).
+
+    Prior OR allowed pin-only entries; contract requires both evidence types.
+    """
+    # Never confirm an already-invalidated zone (Z03).
+    if isinstance(zone, dict) and (
+            zone.get('invalidated') or str(zone.get('state') or '').upper() == 'INVALIDATED'):
+        return {
+            'ok': False,
+            'rejection': {'ok': False, 'reason': 'zone_invalidated', 'kind': None},
+            'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
+            'reason': 'zone_invalidated',
+        }
+    inv = zone_invalidation_status(zone, candles, tick=tick)
+    if inv.get('invalidated'):
+        return {
+            'ok': False,
+            'rejection': {'ok': False, 'reason': 'zone_invalidated', 'kind': None},
+            'structure': {'ok': False, 'reason': 'zone_invalidated', 'event': None},
+            'reason': 'zone_invalidated',
+            'invalidation': inv,
+        }
     rej = rejection_candle(action, candles, zone, tick=tick)
     st = micro_structure_confirm(action, candles, zone, tick=tick)
-    ok = bool(rej.get('ok') or st.get('ok'))
+    ok = bool(rej.get('ok') and st.get('ok'))
+    if ok:
+        reason = f"rejection+{rej.get('kind')}+{st.get('reason')}"
+    elif rej.get('ok') and not st.get('ok'):
+        reason = f"wait_structure_after_rejection ({st.get('reason')})"
+    elif st.get('ok') and not rej.get('ok'):
+        reason = f"wait_rejection_after_structure ({rej.get('reason')})"
+    else:
+        reason = 'wait_zone_confirm'
     return {
         'ok': ok,
         'rejection': rej,
         'structure': st,
-        'reason': (
-            'rejection+' + str(rej.get('kind')) if rej.get('ok')
-            else (st.get('reason') if st.get('ok') else 'wait_zone_confirm')
-        ),
+        'reason': reason,
     }
 
 

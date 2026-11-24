@@ -295,19 +295,41 @@ def mid_range_blocked(action, scenario: dict, price, *, tick=0.01) -> tuple:
 
 
 def scenario_allows_trigger(action, scenario: dict, trigger: str, *, store=None) -> dict:
-    """Whether break|zone trigger fits the live scenario (+ learned penalties)."""
+    """Whether break|zone trigger fits the live scenario (+ learned penalties).
+
+    V3 S08/S09: UNKNOWN / disabled / unready is never a successful check —
+    return ok=False with HOLD_SCENARIO (not ok=True with a soft reason).
+    """
     cfg = load_params(store)
     action = (action or '').upper()
     trigger = str(trigger or '').lower()
-    out = {'ok': True, 'reason': 'scenario_ok', 'scenario': None}
+    out = {
+        'ok': False,
+        'reason': 'HOLD_SCENARIO',
+        'scenario': None,
+        'hold': 'HOLD_SCENARIO',
+        'ready': False,
+    }
     if not isinstance(scenario, dict) or not scenario.get('ready'):
-        out['reason'] = 'scenario_unready'
+        out['reason'] = 'HOLD_SCENARIO'
+        out['detail'] = 'scenario_unready'
         return out
     if not scenario.get('enabled', True):
-        out['reason'] = 'scenario_disabled'
+        out['reason'] = 'HOLD_SCENARIO'
+        out['detail'] = 'scenario_disabled'
         return out
-    name = str(scenario.get('scenario') or 'UNKNOWN')
+    name = str(scenario.get('scenario') or 'UNKNOWN').upper()
     out['scenario'] = name
+    # UNKNOWN / CHOP: no tradable structure — not a pass (S08).
+    if name in ('UNKNOWN', 'CHOP', ''):
+        out['reason'] = 'HOLD_SCENARIO'
+        out['detail'] = f'scenario_{name.lower() or "unknown"}'
+        return out
+    # Ready + enabled + named scenario — evaluate trigger fit.
+    out['ready'] = True
+    out['ok'] = True
+    out['reason'] = 'scenario_ok'
+    out['hold'] = None
     hint = str(scenario.get('entry_hint') or '')
     conf = float(scenario.get('confidence') or 0)
 
@@ -317,6 +339,7 @@ def scenario_allows_trigger(action, scenario: dict, trigger: str, *, store=None)
         if trigger == 'break' and conf >= thr:
             out['ok'] = False
             out['reason'] = 'block_fakeout_break'
+            out['hold'] = 'HOLD_SCENARIO'
             return out
 
     if name == 'RANGE' and trigger == 'break':
@@ -327,19 +350,34 @@ def scenario_allows_trigger(action, scenario: dict, trigger: str, *, store=None)
             if prefer:
                 out['ok'] = False
                 out['reason'] = 'wait_range_edge_or_retest'
+                out['hold'] = 'HOLD_SCENARIO'
                 return out
+
+    if name == 'COMPRESSION' and trigger == 'break':
+        # S08: compression is preparation — wait for quality BREAK evidence
+        # already stamped, else HOLD (range-edge / zone path may still pass).
+        tags = scenario.get('scenarios') or []
+        if 'BREAKOUT_UP' not in tags and 'BREAKOUT_DOWN' not in tags:
+            out['ok'] = False
+            out['reason'] = 'HOLD_SCENARIO'
+            out['detail'] = 'compression_wait_break_or_edge'
+            out['hold'] = 'HOLD_SCENARIO'
+            return out
 
     if hint == 'BUY' and action == 'SELL' and conf >= 0.65:
         out['ok'] = False
         out['reason'] = f'scenario_conflict ({name} prefers BUY)'
+        out['hold'] = 'HOLD_SCENARIO'
         return out
     if hint == 'SELL' and action == 'BUY' and conf >= 0.65:
         out['ok'] = False
         out['reason'] = f'scenario_conflict ({name} prefers SELL)'
+        out['hold'] = 'HOLD_SCENARIO'
         return out
     if hint == 'WAIT' and trigger == 'break':
         out['ok'] = False
         out['reason'] = f'wait_scenario ({name})'
+        out['hold'] = 'HOLD_SCENARIO'
         return out
     return out
 

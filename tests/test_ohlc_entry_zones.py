@@ -194,3 +194,103 @@ def test_swing_anchor_sl_behind_demand_zone():
     assert swing.get('ready') is True
     assert float(swing['stop_level']) < float(buy['lo']) + 1e-9
     assert swing.get('zone_sl') is True or float(swing['stop_level']) <= float(buy['lo'])
+
+
+def test_z03_invalidated_demand_never_selected_even_high_quality():
+    """V3 T05: close below demand lo−tick → INVALIDATED; not selected."""
+    zone = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 999.0, 'touches': 0, 'impulse_i1': 0,
+        'at': '2026-11-18T10:00:00+00:00',
+    }
+    candles = [
+        {'at': '2026-11-18T10:00:00+00:00',
+         'open': 101.0, 'high': 102.0, 'low': 100.0, 'close': 101.5},
+        {'at': '2026-11-18T10:01:00+00:00',
+         'open': 101.0, 'high': 101.2, 'low': 98.5, 'close': 99.0},  # close 99, tick 0.1
+    ]
+    inv = oez.zone_invalidation_status(zone, candles, tick=0.1)
+    assert inv['invalidated'] is True
+    assert inv['state'] == 'INVALIDATED'
+    assert inv['invalidation_reason'] == 'demand_close_below'
+
+    picked = oez._pick_best_zone([zone], mid=101.0, candles=candles, tick=0.1)
+    assert picked is None
+
+    # Wick below lo without close-through is NOT invalidation.
+    wick_only = [
+        candles[0],
+        {'at': '2026-11-18T10:01:00+00:00',
+         'open': 101.0, 'high': 101.5, 'low': 99.0, 'close': 100.5},
+    ]
+    inv2 = oez.zone_invalidation_status(zone, wick_only, tick=0.1)
+    assert inv2['invalidated'] is False
+
+
+def test_z03_high_quality_invalidated_loses_to_valid_lower_quality():
+    """Invalidated high-quality zone must not win over a valid weaker zone."""
+    bad = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 500.0, 'touches': 0, 'impulse_i1': 0,
+        'at': 'a',
+    }
+    # Lower demand — close 99 invalidates 100–102 but not 90–92.
+    good = {
+        'lo': 90.0, 'hi': 92.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 5.0, 'touches': 0, 'impulse_i1': 0,
+        'at': 'b',
+    }
+    candles = [
+        {'at': 't0', 'open': 101, 'high': 102, 'low': 100, 'close': 101},
+        {'at': 't1', 'open': 101, 'high': 101, 'low': 98, 'close': 99},
+    ]
+    picked = oez._pick_best_zone(
+        [bad, good], mid=91.0, candles=candles, tick=0.1)
+    assert picked is not None
+    assert float(picked['lo']) == 90.0
+    assert picked.get('invalidated') is False
+
+
+def test_z04_zone_confirm_requires_rejection_and_structure():
+    """V3 T06: pin without microstructure → HOLD; both → confirm."""
+    rows, _ = demand_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    assert buy
+    # Append bullish pin only — rejection without micro structure.
+    from datetime import datetime, timedelta
+    last = rows[-1]
+    base_lo, base_hi = float(buy['lo']), float(buy['hi'])
+    mid = 0.5 * (base_lo + base_hi)
+    t = datetime.fromisoformat(last['at'])
+    pin = {
+        'at': (t + timedelta(minutes=1)).isoformat(),
+        'open': mid + 0.05, 'high': mid + 0.2,
+        'low': base_lo - 0.05, 'close': mid + 0.12,
+    }
+    pin_only = list(rows) + [pin]
+    conf = oez.zone_confirm_allows('BUY', candles=pin_only, zone=buy, tick=0.1)
+    assert conf['ok'] is False
+    assert conf['rejection'].get('ok') is True
+    assert conf['structure'].get('ok') is False
+    assert 'wait_structure' in (conf.get('reason') or '')
+
+    # Full confirm path has both evidence types.
+    rows_ok, _ = demand_zone_path(confirm=True)
+    z2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)
+    buy2 = z2['buy_entry']
+    conf2 = oez.zone_confirm_allows(
+        'BUY', candles=rows_ok, zone=buy2, tick=0.1)
+    assert conf2['ok'] is True
+    assert conf2['rejection'].get('ok') is True
+    assert conf2['structure'].get('ok') is True
+
+
+def test_z04_invalidated_zone_confirm_refused():
+    zone = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'state': 'INVALIDATED', 'invalidated': True, 'quality': 99.0,
+    }
+    conf = oez.zone_confirm_allows('BUY', candles=[], zone=zone, tick=0.1)
+    assert conf['ok'] is False
+    assert conf['reason'] == 'zone_invalidated'

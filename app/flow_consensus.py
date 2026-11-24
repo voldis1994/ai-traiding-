@@ -76,6 +76,13 @@ def _cfg_nudge(store) -> float:
 
 
 def _cfg_block_fights(store) -> bool:
+    # Playbook hard ENTRY: volume/flow fight becomes a real OPEN ban.
+    try:
+        from . import playbook_entry as _pb
+        if _pb.hard_entry_enabled(store):
+            return True
+    except Exception:
+        pass
     if store is None:
         return bool(DEFAULT_BLOCK_FIGHTS)
     try:

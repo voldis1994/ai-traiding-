@@ -40,11 +40,25 @@ def _finite(v):
 def _params(store=None) -> dict:
     out = dict(DEFAULTS)
     if store is None:
+        # Playbook hard entry forces regime gate ON even without a Store.
+        try:
+            from . import playbook_entry as _pb
+            if _pb.hard_entry_enabled(None):
+                out['enabled'] = 1
+        except Exception:
+            out['enabled'] = 1
         return out
     try:
         from .self_params import get as sp_get
         out['enabled'] = int(sp_get(
             store, 'ohlc_regime_gate_enabled', DEFAULTS['enabled']))
+        # 1m playbook hard ENTRY turns chop/doji/impulse into real OPEN bans.
+        try:
+            from . import playbook_entry as _pb
+            if _pb.hard_entry_enabled(store):
+                out['enabled'] = 1
+        except Exception:
+            pass
         out['lookback'] = int(sp_get(store, 'ohlc_regime_lookback', DEFAULTS['lookback']))
         out['chop_flip_min'] = int(sp_get(store, 'ohlc_regime_chop_flips', DEFAULTS['chop_flip_min']))
         out['chop_progress_max'] = float(

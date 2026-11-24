@@ -92,7 +92,8 @@ def test_demand_zone_appears_during_or_right_after_impulse_not_after_move_gone()
 
 
 def test_zone_open_only_on_pullback_confirm_not_impulse_tip():
-    """OPEN on zone path waits for return + rejection — impulse tip alone is not entry."""
+    """OPEN on zone path waits for return + rejection+structure (playbook AND)."""
+    from tests.ohlc_zone_path import demand_zone_path
     tl = _demand_timeline()
     rows = tl['rows']
     # At impulse tip — zone may exist, but price far above → wait.
@@ -108,8 +109,8 @@ def test_zone_open_only_on_pullback_confirm_not_impulse_tip():
     assert gate_tip['allowed'] is False
     assert 'wait' in (gate_tip['reason'] or '')
 
-    # After confirm pin in zone → allow.
-    full = rows[: tl['confirm_i'] + 1]
+    # Full AND confirm path (pin + HL) from shared fixture.
+    full, _ = demand_zone_path(confirm=True)
     z2 = oez.compute_entry_zones(full, tick=0.1, spread=0.2)
     buy2 = z2['buy_entry']
     inside = (float(buy2['lo']) + float(buy2['hi'])) / 2
@@ -119,6 +120,10 @@ def test_zone_open_only_on_pullback_confirm_not_impulse_tip():
     assert gate['allowed'] is True
     assert gate.get('trigger') == 'zone'
     assert gate.get('reason') == 'ohlc_entry_zone_confirm'
+    conf = (gate.get('confirm') or {})
+    assert conf.get('require_both') is True
+    assert conf.get('rejection', {}).get('ok') is True
+    assert conf.get('structure', {}).get('ok') is True
 
 
 def test_detector_marks_fresh_untouched_zone_at_impulse_end():

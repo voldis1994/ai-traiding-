@@ -19,12 +19,29 @@ def _eval(**kwargs):
     return rg.evaluate(store=_EnableStore(), **kwargs)
 
 
-def test_gate_disabled_by_default():
+def test_gate_disabled_when_playbook_soft():
+    """Explicit soft playbook keeps regime gate off (legacy soft notes)."""
+    class SoftStore:
+        def get(self, key, default=None):
+            if key == 'self_params_v1':
+                return {'playbook_hard_entry': 0, 'ohlc_regime_gate_enabled': 0}
+            return default
+
     candles = [_bar(100, 100.02, 99.98, 100.01) for _ in range(20)]
-    out = rg.evaluate(candles=candles, mid=100.0, spread=0.05, atr=0.02)
+    out = rg.evaluate(candles=candles, mid=100.0, spread=0.05, atr=0.02,
+                      store=SoftStore())
     assert out['allowed'] is True
     assert out['reason'] == 'disabled'
     assert out['enabled'] is False
+
+
+def test_playbook_hard_forces_regime_gate_on():
+    candles = [_bar(100, 100.02, 99.98, 100.01) for _ in range(20)]
+    out = rg.evaluate(candles=candles, mid=100.0, spread=0.05, atr=0.02)
+    assert out['enabled'] is True
+    # Low vol path should ban under playbook hard (no store → hard default).
+    assert out['allowed'] is False
+    assert out['reason'] == 'no_trade_low_vol'
 
 
 def test_chop_blocks():

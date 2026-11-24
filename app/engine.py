@@ -3018,10 +3018,42 @@ class SingleTradeEngine:
                 soft_notes.append((regime_gate or {}).get('reason') or 'regime_soft')
             zone_gate=self._ohlc_entry_zone_gate(
                 result['action'],mtf_analysis=mtf_analysis)
-            result=dict(result,ohlc_entry_zone=dict(zone_gate or {},allowed=True,
-                soft_allowed=bool((zone_gate or {}).get('allowed'))))
-            if not (zone_gate or {}).get('allowed'):
-                soft_notes.append((zone_gate or {}).get('reason') or 'zone_soft')
+            from . import playbook_entry as _pb_entry
+            playbook_hard=_pb_entry.hard_entry_enabled(self.store)
+            if playbook_hard:
+                # Hard checklist: zone/regime failures ban OPEN (not soft note).
+                zone_ok=bool((zone_gate or {}).get('allowed'))
+                regime_ok=bool((regime_gate or {}).get('allowed',True))
+                result=dict(result,ohlc_entry_zone=dict(
+                    zone_gate or {},allowed=zone_ok,
+                    soft_allowed=zone_ok,hard=True),
+                    ohlc_regime=dict(
+                        regime_gate or {},allowed=regime_ok,
+                        soft_allowed=regime_ok,hard=True))
+                ban_reason=None
+                if not regime_ok:
+                    ban_reason=(regime_gate or {}).get('reason') or 'regime_hard'
+                elif not zone_ok:
+                    ban_reason=(zone_gate or {}).get('reason') or 'zone_hard'
+                sess=_pb_entry.session_allows_open(store=self.store)
+                result=dict(result,playbook_session=sess)
+                if ban_reason is None and not sess.get('allowed',True):
+                    ban_reason=sess.get('reason') or 'session_hard'
+                if ban_reason:
+                    result=dict(
+                        result,action='HOLD',proposal=result.get('action'),
+                        playbook_hard_ban=True,soft_notes=soft_notes,
+                        soft_reason=ban_reason,reason=ban_reason,
+                        structure_shadow=self._structure_shadow_advice(
+                            result.get('proposal') or 'HOLD'))
+                    return result
+            else:
+                result=dict(result,ohlc_entry_zone=dict(
+                    zone_gate or {},allowed=True,
+                    soft_allowed=bool((zone_gate or {}).get('allowed'))))
+                if not (zone_gate or {}).get('allowed'):
+                    soft_notes.append(
+                        (zone_gate or {}).get('reason') or 'zone_soft')
             swing_br=self._would_be_brackets(result['action'])
             result=dict(result,ohlc_swing_brackets=swing_br)
             if not swing_br:
@@ -8011,19 +8043,42 @@ class SingleTradeEngine:
                 candles=candles,mid=mid,spread=spread,atr=atr_sub,
                 structure=(self.market_context or {}).get('structure'),
                 store=self.store)
-            if not regime_sub.get('allowed',True):
-                self.store.event('entry','OHLC regime soft note (OPEN not banned)',{
-                    'reason':regime_sub.get('reason'),'action':action,
-                    'flags':regime_sub.get('flags')})
+            from . import playbook_entry as _pb_sub
+            playbook_hard=_pb_sub.hard_entry_enabled(self.store)
             zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
-            if not zone_gate.get('allowed'):
-                self.store.event('entry','OHLC zone soft note (OPEN not banned)',{
-                    'reason':zone_gate.get('reason'),'action':action,
-                    'price':zone_gate.get('price'),'zone':zone_gate.get('zone'),
-                    'mtf_ok':zone_gate.get('mtf_ok'),
-                    'trigger':zone_gate.get('trigger'),
-                    'shared_side':zone_gate.get('shared_side'),
-                    'source':zone_gate.get('source')})
+            if playbook_hard:
+                sess=_pb_sub.session_allows_open(store=self.store)
+                ban=None
+                if not regime_sub.get('allowed',True):
+                    ban=regime_sub.get('reason') or 'regime_hard'
+                elif not zone_gate.get('allowed'):
+                    ban=zone_gate.get('reason') or 'zone_hard'
+                elif not sess.get('allowed',True):
+                    ban=sess.get('reason') or 'session_hard'
+                if ban:
+                    self.last_entry_reason=str(ban)
+                    self.store.event('entry','Playbook hard OPEN ban',{
+                        'reason':ban,'action':action,
+                        'trigger':zone_gate.get('trigger'),
+                        'zone':zone_gate.get('zone'),
+                        'session':sess})
+                    return
+            else:
+                if not regime_sub.get('allowed',True):
+                    self.store.event(
+                        'entry','OHLC regime soft note (OPEN not banned)',{
+                            'reason':regime_sub.get('reason'),'action':action,
+                            'flags':regime_sub.get('flags')})
+                if not zone_gate.get('allowed'):
+                    self.store.event(
+                        'entry','OHLC zone soft note (OPEN not banned)',{
+                            'reason':zone_gate.get('reason'),'action':action,
+                            'price':zone_gate.get('price'),
+                            'zone':zone_gate.get('zone'),
+                            'mtf_ok':zone_gate.get('mtf_ok'),
+                            'trigger':zone_gate.get('trigger'),
+                            'shared_side':zone_gate.get('shared_side'),
+                            'source':zone_gate.get('source')})
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))

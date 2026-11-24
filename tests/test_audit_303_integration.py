@@ -156,7 +156,7 @@ def test_unmatched_funds_stay_unmatched_until_exact_link():
              'dealId': 'DEAL99'},
             account_id='1', environment='live', account_currency='GBP',
             deal_link='DEAL99', transaction_id='tx-linked-99')
-        realized = cash_ledger.deal_realized(store, 'DEAL99')
+        realized = cash_ledger.deal_realized(store, 'DEAL99', currency='GBP')
         assert realized.get('may_teach') is True
         assert realized.get('amount_minor') == 126
 
@@ -173,7 +173,7 @@ def test_cash_ledger_is_sole_teach_authority():
              'dealId': 'Z0'},
             account_id='1', environment='live', account_currency='GBP',
             deal_link='Z0', transaction_id='tx0')
-        realized = cash_ledger.deal_realized(store, 'Z0')
+        realized = cash_ledger.deal_realized(store, 'Z0', currency='GBP')
         # Verified £0.00 is teachable settled-zero.
         assert realized.get('amount_minor') == 0
         assert realized.get('may_teach') is True
@@ -400,7 +400,7 @@ def test_match_uncertain_never_teaches():
             transaction_id='u1', transaction_type='TRADE',
             close_proof=True, status=cash_ledger.STATUS_MATCH_UNCERTAIN,
             amount_minor=100, currency='GBP', deal_link='U1'))
-        realized = cash_ledger.deal_realized(store, 'U1')
+        realized = cash_ledger.deal_realized(store, 'U1', currency='GBP')
         assert realized.get('may_teach') is False
         assert realized.get('amount_minor') is None
 
@@ -666,7 +666,7 @@ def test_no_double_count_learn_synthetic_vs_funds():
             close_proof=True, status=cash_ledger.STATUS_SETTLED,
             amount_minor=350, currency='GBP', deal_link='D50'))
         realized = cash_ledger.deal_realized(
-            store, 'D50', account_id='1', environment='live')
+            store, 'D50', currency='GBP', account_id='1', environment='live')
         assert realized['may_teach'] is True
         assert realized['amount_minor'] == 350  # not 700
 
@@ -709,9 +709,9 @@ def test_deal_realized_filters_account_and_environment():
             account_id='demo-1', environment='demo', account_currency='GBP',
             deal_link='X1', transaction_id='D1')
         live = cash_ledger.deal_realized(
-            store, 'X1', account_id='live-1', environment='live')
+            store, 'X1', currency='GBP', account_id='live-1', environment='live')
         demo = cash_ledger.deal_realized(
-            store, 'X1', account_id='demo-1', environment='demo')
+            store, 'X1', currency='GBP', account_id='demo-1', environment='demo')
         assert live['amount_minor'] == 100
         assert demo['amount_minor'] == 900
 
@@ -757,3 +757,107 @@ def test_desk_journal_without_ledger_is_not_cash_truth():
         # No ledger row → journal demoted; not authoritative cash.
         assert stats.get('cash_trades', 0) == 0 or stats.get('realized_pnl') in (
             None, 0, 0.0)
+
+
+def test_desk_ignores_learn_synthetic_and_quarantine_migrates():
+    """P0: Desk must not £×2 from legacy learn:{deal} rows."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 3.50, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='DX', transaction_id='BROKER-DX')
+        cash_ledger.append_event(store, cash_ledger.cash_event(
+            account_id='1', environment='live',
+            transaction_id='learn:DX', transaction_type='TRADE',
+            close_proof=True, status=cash_ledger.STATUS_SETTLED,
+            amount_minor=350, currency='GBP', deal_link='DX'))
+        store.upsert_trade({
+            'dealId': 'DX', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade('DX', 101, 3.50, currency='GBP', source='broker')
+        from app.runtime_hub import RuntimeHub
+        hub = RuntimeHub.__new__(RuntimeHub)
+        stats = hub._trade_stats(store, 'GBP')
+        assert float(stats.get('realized_pnl') or 0) == pytest.approx(3.50)
+        q = cash_ledger.quarantine_learn_synthetic(store)
+        assert q['quarantined'] >= 1
+        # After quarantine, Desk still £3.50 not £7.
+        stats2 = hub._trade_stats(store, 'GBP')
+        assert float(stats2.get('realized_pnl') or 0) == pytest.approx(3.50)
+
+
+def test_unmatched_late_deal_link_upgrades_via_ingest():
+    """P0: UNMATCHED + same cash_id with deal_link must link, not stay stuck."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        out = cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 2.00, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link=None, transaction_id='TX-LATE')
+        assert (out.get('event') or out)['status'] == cash_ledger.STATUS_UNMATCHED
+        # Same broker tx later arrives with deal proof.
+        out2 = cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 2.00, 'currency': 'GBP', 'transactionType': 'TRADE',
+             'dealId': 'LATE1'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='LATE1', transaction_id='TX-LATE')
+        assert out2.get('linked') is True or (
+            (out2.get('event') or {}).get('deal_link') == 'LATE1')
+        realized = cash_ledger.deal_realized(
+            store, 'LATE1', currency='GBP', account_id='1', environment='live')
+        assert realized.get('may_teach') is True
+        assert realized.get('amount_minor') == 200
+
+
+def test_deal_realized_requires_currency_filter():
+    """P0: AI ledger teach refuses cross-currency when currency omitted."""
+    with tempfile.TemporaryDirectory() as d:
+        store, _ = new_brain(d)
+        cash_ledger.ingest_funds_row(
+            store,
+            {'pnl': 1.0, 'currency': 'GBP', 'transactionType': 'TRADE'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link='C1', transaction_id='C1TX')
+        bare = cash_ledger.deal_realized(store, 'C1')
+        assert bare.get('may_teach') is False
+        assert bare.get('reason') == 'currency_required'
+        ok = cash_ledger.deal_realized(store, 'C1', currency='GBP')
+        assert ok.get('may_teach') is True
+
+
+def test_committed_only_after_weights_saved_flag():
+    """P0: learn_pending_commit weights_saved gates COMMITTED recovery."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        store.upsert_trade({
+            'dealId': 'SV1', 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade('SV1', 101, 1.0, currency='GBP', source='broker')
+        from app import learn_attempt as la
+        assert la.claim(store, 'SV1', source='broker', pnl=1.0) is not None
+        la.transition(store, 'SV1', la.STATE_RUNNING)
+        e._mark_trade_applied('SV1', mode='test', pnl=1.0, source='broker')
+        att = la.get_attempt(store, 'SV1')
+        assert att.get('state') == la.STATE_APPLIED
+        pend = store.get('learn_pending_commit:SV1')
+        assert isinstance(pend, dict) and pend.get('weights_saved') is False
+        # Crash before save → recovery must NOT auto-COMMITTED.
+        e._recover_pending_learn_commits()
+        assert la.get_attempt(store, 'SV1').get('state') != la.STATE_COMMITTED
+        # After save flag → COMMITTED.
+        pend = dict(store.get('learn_pending_commit:SV1') or {})
+        pend['weights_saved'] = True
+        pend.setdefault('mode', 'test')
+        pend.setdefault('pnl', 1.0)
+        pend.setdefault('source', 'broker')
+        store.set('learn_pending_commit:SV1', pend)
+        n2 = e._recover_pending_learn_commits()
+        assert n2 >= 1
+        assert la.is_committed(store, 'SV1')

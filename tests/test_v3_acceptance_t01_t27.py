@@ -606,7 +606,7 @@ def test_t18_funds_pending_vs_settled_zero():
     assert uncertain['status'] == cash_ledger.STATUS_MATCH_UNCERTAIN
     assert uncertain['amount_minor'] is None
     assert uncertain['may_teach'] is False
-    assert cash_ledger.deal_realized(store2, 'mystery')['status'] == (
+    assert cash_ledger.deal_realized(store2, 'mystery', currency='GBP')['status'] == (
         cash_ledger.STATUS_MATCH_UNCERTAIN)
 
 

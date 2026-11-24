@@ -401,6 +401,9 @@ class RuntimeHub:
                 st=str(ev.get('status') or '')
                 if not deal or ev.get('amount_minor') is None:
                     continue
+                # Same filter as deal_realized — never Desk-sum learn:* doubles.
+                if cash_ledger._is_learn_synthetic(ev):
+                    continue
                 # Isolate by account + environment; never mix LIVE/DEMO.
                 ev_acct=str(ev.get('account_id') or '')
                 if ev_acct and ev_acct!=acct_id:
@@ -465,6 +468,8 @@ class RuntimeHub:
                 if str(ev.get('status') or '')!=_cl.STATUS_UNMATCHED:
                     continue
                 if ev.get('amount_minor') is None:
+                    continue
+                if _cl._is_learn_synthetic(ev):
                     continue
                 ev_acct=str(ev.get('account_id') or '')
                 if ev_acct and ev_acct!=acct_id:

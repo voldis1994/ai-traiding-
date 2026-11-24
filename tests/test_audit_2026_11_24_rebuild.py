@@ -184,7 +184,8 @@ def test_p0_10_funds_bind_exact_deal_id_only():
             store, {'pnl': 0.55, 'currency': 'GBP', 'transactionType': 'TRADE'},
             account_id='1', environment='live', account_currency='GBP',
             deal_link='EXACT1', transaction_id='exact-x')
-        assert cash_ledger.deal_realized(store, 'EXACT1')['may_teach'] is True
+        assert cash_ledger.deal_realized(
+            store, 'EXACT1', currency='GBP')['may_teach'] is True
 
 
 def test_pending_queue_does_not_silently_drop():

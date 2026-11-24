@@ -61,7 +61,8 @@ def needs_correction(store, deal_id: str) -> dict[str, Any] | None:
     taught_pnl = meta.get('pnl')
     bad_source = (not may_teach_live_cash(taught_src)) or taught_src in (
         'capital', 'upl_estimate', 'estimate')
-    realized = cash_ledger.deal_realized(store, str(deal_id))
+    ccy = str(meta.get('currency') or 'GBP')
+    realized = cash_ledger.deal_realized(store, str(deal_id), currency=ccy)
     if not realized.get('may_teach'):
         if bad_source:
             return {
@@ -73,7 +74,7 @@ def needs_correction(store, deal_id: str) -> dict[str, Any] | None:
                 'taught_at': meta.get('at'),
             }
         return None
-    ccy = realized.get('currency') or 'GBP'
+    ccy = realized.get('currency') or ccy
     try:
         ledger_pnl = float(from_minor(int(realized['amount_minor']), ccy))
     except Exception:
@@ -148,13 +149,15 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
         flag = store.get(key)
         if not isinstance(flag, dict) or flag.get('status') != 'QUEUED':
             continue
-        realized = cash_ledger.deal_realized(store, str(deal_id))
+        ccy = engine._account_currency() or 'GBP'
+        realized = cash_ledger.deal_realized(
+            store, str(deal_id), currency=ccy)
         if not realized.get('may_teach') or realized.get('amount_minor') is None:
             continue
         if str(realized.get('status') or '') not in (
                 cash_ledger.STATUS_SETTLED, cash_ledger.STATUS_SETTLED_ZERO):
             continue
-        ccy = realized.get('currency') or engine._account_currency() or 'GBP'
+        ccy = realized.get('currency') or ccy
         try:
             pnl = float(from_minor(int(realized['amount_minor']), ccy))
         except Exception:

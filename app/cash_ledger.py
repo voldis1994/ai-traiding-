@@ -214,6 +214,7 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
     key = _event_key(ev)
     cid = str(ev.get('cash_id') or '')
     new_minor = ev.get('amount_minor')
+    new_deal = str(ev.get('deal_link') or '').strip()
     # Same cash_id+revision OR same cash_id with amended Capital amount.
     if cid and new_minor is not None and str(
             ev.get('transaction_type') or '').upper() != 'CORRECTION':
@@ -225,14 +226,38 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
             except (TypeError, ValueError):
                 target = None
             if target is not None and current is not None and current != target:
-                return apply_correction(
+                result = apply_correction(
                     store, cash_id=cid, corrected_amount_minor=target,
                     currency=ev.get('currency') or 'GBP',
                     note='capital_amount_amendment', outbox=outbox)
-            # Identical net / exact key — no double count.
+                # Amount amend must not block a late deal_link on UNMATCHED.
+                if new_deal:
+                    try:
+                        linked = link_deal(store, cid, new_deal)
+                        result = dict(result)
+                        result['event'] = linked
+                        result['linked'] = True
+                    except Exception:
+                        pass
+                return result
+            # Identical net / exact key — no double count, BUT allow late
+            # deal_link when existing row is still UNMATCHED / MATCH_UNCERTAIN.
             for existing in same:
                 if _event_key(existing) == key or (
                         target is not None and current == target):
+                    old_deal = str(existing.get('deal_link') or '').strip()
+                    old_st = str(existing.get('status') or '')
+                    if new_deal and (
+                            not old_deal
+                            or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
+                        linked = link_deal(store, cid, new_deal)
+                        return {
+                            'appended': False,
+                            'duplicate': True,
+                            'linked': True,
+                            'event': linked,
+                            'outbox_enqueued': False,
+                        }
                     return {
                         'appended': False,
                         'duplicate': True,
@@ -241,6 +266,19 @@ def append_event(store, event: Mapping, *, outbox: bool = True) -> dict:
                     }
     for existing in events:
         if _event_key(existing) == key:
+            old_deal = str(existing.get('deal_link') or '').strip()
+            old_st = str(existing.get('status') or '')
+            if new_deal and (
+                    not old_deal
+                    or old_st in (STATUS_UNMATCHED, STATUS_MATCH_UNCERTAIN)):
+                linked = link_deal(store, cid, new_deal)
+                return {
+                    'appended': False,
+                    'duplicate': True,
+                    'linked': True,
+                    'event': linked,
+                    'outbox_enqueued': False,
+                }
             return {
                 'appended': False,
                 'duplicate': True,
@@ -328,6 +366,19 @@ def _in_period(ev: Mapping, period) -> bool:
     return stamp.startswith(str(period)[:10])
 
 
+def _is_learn_synthetic(ev: Mapping) -> bool:
+    """Legacy synthetic cash invented as learn:{deal} — never sum or teach."""
+    txid = str(ev.get('transaction_id') or '')
+    cid = str(ev.get('cash_id') or '')
+    note = str(ev.get('note') or '')
+    return (
+        txid.startswith('learn:')
+        or cid.startswith('learn:')
+        or 'learn:' in cid
+        or note.startswith('learn_synthetic')
+    )
+
+
 def list_account_events(store, account_id: str, currency: str | None = None,
                         *, environment: str | None = None,
                         period=None, include_fees: bool = True) -> list[dict]:
@@ -342,6 +393,9 @@ def list_account_events(store, account_id: str, currency: str | None = None,
             continue
         if ccy and str(ev.get('currency') or '').upper() != ccy:
             continue
+        # Desk / API / teacher sums must ignore legacy learn:* doubles.
+        if _is_learn_synthetic(ev):
+            continue
         if not _in_period(ev, period):
             continue
         t = str(ev.get('transaction_type') or 'TRADE').upper()
@@ -349,6 +403,32 @@ def list_account_events(store, account_id: str, currency: str | None = None,
             continue
         out.append(ev)
     return out
+
+
+def quarantine_learn_synthetic(store) -> dict:
+    """Migrate legacy learn:{deal} rows out of summable statuses (Desk £×2).
+
+    Idempotent: already-QUARANTINE learn rows are left alone.
+    """
+    events = load_events(store)
+    changed = 0
+    for ev in events:
+        if not _is_learn_synthetic(ev):
+            continue
+        st = str(ev.get('status') or '')
+        if st == STATUS_QUARANTINE and str(ev.get('note') or '').startswith(
+                'learn_synthetic'):
+            continue
+        ev['status'] = STATUS_QUARANTINE
+        prev = str(ev.get('note') or '')
+        if not prev.startswith('learn_synthetic'):
+            ev['note'] = 'learn_synthetic|' + prev if prev else 'learn_synthetic'
+        # Null amount so even a stray sum path cannot count it.
+        ev['amount_minor'] = None
+        changed += 1
+    if changed:
+        _save_events(store, events)
+    return {'quarantined': changed, 'total_events': len(events)}
 
 
 def sum_account(store, account_id: str, currency: str, period=None,
@@ -513,6 +593,7 @@ def deal_realized(
 ) -> dict:
     """Resolve deal PnL from ledger links.
 
+    Currency filter is mandatory for teach (no cross-currency sum).
     No unique deal_link → MATCH_UNCERTAIN (amount_minor null for teach).
     Multiple candidates without unique proof → MATCH_UNCERTAIN.
     Filters account_id + LIVE/DEMO environment when provided.
@@ -520,6 +601,19 @@ def deal_realized(
     deal = str(deal_id or '').strip()
     acct = str(account_id).strip() if account_id else None
     env = str(environment).strip().lower() if environment else None
+    ccy_req = str(currency or '').strip().upper() or None
+    # Without an explicit currency, refuse teach — never mix GBP+USD.
+    if not ccy_req:
+        return {
+            'deal_id': deal,
+            'amount_minor': None,
+            'currency': None,
+            'status': STATUS_MATCH_UNCERTAIN,
+            'events': [],
+            'may_teach': False,
+            'uncertain_candidates': False,
+            'reason': 'currency_required',
+        }
     matches = []
     uncertain = False
     for ev in load_events(store):
@@ -527,13 +621,16 @@ def deal_realized(
             continue
         # Never teach from synthetic learn:* duplicates (legacy double-count).
         txid = str(ev.get('transaction_id') or '')
-        if txid.startswith('learn:'):
+        if txid.startswith('learn:') or str(ev.get('cash_id') or '').startswith('learn:'):
+            continue
+        if str(ev.get('status') or '') == STATUS_QUARANTINE and (
+                str(ev.get('note') or '').startswith('learn_synthetic')):
             continue
         if acct and str(ev.get('account_id') or '') not in ('', acct):
             continue
         if env and str(ev.get('environment') or '').lower() not in ('', env):
             continue
-        if currency and str(ev.get('currency') or '').upper() != currency.upper():
+        if str(ev.get('currency') or '').upper() != ccy_req:
             continue
         st = str(ev.get('status') or '')
         # Never teach from uncertain / unmatched / quarantine / estimate.
@@ -550,7 +647,7 @@ def deal_realized(
         return {
             'deal_id': deal,
             'amount_minor': None,
-            'currency': currency,
+            'currency': ccy_req,
             'status': STATUS_MATCH_UNCERTAIN,
             'events': [],
             'may_teach': False,
@@ -718,4 +815,5 @@ __all__ = [
     'pending_outbox', 'ingest_funds_row', 'consumer_snapshot',
     'list_account_events', 'classify_pnl_source', 'to_minor', 'from_minor',
     'format_ui_amount', 'parse_broker_cash_amount',
+    'quarantine_learn_synthetic', '_is_learn_synthetic',
 ]

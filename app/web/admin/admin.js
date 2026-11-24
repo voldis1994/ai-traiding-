@@ -13,11 +13,11 @@ const deskPrevFields=new Map(); // clientId → {field: previous string}
 const deskPrevTicks=new Map();  // clientId → {tick, at}
 // Desk near tick rate — Capital WS is live; UI poll must not lag far behind.
 // Heavy markets-ohlc / structure-view must NOT block this poll (was 5–33s lag).
-const POLL_IDLE_MS=3000;
-const POLL_LIVE_MS=800;
-const POLL_DESK_MS=250;
+const POLL_IDLE_MS=2000;
+const POLL_LIVE_MS=400;
+const POLL_DESK_MS=120;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
-const OHLC_REFRESH_MS=500;
+const OHLC_REFRESH_MS=250;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();

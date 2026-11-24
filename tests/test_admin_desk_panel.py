@@ -23,7 +23,7 @@ def test_desk_js_uses_live_endpoints_not_fake_curve():
     assert 'renderDeskReact' in js
     assert 'deskTrack' in js
     assert 'POLL_DESK_MS' in js
-    assert 'POLL_DESK_MS=250' in js.replace(' ', '')
+    assert 'POLL_DESK_MS=120' in js.replace(' ', '')
     assert 'renderDeskLight' in js
     assert 'renderDeskHeavy' in js
     # Heavy OHLC must not block overviewInFlight (was 5–33s Desk lag).

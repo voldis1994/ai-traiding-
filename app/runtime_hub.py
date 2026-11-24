@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 267
+DESK_TRUTH_REV = 268
 
 
 def _finite_num(v):
@@ -1838,7 +1838,7 @@ class RuntimeHub:
                                  force: bool = False) -> dict:
         """Remap + shadow on Desk poll; Funds mirror completes in background.
 
-        Overview uses ``wait_for(..., 0.4)`` so awaiting Funds HTTP here used to
+        Overview uses ``wait_for(..., 0.2)`` so awaiting Funds HTTP here used to
         *cancel* the mirror every poll — CLIENT CLOSES kept UPL guesses (±0.09)
         instead of Capital Funds £ (+0.79). ``force=True`` (refresh-truth) still
         awaits the mirror so the operator button blocks until cash is true.
@@ -1943,7 +1943,7 @@ class RuntimeHub:
                             'window': 'history'})
                         self._live_truth_last[cid] = now_m
                 else:
-                    # Desk poll: schedule mirror so wait_for(0.4) cannot cancel it.
+                    # Desk poll: schedule mirror so wait_for(0.2) cannot cancel it.
                     prev = self._mirror_bg_tasks.get(cid)
                     if prev is None or prev.done():
                         self._live_truth_last[cid] = now_m
@@ -2229,7 +2229,7 @@ class RuntimeHub:
 
         Gating poll by wall clock alone starved the event loop when poll() took
         longer than the gap (common): no sleep, no Desk HTTP, mid/UPL frozen.
-        Always run ~0.5–0.7s of 50ms quote/UPL/entry ticks after each poll.
+        Always run ~0.35–0.5s of 25ms quote/UPL/entry ticks after each poll (~2×).
         """
         error_count=0
         engine=rt.engine
@@ -2252,8 +2252,8 @@ class RuntimeHub:
                                 and hasattr(engine,'quote_entry_tick')
                                 and engine._wants_fast_entry_ticks())
                     # Guaranteed yield window so Admin/Desk HTTP can run.
-                    light_n=14 if (open_book or fast_entry) else 10
-                    gap=0.05
+                    light_n=18 if (open_book or fast_entry) else 12
+                    gap=0.025
                     for _ in range(light_n):
                         await asyncio.sleep(gap)
                         if not engine.mandate:

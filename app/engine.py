@@ -1450,7 +1450,7 @@ class SingleTradeEngine:
             if n_commit:
                 self.store.event('learning','Pending learn commits recovered',
                                  {'n':n_commit})
-            _lc.scan_and_flag(self.store,limit=40)
+            _lc.scan_and_flag(self.store)
         except Exception as exc:
             self.store.event('warning','Boot learn/queue recovery skipped',
                              {'type':type(exc).__name__})
@@ -4812,6 +4812,32 @@ class SingleTradeEngine:
         except Exception:
             return None
 
+    def _deal_ledger_final(self,deal_id) -> bool:
+        """True when Cash Ledger has verified teachable £ (incl. SETTLED_ZERO)."""
+        try:
+            from . import cash_ledger as _cl
+            ccy=self._account_currency() or 'GBP'
+            acct=str(self.store.get('capital_account_id') or '') or None
+            env=str(self.store.get('capital_environment') or '').lower() or None
+            realized=_cl.deal_realized(
+                self.store,str(deal_id),currency=ccy,
+                account_id=acct,environment=env)
+            return bool(realized.get('may_teach'))
+        except Exception:
+            return False
+
+    def _settle_queue_already_done(self,deal_id) -> bool:
+        """Avoid re-arming DONE settle jobs (dedupe ignores DONE rows)."""
+        try:
+            from . import work_queue as _wq
+            _wq.ensure_schema(self.store)
+            row=self.store.db.execute(
+                "SELECT 1 FROM work_queue WHERE dedupe_key=? AND status=? LIMIT 1",
+                ('settle:'+str(deal_id),_wq.STATUS_DONE)).fetchone()
+            return bool(row)
+        except Exception:
+            return False
+
     def _requeue_unsettled_cash_closes(self):
         """Pull journal rows stuck on pending/capital/upl_estimate into harvest.
 
@@ -4819,6 +4845,8 @@ class SingleTradeEngine:
         Funds £ can refine. Legacy ``upl_estimate`` rows stay harvestable too.
         Also re-arm £0 ``broker`` binds — Capital often journals 0 before the
         real close £ lands (poison that used to freeze Admin forever).
+        Verified ledger £0.00 / DONE settle jobs are never re-armed.
+        No LIMIT — every unsettled close must stay harvestable.
         """
         try:
             rows=self.store.db.execute(
@@ -4827,7 +4855,7 @@ class SingleTradeEngine:
                 "('pending_broker_pnl','pending_close_sync',"
                 "'ticks_only','price_size','position_disappeared',"
                 "'upl_estimate','capital','broker')) "
-                "ORDER BY closed DESC LIMIT 80").fetchall()
+                "ORDER BY closed DESC").fetchall()
         except Exception:
             return 0
         n=0
@@ -4843,10 +4871,16 @@ class SingleTradeEngine:
                          and self._pnl_looks_like_lot_size(pnl_n,size))
             if src_s=='broker' and not zero_broker and not size_poison:
                 continue
+            # Ledger may_teach (incl. £0.00) OR settle already DONE → stop.
+            if self._deal_ledger_final(deal) and not size_poison:
+                continue
+            if self._settle_queue_already_done(deal) and not size_poison:
+                continue
             banked=self.store.get('broker_cash_banked:'+deal)
             if isinstance(banked,dict) and str(banked.get('source') or '')=='broker':
-                banked_pnl=_num(banked.get('pnl'))
-                if banked_pnl is not None and abs(float(banked_pnl))>=1e-12 and not zero_broker:
+                # Banked broker (incl. verified £0.00) is finished for settle
+                # re-arm — Funds mirror / ledger amend handles later revisions.
+                if not size_poison:
                     continue
             # capital / upl_estimate stay harvestable so Funds £ can refine.
             elif (banked and src_s not in ('upl_estimate','capital')
@@ -6309,6 +6343,7 @@ class SingleTradeEngine:
         Keyed by ``broker_cash_banked:{deal}``. First bank wins; a later
         ``broker`` figure may *refine* a prior ``upl_estimate`` via £ delta
         (no double close count). £0 poison binds may also be corrected.
+        Banked non-zero broker £ may be amended when Capital Funds revises.
         """
         if pnl is None or deal_id is None:
             return False
@@ -6332,20 +6367,26 @@ class SingleTradeEngine:
                          and abs(val)>=1e-12)
             upl_to_broker=(prev_src in ('upl_estimate','capital','') and src=='broker'
                           and prev_pnl is not None)
-            if upl_to_broker and not zero_poison:
-                # Refine last-UPL Capital £ bank with Funds £ — apply delta only.
+            broker_amend=(prev_src=='broker' and src=='broker'
+                          and prev_pnl is not None
+                          and abs(float(prev_pnl)-float(val))>=1e-9)
+            if (upl_to_broker or broker_amend) and not zero_poison:
+                # Refine UPL/capital→Funds or Funds amount amendment — delta only.
                 hard_risk.refine_realized_pnl(self.store,prev_pnl,val)
                 day_book.refine_close(
                     self.store,deal_id=deal,old_pnl=prev_pnl,new_pnl=val,
                     equity=equity,open_count=open_n)
                 self.store.set(key,{
                     'at':now(),'pnl':val,'currency':currency,'action':action,
-                    'source':'broker','refined_from':prev_src or 'capital',
-                    'prev_pnl':prev_pnl})
+                    'source':'broker',
+                    'refined_from':prev_src or 'capital',
+                    'prev_pnl':prev_pnl,
+                    'amend':bool(broker_amend)})
                 self.store.event('learning',
-                    'Day-book/hard-risk refined UPL/capital→Funds £',
+                    'Day-book/hard-risk refined banked £→Funds £',
                     {'deal_id':deal,'prev':prev_pnl,'pnl':val,
-                     'refined_from':prev_src or 'capital'})
+                     'refined_from':prev_src or 'capital',
+                     'amend':bool(broker_amend)})
                 return True
             if not zero_poison:
                 return False
@@ -6554,7 +6595,7 @@ class SingleTradeEngine:
                 attempts=int(job.get('attempts') or 0)
                 try:
                     if job.get('kind')==_wq.KIND_LEARN_RECOVERY:
-                        _lc.scan_and_flag(self.store,limit=40)
+                        _lc.scan_and_flag(self.store)
                         _lc.apply_queued_corrections(self,limit=8)
                         _wq.complete(self.store,job['id'])
                         continue

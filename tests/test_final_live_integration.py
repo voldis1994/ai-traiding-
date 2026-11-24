@@ -370,6 +370,58 @@ def test_live_diagnostics_on_existing_store():
         assert 'event_loop' in snap
 
 
+def test_banked_nonzero_funds_amend_refines():
+    """Banked non-zero broker £ must refine when Capital Funds revises amount."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        deal = 'AMD1'
+        store.upsert_trade({
+            'dealId': deal, 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade(deal, 101, 1.00, currency='GBP', source='broker')
+        assert e._bank_broker_cash_side_effects(
+            deal, 1.00, currency='GBP', source='broker') is True
+        # Same deal, Funds revises to 1.15 — must refine, not ignore.
+        assert e._bank_broker_cash_side_effects(
+            deal, 1.15, currency='GBP', source='broker') is True
+        banked = store.get('broker_cash_banked:' + deal)
+        assert banked and float(banked['pnl']) == pytest.approx(1.15)
+        assert banked.get('amend') is True
+
+
+def test_verified_zero_ledger_not_rearmed_on_settle_queue():
+    """SETTLED_ZERO + DONE settle must not spawn infinite work_queue jobs."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        deal = 'ZDONE'
+        store.set('capital_account_id', '1')
+        store.set('capital_environment', 'live')
+        store.upsert_trade({
+            'dealId': deal, 'epic': 'GOLD', 'size': '0.1',
+            'direction': 'BUY', 'level': 100})
+        store.close_trade(deal, 100, 0.0, currency='GBP', source='broker')
+        store.set('broker_cash_banked:' + deal, {'pnl': 0.0, 'source': 'broker'})
+        cash_ledger.ingest_funds_row(
+            store, {'pnl': 0.0, 'currency': 'GBP'},
+            account_id='1', environment='live', account_currency='GBP',
+            deal_link=deal, transaction_id='TX-ZDONE')
+        work_queue.ensure_schema(store)
+        wid = work_queue.enqueue(
+            store, work_queue.KIND_SETTLE_PNL, {'deal_id': deal},
+            dedupe_key='settle:' + deal)
+        work_queue.complete(store, wid)
+        before = store.db.execute(
+            "SELECT COUNT(*) FROM work_queue WHERE dedupe_key=?",
+            ('settle:' + deal,)).fetchone()[0]
+        e._requeue_unsettled_cash_closes()
+        after = store.db.execute(
+            "SELECT COUNT(*) FROM work_queue WHERE dedupe_key=?",
+            ('settle:' + deal,)).fetchone()[0]
+        assert after == before
+
+
 def test_npz_attempt_id_authoritative_over_sidecar():
     with tempfile.TemporaryDirectory() as d:
         store, brain = new_brain(d)

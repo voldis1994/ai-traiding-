@@ -33,14 +33,24 @@ def _newer_committed_exists(store, deal_id: str, after_at: str | None) -> bool:
     """True when another deal COMMITTED learn after this deal's teach time."""
     if not after_at:
         return True  # unknown → refuse full rewind
+    # Prefer learn_attempt:* keys (complete set); fall back to all closed trades.
+    deal_ids: list[str] = []
     try:
         rows = store.db.execute(
-            "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
-            "ORDER BY closed DESC LIMIT 80").fetchall()
+            "SELECT key FROM state WHERE key LIKE 'learn_attempt:%'"
+        ).fetchall()
+        deal_ids = [str(k).split(':', 1)[-1] for (k,) in rows]
     except Exception:
-        return True
-    for (other,) in rows:
-        oid = str(other)
+        deal_ids = []
+    if not deal_ids:
+        try:
+            rows = store.db.execute(
+                "SELECT deal_id FROM trades WHERE closed IS NOT NULL"
+            ).fetchall()
+            deal_ids = [str(d) for (d,) in rows]
+        except Exception:
+            return True
+    for oid in deal_ids:
         if oid == str(deal_id):
             continue
         att = la.get_attempt(store, oid)
@@ -141,13 +151,20 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
     """
     store = engine.store
     applied = []
+    # All QUEUED corrections — not a truncated last-N trades window.
+    queued_deals: list[str] = []
     try:
         rows = store.db.execute(
-            "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
-            "ORDER BY closed DESC LIMIT ?", (int(limit) * 3,)).fetchall()
+            "SELECT key FROM state WHERE key LIKE 'learn_correction:%'"
+        ).fetchall()
+        for (k,) in rows:
+            deal = str(k).split(':', 1)[-1]
+            flag = store.get('learn_correction:' + deal)
+            if isinstance(flag, dict) and flag.get('status') == 'QUEUED':
+                queued_deals.append(deal)
     except Exception:
-        return applied
-    for (deal_id,) in rows:
+        queued_deals = []
+    for deal_id in queued_deals:
         if len(applied) >= limit:
             break
         key = 'learn_correction:' + str(deal_id)
@@ -241,13 +258,18 @@ def apply_queued_corrections(engine, *, limit: int = 8) -> list[dict]:
     return applied
 
 
-def scan_and_flag(store, *, limit: int = 80) -> list[dict]:
-    """Scan recent closed journal deals for contradicted learns."""
+def scan_and_flag(store, *, limit: int | None = None) -> list[dict]:
+    """Scan closed journal deals for contradicted learns (all deals by default)."""
     out = []
     try:
-        rows = store.db.execute(
-            "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
-            "ORDER BY closed DESC LIMIT ?", (int(limit),)).fetchall()
+        if limit is None:
+            rows = store.db.execute(
+                "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
+                "ORDER BY closed DESC").fetchall()
+        else:
+            rows = store.db.execute(
+                "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
+                "ORDER BY closed DESC LIMIT ?", (int(limit),)).fetchall()
     except Exception:
         return out
     for (deal_id,) in rows:
@@ -282,8 +304,16 @@ def recover_incomplete_on_boot(store) -> list[dict]:
             deal_ids.add(deal)
     try:
         rows = store.db.execute(
-            "SELECT deal_id FROM trades WHERE closed IS NOT NULL "
-            "ORDER BY closed DESC LIMIT 120").fetchall()
+            "SELECT key FROM state WHERE key LIKE 'learn_attempt:%'"
+        ).fetchall()
+        for (k,) in rows:
+            deal_ids.add(str(k).split(':', 1)[-1])
+    except Exception:
+        pass
+    try:
+        rows = store.db.execute(
+            "SELECT deal_id FROM trades WHERE closed IS NOT NULL"
+        ).fetchall()
         for (deal_id,) in rows:
             deal_ids.add(str(deal_id))
     except Exception:

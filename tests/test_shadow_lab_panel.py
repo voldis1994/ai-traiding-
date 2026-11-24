@@ -20,18 +20,26 @@ def test_shadow_rail_and_view_exist():
     assert 'function renderShadowLab(' in JS
     assert 'shadow-board' in CSS
     assert 'hundred_variations' in JS
-    assert 'admin.css?v=139' in HTML
-    assert 'admin.js?v=172' in HTML
-    assert 'live_news' in JS or 'Live today' in JS
+    assert 'admin.css?v=140' in HTML
+    assert 'admin.js?v=175' in HTML
     assert 'auditWindow24' in JS
+    assert 'shadowCmdLog' in JS
     assert ('from_journal' in JS or 'Capital journal' in JS or 'from Capital' in JS)
     assert 'audit_backfill' in JS or 'PRICE PTS' in JS
     assert 'display_net' in JS
-    assert 'MISTAKE AUDIT' in JS or 'mistake_audit' in JS
+    assert 'mistake_audit' in JS
     assert 'SCENARIO MEMORY' in JS
     assert 'SHADOW CMD LOG' in JS
     assert 'learning_log' in JS
+    assert 'shadow-cmd-meta' in JS
+    assert 'shadow-cmd-meta' in CSS
+    assert 'TARGETED FIX' not in JS  # folded into CMD MAP/WRITE
+    assert 'MISTAKE AUDIT' not in JS  # folded into CMD
+    assert 'RECENT AUDITS' not in JS  # CMD CLOSE lines replace it
+    assert 'fixSteps' in JS or 'fix_steps' in JS or 'fixState' in JS
+    assert 'DIAGNOSING' in JS
     assert 'shadow-cmd' in CSS
+    assert 'minmax(220px' in CSS or '2.2fr' in CSS
 
 
 def test_shadow_lab_payload_honest_about_100():

@@ -858,7 +858,8 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
   flex:1;min-height:0;overflow:hidden;padding:0;
   display:grid;gap:4px;
   grid-template-columns:repeat(6,minmax(0,1fr));
-  grid-template-rows:minmax(140px,1.35fr) repeat(3,minmax(0,1fr)) minmax(0,1.05fr);
+  /* CMD dominates: ~45% height; secondary cards share the rest */
+  grid-template-rows:minmax(220px,2.2fr) repeat(2,minmax(0,1fr)) minmax(0,.95fr);
   align-content:stretch}
 .shadow-card{
   grid-column:span 2;
@@ -866,11 +867,17 @@ table.data tr:hover td{background:rgba(118,160,222,.06)}
   border-radius:2px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .shadow-card.wide{grid-column:span 3}
 .shadow-card.cmdlog{grid-column:1 / -1;grid-row:1}
+.shadow-cmd-meta{
+  display:flex;flex-wrap:wrap;gap:6px 12px;flex:0 0 auto;
+  padding:2px 2px 4px;font-size:9px;color:var(--desk-muted,#8c95a6);
+  border-bottom:1px solid #0d2a18;margin-bottom:4px}
+.shadow-cmd-meta b{color:var(--desk-yellow,#e9bc65);font-weight:800;margin-right:3px}
+.shadow-cmd-meta span{white-space:nowrap}
 .shadow-cmd{
-  flex:1;min-height:0;overflow:auto;padding:6px 8px;
+  flex:1;min-height:0;overflow:auto;padding:8px 10px;
   background:#020805;border:1px solid #0d2a18;border-radius:2px;
   font-family:"IBM Plex Mono","Consolas","Courier New",monospace;
-  font-size:10px;line-height:1.35;color:#8fd9a8;white-space:pre-wrap;
+  font-size:11px;line-height:1.4;color:#8fd9a8;white-space:pre-wrap;
   scrollbar-width:thin}
 .shadow-cmd-line{margin:0 0 1px;word-break:break-word}
 .shadow-cmd-line.head{color:#e9bc65;font-weight:800;letter-spacing:.02em;margin-bottom:4px}

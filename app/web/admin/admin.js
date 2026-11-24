@@ -453,12 +453,21 @@ function renderShadowLab(client){
   const winNet=win24.net!=null?Number(win24.net):null;
   const winNetTxt=winNet==null?'—'
     :((winNet>=0?'+':'')+num(winNet,2));
+  const promoteNeed=auditLast.promote_need!=null
+    ?auditLast.promote_need
+    :(audit.promote_n!=null?audit.promote_n:1);
   const gateTxt=(auditLast.promote_count!=null)
-    ?(`${auditLast.promote_count}/${auditLast.promote_need||3}`)
-    :'0/3';
+    ?(`${auditLast.promote_count}/${promoteNeed}`)
+    :(`0/${promoteNeed}`);
+  const fixSteps=Array.isArray(pendingFix.steps)?pendingFix.steps
+    :(Array.isArray(auditLast.fix_steps)?auditLast.fix_steps:[]);
+  const fixWaiting=fixSteps.some(s=>s&&s.status==='wait');
   const fixState=pendingFix.committed?'COMMITTED'
-    :(pendingFix.fingerprint?'PENDING':'—');
-  const fixCls=pendingFix.committed?'ok':(pendingFix.fingerprint?'neu':'');
+    :(fixWaiting?'DIAGNOSING'
+      :(pendingFix.fingerprint?'PENDING'
+        :(fixSteps.length?'DIAGNOSING':'IDLE')));
+  const fixCls=pendingFix.committed?'ok'
+    :(fixWaiting||pendingFix.fingerprint?'neu':'');
   const scenRows=(Array.isArray(audit.top_scenarios)?audit.top_scenarios:[]).slice(0,2).map(s=>{
     if(!s||typeof s!=='object')return '';
     const tag=s.ready_for_live?'READY':(s.fix_committed?'FIXED':'…');
@@ -505,41 +514,22 @@ function renderShadowLab(client){
     const lv=String(L.level||'info');
     return `<div class="shadow-cmd-line ${esc(lv)}">${esc(String(L.text||''))}</div>`;
   }).join(''):'<div class="shadow-cmd-line wait">waiting for Capital / paper closes — nothing audited yet</div>';
+  // Compact strip — only numbers not already spelled out in CMD MAP/WRITE.
+  const cmdMeta=(
+    `<div class="shadow-cmd-meta">`
+    +`<span><b>24h</b> ${esc(winN?(`${winW}/${winL}`):'0/0')} · ${esc(winNetTxt)}</span>`
+    +`<span><b>gate</b> ${esc(gateTxt)}</span>`
+    +`<span><b>fix</b> ${esc(fixState)}</span>`
+    +`<span><b>ready</b> ${esc(audit.ready_count!=null?audit.ready_count:0)}</span>`
+    +`<span><b>fp</b> ${esc(pendingFix.fingerprint?String(pendingFix.fingerprint).slice(0,8):'—')}</span>`
+    +`</div>`
+  );
   stableHtml(board,`
     <article class="shadow-card cmdlog">
-      <div class="psx-h"><h2>SHADOW CMD LOG</h2><span class="psx-src">CLOSE→ERROR→FIX</span><span class="psx-live">● LIVE</span></div>
-      <div class="body"><div class="shadow-cmd" id="shadowCmdLog">${cmdHtml}</div></div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>MISTAKE AUDIT</h2><span class="psx-src">DIAGNOSE</span></div>
+      <div class="psx-h"><h2>SHADOW CMD LOG</h2><span class="psx-src">CLOSE→MAP→WRITE</span><span class="psx-live">● LIVE</span></div>
       <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Last mistakes',missTxt,missCls)}
-          ${_shadowKv('Last £',auditPnlTxt,auditPnl==null?'neu':(auditPnl>=0?'ok':'bad'))}
-          ${_shadowKv('24h W/L',winN?(`${winW} / ${winL}`):'0 / 0',winL?'bad':(winW?'ok':'neu'))}
-          ${_shadowKv('24h net',winNetTxt,winNet==null?'neu':(winNet>=0?'ok':'bad'))}
-        </div>
-        <div class="shadow-note">${esc(
-          winN
-            ?('24h · '+winN+' closes W'+winW+'/L'+winL
-              +(win24.from_journal?' · Capital journal':'')
-              +' · '+(auditLast.source||'—')+' '
-              +(missTxt!=='none'?missTxt:(auditLast.scenario||'')))
-            :(auditLast.display_note==='showing_last_hurt_not_scratch'
-              ?('Last hurt · '+(auditLast.scenario||''))
-              :(auditLast.display_note==='showing_journal_24h_seed'
-                ?('Seeded from Capital 24h journal')
-                :((Array.isArray(auditLast.notes)&&auditLast.notes.length)
-                  ?String(auditLast.notes[0]).slice(0,90)
-                  :(audit.loop||'diagnose → fix → LIVE')))))}</div>
-        <div class="shadow-note">${esc((()=>{
-          const ln=audit.live_news||{};
-          const lp=audit.live_peers||{};
-          return 'news '+(auditLast.news_status||ln.status||'—')
-            +' · peers '+(auditLast.intermarket_status||lp.status||'—')
-            +(lp.ready_peers!=null?(' '+lp.ready_peers+'/'+(lp.peer_n||0)):'')
-            +' · zone '+(auditLast.zone_side||'—');
-        })())}</div>
+        ${cmdMeta}
+        <div class="shadow-cmd" id="shadowCmdLog">${cmdHtml}</div>
       </div>
     </article>
     <article class="shadow-card">
@@ -552,30 +542,6 @@ function renderShadowLab(client){
           ${_shadowKv('Audits',audit.hist_n!=null?audit.hist_n:0)}
         </div>
         ${scenRows}
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>TARGETED FIX</h2><span class="psx-src">NOT £ CHASE</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('State',fixState,fixCls)}
-          ${_shadowKv('Fingerprint',pendingFix.fingerprint?String(pendingFix.fingerprint).slice(0,8):'—')}
-          ${_shadowKv('News respect',audit.respect_news_window?'ON':'off',audit.respect_news_window?'ok':'neu')}
-          ${_shadowKv('Peer veto',audit.respect_intermarket_veto?'ON':'off',audit.respect_intermarket_veto?'ok':'neu')}
-        </div>
-        <div class="shadow-note">${esc(
-          pendingFix.committed
-            ?('Committed knobs: '+((pendingFix.changed||[]).join(', ')||'flags'))
-            :(pendingFix.why||'First same mistake commits fix → ready LIVE immediately'))}</div>
-      </div>
-    </article>
-    <article class="shadow-card">
-      <div class="psx-h"><h2>READY → LIVE</h2><span class="psx-src">PROMOTE</span></div>
-      <div class="body">
-        <div class="shadow-kv">
-          ${_shadowKv('Proof wins need',audit.ready_n!=null?audit.ready_n:2)}
-          ${_shadowKv('Queue',audit.ready_count!=null?audit.ready_count:0)}
-        </div>
         ${readyRows}
       </div>
     </article>
@@ -662,10 +628,6 @@ function renderShadowLab(client){
         <div class="shadow-note">Last advice: ${esc(advice)}</div>
         ${top}
       </div>
-    </article>
-    <article class="shadow-card wide">
-      <div class="psx-h"><h2>RECENT AUDITS</h2><span class="psx-src">LOOP</span><span class="psx-live">● LIVE</span></div>
-      <div class="body"><div class="shadow-rows">${auditRows}</div></div>
     </article>
     <article class="shadow-card wide">
       <div class="psx-h"><h2>RECENT PAPER CLOSES</h2><span class="psx-src">JOURNAL</span><span class="psx-live">● LIVE</span></div>

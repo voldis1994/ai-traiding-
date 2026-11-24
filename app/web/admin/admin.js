@@ -11,11 +11,12 @@ let deskStructureInFlight=null;
 let lastDeskChartKey='';
 const deskPrevFields=new Map(); // clientId → {field: previous string}
 const deskPrevTicks=new Map();  // clientId → {tick, at}
-const POLL_IDLE_MS=10000;
-const POLL_LIVE_MS=5000;
-const POLL_DESK_MS=2500;
+// Desk must feel live vs phone — Capital quotes tick; UI was 2.5–10s poll-only.
+const POLL_IDLE_MS=5000;
+const POLL_LIVE_MS=1500;
+const POLL_DESK_MS=800;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
-const OHLC_REFRESH_MS=2000;
+const OHLC_REFRESH_MS=1000;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
 // lagging backend cannot make the Admin card dance mid-trade.
 const frozenScoresByClient=new Map();
@@ -2481,7 +2482,8 @@ function desiredPollMs(data){
   const s=(data&&data.summary)||{};
   const running=Number(s.running_robots)||0;
   const open=Number(s.open_trades_all)||collectOpenTrades((data&&data.clients)||[]).length;
-  if(deskOn&&(running>0||open>0))return POLL_DESK_MS;
+  // Desk tab always fast — operator is watching live tape / SHADOW CMD.
+  if(deskOn)return POLL_DESK_MS;
   return (running>0 || open>0)?POLL_LIVE_MS:POLL_IDLE_MS;
 }
 
@@ -2562,10 +2564,10 @@ async function loadOverview(){
   // Coalesce overlapping polls so a slow /overview cannot stack and freeze UI.
   if(overviewInFlight)return overviewInFlight;
   overviewInFlight=(async()=>{
-    // First Desk paint after browser load: force Funds mirror (ignore 12s cooldown).
+    // First paint: kick Funds mirror in background — never block the live poll.
     if(!truthForceBooted){
       truthForceBooted=true;
-      try{await api('/api/admin/refresh-truth','POST')}catch(_){/* keep poll */}
+      api('/api/admin/refresh-truth','POST').catch(()=>{});
     }
     let data=await api('/api/admin/overview');
     if(deskDemoMode){

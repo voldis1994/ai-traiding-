@@ -12,9 +12,10 @@ let lastDeskChartKey='';
 const deskPrevFields=new Map(); // clientId → {field: previous string}
 const deskPrevTicks=new Map();  // clientId → {tick, at}
 // Desk near tick rate — Capital WS is live; UI poll must not lag far behind.
+// Heavy markets-ohlc / structure-view must NOT block this poll (was 5–33s lag).
 const POLL_IDLE_MS=3000;
 const POLL_LIVE_MS=800;
-const POLL_DESK_MS=400;
+const POLL_DESK_MS=250;
 // Popup OHLC refresh (only when operator opens a client window — no main-board poll).
 const OHLC_REFRESH_MS=500;
 // While a LIVE deal is open, freeze displayed BUY/HOLD/SELL per client so a
@@ -187,12 +188,9 @@ function isCapitalFundsSrc(src){
   return s==='broker'||s==='funds'||s==='capital'||s==='live_funds_mirror'
     ||s==='cash_ledger'||s==='capital_funds'||s==='verified_funds'||s==='cash';
 }
-/** Rows Desk may list in NESEN / CLIENT CLOSES (Funds £ or journal waiting for Funds). */
+/** CLIENT CLOSES = Capital Funds £ only — never UPL/pending guesses (looked “random”). */
 function isDeskListableClose(src){
-  if(isCapitalFundsSrc(src))return true;
-  const s=String(src||'').toLowerCase();
-  return s==='upl_estimate'||s==='pending_broker_pnl'||s==='pending_close_sync'
-    ||s==='pending_upl_teach';
+  return isCapitalFundsSrc(src);
 }
 function sourceLabel(src){
   if(isCapitalFundsSrc(src))return 'Capital £';
@@ -1600,6 +1598,90 @@ async function loadDeskStructure(clientId){
   return deskStructureInFlight;
 }
 
+/** Paint Desk from overview activity first — never block poll on OHLC HTTP. */
+function renderDeskLight(data,focus){
+  const open=collectOpenTrades(data.clients||[]);
+  renderDeskLiveTrades(open);
+  renderDeskUtc();
+  renderDeskStatusBoard(focus);
+  renderDeskLearn(focus);
+  renderShadowLab(focus);
+  renderDeskClosed(focus);
+  renderDeskEngine(focus);
+  renderDeskCrowd(focus);
+  renderDeskIntel(focus);
+  renderDeskPulse(focus);
+  renderDeskFear(focus);
+  // Quote / signal / book from live activity — ask/bid must not wait for candles.
+  renderDeskQuote(deskStructure,focus);
+  renderDeskSignal(focus,[]);
+  renderDeskBook(focus,deskStructure);
+  renderDeskLevels(deskStructure,focus);
+  renderDeskIndicators(focus,deskStructure);
+  renderDeskCheck(focus,deskStructure);
+  if(deskStructure&&(deskStructure.candles||[]).length){
+    renderDeskIndCharts(focus,deskStructure);
+    requestAnimationFrame(()=>{
+      deskAutoFit();
+      lastDeskChartKey='';
+      drawDeskChart(deskStructure);
+    });
+  }
+}
+
+async function renderDeskHeavy(focus,demoFx){
+  let markets=[];
+  let view=null;
+  if(demoFx){
+    markets=demoFx.markets||[];
+    view=demoFx.view||null;
+  }else{
+    try{
+      const board=await api('/api/admin/markets-ohlc?n=90');
+      markets=board.markets||[];
+    }catch(_){markets=[]}
+    if(focus){
+      const epic=((focus.activity||{}).market)
+        ||(((focus.activity||{}).mandate)||{}).epic;
+      view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
+        &&(m.client_ids||[]).map(String).includes(String(focus.id)))
+        ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
+        ||null;
+      if(!view||!(view.candles||[]).length){
+        view=await loadDeskStructure(focus.id);
+      }
+    }
+  }
+  renderDeskTape(markets,focus);
+  renderDeskWatch(markets,focus);
+  renderDeskSignal(focus,markets);
+  view=enrichViewOpenLevels(view,focus);
+  if(view)deskStructure=view;
+  const titleEl=$('deskChartTitle');
+  if(titleEl){
+    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'INSTRUMENT';
+    titleEl.textContent=`${ep} CHART`;
+  }
+  const epicTitle=$('deskEpicTitle');
+  if(epicTitle){
+    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
+    epicTitle.textContent=ep;
+  }
+  renderDeskQuote(view,focus);
+  renderDeskLevels(view,focus);
+  renderDeskIndicators(focus,view);
+  renderDeskCheck(focus,view);
+  renderDeskBook(focus,view);
+  renderDeskIndCharts(focus,view);
+  lastDeskChartKey='';
+  requestAnimationFrame(()=>{
+    deskAutoFit();
+    lastDeskChartKey='';
+    drawDeskChart(view);
+    requestAnimationFrame(()=>{lastDeskChartKey='';drawDeskChart(view);});
+  });
+}
+
 async function renderDesk(data){
   let clients=data.clients||[];
   let demoFx=null;
@@ -1621,73 +1703,10 @@ async function renderDesk(data){
     if(deskFocusId!=null)sel.value=String(deskFocusId);
     else if(prev)sel.value=prev;
   }
-  const open=collectOpenTrades(clients);
-  renderDeskLiveTrades(open);
-  renderDeskUtc();
-  renderDeskStatusBoard(focus);
-  renderDeskLearn(focus);
-  renderShadowLab(focus);
-  renderDeskClosed(focus);
-  renderDeskEngine(focus);
-  renderDeskCrowd(focus);
-  renderDeskIntel(focus);
-  renderDeskPulse(focus);
-  renderDeskFear(focus);
-  let markets=[];
-  if(demoFx){
-    markets=demoFx.markets;
-  }else{
-    try{
-      const board=await api('/api/admin/markets-ohlc?n=90');
-      markets=board.markets||[];
-    }catch(_){markets=[]}
-  }
-  renderDeskTape(markets,focus);
-  renderDeskWatch(markets,focus);
-  renderDeskSignal(focus,markets);
-  let view=null;
-  if(demoFx){
-    view=demoFx.view;
-    deskStructure=view;
-  }else if(focus){
-    const epic=((focus.activity||{}).market)
-      ||(((focus.activity||{}).mandate)||{}).epic;
-    view=(markets||[]).find(m=>epic&&String(m.epic)===String(epic)
-      &&(m.client_ids||[]).map(String).includes(String(focus.id)))
-      ||(markets||[]).find(m=>(m.client_ids||[]).map(String).includes(String(focus.id)))
-      ||null;
-    if(!view||!(view.candles||[]).length){
-      view=await loadDeskStructure(focus.id);
-    }else{
-      deskStructure=view;
-    }
-  }
-  const titleEl=$('deskChartTitle');
-  if(titleEl){
-    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'INSTRUMENT';
-    titleEl.textContent=`${ep} CHART`;
-  }
-  const epicTitle=$('deskEpicTitle');
-  if(epicTitle){
-    const ep=(view&&view.epic)||((focus&&focus.activity)||{}).market||'—';
-    epicTitle.textContent=ep;
-  }
-  view=enrichViewOpenLevels(view,focus);
-  if(view)deskStructure=view;
-  renderDeskQuote(view,focus);
-  renderDeskLevels(view,focus);
-  renderDeskIndicators(focus,view);
-  renderDeskCheck(focus,view);
-  renderDeskBook(focus,view);
-  renderDeskIndCharts(focus,view);
-  lastDeskChartKey='';
-  requestAnimationFrame(()=>{
-    deskAutoFit();
-    lastDeskChartKey='';
-    drawDeskChart(view);
-    // Second pass after flex layout settles (canvas often 0×0 on first paint).
-    requestAnimationFrame(()=>{lastDeskChartKey='';drawDeskChart(view);});
-  });
+  // Light paint returns immediately so overview poll stays ≤250ms cadence.
+  renderDeskLight(data,focus);
+  // Heavy OHLC board/chart — background; never hold overviewInFlight.
+  renderDeskHeavy(focus,demoFx).catch(err=>console.warn('desk-heavy',err));
 }
 
 function positionMid(p,activity){
@@ -1952,7 +1971,8 @@ function drawPerfChart(clients){
   const perfKey=chartRange+'|'+pts.map(p=>p.t+':'+p.v).join(',');
   const dpr=window.devicePixelRatio||1;
   const cssW=canvas.clientWidth||800;
-  const cssH=220;
+  // Match CSS #perfChart height — never paint 220px over client chips.
+  const cssH=Math.min(100,canvas.clientHeight||100);
   const bw=Math.floor(cssW*dpr),bh=Math.floor(cssH*dpr);
   if(perfKey===lastPerfKey&&canvas.width===bw&&canvas.height===bh)return;
   lastPerfKey=perfKey;
@@ -2586,7 +2606,7 @@ async function loadOverview(){
     renderRiskBoard(data.clients);
     renderRecentClosed(data.clients);
     drawPerfChart(data.clients);
-    // Desk uses overview + markets-ohlc / structure-view (real Capital tape).
+    // Light Desk paint only — heavy markets-ohlc runs in background.
     try{await renderDesk(data)}catch(err){console.warn('desk',err)}
 
     const room=$('controlRoom');

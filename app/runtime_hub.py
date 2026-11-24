@@ -19,7 +19,7 @@ log=logging.getLogger('runtime_hub')
 # Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
 # the Desk status pill proves the Windows process reloaded after git pull.
 # After this PR merges, operators look for this number — not #241 (already on main).
-DESK_TRUTH_REV = 265
+DESK_TRUTH_REV = 267
 
 
 def _finite_num(v):
@@ -1806,18 +1806,50 @@ class RuntimeHub:
             'configured':True})
         return hard_risk.snapshot(store)
 
-    async def refresh_live_truth(self, *, client_id: int | None = None,
-                                 force: bool = False) -> dict:
-        """Await Funds mirror + remap news/peers + boot shadow before Desk paint.
-
-        ensure_future on the sync card path raced the HTTP response — Desk kept
-        −0.81 / UNMAPPED / shadow off until a later poll luckily caught up.
-        Mirror is awaited at most every ~12s per client so 2s Desk polls stay snappy.
-        """
-        import time as _time
-        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0, 'skipped': 0}
+    async def _bg_mirror_capital_funds(self, eng, cid: int) -> None:
+        """Complete Funds HTTP off the Desk poll — never cancel mid-mirror."""
+        out_n = 0
+        try:
+            n24 = await asyncio.wait_for(
+                eng._mirror_capital_funds_closes(days=1), timeout=12.0)
+            out_n += int(n24 or 0)
+        except Exception:
+            pass
+        try:
+            n7 = await asyncio.wait_for(
+                eng._mirror_capital_funds_closes(
+                    days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
+                timeout=35.0)
+            out_n += int(n7 or 0)
+        except Exception:
+            pass
         if not hasattr(self, '_live_truth_last'):
             self._live_truth_last = {}
+        import time as _time
+        self._live_truth_last[int(cid)] = _time.monotonic()
+        if out_n and getattr(eng, 'store', None) is not None:
+            try:
+                eng.store.event('desk', 'Capital Funds mirror done',
+                                {'client_id': int(cid), 'rows': out_n})
+            except Exception:
+                pass
+
+    async def refresh_live_truth(self, *, client_id: int | None = None,
+                                 force: bool = False) -> dict:
+        """Remap + shadow on Desk poll; Funds mirror completes in background.
+
+        Overview uses ``wait_for(..., 0.4)`` so awaiting Funds HTTP here used to
+        *cancel* the mirror every poll — CLIENT CLOSES kept UPL guesses (±0.09)
+        instead of Capital Funds £ (+0.79). ``force=True`` (refresh-truth) still
+        awaits the mirror so the operator button blocks until cash is true.
+        """
+        import time as _time
+        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0, 'skipped': 0,
+               'mirror_scheduled': 0}
+        if not hasattr(self, '_live_truth_last'):
+            self._live_truth_last = {}
+        if not hasattr(self, '_mirror_bg_tasks'):
+            self._mirror_bg_tasks = {}
         clients = self.platform.list_clients()
         now_m = _time.monotonic()
         for c in clients:
@@ -1888,31 +1920,39 @@ class RuntimeHub:
                 except Exception:
                     pass
             if do_mirror and hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
-                # 24h first (short timeout) — must commit before older-day pages.
-                # Full 7d used to cancel the whole coroutine → empty NESEN while
-                # SHADOW already showed Capital 24h from journal estimates.
-                try:
-                    n24 = await asyncio.wait_for(
-                        eng._mirror_capital_funds_closes(days=1), timeout=12.0)
-                    out['mirrored'] += int(n24 or 0)
-                except Exception as exc:
-                    out.setdefault('mirror_errors', []).append({
-                        'client_id': cid, 'type': type(exc).__name__,
-                        'window': '24h'})
-                hist_timeout = 35.0 if force else 18.0
-                try:
-                    n7 = await asyncio.wait_for(
-                        eng._mirror_capital_funds_closes(
-                            days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
-                        timeout=hist_timeout)
-                    out['mirrored'] += int(n7 or 0)
-                    self._live_truth_last[cid] = now_m
-                except Exception as exc:
-                    out.setdefault('mirror_errors', []).append({
-                        'client_id': cid, 'type': type(exc).__name__,
-                        'window': 'history'})
-                    # 24h may already be in SQLite — do not block the next poll forever.
-                    self._live_truth_last[cid] = now_m
+                if force:
+                    # Operator refresh-truth — await until Capital £ is on Desk.
+                    try:
+                        n24 = await asyncio.wait_for(
+                            eng._mirror_capital_funds_closes(days=1), timeout=12.0)
+                        out['mirrored'] += int(n24 or 0)
+                    except Exception as exc:
+                        out.setdefault('mirror_errors', []).append({
+                            'client_id': cid, 'type': type(exc).__name__,
+                            'window': '24h'})
+                    try:
+                        n7 = await asyncio.wait_for(
+                            eng._mirror_capital_funds_closes(
+                                days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
+                            timeout=35.0)
+                        out['mirrored'] += int(n7 or 0)
+                        self._live_truth_last[cid] = now_m
+                    except Exception as exc:
+                        out.setdefault('mirror_errors', []).append({
+                            'client_id': cid, 'type': type(exc).__name__,
+                            'window': 'history'})
+                        self._live_truth_last[cid] = now_m
+                else:
+                    # Desk poll: schedule mirror so wait_for(0.4) cannot cancel it.
+                    prev = self._mirror_bg_tasks.get(cid)
+                    if prev is None or prev.done():
+                        self._live_truth_last[cid] = now_m
+                        task = asyncio.create_task(
+                            self._bg_mirror_capital_funds(eng, cid))
+                        self._mirror_bg_tasks[cid] = task
+                        out['mirror_scheduled'] += 1
+                    else:
+                        out['skipped'] += 1
             elif not do_mirror:
                 out['skipped'] += 1
             if hasattr(eng, '_backfill_mistake_audits_from_journal'):

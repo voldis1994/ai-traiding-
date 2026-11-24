@@ -23,11 +23,21 @@ def test_desk_js_uses_live_endpoints_not_fake_curve():
     assert 'renderDeskReact' in js
     assert 'deskTrack' in js
     assert 'POLL_DESK_MS' in js
+    assert 'POLL_DESK_MS=250' in js.replace(' ', '')
+    assert 'renderDeskLight' in js
+    assert 'renderDeskHeavy' in js
+    # Heavy OHLC must not block overviewInFlight (was 5–33s Desk lag).
+    assert 'renderDeskHeavy(focus,demoFx).catch' in js.replace(' ', '') or \
+        'renderDeskHeavy(focus, demoFx).catch' in js
     assert '/api/admin/markets-ohlc' in js
     assert 'structure-view' in js
     assert 'Nav Capital Funds £ closes' in js or 'Nav Capital £ closes' in js
     # Placeholder equity seed removed.
     assert 'seed=[0,12,8,22' not in js
+    # CLIENT CLOSES = Capital Funds £ only (no UPL/pending guesses).
+    chunk = js.split('function isDeskListableClose')[1].split('function sourceLabel')[0]
+    assert 'upl_estimate' not in chunk
+    assert 'isCapitalFundsSrc' in chunk
 
 
 def test_admin_card_exposes_desk_intel_fields():

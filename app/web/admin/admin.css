@@ -235,28 +235,31 @@ body:has(#dash:not(.hidden)){overflow:hidden}
 .overview-main,.overview-side{display:flex;flex-direction:column;gap:4px;min-width:0;min-height:0;overflow:hidden}
 .perf-row{display:flex;align-items:baseline;gap:8px;margin:2px 6px 0;flex-wrap:wrap}
 .perf-row strong{font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:800}
-.perf-clients{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 0;max-width:100%}
+/* Client chips ABOVE chart — never inside 24px card-head (was clipped / covered). */
+.perf-clients{
+  display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:6px 8px;max-width:100%;
+  flex:0 0 auto;border-bottom:1px solid var(--desk-grid,#1a2534);background:#070d0a}
 .perf-client{
-  appearance:none;border:1px solid rgba(57,255,136,.18);background:rgba(8,17,13,.7);
-  color:var(--desk-text,#d9e6de);border-radius:3px;padding:3px 6px;cursor:pointer;
-  display:inline-flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:0;
-  font-family:"IBM Plex Mono",monospace;font-size:8px;line-height:1.2}
-.perf-client span{color:var(--desk-muted,#809188);max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.perf-client strong{font-size:10px;font-weight:800;color:#e8fff0}
-.perf-client.on{border-color:rgba(57,255,136,.55);background:rgba(57,255,136,.1)}
-.perf-client:hover{border-color:rgba(57,255,136,.4)}
-.range-tabs{display:flex;gap:3px;flex-wrap:nowrap;padding-right:2px}
+  appearance:none;border:1px solid rgba(57,255,136,.22);background:rgba(8,17,13,.85);
+  color:var(--desk-text,#d9e6de);border-radius:3px;padding:4px 8px;cursor:pointer;
+  display:inline-flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:64px;
+  font-family:"IBM Plex Mono",monospace;font-size:9px;line-height:1.25}
+.perf-client span{color:var(--desk-muted,#809188);max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.perf-client strong{font-size:11px;font-weight:800;color:#e8fff0}
+.perf-client.on{border-color:rgba(57,255,136,.6);background:rgba(57,255,136,.12)}
+.perf-client:hover{border-color:rgba(57,255,136,.45)}
+.range-tabs{display:flex;gap:3px;flex-wrap:nowrap;padding-right:2px;margin-left:auto}
 .range-tab{
   appearance:none;border:1px solid var(--desk-grid,#1a2534);background:transparent;color:var(--desk-muted,#8c95a6);
   border-radius:2px;padding:1px 6px;font:inherit;font-weight:800;font-size:9px;cursor:pointer;letter-spacing:.04em}
 .range-tab.active{background:rgba(233,188,101,.18);color:var(--desk-yellow,#e9bc65);border-color:var(--desk-yellow,#e9bc65)}
-#perfChart{width:100%;height:min(12vh,110px);flex:1;min-height:72px;max-height:140px;display:block;margin:0;border-radius:0;
-  background:#060a14;border-top:1px solid var(--desk-grid,#1a2534)}
-.chart-card{flex:0 1 auto;min-height:0;max-height:42%;overflow:hidden}
-.chart-card .card-head{align-items:center}
-.chart-card .card-head>div:first-child{min-width:0;overflow:hidden}
-.chart-card .perf-row{margin:0;align-items:center}
-.chart-card .perf-row strong{font-size:11px}
+#perfChart{width:100%;height:100px;flex:0 0 100px;min-height:80px;max-height:100px;display:block;margin:0;border-radius:0;
+  background:#060a14;border-top:0}
+.chart-card{flex:0 0 auto;min-height:0;max-height:none;overflow:hidden}
+.chart-card .card-head{align-items:center;gap:8px}
+.chart-card .card-head h2{flex:0 0 auto}
+.chart-card .perf-row{margin:0;align-items:center;flex:1;min-width:0}
+.chart-card .perf-row strong{font-size:12px}
 
 .table-wrap{overflow:hidden}
 table.data{width:100%;border-collapse:collapse;font-size:10px;font-variant-numeric:tabular-nums}

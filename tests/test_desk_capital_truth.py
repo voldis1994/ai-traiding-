@@ -207,8 +207,8 @@ def test_lab_payload_news_peers_not_waiting_gate():
         assert lab['live_peers']['status'] != 'WAITING'
 
 
-def test_refresh_live_truth_awaits_funds_mirror():
-    """Desk poll must await Funds mirror — ensure_future raced −0.81 paint."""
+def test_refresh_live_truth_schedules_funds_mirror_on_poll():
+    """Desk poll schedules Funds mirror — awaiting it was cancelled by wait_for(0.4)."""
     import asyncio
     from types import SimpleNamespace
 
@@ -220,8 +220,9 @@ def test_refresh_live_truth_awaits_funds_mirror():
             instrument_profile = {'mapped': False, 'currencies': []}
             mandate = {'epic': 'CS.D.USCGC.TODAY.IP'}
             shadow_brain = None
-            intermarket = SimpleNamespace(state={'status': 'WAITING'})
+            intermarket = SimpleNamespace(state={'status': 'READY'})
             store = None
+            FUNDS_MIRROR_DAYS = 7
 
             def _ensure_instrument_mapped(self):
                 self.instrument_profile = {
@@ -255,11 +256,21 @@ def test_refresh_live_truth_awaits_funds_mirror():
         hub.platform = _Platform()
         hub.get = lambda cid: _RT() if int(cid) == 1 else None
         out = await hub.refresh_live_truth()
-        # 24h then history Funds windows both await the mirror (no fire-and-forget).
-        assert calls['n'] >= 1
-        assert out['mirrored'] >= 1
+        assert out['mirror_scheduled'] >= 1
         assert out['shadow'] == 1
         assert out['remapped'] == 1
+        # Background task must finish (not cancelled by overview wait_for).
+        task = hub._mirror_bg_tasks.get(1)
+        assert task is not None
+        await task
+        assert calls['n'] >= 1
+
+        # force=True still awaits (operator refresh-truth button).
+        calls['n'] = 0
+        hub._live_truth_last = {}
+        out2 = await hub.refresh_live_truth(force=True)
+        assert out2['mirrored'] >= 1
+        assert calls['n'] >= 1
 
     asyncio.run(scenario())
 

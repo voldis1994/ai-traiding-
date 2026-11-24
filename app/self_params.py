@@ -150,7 +150,11 @@ DEFAULTS = {
     'day_risk_per_trade_frac': 0.005,
     # Operator: no day risk regimes by default — LIVE must open freely.
     'day_risk_gates': 0,
-    'day_size_full_balance': 1,
+    # Default ON: every OPEN uses the first-trade mandate lot (e.g. 0.25→0.25).
+    # When OFF, day_size_full_balance / equity-risk paths may resize.
+    'day_size_fixed_mandate': 1,
+    # OFF by default — full-balance min-pack was shrinking LIVE lots (0.25→0.05).
+    'day_size_full_balance': 0,
     'day_be_band_frac': 0.001,
     'day_max_positions': 5,
     'day_conviction_nudge': 0.12,
@@ -252,6 +256,7 @@ BOUNDS = {
     'day_loss_budget_frac': (0.002, 0.10),
     'day_risk_per_trade_frac': (0.0005, 0.03),
     'day_risk_gates': (0, 1),
+    'day_size_fixed_mandate': (0, 1),
     'day_size_full_balance': (0, 1),
     'day_be_band_frac': (0.0001, 0.01),
     'day_max_positions': (5, 8),
@@ -432,7 +437,7 @@ def _clip(key, value):
                'structure_edge_min_samples',
                'situation_memory_min_samples',
                'day_max_positions','day_open_slices','day_size_full_balance',
-               'day_risk_gates'):
+               'day_size_fixed_mandate','day_risk_gates'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds

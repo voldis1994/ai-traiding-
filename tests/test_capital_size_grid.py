@@ -89,13 +89,12 @@ def test_propose_size_preserves_manual_mandate_015_not_floor_to_010():
     }
     # Floor-only snap would shrink 0.15 → 0.1 — that was the LIVE complaint.
     assert snap_deal_size('0.15', min_size='0.1', step='0.1') == Decimal('0.1')
-    # Missing tick_value → mandate fallback path (common until instrument pip known).
+    # Default fixed-mandate (or fractional fallback) must keep broker-accepted 0.15.
     params = dict(db.load_params(None))
-    params['size_full_balance'] = 0  # fractional: return mandate seed
     out = db.propose_size(
         mandate_size='0.15', equity=5_000.0, daily={'realized_pnl': 0},
         params=params, stop_ticks=None, tick_value=None,
         positions=[], score_edge=0.1, market=market)
     assert out['allowed'] is True
     assert Decimal(str(out['size'])) == Decimal('0.15')
-    assert out['reason'] == 'mandate_on_capital_grid'
+    assert out['reason'] in ('fixed_mandate_lot', 'mandate_on_capital_grid')

@@ -85,3 +85,39 @@ def test_wants_fast_entry_ticks_while_flat_with_signal():
         e.last_closed_step = 1
         e.last_signal = {'scores': {'BUY': 0.2, 'SELL': 0.2, 'HOLD': 0.6}}
         assert e._wants_fast_entry_ticks() is True
+
+
+def test_try_live_ohlc_open_promotes_on_flow_sell_when_neural_hold():
+    """Desk: Trend NEUT + M1 Flow SELL + Supply touch → promote SELL."""
+    with tempfile.TemporaryDirectory() as d:
+        store, brain = new_brain(d)
+        e = SingleTradeEngine(store, brain)
+        brain._activate('GOLD')
+        e.mandate = {'epic': 'GOLD', 'size': '0.02'}
+        e.positions = []
+        from tests.ohlc_zone_path import supply_zone_path
+        rows, _ = supply_zone_path(confirm=False)
+        from app import ohlc_entry_zones as oez
+        z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+        sell = z['sell_entry']
+        inside = (float(sell['lo']) + float(sell['hi'])) / 2
+        e.market = {
+            'mid': inside, 'ask': inside + 0.1, 'bid': inside,
+            'spread': 0.1, 'tick': 0.1,
+        }
+        e._decision_candles = lambda *a, **k: rows
+        e._flow_consensus = {
+            'consensus': 'SELL', 'blocked': False, 'confidence': 0.7,
+        }
+        mtf = {
+            'ready': True, 'mode': 'HOLD', 'preferred': 'HOLD',
+            'confidence': 0.2, 'structure_break': None,
+        }
+        out = e._try_live_ohlc_open(
+            {'action': 'HOLD', 'proposal': 'HOLD'},
+            base_scores={'BUY': 0.22, 'SELL': 0.24, 'HOLD': 0.54},
+            nudged_scores={'BUY': 0.22, 'SELL': 0.24, 'HOLD': 0.54},
+            mtf_analysis=mtf)
+        assert out is not None
+        assert out['action'] == 'SELL'
+        assert out['live_ohlc_promote'] is True

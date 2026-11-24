@@ -3107,19 +3107,32 @@ class SingleTradeEngine:
         mtf=mtf_analysis if isinstance(mtf_analysis,dict) else {}
         pref=str(mtf.get('preferred') or '').upper()
         mode=str(mtf.get('mode') or '').upper()
+        # Desk Momentum BEAR/BULL maps from preferred — also accept aliases.
+        if pref in ('BEAR','DOWN'):
+            pref='SELL'
+        elif pref in ('BULL','UP'):
+            pref='BUY'
+        if mode in ('BEAR','DOWN'):
+            mode='SELL'
+        elif mode in ('BULL','UP'):
+            mode='BUY'
         try:
             conf=float(mtf.get('confidence') or 0)
         except (TypeError,ValueError):
             conf=0.0
+        fc=getattr(self,'_flow_consensus',None) or {}
+        flow=str((fc.get('consensus') if isinstance(fc,dict) else '') or '').upper()
         need=float(unified_cycle.entry_edge_floor(self.store))
         candidates=[]
         for side,sc,other in (('BUY',buy,sell),('SELL',sell,buy)):
             mtf_ok=((pref==side) or (mode==side)) and conf>=0.45
+            flow_ok=(flow==side) and not bool(
+                isinstance(fc,dict) and fc.get('blocked'))
             lean=sc-hold
-            # Prefer the side that beats HOLD (and the other side), or strong MTF.
-            if not mtf_ok and not (sc>=other and lean>=need):
+            # Prefer the side that beats HOLD (and the other side), or strong MTF/flow.
+            if not mtf_ok and not flow_ok and not (sc>=other and lean>=need):
                 continue
-            candidates.append((side,bool(mtf_ok),float(lean)))
+            candidates.append((side,bool(mtf_ok or flow_ok),float(lean)))
         if not candidates:
             return None
         candidates.sort(key=lambda row:(row[1],row[2]),reverse=True)
@@ -8706,7 +8719,7 @@ class SingleTradeEngine:
         if self._fusion_entry_blocked():
             return ('External fusion gap blocks new entry: '+(
                 self.fusion_block_reason or 'aligned external neural inputs unavailable'))
-        if not readiness.get('ready'):
+        if not readiness.get('ready') and not readiness.get('cold_start_open'):
             return 'Model prep/eval not ready: '+(readiness.get('reason') or '')
         if isinstance(evaluation,dict) and evaluation.get('flow_blocked'):
             return (evaluation.get('reason')
@@ -8851,6 +8864,8 @@ class SingleTradeEngine:
                 'entry_decision_pending_new_bar':bool(self.last_decision_bar==self.last_entry_processed_bar),
                 'entry_policy_reason':evaluation.get('reason') if evaluation else None,
                 'entry_independent_samples':(evaluation.get('evidence') or {}).get('samples') if evaluation else None,
+                # Mid-bar live zone/break promote may OPEN without a new M1 close —
+                # do not force OPEN:NO on Desk just because this bar was already seen.
                 'entry_can_submit_now':bool(evaluation and evaluation.get('action') in ('BUY','SELL') and
                     gates.get('allowed') and
                     self.market.get('status')=='TRADEABLE' and self.market_context.get('ready') and
@@ -8860,7 +8875,9 @@ class SingleTradeEngine:
                     self._external_entry_check(evaluation['action'])['entry_allowed'] and
                     self.brain.core.steps>max(self.last_closed_step,self.last_entry_signal_step) and
                     self.last_decision_bar is not None and
-                    self.last_entry_processed_bar!=self.last_decision_bar),
+                    (self.last_entry_processed_bar!=self.last_decision_bar
+                     or evaluation.get('live_ohlc_promote')
+                     or self._wants_fast_entry_ticks())),
                 'fusion_block_reason':self.fusion_block_reason,
                 'entry_block_reason':self._compose_entry_block_reason(
                     readiness=readiness,evaluation=evaluation,decision=decision),

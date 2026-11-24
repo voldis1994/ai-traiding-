@@ -1,5 +1,6 @@
 """Worker quote loop must keep mid/UPL near Capital tick rate."""
 import inspect
+from pathlib import Path
 
 from app import runtime_hub
 from app import stream as stream_mod
@@ -31,6 +32,15 @@ def test_overview_truth_refresh_is_time_bounded():
     assert 'wait_for' in src
     assert 'refresh_live_truth' in src
     assert '0.4' in src
+
+
+def test_funds_mirror_not_awaited_on_desk_poll():
+    """Overview wait_for(0.4) must not cancel Funds HTTP — schedule in background."""
+    src = Path('app/runtime_hub.py').read_text(encoding='utf-8')
+    assert '_bg_mirror_capital_funds' in src
+    assert 'mirror_scheduled' in src
+    assert 'create_task' in src
+    assert 'DESK_TRUTH_REV = 266' in src
 
 
 def test_stream_pushes_quote_into_engine_market():

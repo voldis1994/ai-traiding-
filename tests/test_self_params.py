@@ -47,7 +47,8 @@ def test_learn_lr_only_two_decimal_places():
     assert LEARN_LR_SOFT_MAX == pytest.approx(0.12)
     assert DEFAULTS['learn_lr'] == pytest.approx(0.10)
     assert DEFAULTS['learn_win_repeats'] == 2
-    assert DEFAULTS['learn_loss_repeats'] == 3
+    assert DEFAULTS['learn_loss_repeats'] == 4
+    assert DEFAULTS['self_params_horizon_trades'] == 8
     # Soft ceiling: 0.28 / 0.29 from older builds must not survive load/save.
     assert quantize_learn_lr(0.294) == pytest.approx(LEARN_LR_SOFT_MAX)
     assert quantize_learn_lr(0.28) == pytest.approx(LEARN_LR_SOFT_MAX)
@@ -60,8 +61,9 @@ def test_learn_lr_only_two_decimal_places():
         save(store,{**DEFAULTS,'learn_lr':0.12345},reason='poison float')
         assert get(store,'learn_lr') == pytest.approx(0.12)
         # Stale hot LR in Store is clamped on load.
+        from app.self_params import LEARN_LOSS_REPEATS_SOFT_MAX
         store.set(STORE_KEY,{**DEFAULTS,'learn_lr':0.28,
-                             'learn_win_repeats':4,'learn_loss_repeats':5})
+                             'learn_win_repeats':4,'learn_loss_repeats':9})
         assert load(store)['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
         # migrate_soft_ceilings persists the clamp so Store no longer holds 0.28.
         migrated=migrate_soft_ceilings(store)
@@ -69,7 +71,7 @@ def test_learn_lr_only_two_decimal_places():
         raw=store.get(STORE_KEY)
         assert raw['learn_lr'] == pytest.approx(LEARN_LR_SOFT_MAX)
         assert raw['learn_win_repeats'] <= 3
-        assert raw['learn_loss_repeats'] <= 3
+        assert raw['learn_loss_repeats'] <= LEARN_LOSS_REPEATS_SOFT_MAX
         assert migrate_soft_ceilings(store) is None  # idempotent
         # Meaningful loss calms LR by exactly one hundredth (no amplify-mistakes).
         before=get(store,'learn_lr')
@@ -93,7 +95,10 @@ def test_scratch_loss_does_not_ratchet_hold_repeats():
         evolve_from_feedback(store,broker_pnl=-1.5)
         after=load(store)['learn_loss_repeats']
         win=load(store)['learn_win_repeats']
-        assert after<=win  # loss repeats never exceed win path
+        # Loss teach stays; win path is raised toward it (not crushed to ≤loss).
+        assert after >= before
+        assert win >= 2  # seed floor
+        assert win >= min(after, 3)  # soft win max steps toward loss teach
 
 
 def test_exec_friction_evolves_from_broker_and_shadow():

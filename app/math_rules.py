@@ -52,11 +52,12 @@ def _rule_value(rules, *names):
 
 
 def dealing_size_grid(market=None, *, mandate_size=None):
-    """Capital.com lot grid from GET /markets/{epic} dealingRules.
+    """Capital.com lot grid from GET /markets/{epic} dealingRules (V5 / #270).
 
     Fields (Capital): minDealSize, maxDealSize, minSizeIncrement.
     If Capital omits the grid, fall back to the adopted mandate size as the
-    only legal step/min — never invent a fractional lot.
+    only legal step/min — never invent a fractional lot. Missing grid must not
+    invent a new HOLD_RISK OPEN veto (V5 R02 / T17).
     """
     market = market or {}
     rules = market.get('dealingRules') if isinstance(market, dict) else None
@@ -92,6 +93,8 @@ def dealing_size_grid(market=None, *, mandate_size=None):
         'step': step,
         'source': source,
         'ok': bool(min_size is not None and step is not None and step > 0),
+        'reason': 'ok' if (min_size is not None and step is not None and step > 0)
+                  else 'size grid unavailable',
     }
 
 
@@ -249,6 +252,34 @@ def _min_ticks(minimum, tick):
         return 0
     n = int((minimum / tick).to_integral_value(rounding=ROUND_CEILING))
     return n if n >= 1 else 1
+
+
+def snap_distance_to_tick(distance, tick_size):
+    """Ceil a price distance onto the broker tick grid.
+
+    Does **not** raise to broker min or rewrite SL from range — callers that
+    already chose swing structure must snap distances only, then rebuild levels.
+
+    Float dust (``0.8*0.9 → 0.7200000000000001``) must not push a clean
+    multiple up by one tick — subtract a tiny epsilon before CEILING.
+    """
+    # Prefer str() so binary float dust becomes an exact Decimal when possible;
+    # still apply epsilon before ceil for residual binary noise.
+    try:
+        d = D(str(distance)) if not isinstance(distance, Decimal) else D(distance)
+    except Exception:
+        d = D(distance)
+    tick = D(str(tick_size)) if not isinstance(tick_size, Decimal) else D(tick_size)
+    if tick <= 0:
+        raise ValueError('tick must be positive')
+    if d <= 0 or not d.is_finite():
+        raise ValueError('distance must be positive')
+    ratio = d / tick
+    # 1e-9 ticks of slack — kills 0.7200000000000001 → 72.000…001 ceil-to-73.
+    ticks = int((ratio - D('1e-9')).to_integral_value(rounding=ROUND_CEILING))
+    if ticks < 1:
+        ticks = 1
+    return float(tick * ticks), int(ticks)
 
 
 def distances_meet_broker_min(stop_distance, profit_distance, min_distance, eps=None):

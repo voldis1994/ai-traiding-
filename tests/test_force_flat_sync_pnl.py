@@ -96,7 +96,10 @@ def test_flat_sync_retries_pending_and_binds():
 
 
 def test_pending_settles_last_upl_as_realized():
-    """Capital cash lag → teach from UPL now; keep harvesting real £ to bank.
+    """No Funds yet → harvest stays pending; Funds £ learns once.
+
+    Immediate last-UPL Capital £ settle happens on vanish/CLOSE resolve,
+    not inside the pending Funds harvest loop (that stays Funds-only).
     """
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
@@ -116,31 +119,23 @@ def test_pending_settles_last_upl_as_realized():
             store.set('pending_broker_pnl_deals',
                       [{'deal_id':'upl1','exit_level':99.8,'attempts':1,
                         'queued_at':'2026-10-29T10:00:00+00:00'}])
+            # Pending harvest waits for Funds (does not re-teach from UPL alone).
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
-            assert row['pnl']==pytest.approx(-0.19)
-            assert row['pnl_source']=='upl_estimate'
-            # UPL teaches now; still queued until Capital history banks £.
+            assert row.get('pnl') is None or row.get('pnl_source')=='pending_broker_pnl'
+            assert not e._trade_already_learned('upl1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str((x.get('deal_id') if isinstance(x,dict) else x))=='upl1'
                        for x in pending)
-            assert store.get('broker_cash_banked:upl1')  # banked from UPL — no wait
-            banked=store.get('broker_cash_banked:upl1')
-            assert banked.get('source')=='upl_estimate'
-            assert e._trade_already_learned('upl1')
-            labeled=brain.trade_labeled
-            # Real broker £ later → journal + day-book/hard-risk refine (delta),
-            # no second neural teach.
+            # Real Capital Funds £ → learn once.
             broker.tx=[{'reference':'upl1','pnl':-0.21,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.21)
             assert row['pnl_source']=='broker'
             assert e._trade_already_learned('upl1')
-            assert brain.trade_labeled==labeled
             banked2=store.get('broker_cash_banked:upl1')
             assert banked2.get('source')=='broker'
-            assert banked2.get('refined_from')=='upl_estimate'
             assert banked2.get('pnl')==pytest.approx(-0.21)
     asyncio.run(scenario())
 
@@ -211,6 +206,7 @@ def test_fuzzy_single_gold_tx_binds_pending():
 
 
 def test_snapshot_open_reason_includes_deal_and_upl():
+    """V5: entry_block names open state only — UPL/dealId stay on the position card."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -218,7 +214,9 @@ def test_snapshot_open_reason_includes_deal_and_upl():
         e.mandate={'epic':'GOLD','size':'0.02'}
         e.positions=[{'dealId':'live9','epic':'GOLD','direction':'SELL',
                       'size':'0.02','upl':-0.07}]
+        e.last_signal={'action':'SELL','scores':{'BUY':0.2,'SELL':0.5,'HOLD':0.3}}
         reason=e.snapshot()['entry_block_reason']
-        assert 'Existing open position' in reason
-        assert 'live9' in reason
-        assert 'UPL' in reason
+        assert reason == 'Existing open position'
+        assert 'UPL' not in reason
+        assert 'live9' not in reason
+        assert e.positions[0].get('upl') == pytest.approx(-0.07)

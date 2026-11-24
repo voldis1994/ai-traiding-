@@ -47,7 +47,8 @@ DEFAULTS = {
     'model_max_dd_ratio': 1.15,
     'model_stability_slack': 0.08,
     # Low enough that shadow↔LIVE promote can resolve within a trading day.
-    'shadow_min_broker_trades': 6,
+    # SHADOW vs LIVE compare needs enough Capital £ — 6 was noise-prone.
+    'shadow_min_broker_trades': 12,
     'shadow_rollback_window': 8,
     'shadow_rollback_delta': 0.35,
     # Learning — moderate pace for sparse broker £ feedback.
@@ -56,7 +57,8 @@ DEFAULTS = {
     # Soft ceiling clamps stale Store values that still hold 0.28 from older builds.
     'learn_lr': 0.10,
     'learn_win_repeats': 2,
-    'learn_loss_repeats': 3,
+    # Audit: against-structure losses need stronger ΔW to stick the correct side.
+    'learn_loss_repeats': 4,
     # Closed-trade KEEP/ROLLBACK — ΔW sticks only if holdout accuracy improves.
     'learn_gate_enabled': 1,
     'learn_gate_min_rows': 12,
@@ -83,18 +85,26 @@ DEFAULTS = {
     # Penny/scratch |£| band — seed only; engine + bracket_learn read Store.
     'scratch_pnl_abs': 0.05,
     # Post-BE trail gap (LIVE + shadow) — seeds; evolve from scratch/trail exits.
+    # Wider than old 0.40 — trail must breathe with SL/TP, not cut at the start.
     'trail_min_mult': 2.0,
-    'trail_open_gap_frac': 0.40,
-    'trail_fallback_frac': 0.55,
+    'trail_open_gap_frac': 0.55,
+    'trail_fallback_frac': 0.65,
     # Adaptive structure edge (robot-learned EV by TREND/BREAKOUT/…)
-    'structure_edge_min_samples': 5,
-    'structure_edge_nudge': 0.08,
-    # Trail self-arm: wait near ~1R before first lock — early 0.55R BE-locks
-    # were killed by micro bounce-backs and ate the real move.
-    'trail_arm_mfe_frac': 0.90,
+    # Louder seed so library graves (e.g. TREND_DOWN×BUY) actually move the vote.
+    # First same-structure loss already marks a grave (self-teach, not hard ban).
+    'structure_edge_min_samples': 1,
+    'structure_edge_nudge': 0.16,
+    # Trail self-arm — audit: 19 GOLD trades hit ≥0.8×TP then full SL (−£9.46).
+    # Arm earlier so winners can lock; still require both R and TP progress.
+    'trail_arm_mfe_frac': 0.80,
+    'trail_arm_tp_frac': 0.40,
     'trail_arm_min_ev': 0.0,
+    # LIVE broker trail — HARD OFF (fixed OHLC swing SL/TP). Engine ignores ON.
+    'trail_live_enabled': 0,
     # First lock sits BE+ (profit cushion) so a small bounce does not scratch.
     'trail_be_cushion_frac': 0.15,
+    # Post-BE gap also floors vs original TP so trail stays even with RR.
+    'trail_gap_vs_tp_frac': 0.30,
     # Bracket teacher schedule (seeds) — thresholds/steps evolve; mults already Store.
     'bracket_vs_vol_noise': 1.15,
     'bracket_vs_stop_noise': 1.05,
@@ -109,36 +119,45 @@ DEFAULTS = {
     'bracket_scratch_kappa_step': 0.97,
     'bracket_batch_raise_step': 1.08,
     'bracket_batch_cut_step': 0.92,
-    # Min reward:risk for LIVE SL/TP — swing SL is capped (or vetoed) to this RR.
+    # PR #181 baseline (temporary restore): min RR 1.0 + soft-cap SL, not invent TP.
     'bracket_min_rr': 1.0,
+    # Swing SL beyond this × ATR is "unrealistically far" — pull toward entry.
+    'bracket_sl_max_atr': 2.0,
     # LIVE OPEN prep/eval floors (seeds) — robot-owned, not frozen module consts.
     'min_prep_candles': 96,
     'train_frac': 0.70,
     'min_holdout_bars': 24,
     'min_online_labeled': 64,
     'min_holdout_minute_acc': 0.34,
-    # Policy.py search + LIVE entry gate — ON so promoted strategies actually execute.
-    # Neural argmax still proposes side; evolved decide() may HOLD or confirm.
+    # Policy.py search + LIVE entry gate — evolve ON, execute OFF by default (V3).
+    # Neural argmax still proposes side; evolved decide() is research-only until
+    # operator sets policy_live_execute=1 after validation.
     'policy_evolve_enabled': 1,
     # When 1, evaluate_neural_entry consults active_policy.py before OPEN.
-    'policy_live_execute': 1,
+    'policy_live_execute': 0,
     # Record full feature vectors + scores for multi-horizon forecast quality
     # (does NOT change OPEN/CLOSE rules).
     'forecast_memory_enabled': 1,
     # Soft LIVE nudge from fitted multi-horizon head (NeuralCore still proposes).
     'forecast_bridge_enabled': 1,
     'forecast_bridge_nudge': 0.06,
-    'forecast_bridge_min_resolved': 24,
+    # Forecast head needs denser resolved rows before LIVE soft nudge.
+    'forecast_bridge_min_resolved': 40,
     'forecast_bridge_refit_every': 12,
     # Long-horizon gate before committing param nudges
-    'self_params_horizon_trades': 20,
+    # Faster first trial commit — 20 froze physical evo for days of thin GOLD £.
+    'self_params_horizon_trades': 8,
     # Day book / situation memory (Komandcentrs + Riski)
     'day_profit_target_frac': 0.0,
     'day_loss_budget_frac': 0.10,
     'day_risk_per_trade_frac': 0.005,
     # Operator: no day risk regimes by default — LIVE must open freely.
     'day_risk_gates': 0,
-    'day_size_full_balance': 1,
+    # Default ON: every OPEN uses the first-trade mandate lot (e.g. 0.25→0.25).
+    # When OFF, day_size_full_balance / equity-risk paths may resize.
+    'day_size_fixed_mandate': 1,
+    # OFF by default — full-balance min-pack was shrinking LIVE lots (0.25→0.05).
+    'day_size_full_balance': 0,
     'day_be_band_frac': 0.001,
     'day_max_positions': 5,
     'day_conviction_nudge': 0.12,
@@ -167,6 +186,50 @@ DEFAULTS = {
     'mtf_kama_slow': 30,
     'mtf_semivar_bars': 30,
     'mtf_mode_preset': 'trend_follow',  # trend_follow | fast_shift | noise_hold
+    # GOLD audit strategies — soft teach by default (hard_block off).
+    # Distilled from labeled history; GOLD/XAU only.
+    'gold_strat_enabled': 1,
+    'gold_strat_hard_block': 0,
+    'gold_strat_structure_align': 1,
+    # Hard RR gate off — teach still labels RR<1; see gold_strategies DEFAULTS.
+    'gold_strat_min_rr': 0,
+    'gold_strat_buy_strict_down': 1,
+    'gold_strat_min_rr_floor': 1.0,
+    'gold_strat_buy_down_min_edge': 0.12,
+    'gold_strat_chop_hold': 0,
+    'gold_strat_chop_min_edge': 0.18,
+    'gold_strat_soft_nudge': 0.18,
+    # M1 multi-source Order Flow + Liquidity + Impact — soft nudge only.
+    'flow_consensus_nudge': 0.18,
+    # PR #181 restore: do not hard-HOLD when flow fights the neural side.
+    'flow_consensus_block_fights': 0,
+    'flow_consensus_block_min_agree': 2,
+    # Pillar vote thresholds (bounded liquidity features) — tunable, not frozen.
+    'flow_pillar_impulse': 0.12,
+    'flow_pillar_vol_z': 0.20,
+    'flow_pillar_imbalance': 0.18,
+    'flow_pillar_impact': 0.15,
+    # OHLC chop/doji/impulse notes — soft by default (never OPEN ban).
+    'ohlc_regime_gate_enabled': 0,
+    # 1m playbook hard ENTRY: mid-range veto, session, regime SL.
+    # Zone candle confirm OFF by default — regime + price-in-zone is enough.
+    'playbook_hard_entry': 1,
+    'playbook_require_zone_confirm': 0,
+    'playbook_zone_confirm_and': 0,
+    'playbook_session_filter': 1,
+    # PR #181 restore: re-entry confirm off — was blocking most follow-on OPENs.
+    'reentry_confirm_enabled': 0,
+    'reentry_raw_strong': 0.20,
+    'reentry_raw_medium': 0.12,
+    'reentry_raw_weak': 0.07,
+    'reentry_same_dir_atr_frac': 0.55,
+    'reentry_medium_m1_streak': 2,
+    # Strategy generator — harvest library EV → soft LIVE cards (not .py files).
+    'strategy_gen_enabled': 1,
+    'strategy_gen_min_samples': 8,
+    'strategy_gen_min_mean': 0.08,
+    'strategy_gen_nudge': 0.14,
+    'strategy_gen_max_active': 12,
 }
 
 # Soft rails so a bad evolve step cannot explode dim / divide-by-zero.
@@ -187,7 +250,7 @@ BOUNDS = {
     'model_min_oos': (8, 80),
     'model_max_dd_ratio': (1.0, 2.0),
     'model_stability_slack': (0.0, 0.2),
-    'shadow_min_broker_trades': (6, 60),
+    'shadow_min_broker_trades': (8, 60),
     'shadow_rollback_window': (5, 40),
     'shadow_rollback_delta': (0.05, 5.0),
     'learn_lr': (0.01, 0.50),
@@ -202,6 +265,7 @@ BOUNDS = {
     'day_loss_budget_frac': (0.002, 0.10),
     'day_risk_per_trade_frac': (0.0005, 0.03),
     'day_risk_gates': (0, 1),
+    'day_size_fixed_mandate': (0, 1),
     'day_size_full_balance': (0, 1),
     'day_be_band_frac': (0.0001, 0.01),
     'day_max_positions': (5, 8),
@@ -230,13 +294,17 @@ BOUNDS = {
     'exec_fill_delay_bars': (0, 5),
     'scratch_pnl_abs': (0.01, 0.5),
     'trail_min_mult': (1.0, 4.0),
-    'trail_open_gap_frac': (0.20, 0.75),
-    'trail_fallback_frac': (0.30, 0.85),
-    'structure_edge_min_samples': (3, 30),
-    'structure_edge_nudge': (0.02, 0.25),
-    'trail_arm_mfe_frac': (0.55, 1.0),
+    'trail_open_gap_frac': (0.30, 0.80),
+    'trail_fallback_frac': (0.40, 0.85),
+    'structure_edge_min_samples': (1, 30),
+    'structure_edge_nudge': (0.02, 0.35),
+    'trail_arm_mfe_frac': (0.70, 1.0),
+    'trail_arm_tp_frac': (0.25, 0.70),
     'trail_arm_min_ev': (-1.0, 2.0),
+    # Locked off — evolve cannot turn trail back on.
+    'trail_live_enabled': (0, 0),
     'trail_be_cushion_frac': (0.05, 0.35),
+    'trail_gap_vs_tp_frac': (0.15, 0.50),
     'bracket_vs_vol_noise': (0.8, 2.0),
     'bracket_vs_stop_noise': (0.8, 1.5),
     'bracket_shape_wide': (1.1, 2.5),
@@ -251,6 +319,7 @@ BOUNDS = {
     'bracket_batch_raise_step': (1.02, 1.2),
     'bracket_batch_cut_step': (0.8, 0.98),
     'bracket_min_rr': (0.6, 2.5),
+    'bracket_sl_max_atr': (1.0, 4.0),
     'min_prep_candles': (64, 240),
     'train_frac': (0.55, 0.85),
     'min_holdout_bars': (12, 80),
@@ -261,7 +330,7 @@ BOUNDS = {
     'forecast_memory_enabled': (0, 1),
     'forecast_bridge_enabled': (0, 1),
     'forecast_bridge_nudge': (0.0, 0.15),
-    'forecast_bridge_min_resolved': (12, 80),
+    'forecast_bridge_min_resolved': (24, 120),
     'forecast_bridge_refit_every': (4, 40),
     'self_params_horizon_trades': (8, 80),
     'mtf_momentum_enabled': (0, 1),
@@ -274,12 +343,46 @@ BOUNDS = {
     'mtf_kama_fast': (2, 5),
     'mtf_kama_slow': (20, 40),
     'mtf_semivar_bars': (10, 120),
+    'gold_strat_enabled': (0, 1),
+    'gold_strat_hard_block': (0, 1),
+    'gold_strat_structure_align': (0, 1),
+    'gold_strat_min_rr': (0, 1),
+    'gold_strat_buy_strict_down': (0, 1),
+    'gold_strat_min_rr_floor': (1.0, 2.5),
+    'gold_strat_buy_down_min_edge': (0.02, 0.45),
+    'gold_strat_chop_hold': (0, 1),
+    'gold_strat_chop_min_edge': (0.05, 0.50),
+    'gold_strat_soft_nudge': (0.0, 0.40),
+    'flow_consensus_nudge': (0.0, 0.35),
+    'flow_consensus_block_fights': (0, 1),
+    'flow_consensus_block_min_agree': (2, 3),
+    'flow_pillar_impulse': (0.04, 0.40),
+    'flow_pillar_vol_z': (0.05, 0.50),
+    'flow_pillar_imbalance': (0.05, 0.45),
+    'flow_pillar_impact': (0.04, 0.40),
+    'ohlc_regime_gate_enabled': (0, 1),
+    'playbook_hard_entry': (0, 1),
+    'playbook_require_zone_confirm': (0, 1),
+    'playbook_zone_confirm_and': (0, 1),
+    'playbook_session_filter': (0, 1),
+    'reentry_confirm_enabled': (0, 1),
+    'reentry_raw_strong': (0.12, 0.28),
+    'reentry_raw_medium': (0.06, 0.18),
+    'reentry_raw_weak': (0.03, 0.12),
+    'reentry_same_dir_atr_frac': (0.25, 1.0),
+    'reentry_medium_m1_streak': (1, 4),
+    'strategy_gen_enabled': (0, 1),
+    'strategy_gen_min_samples': (4, 40),
+    'strategy_gen_min_mean': (0.02, 0.50),
+    'strategy_gen_nudge': (0.04, 0.35),
+    'strategy_gen_max_active': (4, 24),
 }
 
 IMMUTABLE_NOTE = (
     'Capital: no volume/DOM (per-instrument Yahoo/Coinbase/OKX liquidity is EXTERNAL). '
     'Layout: BASE|DYNAMIC|EXTERNAL. Actions: BUY/SELL/HOLD. '
-    'Broker tick/min-stop/margin are exchange rules.'
+    'Broker tick/min-stop/margin are exchange rules. '
+    'Trail SL: hard OFF — fixed OHLC swing SL/TP only (not evolvable).'
 )
 
 # learn_lr moves only in whole hundredths — same discipline as entry_edge.
@@ -287,7 +390,8 @@ LEARN_LR_STEP = 0.01
 # Hard rail in BOUNDS is 0.50; soft ceiling stops live Stores from keeping 0.28+.
 LEARN_LR_SOFT_MAX = 0.12
 LEARN_WIN_REPEATS_SOFT_MAX = 3
-LEARN_LOSS_REPEATS_SOFT_MAX = 3
+# Audit: against-structure ΔW needs room above win path (engine +1 on graves).
+LEARN_LOSS_REPEATS_SOFT_MAX = 5
 
 
 def _finite(v):
@@ -346,7 +450,7 @@ def _clip(key, value):
                'structure_edge_min_samples',
                'situation_memory_min_samples',
                'day_max_positions','day_open_slices','day_size_full_balance',
-               'day_risk_gates'):
+               'day_size_fixed_mandate','day_risk_gates'):
         n=int(round(n))
     if bounds:
         lo,hi=bounds
@@ -367,6 +471,8 @@ def _apply_soft_ceilings(out: dict) -> dict:
     except (TypeError,ValueError):
         out['learn_win_repeats']=int(DEFAULTS['learn_win_repeats'])
         out['learn_loss_repeats']=int(DEFAULTS['learn_loss_repeats'])
+    # Product: trail never comes back via evolve / stale Store bags.
+    out['trail_live_enabled']=0
     return out
 
 
@@ -377,7 +483,9 @@ def load(store) -> dict:
         for k,v in raw.items():
             if k in DEFAULTS:
                 out[k]=_clip(k,v)
-    return _apply_soft_ceilings(out)
+    out=_apply_soft_ceilings(out)
+    out['trail_live_enabled']=0
+    return out
 
 
 def migrate_soft_ceilings(store):
@@ -425,6 +533,7 @@ def save(store, params: dict, *, reason=''):
     if store is None:return
     clean=_apply_soft_ceilings(
         {k:_clip(k,params.get(k,DEFAULTS[k])) for k in DEFAULTS})
+    clean['trail_live_enabled']=0
     store.set(STORE_KEY,clean)
     if reason:
         store.set('self_params_reason',reason)
@@ -609,10 +718,15 @@ def _apply_nudge(p, *, feature_approved=None, feature_rejected=None,
                 # Calm LR after losses — raising it was "learning bigger mistakes"
                 # and diverged clients (one balloons, peers stay compact).
                 p['learn_lr']=quantize_learn_lr(float(p['learn_lr'])-LEARN_LR_STEP)
-                # Never let loss repeats exceed win repeats (symmetric teacher).
+                # Keep loss teach strength; raise win path to stay near it.
+                # Old min(win,loss) crushed audit loss_repeats=4 → 2 every close.
                 win_r=int(p.get('learn_win_repeats',DEFAULTS['learn_win_repeats']))
                 cur=int(p['learn_loss_repeats'])
-                p['learn_loss_repeats']=min(win_r,cur)
+                p['learn_loss_repeats']=min(
+                    int(LEARN_LOSS_REPEATS_SOFT_MAX), max(1, cur))
+                p['learn_win_repeats']=min(
+                    BOUNDS['learn_win_repeats'][1],
+                    max(win_r, min(int(p['learn_loss_repeats']), win_r + 1)))
                 # Adverse cash → assume more LIVE friction; raise shadow slip estimate.
                 p['exec_slip_bps']=min(BOUNDS['exec_slip_bps'][1],
                     float(p['exec_slip_bps'])*1.05)
@@ -783,11 +897,14 @@ def maybe_commit_long_horizon(store, broker_pnls):
     elif len(prior)<need:
         prior_net=float(sum(prior))
         prior_mean=prior_net/len(prior)
-        beat=trial_mean>0 and trial_mean>prior_mean
+        # Relative improvement is enough — requiring trial_mean>0 rejected
+        # recovery trials (prior −0.5 → trial −0.1) and froze evo (7/8 rejects).
+        beat=trial_mean > prior_mean
         mode='short_prior_mean'
     else:
         prior_net=float(sum(prior[-need:]))
-        beat=trial_net>0 and trial_net>prior_net
+        # Prefer relative beat; still require trial not a pure dump (net≥prior).
+        beat=trial_net > prior_net
         mode='equal_window_net'
     if not beat:
         baseline=pending.get('baseline_params') or DEFAULTS

@@ -17,14 +17,16 @@ STORE_KEY = 'reentry_confirm_v1'
 DEFAULTS = {
     'enabled': 1,
     # Raw score_edge floors (winner − max(other, HOLD)) on scores_raw.
-    'raw_strong': 0.18,
-    'raw_medium': 0.10,
-    'raw_weak': 0.06,
+    # Audit-seeded slightly higher so weak same-bar re-opens need more edge.
+    'raw_strong': 0.20,
+    'raw_medium': 0.12,
+    'raw_weak': 0.07,
     # Same-dir re-entry: need this fraction of ATR14 move since last close mid.
-    'same_dir_atr_frac': 0.35,
+    # Audit: rapid same-dir re-open after loss cost −£14.24 / 176 GOLD trades.
+    'same_dir_atr_frac': 0.55,
     # Medium tier: consecutive completed M1 closes in action direction.
-    # 1 = confirm without waiting for the move to finish (unified live path).
-    'medium_m1_streak': 1,
+    # 2 = demand a fresh micro-move (was 1 — too easy to spam re-entry).
+    'medium_m1_streak': 2,
     # Soft learn rails for floors.
     'raw_strong_min': 0.12,
     'raw_strong_max': 0.28,
@@ -60,7 +62,7 @@ def load_params(store=None) -> dict:
         return out
     try:
         from .self_params import get as sp_get
-        out['enabled'] = int(sp_get(store, 'reentry_confirm_enabled', 1))
+        out['enabled'] = int(sp_get(store, 'reentry_confirm_enabled', 0))
         out['raw_strong'] = float(sp_get(store, 'reentry_raw_strong', DEFAULTS['raw_strong']))
         out['raw_medium'] = float(sp_get(store, 'reentry_raw_medium', DEFAULTS['raw_medium']))
         out['raw_weak'] = float(sp_get(store, 'reentry_raw_weak', DEFAULTS['raw_weak']))

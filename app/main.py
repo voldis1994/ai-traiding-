@@ -35,22 +35,31 @@ hub=RuntimeHub(platform)
 WEB=Path(__file__).parent/'web'
 
 
+_WEAK_ADMIN_PASSWORDS=frozenset({
+    'admin123','change-me-now','password','admin','changeme',
+    'ChangeMe_LocalOnly_9x!','ChangeMe_LocalOnly_9x','123456','adminadmin',
+})
+
+
 def _bootstrap_admin():
     from .config import env_flag
     user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
     password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
-    if env_flag('NTA_PRODUCTION') and password in ('admin123','change-me-now','password','admin'):
+    if env_flag('NTA_PRODUCTION') and (
+            password in _WEAK_ADMIN_PASSWORDS or len(password)<12):
         logging.error('Refusing weak NTA_ADMIN_PASSWORD in production — set a strong secret')
         raise RuntimeError('Set a strong NTA_ADMIN_PASSWORD before production start')
     if platform.admin_count()==0:
         platform.ensure_admin(user,password)
         logging.warning('Bootstrapped admin user %r — change NTA_ADMIN_PASSWORD if still default',user)
     else:
-        # Ensure configured admin exists (idempotent username).
-        platform.ensure_admin(user,password)
+        # Sync env password onto existing admin so a volume with admin123
+        # cannot outlive a strong NTA_ADMIN_PASSWORD (audit).
+        platform.ensure_admin(user,password,sync_password=True)
 
 
 async def worker():
+    """Legacy single-engine loop — poll then guaranteed light ticks (same as hub)."""
     error_count=0
     while True:
         try:
@@ -61,6 +70,26 @@ async def worker():
                 if RuntimeHub._can_rearm_after_read(engine):
                     engine._paused_for_read=False;engine.armed=True;engine.execution_enabled=True
                     store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
+                open_book=bool(engine.positions)
+                fast_entry=(bool(engine.mandate) and not open_book
+                            and hasattr(engine,'quote_entry_tick')
+                            and engine._wants_fast_entry_ticks())
+                light_n=18 if (open_book or fast_entry) else 12
+                for _ in range(light_n):
+                    await asyncio.sleep(0.025)
+                    if not engine.mandate:
+                        continue
+                    try:
+                        if open_book and hasattr(engine,'quote_upl_tick'):
+                            await engine.quote_upl_tick()
+                        else:
+                            if hasattr(engine,'_apply_stream_quote'):
+                                engine._apply_stream_quote()
+                            if fast_entry:
+                                await engine.quote_entry_tick()
+                    except Exception:
+                        break
+                continue
         except asyncio.CancelledError:raise
         except Exception as exc:
             engine.last_error=f'{type(exc).__name__}: {str(exc)[:180]}'
@@ -85,7 +114,7 @@ async def worker():
                     pass
                 if hasattr(engine,'_ensure_live_unless_operator_paused'):
                     engine._ensure_live_unless_operator_paused()
-        await asyncio.sleep(3 if error_count<3 else 10)
+        await asyncio.sleep(0.5 if error_count<3 else 3)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -123,6 +152,10 @@ app=FastAPI(title='Neural Trading AI',lifespan=lifespan,docs_url=None,redoc_url=
 app.mount('/static',StaticFiles(directory=str(WEB)),name='static')
 app.mount('/app/static',StaticFiles(directory=str(WEB/'client')),name='client-static')
 app.mount('/admin/static',StaticFiles(directory=str(WEB/'admin')),name='admin-static')
+# React PerpSignal Desk (built into app/web/desk). Assets under /desk/assets.
+_DESK=WEB/'desk'
+if _DESK.is_dir() and (_DESK/'assets').is_dir():
+    app.mount('/desk/assets',StaticFiles(directory=str(_DESK/'assets')),name='desk-assets')
 
 @app.middleware('http')
 async def headers(request:Request,call_next):
@@ -133,7 +166,9 @@ async def headers(request:Request,call_next):
     host=request.headers.get('host') or '127.0.0.1:8765'
     ws=f"ws://{host} wss://{host}"
     response.headers['Content-Security-Policy']=(
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
         f"connect-src 'self' {ws}; img-src 'self' data:")
     return response
 
@@ -142,12 +177,56 @@ def require_auth(request:Request):
         raise HTTPException(401,'Login required')
     return True
 
+def _is_loopback_host(host: str|None) -> bool:
+    h=(host or '').strip().lower().strip('[]')
+    if not h:
+        return False
+    if h in ('127.0.0.1','::1','localhost','testclient','0.0.0.0'):
+        return True
+    # Windows / uvicorn often reports IPv4-mapped IPv6.
+    if h.startswith('::ffff:'):
+        return _is_loopback_host(h.split('::ffff:',1)[-1])
+    return h.startswith('127.')
+
+def _is_loopback_request(request:Request) -> bool:
+    """True only for direct local Desk (Windows START.bat on this machine)."""
+    peer=(request.client.host if request.client else '') or ''
+    if _is_loopback_host(peer):
+        return True
+    hdr=(request.headers.get('host') or '').split(':')[0].strip().lower()
+    return _is_loopback_host(hdr)
+
+def _mint_local_admin_token() -> str:
+    _bootstrap_admin()
+    admin=platform.first_admin()
+    if not admin:
+        user=(os.getenv('NTA_ADMIN_USER') or 'admin').strip() or 'admin'
+        password=os.getenv('NTA_ADMIN_PASSWORD') or 'admin123'
+        admin=platform.ensure_admin(user,password)
+    return platform.create_session('admin',int(admin['id']))
+
+def _set_local_admin_cookie(response,token: str):
+    # Local HTTP must NOT use Secure cookies — browsers drop them on http://127.0.0.1.
+    response.set_cookie(ADMIN_COOKIE,token,httponly=True,samesite='lax',
+                        secure=False,path='/')
+
 def require_admin(request:Request):
     token=request.cookies.get(ADMIN_COOKIE)
     session=platform.get_session(token)
-    if not session or session.get('role')!='admin':
-        raise HTTPException(401,'Admin login required')
-    return session
+    if session and session.get('role')=='admin':
+        return session
+    # Loopback Desk: mint session on the fly so a dropped cookie cannot trap
+    # the operator on the login gate after START.bat.
+    if _is_loopback_request(request):
+        try:
+            tok=_mint_local_admin_token()
+            request.state.local_admin_token=tok  # type: ignore[attr-defined]
+            session=platform.get_session(tok)
+            if session and session.get('role')=='admin':
+                return session
+        except Exception:
+            logging.exception('loopback admin auto-session failed')
+    raise HTTPException(401,'Admin login required')
 
 def require_client(request:Request):
     token=request.cookies.get(CLIENT_COOKIE)
@@ -255,7 +334,29 @@ async def operator_console():
     return RedirectResponse('/admin', status_code=302)
 
 @app.get('/admin')
-async def admin_page():return FileResponse(WEB/'admin'/'index.html')
+async def admin_page(request:Request):
+    """Serve Desk HTML. On 127.0.0.1 mint admin cookie so login form is skipped."""
+    resp=FileResponse(WEB/'admin'/'index.html')
+    if not _is_loopback_request(request):
+        return resp
+    token=request.cookies.get(ADMIN_COOKIE)
+    session=platform.get_session(token) if token else None
+    if session and session.get('role')=='admin':
+        return resp
+    try:
+        _set_local_admin_cookie(resp,_mint_local_admin_token())
+    except Exception:
+        logging.exception('admin local auto-session failed')
+    return resp
+
+@app.get('/desk')
+@app.get('/desk/')
+async def desk_page():
+    """Pixel PerpSignal Desk (React) — live Capital/neural via Admin API cookies."""
+    index=WEB/'desk'/'index.html'
+    if not index.is_file():
+        return RedirectResponse('/admin', status_code=302)
+    return FileResponse(index)
 
 @app.get('/admin/ohlc')
 async def admin_ohlc_page():
@@ -271,7 +372,13 @@ async def client_page_slash():return RedirectResponse('/app')
 # ---------- legacy operator Capital.com console ----------
 @app.post('/api/connect')
 async def connect(data:Credentials):
-    global stream_task
+    global stream_task,SESSION
+    from .config import env_flag
+    # Public deploy must use Admin→client broker attach — unauthenticated LIVE
+    # attach is a critical risk when the host is reachable on 0.0.0.0.
+    if env_flag('NTA_PRODUCTION') and not env_flag('NTA_ALLOW_LEGACY_CONNECT'):
+        raise HTTPException(403,
+            'Legacy /api/connect disabled in production — use /admin broker attach')
     # Legacy console must not steal a hub client's Capital LIVE session.
     dupes=platform.find_clients_with_api_key('capital_com',data.api_key.strip())
     if dupes:
@@ -306,6 +413,8 @@ async def connect(data:Credentials):
     store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized',
                 {'data_dir':str(DATA),'sqlite':str(store.path),
                  'mandate_requires_new_manual_trade':engine.mandate is None})
+    # Rotate process session on every connect so a stolen cookie dies.
+    SESSION=secrets.token_urlsafe(48)
     response=JSONResponse({'ok':True,'live':True,'automatic':True,
                            'data_dir':str(DATA),'mandate':engine.mandate})
     _set_session_cookie(response,COOKIE,SESSION)
@@ -366,14 +475,9 @@ async def prepare_new_market(_:bool=Depends(require_auth)):
 
 @app.post('/api/emergency')
 async def emergency(_:bool=Depends(require_auth)):
-    engine.armed=False;engine.operator_paused=True
-    if len(engine.positions)==1:
-        engine.execution_enabled=True
-        async with engine.lock:
-            await engine.exit_position(engine.positions[0]['dealId'])
-    engine.execution_enabled=False
-    store.event('control','Emergency stop requested; future entries disabled')
-    return {'ok':True,'positions':engine.positions}
+    async with engine.lock:
+        result=await engine.emergency_flatten()
+    return {'ok':True,**result}
 
 @app.get('/api/history')
 async def history(_:bool=Depends(require_auth)):
@@ -385,21 +489,23 @@ async def code(_:bool=Depends(require_auth)):
 
 @app.post('/api/logout')
 async def logout(_:bool=Depends(require_auth)):
+    global SESSION
     engine.armed=False;engine.execution_enabled=False
     if engine.broker:await engine.broker.close()
     engine.broker=None;engine.mandate=None
     store.set('mandate',None)
-    response=JSONResponse({'ok':True});response.delete_cookie(COOKIE);return response
+    # Invalidate legacy cookie for everyone after logout.
+    SESSION=secrets.token_urlsafe(48)
+    response=JSONResponse({'ok':True});response.delete_cookie(COOKIE,path='/');return response
 
 @app.get('/api/health')
 async def health():
+    # Public readiness only — do not leak tenant counts to recon.
     return {'app':'Neural Trading AI','ready':True,'authenticated':False,
-            'portals':{'home':'/admin','operator':'/admin','admin':'/admin','client':'/app',
+            'portals':{'home':'/admin','operator':'/admin','admin':'/admin','desk':'/desk','client':'/app',
                        'portal':'/portal'},
             'public_url':public_base_url(),
-            'secure_cookies':cookie_secure(),
-            'clients':len(platform.list_clients()),
-            'running_robots':len(hub.all_runtimes())}
+            'secure_cookies':cookie_secure()}
 
 # ---------- admin portal API ----------
 @app.post('/api/admin/login')
@@ -409,6 +515,31 @@ async def admin_login(data:UserPass):
     token=platform.create_session('admin',admin['id'])
     response=JSONResponse({'ok':True,'username':admin['username']})
     _set_session_cookie(response,ADMIN_COOKIE,token)
+    return response
+
+@app.post('/api/admin/local-boot')
+async def admin_local_boot(request:Request):
+    """Loopback-only: open Desk without typing password (Windows START.bat)."""
+    if not _is_loopback_request(request):
+        raise HTTPException(403,'Local boot only on 127.0.0.1')
+    token=_mint_local_admin_token()
+    admin=platform.first_admin() or {'username':'admin'}
+    response=JSONResponse({
+        'ok':True,'role':'admin','local_boot':True,
+        'username':admin.get('username') or 'admin'})
+    _set_local_admin_cookie(response,token)
+    return response
+
+@app.middleware('http')
+async def _attach_loopback_admin_cookie(request:Request,call_next):
+    """If require_admin minted a loopback token, attach Set-Cookie on the way out."""
+    response=await call_next(request)
+    tok=getattr(request.state,'local_admin_token',None)
+    if tok and _is_loopback_request(request):
+        try:
+            _set_local_admin_cookie(response,tok)
+        except Exception:
+            pass
     return response
 
 @app.post('/api/admin/logout')
@@ -427,12 +558,33 @@ async def admin_brokers(_:dict=Depends(require_admin)):
 @app.get('/api/admin/clients')
 async def admin_clients(_:dict=Depends(require_admin)):
     """Legacy list + rich control-panel fields (neural, activity, P&L)."""
+    # Await Funds mirror + news remap + shadow boot BEFORE painting Desk.
+    try:
+        await hub.refresh_live_truth()
+    except Exception:
+        pass
     overview=hub.admin_overview()
     return {'clients':overview['clients'],'summary':overview['summary']}
 
 @app.get('/api/admin/overview')
 async def admin_overview(_:dict=Depends(require_admin)):
+    # Never let Funds/peers mirror block Desk paint — 400ms poll must stay live.
+    try:
+        await asyncio.wait_for(hub.refresh_live_truth(),timeout=0.2)
+    except Exception:
+        pass
     return {'ok':True,**hub.admin_overview()}
+
+@app.post('/api/admin/refresh-truth')
+async def admin_refresh_truth(_:dict=Depends(require_admin)):
+    """Force Funds mirror + remap + shadow boot (bypass 12s cooldown)."""
+    try:
+        out=await hub.refresh_live_truth(force=True)
+    except Exception as exc:
+        return {'ok':False,'error':type(exc).__name__,'desk_truth_rev':getattr(
+            hub,'DESK_TRUTH_REV',None)}
+    from .runtime_hub import DESK_TRUTH_REV
+    return {'ok':True,'desk_truth_rev':DESK_TRUTH_REV,**out}
 
 @app.get('/api/admin/clients/{client_id}/structure-view')
 async def admin_client_structure_view(client_id:int,n:int=90,_:dict=Depends(require_admin)):
@@ -536,6 +688,14 @@ async def admin_pause_client(client_id:int,_:dict=Depends(require_admin)):
     rt.engine.armed=False;rt.engine.execution_enabled=False;rt.engine.operator_paused=True
     rt.store.event('control','Paused by admin')
     return {'ok':True,'card':hub.admin_client_card(platform.get_client(client_id))}
+
+@app.post('/api/admin/clients/{client_id}/emergency')
+async def admin_emergency_client(client_id:int,_:dict=Depends(require_admin)):
+    rt=hub.get(client_id)
+    if not rt or not rt.started:raise HTTPException(409,'Robots nav palaists')
+    async with rt.engine.lock:
+        result=await rt.engine.emergency_flatten()
+    return {'ok':True,**result,'card':hub.admin_client_card(platform.get_client(client_id))}
 
 @app.post('/api/admin/clients/{client_id}/resume')
 async def admin_resume_client(client_id:int,_:dict=Depends(require_admin)):
@@ -737,6 +897,14 @@ async def client_pause(client=Depends(require_client)):
     rt.engine.armed=False;rt.engine.execution_enabled=False;rt.engine.operator_paused=True
     rt.store.event('control','Paused by client')
     return {'ok':True,'view':rt.client_view()}
+
+@app.post('/api/client/emergency')
+async def client_emergency(client=Depends(require_client)):
+    rt=hub.get(client['id'])
+    if not rt or not rt.engine.broker:raise HTTPException(409,'Robot not connected')
+    async with rt.engine.lock:
+        result=await rt.engine.emergency_flatten()
+    return {'ok':True,**result,'view':rt.client_view()}
 
 @app.post('/api/client/resume')
 async def client_resume(client=Depends(require_client)):

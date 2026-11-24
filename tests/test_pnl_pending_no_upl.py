@@ -1,4 +1,4 @@
-"""Audit #1–2: UPL is not realized P&L; each deal trains at most once."""
+"""Audit: UPL is not realized P&L; wait for Capital Funds £; train once."""
 import asyncio
 import tempfile
 from pathlib import Path
@@ -11,8 +11,8 @@ from tests.test_broker_pnl_resolve import HistoryBroker
 from tests.test_learning_integrity import new_brain
 
 
-def test_resolve_returns_upl_as_estimate_not_broker():
-    """UPL may fill journal provisionally — source must stay upl_estimate."""
+def test_resolve_upl_is_capital_and_teachable():
+    """Last open UPL before close = Capital £ (teachable); not invent mid×size."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -22,8 +22,10 @@ def test_resolve_returns_upl_as_estimate_not_broker():
             store.set('last_upl:d2',{'upl':0.45,'currency':'GBP'})
             pnl,src,ccy=await e._resolve_broker_pnl('d2',{})
             assert pnl==pytest.approx(0.45)
-            assert src=='upl_estimate'
+            assert src=='capital'
             assert src!='broker'
+            from app.realized_cash import may_teach_live_cash
+            assert may_teach_live_cash(src) is True
     asyncio.run(scenario())
 
 
@@ -44,11 +46,12 @@ def test_late_broker_pnl_refines_without_relearn():
             broker.tx=[{'reference':'once1','pnl':'-0.10','currency':'GBP','transactionType':'TRADE'}]
             pnl,src,ccy=await e._resolve_broker_pnl('once1',{'level':99.8})
             assert src=='broker' and pnl==pytest.approx(-0.10)
-            e._learn_closed_trade('once1',{'level':99.8,'profit':pnl,'pnl_currency':ccy})
+            e._learn_closed_trade('once1',{'level':99.8,'profit':pnl,'pnl_currency':ccy,
+                                           'pnl_source':'broker'})
             assert e._trade_already_learned('once1')
             labeled_after=brain.labeled
-            # Late refine with different cash must not train again.
-            e._learn_closed_trade('once1',{'level':99.8,'profit':-0.50,'pnl_currency':'GBP'})
+            e._learn_closed_trade('once1',{'level':99.8,'profit':-0.50,'pnl_currency':'GBP',
+                                           'pnl_source':'broker'})
             assert brain.labeled==labeled_after
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.50)
@@ -76,10 +79,10 @@ def test_vanish_queues_pending_when_history_empty():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            # UPL peļņa journals + teaches immediately; never invent ticks as broker.
-            assert row.get('pnl_source')=='upl_estimate'
+            # Last open UPL before close = Capital £ — teach now.
+            assert row.get('pnl_source')=='capital'
             assert row.get('pnl')==pytest.approx(-0.22)
+            assert e._trade_already_learned('gold1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='gold1' for x in pending)
-            assert e._trade_already_learned('gold1')
     asyncio.run(scenario())

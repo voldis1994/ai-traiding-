@@ -44,8 +44,10 @@ def test_positions_api_error_clears_ghost_when_history_has_cash():
             snap=e.snapshot()
             assert snap['entry_block_reason']!='Existing open position'
             row=store.trades(1)[0]
-            assert row['pnl']==pytest.approx(-0.08)
+            assert row['closed'] is not None
+            # Capital history £ on ghost recover → take it and stamp broker.
             assert row['pnl_source']=='broker'
+            assert row['pnl']==pytest.approx(-0.08)
             # Open-book score wipe must not apply after ghost clear; signal kept
             # until flat+not-ready path (market_context still default-ready here).
             assert e.last_signal is not None
@@ -77,6 +79,23 @@ def test_map_positions_drops_deal_less_rows():
         e=SingleTradeEngine(store,brain)
         mapped=e._map_positions([{'position':{'size':1,'direction':'BUY'},'market':{'epic':'GOLD'}}])
         assert mapped==[]
+
+
+def test_map_positions_reads_stop_alias_when_stopLevel_missing():
+    """Capital amount-mode payloads may expose SL under ``stop`` only."""
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        mapped=e._map_positions([{
+            'position':{
+                'dealId':'d1','direction':'SELL','size':'0.08','level':3531.38,
+                'stop':3547.64,'profitLevel':3503.67,'upl':0.31,
+            },
+            'market':{'epic':'GOLD'},
+        }])
+        assert len(mapped)==1
+        assert mapped[0]['stopLevel']==3547.64
+        assert mapped[0]['profitLevel']==3503.67
 
 
 def test_pending_close_sync_queues_broker_pnl_retry():
@@ -111,10 +130,12 @@ def test_admin_recent_trades_lists_pending_cash_bind():
         store.close_trade('new1',99.5,source='pending_broker_pnl',overwrite=True)
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP')
-        # Realized £ still only broker cash.
+        # Realized £ / NESEN still only broker cash; pending tracked separately.
         assert stats['realized_pnl']==pytest.approx(0.14)
         ids=[t['deal_id'] for t in stats['recent_trades']]
-        assert 'new1' in ids and 'old' in ids
+        assert ids==['old']
+        assert 'new1' not in ids
+        assert stats['pending_cash_trades']>=1
 
 
 def test_open_position_keeps_scores_when_market_context_not_ready():
@@ -135,5 +156,6 @@ def test_open_position_keeps_scores_when_market_context_not_ready():
         assert e.last_signal['scores']['SELL']==pytest.approx(0.61)
         snap=e.snapshot()
         assert 'Existing open position' in (snap['entry_block_reason'] or '')
-        assert 'p1' in (snap['entry_block_reason'] or '')
+        assert 'UPL' not in (snap['entry_block_reason'] or '')
+        assert 'p1' not in (snap['entry_block_reason'] or '')
         assert snap['signal']['scores']['SELL']==pytest.approx(0.61)

@@ -60,7 +60,8 @@ def side_stats(store, epic, structure, direction):
 def compare_frame(store, *, epic, structure):
     """BUY vs SELL evidence in one layout — robot's adaptive edge read."""
     cfg = _cfg(store)
-    need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
+    # First Capital £ loss in a frame can mark the grave (self-teach).
+    need = max(1, int(cfg.get('structure_edge_min_samples', 1)))
     buy = side_stats(store, epic, structure, 'BUY')
     sell = side_stats(store, epic, structure, 'SELL')
     out = {
@@ -99,10 +100,17 @@ def compare_frame(store, *, epic, structure):
                 f'(n={best_n}); opposite unproven — prefer {best_side}')
             out['confidence'] = min(0.85, 0.35 + 0.05 * best_n)
         elif other[1] < 0:
+            # Clear correct approach: one side pays, the other is a grave.
+            gap = float(best_ev) - float(other[1])
+            out['toxic_opposite'] = other[0]
+            out['evidence_gap'] = gap
             out['reason'] = (
                 f'{structure}: {best_side} +EV ({best_ev:.4f}) vs '
                 f'{other[0]} −EV ({other[1]:.4f}) — prefer {best_side}')
-            out['confidence'] = min(0.95, 0.45 + 0.04 * (best_n + other[2]))
+            # More samples + larger £ gap → louder soft teach (still not a veto).
+            out['confidence'] = min(
+                0.98, 0.50 + 0.04 * (best_n + other[2]) + min(0.2, 0.05 * gap))
+            out['nudge_scale'] = min(4.0, 1.5 + min(2.5, gap / 0.25))
         else:
             # Both positive — keep the stronger, mild confidence.
             out['reason'] = (
@@ -118,60 +126,135 @@ def compare_frame(store, *, epic, structure):
             f'{structure}: BUY mean={buy_m} (n={buy_n}), '
             f'SELL mean={sell_m} (n={sell_n}) — both ≤0; HOLD until edge appears')
         out['confidence'] = min(0.9, 0.4 + 0.03 * (buy_n + sell_n))
+        out['nudge_scale'] = 1.8
         return out
 
     # Only one side known and it is ≤0 — do NOT auto-HOLD forever; leave room
     # for the opposite (unproven) to be tried by neurons / CF teacher.
+    # Still mark the known grave so soft_nudge can damp that side.
     out['advice'] = None
+    out['toxic_opposite'] = best_side
     out['reason'] = (
         f'{structure}: known side {best_side} mean £={best_ev:.4f}≤0 '
-        f'(n={best_n}); opposite still unproven — no forced HOLD')
-    out['confidence'] = min(0.55, 0.2 + 0.03 * best_n)
+        f'(n={best_n}); opposite still unproven — damp grave, no forced HOLD')
+    out['confidence'] = min(0.7, 0.35 + 0.03 * best_n)
+    out['nudge_scale'] = 1.4
     return out
 
 
+def apply_learned_memory(base_scores, nudged_scores, advice, *, min_conf=0.35):
+    """After £ losses, damp a toxic structure×side in the LIVE decide path.
+
+    Cosmetic soft nudges (flow/MTF) stay diagnostic on ``scores``. When the
+    structure library has already marked the neural side as a grave (or both
+    sides ≤0), OPEN decides from the memory-damped simplex — still not a
+    hardcoded regime ban, only self-taught from closed Capital £.
+    """
+    if not isinstance(base_scores, dict):
+        return base_scores, {'applied': False, 'reason': 'no_scores'}
+    base = {k: float(base_scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+    if not isinstance(advice, dict):
+        return base, {'applied': False, 'reason': 'no_advice'}
+    try:
+        conf = float(advice.get('confidence') or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if conf < float(min_conf):
+        return base, {'applied': False, 'reason': 'weak_confidence', 'confidence': conf}
+    toxic = advice.get('toxic_opposite')
+    target = advice.get('advice')
+    try:
+        neural = max(('BUY', 'SELL', 'HOLD'), key=lambda a: float(base.get(a, 0)))
+    except Exception:
+        return base, {'applied': False, 'reason': 'bad_scores'}
+    nudged = nudged_scores if isinstance(nudged_scores, dict) else None
+    # Neural wants a proven grave → decide from damped scores.
+    if toxic in ('BUY', 'SELL') and neural == toxic and nudged is not None:
+        out = {k: float(nudged.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        return out, {
+            'applied': True, 'reason': 'damp_toxic_side',
+            'toxic': toxic, 'neural': neural, 'confidence': conf,
+            'advice': target,
+        }
+    # Both sides ≤0 in this frame → let HOLD rise via damped scores.
+    if target == 'HOLD' and neural in ('BUY', 'SELL') and nudged is not None:
+        out = {k: float(nudged.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        return out, {
+            'applied': True, 'reason': 'both_sides_negative',
+            'neural': neural, 'confidence': conf, 'advice': target,
+        }
+    return base, {
+        'applied': False, 'reason': 'neural_ok_or_no_grave',
+        'neural': neural, 'advice': target, 'toxic': toxic, 'confidence': conf,
+    }
+
+
 def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
-    """Gently tilt softmax-ish scores toward adaptive advice — never a hard veto.
+    """Tilt scores toward the library's correct approach — never a hard veto.
 
-    Returns (new_scores, meta). If advice is None/weak, scores unchanged.
+    When one structure×side is a proven £ grave and the other pays, nudge louder
+    so neurons learn to pick the paying side. Still renormalizes to a simplex.
 
-    After tilt, scores are clipped to [0, 1] and renormalized to sum exactly 1
-    so ``autonomy._safe_scores`` (sum≈1) does not reject → false HOLD.
-
-    When live multi-TF ``trend`` fights historical frame advice (e.g. advice=BUY
-    but trend=DOWN), skip the nudge — do not keep the robot glued to the old side.
+    ``live_trend_disagrees`` no longer cancels a *protective* damp of a toxic
+    opposite — only skips when advice would push *into* a fight with live trend
+    without toxic evidence.
     """
     if not isinstance(scores, dict):
         return scores, {'nudged': False, 'reason': 'no_scores'}
-    if not isinstance(advice, dict) or not advice.get('advice'):
+    if not isinstance(advice, dict):
         return dict(scores), {'nudged': False, 'reason': 'no_advice'}
     cfg = _cfg(store)
     strength = float(cfg.get('structure_edge_nudge', 0.08))
     conf = float(advice.get('confidence') or 0)
+    target = advice.get('advice')
+    toxic = advice.get('toxic_opposite')
+    # Grave-only advice (no positive side yet): damp toxic side toward HOLD.
+    if not target and toxic in ('BUY', 'SELL') and conf >= 0.35 and strength > 0:
+        scale = float(advice.get('nudge_scale') or 1.4)
+        delta = strength * conf * scale
+        out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
+        out[toxic] = out.get(toxic, 0) - delta
+        out['HOLD'] = out.get('HOLD', 0) + 0.6 * delta
+        for k in out:
+            out[k] = max(0.0, float(out[k]))
+        total = sum(out.values())
+        if total <= 1e-12:
+            return dict(scores), {'nudged': False, 'reason': 'degenerate_after_nudge'}
+        out = {k: v / total for k, v in out.items()}
+        return out, {
+            'nudged': True, 'delta': delta, 'target': 'HOLD',
+            'toxic_opposite': toxic, 'reason': advice.get('reason'),
+            'confidence': conf, 'nudge_scale': scale,
+            'renormalized': True, 'sum': sum(out.values()),
+        }
+    if not target:
+        return dict(scores), {'nudged': False, 'reason': 'no_advice'}
     if conf < 0.35 or strength <= 0:
         return dict(scores), {'nudged': False, 'reason': 'weak_confidence'}
-    target = advice['advice']
-    # Live regime flip: historical EV must not fight the current move.
+    scale = float(advice.get('nudge_scale') or 1.0)
+    scale = max(1.0, min(4.0, scale))
     trend = (live_trend or '').upper() if isinstance(live_trend, str) else None
     if target in ('BUY', 'SELL') and trend in ('UP', 'DOWN'):
-        if (target == 'BUY' and trend == 'DOWN') or (target == 'SELL' and trend == 'UP'):
+        fights = (target == 'BUY' and trend == 'DOWN') or (
+            target == 'SELL' and trend == 'UP')
+        # Only skip when we lack a toxic grave — protective teach must stay on.
+        if fights and not toxic and scale < 1.5:
             return dict(scores), {
                 'nudged': False, 'reason': 'live_trend_disagrees',
                 'target': target, 'live_trend': trend,
             }
-    delta = strength * conf
+    delta = strength * conf * scale
     out = {k: float(scores.get(k) or 0) for k in ('BUY', 'SELL', 'HOLD')}
     if target in ('BUY', 'SELL'):
         out[target] = out.get(target, 0) + delta
-        # Slightly damp the weaker directional side only — HOLD untouched unless
-        # advice is HOLD.
         other = 'SELL' if target == 'BUY' else 'BUY'
-        out[other] = out.get(other, 0) - 0.5 * delta
+        # Louder damp on the grave side when library marked it toxic.
+        damp = 0.85 * delta if toxic == other else 0.5 * delta
+        out[other] = out.get(other, 0) - damp
     elif target == 'HOLD':
         out['HOLD'] = out.get('HOLD', 0) + delta
         out['BUY'] = out.get('BUY', 0) - 0.35 * delta
         out['SELL'] = out.get('SELL', 0) - 0.35 * delta
-    # Clip negatives from dampening, then renormalize to a valid simplex.
     for k in out:
         out[k] = max(0.0, float(out[k]))
     total = sum(out.values())
@@ -180,6 +263,7 @@ def soft_nudge_scores(scores, advice, *, store=None, live_trend=None):
     out = {k: v / total for k, v in out.items()}
     return out, {
         'nudged': True, 'delta': delta, 'target': target,
+        'toxic_opposite': toxic, 'nudge_scale': scale,
         'reason': advice.get('reason'), 'confidence': conf,
         'renormalized': True, 'sum': sum(out.values()),
     }
@@ -247,19 +331,21 @@ def teach_after_loss(*, direction, cf_best, structure_prefer_hold=False,
 
 
 def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
-                       original_risk=None, be_locked=False):
+                       original_risk=None, original_profit=None,
+                       be_locked=False):
     """Whether the robot should enable broker trail now.
 
-    Adaptive evidence (any one is enough once past noise):
+    Same geometry as SL/TP brackets — do not arm on micro R alone:
       • stop already at/through BE → always arm (lock gains)
-      • MFE ≥ trail_arm_mfe_frac × opening risk (~0.9R seed — not micro bounce)
-      • structure×side mean £ > trail_arm_min_ev AND MFE ≥ same arm frac
-        (no 0.35R shortcut — that BE-locked into bounce scratches)
+      • MFE ≥ trail_arm_mfe_frac × opening risk (seed 1.0R)
+        AND MFE ≥ trail_arm_tp_frac × opening TP (seed 0.45 of TP)
+      • structure×side mean £ > trail_arm_min_ev with the same MFE bars
     """
     cfg = _cfg(store)
     out = {
         'arm': False, 'reason': 'waiting_for_evidence',
         'mfe': _finite(mfe), 'original_risk': _finite(original_risk),
+        'original_profit': _finite(original_profit),
         'structure': structure, 'direction': direction,
     }
     if be_locked:
@@ -267,31 +353,41 @@ def trail_arm_decision(store, *, epic, structure, direction, mfe=None,
         out['reason'] = 'be_locked — trail to protect open gains'
         return out
     risk = _finite(original_risk)
+    profit = _finite(original_profit)
     mfe_n = _finite(mfe)
-    frac = float(cfg.get('trail_arm_mfe_frac', 0.90))
-    frac = max(0.55, min(1.0, frac))
-    if risk is not None and risk > 0 and mfe_n is not None and mfe_n >= frac * risk:
+    frac = float(cfg.get('trail_arm_mfe_frac', 1.0))
+    frac = max(0.70, min(1.0, frac))
+    tp_frac = float(cfg.get('trail_arm_tp_frac', 0.45))
+    tp_frac = max(0.25, min(0.70, tp_frac))
+    need_r = (frac * risk) if risk is not None and risk > 0 else None
+    need_tp = (tp_frac * profit) if profit is not None and profit > 0 else None
+    # Require both R and TP-progress floors when available — even SL/TP/trail.
+    enough_r = (need_r is None) or (mfe_n is not None and mfe_n + 1e-12 >= need_r)
+    enough_tp = (need_tp is None) or (mfe_n is not None and mfe_n + 1e-12 >= need_tp)
+    if risk is not None and risk > 0 and mfe_n is not None and enough_r and enough_tp:
         out['arm'] = True
         out['reason'] = (
-            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk {risk:.4f} — arm trail')
+            f'mfe {mfe_n:.4f} ≥ {frac:.2f}×risk'
+            + (f' and ≥ {tp_frac:.2f}×tp' if need_tp is not None else '')
+            + ' — arm trail')
         return out
     need = max(2, int(cfg.get('structure_edge_min_samples', 5)))
     st = side_stats(store, epic, structure, direction)
     min_ev = float(cfg.get('trail_arm_min_ev', 0.0))
-    # Same MFE bar as the primary path — structure EV must not re-open the
-    # 0.35R early-arm hole that bounced trades out of a real move.
     if (st['samples'] >= need and st['mean_pnl'] is not None
             and float(st['mean_pnl']) > min_ev
             and mfe_n is not None and risk is not None and risk > 0
-            and mfe_n >= frac * risk):
+            and enough_r and enough_tp):
         out['arm'] = True
         out['reason'] = (
             f'structure {structure}/{direction} mean £={st["mean_pnl"]:.4f} '
-            f'+ mfe≥{frac:.2f}R — arm trail')
+            f'+ mfe≥{frac:.2f}R/TP — arm trail')
         return out
     out['reason'] = (
-        f'waiting: mfe={mfe_n} risk={risk} need≥{frac:.2f}R structure_mean='
-        f'{st.get("mean_pnl")} n={st.get("samples")}')
+        f'waiting: mfe={mfe_n} risk={risk} tp={profit} '
+        f'need≥{frac:.2f}R'
+        + (f'+{tp_frac:.2f}TP' if need_tp is not None else '')
+        + f' structure_mean={st.get("mean_pnl")} n={st.get("samples")}')
     return out
 
 

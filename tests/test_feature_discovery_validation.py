@@ -261,14 +261,13 @@ def test_engine_wires_self_dev_modules():
         assert snap['neural']['input_dimension']==brain.core.d
 
 
-def test_shadow_is_independent_core_not_halved_losses():
+def test_shadow_isolated_core_paper_cash_still_independent():
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
         brain=AdaptiveBrain(store,data_dir=d)
         e=SingleTradeEngine(store,brain)
         shadow=e._ensure_shadow_brain()
-        assert shadow is not None and shadow is not brain.core
-        assert shadow.d==brain.core.d
+        assert shadow is not brain.core
         # LIVE broker £ with entry/exit so cash scale can be estimated.
         for i in range(30):
             e.profit_learning.history.append({

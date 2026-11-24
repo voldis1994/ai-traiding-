@@ -67,6 +67,45 @@ def test_soft_nudge_tilts_scores_without_veto():
         assert meta.get('renormalized') is True
 
 
+def test_toxic_library_louder_nudge_teaches_correct_side():
+    """TREND_DOWN×BUY grave + SELL pays → soft nudge must move vote toward SELL."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='TREND_DOWN', direction='BUY',
+                   total_pnl=-40.0, samples=50, wins=0, losses=50)
+        _seed_side(s, structure='TREND_DOWN', direction='SELL',
+                   total_pnl=20.0, samples=40, wins=35, losses=5)
+        advice = se.compare_frame(s, epic='GOLD', structure='TREND_DOWN')
+        assert advice['advice'] == 'SELL'
+        assert advice.get('toxic_opposite') == 'BUY'
+        assert float(advice.get('nudge_scale') or 1) > 1.5
+        # Strong neural BUY (wrong approach) — loud soft teach should flip argmax.
+        scores = {'BUY': 0.70, 'SELL': 0.20, 'HOLD': 0.10}
+        nudged, meta = se.soft_nudge_scores(scores, advice, store=s)
+        assert meta['nudged'] is True
+        assert nudged['SELL'] > nudged['BUY']
+        # live_trend must NOT cancel protective teach against a toxic grave.
+        nudged2, meta2 = se.soft_nudge_scores(
+            scores, advice, store=s, live_trend='UP')
+        assert meta2['nudged'] is True
+        assert nudged2['SELL'] > nudged2['BUY']
+
+
+def test_grave_only_side_damps_without_forced_hold_advice():
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='BREAKOUT_DOWN', direction='BUY',
+                   total_pnl=-12.0, samples=20, wins=2, losses=18)
+        advice = se.compare_frame(s, epic='GOLD', structure='BREAKOUT_DOWN')
+        assert advice.get('advice') is None
+        assert advice.get('toxic_opposite') == 'BUY'
+        scores = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
+        nudged, meta = se.soft_nudge_scores(scores, advice, store=s)
+        assert meta['nudged'] is True
+        assert nudged['BUY'] < scores['BUY']
+        assert nudged['HOLD'] > scores['HOLD']
+
+
 def test_soft_nudge_keeps_safe_scores_for_autonomy():
     """Regression: raw tilt sum>1 used to force neural HOLD via _safe_scores."""
     from app.autonomy import AutoEvolution
@@ -157,14 +196,19 @@ def test_label_from_profit_uses_structure_frame_advice():
 def test_trail_arm_on_mfe_fraction():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
-        # Seed ~0.90R — micro 0.5/0.8 must wait; real ~1R arms.
+        # Seed 1.0R + 0.45×TP — micro moves wait; real progress arms.
         weak = se.trail_arm_decision(
             s, epic='GOLD', structure='TREND_UP', direction='BUY',
-            mfe=0.5, original_risk=0.8, be_locked=False)
+            mfe=0.5, original_risk=0.8, original_profit=2.0, be_locked=False)
         assert weak['arm'] is False
+        # 0.75 covers neither full 1R (0.8) nor 0.45×TP (0.9).
+        mid = se.trail_arm_decision(
+            s, epic='GOLD', structure='TREND_UP', direction='BUY',
+            mfe=0.75, original_risk=0.8, original_profit=2.0, be_locked=False)
+        assert mid['arm'] is False
         arm = se.trail_arm_decision(
             s, epic='GOLD', structure='TREND_UP', direction='BUY',
-            mfe=0.75, original_risk=0.8, be_locked=False)
+            mfe=0.95, original_risk=0.8, original_profit=2.0, be_locked=False)
         assert arm['arm'] is True
         assert 'mfe' in arm['reason']
 
@@ -174,7 +218,7 @@ def test_trail_arm_waits_without_evidence():
         s = _store(d)
         arm = se.trail_arm_decision(
             s, epic='GOLD', structure='CHOP', direction='BUY',
-            mfe=0.1, original_risk=0.8, be_locked=False)
+            mfe=0.1, original_risk=0.8, original_profit=2.0, be_locked=False)
         assert arm['arm'] is False
 
 
@@ -194,20 +238,20 @@ def test_propose_early_arm_locks_be_plus_cushion():
         s = _store(d)
         pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
                'stopLevel': 99.2, 'profitLevel': 102.0, 'size': '.25'}
-        # ~0.9R tip (risk 0.8 → need 0.72); bid still above cushion.
-        market = {'epic': 'GOLD', 'bid': 100.75, 'ask': 100.85, 'spread': 0.1,
+        # Need max(1.0×0.8, 0.45×2.0)=0.9 tip before first early-arm lock.
+        market = {'epic': 'GOLD', 'bid': 100.95, 'ask': 101.05, 'spread': 0.1,
                   'tick': 0.01, 'min_distance': 0.3, 'status': 'TRADEABLE'}
         meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
                 'original_profit': 2.0}
-        # Without arm: tip_fav < open_gap → no trail.
-        assert propose_broker_trail(pos, market, meta, extreme=100.75, store=s) is None
-        # Micro tip still waits (below ~0.9R).
+        # Without arm: tip_fav < open_gap → no full-R trail yet.
+        assert propose_broker_trail(pos, market, meta, extreme=100.7, store=s) is None
+        # Micro tip still waits (below 1R / TP share).
         arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.5}
         assert propose_broker_trail(
             pos, market, meta, extreme=100.5, store=s, arm_decision=arm) is None
-        arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.75}
+        arm = {'arm': True, 'reason': 'mfe test', 'mfe': 0.95}
         out = propose_broker_trail(
-            pos, market, meta, extreme=100.75, store=s, arm_decision=arm)
+            pos, market, meta, extreme=100.95, store=s, arm_decision=arm)
         assert out is not None
         assert out['stop_level'] >= 100.0 - 1e-9  # never loss-side
         assert out['stop_level'] > 100.0 + 1e-9   # BE+ cushion, not exact BE
@@ -221,14 +265,55 @@ def test_propose_early_arm_skips_when_be_violates_min_distance():
         s = _store(d)
         pos = {'dealId': 'a1', 'epic': 'GOLD', 'direction': 'BUY', 'level': 100.,
                'stopLevel': 99.2, 'profitLevel': 102.0, 'size': '.25'}
-        # tip enough for 0.9R but bid barely above entry; minStop large
+        # tip enough for 1R+TP-share but bid barely above entry; minStop large
         market = {'epic': 'GOLD', 'bid': 100.2, 'ask': 100.3, 'spread': 0.1,
                   'tick': 0.01, 'min_distance': 0.5, 'status': 'TRADEABLE'}
         meta = {'owner': 'AUTO', 'deal_id': 'a1', 'original_risk': 0.8,
                 'original_profit': 2.0}
-        arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.75}
+        arm = {'arm': True, 'reason': 'mfe', 'mfe': 0.95}
         out = propose_broker_trail(
-            pos, market, meta, extreme=100.75, store=s, arm_decision=arm)
+            pos, market, meta, extreme=100.95, store=s, arm_decision=arm)
         # Either None (skipped) or stop >= entry — never below entry.
         if out is not None:
             assert out['stop_level'] >= 100.0 - 1e-9
+
+
+def test_first_loss_marks_toxic_and_learned_decide_damps():
+    """One SELL loss in BREAKOUT_UP → toxic; neural SELL decide uses damped scores."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='BREAKOUT_UP', direction='SELL',
+                   total_pnl=-0.54, samples=1, wins=0, losses=1)
+        advice = se.compare_frame(s, epic='GOLD', structure='BREAKOUT_UP')
+        assert advice.get('toxic_opposite') == 'SELL'
+        assert advice['advice'] is None  # opposite unproven — damp grave only
+        raw = {'BUY': 0.20, 'SELL': 0.70, 'HOLD': 0.10}
+        nudged, nmeta = se.soft_nudge_scores(raw, advice, store=s)
+        assert nmeta.get('nudged') is True
+        assert nudged['SELL'] < raw['SELL']
+        decide, meta = se.apply_learned_memory(raw, nudged, advice)
+        assert meta.get('applied') is True
+        assert meta.get('reason') == 'damp_toxic_side'
+        assert decide['SELL'] <= nudged['SELL'] + 1e-12
+        # Soft cosmetic nudge without toxic must NOT flip decide.
+        decide2, meta2 = se.apply_learned_memory(
+            raw, {'BUY': 0.10, 'SELL': 0.10, 'HOLD': 0.80},
+            {'advice': None, 'confidence': 0.0})
+        assert meta2.get('applied') is False
+        assert decide2 == raw
+
+
+def test_both_negative_learned_decide_allows_hold():
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        _seed_side(s, structure='RANGE', direction='BUY',
+                   total_pnl=-2.0, samples=3, wins=0, losses=3)
+        _seed_side(s, structure='RANGE', direction='SELL',
+                   total_pnl=-1.0, samples=3, wins=0, losses=3)
+        advice = se.compare_frame(s, epic='GOLD', structure='RANGE')
+        assert advice['advice'] == 'HOLD'
+        raw = {'BUY': 0.55, 'SELL': 0.30, 'HOLD': 0.15}
+        nudged, _ = se.soft_nudge_scores(raw, advice, store=s)
+        decide, meta = se.apply_learned_memory(raw, nudged, advice)
+        assert meta.get('applied') is True
+        assert decide['HOLD'] >= raw['HOLD']

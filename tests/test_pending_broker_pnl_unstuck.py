@@ -38,8 +38,8 @@ def test_parse_cash_num_strips_currency():
         assert e._row_cash_pnl({},{'profitAndLoss':-0.08})==pytest.approx(-0.08)
 
 
-def test_vanish_teaches_ticks_while_pending_keeps_source():
-    """Vanish with UPL: teach immediately; broker £ later refines without re-train."""
+def test_vanish_waits_for_funds_then_teaches_once():
+    """Vanish without Funds: pending; Funds £ teaches once."""
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -59,18 +59,18 @@ def test_vanish_teaches_ticks_while_pending_keeps_source():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
-            assert row.get('pnl_source')=='upl_estimate'
+            # Last UPL = Capital £ — teach now; Funds later refines.
+            assert row.get('pnl_source')=='capital'
+            assert row.get('pnl')==pytest.approx(-0.11)
             assert e._trade_already_learned('g1')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id'))=='g1' for x in pending)
-            # Verified Capital £ → journal refine, no second neural teach.
             labeled=brain.trade_labeled
             broker.tx=[{'reference':'g1','pnl':-0.09,'currency':'GBP'}]
             await e._retry_pending_broker_pnl()
             row=store.trades(1)[0]
             assert row['pnl']==pytest.approx(-0.09)
             assert row['pnl_source']=='broker'
-            assert e._trade_already_learned('g1')
             assert brain.trade_labeled==labeled
             assert not (store.get('pending_broker_pnl_deals') or [])
     asyncio.run(scenario())
@@ -100,8 +100,8 @@ def test_activity_scan_without_deal_id_filter_finds_profit():
     asyncio.run(scenario())
 
 
-def test_admin_recent_trade_shows_pending_upl_hint():
-    """Pending + last_upl → Admin shows the £ figure (not blank gaida)."""
+def test_admin_recent_hides_pending_until_capital_funds():
+    """Pending close stays off Desk until Capital Funds £ settles — no UPL invent."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         store.upsert_trade({'dealId':'p1','epic':'GOLD','size':'.02','direction':'BUY','level':100})
@@ -109,10 +109,9 @@ def test_admin_recent_trade_shows_pending_upl_hint():
         store.set('last_upl:p1',{'upl':-0.13,'currency':'GBP'})
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=RuntimeHub._trade_stats(hub,store,'GBP')
-        recent=stats['recent_trades']
-        assert recent
-        assert recent[0].get('pnl')==pytest.approx(-0.13)
-        assert recent[0].get('pnl_source')=='upl_estimate'
-        assert recent[0].get('pending_cash') is False
-        assert stats['working_pnl']==pytest.approx(-0.13)
-        assert stats['pending_trades']==0
+        # Desk CLIENT CLOSES / Kopējais = Funds cash only.
+        assert stats['recent_trades']==[]
+        assert stats['working_pnl'] is None
+        assert stats['working_pnl_source'] in ('none','empty')
+        assert stats['cash_trades']==0
+        assert stats['pending_trades']>=1

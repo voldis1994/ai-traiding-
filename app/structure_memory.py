@@ -171,6 +171,196 @@ def bos_choch(bars, *, left=2, right=2) -> dict:
     return out
 
 
+def label_swing_structure(bars, *, left=2, right=2) -> dict:
+    """Tag each confirmed swing as HH/LH or HL/LL — real structure, not bar noise.
+
+    Returns labeled pivots plus a structure bias:
+      UP   — last swings print HH + HL
+      DOWN — last swings print LH + LL
+      RANGE — mixed / insufficient pivots
+    """
+    piv = swing_pivots(bars, left=left, right=right)
+    highs = list(piv.get('swing_highs') or [])
+    lows = list(piv.get('swing_lows') or [])
+    labeled_h = []
+    for i, h in enumerate(highs):
+        row = dict(h)
+        if i == 0:
+            row['tag'] = 'SH'
+        else:
+            row['tag'] = 'HH' if float(h['price']) > float(highs[i - 1]['price']) else 'LH'
+        labeled_h.append(row)
+    labeled_l = []
+    for i, lo in enumerate(lows):
+        row = dict(lo)
+        if i == 0:
+            row['tag'] = 'SL'
+        else:
+            row['tag'] = 'HL' if float(lo['price']) > float(lows[i - 1]['price']) else 'LL'
+        labeled_l.append(row)
+    last_h = labeled_h[-1]['tag'] if labeled_h else None
+    last_l = labeled_l[-1]['tag'] if labeled_l else None
+    if last_h == 'HH' and last_l == 'HL':
+        bias = 'UP'
+    elif last_h == 'LH' and last_l == 'LL':
+        bias = 'DOWN'
+    else:
+        bias = 'RANGE'
+    return {
+        'ready': bool(piv.get('ready')),
+        'swing_highs': labeled_h,
+        'swing_lows': labeled_l,
+        'last_high_tag': last_h,
+        'last_low_tag': last_l,
+        'bias': bias,
+        'hh_count': sum(1 for x in labeled_h if x.get('tag') == 'HH'),
+        'lh_count': sum(1 for x in labeled_h if x.get('tag') == 'LH'),
+        'hl_count': sum(1 for x in labeled_l if x.get('tag') == 'HL'),
+        'll_count': sum(1 for x in labeled_l if x.get('tag') == 'LL'),
+    }
+
+
+def _atr_proxy(path, period=14):
+    if len(path) < 2:
+        return None
+    trs = []
+    prev_c = path[0]['close']
+    for b in path[1:]:
+        tr = max(
+            b['high'] - b['low'],
+            abs(b['high'] - prev_c),
+            abs(b['low'] - prev_c),
+        )
+        trs.append(tr)
+        prev_c = b['close']
+    if not trs:
+        return None
+    n = min(max(2, int(period)), len(trs))
+    return sum(trs[-n:]) / float(n)
+
+
+def detect_base_impulse_zones(bars, *, atr=None, limit=80, max_zones=6) -> dict:
+    """1m Supply/Demand: base (consolidation) immediately before impulse.
+
+    Guide 1:1:
+      • Impulse UP after base  → Demand (BUY) zone = base High→Low
+      • Impulse DOWN after base → Supply (SELL) zone = base High→Low
+      • Quality: strong impulse, clean/narrow base, prefer fresher first touch
+    """
+    path = normalise(bars, limit=limit)
+    out = {
+        'ready': False, 'reason': 'too_few_bars',
+        'demand': [], 'supply': [], 'zones': [],
+        'atr': None, 'bars': len(path),
+    }
+    if len(path) < 16:
+        return out
+    atr_v = _finite(atr) or _atr_proxy(path, 14)
+    if atr_v is None or atr_v <= 0:
+        # Fallback from median bar range.
+        spans = sorted(max(1e-9, b['high'] - b['low']) for b in path)
+        atr_v = spans[len(spans) // 2]
+    out['atr'] = float(atr_v)
+    found = []
+    # Impulse ends at index i; base sits immediately before impulse start.
+    for i in range(10, len(path)):
+        for impulse_len in (3, 4, 5, 6, 7, 8):
+            imp_start = i - impulse_len + 1
+            if imp_start < 3:
+                continue
+            imp = path[imp_start:i + 1]
+            move = imp[-1]['close'] - imp[0]['open']
+            imp_hi = max(b['high'] for b in imp)
+            imp_lo = min(b['low'] for b in imp)
+            imp_span = max(imp_hi - imp_lo, 1e-12)
+            if abs(move) < 1.35 * atr_v:
+                continue
+            if abs(move) / imp_span < 0.55:
+                continue
+            # Mostly one-way bodies.
+            up_bodies = sum(1 for b in imp if b['close'] > b['open'])
+            dn_bodies = sum(1 for b in imp if b['close'] < b['open'])
+            if move > 0 and up_bodies < max(2, impulse_len // 2 + 1):
+                continue
+            if move < 0 and dn_bodies < max(2, impulse_len // 2 + 1):
+                continue
+            direction = 'UP' if move > 0 else 'DOWN'
+            for base_len in (2, 3, 4, 5, 6):
+                b0 = imp_start - base_len
+                if b0 < 0:
+                    continue
+                base = path[b0:imp_start]
+                if len(base) < 2:
+                    continue
+                base_hi = max(b['high'] for b in base)
+                base_lo = min(b['low'] for b in base)
+                base_span = base_hi - base_lo
+                if base_span <= 0 or base_span > 0.55 * abs(move):
+                    continue
+                # Clean base: bodies overlap / small relative to impulse.
+                body_mids = [0.5 * (b['open'] + b['close']) for b in base]
+                mid_span = max(body_mids) - min(body_mids)
+                if mid_span > 0.70 * base_span + 1e-12:
+                    continue
+                if base_span > 1.15 * atr_v and base_len > 4:
+                    continue
+                # Touches after impulse (freshness).
+                touches = 0
+                for b in path[i + 1:]:
+                    if b['low'] <= base_hi and b['high'] >= base_lo:
+                        touches += 1
+                # Quality: strong move, tight base, fewer post-touches, recent.
+                q = (abs(move) / atr_v) * (abs(move) / max(base_span, 1e-9))
+                q *= 1.0 / (1.0 + 0.65 * touches)
+                q *= 1.0 / (1.0 + 0.02 * (len(path) - 1 - i))
+                side = 'BUY' if direction == 'UP' else 'SELL'
+                found.append({
+                    'side': side,
+                    'kind': 'demand' if side == 'BUY' else 'supply',
+                    'lo': float(base_lo),
+                    'hi': float(base_hi),
+                    'impulse_dir': direction,
+                    'impulse_move': float(move),
+                    'impulse_len': int(impulse_len),
+                    'base_len': int(base_len),
+                    'base_i0': int(b0),
+                    'base_i1': int(imp_start - 1),
+                    'impulse_i0': int(imp_start),
+                    'impulse_i1': int(i),
+                    'touches': int(touches),
+                    'quality': float(q),
+                    'at': base[0].get('at'),
+                })
+    if not found:
+        out['reason'] = 'no_base_impulse'
+        return out
+    # Deduplicate overlapping same-side zones — keep highest quality.
+    found.sort(key=lambda z: -float(z['quality']))
+    picked = []
+    for z in found:
+        overlap = False
+        for p in picked:
+            if p['side'] != z['side']:
+                continue
+            lo = max(p['lo'], z['lo'])
+            hi = min(p['hi'], z['hi'])
+            if hi >= lo and (hi - lo) >= 0.45 * min(p['hi'] - p['lo'], z['hi'] - z['lo']):
+                overlap = True
+                break
+        if not overlap:
+            picked.append(z)
+        if len(picked) >= int(max_zones):
+            break
+    demand = [z for z in picked if z['side'] == 'BUY']
+    supply = [z for z in picked if z['side'] == 'SELL']
+    out['demand'] = demand
+    out['supply'] = supply
+    out['zones'] = picked
+    out['ready'] = bool(picked)
+    out['reason'] = 'base_impulse' if picked else 'empty'
+    return out
+
+
 def snapshot_from_frame(frame, *, mid=None, bos=None) -> dict:
     """Compact structure snapshot stored on entry_brain / last_trade_outcome."""
     frame = frame if isinstance(frame, dict) else {}
@@ -303,18 +493,20 @@ def developed_since(prior: dict, live: dict, *, action=None, atr=None) -> dict:
 
 
 def extension_chase(action, *, candles=None, market_context=None, atr=None,
-                    lookback=30, top_frac=0.85, min_atr_mult=2.0) -> dict:
-    """Block only exhaustion chases — not clear trend continuation.
+                    lookback=30, top_frac=0.85, min_atr_mult=2.0,
+                    fresh_extreme_bars=2) -> dict:
+    """Block OPEN when the move is already finished (exhaustion chase).
 
     Block:
-      • BUY at the top of a large impulse while M1 is already rolling (reds)
-      • SELL at the bottom while M1 is bouncing (greens)
+      • BUY stuck at the top of a large impulse
+      • SELL stuck at the bottom of a large dump
 
     Allow:
-      • SELL still printing reds at the low (the live dump that became HOLD)
-      • BUY still printing greens at the high (continuation, not a weak bounce)
+      • Mid-range pressure (early/mid structure — not a chase)
+      • First 1–2 bars into the extreme (fresh break) — structure entry
+        before the move is exhausted
 
-    Earlier “always block at extreme” turned every sustained move into HOLD.
+    Pullback/zone + swing RR gates still place SL/TP on OHLC structure.
     """
     if action not in ('BUY', 'SELL'):
         return {'needed': False, 'ok': True, 'reason': 'not_directional'}
@@ -338,10 +530,6 @@ def extension_chase(action, *, candles=None, market_context=None, atr=None,
             return {'needed': False, 'ok': True, 'reason': 'impulse_not_large',
                     'span': span, 'atr': atr_v}
     pos = (mid - lo) / span  # 0=bottom, 1=top of lookback range
-    last3 = path[-3:]
-    reds = sum(1 for b in last3 if b['close'] < b['open'])
-    greens = sum(1 for b in last3 if b['close'] > b['open'])
-    # Same-dir M1 streak = clear candle pressure — do not HOLD for “weak body”.
     same_dir = 0
     for b in reversed(path[-8:]):
         if action == 'SELL' and b['close'] < b['open']:
@@ -351,43 +539,48 @@ def extension_chase(action, *, candles=None, market_context=None, atr=None,
         else:
             break
     frac = float(top_frac)
+    # How long has price been grinding the extreme? >fresh → move finished.
+    extreme_bars = 0
+    for b in reversed(path):
+        p = (b['close'] - lo) / span
+        if action == 'BUY' and p >= frac:
+            extreme_bars += 1
+        elif action == 'SELL' and p <= (1.0 - frac):
+            extreme_bars += 1
+        else:
+            break
+    fresh_n = max(1, int(fresh_extreme_bars))
+
     if action == 'BUY' and pos >= frac:
-        if same_dir >= 2:
+        if extreme_bars <= fresh_n:
             return {
-                'needed': False, 'ok': True, 'reason': 'continuation_at_high',
+                'needed': False, 'ok': True, 'reason': 'fresh_extreme_high',
                 'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'same_dir_streak': same_dir,
-            }
-        if reds >= 2:
-            return {
-                'needed': True, 'ok': False, 'reason': 'chase_extension_high',
-                'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+                'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
             }
         return {
-            'needed': False, 'ok': True, 'reason': 'top_without_rollover',
-            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'reds': reds,
+            'needed': True, 'ok': False, 'reason': 'chase_extension_high',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo,
+            'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
+            'exhausted': True,
         }
     if action == 'SELL' and pos <= (1.0 - frac):
-        if same_dir >= 2:
-            # Clear dump with consecutive red M1 — OPEN allowed (user screenshot).
+        if extreme_bars <= fresh_n:
             return {
-                'needed': False, 'ok': True, 'reason': 'continuation_at_low',
+                'needed': False, 'ok': True, 'reason': 'fresh_extreme_low',
                 'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'same_dir_streak': same_dir,
-            }
-        if greens >= 2:
-            return {
-                'needed': True, 'ok': False, 'reason': 'chase_extension_low',
-                'pos': round(pos, 3), 'span': span, 'mid': mid,
-                'range_hi': hi, 'range_lo': lo, 'rolling': True,
+                'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
             }
         return {
-            'needed': False, 'ok': True, 'reason': 'low_without_bounce',
-            'pos': round(pos, 3), 'same_dir_streak': same_dir, 'greens': greens,
+            'needed': True, 'ok': False, 'reason': 'chase_extension_low',
+            'pos': round(pos, 3), 'span': span, 'mid': mid,
+            'range_hi': hi, 'range_lo': lo,
+            'extreme_bars': extreme_bars, 'same_dir_streak': same_dir,
+            'exhausted': True,
         }
     return {'needed': False, 'ok': True, 'reason': 'not_extended',
-            'pos': round(pos, 3), 'span': span}
+            'pos': round(pos, 3), 'span': span, 'same_dir_streak': same_dir}
 
 
 def gate_reentry(*, action, last_outcome=None, candles=None,

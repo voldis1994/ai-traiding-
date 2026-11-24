@@ -1,0 +1,230 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap");
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: #02040a;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.2;
+  overflow: hidden;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+.desk-stage {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: #02040a;
+  position: relative;
+}
+
+.desk-auth-banner,
+.desk-live-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  padding: 6px 10px;
+  font-size: 11px;
+  background: #1a1210;
+  border-bottom: 1px solid var(--border-primary);
+  color: var(--text-primary);
+}
+.desk-live-banner {
+  background: #0b1a14;
+}
+.desk-live-banner.on {
+  box-shadow: inset 0 -1px 0 rgba(48, 214, 154, 0.35);
+}
+.desk-auth-banner a,
+.desk-live-banner a {
+  color: var(--accent-gold);
+  font-weight: 700;
+}
+.desk-auth-hint {
+  color: var(--text-muted);
+  width: 100%;
+}
+.desk-auth-hint code {
+  color: var(--accent-blue);
+}
+
+.desk-frame {
+  width: var(--ref-w);
+  height: var(--ref-h);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  display: grid;
+  grid-template-rows: 31px 18px 1fr;
+  overflow: hidden;
+  transform-origin: center center;
+}
+
+.desk-workspace {
+  display: grid;
+  grid-template-columns: 43px 136px 1fr 128px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.desk-center {
+  display: grid;
+  /* Reference: toolbar ~33, chart row ~248, bottom row ~177 */
+  grid-template-rows: 33px minmax(0, 1.4fr) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  gap: 4px;
+  padding: 0 4px 4px;
+}
+
+.desk-center-top {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 4px;
+  min-height: 0;
+}
+
+.desk-center-bottom {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  gap: 4px;
+  min-height: 0;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-header {
+  flex: 0 0 auto;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 6px;
+  background: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--bull);
+  text-transform: uppercase;
+}
+
+.live-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--bull);
+  box-shadow: 0 0 4px var(--bull);
+}
+
+.status-badge {
+  display: inline-block;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 1px 4px;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+}
+
+.status-badge.bull {
+  color: var(--bull);
+  background: rgba(48, 214, 154, 0.12);
+  border-color: rgba(48, 214, 154, 0.28);
+}
+
+.status-badge.bear {
+  color: var(--bear);
+  background: rgba(240, 107, 120, 0.12);
+  border-color: rgba(240, 107, 120, 0.28);
+}
+
+.status-badge.neu {
+  color: var(--accent-blue);
+  background: rgba(105, 155, 221, 0.1);
+  border-color: rgba(105, 155, 221, 0.25);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.up {
+  color: var(--bull);
+}
+.dn {
+  color: var(--bear);
+}
+
+/* thin scrollbars */
+.panel-body::-webkit-scrollbar,
+.scroll::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.panel-body::-webkit-scrollbar-thumb,
+.scroll::-webkit-scrollbar-thumb {
+  background: #3a5f8c;
+  border-radius: 2px;
+}
+.panel-body::-webkit-scrollbar-track,
+.scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (max-width: 1289px) {
+  .desk-stage {
+    overflow: auto;
+    place-items: start center;
+    padding: 8px;
+  }
+}

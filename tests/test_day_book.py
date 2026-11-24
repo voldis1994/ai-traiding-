@@ -123,7 +123,7 @@ def test_propose_size_scales_with_equity_risk():
     with tempfile.TemporaryDirectory() as d:
         s = _store(d)
         daily = db.load_daily(s, equity=10_000.0)
-        params = dict(db.load_params(s), size_full_balance=0)
+        params = dict(db.load_params(s), size_full_balance=0, size_fixed_mandate=0)
         out = db.propose_size(
             mandate_size='1', equity=10_000.0, daily=daily, params=params,
             stop_ticks=20, tick_value=1.0, positions=[], score_edge=0.1)
@@ -131,6 +131,33 @@ def test_propose_size_scales_with_equity_risk():
         assert out['size'] is not None
         assert isinstance(out['size'], Decimal)
         assert out['size'] > 0
+
+
+def test_fixed_mandate_keeps_first_trade_lot():
+    """Default: first-trade 0.25 stays 0.25 even when tick_value is missing."""
+    with tempfile.TemporaryDirectory() as d:
+        s = _store(d)
+        market = {
+            'dealingRules': {
+                'minDealSize': {'value': '0.01'},
+                'minSizeIncrement': {'value': '0.01'},
+                'maxDealSize': {'value': '50'},
+            },
+        }
+        params = db.load_params(s)
+        assert int(params.get('size_fixed_mandate') or 0) == 1
+        out = db.propose_size(
+            mandate_size='0.25', equity=15.0, daily={}, params=params,
+            stop_ticks=500, tick_value=None, positions=[], score_edge=0.0,
+            market=market)
+        assert out['allowed'] is True
+        assert out['reason'] == 'fixed_mandate_lot'
+        assert Decimal(str(out['size'])) == Decimal('0.25')
+
+
+def _adaptive_params(store):
+    """Full-balance / equity-risk tests opt out of fixed-mandate default."""
+    return dict(db.load_params(store), size_fixed_mandate=0, size_full_balance=1)
 
 
 def test_full_balance_uses_account_and_splits_multi_lot():
@@ -146,7 +173,7 @@ def test_full_balance_uses_account_and_splits_multi_lot():
             'instrument': {},
             'snapshot': {'decimalPlacesFactor': 2},
         }
-        params = db.load_params(s)
+        params = _adaptive_params(s)
         assert int(params.get('size_full_balance') or 0) == 1
         daily = db.load_daily(s, equity=20.0)
         # Strong signal + stop_ticks=10, tick_value=1 → size = 20/10 = 2.0
@@ -181,7 +208,7 @@ def test_full_balance_no_tick_value_deploys_min_pack_not_mandate():
                 'maxDealSize': {'value': '50'},
             },
         }
-        params = db.load_params(s)
+        params = _adaptive_params(s)
         assert int(params.get('size_full_balance') or 0) == 1
         # Weak/zero edge → open_slices(5)×min (not mandate glue).
         out = db.propose_size(
@@ -217,7 +244,7 @@ def test_gold_like_full_balance_splits_three_min_lots():
                 'maxDealSize': {'value': '50'},
             },
         }
-        params = db.load_params(s)
+        params = _adaptive_params(s)
         # stop_ticks=500, tick_value=1 → size = 15/500 = 0.03 (unknown edge = full £)
         out = db.propose_size(
             mandate_size='0.1', equity=15.0, daily={}, params=params,
@@ -253,7 +280,7 @@ def test_signal_strength_scales_full_balance_pack():
                 'maxDealSize': {'value': '50'},
             },
         }
-        params = db.load_params(s)
+        params = _adaptive_params(s)
         weak = db.propose_size(
             mandate_size='0.1', equity=20.0, daily={}, params=params,
             stop_ticks=10, tick_value=1.0, positions=[], score_edge=0.0,
@@ -407,7 +434,7 @@ def test_tick_value_missing_calibrated_lot_not_stuck_on_mandate():
             'snapshot': {'decimalPlacesFactor': 2, 'marketStatus': 'TRADEABLE'},
         }
         # Calibrate like submit (fractional mode): mandate ≈ risk_per_trade at stop.
-        params = dict(db.load_params(store), size_full_balance=0)
+        params = dict(db.load_params(store), size_full_balance=0, size_fixed_mandate=0)
         b = db.budgets(equity=10_000.0, params=params, daily={})
         rpt = float(b['risk_per_trade'])
         stop_ticks = 50
@@ -556,3 +583,5 @@ def test_default_max_positions_is_five():
     params = db.load_params(None)
     assert params['max_positions'] == 5
     assert params['open_slices'] == 5
+    assert int(params.get('size_fixed_mandate') or 0) == 1
+    assert int(params.get('size_full_balance') or 0) == 0

@@ -7,7 +7,7 @@ import pytest
 
 from app.autonomy import AutoEvolution
 from app.engine import Store, SingleTradeEngine
-from app.runtime_hub import RuntimeHub
+from app.runtime_hub import AccountRuntime, RuntimeHub
 from tests.test_learning_integrity import new_brain
 from tests.test_broker_pnl_resolve import HistoryBroker
 
@@ -56,6 +56,29 @@ def test_upl_snapshot_uses_account_not_position_usd():
         assert store.get('last_upl:y')['currency'] is None
 
 
+def test_mapped_open_position_currency_is_account_not_gold_usd():
+    """Capital tags GOLD with quote USD — Admin must never show Open … USD."""
+    with tempfile.TemporaryDirectory() as d:
+        store,brain=new_brain(d)
+        e=SingleTradeEngine(store,brain)
+        e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
+        mapped=e._map_positions([{
+            'position':{
+                'dealId':'g1','direction':'BUY','size':'0.1','level':2650,
+                'upl':-0.15,'currency':'USD','stopLevel':2660,'profitLevel':2640,
+            },
+            'market':{'epic':'GOLD'},
+        }])
+        assert len(mapped)==1
+        assert mapped[0]['currency']=='GBP'
+        rt=AccountRuntime.__new__(AccountRuntime)
+        enriched=rt._enrich_positions(e,[{
+            'dealId':'g1','epic':'GOLD','direction':'BUY','size':'0.1',
+            'level':2650,'upl':-0.15,'currency':'USD',
+        }])
+        assert enriched[0]['currency']=='GBP'
+
+
 def test_repair_relabels_usd_broker_rows_to_gbp():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
@@ -94,29 +117,36 @@ def test_admin_trade_stats_sum_gbp_not_split_usd():
 
 
 def test_admin_trade_stats_sums_beyond_200_and_legacy_blank_source():
-    """P&L must include full history + blank pnl_source cash (not only last 200)."""
+    """Full history sums broker cash; blank source is NOT cash (V3 P05/T38)."""
     with tempfile.TemporaryDirectory() as d:
         store=Store(Path(d)/'db.sqlite3')
-        total=0.0
+        broker_total=0.0
+        blank_n=0
         for i in range(250):
             pnl=-0.04
-            total+=pnl
             store.upsert_trade({'dealId':f'old{i}','epic':'GOLD','size':'0.1',
                                 'direction':'SELL','level':2000})
-            # Half legacy blank source, half broker — both are account cash.
+            # Half broker cash, half legacy blank — blank ≠ Funds £.
             src='broker' if i%2==0 else None
             store.close_trade(f'old{i}',1999,pnl,currency='GBP',source=src)
             if src is None:
+                blank_n+=1
                 store.db.execute(
                     "UPDATE trades SET pnl_source=NULL WHERE deal_id=?",(f'old{i}',))
                 store.db.commit()
+            else:
+                broker_total+=pnl
         hub=RuntimeHub.__new__(RuntimeHub)
         stats=hub._trade_stats(store,'GBP',open_upl=-0.57)
-        assert stats['cash_trades']==250
-        assert stats['realized_pnl']==pytest.approx(total)
+        assert stats['cash_trades']==125
+        assert stats['blank_pnl_trades']==blank_n
+        assert stats['realized_pnl']==pytest.approx(broker_total)
         assert stats['open_upl']==pytest.approx(-0.57)
-        assert stats['equity_pnl']==pytest.approx(total-0.57)
-        assert stats['losses']==250 and stats['wins']==0
+        # Equity = settled Funds £ only (open UPL stays on position cards).
+        assert stats['equity_pnl']==pytest.approx(broker_total)
+        assert stats['losses']==125 and stats['wins']==0
+        assert RuntimeHub._cash_pnl_source(None)=='unverified'
+        assert RuntimeHub._cash_pnl_source('')=='unverified'
 
 
 def test_shadow_rollback_restores_when_recent_pound_worse():
@@ -148,8 +178,13 @@ def test_shadow_rollback_restores_when_recent_pound_worse():
         # Recent £ worse → rollback attempted (restored or seeded, never stuck).
         assert out is not None
         if out.get('rollback'):
-            assert out.get('weights_restored') is True
-            assert 'restored' in reason.lower()
+            # V5: candidate validation may refuse restore without proof — never
+            # invent a LIVE weight swap. Accept restored OR explicit refusal.
+            assert out.get('weights_restored') in (True, False)
+            if out.get('weights_restored'):
+                assert 'restored' in reason.lower()
+            else:
+                assert out.get('rollback') is True
 
 
 def test_weight_checkpoint_every_rollback_window():

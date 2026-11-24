@@ -16,6 +16,11 @@ from .stream import CapitalQuoteStream
 
 log=logging.getLogger('runtime_hub')
 
+# Running-process stamp (NOT “which PR to merge”). Bump on every truth deploy so
+# the Desk status pill proves the Windows process reloaded after git pull.
+# After this PR merges, operators look for this number — not #241 (already on main).
+DESK_TRUTH_REV = 273
+
 
 def _finite_num(v):
     try:
@@ -100,8 +105,27 @@ class AccountRuntime:
         has_sl=_live_lvl(p.get('stopLevel')) is not None
         has_tp=_live_lvl(p.get('profitLevel')) is not None
         enrolled=bool(isinstance(meta,dict) and meta.get('owner')=='AUTO')
+        # Prefer hard kill switch; never advertise trail from stale class defaults.
+        trail_on=False
+        if engine is not None and hasattr(engine,'_trail_is_enabled'):
+            try:
+                trail_on=bool(engine._trail_is_enabled())
+            except Exception:
+                trail_on=False
+        else:
+            trail_on=bool(getattr(engine,'TRAIL_ENABLED',False))
         phase='flat'
-        if not deal:
+        # Trail disabled → never advertise armed/ratchet/trail phases (Admin honesty).
+        if not trail_on:
+            if not deal:
+                phase='unknown'
+            elif not has_sl or not has_tp:
+                phase='watch'  # brackets incomplete — protect should attach
+            elif not robot:
+                phase='manual'
+            else:
+                phase='flat'
+        elif not deal:
             phase='unknown'
         elif not robot:
             phase='manual'
@@ -177,6 +201,21 @@ class AccountRuntime:
             current=(p.get('currentLevel') if p.get('currentLevel') is not None
                      else (p.get('current_price') if p.get('current_price') is not None
                            else (p.get('mark') if p.get('mark') is not None else mid)))
+            # Open floating cash is account currency — never GOLD quote USD.
+            acct=None
+            try:
+                acct=(engine._account_currency()
+                      if engine is not None and hasattr(engine,'_account_currency')
+                      else None)
+            except Exception:
+                acct=None
+            cash_ccy=None
+            try:
+                cash_ccy=(engine._cash_currency(p.get('currency'))
+                          if engine is not None and hasattr(engine,'_cash_currency')
+                          else None)
+            except Exception:
+                cash_ccy=None
             out.append({
                 'dealId':p.get('dealId'),
                 'epic':p.get('epic'),
@@ -186,7 +225,7 @@ class AccountRuntime:
                 'stopLevel':p.get('stopLevel'),
                 'profitLevel':p.get('profitLevel'),
                 'upl':p.get('upl'),
-                'currency':p.get('currency'),
+                'currency':cash_ccy or acct or 'GBP',
                 'bid':bid,
                 'ask':ask,
                 'mid':mid,
@@ -331,19 +370,13 @@ class RuntimeHub:
 
     @staticmethod
     def _cash_pnl_source(src) -> str:
-        """Classify journal source: cash | pending | estimate | proxy."""
-        s=(src or '').strip().lower()
-        if s in ('ticks_only','price_size','position_disappeared'):
-            return 'proxy'
-        if s in ('pending_close_sync','pending_broker_pnl'):
-            return 'pending'
-        # Last live UPL settled as peļņa when Capital history lags — count as cash.
-        if s in ('upl_estimate',):
-            return 'cash'
-        # Explicit broker, or legacy blank source with a settled pnl figure.
-        if s in ('broker','') or not s:
-            return 'cash'
-        return 'other'
+        """Classify journal source via V3 P05–P13 (blank ≠ cash).
+
+        Delegates to ``realized_cash.classify_pnl_source`` so Desk/NESEN
+        share the same cash|pending|estimate|proxy|unverified|other map.
+        """
+        from .realized_cash import classify_pnl_source
+        return classify_pnl_source(src)
 
     def _trade_stats(self,store: Store, account_currency: str|None=None,
                      open_upl: float|None=None) -> dict:
@@ -363,23 +396,41 @@ class RuntimeHub:
         open_n=int(store.db.execute(
             'SELECT COUNT(*) FROM trades WHERE closed IS NULL').fetchone()[0] or 0)
         by_ccy: dict[str,list[float]]={}
+        by_ccy_24h: dict[str,list[float]]={}
         signed=[]
+        signed_24h=[]
         estimate_signed=[]
+        estimate_signed_24h=[]
         recent=[]
         cash_n=0
+        cash_n_24h=0
         pending_n=0
         proxy_n=0
         estimate_n=0
         estimate_sum=0.0
+        estimate_sum_24h=0.0
         blank_n=0
+        estimate_rows=[]
+        from datetime import datetime, timezone, timedelta
+        cutoff_24h=datetime.now(timezone.utc)-timedelta(hours=24)
+
+        def _in_24h(closed_raw):
+            if not closed_raw:
+                return True  # unknown stamp — keep in window rather than drop
+            try:
+                raw=str(closed_raw).replace('Z','+00:00').replace(' ','T',1)
+                dt=datetime.fromisoformat(raw)
+                if dt.tzinfo is None:
+                    dt=dt.replace(tzinfo=timezone.utc)
+                return dt>=cutoff_24h
+            except Exception:
+                return True
+
         for t in closed_rows:
             kind=self._cash_pnl_source(t.get('pnl_source'))
             if kind=='proxy':
                 proxy_n+=1
-                if len(recent)<12:
-                    recent.append({**t,'pnl_currency':(
-                        (t.get('pnl_currency') or '').strip().upper() or acct or '?')})
-                continue
+                continue  # Desk shows Capital Funds £ only — never pts/proxy
             raw_ccy=(t.get('pnl_currency') or '').strip().upper() or None
             val=None
             if t.get('pnl') is not None:
@@ -392,63 +443,73 @@ class RuntimeHub:
                 ccy=raw_ccy or acct or '?'
             row={**t,'pnl_currency':ccy}
             if val is not None and kind=='cash':
-                cash_n+=1
-                by_ccy.setdefault(ccy,[]).append(val)
-                if not acct or ccy==acct:
-                    signed.append(val)
-                if len(recent)<12:
-                    recent.append(row)
-            elif kind=='pending':
-                # Last live UPL as display hint — promote into peļņa when the
-                # journal already has a numeric pnl (UPL stamped then source
-                # clobbered) or when last_upl still holds the close figure.
-                snap=store.get('last_upl:'+str(t.get('deal_id') or '')) or {}
-                try:
-                    hint=float(snap.get('upl')) if snap.get('upl') is not None else None
-                except (TypeError,ValueError):
-                    hint=None
-                if hint is not None and not __import__('math').isfinite(hint):
-                    hint=None
-                show=val if val is not None else hint
-                if show is not None:
-                    # Operator: closed at 0.01 must show 0.01, not blank gaida.
-                    cash_n+=1
-                    by_ccy.setdefault(ccy,[]).append(float(show))
-                    if not acct or ccy==acct:
-                        signed.append(float(show))
-                    row={**row,'pnl':round(float(show),4),'pnl_source':'upl_estimate',
-                         'pending_cash':False}
-                    if hint is not None:
-                        row['upl_hint']=round(hint,4)
-                    if len(recent)<12:
-                        recent.append(row)
-                else:
-                    pending_n+=1
+                # Capital often journals broker £0 before Funds settles — hide
+                # from Desk until real £ arrives (no GAIDA / pending rows).
+                if abs(float(val))<1e-12:
                     blank_n+=1
-                    row['pending_cash']=True
-                    if len(recent)<12:
-                        recent.append(row)
-            elif kind=='estimate' and val is not None:
+                    pending_n+=1
+                else:
+                    cash_n+=1
+                    by_ccy.setdefault(ccy,[]).append(val)
+                    if not acct or ccy==acct:
+                        signed.append(val)
+                    if _in_24h(t.get('closed')):
+                        cash_n_24h+=1
+                        by_ccy_24h.setdefault(ccy,[]).append(val)
+                        if not acct or ccy==acct:
+                            signed_24h.append(val)
+                    if len(recent)<80:
+                        recent.append({**row,'pnl_source':'broker'})
+            elif kind=='pending':
+                # Track for harvest / estimate counters — never NESEN Funds cash.
+                pending_n+=1
+                if val is None or abs(float(val))<1e-12:
+                    blank_n+=1
+                else:
+                    estimate_n+=1
+                    estimate_sum+=float(val)
+                    estimate_signed.append(float(val))
+                    if _in_24h(t.get('closed')):
+                        estimate_sum_24h+=float(val)
+                        estimate_signed_24h.append(float(val))
+                    if len(estimate_rows)<80:
+                        estimate_rows.append(row)
+            elif kind=='estimate' and val is not None and abs(float(val))>=1e-12:
                 estimate_n+=1
                 estimate_sum+=float(val)
                 estimate_signed.append(float(val))
-                if len(recent)<12:
-                    recent.append(row)
-            elif kind=='other' or (kind=='cash' and val is None):
-                if kind=='cash' and val is None:blank_n+=1
-                if len(recent)<12:
-                    recent.append(row)
+                if _in_24h(t.get('closed')):
+                    estimate_sum_24h+=float(val)
+                    estimate_signed_24h.append(float(val))
+                if len(estimate_rows)<80:
+                    estimate_rows.append(row)
+            elif kind in ('other','unverified') or (kind=='cash' and val is None):
+                # Blank / unverified ≠ Capital Funds cash (V3 P05 / T38).
+                blank_n+=1
+                if kind=='cash' and val is None:
+                    pending_n+=1
+        # NESEN / recent_trades = Funds/broker cash only. Estimates stay in
+        # estimate_* aggregates (and estimate_rows) — never fill as cash totals.
         wins=sum(1 for p in signed if p>0)
         losses=sum(1 for p in signed if p<0)
         est_wins=sum(1 for p in estimate_signed if p>0)
         est_losses=sum(1 for p in estimate_signed if p<0)
         primary=None
-        if len(by_ccy)==1:
-            ccy,vals=next(iter(by_ccy.items()))
-            primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
-        elif acct and acct in by_ccy:
+        if acct and acct in by_ccy:
             primary={'currency':acct,
                      'realized_pnl':round(sum(by_ccy[acct]),4)}
+        elif len(by_ccy)==1:
+            ccy,vals=next(iter(by_ccy.items()))
+            # GOLD quote USD alone must not become Desk cash currency.
+            if acct and ccy=='USD' and acct!='USD':
+                primary={'currency':acct,'realized_pnl':round(sum(vals),4)}
+            else:
+                primary={'currency':ccy,'realized_pnl':round(sum(vals),4)}
+        elif acct and by_ccy:
+            # Prefer account currency even when SQLite still holds quote tags.
+            primary={'currency':acct,
+                     'realized_pnl':round(sum(by_ccy.get(acct) or
+                                             next(iter(by_ccy.values()))),4)}
         # Never invent 0.00 when multi-currency cash cannot be summed.
         # Also never invent 0.00 when there are simply no closed trades — that
         # blanked Admin "Kopējais P&L" while live open UPL was available.
@@ -462,30 +523,48 @@ class RuntimeHub:
             realized=None
         else:
             realized=0.0
-        # Honest status: 13 closes with £0 is NOT "fine" when broker cash never landed.
-        if closed_n>0 and cash_n==0:
+        # Honest status: UPL-only closes are NOT Capital cash yet.
+        if closed_n>0 and cash_n==0 and estimate_n>0:
+            pnl_status='upl_estimate_pending'
+        elif closed_n>0 and cash_n==0:
             pnl_status='closed_without_broker_cash'
         elif pending_n>0 or blank_n>0:
             pnl_status='broker_cash_pending'
+        elif cash_n>0 and estimate_n>0:
+            pnl_status='broker_cash_partial'
         elif cash_n>0:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
-        # Operator display: prefer broker £; else UPL-estimate sum so Admin is
-        # not stuck on lying 0 / empty while Capital history is pending.
-        if realized is not None and cash_n>0:
+        # 24h Capital Funds window — matches phone Closed Positions better than
+        # all-time SQLite sum (that made Desk −13 look unlike Funds today).
+        realized_24h=None
+        if signed_24h:
+            realized_24h=round(sum(signed_24h),4)
+        elif by_ccy_24h:
+            if acct and acct in by_ccy_24h:
+                realized_24h=round(sum(by_ccy_24h[acct]),4)
+            elif len(by_ccy_24h)==1:
+                realized_24h=round(sum(next(iter(by_ccy_24h.values()))),4)
+        wins_24h=sum(1 for p in signed_24h if p>0)
+        losses_24h=sum(1 for p in signed_24h if p<0)
+        # Desk Kopējais = Capital Funds £ only. Never ≈UPL / pending / pts.
+        if realized_24h is not None and cash_n_24h>0:
+            working_pnl=realized_24h
+            working_pnl_source='broker'
+            working_pnl_window='24h'
+        elif realized is not None and cash_n>0:
             working_pnl=realized
             working_pnl_source='broker'
-        elif estimate_n>0:
-            working_pnl=round(estimate_sum,4)
-            working_pnl_source='upl_estimate'
+            working_pnl_window='all'
         else:
             working_pnl=None
             working_pnl_source=('none' if closed_n else 'empty')
-        if cash_n>0:
+            working_pnl_window=None
+        if cash_n_24h>0:
+            display_wins,display_losses,wl_source=wins_24h,losses_24h,'broker'
+        elif cash_n>0:
             display_wins,display_losses,wl_source=wins,losses,'broker'
-        elif estimate_n>0:
-            display_wins,display_losses,wl_source=est_wins,est_losses,'upl_estimate'
         else:
             display_wins,display_losses,wl_source=0,0,'none'
         upl=None
@@ -496,20 +575,14 @@ class RuntimeHub:
                     upl=round(u,4)
             except (TypeError,ValueError):
                 upl=None
-        base_for_equity=working_pnl if working_pnl is not None else realized
-        if base_for_equity is not None and upl is not None:
-            equity=round(float(base_for_equity)+float(upl),4)
-        elif base_for_equity is not None:
-            equity=base_for_equity
-        elif upl is not None:
-            equity=upl
-        else:
-            equity=None
+        # Equity for Desk = settled Funds £ only (open UPL stays on position cards).
+        equity=working_pnl if working_pnl is not None else realized
         pending_q=0
         try:
             pending_q=len(store.get('pending_broker_pnl_deals') or [])
         except Exception:
             pending_q=0
+        # No edge-hist / estimate filler — CLIENT CLOSES lists Funds £ only.
         return {
             'closed_trades':closed_n,
             'open_trades_recorded':open_n,
@@ -525,14 +598,22 @@ class RuntimeHub:
             'blank_pnl_trades':blank_n,
             'pnl_status':pnl_status,
             'realized_pnl':realized,
+            'realized_pnl_24h':realized_24h,
+            'cash_trades_24h':cash_n_24h,
+            'estimate_pnl_24h':(
+                round(estimate_sum_24h,4) if estimate_signed_24h else None),
             'working_pnl':working_pnl,
             'working_pnl_source':working_pnl_source,
+            'working_pnl_window':working_pnl_window,
             'open_upl':upl,
             'equity_pnl':equity,
-            'pnl_currency':primary['currency'] if primary else acct,
+            # Always prefer account currency — never GOLD quote USD as Desk ccy.
+            'pnl_currency':(acct or (primary['currency'] if primary else None)),
             'pnl_by_currency':{k:round(sum(v),4) for k,v in by_ccy.items()},
             'wins':wins,
             'losses':losses,
+            'wins_24h':wins_24h,
+            'losses_24h':losses_24h,
             'display_wins':display_wins,
             'display_losses':display_losses,
             'wl_source':wl_source,
@@ -540,13 +621,436 @@ class RuntimeHub:
             'win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'trade_win_rate':round(display_wins/max(1,display_wins+display_losses),3),
             'metric':'closed_trade_win_rate',
-            'recent_trades':recent[:12],
-            # Compact ledger for Admin cards — every closed row with a number.
+            # NESEN: Capital Funds / broker cash only (V3 P13).
+            'recent_trades':recent[:80],
+            # Separate estimate listing — never mixed into Funds cash totals.
+            'estimate_recent':estimate_rows[:80],
+            # Compact ledger for Admin — Capital Funds £ only.
             'pnl_ledger':[
                 {'pnl':float(v),'source':'broker'} for v in signed
-            ]+[
-                {'pnl':float(v),'source':'upl_estimate'} for v in estimate_signed
             ],
+        }
+
+    def _desk_system_payload(self, rt, snap: dict | None = None) -> dict:
+        """At-a-glance A–F board for Desk — cards, shadow, params, samples, flow."""
+        snap = snap if isinstance(snap, dict) else {}
+        store = getattr(rt, 'store', None) if rt is not None else None
+        sd = snap.get('self_development') if isinstance(snap.get('self_development'), dict) else {}
+        # Keep SHADOW "Live today" news/peers in sync even mid-boot.
+        if store is not None:
+            try:
+                news = snap.get('economic_news_risk')
+                im = snap.get('intermarket_analysis')
+                if isinstance(news, dict) or isinstance(im, dict):
+                    store.set('live_external_context', {
+                        'at': __import__('datetime').datetime.now(
+                            __import__('datetime').timezone.utc).isoformat(),
+                        'news': news if isinstance(news, dict) else {},
+                        'intermarket': im if isinstance(im, dict) else {},
+                    })
+            except Exception:
+                pass
+        out = {
+            'ok': True,
+            'can_open': bool(snap.get('entry_can_submit_now')),
+            'entry_block': snap.get('entry_block_reason'),
+            'entry_intent': snap.get('entry_intent') or snap.get('policy_proposal'),
+            'neural_close_executable': bool(snap.get('neural_close_executable', True)),
+            'neural_close_diagnostic_only': bool(
+                snap.get('neural_close_diagnostic_only', False)),
+            'neural_exit_intent': snap.get('neural_exit_intent'),
+            'cards': {'active': [], 'n': 0},
+            'shadow': {},
+            'self_params': {},
+            'samples': {},
+            'flow_learn': {},
+            'adaptive': {},
+        }
+        try:
+            from . import strategy_gen
+            bag = strategy_gen.load(store) if store is not None else {'active_ids': []}
+            ids = list(bag.get('active_ids') or [])
+            out['cards'] = {
+                'active': ids[:12],
+                'n': len(ids),
+                'enabled': True,
+            }
+        except Exception as exc:
+            out['cards'] = {'active': [], 'n': 0, 'error': type(exc).__name__}
+        try:
+            sp_snap = sd.get('shadow_paper') if isinstance(sd.get('shadow_paper'), dict) else None
+            sp_live = None
+            if store is not None:
+                eng = getattr(rt, 'engine', None) if rt is not None else None
+                # Desk poll = boot: SHADOW learns ALL closed trades BEFORE paper restore.
+                if eng is not None and hasattr(eng, '_backfill_mistake_audits_from_journal'):
+                    try:
+                        eng._backfill_mistake_audits_from_journal(limit=2000, hours=0)
+                    except Exception:
+                        pass
+                # Prefer awaited mirror via refresh_live_truth(); keep a
+                # best-effort schedule here if desk path ran without await.
+                if eng is not None and hasattr(eng, '_mirror_capital_funds_closes'):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(eng._mirror_capital_funds_closes())
+                    except RuntimeError:
+                        pass
+                    except Exception:
+                        pass
+                # Shadow neural must not stay "off / booting" on Desk while LIVE runs.
+                if eng is not None and hasattr(eng, '_ensure_shadow_brain'):
+                    try:
+                        eng._ensure_shadow_brain()
+                    except Exception:
+                        pass
+                if eng is not None and getattr(eng, 'shadow_paper', None) is not None:
+                    try:
+                        # Empty journal + surviving *shadow* audit hist → restore.
+                        # Never seed Capital LIVE £ into independent Paper Book.
+                        eng.shadow_paper.purge_capital_journal_rows()
+                        eng.shadow_paper.backfill_from_mistake_audits()
+                    except Exception:
+                        pass
+                    try:
+                        # Re-scale price-only paper closes from LIVE broker £.
+                        live = getattr(
+                            getattr(eng, 'profit_learning', None), 'history', None) or []
+                        eng.shadow_paper.update_cash_scale(live)
+                    except Exception:
+                        pass
+                    sp_live = eng.shadow_paper.summary()
+                else:
+                    from .shadow_paper import ShadowPaperJournal
+                    jp = ShadowPaperJournal(store)
+                    try:
+                        jp.purge_capital_journal_rows()
+                        jp.backfill_from_mistake_audits()
+                    except Exception:
+                        pass
+                    try:
+                        jp.update_cash_scale([])
+                    except Exception:
+                        pass
+                    sp_live = jp.summary()
+            def _shadow_richer(a, b):
+                if not isinstance(a, dict):
+                    return b if isinstance(b, dict) else {}
+                if not isinstance(b, dict):
+                    return a
+                # Prefer the journal that actually has closes — snap can be a stale 0.
+                # Price-only paper closes (no £ scale yet) still beat a blank snap.
+                def score(d):
+                    cash = int(d.get('cash_trades') or 0)
+                    price = int(d.get('price_trades') or 0)
+                    trades = int(d.get('display_trades') or d.get('trades') or 0)
+                    return cash * 100 + price * 10 + trades
+                return b if score(b) > score(a) else a
+            out['shadow'] = _shadow_richer(sp_snap, sp_live)
+        except Exception as exc:
+            out['shadow'] = {'error': type(exc).__name__}
+        try:
+            from . import self_params as sp_mod
+            if isinstance(sd.get('self_params'), dict):
+                out['self_params'] = sd['self_params']
+            elif store is not None:
+                out['self_params'] = sp_mod.snapshot(store)
+        except Exception as exc:
+            out['self_params'] = {'error': type(exc).__name__}
+        try:
+            if store is not None:
+                from . import sample_strategies
+                flag = store.get(sample_strategies.STORE_FLAG) or {}
+                if not isinstance(flag, dict):
+                    flag = {}
+                lib_n = int(
+                    flag.get('library_samples')
+                    or sample_strategies.library_sample_count(store) or 0)
+                cards_n = int((out.get('cards') or {}).get('n') or 0)
+                # Stale ingest flag often keeps active_n=0 after cards regenerate.
+                active_n = int(flag.get('active_n') or 0) or cards_n
+                closed_n = 0
+                try:
+                    closed_n = int(store.db.execute(
+                        'SELECT COUNT(*) FROM trades WHERE closed IS NOT NULL'
+                    ).fetchone()[0] or 0)
+                except Exception:
+                    closed_n = 0
+                # Headline count for Desk — never flash a bare 0 when cards/closes exist.
+                display_n = lib_n or active_n or closed_n
+                out['samples'] = {
+                    'done': bool(flag.get('done')),
+                    'library_samples': lib_n,
+                    'trades': int(flag.get('trades') or 0),
+                    'closed_trades': closed_n,
+                    'source': flag.get('source') or (
+                        'strategy_cards' if cards_n else (
+                            'closed_trades' if closed_n else None)),
+                    'active_n': active_n,
+                    'display_n': display_n,
+                }
+        except Exception as exc:
+            out['samples'] = {'error': type(exc).__name__}
+        try:
+            fc = snap.get('flow_consensus') if isinstance(snap.get('flow_consensus'), dict) else {}
+            learn = fc.get('learn') if isinstance(fc.get('learn'), dict) else {}
+            if not learn and store is not None:
+                from . import flow_consensus
+                learn = flow_consensus.learn_snapshot(store)
+            out['flow_learn'] = learn if isinstance(learn, dict) else {}
+            out['flow_consensus'] = {
+                'consensus': fc.get('consensus'),
+                'confidence': fc.get('confidence'),
+                'blocked': bool(fc.get('blocked')),
+                'decision_effect': fc.get('decision_effect'),
+                'decision_reason': fc.get('decision_reason') or fc.get('reason'),
+            }
+        except Exception as exc:
+            out['flow_learn'] = {'error': type(exc).__name__}
+        try:
+            from . import adaptive_system
+            if store is not None:
+                out['adaptive'] = adaptive_system.snapshot(store)
+        except Exception as exc:
+            out['adaptive'] = {'error': type(exc).__name__}
+        try:
+            if store is not None:
+                from . import unified_cycle
+                out['learn_horizon'] = unified_cycle.learn_horizon(store)
+        except Exception as exc:
+            out['learn_horizon'] = {'error': type(exc).__name__}
+        # Highlight knobs operators care about on the board.
+        try:
+            p = out.get('self_params') or {}
+            knobs = p.get('params') if isinstance(p.get('params'), dict) else p
+            if isinstance(knobs, dict):
+                out['knobs'] = {
+                    'flow_nudge': knobs.get('flow_consensus_nudge'),
+                    'flow_block': knobs.get('flow_consensus_block_fights'),
+                    'flow_impulse': knobs.get('flow_pillar_impulse'),
+                    'strategy_gen_nudge': knobs.get('strategy_gen_nudge'),
+                    'horizon': knobs.get('self_params_horizon_trades'),
+                }
+        except Exception:
+            out['knobs'] = {}
+        # Full SHADOW lab — what the operator can watch live (not a fake 100-sweep).
+        try:
+            out['shadow_lab'] = self._shadow_lab_payload(rt, store, sd, out)
+        except Exception as exc:
+            out['shadow_lab'] = {'ok': False, 'error': type(exc).__name__}
+        return out
+
+    def _shadow_lab_payload(self, rt, store, sd, desk_out: dict) -> dict:
+        """Compact live picture of every shadow / self-dev loop."""
+        sd = sd if isinstance(sd, dict) else {}
+        paper = desk_out.get('shadow') if isinstance(desk_out.get('shadow'), dict) else {}
+        recent = []
+        open_pos = paper.get('position') if isinstance(paper.get('position'), dict) else None
+        pending = paper.get('pending') if isinstance(paper.get('pending'), dict) else None
+        if store is not None:
+            try:
+                from .shadow_paper import STORE_KEY as PAPER_KEY
+                hist = list(store.get(PAPER_KEY) or [])
+                for row in reversed(hist):
+                    if not isinstance(row, dict):
+                        continue
+                    recent.append({
+                        'at': row.get('at') or row.get('bar_time'),
+                        'direction': row.get('direction'),
+                        'entry': row.get('entry'),
+                        'exit': row.get('exit'),
+                        'paper_pnl': row.get('paper_pnl'),
+                        'price_pnl': row.get('price_pnl'),
+                        'unit': row.get('unit'),
+                        'exit_reason': row.get('exit_reason'),
+                    })
+                    if len(recent) >= 12:
+                        break
+            except Exception:
+                recent = []
+            # Paper book empty after bag wipe — still show Capital/audit closes
+            # so SHADOW is not a blank "No paper closes" while CLIENT CLOSES has £.
+            if not recent:
+                try:
+                    from . import shadow_mistake_audit as sma
+                    lab = sma.lab_payload(store) if hasattr(sma, 'lab_payload') else {}
+                    seed = list((lab or {}).get('recent_audits') or [])
+                    for row in seed:
+                        if not isinstance(row, dict):
+                            continue
+                        pnl = row.get('pnl')
+                        try:
+                            pnl_n = float(pnl) if pnl is not None else None
+                        except (TypeError, ValueError):
+                            pnl_n = None
+                        recent.append({
+                            'at': row.get('at') or row.get('closed'),
+                            'direction': row.get('direction'),
+                            'entry': row.get('entry'),
+                            'exit': row.get('exit'),
+                            'paper_pnl': pnl_n,
+                            'price_pnl': None,
+                            'unit': 'account_currency',
+                            'exit_reason': (
+                                'live_journal' if str(row.get('source') or '').startswith('live')
+                                else (row.get('source') or 'audit')),
+                        })
+                        if len(recent) >= 12:
+                            break
+                except Exception:
+                    pass
+            if open_pos is None or pending is None:
+                try:
+                    from .shadow_paper import ShadowPaperJournal
+                    live = ShadowPaperJournal(store)
+                    if open_pos is None and isinstance(live.position, dict):
+                        open_pos = live.position
+                    if pending is None and isinstance(live.pending, dict):
+                        pending = live.pending
+                except Exception:
+                    pass
+        hold = sd.get('hold_shadow') if isinstance(sd.get('hold_shadow'), dict) else {}
+        struct = sd.get('structure_shadow') if isinstance(sd.get('structure_shadow'), dict) else {}
+        if store is not None:
+            if not hold:
+                try:
+                    from . import hold_shadow
+                    hold = hold_shadow.strategy_evidence(store)
+                except Exception:
+                    hold = {}
+            if not struct:
+                try:
+                    from . import structure_shadow
+                    struct = structure_shadow.summary(store)
+                except Exception:
+                    struct = {}
+        trial = {}
+        if store is not None:
+            try:
+                from . import self_params as sp_mod
+                pending_sp = sp_mod._pending(store)
+                trial = {
+                    'active': bool(pending_sp.get('trial_active')),
+                    'trial_id': pending_sp.get('trial_id'),
+                    'started_at_trades': int(pending_sp.get('trial_started_at_trades') or 0),
+                    'draft': pending_sp.get('draft'),
+                    'pending_events': len(pending_sp.get('events') or []),
+                    'horizon': (desk_out.get('knobs') or {}).get('horizon'),
+                }
+            except Exception:
+                trial = {}
+        last_dev = {}
+        evo = {}
+        if store is not None:
+            try:
+                raw = store.get('shadow_self_dev_last') or {}
+                if isinstance(raw, dict):
+                    dec = raw.get('decision') if isinstance(raw.get('decision'), dict) else {}
+                    last_dev = {
+                        'promote': bool(dec.get('promote') or dec.get('weights_promoted')),
+                        'rollback': bool(dec.get('rollback')),
+                        'reason': (dec.get('reason')
+                                   or store.get('evolution_last_reason')),
+                        'shadow_neurons': raw.get('shadow_neurons'),
+                        'shadow_dim': raw.get('shadow_dim'),
+                        'live_samples': raw.get('live_samples'),
+                        'paper_cash_samples': raw.get('paper_cash_samples'),
+                        'method': raw.get('method'),
+                    }
+            except Exception:
+                last_dev = {}
+            try:
+                evo = {
+                    'attempts': int(store.get('evolution_attempts') or 0),
+                    'last_reason': store.get('evolution_last_reason'),
+                    # Honesty: policy search is ~3 kinds × ~10 margins ≈ 30, not 100.
+                    'policy_candidates_approx': 30,
+                    'mode': 'paper_book + ~30 policy variants + param trials',
+                }
+            except Exception:
+                evo = {}
+        shadow_on = bool(sd.get('shadow_active'))
+        if rt is not None:
+            eng = getattr(rt, 'engine', None)
+            if eng is not None and hasattr(eng, '_ensure_shadow_brain'):
+                try:
+                    eng._ensure_shadow_brain()
+                except Exception:
+                    pass
+            if not shadow_on:
+                shadow_on = bool(
+                    eng is not None and getattr(eng, 'shadow_brain', None) is not None)
+        running = False
+        if rt is not None:
+            try:
+                running = bool(getattr(rt, 'running', False) or (
+                    getattr(rt, 'engine', None) is not None))
+            except Exception:
+                running = False
+        mistake_audit = {}
+        if store is not None:
+            try:
+                from . import shadow_mistake_audit as sma
+                # Ensure SHADOW has every closed Capital row even mid-boot.
+                eng_ma = getattr(rt, 'engine', None) if rt is not None else None
+                if eng_ma is not None and hasattr(
+                        eng_ma, '_backfill_mistake_audits_from_journal'):
+                    try:
+                        eng_ma._backfill_mistake_audits_from_journal(
+                            limit=2000, hours=0)
+                    except Exception:
+                        pass
+                mistake_audit = sma.lab_payload(store)
+            except Exception:
+                mistake_audit = {'ok': False}
+        cash_n = int(paper.get('cash_trades') or 0)
+        trades_n = int(paper.get('trades') or 0)
+        price_n = int(paper.get('price_trades') or paper.get('display_trades') or 0)
+        win24_n = int(((mistake_audit.get('window_24h') or {}).get('n')) or 0)
+        pulse = 'IDLE'
+        if open_pos or pending:
+            pulse = 'OPEN'
+        elif (mistake_audit.get('last') or {}).get('mistakes') or win24_n:
+            pulse = 'LEARNING'
+        elif cash_n or trades_n or price_n:
+            pulse = 'LEARNING'
+        elif shadow_on and running:
+            pulse = 'WATCHING'
+        elif running:
+            pulse = 'BOOTING'
+        return {
+            'ok': True,
+            'pulse': pulse,
+            'shadow_active': shadow_on,
+            'robot_attached': running,
+            # Explicit honesty for the operator.
+            'truth': {
+                'hundred_variations': False,
+                'what_runs': (
+                    'One neural core for LIVE + SHADOW; paper SL/TP book; '
+                    'mistake-audit (OHLC/zones/news/intermarket) → scenario '
+                    'memory → targeted fix → LIVE; ~30 policy edge candidates; '
+                    'self-params trials; HOLD opposite. Not a second brain.'),
+                'policy_candidates_approx': 30,
+                'mistake_audit': True,
+            },
+            'paper': {
+                **paper,
+                'open': open_pos,
+                'pending_fill': pending,
+                'recent': recent,
+            },
+            'hold_shadow': hold if isinstance(hold, dict) else {},
+            'structure_shadow': {
+                'buckets': struct.get('buckets'),
+                'snapshots': struct.get('snapshots'),
+                'last_advice': struct.get('last_advice'),
+                'top': (struct.get('top') or [])[:5],
+            },
+            'trial': trial,
+            'self_dev_last': last_dev,
+            'evolution': evo,
+            'mistake_audit': mistake_audit if isinstance(mistake_audit, dict) else {},
         }
 
     def admin_client_card(self,client: dict) -> dict:
@@ -576,9 +1080,11 @@ class RuntimeHub:
             },
             'last_start_error':self._start_errors.get(cid),
             'results':{
-                'closed_trades':0,'open_trades_recorded':0,'realized_pnl':0.0,
+                'closed_trades':0,'open_trades_recorded':0,'realized_pnl':None,
+                'working_pnl':None,'working_pnl_source':'empty',
                 'pnl_currency':None,'pnl_by_currency':{},
                 'wins':0,'losses':0,'win_rate':0.0,'recent_trades':[],
+                'estimate_recent':[],
             },
             'account_currency':None,
         }
@@ -594,6 +1100,23 @@ class RuntimeHub:
             store=rt.store
             account_currency=((snap.get('account') or {}).get('currency') or '').strip().upper() or None
             pos=view.get('position') or {}
+            # Fresh news/peers on every Desk paint — kill stale UNMAPPED/WAITING chips.
+            desk_news=snap.get('economic_news_risk')
+            desk_im=snap.get('intermarket_analysis')
+            try:
+                if hasattr(rt.engine,'_news_risk'):
+                    fresh_news=rt.engine._news_risk()
+                    if isinstance(fresh_news,dict):
+                        desk_news=fresh_news
+            except Exception:
+                pass
+            try:
+                im_obj=getattr(rt.engine,'intermarket',None)
+                st_im=getattr(im_obj,'state',None) if im_obj is not None else None
+                if isinstance(st_im,dict) and st_im:
+                    desk_im=dict(st_im)
+            except Exception:
+                pass
             card.update({
                 'robot_running':True,
                 'phase':view.get('phase'),
@@ -660,14 +1183,61 @@ class RuntimeHub:
                     'entry_trigger':view.get('entry_trigger') or snap.get('entry_trigger'),
                     'entry_wait':view.get('entry_wait') or snap.get('entry_wait'),
                     'model_readiness':snap.get('model_readiness') or view.get('model_readiness'),
-                    'neural_close_diagnostic_only':True,
-                    'neural_close_executable':False,
+                    # Desk truth — never hardcode diagnostic-only (engine snapshot is source).
+                    'neural_close_diagnostic_only':bool(
+                        snap.get('neural_close_diagnostic_only', False)),
+                    'neural_close_executable':bool(
+                        snap.get('neural_close_executable', True)),
                     'neural_exit_intent':snap.get('neural_exit_intent'),
+                    'neural_exit_rule':snap.get('neural_exit_rule'),
                     'neural_seed':view.get('neural_seed'),
                     'error':view.get('error') or snap.get('error'),
                     'last_start_error':None,
                     'balance':((snap.get('account') or {}).get('balance') or {}),
                     'currency':account_currency,
+                    # Desk intel — prefer live remap over a stale UNMAPPED/WAITING snap.
+                    'economic_news_risk':desk_news,
+                    'intermarket_analysis':desk_im,
+                    'trail_enabled':bool(
+                        rt.engine._trail_is_enabled()
+                        if hasattr(rt.engine,'_trail_is_enabled') else False),
+                    # Full robot telemetry for the Desk control panel.
+                    'returns_bps':((snap.get('market_context') or {}).get('returns_bps')
+                                   if isinstance(snap.get('market_context'),dict) else None),
+                    'bar_time':((snap.get('market_context') or {}).get('bar_time')
+                                if isinstance(snap.get('market_context'),dict) else None),
+                    'market_regime':snap.get('market_regime'),
+                    'fusion_block_reason':snap.get('fusion_block_reason'),
+                    'directional_advantage':snap.get('directional_advantage'),
+                    'economic_utility':snap.get('economic_utility'),
+                    'neural_decision_bar':snap.get('neural_decision_bar'),
+                    'manage_signal':snap.get('manage_signal'),
+                    'situation_memory':snap.get('situation_memory'),
+                    'flow_consensus':snap.get('flow_consensus'),
+                    'entry_eligible':snap.get('entry_eligible'),
+                    'policy_decision':snap.get('policy_decision'),
+                    'policy_proposal':snap.get('policy_proposal'),
+                    'unresolved_orders':snap.get('unresolved_orders'),
+                    'position_age':snap.get('position_age'),
+                    'instrument_profile':snap.get('instrument_profile'),
+                    'minute_direction_accuracy':snap.get('minute_direction_accuracy'),
+                    'trade_win_rate':snap.get('trade_win_rate'),
+                    'trade_wins':snap.get('trade_wins'),
+                    'trade_losses':snap.get('trade_losses'),
+                    'labeled_samples':snap.get('labeled_samples'),
+                    'entry_decision_pending_new_bar':snap.get(
+                        'entry_decision_pending_new_bar'),
+                    'neural_market_exit':snap.get('neural_market_exit'),
+                    'spread':(snap.get('market') or {}).get('spread'),
+                    'tick':(snap.get('market') or {}).get('tick'),
+                    'min_distance':(snap.get('market') or {}).get('min_distance'),
+                    'learn_horizon':snap.get('learn_horizon'),
+                    'last_open_size_plan':snap.get('last_open_size_plan'),
+                    'unified_cycle':snap.get('unified_cycle'),
+                    'hard_risk':snap.get('hard_risk'),
+                    # A–F desk board: cards / shadow / params / samples.
+                    'self_development':snap.get('self_development'),
+                    'desk_system':self._desk_system_payload(rt, snap),
                 },
                 'last_start_error':None,
             })
@@ -682,31 +1252,64 @@ class RuntimeHub:
                 except Exception:store=None
         if store is not None:
             try:
+                # Open P&L: Capital GET /accounts balance.profitLoss first
+                # (same figure as Capital.com phone). Fall back to position upl sum.
                 upl=None
-                pos_list=card.get('activity',{}).get('positions') or []
-                if not pos_list:
-                    one=card.get('activity',{}).get('position')
-                    pos_list=[one] if isinstance(one,dict) else []
-                vals=[]
-                for pos in pos_list:
-                    if not isinstance(pos,dict) or pos.get('upl') is None:
-                        continue
+                bal=((card.get('activity') or {}).get('balance') or {})
+                if isinstance(bal,dict) and bal.get('profitLoss') is not None:
                     try:
-                        u=float(pos['upl'])
+                        pl=float(bal['profitLoss'])
+                        if __import__('math').isfinite(pl):
+                            upl=pl
                     except (TypeError,ValueError):
-                        continue
-                    if __import__('math').isfinite(u):
-                        vals.append(u)
-                if vals:
-                    upl=sum(vals)
+                        upl=None
+                if upl is None:
+                    pos_list=card.get('activity',{}).get('positions') or []
+                    if not pos_list:
+                        one=card.get('activity',{}).get('position')
+                        pos_list=[one] if isinstance(one,dict) else []
+                    vals=[]
+                    for pos in pos_list:
+                        if not isinstance(pos,dict) or pos.get('upl') is None:
+                            continue
+                        try:
+                            u=float(pos['upl'])
+                        except (TypeError,ValueError):
+                            continue
+                        if __import__('math').isfinite(u):
+                            vals.append(u)
+                    if vals:
+                        upl=sum(vals)
                 card['results']=self._trade_stats(
                     store,card.get('account_currency'),open_upl=upl)
-            except Exception:pass
+            except Exception as exc:
+                try:
+                    store.event('warning','Admin trade stats failed',
+                                {'type':type(exc).__name__,'detail':str(exc)[:160]})
+                except Exception:
+                    pass
+                # Keep prior zeros but mark failure so Desk is not a silent lie.
+                card['results']={
+                    **(card.get('results') or {}),
+                    'stats_error':type(exc).__name__,
+                }
             try:
                 from . import hard_risk
                 card['hard_risk']=hard_risk.snapshot(store)
             except Exception:
                 card['hard_risk']=None
+            # Desk board even when robot is stopped (store-only truth).
+            try:
+                act=card.setdefault('activity',{})
+                if not isinstance(act.get('desk_system'), dict):
+                    class _StopRT:
+                        pass
+                    fake=rt if rt is not None else _StopRT()
+                    if getattr(fake,'store',None) is None:
+                        fake.store=store
+                    act['desk_system']=self._desk_system_payload(fake, snap=None)
+            except Exception:
+                pass
         else:
             card['hard_risk']=None
         return card
@@ -730,7 +1333,10 @@ class RuntimeHub:
         Not every-candle signals — zone bands from structure so the operator
         can see where a future BUY/SELL entry would sit relative to swings.
         """
-        from . import structure_memory, bracket_learn, ohlc_entry_zones, mtf_momentum
+        from . import (
+            structure_memory, bracket_learn, ohlc_entry_zones, mtf_momentum,
+            ohlc_scenarios,
+        )
         cid=int(client_id)
         rt=self.get(cid)
         store=None
@@ -748,6 +1354,8 @@ class RuntimeHub:
                     'candles':[],'zones':{},'levels':{}}
         epic_source=None
         eng=None
+        market_bid=None
+        market_ask=None
         if rt and rt.started and rt.engine is not None:
             eng=rt.engine
             market=getattr(eng,'market',None) or {}
@@ -759,6 +1367,9 @@ class RuntimeHub:
             elif getattr(eng.brain,'epic',None):
                 epic=eng.brain.epic;epic_source='brain'
             mid=market.get('mid')
+            market_bid=market.get('bid')
+            market_ask=(market.get('ask') if market.get('ask') is not None
+                        else market.get('offer'))
             try:
                 spread=float(market.get('spread') or 0)
             except (TypeError,ValueError):
@@ -873,20 +1484,34 @@ class RuntimeHub:
                 preferred=ss
         if not preferred and isinstance(mtf,dict) and mtf.get('ready'):
             mp=str(mtf.get('preferred') or '').upper()
+            mode=str(mtf.get('mode') or '').upper()
             if mp in ('BUY','SELL'):
                 preferred=mp
+            # MTF HOLD — do not invent a BUY/SELL zona from neural max scores
+            # (that painted opposite sides across clients while MTF said HOLD).
+            elif mode=='HOLD':
+                preferred=None
         if not preferred and action in ('BUY','SELL'):
             preferred=action
         if not preferred and isinstance(scores,dict):
-            try:
-                preferred=max(('BUY','SELL','HOLD'),
-                              key=lambda a:float(scores.get(a) or 0))
-                if preferred=='HOLD':
+            mtf_hold=(isinstance(mtf,dict) and str(mtf.get('mode') or '').upper()=='HOLD')
+            if not mtf_hold:
+                try:
+                    preferred=max(('BUY','SELL','HOLD'),
+                                  key=lambda a:float(scores.get(a) or 0))
+                    if preferred=='HOLD':
+                        preferred=None
+                except (TypeError,ValueError):
                     preferred=None
-            except (TypeError,ValueError):
-                preferred=None
+        # Live position direction wins for Admin preferred (truth on tape).
+        open_dirs=[str(p.get('direction') or '').upper()
+                   for p in positions if isinstance(p,dict)]
+        open_dirs=[d for d in open_dirs if d in ('BUY','SELL')]
+        if open_dirs:
+            preferred=open_dirs[0]
         # Publish from this client's MTF/structure so peers can adopt.
-        if preferred in ('BUY','SELL') and epic:
+        # Skip while in trade — open deal already owns the preferred side.
+        if preferred in ('BUY','SELL') and epic and not open_dirs:
             try:
                 from . import shared_market
                 conf=(mtf or {}).get('confidence') if isinstance(mtf,dict) else None
@@ -900,40 +1525,28 @@ class RuntimeHub:
                 pass
         atr_hint=None
         kama_hint=None
-        # Bracket geometry uses M1 ATR (same as entry zones) — M5 stop_hint
-        # was only for protective width labels and inflated hairline SL floors.
+        # Bracket + Desk ATR14 = M1 only. Never fall back to M5 stop_hint
+        # (GOLD M5 ~7.5 used to paint as "ATR14" and disagree with the tape).
         if isinstance(mtf,dict) and mtf.get('ready'):
             tf=mtf.get('tf') or {}
             atr_hint=_finite_num((tf.get('m1') or {}).get('atr14'))
-            if atr_hint is None:
-                atr_hint=_finite_num(mtf.get('stop_hint_atr14'))
             kama_hint=(tf.get('m5') or {}).get('kama')
             if kama_hint is None:
                 kama_hint=(tf.get('m1') or {}).get('kama')
         if atr_hint is None and isinstance(overlays,dict):
-            atr_hint=_finite_num(overlays.get('atr14')) or _finite_num(
-                overlays.get('stop_hint_atr14'))
+            # overlays.atr14 is M1 after chart_overlays fix — still refuse stop_hint.
+            atr_hint=_finite_num(overlays.get('atr14'))
         if atr_hint is None and isinstance(ez,dict):
             atr_hint=_finite_num(ez.get('atr14'))
+        if atr_hint is None and (candles_full or candles):
+            try:
+                from .ohlc_entry_zones import _m1_atr_from_candles
+                atr_hint=_finite_num(_m1_atr_from_candles(candles_full or candles))
+            except Exception:
+                atr_hint=None
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
-        # Preview SL/TP at side price (ask/bid) — same as LIVE OPEN entry.
-        entry_px=mid
-        if preferred=='BUY' and mid is not None:
-            entry_px=mid+(spread/2.0 if spread else 0)
-        elif preferred=='SELL' and mid is not None:
-            entry_px=mid-(spread/2.0 if spread else 0)
-        if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
-            try:
-                zone=bracket_learn.zone_at_open(
-                    candles_full or candles,multi_tf=True)
-                swing_brackets=bracket_learn.swing_anchor_brackets(
-                    candles=candles_full or candles,entry=entry_px,action=preferred,
-                    tick=tick,spread=spread,min_distance=0.,zone=zone,
-                    atr=atr_hint,kama=kama_hint,store=store)
-            except Exception as exc:
-                swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]
         def _level_or_none(raw):
             """Broker unset SL/TP often arrives as 0 — omit for chart + Admin."""
@@ -954,6 +1567,31 @@ class RuntimeHub:
                 'stop':_level_or_none(p.get('stopLevel')),
                 'profit':_level_or_none(p.get('profitLevel')),
             })
+        # Prospective swing brackets only when flat — never stack on live poz.
+        if not open_levels:
+            entry_px=mid
+            if preferred=='BUY' and mid is not None:
+                entry_px=mid+(spread/2.0 if spread else 0)
+            elif preferred=='SELL' and mid is not None:
+                entry_px=mid-(spread/2.0 if spread else 0)
+            min_dist=0.
+            try:
+                # Broker min stop when known — Admin preview must match LIVE.
+                min_dist=float((eng.market or {}).get('min_distance')
+                               or (eng.market or {}).get('minStopDistance')
+                               or 0) if eng else 0.
+            except (TypeError,ValueError,AttributeError):
+                min_dist=0.
+            if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
+                try:
+                    zone=bracket_learn.zone_at_open(
+                        candles_full or candles,multi_tf=True)
+                    swing_brackets=bracket_learn.swing_anchor_brackets(
+                        candles=candles_full or candles,entry=entry_px,action=preferred,
+                        tick=tick,spread=spread,min_distance=min_dist,zone=zone,
+                        atr=atr_hint,kama=kama_hint,store=store)
+                except Exception as exc:
+                    swing_brackets={'ready':False,'reason':type(exc).__name__}
         # Compact candle payload for canvas (popup may ask for more history).
         bare=[]
         for c in candles:
@@ -980,6 +1618,8 @@ class RuntimeHub:
             'epic':epic,
             'epic_source':epic_source,
             'mid':mid,
+            'bid':market_bid,
+            'ask':market_ask,
             'action':action,
             'preferred':preferred,
             'shared_side':(shared_side.get('side')
@@ -1006,9 +1646,18 @@ class RuntimeHub:
                 'resistance':ez.get('resistance'),
                 'buy_entry':buy_zone,
                 'sell_entry':sell_zone,
+                'ok':bool(ez.get('ok')),
+                'reason':ez.get('reason'),
             },
             'entry_zone_source':'ohlc_entry_zones',
-            'info_stack':ez.get('info_stack') or 'ohlc_swing',
+            'entry_zone_reason':ez.get('reason'),
+            'info_stack':ez.get('info_stack') or 'ohlc_base_impulse',
+            'zone_structure':ez.get('structure'),
+            'demand_zones':ez.get('demand_zones') or [],
+            'supply_zones':ez.get('supply_zones') or [],
+            'candles_n':len(candles_full or candles or []),
+            'scenario':ohlc_scenarios.classify(
+                candles_full or candles,mid=mid,zones=ez,tick=tick,store=store),
             'entry_path':(getattr(eng,'_entry_path',None) if eng is not None else None),
             'overlays':overlay_wire,
             'mtf':{
@@ -1164,6 +1813,188 @@ class RuntimeHub:
             'configured':True})
         return hard_risk.snapshot(store)
 
+    async def _bg_mirror_capital_funds(self, eng, cid: int) -> None:
+        """Complete Funds HTTP off the Desk poll — never cancel mid-mirror."""
+        out_n = 0
+        try:
+            n24 = await asyncio.wait_for(
+                eng._mirror_capital_funds_closes(days=1), timeout=12.0)
+            out_n += int(n24 or 0)
+        except Exception:
+            pass
+        try:
+            n7 = await asyncio.wait_for(
+                eng._mirror_capital_funds_closes(
+                    days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
+                timeout=35.0)
+            out_n += int(n7 or 0)
+        except Exception:
+            pass
+        if not hasattr(self, '_live_truth_last'):
+            self._live_truth_last = {}
+        import time as _time
+        self._live_truth_last[int(cid)] = _time.monotonic()
+        if out_n and getattr(eng, 'store', None) is not None:
+            try:
+                eng.store.event('desk', 'Capital Funds mirror done',
+                                {'client_id': int(cid), 'rows': out_n})
+            except Exception:
+                pass
+
+    async def refresh_live_truth(self, *, client_id: int | None = None,
+                                 force: bool = False) -> dict:
+        """Remap + shadow on Desk poll; Funds mirror completes in background.
+
+        Overview uses ``wait_for(..., 0.2)`` so awaiting Funds HTTP here used to
+        *cancel* the mirror every poll — CLIENT CLOSES kept UPL guesses (±0.09)
+        instead of Capital Funds £ (+0.79). ``force=True`` (refresh-truth) still
+        awaits the mirror so the operator button blocks until cash is true.
+        """
+        import time as _time
+        out = {'mirrored': 0, 'shadow': 0, 'remapped': 0, 'peers': 0, 'skipped': 0,
+               'mirror_scheduled': 0}
+        if not hasattr(self, '_live_truth_last'):
+            self._live_truth_last = {}
+        if not hasattr(self, '_mirror_bg_tasks'):
+            self._mirror_bg_tasks = {}
+        clients = self.platform.list_clients()
+        now_m = _time.monotonic()
+        for c in clients:
+            cid = int(c.get('id') or 0)
+            if client_id is not None and cid != int(client_id):
+                continue
+            rt = self.get(cid)
+            if not rt or not getattr(rt, 'started', False):
+                continue
+            eng = getattr(rt, 'engine', None)
+            if eng is None:
+                continue
+            last = float(self._live_truth_last.get(cid) or 0)
+            # Remap + shadow every poll (cheap). Capital Funds HTTP only on cooldown.
+            do_mirror = force or (now_m - last) >= 12.0
+            if hasattr(eng, '_ensure_instrument_mapped'):
+                try:
+                    before = dict(getattr(eng, 'instrument_profile', None) or {})
+                    prof = eng._ensure_instrument_mapped()
+                    if (prof or {}).get('currencies') and not (before.get('currencies')):
+                        out['remapped'] += 1
+                except Exception:
+                    pass
+            news_live = None
+            if hasattr(eng, '_news_risk'):
+                try:
+                    news_live = eng._news_risk()
+                except Exception:
+                    news_live = None
+            if hasattr(eng, '_ensure_shadow_brain'):
+                try:
+                    if eng._ensure_shadow_brain() is not None:
+                        out['shadow'] += 1
+                except Exception:
+                    pass
+            im = getattr(eng, 'intermarket', None)
+            st = (getattr(im, 'state', None) or {}) if im is not None else {}
+            if (do_mirror and im is not None and hasattr(eng, 'broker') and eng.broker
+                    and str(st.get('status') or '') in ('WAITING', 'UNAVAILABLE', '')):
+                try:
+                    epic = (getattr(eng, 'mandate', None) or {}).get('epic')
+                    inst = {}
+                    bm = getattr(eng, '_last_broker_market', None) or {}
+                    if isinstance(bm, dict):
+                        inst = bm.get('instrument') if isinstance(
+                            bm.get('instrument'), dict) else {}
+                    candles = []
+                    if epic and getattr(eng, 'store', None) is not None:
+                        candles = eng.store.candles(epic, n=80, historical_only=True)
+                    if epic and hasattr(im, 'refresh'):
+                        await asyncio.wait_for(
+                            im.refresh(eng.broker, epic, inst, candles),
+                            timeout=6.0)
+                        out['peers'] += 1
+                        st = dict(getattr(im, 'state', None) or {})
+                except Exception:
+                    pass
+            # Keep SHADOW "Live today" + INTEL in sync with remapped news/peers.
+            if getattr(eng, 'store', None) is not None and (
+                    isinstance(news_live, dict) or isinstance(st, dict)):
+                try:
+                    from datetime import datetime, timezone
+                    eng.store.set('live_external_context', {
+                        'at': datetime.now(timezone.utc).isoformat(),
+                        'news': news_live if isinstance(news_live, dict) else {},
+                        'intermarket': st if isinstance(st, dict) else {},
+                    })
+                except Exception:
+                    pass
+            if do_mirror and hasattr(eng, '_mirror_capital_funds_closes') and eng.broker:
+                if force:
+                    # Operator refresh-truth — await until Capital £ is on Desk.
+                    try:
+                        n24 = await asyncio.wait_for(
+                            eng._mirror_capital_funds_closes(days=1), timeout=12.0)
+                        out['mirrored'] += int(n24 or 0)
+                    except Exception as exc:
+                        out.setdefault('mirror_errors', []).append({
+                            'client_id': cid, 'type': type(exc).__name__,
+                            'window': '24h'})
+                    try:
+                        n7 = await asyncio.wait_for(
+                            eng._mirror_capital_funds_closes(
+                                days=getattr(eng, 'FUNDS_MIRROR_DAYS', 7)),
+                            timeout=35.0)
+                        out['mirrored'] += int(n7 or 0)
+                        self._live_truth_last[cid] = now_m
+                    except Exception as exc:
+                        out.setdefault('mirror_errors', []).append({
+                            'client_id': cid, 'type': type(exc).__name__,
+                            'window': 'history'})
+                        self._live_truth_last[cid] = now_m
+                else:
+                    # Desk poll: schedule mirror so wait_for(0.2) cannot cancel it.
+                    prev = self._mirror_bg_tasks.get(cid)
+                    if prev is None or prev.done():
+                        self._live_truth_last[cid] = now_m
+                        task = asyncio.create_task(
+                            self._bg_mirror_capital_funds(eng, cid))
+                        self._mirror_bg_tasks[cid] = task
+                        out['mirror_scheduled'] += 1
+                    else:
+                        out['skipped'] += 1
+            elif not do_mirror:
+                out['skipped'] += 1
+            # NEVER run journal backfill sync on Desk overview — it scans up to
+            # 2000 closes with no await and freezes the event loop (~1m then stick).
+            # Schedule a rare background pass instead.
+            if hasattr(eng, '_backfill_mistake_audits_from_journal'):
+                if not hasattr(self, '_backfill_bg_last'):
+                    self._backfill_bg_last = {}
+                if not hasattr(self, '_backfill_bg_tasks'):
+                    self._backfill_bg_tasks = {}
+                last_bf = float(self._backfill_bg_last.get(cid) or 0)
+                prev_bf = self._backfill_bg_tasks.get(cid)
+                if (force or (now_m - last_bf) >= 60.0) and (
+                        prev_bf is None or prev_bf.done()):
+                    self._backfill_bg_last[cid] = now_m
+                    self._backfill_bg_tasks[cid] = asyncio.create_task(
+                        self._bg_backfill_mistake_audits(eng, cid))
+                    out['backfill_scheduled'] = int(
+                        out.get('backfill_scheduled') or 0) + 1
+        return out
+
+    async def _bg_backfill_mistake_audits(self, eng, client_id: int) -> None:
+        """Off the Desk poll path — yield so light ticks / overview stay live."""
+        await asyncio.sleep(0)
+        try:
+            # Small batch; full history is not needed every minute.
+            n = await asyncio.to_thread(
+                lambda: eng._backfill_mistake_audits_from_journal(
+                    limit=80, hours=0))
+            if n:
+                log.info('backfill audits client=%s n=%s', client_id, n)
+        except Exception as exc:
+            log.warning('backfill audits client=%s failed: %s',
+                        client_id, type(exc).__name__)
+
     def admin_overview(self) -> dict:
         clients=[self.admin_client_card(c) for c in self.platform.list_clients()]
         running=sum(1 for c in clients if c.get('robot_running'))
@@ -1191,8 +2022,8 @@ class RuntimeHub:
             wp=res.get('working_pnl')
             wsrc=(res.get('working_pnl_source') or '').strip().lower()
             wccy=(res.get('pnl_currency') or c.get('account_currency') or '').strip().upper() or None
-            # Skip empty/none working_pnl placeholders — they used to force fleet 0.00.
-            if wp is not None and wccy and wsrc not in ('none','empty',''):
+            # Skip empty/none/≈UPL placeholders — they used to invent fleet totals.
+            if wp is not None and wccy and wsrc not in ('none','empty','','upl_estimate'):
                 working_by_ccy[wccy]=round(working_by_ccy.get(wccy,0.0)+float(wp),4)
             ou=res.get('open_upl')
             if ou is not None and wccy:
@@ -1219,21 +2050,44 @@ class RuntimeHub:
         if len(open_upl_by_ccy)==1:
             ccy,val=next(iter(open_upl_by_ccy.items()))
             open_upl_primary={'currency':ccy,'open_upl':val}
-        if total_closed>0 and total_cash==0:
+        if total_closed>0 and total_cash==0 and total_estimate>0:
+            pnl_status='upl_estimate_pending'
+        elif total_closed>0 and total_cash==0:
             pnl_status='closed_without_broker_cash'
         elif total_pending>0:
             pnl_status='broker_cash_pending'
+        elif total_cash>0 and total_estimate>0:
+            pnl_status='broker_cash_partial'
         elif total_cash>0:
             pnl_status='broker_cash_ok'
         else:
             pnl_status='no_closes'
         wl_source=('broker' if total_cash>0 else
                    ('upl_estimate' if total_estimate>0 else 'none'))
+        # Live open UPL beats stuck ≈UPL closes — Desk must not wall on gaida.
         working_src=('broker' if total_cash>0 else
-                     ('upl_estimate' if total_estimate>0 else
-                      ('open_upl' if open_upl_primary else 'none')))
+                     ('open_upl' if open_upl_primary else
+                      ('upl_estimate' if total_estimate>0 else 'none')))
+        estimate_pnl_all=None
+        if total_estimate>0 and not working_primary and not open_upl_primary:
+            est_sum=0.0
+            est_ccy=None
+            for c in clients:
+                res=c.get('results') or {}
+                ep=res.get('estimate_pnl')
+                if ep is None:
+                    continue
+                try:
+                    est_sum+=float(ep)
+                except (TypeError,ValueError):
+                    continue
+                if est_ccy is None:
+                    est_ccy=((res.get('pnl_currency') or c.get('account_currency') or '')
+                             .strip().upper() or None)
+            estimate_pnl_all=round(est_sum,4)
         return {
             'summary':{
+                'desk_truth_rev':DESK_TRUTH_REV,
                 'clients':len(clients),
                 'running_robots':running,
                 'open_trades_all':open_positions,
@@ -1243,6 +2097,7 @@ class RuntimeHub:
                 'working_pnl_source':working_src,
                 'open_upl_all':(open_upl_primary['open_upl'] if open_upl_primary else None),
                 'open_upl_by_currency':open_upl_by_ccy,
+                'estimate_pnl_all':estimate_pnl_all,
                 'pnl_currency':(working_primary['currency'] if working_primary
                                 else (open_upl_primary['currency'] if open_upl_primary
                                       else (primary['currency'] if primary else None))),
@@ -1403,6 +2258,12 @@ class RuntimeHub:
             and not engine.store.unresolved() and len(engine.positions)<=1)
 
     async def _worker(self,rt: AccountRuntime):
+        """Heavy poll, then a guaranteed light window — never back-to-back poll.
+
+        Gating poll by wall clock alone starved the event loop when poll() took
+        longer than the gap (common): no sleep, no Desk HTTP, mid/UPL frozen.
+        Always run ~0.35–0.5s of 25ms quote/UPL/entry ticks after each poll (~2×).
+        """
         error_count=0
         engine=rt.engine
         store=rt.store
@@ -1419,19 +2280,29 @@ class RuntimeHub:
                         engine.armed=True
                         engine.execution_enabled=True
                         store.event('recovery','Read-only broker outage recovered; autonomous execution resumed')
-                    # Fast WS quote ticks while flat + intent — catch break/zone
-                    # without waiting the next heavy 3s poll.
-                    if (not engine.positions and engine.mandate
-                            and hasattr(engine,'quote_entry_tick')
-                            and engine._wants_fast_entry_ticks()):
-                        for _ in range(2):
-                            await asyncio.sleep(1)
-                            try:
-                                await engine.quote_entry_tick()
-                            except Exception:
-                                break
-                        continue
-                await asyncio.sleep(3 if error_count<3 else 10)
+                    open_book=bool(engine.positions)
+                    fast_entry=(bool(engine.mandate) and not open_book
+                                and hasattr(engine,'quote_entry_tick')
+                                and engine._wants_fast_entry_ticks())
+                    # Guaranteed yield window so Admin/Desk HTTP can run.
+                    light_n=18 if (open_book or fast_entry) else 12
+                    gap=0.025
+                    for _ in range(light_n):
+                        await asyncio.sleep(gap)
+                        if not engine.mandate:
+                            continue
+                        try:
+                            if open_book and hasattr(engine,'quote_upl_tick'):
+                                await engine.quote_upl_tick()
+                            else:
+                                if hasattr(engine,'_apply_stream_quote'):
+                                    engine._apply_stream_quote()
+                                if fast_entry:
+                                    await engine.quote_entry_tick()
+                        except Exception:
+                            break
+                    continue
+                await asyncio.sleep(0.5 if error_count<3 else 3)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1456,4 +2327,4 @@ class RuntimeHub:
                         {'count':error_count,'client_id':rt.client_id})
                     if hasattr(engine,'_ensure_live_unless_operator_paused'):
                         engine._ensure_live_unless_operator_paused()
-                await asyncio.sleep(3 if error_count<3 else 10)
+                await asyncio.sleep(0.5 if error_count<3 else 3)

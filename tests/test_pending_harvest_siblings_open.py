@@ -152,8 +152,9 @@ def test_admin_gaida_counts_clear_after_sibling_harvest():
         before=RuntimeHub._trade_stats(hub,store,'GBP')
         assert before['pending_broker_pnl']==1
         assert before['pending_trades']>=1
-        recent=before['recent_trades'][0]
-        assert recent.get('pending_cash') is True
+        # V5: NESEN / recent_trades = Funds £ only — pending stays out of cash list.
+        assert before['recent_trades']==[]
+        assert before.get('blank_pnl_trades',0)>=1 or before.get('pnl_status')
 
         async def settle():
             e=SingleTradeEngine(store,brain)

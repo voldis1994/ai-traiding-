@@ -16,15 +16,17 @@ from .market_fusion import FUSION_DIM, FUSION_SCHEMA
 
 # Pipeline: F_learn ∘ F_broker ∘ F_order ∘ F_decision ∘ F_neuron
 # Neural argmax proposes side; promoted policy.py decide() confirms or HOLDs
-# when self_params.policy_live_execute=1 (default ON with policy_evolve_enabled).
-LIVE_DECISION_RULE = 'neural_argmax_then_evolved_policy_gate'
+# when self_params.policy_live_execute=1 (default OFF — research until operator enables).
+# Neural argmax on scores_raw; learned structure £ graves may damp decide scores.
+LIVE_DECISION_RULE = (
+    'neural_argmax_then_learned_structure_damp_then_evolved_policy_gate')
 LIVE_DECISION_BAR = 'completed_broker_M1'
 # Perceive on completed M1; trigger OPEN on WS mid (break|zone) between polls.
 LIVE_ENTRY_PATH = 'intent_then_break_or_zone_trigger'
 # OHLC band/tape/MTF knobs adapt from closed £ (ohlc_entry_gates_v1).
-OHLC_GATES_LEARN = 'ohlc_entry_gates_v1_observe_close'
-POLL_SECONDS = 3
-FAST_ENTRY_TICK_SECONDS = 1
+OHLC_GATES_LEARN = 'ohlc_entry_gates_v2_observe_close'
+POLL_SECONDS = 1  # heavy poll gated ~0.8–1.2s; light ticks at 25ms
+FAST_ENTRY_TICK_SECONDS = 0.025
 NEURAL_DT_SECONDS = 60
 DEFAULT_LEARNING_RATE = NeuralCore.DEFAULT_LR  # 0.1 — visible ~0.01 weight steps
 LABEL_HORIZON_BARS = 1  # next M1 bar — same tempo as trading decisions
@@ -91,6 +93,14 @@ SELF_DEV_CYCLE = (
 DISCOVERY_DATA = ('ohlc','spread','peers','scheduled_news')
 EXTERNAL_LIQUIDITY = ('yahoo_futures_etf_volume','coinbase_spot_volume_l2',
                       'okx_spot_volume_backup','per_instrument_route_resolver')
+# M1 consensus: fuse free public feeds only (Order Flow + Liquidity + Impact).
+# Gates OPEN, then learns from £ / blocked counterfactuals → adapts nudge/block.
+FLOW_CONSENSUS = (
+    'm1_multi_source_soft_nudge',
+    'free_public_feeds_only',
+    'learn_close_and_blocked_shadows',
+    'adapt_nudge_block_from_ledger',
+)
 # Tunable knobs live in Store via app.self_params — not frozen magic in modules.
 SELF_TUNABLE = 'self_params_v1'
 IMMUTABLE = (

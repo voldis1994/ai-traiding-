@@ -1,4 +1,4 @@
-"""Teach from UPL immediately + forward-live diagnostics."""
+"""Forward-live diagnostics; neural teach waits for Capital Funds £."""
 import asyncio
 import tempfile
 from pathlib import Path
@@ -17,7 +17,7 @@ def test_forward_live_flags_hairline_and_scratch():
         store,_=new_brain(d)
         forward_live.record_close(
             store,deal_id='h1',epic='GOLD',direction='BUY',pnl=0.01,
-            pnl_source='upl_estimate',entry=3679,exit_level=3679.2,
+            pnl_source='broker',entry=3679,exit_level=3679.2,
             spread=0.3,stop_distance=2.0,profit_distance=3.0,atr=4.65,
             hold_bars=1,scratch_band=0.05)
         snap=forward_live.snapshot(store)
@@ -29,7 +29,7 @@ def test_forward_live_flags_hairline_and_scratch():
         assert snap['tips']
 
 
-def test_upl_close_teaches_neural_without_waiting_for_broker():
+def test_close_waits_for_funds_before_neural_teach():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -54,13 +54,20 @@ def test_upl_close_teaches_neural_without_waiting_for_broker():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
+            # Last UPL before close = Capital £ — neural teaches now.
             assert row['pnl']==pytest.approx(-0.11)
-            assert row['pnl_source']=='upl_estimate'
-            # Must claim/learn from UPL — not leave pending without ΔW.
-            assert e._trade_already_learned('learn1') or brain.trade_labeled>=labeled_before
-            fl=forward_live.snapshot(store)
-            assert fl['ok'] is True
+            assert row['pnl_source']=='capital'
+            assert e._trade_already_learned('learn1')
+            assert brain.trade_labeled>=labeled_before
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='learn1'
                        for x in pending)
+            labeled_mid=brain.trade_labeled
+            broker.tx=[{'reference':'learn1','pnl':'-0.11','currency':'GBP',
+                        'transactionType':'TRADE'}]
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(-0.11)
+            assert row['pnl_source']=='broker'
+            assert brain.trade_labeled==labeled_mid
     asyncio.run(scenario())

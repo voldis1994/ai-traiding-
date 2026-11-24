@@ -122,18 +122,21 @@ def test_learn_claim_before_save_blocks_relearn():
         e._claim_trade_learned('c5')
         assert e._trade_already_learned('c5')
         labeled_before=brain.labeled
-        e._learn_closed_trade('c5',{'level':99.8,'profit':-1.0,'pnl_currency':'GBP'})
+        e._learn_closed_trade('c5',{'level':99.8,'profit':-1.0,'pnl_currency':'GBP',
+                                    'pnl_source':'broker'})
         assert brain.labeled==labeled_before
         store.set('learned_trade:c5b',None)
         store.upsert_trade({'dealId':'c5b','epic':'GOLD','size':'.02','direction':'BUY','level':100})
         store.set('entry_brain:c5b',{
             'epic':'GOLD','direction':'BUY','entry':100,'tick_size':.01,
             'transition':brain._json_transition(brain.core.last_transition)})
-        e._learn_closed_trade('c5b',{'level':101.0,'profit':1.5,'pnl_currency':'GBP'})
+        e._learn_closed_trade('c5b',{'level':101.0,'profit':1.5,'pnl_currency':'GBP',
+                                       'pnl_source':'broker'})
         meta=store.get('learned_trade:c5b')
         assert meta and meta.get('learned') and meta.get('claimed')
         labeled_mid=brain.labeled
-        e._learn_closed_trade('c5b',{'level':101.0,'profit':9.9,'pnl_currency':'GBP'})
+        e._learn_closed_trade('c5b',{'level':101.0,'profit':9.9,'pnl_currency':'GBP',
+                                       'pnl_source':'broker'})
         assert brain.labeled==labeled_mid
 
 
@@ -152,7 +155,8 @@ def test_trade_learn_survives_restart_no_relearn():
             'epic':'GOLD','direction':'BUY','entry':100,'tick_size':.01,
             'transition':brain._json_transition(brain.core.last_transition)})
         before=brain.core.snapshot_weights()
-        e._learn_closed_trade('rst1',{'level':101.0,'profit':2.0,'pnl_currency':'GBP'})
+        e._learn_closed_trade('rst1',{'level':101.0,'profit':2.0,'pnl_currency':'GBP',
+                                       'pnl_source':'broker'})
         after=brain.core.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)>0
         assert e._trade_already_learned('rst1')
@@ -169,26 +173,33 @@ def test_trade_learn_survives_restart_no_relearn():
         assert NeuralCore.weight_delta_norm(after,brain2.core.snapshot_weights())==pytest.approx(0)
         # Re-invoke learn — must not change weights or train again.
         trade_before=brain2.trade_labeled
-        e2._learn_closed_trade('rst1',{'level':101.0,'profit':99.0,'pnl_currency':'GBP'})
+        e2._learn_closed_trade('rst1',{'level':101.0,'profit':99.0,'pnl_currency':'GBP',
+                                        'pnl_source':'broker'})
         assert brain2.trade_labeled==trade_before
         assert NeuralCore.weight_delta_norm(after,brain2.core.snapshot_weights())==pytest.approx(0)
 
 
-def test_shadow_weights_persist_across_engine_restart():
-    """Pre-test #2 companion: shadow matrices survive recreate from store."""
+def test_shadow_shares_live_core_across_engine_restart():
+    """V5 H01: SHADOW is an isolated clone — learn must not mutate LIVE W."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         brain.core.last_z=np.linspace(-0.3,0.3,brain.core.d)
         e=SingleTradeEngine(store,brain)
         shadow=e._ensure_shadow_brain()
+        assert shadow is not brain.core
+        live_before=brain.core.snapshot_weights()
         e._shadow_scores_now(advance=True,bar_time='t0')
         before=shadow.snapshot_weights()
         assert e._shadow_learn(None,0,lr=0.2) is not None
         after=shadow.snapshot_weights()
         assert NeuralCore.weight_delta_norm(before,after)>0
+        assert NeuralCore.weight_delta_norm(
+            live_before,brain.core.snapshot_weights())==pytest.approx(0)
         e.shadow_brain=None
         e2=SingleTradeEngine(store,brain)
         shadow2=e2._ensure_shadow_brain()
+        assert shadow2 is not brain.core
+        # Isolated shadow persists weights across engine restart.
         assert NeuralCore.weight_delta_norm(after,shadow2.snapshot_weights())==pytest.approx(0)
 
 

@@ -92,8 +92,9 @@ def test_stale_unresolved_open_no_longer_blocks_fresh_gold_adoption():
             eng=SingleTradeEngine(store,brain)
             eng.policy=AutoEvolution(store,Path(d)/'policy.py')
             eng.attach(broker)
-            assert eng.execution_enabled is False  # unresolved-at-login pause
-            assert eng.mandate is None
+            # V5 / #270: stale unresolved OPEN is cleared on attach — LIVE continues
+            # (no HOLD_MODEL / execution pause) so the fresh manual Gold deal adopts.
+            assert eng.mandate is None or eng.mandate.get('epic') in (None,'GOLD')
             await eng.sync()
             assert eng.mandate is not None
             assert eng.mandate['epic']=='GOLD'

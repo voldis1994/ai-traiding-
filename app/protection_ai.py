@@ -44,20 +44,48 @@ def _away_from_market(level,direction,bid,ask,minimum,tick):
     return float(lvl)
 
 
+def _open_minute_cutoff(opened_at):
+    """Opening M1 bar start — that bar is excluded from trail OHLC.
+
+    ``candle_time`` floors seconds, so ``t < opened_at`` still kept the whole
+    opening minute (pre-open spike → premature trail). Skip ``t <= cutoff``.
+    """
+    from .market_context import event_time, candle_time
+    if opened_at is None:
+        return None
+    exact=event_time(opened_at)
+    if exact is None:
+        return candle_time(opened_at)
+    return exact.replace(second=0, microsecond=0)
+
+
 def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prior_extreme=None):
     """Best favorable *exit-side* price from live quotes + OHLC since open.
 
     Stored M1 high/low are midprices. Convert with per-bar spread when present
     so BUY tip ≈ bid extreme and SELL tip ≈ ask extreme — mid highs alone
     inflate the tip and glue SL too tight (early stop-outs vs the chart).
+
+    Opening-minute bars are excluded: their high/low can include prices from
+    *before* the fill. Live bid/ask after open still seed the tip.
     """
+    cutoff=_open_minute_cutoff(opened_at)
+    def _bar_ok(row):
+        t=candle_time(row.get('at'))
+        if cutoff is not None and t is not None and t<=cutoff:
+            return False
+        return True
     if direction=='BUY':
         tip=_finite(bid)
         if tip is None:return None
-        if prior_extreme is not None:tip=max(tip,float(prior_extreme))
+        # prior_extreme only if still useful — never re-poison from a pre-open bar.
+        if prior_extreme is not None:
+            try:
+                tip=max(tip,float(prior_extreme))
+            except (TypeError,ValueError):
+                pass
         for row in candles or ():
-            t=candle_time(row.get('at'))
-            if opened_at and t and t<opened_at:continue
+            if not _bar_ok(row):continue
             h=_finite(row.get('high'))
             if h is None:continue
             sp=_finite(row.get('spread'))
@@ -68,10 +96,13 @@ def trail_extreme_from_broker(direction,bid,ask,candles=None,opened_at=None,prio
     if direction=='SELL':
         tip=_finite(ask)
         if tip is None:return None
-        if prior_extreme is not None:tip=min(tip,float(prior_extreme))
+        if prior_extreme is not None:
+            try:
+                tip=min(tip,float(prior_extreme))
+            except (TypeError,ValueError):
+                pass
         for row in candles or ():
-            t=candle_time(row.get('at'))
-            if opened_at and t and t<opened_at:continue
+            if not _bar_ok(row):continue
             low=_finite(row.get('low'))
             if low is None:continue
             sp=_finite(row.get('spread'))
@@ -90,16 +121,26 @@ def _trail_knobs(store=None):
         'min_mult':float(sp.get('trail_min_mult',DEFAULTS['trail_min_mult'])),
         'open_frac':float(sp.get('trail_open_gap_frac',DEFAULTS['trail_open_gap_frac'])),
         'fallback_frac':float(sp.get('trail_fallback_frac',DEFAULTS['trail_fallback_frac'])),
+        'gap_vs_tp':float(sp.get('trail_gap_vs_tp_frac',
+                                 DEFAULTS.get('trail_gap_vs_tp_frac',0.30))),
+        'arm_mfe':float(sp.get('trail_arm_mfe_frac',DEFAULTS['trail_arm_mfe_frac'])),
+        'arm_tp':float(sp.get('trail_arm_tp_frac',
+                              DEFAULTS.get('trail_arm_tp_frac',0.45))),
+        'be_cushion':float(sp.get('trail_be_cushion_frac',
+                                  DEFAULTS.get('trail_be_cushion_frac',0.15))),
     }
 
 
 def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
-                       min_mult=None,open_frac=None,fallback_frac=None):
-    """After BE, follow distance from OHLC noise — never tip±minStop alone.
+                       min_mult=None,open_frac=None,fallback_frac=None,
+                       original_profit=None,atr=None):
+    """After BE, follow with a gap that stays even with SL/TP geometry.
 
-    Floor uses Store-owned trail_min_mult / trail_open_gap_frac (seeds ~2× /
-    35%); robot evolves them from scratch/trail £. Cap at opening risk; prefer
-    zone median when ready.
+    Floor uses Store trail_min_mult / trail_open_gap_frac, plus:
+      • share of original TP (trail_gap_vs_tp_frac) — do not cut a 1.5R
+        trade with a hairline M1 zone gap
+      • ~1×ATR when known — same breathe floor as far-SL ATR cap
+    Cap at opening risk; prefer zone median when it is not tighter than floor.
     """
     knobs=_trail_knobs(store)
     if min_mult is not None:knobs['min_mult']=float(min_mult)
@@ -108,28 +149,29 @@ def _post_be_trail_gap(open_gap,minimum,zone_range=None,store=None,*,
     open_gap=float(open_gap);minimum=float(minimum)
     floor=max(minimum,min(open_gap,max(knobs['min_mult']*minimum,
                                        knobs['open_frac']*open_gap)))
+    op=_finite(original_profit)
+    if op is not None and op>0:
+        tp_frac=max(0.15,min(0.50,float(knobs.get('gap_vs_tp',0.30))))
+        floor=max(floor,min(open_gap,tp_frac*op))
+    atr_v=_finite(atr)
+    if atr_v is not None and atr_v>0:
+        floor=max(floor,min(open_gap,float(atr_v)))
     zr=_finite(zone_range)
     if zr is not None and zr>0:
-        return max(floor,min(open_gap,zr))
-    # No OHLC zone yet — Store fallback fraction, never only minStop.
+        # Zone may raise the gap, never shrink below the SL/TP-aware floor.
+        return max(floor,min(open_gap,max(zr,floor)))
     return max(floor,min(open_gap,knobs['fallback_frac']*open_gap))
 
 
+# LIVE trail is HARD OFF (engine._trail_is_enabled → False). Helper kept for
+# offline unit tests / historical sims only — never call from LIVE adapt_protection.
+
+
 def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
-                         zone_range=None,store=None,arm_decision=None):
-    """Trail SL behind broker extreme — past break-even, not stuck at BE.
+                         zone_range=None,store=None,arm_decision=None,atr=None):
+    """Offline trail proposal (tests/sims). LIVE must not call this.
 
-    Before BE: gap = opening risk (avoids tip±min £0 scratches). When
-    ``arm_decision`` says the robot may arm early (MFE / structure EV), the first
-    ratchet may lock near BE once tip covers the adaptive fraction of R — not a
-    frozen human “always wait 1R” law. After BE: gap = recent M1 median range
-    (OHLC zone), with a Store-owned floor above raw minStop.
-
-    CRITICAL: always re-send live profitLevel on trail PUTs. Omitting TP on
-    Capital update_position turns Take Profit Off — price can touch the old
-    TP mark twice with no order left to fill.
-
-    BUY:  stop = peak − gap.  SELL: stop = trough + gap.
+    BUY: stop = peak − gap. SELL: stop = trough + gap — abandons OHLC swing SL.
     """
     if market.get('status')!='TRADEABLE':return None
     direction=position.get('direction');sign={'BUY':1,'SELL':-1}.get(direction)
@@ -144,6 +186,12 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     tick=_finite(market.get('tick'));bid=_finite(market.get('bid'));ask=_finite(market.get('ask'))
     minimum=_finite(market.get('min_distance'))
     gap=_finite(initial.get('original_risk'))
+    orig_tp=_finite(initial.get('original_profit'))
+    if orig_tp is None and tp is not None and entry is not None:
+        # Live TP distance when meta lacked original_profit.
+        cand=sign*(tp-entry)
+        if cand is not None and cand>0:orig_tp=cand
+    atr_v=_finite(atr) if atr is not None else _finite(initial.get('atr'))
     if any(v is None for v in (entry,stop,tick,bid,ask,minimum)):
         return None
     positives=(entry,stop,tick,bid,ask)+( (tp,) if tp is not None else () )
@@ -162,7 +210,9 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
     if be_locked:
         # Prefer zone_range from caller; fall back to value stored on open meta.
         zr=zone_range if zone_range is not None else initial.get('zone_range')
-        trail_gap=_post_be_trail_gap(open_gap,minimum,zr,store=store)
+        trail_gap=_post_be_trail_gap(
+            open_gap,minimum,zr,store=store,
+            original_profit=orig_tp,atr=atr_v)
     else:
         trail_gap=open_gap
     exit_quote=bid if sign==1 else ask
@@ -172,21 +222,17 @@ def propose_broker_trail(position,market,initial,*,extreme=None,mark_time=None,
         tip=bid if sign==1 else ask
     favorable=sign*(exit_quote-entry)
     tip_fav=sign*(tip-entry)
-    # Adaptive first arm: wait for ~trail_arm_mfe_frac × R, then lock BE+
-    # (profit cushion) so a micro bounce-back does not scratch a real move.
+    # First arm: wait for ~1R *and* TP-share, then lock BE+ cushion — breathe
+    # with SL/TP instead of cutting the move at the start.
     cushion=0.0
+    knobs=_trail_knobs(store)
     if not be_locked and early_arm and tip_fav>0:
-        try:
-            from .self_params import load as _sp_load, DEFAULTS as _SP_DEF
-            sp=_sp_load(store) or {}
-            arm_frac=float(sp.get('trail_arm_mfe_frac',_SP_DEF['trail_arm_mfe_frac']))
-            cush_frac=float(sp.get('trail_be_cushion_frac',
-                                   _SP_DEF.get('trail_be_cushion_frac',0.15)))
-        except Exception:
-            arm_frac=0.90;cush_frac=0.15
-        arm_frac=max(0.55,min(1.0,arm_frac))
-        cush_frac=max(0.05,min(0.35,cush_frac))
+        arm_frac=max(0.70,min(1.0,float(knobs['arm_mfe'])))
+        tp_frac=max(0.25,min(0.70,float(knobs['arm_tp'])))
+        cush_frac=max(0.05,min(0.35,float(knobs['be_cushion'])))
         floor_need=arm_frac*open_gap
+        if orig_tp is not None and orig_tp>0:
+            floor_need=max(floor_need,tp_frac*float(orig_tp))
         if tip_fav<floor_need:
             return None
         cushion=min(tip_fav*0.5,cush_frac*open_gap)

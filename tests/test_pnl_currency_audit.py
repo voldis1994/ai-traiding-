@@ -22,7 +22,7 @@ def test_broker_profit_stores_account_currency():
         store.set('entry_brain:g1',{'epic':'GOLD','direction':'BUY','entry':2650,
             'tick_size':.1,'transition':brain._json_transition(brain.core.last_transition)})
         # Broker cash is GBP; price×size would be ~1.0 "USD-like".
-        engine._learn_closed_trade('g1',{'level':2660,'profit':0.79})
+        engine._learn_closed_trade('g1',{'level':2660,'profit':0.79,'pnl_source':'broker'})
         row=store.trades(1)[0]
         assert row['pnl']==pytest.approx(0.79)
         assert row['pnl_currency']=='GBP'

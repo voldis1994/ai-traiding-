@@ -93,18 +93,19 @@ def test_history_need_covers_multi_tf():
     assert need >= 260
 
 
-def test_live_trail_put_after_stale_protect_supersede():
+def test_adapt_protection_disabled_ignores_stale_protect_journal():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             e, b, s = engine_fixture(d)
-            # Fake a stale PENDING PROTECT that used to freeze trail forever.
+            # Stale PENDING PROTECT must not unlock a trail PUT — trail is off.
             oid = s.order('PROTECT', 'auto1', {'stop': 99.5, 'profit': 101.6})
             s.order_update(oid, 'PENDING', 'stale-ref')
             assert s.unresolved()
             await e.sync()
+            live_sl = e.positions[0]['stopLevel']
             await e.adapt_protection(e.positions[0])
-            # Trail proceeded (stale superseded) or waited for arm — must not hang unresolved forever.
-            left = [u for u in (s.unresolved() or [])
-                    if u.get('kind') == 'PROTECT' and str(u.get('deal_id')) == 'auto1']
-            assert not left
+            assert not [r for r in b.requests if r[0] == 'PROTECT']
+            assert e.positions[0]['stopLevel'] == live_sl
+            brief = str((e.protection_brief or {}).get('status') or '')
+            assert 'disabled' in brief.lower()
     asyncio.run(scenario())

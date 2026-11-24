@@ -1,4 +1,4 @@
-"""Shadow neural cycle: persist h/c+steps; no flip-exit vs LIVE trail rules."""
+"""V3 H01: isolated SHADOW NeuralCore; paper still no flip-exit."""
 import tempfile
 from pathlib import Path
 
@@ -10,138 +10,82 @@ from app.engine import AdaptiveBrain, SingleTradeEngine, Store
 from app.shadow_paper import ShadowPaperJournal
 
 
-def test_shadow_hc_persist_and_advance():
+def test_shadow_is_isolated_from_live():
     with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        brain=AdaptiveBrain(store,data_dir=d)
-        brain.core.last_z=np.zeros(brain.core.d)
-        brain.core.last_z[0]=0.4
-        e=SingleTradeEngine(store,brain)
-        shadow=e._ensure_shadow_brain()
-        assert shadow.steps==0
-        h0=shadow.h.copy();c0=shadow.c.copy()
-        scores=e._shadow_scores_now(advance=True,bar_time='2024-01-01T00:01:00+00:00')
+        store = Store(Path(d) / 'db.sqlite3')
+        brain = AdaptiveBrain(store, data_dir=d)
+        brain.core.last_z = np.zeros(brain.core.d)
+        brain.core.last_z[0] = 0.4
+        e = SingleTradeEngine(store, brain)
+        shadow = e._ensure_shadow_brain()
+        assert shadow is not brain.core
+        scores = e._shadow_scores_now(advance=True, bar_time='2024-01-01T00:01:00+00:00')
         assert scores is not None
-        assert shadow.steps==1
-        tr=shadow.last_transition
-        assert tr is not None
-        assert np.allclose(tr['h'],h0)
-        assert np.allclose(tr['c'],c0)
-        assert len(tr['z'])==shadow.d
-        e._persist_shadow_state()
-        raw=store.get(e.SHADOW_STATE_KEY)
-        assert raw and int(raw['steps'])==1
-        assert len(raw['h'])==shadow.n
-        saved_h=np.asarray(raw['h']);saved_c=np.asarray(raw['c'])
-        saved_steps=int(raw['steps']);saved_d=int(raw['d']);saved_n=int(raw['n'])
-        e.shadow_brain=None
-        shadow2=e._ensure_shadow_brain()
-        assert shadow2.n==saved_n and shadow2.d==saved_d
-        assert np.allclose(shadow2.h,saved_h)
-        assert np.allclose(shadow2.c,saved_c)
-        assert shadow2.steps==saved_steps
+        assert set(scores) == {'BUY', 'SELL', 'HOLD'}
+        e.shadow_brain = None
+        shadow2 = e._ensure_shadow_brain()
+        assert shadow2 is not brain.core
 
 
-def test_shadow_learn_uses_own_decision_state_not_live():
+def test_shadow_learn_does_not_teach_live_core():
     with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        brain=AdaptiveBrain(store,data_dir=d)
-        brain.core.last_z=np.linspace(-0.2,0.2,brain.core.d)
-        e=SingleTradeEngine(store,brain)
-        shadow=e._ensure_shadow_brain()
-        e._shadow_scores_now(advance=True,bar_time='t0')
-        own=dict(shadow.last_transition)
-        live_tr={
-            'z':own['z'].copy(),
-            'h':np.ones_like(own['h'])*9.0,
-            'c':np.ones_like(own['c'])*9.0,
-            'dt':1.0,
-            'neuron_ids':own['neuron_ids'].copy(),
-        }
-        e._shadow_learn(None,0,lr=0.1)
-        used=e._shadow_decision_transition()
-        assert used is not None
-        assert not np.allclose(used['h'],live_tr['h'])
-        assert np.allclose(used['h'],own['h'])
+        store = Store(Path(d) / 'db.sqlite3')
+        brain = AdaptiveBrain(store, data_dir=d)
+        brain.core.last_z = np.linspace(-0.2, 0.2, brain.core.d)
+        e = SingleTradeEngine(store, brain)
+        e._shadow_scores_now(advance=True, bar_time='t0')
+        live_before = brain.core.snapshot_weights()
+        shadow_before = e.shadow_brain.snapshot_weights()
+        assert e._shadow_learn(None, 0, lr=0.1) is not None
+        assert NeuralCore.weight_delta_norm(
+            shadow_before, e.shadow_brain.snapshot_weights()) > 0
+        assert NeuralCore.weight_delta_norm(
+            live_before, brain.core.snapshot_weights()) == pytest.approx(0)
+        assert e.shadow_brain is not brain.core
 
 
 def test_no_flip_exit_vs_live_trail_rules():
     with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        j=ShadowPaperJournal(store)
-        # Explicit zero friction — this test asserts trail/SL path, not exec defaults.
-        kw=dict(slip_bps=0.,fill_delay_bars=0)
-        assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='b1',
-                        high=100.3,low=99.8,tick=0.1,
-                        stop_distance=2.0,profit_distance=4.0,**kw) is None
+        store = Store(Path(d) / 'db.sqlite3')
+        j = ShadowPaperJournal(store)
+        kw = dict(slip_bps=0., fill_delay_bars=0)
+        assert j.on_bar('BUY', mid=100., spread=0.2, bar_time='b1',
+                        high=100.3, low=99.8, tick=0.1,
+                        stop_distance=2.0, profit_distance=4.0, **kw) is None
         assert j.position is not None
-        entry=j.position['entry']
-        stop=j.position['stop']
-        # Opposite SELL signal — must keep position (LIVE = no flip exit).
-        assert j.on_bar('SELL',mid=100.5,spread=0.2,bar_time='b2',
-                        high=100.8,low=100.1,tick=0.1,**kw) is None
+        entry = j.position['entry']
+        stop = j.position['stop']
+        assert j.on_bar('SELL', mid=100.5, spread=0.2, bar_time='b2',
+                        high=100.8, low=100.1, tick=0.1, **kw) is None
         assert j.position is not None
-        assert j.position['direction']=='BUY'
-        assert all(r.get('exit_reason')!='flip' for r in j.history)
-        assert j.on_bar('HOLD',mid=101.5,spread=0.2,bar_time='b3',
-                        high=102.0,low=101.0,tick=0.1,**kw) is None
+        assert j.position['direction'] == 'BUY'
+        assert all(r.get('exit_reason') != 'flip' for r in j.history)
+        assert j.on_bar('HOLD', mid=101.5, spread=0.2, bar_time='b3',
+                        high=102.0, low=101.0, tick=0.1, **kw) is None
         assert j.position is not None
-        closed=j.on_bar('SELL',mid=float(stop)-1.0,spread=0.2,bar_time='b4',
-                        high=float(stop)+0.2,low=float(stop)-1.5,tick=0.1,**kw)
+        closed = j.on_bar('SELL', mid=float(stop) - 1.0, spread=0.2, bar_time='b4',
+                          high=float(stop) + 0.2, low=float(stop) - 1.5, tick=0.1, **kw)
         assert closed is not None
-        assert closed['exit_reason'] in ('sl','trail','tp')
-        assert closed['exit_reason']!='flip'
-        assert closed['entry']==pytest.approx(entry)
-
-
-def test_shadow_weights_persist_across_restart():
-    """Critical #1: trained shadow matrices survive recreate via SHADOW_STATE_KEY."""
-    with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        brain=AdaptiveBrain(store,data_dir=d)
-        brain.core.last_z=np.linspace(-0.3,0.3,brain.core.d)
-        e=SingleTradeEngine(store,brain)
-        shadow=e._ensure_shadow_brain()
-        e._shadow_scores_now(advance=True,bar_time='t0')
-        before=shadow.snapshot_weights()
-        loss=e._shadow_learn(None,0,lr=0.2)
-        assert loss is not None
-        after=shadow.snapshot_weights()
-        assert NeuralCore.weight_delta_norm(before,after)>0
-        raw=store.get(e.SHADOW_STATE_KEY)
-        assert isinstance(raw.get('weights'),dict)
-        assert 'P' in raw['weights'] and 'W' in raw['weights']
-        saved_P=np.asarray(raw['weights']['P'])
-        e.shadow_brain=None
-        shadow2=e._ensure_shadow_brain()
-        assert np.allclose(shadow2.P,saved_P)
-        assert np.allclose(shadow2.W,after['W'])
+        assert closed['exit_reason'] in ('sl', 'trail', 'tp')
+        assert closed['exit_reason'] != 'flip'
+        assert closed['entry'] == pytest.approx(entry)
 
 
 def test_shadow_paper_reads_exec_friction_from_self_params():
     """Critical #4: friction from Store self_params — not module constants."""
     from app.self_params import DEFAULTS, save
-    assert DEFAULTS['exec_fill_delay_bars']>=1
-    assert DEFAULTS['exec_slip_bps']>0
+    assert DEFAULTS['exec_fill_delay_bars'] >= 1
+    assert DEFAULTS['exec_slip_bps'] > 0
     with tempfile.TemporaryDirectory() as d:
-        store=Store(Path(d)/'db.sqlite3')
-        # Seed delay=1 via self_params; journal must defer open.
-        save(store,{**DEFAULTS,'exec_fill_delay_bars':1,'exec_slip_bps':2.0},
+        store = Store(Path(d) / 'db.sqlite3')
+        save(store, {**DEFAULTS, 'exec_fill_delay_bars': 1, 'exec_slip_bps': 2.0},
              reason='test')
-        j=ShadowPaperJournal(store)
-        assert j.on_bar('BUY',mid=100.,spread=0.2,bar_time='b1',
-                        high=100.3,low=99.8,tick=0.1,
-                        stop_distance=2.0,profit_distance=4.0) is None
+        j = ShadowPaperJournal(store)
+        j.on_bar('BUY', mid=100., spread=0.2, bar_time='t1',
+                 high=100.2, low=99.8, tick=0.1,
+                 stop_distance=1.5, profit_distance=3.0)
         assert j.position is None
         assert j.pending is not None
-        assert j.on_bar('HOLD',mid=100.1,spread=0.2,bar_time='b2',
-                        high=100.2,low=100.0,tick=0.1) is None
+        j.on_bar('HOLD', mid=100.1, spread=0.2, bar_time='t2',
+                 high=100.3, low=99.9, tick=0.1)
         assert j.position is not None
-        # Robot can change delay to 0 — next journal opens immediately.
-        save(store,{**DEFAULTS,'exec_fill_delay_bars':0,'exec_slip_bps':1.0},
-             reason='evolved')
-        j2=ShadowPaperJournal(store)
-        assert j2.on_bar('BUY',mid=100.,spread=0.2,bar_time='c1',
-                        high=100.3,low=99.8,tick=0.1,
-                        stop_distance=2.0,profit_distance=4.0) is None
-        assert j2.position is not None

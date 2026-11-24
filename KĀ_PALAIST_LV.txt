@@ -1,0 +1,45 @@
+================================================================================
+KĀ PALAIST PILNO SISTĒMU (nevis vizuālo mock)
+================================================================================
+
+1) Atver mapī, kur ir VISA repo sakne:
+     - launcher.py
+     - run_windows.bat
+     - mape app\
+     - (pēc pull arī) PALAIST_PILNO_SISTEMU.bat
+
+   Pareizi piemēri:
+     C:\NeuralTradingAI_NEW\
+     C:\Users\voldi\ai-traiding-\
+
+2) Dubultklikšķis uz:
+     START.bat
+   (vai run_windows.bat / PALAIST_PILNO_SISTEMU.bat)
+
+   Pārlūkam jāatveras pats pēc ~8 sekundēm.
+   Ja neatveras — manuāli: http://127.0.0.1:8765/admin
+
+3) URL:
+     http://127.0.0.1:8765/admin     ← īstā sistēma (Capital + neironi)
+     http://127.0.0.1:8765/desk      ← React PerpSignal Desk ar LIVE API
+
+4) Admin login (noklusējums, ja nav mainīts env):
+     lietotājs: admin
+     parole:    admin123
+   Tad: izveido klientu + pieslēdz Capital.com LIVE API atslēgas + Start.
+
+--------------------------------------------------------------------------------
+KAS NEDARBOJAS / KĀPĒC “neko neatjauno”
+--------------------------------------------------------------------------------
+• http://localhost:5173  = TIKAI vizuālais Vite mock (bez robota).
+• Ja mape nav git clone / nav git pull no GitHub — jaunie faili NEPARĀDĪSIES.
+• Ja atvēri tikai perpsignal-desk\ bez parent repo — palaidējs neatrasts.
+
+Atjaunināt no GitHub (ja mape IR git repo):
+  cd C:\NeuralTradingAI_NEW
+  git pull
+
+Ja “git pull” saka “not a git repository” — lejupielādē ZIP no:
+  https://github.com/voldis1994/ai-traiding-
+  vai clone no jauna.
+================================================================================

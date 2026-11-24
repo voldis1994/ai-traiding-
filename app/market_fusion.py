@@ -33,6 +33,87 @@ EXTERNAL_NAMES = (
 FUSION_NAMES = FEATURE_NAMES + EXTERNAL_NAMES
 FUSION_DIM = len(FUSION_NAMES)  # default empty-registry size; runtime may grow
 
+# V3 D08 — last-good carry must keep original observed_at; never refresh age on re-read.
+# Design defaults (seconds); operator may override via stamp max_age.
+DEFAULT_LAST_GOOD_TTL = {
+    'peers': 120.0,
+    'news': 24 * 3600.0,
+    'liquidity': 10.0,
+}
+
+
+def stamp_last_good(values, *, source, now=None, max_age=None):
+    """Wrap a live EXTERNAL vector with provenance for TTL checks (V3 D08)."""
+    if values is None:
+        return None
+    observed = now if now is not None else datetime.now(timezone.utc)
+    if getattr(observed, 'tzinfo', None) is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    ttl = max_age if max_age is not None else DEFAULT_LAST_GOOD_TTL.get(source, 120.0)
+    return {
+        'values': [float(x) for x in values],
+        'source': str(source),
+        'observed_at': observed.astimezone(timezone.utc).isoformat(),
+        'max_age': float(ttl),
+        'quality': 'live',
+    }
+
+
+def last_good_ttl_expired(stamp, *, now=None, source=None):
+    """True when a stamped last-good vector is missing or older than max_age."""
+    if stamp is None:
+        return True
+    if isinstance(stamp, (list, tuple)):
+        # Legacy unstamped vector — treat as expired (must re-observe).
+        return True
+    if not isinstance(stamp, dict) or stamp.get('values') is None:
+        return True
+    if source is not None and stamp.get('source') not in (None, source):
+        return True
+    raw = stamp.get('observed_at')
+    try:
+        observed = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return True
+    current = now if now is not None else datetime.now(timezone.utc)
+    if getattr(current, 'tzinfo', None) is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age = (current.astimezone(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+    max_age = stamp.get('max_age')
+    if max_age is None:
+        max_age = DEFAULT_LAST_GOOD_TTL.get(stamp.get('source') or source or 'peers', 120.0)
+    try:
+        max_age = float(max_age)
+    except (TypeError, ValueError):
+        return True
+    return age > max_age
+
+
+def last_good_values(stamp, *, now=None, source=None, require_fresh=False):
+    """Return stamped last-good values with honest age (V5 D08 / T04).
+
+    Stale last-good is still usable context — TTL expiry must not invent a
+    REQUIRED→HOLD gate. When ``require_fresh`` is True, expired stamps yield
+    None (diagnostics only). Legacy bare lists are returned as-is (no fake
+    freshness).
+    """
+    if stamp is None:
+        return None
+    if isinstance(stamp, (list, tuple)):
+        if require_fresh:
+            return None
+        return list(stamp)
+    if not isinstance(stamp, dict) or stamp.get('values') is None:
+        return None
+    if source is not None and stamp.get('source') not in (None, source):
+        return None
+    if require_fresh and last_good_ttl_expired(stamp, now=now, source=source):
+        return None
+    vals = stamp.get('values')
+    return list(vals) if isinstance(vals, (list, tuple)) else None
+
 
 def peer_features(state, bar_time, *, max_lag_seconds=0):
     """Six comparable aggregates, built exclusively from completed aligned bars.
@@ -168,21 +249,25 @@ def fusion_gap_reason(base, intermarket, epic, calendar_path, currencies, *, now
     if len(ohlc) != need:
         return f'ohlc: feature dim {len(ohlc)} != expected {need}'
     peers = peer_features(intermarket, base.get('bar_time'))
-    if peers is None and not _peer_vector_ok(peers_fallback):
+    # V5 D08/T04: stale last-good stays usable; never REQUIRED→HOLD on TTL alone.
+    peers_fb = last_good_values(peers_fallback, now=now, source='peers')
+    if peers is None and not _peer_vector_ok(peers_fb):
         status = (intermarket or {}).get('status') if isinstance(intermarket, dict) else None
         detail = (intermarket or {}).get('reason') if isinstance(intermarket, dict) else None
         return 'peers: ' + (detail or status or 'aligned peer features unavailable')
     news = news_features(epic, calendar_path, currencies, now=now)
-    if news is None and not _news_vector_ok(news_fallback):
+    news_fb = last_good_values(news_fallback, now=now, source='news')
+    if news is None and not _news_vector_ok(news_fb):
         return 'news: calendar features unavailable or not CLEAR/NEWS_WINDOW'
-    if liquidity_path is None and not _liquidity_vector_ok(liquidity_fallback):
+    liq_fb = last_good_values(liquidity_fallback, now=now, source='liquidity')
+    if liquidity_path is None and not _liquidity_vector_ok(liq_fb):
         return 'liquidity: path not configured'
     obs = None
     if liquidity_path is not None:
         obs = liquidity_observation_from_path(
             liquidity_path, base.get('bar_time'), now=now, epic=epic)
     live_ok = bool(obs and obs.get('ok') and obs.get('features') is not None)
-    if not live_ok and not _liquidity_vector_ok(liquidity_fallback):
+    if not live_ok and not _liquidity_vector_ok(liq_fb):
         return 'liquidity: ' + ((obs or {}).get('reason')
                                 or 'volume/DOM observation unavailable')
     return None
@@ -206,19 +291,25 @@ def fusion_features(base, intermarket, epic, calendar_path, currencies, *, now=N
     if not isinstance(base,dict) or not base.get('ready'):
         return None
     peers = peer_features(intermarket, base.get('bar_time'))
-    if peers is None and _peer_vector_ok(peers_fallback):
-        peers = [float(x) for x in peers_fallback]
+    if peers is None:
+        peers_fb = last_good_values(peers_fallback, now=now, source='peers')
+        if _peer_vector_ok(peers_fb):
+            peers = [float(x) for x in peers_fb]
     news = news_features(epic,calendar_path,currencies,now=now)
-    if news is None and _news_vector_ok(news_fallback):
-        news = [float(x) for x in news_fallback]
+    if news is None:
+        news_fb = last_good_values(news_fallback, now=now, source='news')
+        if _news_vector_ok(news_fb):
+            news = [float(x) for x in news_fb]
     if peers is None or news is None:
         return None
     liq = None
     if liquidity_path is not None:
         liq = liquidity_features_from_path(
             liquidity_path, base.get('bar_time'), now=now, epic=epic)
-    if liq is None and _liquidity_vector_ok(liquidity_fallback):
-        liq = [float(x) for x in liquidity_fallback]
+    if liq is None:
+        liq_fb = last_good_values(liquidity_fallback, now=now, source='liquidity')
+        if _liquidity_vector_ok(liq_fb):
+            liq = [float(x) for x in liq_fb]
     if liq is None:
         return None
     ohlc = list(base['features'])

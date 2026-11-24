@@ -10,6 +10,7 @@ from app.runtime_hub import RuntimeHub
 
 
 def test_trade_stats_no_closes_keeps_working_pnl_none_and_open_upl():
+    """V5 P05: open UPL is shown on cards; Desk equity stays Funds-only (blank ≠ cash)."""
     with tempfile.TemporaryDirectory() as d:
         store = Store(Path(d) / 'db.sqlite3')
         hub = RuntimeHub.__new__(RuntimeHub)
@@ -18,7 +19,8 @@ def test_trade_stats_no_closes_keeps_working_pnl_none_and_open_upl():
         assert stats['working_pnl'] is None
         assert stats['working_pnl_source'] == 'empty'
         assert stats['open_upl'] == pytest.approx(0.24)
-        assert stats['equity_pnl'] == pytest.approx(0.24)
+        # Equity / Kopējais must not invent cash from UPL.
+        assert stats['equity_pnl'] is None
         assert stats['realized_pnl'] is None
 
 
@@ -69,3 +71,50 @@ def test_admin_overview_surfaces_open_upl_when_no_cash():
     assert s['working_pnl_all'] is None
     assert s['working_pnl_source'] == 'open_upl'
     assert s['pnl_currency'] == 'GBP'
+
+
+def test_admin_overview_open_upl_beats_stuck_estimate_closes():
+    """Stuck ≈UPL closes must not wall fleet P&L on gaida while a live deal has UPL."""
+    hub = RuntimeHub.__new__(RuntimeHub)
+    hub.platform = MagicMock()
+    hub.platform.list_clients.return_value = [
+        {'id': 1, 'username': 'guntis', 'display_name': 'guntis'},
+    ]
+
+    def card(client):
+        return {
+            **client,
+            'robot_running': True,
+            'account_currency': 'GBP',
+            'results': {
+                'closed_trades': 3,
+                'cash_trades': 0,
+                'pending_cash_trades': 0,
+                'proxy_trades': 0,
+                'estimate_trades': 3,
+                'estimate_pnl': -0.42,
+                'realized_pnl': None,
+                'working_pnl': None,
+                'working_pnl_source': 'upl_estimate',
+                'open_upl': 0.31,
+                'pnl_currency': 'GBP',
+                'pnl_by_currency': {},
+                'display_wins': 0,
+                'display_losses': 0,
+            },
+            'activity': {
+                'positions': [{
+                    'dealId': 'live1', 'epic': 'GOLD', 'direction': 'SELL',
+                    'size': 0.08, 'level': 3531.38, 'upl': 0.31, 'mid': 3528.65,
+                    'stopLevel': 3547.64, 'profitLevel': 3503.67,
+                }],
+            },
+        }
+
+    hub.admin_client_card = card
+    out = hub.admin_overview()
+    s = out['summary']
+    assert s['working_pnl_source'] == 'open_upl'
+    assert s['open_upl_all'] == pytest.approx(0.31)
+    assert s['estimate_trades_all'] == 3
+    assert s['estimate_pnl_all'] is None  # open UPL present — not needed for fleet

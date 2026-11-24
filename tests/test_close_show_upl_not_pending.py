@@ -1,4 +1,4 @@
-"""Close at £0.01 must journal 0.01 (UPL) — never blank gaida/pending."""
+"""Close without Funds £ stays pending — never invent peļņa from UPL."""
 import asyncio
 import tempfile
 from pathlib import Path
@@ -13,6 +13,7 @@ from tests.test_learning_integrity import new_brain
 
 
 def test_snapshot_parses_pound_string_upl():
+    """Open UPL snapshot still works for live display (not close settle)."""
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
@@ -25,7 +26,7 @@ def test_snapshot_parses_pound_string_upl():
         assert snap['currency']=='GBP'
 
 
-def test_vanish_with_upl_journals_zero_one_not_pending():
+def test_vanish_without_funds_shows_provisional_upl_then_funds():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -46,18 +47,26 @@ def test_vanish_with_upl_journals_zero_one_not_pending():
             broker.open=[]
             await e.sync()
             row=store.trades(1)[0]
+            # Last UPL before close = Capital £ — teach immediately.
             assert row['pnl']==pytest.approx(0.01)
-            assert row['pnl_source']=='upl_estimate'
-            # Operator: UPL 0.01 teaches immediately — no pending wait.
+            assert row['pnl_source']=='capital'
             assert e._trade_already_learned('g01')
-            hub=RuntimeHub.__new__(RuntimeHub)
-            stats=RuntimeHub._trade_stats(hub,store,'GBP')
-            assert stats['working_pnl']==pytest.approx(0.01)
-            assert stats['pending_cash_trades']==0
+            pending=store.get('pending_broker_pnl_deals') or []
+            assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='g01'
+                       for x in pending)
+            # Real Funds £ overwrites without double-teach.
+            labeled_mid=brain.trade_labeled
+            broker.tx=[{'reference':'g01','pnl':'0.01','currency':'GBP',
+                        'transactionType':'TRADE'}]
+            await e._retry_pending_broker_pnl()
+            row=store.trades(1)[0]
+            assert row['pnl']==pytest.approx(0.01)
+            assert row['pnl_source']=='broker'
+            assert brain.trade_labeled==labeled_mid
     asyncio.run(scenario())
 
 
-def test_pending_close_sync_stamps_upl_immediately():
+def test_pending_close_sync_waits_without_upl_invent():
     async def scenario():
         with tempfile.TemporaryDirectory() as d:
             store,brain=new_brain(d)
@@ -75,42 +84,24 @@ def test_pending_close_sync_stamps_upl_immediately():
                 'tick_size':.01,'transition':brain._json_transition(brain.core.last_transition)})
             e.pending_close=True
             broker.open=[]
-            # Isolate stamp path: clear retry queue effect by checking after vanish
-            # before a second retry would run — sync still runs retry once, which
-            # must leave upl_estimate with 0.01 (never blank pending_close_sync).
             await e.sync()
             row=store.trades(1)[0]
-            assert row['pnl']==pytest.approx(0.01)
-            assert row['pnl_source']=='upl_estimate'
+            assert row['pnl'] is None
+            assert row['pnl_source'] in ('pending_close_sync','pending_broker_pnl')
             pending=store.get('pending_broker_pnl_deals') or []
             assert any(str(x.get('deal_id') if isinstance(x,dict) else x)=='pc01'
                        for x in pending)
     asyncio.run(scenario())
 
 
-def test_teach_pending_does_not_downgrade_upl_estimate():
+def test_teach_pending_keeps_provisional_upl_estimate():
     with tempfile.TemporaryDirectory() as d:
         store,brain=new_brain(d)
         e=SingleTradeEngine(store,brain)
         e.account={'accounts':[{'preferred':True,'currency':'GBP','accountId':'1'}]}
         store.upsert_trade({'dealId':'u1','epic':'GOLD','size':'.02','direction':'BUY','level':100})
         store.close_trade('u1',100.1,0.01,currency='GBP',source='upl_estimate',overwrite=True)
-        store.set('last_upl:u1',{'upl':0.01,'currency':'GBP'})
         e._teach_pending_ticks('u1',100.1)
         row=store.trades(1)[0]
-        assert row['pnl']==pytest.approx(0.01)
         assert row['pnl_source']=='upl_estimate'
-
-
-def test_admin_pending_with_numeric_pnl_counts_as_working():
-    with tempfile.TemporaryDirectory() as d:
-        store,brain=new_brain(d)
-        store.upsert_trade({'dealId':'n1','epic':'GOLD','size':'.02','direction':'BUY','level':100})
-        # Source clobbered to pending but pnl still 0.01 — must show in Kopējais.
-        store.close_trade('n1',100.1,0.01,currency='GBP',source='pending_broker_pnl',
-                          overwrite=True)
-        hub=RuntimeHub.__new__(RuntimeHub)
-        stats=RuntimeHub._trade_stats(hub,store,'GBP')
-        assert stats['working_pnl']==pytest.approx(0.01)
-        assert stats['pending_cash_trades']==0
-        assert stats['recent_trades'][0]['pnl']==pytest.approx(0.01)
+        assert row['pnl']==pytest.approx(0.01)

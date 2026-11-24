@@ -85,7 +85,9 @@ def load_params(store):
         'add_min_edge': float(sp.get('day_add_min_edge', 0.08)),
         'open_slices': max(3, int(sp.get('day_open_slices', 5))),
         'slice_min_edge': float(sp.get('day_slice_min_edge', 0.04)),
-        'size_full_balance': int(sp.get('day_size_full_balance', 1)),
+        # Fixed mandate lot = first manual OPEN size on every later robot OPEN.
+        'size_fixed_mandate': int(sp.get('day_size_fixed_mandate', 1)),
+        'size_full_balance': int(sp.get('day_size_full_balance', 0)),
         # Vestigial — OPEN never blocked by day phase (operator: no risk regimes).
         'risk_gates': 0,
     }
@@ -402,23 +404,55 @@ def propose_size(*, mandate_size, equity, daily, params, stop_ticks, tick_value,
             'size': None, 'reason': 'no_capital_size_grid', 'allowed': False,
             'size_grid': grid,
         }
-    # Snap mandate itself onto the grid — Capital is source of truth.
+    # Adopted mandate is the operator risk frame (manual 0.15 stays 0.15).
+    # Floor-snap onto Capital grid is for *computed* risk lots only — never
+    # shrink the broker-accepted adopt (0.15 → 0.1 was the LIVE bug).
     seed_on_grid = snap_deal_size(
         seed, min_size=grid['min'], step=grid['step'], max_size=grid.get('max'))
-    if seed_on_grid is None:
+    if seed_on_grid is None and seed < grid['min']:
         return {
             'size': None, 'reason': 'mandate_off_capital_grid', 'allowed': False,
             'size_grid': grid,
         }
-    seed = seed_on_grid
+    # Keep exact adopted size when ≥ minDealSize (Capital already filled it).
+    if seed + Decimal('0') >= grid['min']:
+        if grid.get('max') is not None and seed > grid['max']:
+            seed = snap_deal_size(
+                grid['max'], min_size=grid['min'], step=grid['step'],
+                max_size=grid.get('max')) or seed_on_grid or seed
+        # else: preserve exact mandate (may sit between step marks if Capital
+        # accepted a finer size than minSizeIncrement reports).
+    else:
+        seed = seed_on_grid
     p = params or load_params(None)
     b = budgets(equity=equity, params=p, daily=daily)
     rpt = _finite(b.get('risk_per_trade'))
+    fixed_mandate = int(p.get('size_fixed_mandate') or 0) == 1
     full_bal = int(p.get('size_full_balance') or 0) == 1
     minimum = grid['min']
     step = grid['step']
     want = max(3, int(p.get('open_slices') or 5))
     strength = _signal_strength(score_edge)
+    # Operator lot lock: keep the first-trade mandate on every later OPEN
+    # (0.25 stays 0.25 — never shrink to full-balance min-pack 0.05).
+    if fixed_mandate:
+        return {
+            'size': seed,
+            'reason': 'fixed_mandate_lot',
+            'allowed': True,
+            'budgets': b,
+            'estimated_risk': None,
+            'scale': 1.0,
+            'size_fixed_mandate': True,
+            'size_full_balance': False,
+            'signal_strength': strength,
+            'score_edge': _finite(score_edge),
+            'size_grid': {
+                'min': str(grid['min']), 'step': str(grid['step']),
+                'max': str(grid['max']) if grid.get('max') is not None else None,
+                'source': grid.get('source'),
+            },
+        }
     # Full-balance + missing pip value must NOT glue to mandate (that left LIVE
     # on a single tiny/seed lot while cash-risk budget was the whole £ balance).
     # Deploy an edge-scaled N×minDealSize pack so flat OPEN still multi-tickets.

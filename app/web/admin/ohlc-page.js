@@ -92,11 +92,12 @@ function renderChips(view){
   if(view.zones&&view.zones.sell_entry)bits.push(['sell','SELL entry zona']);
   bits.push(['mid','mid']);
   if(view.overlays&&(view.overlays.kama||[]).length)bits.push(['kama','KAMA / EMA']);
-  if(view.swing_brackets&&view.swing_brackets.ready){
+  const inTrade=(view.open_levels||[]).length>0;
+  if(!inTrade&&view.swing_brackets&&view.swing_brackets.ready){
     bits.push(['sl','swing SL']);
     bits.push(['tp','swing TP']);
   }
-  if((view.open_levels||[]).length)bits.push(['entry','atvērtais entry/SL/TP']);
+  if(inTrade)bits.push(['entry','atvērtais entry/SL/TP']);
   chipsEl.innerHTML=bits.map(([cls,label])=>
     `<span class="ohlc-chip ${cls}"><i></i>${label}</span>`).join('');
 }
@@ -142,15 +143,22 @@ async function load(){
     const candleAt=lastCandle&&lastCandle.at?clock(lastCandle.at):'';
     const mtf=view.mtf||{};
     const path=view.entry_path||{};
-    subEl.textContent=[
-      `#${clientId}`,
-      epic,
+    // Structure vs decision are separate — do not mash as one claim.
+    const structBits=[
       st.bias?`bias ${st.bias}`:'',
       st.event||'',
-      view.preferred?`zona ${view.preferred}`:'abas entry zonas',
+    ].filter(Boolean).join(' ');
+    const decisionBits=[
+      view.shared_side?`shared ${view.shared_side}`:(view.preferred?`zona ${view.preferred}`:'zonas abas'),
       mtf.mode?`MTF ${mtf.mode}`:'',
       path.intent?`intent ${path.intent}`:'',
       path.trigger?`trigger ${path.trigger}`:(path.wait?`wait ${String(path.wait).slice(0,40)}`:''),
+    ].filter(Boolean).join(' · ');
+    subEl.textContent=[
+      `#${clientId}`,
+      epic,
+      structBits?`struktūra: ${structBits}`:'',
+      decisionBits?`lēmums: ${decisionBits}`:'',
       view.mid!=null?`mid ${Number(view.mid).toFixed(2)}`:'',
       candleAt?`pēdējā svece ${candleAt}`:'',
       `${candleN} M1`,
@@ -174,8 +182,8 @@ function schedulePoll(){
     if(document.hidden)return;
     load().catch(()=>{});
   };
-  // Popup only (~2s) — no main-board hammer; paint() skips when unchanged.
-  pollTimer=setInterval(tick,2000);
+  // Popup ~500ms — #297 claimed 250ms but timer stayed at 2s; keep light.
+  pollTimer=setInterval(tick,500);
 }
 
 document.getElementById('btnRefresh').onclick=()=>load().catch(()=>{});

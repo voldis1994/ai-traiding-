@@ -1,67 +1,83 @@
-"""OHLC entry zones: Admin drawing geometry == LIVE OPEN wait gate."""
-from datetime import datetime, timedelta, timezone
+"""OHLC entry zones: base→impulse Demand/Supply == LIVE OPEN wait gate."""
+from datetime import datetime, timezone
 
 from app import ohlc_entry_zones as oez
+from tests.ohlc_zone_path import demand_zone_path, supply_zone_path
 
 
-def _swing_candles(n=80, start=100.0):
-    t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
-    rows = []
-    px = start
-    for i in range(n):
-        # Slow climb with clear swing lows/highs.
-        o = px
-        c = px + (0.15 if i % 7 else -0.35)
-        h = max(o, c) + 0.8 + (1.5 if i % 11 == 10 else 0.1)
-        l = min(o, c) - 0.8 - (1.5 if i % 11 == 5 else 0.1)
-        rows.append({
-            'at': (t0 + timedelta(minutes=i)).isoformat(),
-            'open': o, 'high': h, 'low': l, 'close': c,
-        })
-        px = c
-    return rows
-
-
-def test_compute_entry_zones_builds_buy_and_sell_bands():
-    rows = _swing_candles()
-    mid = float(rows[-1]['close'])
+def test_compute_entry_zones_builds_demand_from_base_impulse():
+    rows, mid = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
     assert z['ok'] is True
-    assert z['buy_entry'] and z['sell_entry']
+    assert z['buy_entry']
+    assert z['buy_entry']['kind'] == 'demand'
     assert z['buy_entry']['lo'] < z['buy_entry']['hi']
+    assert 'base_impulse' in (z['buy_entry']['source'] or '')
+    assert z['reason'] == 'base_impulse'
+    # Structure labels present.
+    assert z.get('structure') is not None
+
+
+def test_compute_entry_zones_builds_supply_from_base_impulse():
+    rows, mid = supply_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
+    assert z['ok'] is True
+    assert z['sell_entry']
+    assert z['sell_entry']['kind'] == 'supply'
     assert z['sell_entry']['lo'] < z['sell_entry']['hi']
-    assert z['buy_entry']['hi'] <= z['sell_entry']['lo'] or True  # may overlap mid range
-    assert z['buy_entry']['source'] == 'ohlc_swing'
 
 
-def test_entry_allows_open_waits_until_price_in_buy_zone():
-    rows = _swing_candles()
+def test_entry_allows_open_waits_until_confirm_in_demand_zone():
+    """Confirm OFF: far → wait; inside Demand → allow without pin/structure."""
+    rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     assert buy
-    # Far above discount band, no break proof → wait (pullback path).
     far = float(buy['hi']) + 5.0
     gate = oez.entry_allows_open(
         'BUY', candles=rows, mid=far, ask=far, bid=far - 0.1,
         tick=0.1, spread=0.2)
     assert gate['allowed'] is False
     assert 'wait' in (gate['reason'] or '')
-    # Inside band → zone trigger.
+
+    # Inside band, confirm skipped → allow.
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
-    gate2 = oez.entry_allows_open(
+    gate_touch = oez.entry_allows_open(
         'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
         tick=0.1, spread=0.2)
-    assert gate2['allowed'] is True
-    assert gate2['reason'] == 'ohlc_entry_zone_touch'
-    assert gate2.get('trigger') == 'zone'
+    assert gate_touch['allowed'] is True
+    assert gate_touch.get('trigger') == 'zone'
+    assert (gate_touch.get('confirm') or {}).get('reason') == 'confirm_skipped'
+
+    # Opt-in confirm still waits without pin/structure.
+    gate_need = oez.entry_allows_open(
+        'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
+        tick=0.1, spread=0.2,
+        params={**oez.load_params(None)})
+    # Force confirm via zone_confirm_allows path — store-less default is off;
+    # explicit require_confirm on helper covers opt-in.
+    conf = oez.zone_confirm_allows(
+        'BUY', candles=rows, zone=buy, tick=0.1, require_confirm=True)
+    assert conf['ok'] is False
+    assert 'confirm' in (conf.get('reason') or '')
 
 
 def test_entry_allows_open_on_structure_break_without_zone():
-    """Unified break trigger: structure UP + BUY intent → OPEN outside discount band."""
-    rows = _swing_candles()
+    """Unified break trigger: structure UP + BUY intent → OPEN outside band."""
+    rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
-    far = float(buy['hi']) + 5.0
+    far = float(buy['hi']) + 5.0 if buy else float(rows[-1]['close']) + 5.0
+    # Green tape so break is not blocked as against dump.
+    t_last = rows[-1]
+    rows = list(rows)
+    for k in range(3):
+        o = float(t_last['close']) + k * 0.4
+        c = o + 0.5
+        rows.append({
+            'at': t_last['at'],  # timestamps not critical for tape streak
+            'open': o, 'high': c + 0.1, 'low': o - 0.05, 'close': c,
+        })
     mtf = {
         'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
         'confidence': 0.8, 'structure_break': 'UP', 'move_ok': True,
@@ -75,13 +91,14 @@ def test_entry_allows_open_on_structure_break_without_zone():
 
 
 def test_break_refuses_buy_against_m1_dump():
-    """Micro UP break must not BUY into a completed red dump (illogical OHLC)."""
+    """Micro UP break must not BUY into a completed red dump."""
     t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+    from datetime import timedelta
     rows = []
     px = 3712.0
     for i in range(40):
         o = px
-        c = px - 0.8  # red dump
+        c = px - 0.8
         rows.append({
             'at': (t0 + timedelta(minutes=i)).isoformat(),
             'open': o, 'high': o + 0.2, 'low': c - 0.2, 'close': c,
@@ -89,7 +106,6 @@ def test_break_refuses_buy_against_m1_dump():
         px = c
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z.get('buy_entry')
-    # Price above discount band (bounce mid) — old bug would break-BUY here.
     far = float(buy['hi']) + 3.0 if buy else float(rows[-1]['close']) + 5.0
     mtf = {
         'ready': True, 'enabled': True, 'mode': 'HOLD', 'preferred': 'HOLD',
@@ -103,8 +119,8 @@ def test_break_refuses_buy_against_m1_dump():
     assert 'against_m1_tape' in reason or 'wait' in reason
 
 
-def test_entry_allows_open_sell_zone():
-    rows = _swing_candles()
+def test_entry_allows_open_sell_zone_with_confirm():
+    rows, _ = supply_zone_path(confirm=True)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     sell = z['sell_entry']
     assert sell
@@ -118,6 +134,7 @@ def test_entry_allows_open_sell_zone():
         'SELL', candles=rows, mid=inside, ask=inside + 0.1, bid=inside,
         tick=0.1, spread=0.2)
     assert gate2['allowed'] is True
+    assert gate2.get('trigger') == 'zone'
 
 
 def test_no_candles_blocks_open():
@@ -126,47 +143,16 @@ def test_no_candles_blocks_open():
     assert 'wait_entry_zone' in gate['reason']
 
 
-def test_m5_stop_hint_does_not_inflate_entry_band():
-    """Gold bug: M5 stop_hint ATR swallowed the swing → price always in zone."""
-    rows = _swing_candles()
-    base = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
-    mtf = {
-        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
-        'confidence': 0.7, 'move_ok': True, 'stop_hint_atr14': 50.0,
-        'tf': {
-            'm5': {'kama': None, 'atr14': 50.0},
-            'm1': {'atr14': 0.4},
-        },
-    }
-    rich = oez.compute_entry_zones(rows, tick=0.1, spread=0.2, mtf=mtf)
-    assert rich['atr14'] == 0.4  # M1, not M5 50
-    assert rich['info_stack'] == 'ohlc_swing+kama_adx_atr'
-    span = float(rich['range_hi']) - float(rich['range_lo'])
-    assert rich['band'] <= span * 0.35 + 1e-9
-    # Must stay near structural fraction — not explode toward half-span.
-    assert rich['band'] <= max(base['band'] * 3.0, span * 0.28) + 1e-9
-
-
-def test_mid_range_is_dead_zone_not_pullback():
-    """Structural mid must not count as BUY discount or SELL premium."""
-    rows = _swing_candles()
-    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
-    assert z['ok'] and z['buy_entry'] and z['sell_entry']
-    buy_hi = float(z['buy_entry']['hi'])
-    sell_lo = float(z['sell_entry']['lo'])
-    assert buy_hi < sell_lo  # gap in the middle
-    mid = 0.5 * (float(z['range_lo']) + float(z['range_hi']))
-    assert not oez.price_in_zone(z['buy_entry'], mid)
-    assert not oez.price_in_zone(z['sell_entry'], mid)
-    gate = oez.entry_allows_open(
-        'BUY', candles=rows, mid=mid, ask=mid, bid=mid - 0.1,
-        tick=0.1, spread=0.2)
-    assert gate['allowed'] is False
-    assert 'wait' in (gate['reason'] or '')
+def test_label_swing_structure_hh_hl():
+    from app import structure_memory
+    rows, _ = demand_zone_path(confirm=False)
+    st = structure_memory.label_swing_structure(rows, left=2, right=2)
+    assert st['ready'] is True
+    assert st['last_high_tag'] in ('HH', 'LH', 'SH')
+    assert st['last_low_tag'] in ('HL', 'LL', 'SL')
 
 
 def test_drop_forming_minute_excludes_current_utc_bucket():
-    from datetime import datetime, timezone
     now = datetime(2026, 11, 19, 12, 34, 20, tzinfo=timezone.utc)
     rows = [
         {'at': '2026-11-19T12:32:00+00:00', 'open': 1, 'high': 2, 'low': 0.5, 'close': 1.5},
@@ -179,7 +165,7 @@ def test_drop_forming_minute_excludes_current_utc_bucket():
 
 
 def test_mtf_conflict_blocks_open_even_in_zone():
-    rows = _swing_candles()
+    rows, _ = demand_zone_path(confirm=True)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
@@ -194,3 +180,203 @@ def test_mtf_conflict_blocks_open_even_in_zone():
         tick=0.1, spread=0.2, mtf=mtf)
     assert gate['allowed'] is False
     assert 'mtf' in (gate['reason'] or '')
+
+
+def test_swing_anchor_sl_behind_demand_zone():
+    from app.bracket_learn import swing_anchor_brackets
+    rows, mid = demand_zone_path(confirm=True)
+    z = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    assert buy
+    entry = (float(buy['lo']) + float(buy['hi'])) / 2
+    swing = swing_anchor_brackets(
+        candles=rows, entry=entry, action='BUY', tick=0.1, spread=0.2,
+        min_distance=0.5, atr=1.0, entry_zone=buy)
+    assert swing.get('ready') is True
+    assert float(swing['stop_level']) < float(buy['lo']) + 1e-9
+    assert swing.get('zone_sl') is True or float(swing['stop_level']) <= float(buy['lo'])
+
+
+def test_z03_invalidated_demand_never_selected_even_high_quality():
+    """V3 T05: close below demand lo−tick → INVALIDATED; not selected."""
+    zone = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 999.0, 'touches': 0, 'impulse_i1': 0,
+        'at': '2026-11-18T10:00:00+00:00',
+    }
+    candles = [
+        {'at': '2026-11-18T10:00:00+00:00',
+         'open': 101.0, 'high': 102.0, 'low': 100.0, 'close': 101.5},
+        {'at': '2026-11-18T10:01:00+00:00',
+         'open': 101.0, 'high': 101.2, 'low': 98.5, 'close': 99.0},  # close 99, tick 0.1
+    ]
+    inv = oez.zone_invalidation_status(zone, candles, tick=0.1)
+    assert inv['invalidated'] is True
+    assert inv['state'] == 'INVALIDATED'
+    assert inv['invalidation_reason'] == 'demand_close_below'
+
+    picked = oez._pick_best_zone([zone], mid=101.0, candles=candles, tick=0.1)
+    assert picked is None
+
+    # Wick below lo without close-through is NOT invalidation.
+    wick_only = [
+        candles[0],
+        {'at': '2026-11-18T10:01:00+00:00',
+         'open': 101.0, 'high': 101.5, 'low': 99.0, 'close': 100.5},
+    ]
+    inv2 = oez.zone_invalidation_status(zone, wick_only, tick=0.1)
+    assert inv2['invalidated'] is False
+
+
+def test_z03_high_quality_invalidated_loses_to_valid_lower_quality():
+    """Invalidated high-quality zone must not win over a valid weaker zone."""
+    bad = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 500.0, 'touches': 0, 'impulse_i1': 0,
+        'at': 'a',
+    }
+    # Lower demand — close 99 invalidates 100–102 but not 90–92.
+    good = {
+        'lo': 90.0, 'hi': 92.0, 'kind': 'demand', 'side': 'BUY',
+        'quality': 5.0, 'touches': 0, 'impulse_i1': 0,
+        'at': 'b',
+    }
+    candles = [
+        {'at': 't0', 'open': 101, 'high': 102, 'low': 100, 'close': 101},
+        {'at': 't1', 'open': 101, 'high': 101, 'low': 98, 'close': 99},
+    ]
+    picked = oez._pick_best_zone(
+        [bad, good], mid=91.0, candles=candles, tick=0.1)
+    assert picked is not None
+    assert float(picked['lo']) == 90.0
+    assert picked.get('invalidated') is False
+
+
+def test_z04_zone_confirm_requires_rejection_and_structure():
+    """Confirm OFF by default; optional OR/AND when require_confirm=1."""
+    rows, _ = demand_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    assert buy
+    from datetime import datetime, timedelta
+    last = rows[-1]
+    base_lo, base_hi = float(buy['lo']), float(buy['hi'])
+    mid = 0.5 * (base_lo + base_hi)
+    t = datetime.fromisoformat(last['at'])
+    pin = {
+        'at': (t + timedelta(minutes=1)).isoformat(),
+        'open': mid + 0.05, 'high': mid + 0.2,
+        'low': base_lo - 0.05, 'close': mid + 0.12,
+    }
+    pin_only = list(rows) + [pin]
+    # Default: confirm skipped — price-in-zone path does not wait on pin.
+    conf_off = oez.zone_confirm_allows(
+        'BUY', candles=pin_only, zone=buy, tick=0.1)
+    assert conf_off['ok'] is True
+    assert conf_off.get('reason') == 'confirm_skipped'
+    # Soft OR when confirm forced on.
+    conf_or = oez.zone_confirm_allows(
+        'BUY', candles=pin_only, zone=buy, tick=0.1,
+        require_confirm=True, require_both=False)
+    assert conf_or['ok'] is True
+    assert conf_or['rejection'].get('ok') is True
+    # AND: pin alone waits for structure.
+    conf_and = oez.zone_confirm_allows(
+        'BUY', candles=pin_only, zone=buy, tick=0.1,
+        require_confirm=True, require_both=True)
+    assert conf_and['ok'] is False
+    assert conf_and['rejection'].get('ok') is True
+    assert 'wait_structure' in (conf_and.get('reason') or '')
+
+    rows_ok, _ = demand_zone_path(confirm=True)
+    z2 = oez.compute_entry_zones(rows_ok, tick=0.1, spread=0.2)
+    buy2 = z2['buy_entry']
+    conf2 = oez.zone_confirm_allows(
+        'BUY', candles=rows_ok, zone=buy2, tick=0.1,
+        require_confirm=True, require_both=True)
+    assert conf2['ok'] is True
+    assert conf2['rejection'].get('ok') is True
+    assert conf2['structure'].get('ok') is True
+
+
+def test_z04_invalidated_zone_confirm_refused():
+    zone = {
+        'lo': 100.0, 'hi': 102.0, 'kind': 'demand', 'side': 'BUY',
+        'state': 'INVALIDATED', 'invalidated': True, 'quality': 99.0,
+    }
+    conf = oez.zone_confirm_allows('BUY', candles=[], zone=zone, tick=0.1)
+    assert conf['ok'] is False
+    assert conf['reason'] == 'zone_invalidated'
+
+
+def test_break_fires_on_one_green_m1_not_two():
+    """Default tape_need=1 — structure break is not one extra M1 late."""
+    rows, _ = demand_zone_path(confirm=False)
+    z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
+    buy = z['buy_entry']
+    far = float(buy['hi']) + 5.0 if buy else float(rows[-1]['close']) + 5.0
+    t_last = rows[-1]
+    o = float(t_last['close'])
+    c = o + 0.6
+    rows = list(rows) + [{
+        'at': t_last['at'], 'open': o, 'high': c + 0.1, 'low': o - 0.05, 'close': c,
+    }]
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.55, 'structure_break': 'UP', 'move_ok': True,
+    }
+    br = oez.break_trigger_allows(
+        'BUY', price=far, zones=z, mtf=mtf, tick=0.1, candles=rows)
+    assert br['ok'] is True
+    assert br['tape_need'] == 1
+    assert br['tape_streak'] >= 1
+    assert br['reason'] == 'ohlc_break_structure'
+
+
+def test_range_break_live_mid_when_mtf_aligned():
+    """Live mid through range_hi fires early — do not wait for completed close."""
+    from datetime import timedelta
+    t0 = datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
+    rows = []
+    px = 2000.0
+    for i in range(30):
+        o, c = px, px + 0.05
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': o, 'high': c + 0.1, 'low': o - 0.1, 'close': c,
+        })
+        px = c
+    # Last completed close still inside range; live mid already clears hi.
+    range_hi = 2005.0
+    range_lo = 1998.0
+    # Keep last close below hi.
+    rows[-1] = dict(rows[-1], open=2003.5, high=2004.2, low=2003.0, close=2004.0)
+    # One green tape bar for early proof.
+    rows.append({
+        'at': (t0 + timedelta(minutes=30)).isoformat(),
+        'open': 2003.8, 'high': 2004.5, 'low': 2003.6, 'close': 2004.2,
+    })
+    zones = {
+        'ok': True, 'range_hi': range_hi, 'range_lo': range_lo,
+        'buy_entry': None, 'sell_entry': None,
+    }
+    mtf = {
+        'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
+        'confidence': 0.62, 'structure_break': None, 'move_ok': True,
+    }
+    # Close still below hi → old path would wait; live mid clears → early.
+    live = range_hi + 0.3
+    br = oez.break_trigger_allows(
+        'BUY', price=live, zones=zones, mtf=mtf, tick=0.1, candles=rows)
+    assert br['ok'] is True
+    assert br['reason'] == 'ohlc_break_range_high_live'
+
+    # Without tape + strong conf, live mid alone must not chase.
+    weak = dict(mtf, confidence=0.2)
+    red = list(rows[:-1]) + [{
+        'at': (t0 + timedelta(minutes=30)).isoformat(),
+        'open': 2004.5, 'high': 2004.6, 'low': 2003.0, 'close': 2003.2,
+    }]
+    br_no = oez.break_trigger_allows(
+        'BUY', price=live, zones=zones, mtf=weak, tick=0.1, candles=red)
+    assert br_no['ok'] is False

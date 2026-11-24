@@ -870,11 +870,20 @@ def chart_overlays(candles, *, store=None, epic: str | None = None,
     out['ok'] = True
     out['reason'] = 'series_only'
     analysis = analyze(rows, spread=spread, store=store, epic=epic)
+    # Desk ATR14 = M1 Wilder — never silently paint M5 (~7.5 on GOLD) as ATR14.
+    atr_m1 = atr_wilder(rows, 14) if len(rows) >= 16 else None
+    if atr_m1 is not None:
+        out['atr14'] = float(atr_m1)
     if isinstance(analysis, dict) and analysis.get('ready'):
         tf = analysis.get('tf') or {}
+        m1 = tf.get('m1') or {}
         m5 = tf.get('m5') or {}
         m15 = tf.get('m15') or {}
-        out['atr14'] = _finite(m5.get('atr14')) or _finite(analysis.get('stop_hint_atr14'))
+        atr_m1_tf = _finite(m1.get('atr14'))
+        if atr_m1_tf is not None:
+            out['atr14'] = float(atr_m1_tf)
+        elif atr_m1 is not None:
+            out['atr14'] = float(atr_m1)
         out['adx'] = _finite(m15.get('adx')) or _finite(m5.get('adx'))
         out['di_plus'] = _finite(m15.get('di_plus')) or _finite(m5.get('di_plus'))
         out['di_minus'] = _finite(m15.get('di_minus')) or _finite(m5.get('di_minus'))
@@ -882,7 +891,8 @@ def chart_overlays(candles, *, store=None, epic: str | None = None,
         out['preferred'] = analysis.get('preferred')
         out['confidence'] = analysis.get('confidence')
         out['mtf_reason'] = analysis.get('reason')
-        out['stop_hint_atr14'] = analysis.get('stop_hint_atr14')
+        out['stop_hint_atr14'] = analysis.get('stop_hint_atr14')  # M5 hint only
+        out['atr14_m5'] = _finite(m5.get('atr14')) or _finite(analysis.get('stop_hint_atr14'))
         out['reason'] = 'mtf_ready'
         out['analysis'] = {
             'ready': True,
@@ -894,7 +904,9 @@ def chart_overlays(candles, *, store=None, epic: str | None = None,
             'enabled': analysis.get('enabled'),
             'stop_hint_atr14': analysis.get('stop_hint_atr14'),
             'tf': {
-                'm1': {'kama': (tf.get('m1') or {}).get('kama')},
+                'm1': {
+                    'kama': m1.get('kama'), 'atr14': m1.get('atr14') or atr_m1,
+                },
                 'm5': {
                     'kama': m5.get('kama'), 'atr14': m5.get('atr14'),
                     'adx': m5.get('adx'), 'di_plus': m5.get('di_plus'),
@@ -913,16 +925,15 @@ def chart_overlays(candles, *, store=None, epic: str | None = None,
         if isinstance(analysis, dict):
             out['mtf_reason'] = analysis.get('reason')
             out['mode'] = analysis.get('mode') or 'HOLD'
-        # Partial ADX/ATR for Admin while full 720-bar MTF warms up — avoids
-        # footer flashing "ADX 0 · ATR 0.00" when analyze is not ready yet.
+        # Partial ADX while MTF warms — ATR stays M1 (already set above).
         m5 = resample_m1_ohlc(rows, 5)
         m15 = resample_m1_ohlc(rows, 15)
         if len(m5) >= 30:
             atr5 = atr_wilder(m5, 14)
             a5 = adx_di(m5, 14)
             if atr5 is not None:
-                out['atr14'] = float(atr5)
                 out['stop_hint_atr14'] = float(atr5)
+                out['atr14_m5'] = float(atr5)
             if a5:
                 out['adx'] = _finite(a5.get('adx'))
                 out['di_plus'] = _finite(a5.get('di_plus'))

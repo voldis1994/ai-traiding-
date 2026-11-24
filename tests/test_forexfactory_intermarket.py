@@ -26,9 +26,13 @@ def test_real_forex_factory_schema_week_and_timezone(tmp_path):
     assert raw['events'][0]['impact']=='HIGH'
     assert raw['source']=='Forex Factory weekly JSON'
     assert raw['coverage_start']=='2026-10-11'
-    assert assess_news('EURUSD',tmp_path/'economic_calendar.json',now=NOW,instrument_currencies=['EUR','USD'])['status']=='NEWS_WINDOW'
+    win=assess_news('EURUSD',tmp_path/'economic_calendar.json',now=NOW,instrument_currencies=['EUR','USD'])
+    assert win['status']=='NEWS_WINDOW'
+    assert win['entry_allowed'] is True
     assert assess_news('GBPJPY',tmp_path/'economic_calendar.json',now=NOW,instrument_currencies=['GBP','JPY'])['status']=='CLEAR'
-    assert assess_news('UNKNOWN',tmp_path/'economic_calendar.json',now=NOW,instrument_currencies=[])['status']=='UNMAPPED_INSTRUMENT'
+    unmapped=assess_news('UNKNOWN',tmp_path/'economic_calendar.json',now=NOW,instrument_currencies=[])
+    assert unmapped['status']=='UNMAPPED_INSTRUMENT'
+    assert unmapped['entry_allowed'] is True
 
 
 def test_wrong_week_or_malformed_feed_never_written(tmp_path):
@@ -49,15 +53,22 @@ def test_high_impact_window_only_and_stale_fail_closed(tmp_path):
         ff_record(when='2026-10-14T13:10:00-04:00',impact='Low',country='EUR',title='minor')],now=NOW)))
     # High event 31 min away -> no block, low even within range -> no block.
     assert assess_news('EURUSD',file,now=NOW,instrument_currencies=['EUR','USD'])['status']=='CLEAR'
-    assert assess_news('EURUSD',file,now=NOW+timedelta(minutes=2),instrument_currencies=['EUR','USD'])['status']=='NEWS_WINDOW'
+    mid=assess_news('EURUSD',file,now=NOW+timedelta(minutes=2),instrument_currencies=['EUR','USD'])
+    assert mid['status']=='NEWS_WINDOW' and mid['entry_allowed'] is True
     # Weekly FF cache stays valid for 24h — rate-limits must not stale-out LIVE.
     assert assess_news('EURUSD',file,now=NOW+timedelta(hours=2),instrument_currencies=['EUR','USD'])['status']=='CLEAR'
-    assert assess_news('EURUSD',file,now=NOW+timedelta(hours=25),instrument_currencies=['EUR','USD'])['status']=='CALENDAR_UNAVAILABLE'
+    stale=assess_news('EURUSD',file,now=NOW+timedelta(hours=25),instrument_currencies=['EUR','USD'])
+    assert stale['status']=='CALENDAR_UNAVAILABLE' and stale['entry_allowed'] is True
 
 
 def test_profile_multiple_asset_classes():
     assert instrument_profile('CS.D.EURUSD.CFD.IP')['currencies']==['EUR','USD']
     assert instrument_profile('GOLD')['currencies']==['USD']
+    # Capital.com gold epic has no literal "GOLD" — must still map USD.
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['kind']=='METALS'
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['currencies']==['USD']
+    assert instrument_profile('CS.D.USCGC.TODAY.IP')['mapped'] is True
+    assert instrument_profile('OIL_CRUDE')['kind']=='COMMODITIES'
     assert instrument_profile('NASDAQ')['kind']=='INDICES'
     assert instrument_profile('BITCOIN')['kind']=='CRYPTO'
     assert instrument_profile('SIM')['mapped'] is False
@@ -144,8 +155,10 @@ def test_engine_news_guard_applies_without_duplicate_intermarket_veto(tmp_path):
     event=(current+timedelta(minutes=10)).astimezone(timezone(timedelta(hours=-4))).isoformat()
     e.news_calendar_path.write_text(json.dumps(convert_forex_factory([ff_record(when=event)],now=current)))
     e.intermarket.state={'status':'READY','peers':[]}
-    # Test the actual safety gate used immediately before an order is submitted.
-    assert not e._external_entry_check('BUY')['entry_allowed']
+    # V5 D05: NEWS_WINDOW is informational — OPEN not blocked; status still visible.
+    gated=e._external_entry_check('BUY')
+    assert gated['entry_allowed'] is True
+    assert gated['status'] in ('NEWS_WINDOW','AI_INTERMARKET_FUSION','CLEAR')
     old=(current-timedelta(hours=4)).astimezone(timezone(timedelta(hours=-4))).isoformat()
     e.news_calendar_path.write_text(json.dumps(convert_forex_factory([ff_record(when=old)],now=current)))
     assert e._external_entry_check('BUY')['entry_allowed']

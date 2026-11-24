@@ -58,7 +58,8 @@ if /I "%~1"=="--prepare" (
 )
 
 echo [INFO] Starting the robot and opening the login page...
-echo [INFO] If browser stays closed, open http://127.0.0.1:8765
+echo [INFO] If browser stays closed, open http://127.0.0.1:8765/admin
+echo [INFO] Desk UI: http://127.0.0.1:8765/desk
 echo [INFO] Runtime log: %LOG_DIR%\startup.log
 echo [INFO] Leave this window open while using the robot.
 "%VENV_PY%" -u launcher.py

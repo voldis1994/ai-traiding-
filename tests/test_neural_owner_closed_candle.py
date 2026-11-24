@@ -21,7 +21,11 @@ def sandbox():
 
 def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
     with sandbox() as d:
-        p=AutoEvolution(Store(Path(d)/'db.sqlite3'), Path(d)/'active_policy.py')
+        from app import self_params as sp
+        store=Store(Path(d)/'db.sqlite3')
+        sp.save(store,{**sp.load(store),'policy_live_execute':1},
+                reason='test_neural_owner')
+        p=AutoEvolution(store, Path(d)/'active_policy.py')
         # 38%: previously forbidden by 60% and by 8.1pp margin
         score={'BUY':.32, 'SELL':.38, 'HOLD':.30}
         assert p.neural_decision(score)=='SELL'
@@ -68,7 +72,9 @@ def test_ai_no_entry_confidence_threshold_and_hold_still_its_own_choice():
             score,'BUY',returns_bps={'5':1,'15':2},opposite_streak=5)=='HOLD'
 
 
-def test_second_manual_deal_changes_lot_and_recovers_after_closed():
+def test_second_manual_deal_changes_lot_and_recovers_after_closed(monkeypatch):
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     async def scenario():
         with sandbox() as d:
             store=Store(Path(d)/'db.sqlite3')
@@ -149,6 +155,8 @@ def test_new_manual_market_adopted_without_switch_button():
 
 def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
     from app import engine as module
+    from tests.market_helpers import pass_ohlc_regime
+    pass_ohlc_regime(monkeypatch)
     clock=[datetime(2026,10,14,16,30,tzinfo=timezone.utc)]
     def context(rows,*,spread=0.,epic=None,**_kw):
         return {'ready':True,'reason':'synthetic completed M1','epic':epic,
@@ -184,8 +192,11 @@ def test_signals_and_exits_only_once_per_completed_m1_bar(monkeypatch):
             assert e.last_decision_bar==bar
             assert len([r for r in broker.requests if r[0]=='OPEN'])==1
             assert e.brain.core.steps==2
-            count=store.db.execute("SELECT COUNT(*) FROM events WHERE kind='entry'").fetchone()[0]
-            assert count==1
+            # kind=entry also logs "Trigger fired" — count OPEN approvals only.
+            approved=store.db.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='entry' "
+                "AND message LIKE 'Neural entry approved%'").fetchone()[0]
+            assert approved==1
             assert e.snapshot()['neural_decision_bar']==bar
     asyncio.run(scenario())
 
@@ -226,10 +237,11 @@ def test_position_exit_market_closes_on_confirmed_reverse(monkeypatch):
                 clock[0]+=timedelta(minutes=1)
                 await e.poll()
                 if exits:break
-            assert exits  # confirmed reverse must leave the wrong side
+            assert not exits  # neural reverse is diagnostic — broker SL/TP/TP1 only
             snap=e.snapshot()
-            assert snap.get('neural_market_exit') is True
+            assert snap.get('neural_market_exit') is False
+            assert snap.get('neural_close_executable') is False
             events=store.recent(50)
-            assert any(ev.get('kind')=='exit' and 'confirmed reverse' in str(ev.get('message','')).lower()
+            assert any(ev.get('kind')=='exit' and 'diagnostic' in str(ev.get('message','')).lower()
                        for ev in events)
     asyncio.run(scenario())

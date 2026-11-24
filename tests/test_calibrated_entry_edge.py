@@ -84,6 +84,9 @@ def test_set_calibrated_floor_shared_by_policy_and_compose():
 def test_live_evaluate_exposes_calibration_and_uses_floor():
     with sandbox() as d:
         store = Store(Path(d) / 'db.sqlite3')
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'policy_live_execute': 1},
+                reason='test_calibrated_edge')
         policy = _policy(store, d)
         scores = {'BUY': 0.55, 'SELL': 0.25, 'HOLD': 0.20}
         out = policy.evaluate_neural_entry(

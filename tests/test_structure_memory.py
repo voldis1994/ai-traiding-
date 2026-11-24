@@ -112,14 +112,14 @@ def test_extension_chase_blocks_buy_only_on_rollover_at_high():
     assert ok.get('ok') is True
 
 
-def test_extension_allows_sell_dump_continuation_at_low():
-    """Live screenshot: consecutive red M1 dump — must NOT HOLD as chase."""
+def test_extension_blocks_sell_after_finished_dump_at_low():
+    """Long dump already at the low = move finished — refuse late SHORT chase."""
     t0 = datetime(2026, 11, 18, 14, 30, tzinfo=timezone.utc)
     rows = []
     px = 3780.0
     for i in range(40):
         o = px
-        px -= 0.65  # steady dump like 15:00–15:10 Gold
+        px -= 0.65  # steady dump — by the end RSI-style exhaustion
         rows.append({
             'at': (t0 + timedelta(minutes=i)).isoformat(),
             'open': o, 'high': o + 0.15, 'low': px - 0.1, 'close': px,
@@ -128,8 +128,9 @@ def test_extension_allows_sell_dump_continuation_at_low():
     chase = sm.extension_chase(
         'SELL', candles=rows, market_context={'mid': entry, 'close': entry},
         atr=3.0)
-    assert chase.get('ok') is True
-    assert chase.get('reason') == 'continuation_at_low'
+    assert chase.get('ok') is False
+    assert chase.get('reason') == 'chase_extension_low'
+    assert chase.get('exhausted') is True
 
     scores_raw = {'SELL': 0.55, 'BUY': 0.20, 'HOLD': 0.25}
     out = rc.evaluate(
@@ -138,8 +139,41 @@ def test_extension_allows_sell_dump_continuation_at_low():
         mtf_analysis={'ready': True, 'stop_hint_atr14': 3.0,
                       'structure_break': 'DOWN', 'preferred': 'SELL', 'mode': 'SELL'},
         candles=rows)
-    assert out['allowed'] is True
-    assert (out.get('extension_chase') or {}).get('reason') == 'continuation_at_low'
+    assert out['allowed'] is False
+    assert out['reason'] == 'chase_extension_low'
+
+
+def test_extension_allows_fresh_extreme_and_mid_dump():
+    """First bars into the low + mid-range dump remain early structure (not chase)."""
+    t0 = datetime(2026, 11, 18, 14, 30, tzinfo=timezone.utc)
+    # Build a wide range first, then sit mid — not yet exhausted.
+    rows = []
+    for i in range(20):
+        # Alternate so span is large but closes stay mid.
+        base = 3780.0 - (i % 2) * 8.0
+        rows.append({
+            'at': (t0 + timedelta(minutes=i)).isoformat(),
+            'open': base, 'high': base + 1.0, 'low': base - 1.0, 'close': base,
+        })
+    hi = max(r['high'] for r in rows)
+    lo = min(r['low'] for r in rows)
+    mid = lo + 0.45 * (hi - lo)
+    mid_ok = sm.extension_chase(
+        'SELL', candles=rows, market_context={'mid': mid, 'close': mid}, atr=2.0)
+    assert mid_ok.get('ok') is True
+    assert mid_ok.get('reason') == 'not_extended'
+
+    # One fresh bar into the bottom 15% — early structure entry, not exhausted.
+    tip = lo + 0.05 * (hi - lo)
+    fresh_rows = list(rows) + [{
+        'at': (t0 + timedelta(minutes=20)).isoformat(),
+        'open': tip + 0.4, 'high': tip + 0.5, 'low': tip - 0.1, 'close': tip,
+    }]
+    fresh = sm.extension_chase(
+        'SELL', candles=fresh_rows,
+        market_context={'mid': tip, 'close': tip}, atr=2.0)
+    assert fresh.get('ok') is True
+    assert fresh.get('reason') == 'fresh_extreme_low'
 
 
 def test_reentry_evaluate_blocks_chase_extension():

@@ -17,7 +17,9 @@ Tur ir:
 - kas ir LIVE lēmums vs kas ir tikai shadow
 
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
-Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
+Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`  
+**Pilnā sistēmas karte (full map):** [`SISTEMAS_ARHITEKTURA_LV.md`](SISTEMAS_ARHITEKTURA_LV.md)  
+**V3.0 sistēmas līgums (mērķa ieviešana):** [`docs/v3/`](docs/v3/) — PDF + statuss `IMPLEMENTATION_STATUS.md`
 
 ## Portāli (stabilie ceļi)
 
@@ -36,10 +38,22 @@ Deploy detalizētāk: [`DEPLOY_LV.md`](DEPLOY_LV.md). Ceļi `/`, `/app`, `/admin
 
 ## Kā palaist
 
-1. Windows: `run_windows.bat` → `http://127.0.0.1:8765`
-2. Admin: `/admin` → izveido klientu + pieslēdz brokeru API
-3. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
-4. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+**Windows (pilnā sistēma):** dubultklikšķis **`START.bat`**
+(vai `run_windows.bat`) → **`http://127.0.0.1:8765/admin`**
+
+| URL | Kas |
+|-----|-----|
+| `/admin` | Īstā NEURAL Desk (Capital LIVE + neironi) |
+| `/desk` | React PerpSignal Desk — tie paši Admin API (pēc login) |
+| `/app` | Klienta portāls |
+
+> `perpsignal-desk` + `npm run dev` (`:5173`) ir tikai UI izstrādei. **Robots un LIVE dati ir tikai uz 8765.**
+
+1. Admin: `/admin` → izveido klientu + pieslēdz brokeru API
+2. Klients: `/app` ar admin iedoto login/paroli → 1. manuālais treids broker app → robots pārņem
+3. Pēc aizvēršanas AI lemj uz **katru jaunu pabeigtu M1** sveci
+
+Skat. arī `KĀ_PALAIST_LV.txt`.
 
 Linux:
 

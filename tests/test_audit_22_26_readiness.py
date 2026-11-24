@@ -67,12 +67,20 @@ def test_prep_eval_blocks_until_holdout_passes_and_separates_stages():
 
 def test_argmax_kept_but_score_edge_is_not_utility_without_readiness():
     with tempfile.TemporaryDirectory() as d:
-        p = AutoEvolution(Store(Path(d) / 'db.sqlite3'), Path(d) / 'pol.py')
-        # Small edge 0.05 < default MIN_EDGE 0.06 → evolved policy HOLDs.
+        store = Store(Path(d) / 'db.sqlite3')
+        p = AutoEvolution(store, Path(d) / 'pol.py')
+        # V5: policy_live_execute defaults OFF — research only; argmax passes through.
+        # Score edge is still marked as not calibrated profit probability.
         weak = {'BUY': 0.40, 'SELL': 0.35, 'HOLD': 0.25}
         weak_out = p.evaluate_neural_entry(weak)
-        assert weak_out['action'] == 'HOLD' and weak_out['proposal'] == 'BUY'
+        assert weak_out['action'] == 'BUY' and weak_out['proposal'] == 'BUY'
         assert weak_out['evidence']['score_edge_is_not_trading_advantage'] is True
+        # With live execute ON, small edge < MIN_EDGE → evolved policy HOLDs.
+        from app import self_params as sp
+        sp.save(store, {**sp.load(store), 'policy_live_execute': 1},
+                reason='test_policy_live')
+        weak_hold = p.evaluate_neural_entry(weak)
+        assert weak_hold['action'] == 'HOLD' and weak_hold['proposal'] == 'BUY'
         scores = {'BUY': 0.48, 'SELL': 0.30, 'HOLD': 0.22}  # edge clears policy
         bare = p.evaluate_neural_entry(scores)
         assert bare['action'] == 'BUY'
@@ -146,14 +154,16 @@ def test_cold_start_first_manual_close_releases_prep_block():
         engine.last_closed_step = 10  # first manual already closed
         engine.positions = []
         released = engine._maybe_release_cold_start_prep()
-        assert released and released['ready'] is True
-        assert released.get('cold_start_open') is True
-        assert brain.trading_readiness()['ready'] is True
+        assert released and released.get('cold_start_open') is True
+        assert released.get('ready') is False
+        assert brain.trading_readiness()['ready'] is False
+        assert brain.trading_readiness()['cold_start_open'] is True
         gates = engine.live_open_gates('BUY')
         assert gates['allowed'] is True
-        # Flat re-arm path also grants (idempotent).
+        # Flat re-arm path also grants (idempotent) — still not prep PASSED.
         engine._release_execution_after_flat('m1')
-        assert brain.trading_readiness()['ready'] is True
+        assert brain.trading_readiness()['cold_start_open'] is True
+        assert brain.trading_readiness()['ready'] is False
 
 
 def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic():
@@ -175,9 +185,9 @@ def test_snapshot_separates_minute_accuracy_trade_win_rate_and_close_diagnostic(
         assert snap['minute_direction_accuracy'] == pytest.approx(0.4)
         assert snap['trade_win_rate'] == pytest.approx(1.0)
         assert snap['model_score_is_calibrated_profit_probability'] is False
-        assert snap['neural_close_diagnostic_only'] is False
-        assert snap['neural_market_exit'] is True
-        assert snap['neural_close_executable'] is True
+        assert snap['neural_close_diagnostic_only'] is True
+        assert snap['neural_market_exit'] is False
+        assert snap['neural_close_executable'] is False
         assert 'evolved policy' in snap['neural_entry_rule'].lower()
         assert 'policy_live_execute' in snap['neural_entry_rule']
         assert snap['metric_labels']['minute_direction_accuracy']

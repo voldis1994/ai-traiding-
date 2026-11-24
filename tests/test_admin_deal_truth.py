@@ -21,6 +21,9 @@ class _Engine:
 
 def test_deal_truth_reports_tp_and_trail_phase():
     e = _Engine()
+    # Trail off → Admin must not advertise be_lock/trail (honesty when TRAIL off).
+    e.TRAIL_ENABLED = False
+    e._trail_is_enabled = lambda: False
     p = {
         'dealId': 'd1', 'direction': 'SELL', 'size': '0.12', 'level': 100.,
         'stopLevel': 104., 'profitLevel': 96., 'upl': 0.3, 'epic': 'GOLD',
@@ -38,7 +41,11 @@ def test_deal_truth_reports_tp_and_trail_phase():
     assert t['has_tp'] is True
     assert t['has_sl'] is True
     assert t['enrolled'] is True
-    assert t['trail_phase'] == 'be_lock'
+    assert t['trail_phase'] == 'flat'
+    # When trail is enabled, runtime phase surfaces honestly.
+    e._trail_is_enabled = lambda: True
+    t2 = AccountRuntime._deal_protection_truth(e, p)
+    assert t2['trail_phase'] == 'be_lock'
 
 
 def test_enrich_positions_includes_lot_and_flags():

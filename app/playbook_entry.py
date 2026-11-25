@@ -8,7 +8,8 @@ Default ON via ``self_params.playbook_hard_entry``. When hard:
 
 Zone candle confirm (pin/engulf/structure) is OFF by default —
 ``playbook_require_zone_confirm=0``: price touch/cross of the entry zone
-is enough for OPEN (no wait for a special confirm candle).
+is enough for OPEN. That matches guide 1 “limit order inside the zone”;
+optional pin+structure is the “market after confirm” path when confirm=1.
 """
 from __future__ import annotations
 

@@ -279,7 +279,9 @@ def detect_base_impulse_zones(bars, *, atr=None, limit=80, max_zones=6) -> dict:
     found = []
     # Impulse ends at index i; base sits immediately before impulse start.
     for i in range(10, len(path)):
-        for impulse_len in (3, 4, 5, 6, 7, 8):
+        # 1–2 bar dumps/spikes count (US Tech flag→one red impulse); longer
+        # impulses keep the majority-body rule.
+        for impulse_len in (1, 2, 3, 4, 5, 6, 7, 8):
             imp_start = i - impulse_len + 1
             if imp_start < 3:
                 continue
@@ -292,12 +294,13 @@ def detect_base_impulse_zones(bars, *, atr=None, limit=80, max_zones=6) -> dict:
                 continue
             if abs(move) / imp_span < 0.55:
                 continue
-            # Mostly one-way bodies.
+            # Mostly one-way bodies (majority; single-bar needs 1).
             up_bodies = sum(1 for b in imp if b['close'] > b['open'])
             dn_bodies = sum(1 for b in imp if b['close'] < b['open'])
-            if move > 0 and up_bodies < max(2, impulse_len // 2 + 1):
+            need_bodies = max(1, (impulse_len + 1) // 2)
+            if move > 0 and up_bodies < need_bodies:
                 continue
-            if move < 0 and dn_bodies < max(2, impulse_len // 2 + 1):
+            if move < 0 and dn_bodies < need_bodies:
                 continue
             direction = 'UP' if move > 0 else 'DOWN'
             for base_len in (2, 3, 4, 5, 6):
@@ -310,7 +313,8 @@ def detect_base_impulse_zones(bars, *, atr=None, limit=80, max_zones=6) -> dict:
                 base_hi = max(b['high'] for b in base)
                 base_lo = min(b['low'] for b in base)
                 base_span = base_hi - base_lo
-                if base_span <= 0 or base_span > 0.55 * abs(move):
+                # Flag bases can be ~0.6× a single dump bar (US Tech circle).
+                if base_span <= 0 or base_span > 0.70 * abs(move):
                     continue
                 # Clean base: bodies overlap / small relative to impulse.
                 body_mids = [0.5 * (b['open'] + b['close']) for b in base]
@@ -325,9 +329,17 @@ def detect_base_impulse_zones(bars, *, atr=None, limit=80, max_zones=6) -> dict:
                     if b['low'] <= base_hi and b['high'] >= base_lo:
                         touches += 1
                 # Quality: strong move, tight base, fewer post-touches, recent.
+                # Just-formed flag→impulse must beat older higher boxes — otherwise
+                # LIVE keeps "seeing" stale Supply while the circled break is ignored.
                 q = (abs(move) / atr_v) * (abs(move) / max(base_span, 1e-9))
                 q *= 1.0 / (1.0 + 0.65 * touches)
-                q *= 1.0 / (1.0 + 0.02 * (len(path) - 1 - i))
+                age = len(path) - 1 - i
+                q *= 1.0 / (1.0 + 0.22 * age)
+                q *= 1.0 + 0.35 / float(max(1, impulse_len))
+                if age <= 1:
+                    q *= 2.2
+                elif age <= 3:
+                    q *= 1.45
                 side = 'BUY' if direction == 'UP' else 'SELL'
                 found.append({
                     'side': side,

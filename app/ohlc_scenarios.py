@@ -128,6 +128,46 @@ def _range_box(path, lookback=24):
     }
 
 
+def _recent_flag_box(path, *, min_len=5, max_len=12):
+    """Tight consolidation immediately before the last bar (circled flag).
+
+    Full-window ``_range_box`` often swallows the flag into the prior trend
+    after the break candle prints. Scan short pre-break windows for span ≤
+    1.75×ATR (ATR from pre-break body — dump must not inflate the ruler).
+    """
+    if len(path) < min_len + 1:
+        return None
+    body = path[:-1]
+    # Exclude the break/impulse bar from ATR so a dump does not disqualify
+    # the flag that produced it.
+    atr = _atr(body) or _atr(path)
+    if atr is None or atr <= 0:
+        return None
+    max_span = 1.75 * atr
+    best = None
+    upper = min(max_len, len(body))
+    for n in range(min_len, upper + 1):
+        window = body[-n:]
+        hi = max(b['high'] for b in window)
+        lo = min(b['low'] for b in window)
+        span = hi - lo
+        if span <= 0 or span > max_span:
+            continue
+        closes = [b['close'] for b in window]
+        frac = sum(1 for c in closes if lo <= c <= hi) / float(len(closes))
+        if frac < 0.7:
+            continue
+        score = (max_span / max(span, 1e-9)) * frac
+        if best is None or score > best['score']:
+            best = {
+                'lo': float(lo), 'hi': float(hi), 'span': float(span),
+                'atr': float(atr), 'inside_frac': float(frac),
+                'compression': True, 'flag': True, 'flag_len': int(n),
+                'score': float(score),
+            }
+    return best
+
+
 def classify(candles, *, mid=None, zones=None, tick=0.01, store=None) -> dict:
     """Classify live 1m scenario from completed OHLC (+ optional entry zones)."""
     path = structure_memory.normalise(candles, limit=80)
@@ -160,6 +200,33 @@ def classify(candles, *, mid=None, zones=None, tick=0.01, store=None) -> dict:
     struct = structure_memory.label_swing_structure(path, left=2, right=2) or {}
     bos = structure_memory.bos_choch(path, left=2, right=2) or {}
     box = _range_box(path)
+    # Flag→impulse: prefer the tight pre-break consolidation (circled area)
+    # over a wide post-dump window that erased COMPRESSION.
+    flag = _recent_flag_box(path)
+    if flag:
+        last_c = _finite(path[-1].get('close'))
+        flo = _finite(flag.get('lo'))
+        fhi = _finite(flag.get('hi'))
+        broke = (
+            last_c is not None and flo is not None and fhi is not None
+            and (last_c < flo or last_c > fhi))
+        if broke or not (box and box.get('compression')):
+            box = dict(flag)
+            box['broken'] = bool(broke)
+            box['pre_break'] = True
+    elif len(path) >= 17:
+        pre = _range_box(path[:-1], lookback=16)
+        if pre and pre.get('compression'):
+            last_c = _finite(path[-1].get('close'))
+            pre_lo = _finite(pre.get('lo'))
+            pre_hi = _finite(pre.get('hi'))
+            broke = (
+                last_c is not None and pre_lo is not None and pre_hi is not None
+                and (last_c < pre_lo or last_c > pre_hi))
+            if broke or not (box and box.get('compression')):
+                box = dict(pre)
+                box['broken'] = bool(broke)
+                box['pre_break'] = True
     out['bias'] = struct.get('bias') or bos.get('bias')
     out['event'] = bos.get('event')
     out['range'] = box

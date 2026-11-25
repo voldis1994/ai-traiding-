@@ -2863,25 +2863,16 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=reentry.get('reason') or 'reentry_confirm_hold',
                             proposal=result.get('proposal') or result['action'])
-            # OHLC regime: chop / low vol / doji / impulse / chaos → do not OPEN.
-            # Replaces eternal M1 colour-confirm HOLD as the candle-quality veto.
-            from . import ohlc_regime_gate
-            candles_rg=self._decision_candles()
-            atr_rg=_num((mtf_analysis or {}).get('stop_hint_atr14'))
-            struct_rg=((edge_advice or {}).get('structure')
-                       or ctx.get('structure'))
-            regime_gate=ohlc_regime_gate.evaluate(
-                candles=candles_rg,mid=_num(self.market.get('mid')),
-                spread=_num(self.market.get('spread')),atr=atr_rg,
-                structure=struct_rg,store=self.store)
-            result=dict(result,ohlc_regime=regime_gate)
-            if not regime_gate.get('allowed',True):
+            # Guide 1+2 checklist: London→NY session window (playbook_session_filter).
+            from . import playbook_entry as _pb_entry
+            session_gate=_pb_entry.session_allows_open(store=self.store)
+            result=dict(result,playbook_session=session_gate)
+            if not session_gate.get('allowed',True):
                 return dict(result,action='HOLD',
-                            reason=regime_gate.get('reason') or 'no_trade_ohlc',
+                            reason=session_gate.get('reason') or 'wait_session_london_ny',
                             proposal=result.get('proposal') or result['action'])
-            # OHLC entry zone + MTF (KAMA/ADX/ATR): LIVE OPEN waits for the
-            # structural band, but neural side is still recognized (proposal /
-            # neural_side) so close teachers + UI see the vote even outside zone.
+            # OHLC entry zone first — playbook break/flag may override impulse
+            # regime veto (dump bar is often the continuation the zone just saw).
             zone_gate=self._ohlc_entry_zone_gate(
                 result['action'],mtf_analysis=mtf_analysis)
             neural_side=result.get('action')
@@ -2892,6 +2883,30 @@ class SingleTradeEngine:
                             reason=zone_gate.get('reason') or 'wait_entry_zone',
                             proposal=result.get('proposal') or neural_side,
                             neural_side=neural_side)
+            # OHLC regime: chop / low vol / doji / impulse / chaos → do not OPEN.
+            # Replaces eternal M1 colour-confirm HOLD as the candle-quality veto.
+            from . import ohlc_regime_gate
+            candles_rg=self._decision_candles()
+            atr_m1,_kama_rg=self._bracket_m1_hints(mtf_analysis or {})
+            atr_rg=atr_m1  # M1 only — never M5 stop_hint for impulse/chop scale
+            struct_rg=((edge_advice or {}).get('structure')
+                       or ctx.get('structure'))
+            regime_gate=ohlc_regime_gate.evaluate(
+                candles=candles_rg,mid=_num(self.market.get('mid')),
+                spread=_num(self.market.get('spread')),atr=atr_rg,
+                structure=struct_rg,store=self.store)
+            result=dict(result,ohlc_regime=regime_gate)
+            if not regime_gate.get('allowed',True):
+                if ohlc_regime_gate.playbook_overrides_regime(
+                        regime_gate,zone_gate):
+                    result=dict(result,ohlc_regime=dict(
+                        regime_gate,allowed=True,
+                        playbook_override=True,
+                        override_of=regime_gate.get('reason')))
+                else:
+                    return dict(result,action='HOLD',
+                                reason=regime_gate.get('reason') or 'no_trade_ohlc',
+                                proposal=result.get('proposal') or result['action'])
             # Structure shadow evidence only (UI / why) — NEVER veto LIVE OPEN.
             # LIVE executes neural vote; shadow teaches weights after SL closes.
             result=dict(result,structure_shadow=self._structure_shadow_advice(
@@ -3238,8 +3253,8 @@ class SingleTradeEngine:
         m1 = tf.get('m1') if isinstance(tf.get('m1'), dict) else {}
         m5 = tf.get('m5') if isinstance(tf.get('m5'), dict) else {}
         atr = _num(m1.get('atr14'))
-        if atr is None:
-            atr = _num(mtf.get('stop_hint_atr14'))
+        # Never fall back to M5 stop_hint_atr14 for LIVE SL floor — that reinvented
+        # wrong-TF width. Missing M1 ATR → None → broker min + buffer only.
         kama = _num(m1.get('kama'))
         if kama is None:
             kama = _num(m5.get('kama'))
@@ -6179,17 +6194,13 @@ class SingleTradeEngine:
             # Completed M1 only — forming QUOTE minute must not move zona/SL/TP.
             candles=self._decision_candles(self.mandate['epic'])
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-            from . import ohlc_regime_gate
-            atr_sub=_num((mtf_live or {}).get('stop_hint_atr14'))
-            regime_sub=ohlc_regime_gate.evaluate(
-                candles=candles,mid=mid,spread=spread,atr=atr_sub,
-                structure=(self.market_context or {}).get('structure'),
-                store=self.store)
-            if not regime_sub.get('allowed',True):
-                self.last_entry_reason=regime_sub.get('reason') or 'no_trade_ohlc'
-                self.store.event('entry','OPEN skipped — OHLC regime veto',{
+            from . import playbook_entry as _pb_entry
+            session_sub=_pb_entry.session_allows_open(store=self.store)
+            if not session_sub.get('allowed',True):
+                self.last_entry_reason=session_sub.get('reason') or 'wait_session_london_ny'
+                self.store.event('entry','OPEN skipped — playbook session window',{
                     'reason':self.last_entry_reason,'action':action,
-                    'flags':regime_sub.get('flags')})
+                    'hour':session_sub.get('hour')})
                 return
             # Defense in depth: OHLC+MTF zona *and* shared fleet side (same as eval).
             zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
@@ -6203,18 +6214,30 @@ class SingleTradeEngine:
                     'shared_side':zone_gate.get('shared_side'),
                     'source':zone_gate.get('source')})
                 return
+            from . import ohlc_regime_gate
+            atr_sub,_kama_sub=self._bracket_m1_hints(mtf_live or {})
+            regime_sub=ohlc_regime_gate.evaluate(
+                candles=candles,mid=mid,spread=spread,atr=atr_sub,
+                structure=(self.market_context or {}).get('structure'),
+                store=self.store)
+            if not regime_sub.get('allowed',True):
+                if ohlc_regime_gate.playbook_overrides_regime(
+                        regime_sub,zone_gate):
+                    self.store.event('entry','OPEN — playbook overrides regime',{
+                        'override_of':regime_sub.get('reason'),
+                        'trigger':zone_gate.get('trigger'),'action':action})
+                else:
+                    self.last_entry_reason=regime_sub.get('reason') or 'no_trade_ohlc'
+                    self.store.event('entry','OPEN skipped — OHLC regime veto',{
+                        'reason':self.last_entry_reason,'action':action,
+                        'flags':regime_sub.get('flags')})
+                    return
             zone=bracket_learn.zone_at_open(candles,multi_tf=True)
             rng=zone['range_distance'] or ohlc_range_distance(candles)
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             learned=bracket_learn.load_multipliers(self.store)
-            # Break trigger is earlier/more aggressive — keep SL tighter than pullback.
-            if zone_gate.get('trigger')=='break':
-                try:
-                    learned=dict(learned or {})
-                    learned['sl_scale']=min(float(learned.get('sl_scale') or 1.0),0.85)
-                except (TypeError,ValueError):
-                    pass
+            # Structural SL/TP only — do not shrink break opens via learned sl_scale.
             cycle_state=unified_cycle.load_state(self.store)
             scores=(self.last_signal or {}).get('scores')
             evaluation={'action':action,'score_edge':(

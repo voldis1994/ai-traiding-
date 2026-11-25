@@ -24,16 +24,16 @@ def test_bracket_m1_hints_prefers_m1_atr_over_m5_stop_hint():
     assert kama == 100.1
 
 
-def test_bracket_m1_hints_falls_back_to_stop_hint():
+def test_bracket_m1_hints_no_m5_stop_hint_fallback():
     class _E(SingleTradeEngine):
         def __init__(self):
             pass
     e = _E()
     atr, kama = e._bracket_m1_hints({
-        'stop_hint_atr14': 8.0,
+        'stop_hint_atr14': 8.0,  # M5 — must stay unused for LIVE floor
         'tf': {'m1': {}, 'm5': {'kama': 99.0}},
     })
-    assert atr == 8.0
+    assert atr is None
     assert kama == 99.0
 
 

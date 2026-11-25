@@ -110,7 +110,8 @@ DEFAULTS = {
     'bracket_batch_raise_step': 1.08,
     'bracket_batch_cut_step': 0.92,
     # Min reward:risk for LIVE SL/TP — swing SL is capped (or vetoed) to this RR.
-    'bracket_min_rr': 1.0,
+    # Guide 3: min R:R usually 1:1.5 or 1:2 — seed 1.5 (never soft-cap SL to hit it).
+    'bracket_min_rr': 1.5,
     # LIVE OPEN prep/eval floors (seeds) — robot-owned, not frozen module consts.
     'min_prep_candles': 96,
     'train_frac': 0.70,

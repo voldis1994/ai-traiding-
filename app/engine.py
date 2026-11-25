@@ -1075,8 +1075,10 @@ class SingleTradeEngine:
         self.shadow_paper=ShadowPaperJournal(store)
         # Persist soft LR/repeats ceilings so stale Store 0.28 does not keep teaching hot.
         try:
-            from .self_params import migrate_soft_ceilings
+            from .self_params import migrate_soft_ceilings, migrate_zone_confirm_off
             migrate_soft_ceilings(store)
+            # #309: clear persisted confirm=1 from #308 so zone-touch can OPEN.
+            migrate_zone_confirm_off(store)
         except Exception as exc:
             self.store.event('warning','self_params soft-ceiling migrate deferred',
                 {'type':type(exc).__name__,'detail':str(exc)[:160]})
@@ -2924,7 +2926,8 @@ class SingleTradeEngine:
         needles=(
             'wait_','reentry','need_new','raw_disagrees','mtf_conflict',
             'mtf_hold','entry_zone','ohlc_entry','gaida trigger','intent',
-            'chase_extension','same_range')
+            'chase_extension','same_range','hold_scenario','scenario_conflict',
+            'zone_confirm','confirm')
         return any(n in r for n in needles)
 
     def _apply_stream_quote(self):

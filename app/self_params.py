@@ -433,6 +433,63 @@ def migrate_soft_ceilings(store):
     return migrated
 
 
+def migrate_zone_confirm_off(store):
+    """One-shot #309: clear persisted confirm=1 left by #308 playbook defaults.
+
+    Seeds are first-write only — live Stores that already saved
+    ``playbook_require_zone_confirm=1`` kept waiting for pin+structure after
+    the DEFAULT flipped to 0, so zone-touch OPEN never fired. Run once per
+    Store; operators can still turn confirm back on afterward.
+    """
+    if store is None:
+        return None
+    flag='migrated_zone_confirm_off_v309'
+    try:
+        if store.get(flag):
+            return None
+    except Exception:
+        pass
+    raw=store.get(STORE_KEY)
+    before_confirm=None
+    before_and=None
+    changed=False
+    if isinstance(raw,dict):
+        before_confirm=raw.get('playbook_require_zone_confirm')
+        before_and=raw.get('playbook_zone_confirm_and')
+        try:
+            need_confirm=int(before_confirm) == 1
+        except (TypeError,ValueError):
+            need_confirm=False
+        try:
+            need_and=int(before_and) == 1
+        except (TypeError,ValueError):
+            need_and=False
+        if need_confirm or need_and:
+            migrated=load(store)
+            if need_confirm:
+                migrated['playbook_require_zone_confirm']=0
+            if need_and:
+                migrated['playbook_zone_confirm_and']=0
+            save(store,migrated,reason='zone_confirm_off_v309')
+            changed=True
+    try:
+        store.set(flag,True)
+    except Exception:
+        pass
+    if not changed:
+        return None
+    try:
+        store.event('learning','Migrated zone confirm OFF for touch OPEN (#309)',{
+            'before_require_zone_confirm':before_confirm,
+            'before_zone_confirm_and':before_and,
+            'after_require_zone_confirm':0,
+            'after_zone_confirm_and':0,
+        })
+    except Exception:
+        pass
+    return load(store)
+
+
 def save(store, params: dict, *, reason=''):
     if store is None:return
     clean=_apply_soft_ceilings(

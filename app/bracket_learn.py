@@ -966,7 +966,12 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         ez_sl = ez_hi
 
     def _zone_behind_with_opp_tp():
-        """SL behind Demand/Supply + TP from opposite OHLC swing."""
+        """SL behind Demand/Supply + TP from opposite OHLC swing.
+
+        When ATR/broker floor is wider than the nearest opposite pivot (common
+        on GOLD M1 zone-touch), keep the structural TP anchor and bump it out
+        to clear the floor — refuse only when no opposite structure exists.
+        """
         if action == 'BUY' and ez_sl is not None:
             stop_level = float(ez_sl) - buffer
             # Meet ATR/broker floor by extending *further* behind the zone —
@@ -975,23 +980,23 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 stop_level = entry_f - floor
             if stop_level >= entry_f:
                 return None
-            opp = [s for s in highs if float(s['price']) >= entry_f + floor]
-            if not opp:
-                # BOS range high is still a real chart level.
-                rh = _finite(out.get('swing_hi'))
-                if rh is not None and rh >= entry_f + floor:
-                    profit_level = float(rh)
-                    return {
-                        'stop_level': stop_level, 'profit_level': profit_level,
-                        'swing_lo': float(ez_sl), 'swing_hi': profit_level,
-                        'reason': 'zone_behind_fallback',
-                    }
+            stop_d = entry_f - stop_level
+            need_tp = max(floor, stop_d)  # at least 1R / broker floor
+            opp = [s for s in highs if float(s['price']) > entry_f]
+            rh = _finite(out.get('swing_hi'))
+            if opp:
+                raw_tp = float(min(opp, key=lambda s: float(s['price']))['price'])
+            elif rh is not None and rh > entry_f:
+                raw_tp = float(rh)
+            else:
                 return None
-            profit_level = float(min(opp, key=lambda s: float(s['price']))['price'])
+            profit_level = max(raw_tp, entry_f + need_tp)
             return {
                 'stop_level': stop_level, 'profit_level': profit_level,
                 'swing_lo': float(ez_sl), 'swing_hi': profit_level,
-                'reason': 'zone_behind_fallback',
+                'reason': (
+                    'zone_behind_fallback+floor_tp'
+                    if profit_level > raw_tp + 1e-12 else 'zone_behind_fallback'),
             }
         if action == 'SELL' and ez_sl is not None:
             stop_level = float(ez_sl) + buffer
@@ -999,22 +1004,23 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 stop_level = entry_f + floor
             if stop_level <= entry_f:
                 return None
-            opp = [s for s in lows if float(s['price']) <= entry_f - floor]
-            if not opp:
-                rl = _finite(out.get('swing_lo'))
-                if rl is not None and rl <= entry_f - floor:
-                    profit_level = float(rl)
-                    return {
-                        'stop_level': stop_level, 'profit_level': profit_level,
-                        'swing_hi': float(ez_sl), 'swing_lo': profit_level,
-                        'reason': 'zone_behind_fallback',
-                    }
+            stop_d = stop_level - entry_f
+            need_tp = max(floor, stop_d)
+            opp = [s for s in lows if float(s['price']) < entry_f]
+            rl = _finite(out.get('swing_lo'))
+            if opp:
+                raw_tp = float(max(opp, key=lambda s: float(s['price']))['price'])
+            elif rl is not None and rl < entry_f:
+                raw_tp = float(rl)
+            else:
                 return None
-            profit_level = float(max(opp, key=lambda s: float(s['price']))['price'])
+            profit_level = min(raw_tp, entry_f - need_tp)
             return {
                 'stop_level': stop_level, 'profit_level': profit_level,
                 'swing_hi': float(ez_sl), 'swing_lo': profit_level,
-                'reason': 'zone_behind_fallback',
+                'reason': (
+                    'zone_behind_fallback+floor_tp'
+                    if profit_level < raw_tp - 1e-12 else 'zone_behind_fallback'),
             }
         return None
 

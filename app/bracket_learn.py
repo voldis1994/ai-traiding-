@@ -1229,8 +1229,8 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     if swing+regime cannot place levels, return ``ready=False`` instead of
     inventing median-zone ±distance (the post-BOS 2nd-open bug).
 
-    ``tighten`` ∈ (0,1] only after loss cool-down — still a fraction of the
-    *same* OHLC decision, never an invented wider target.
+    ``tighten`` is retained for call-site compat but LIVE swing/regime paths
+    force ``1.0`` — loss cool-down must HOLD via edge floor, not shrink SL.
     """
     from .math_rules import stop_take
 
@@ -1270,23 +1270,18 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
             spread=sp, min_distance=mn, atr=atr, zone=z, kama=kama,
             store=store, entry_zone=entry_zone)
         if swing.get('ready'):
-            stop_d = float(swing['stop_distance']) * t
-            profit_d = float(swing['profit_distance']) * t
+            # Structural swing/zone levels are never loss-cooled (tighten=1).
+            # Shrinking them recreated hairline SL after soft-cap ban (#312).
+            stop_d = float(swing['stop_distance'])
+            profit_d = float(swing['profit_distance'])
             eff_kappa = (profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA
             snapped = stop_take(
                 float(entry), action, tick_f, sp, mn,
                 kappa=max(0.5, float(eff_kappa)), sl_scale=1.0,
                 range_distance=stop_d)
-            # Keep swing price levels; only snap distances onto broker tick grid.
-            sign = 1 if action == 'BUY' else -1
             e = float(entry)
-            # Prefer the structural levels; re-align if snap shifted them.
             stop_level = float(swing['stop_level'])
             profit_level = float(swing['profit_level'])
-            # If tighten shrunk distances, move levels toward entry proportionally.
-            if abs(t - 1.0) > 1e-9:
-                stop_level = e - sign * stop_d
-                profit_level = e + sign * profit_d
             return {
                 'stop_distance': abs(e - stop_level),
                 'profit_distance': abs(profit_level - e),
@@ -1299,7 +1294,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                 'ohlc_kappa': float(swing.get('kappa') or eff_kappa),
                 'ohlc_sl': float(swing['stop_distance']),
                 'ohlc_tp': float(swing['profit_distance']),
-                'tighten': float(t),
+                'tighten': 1.0,
                 'source': 'swing_anchor',
                 'ready': True,
                 'lookback': z.get('lookback'),
@@ -1522,13 +1517,13 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
     ohlc_tp = _finite(z.get('max_tp'))
     buffer = max(2.0 * tick_f, 2.0 * sp)
     floor = mn + buffer if (mn + buffer) > 0 else tick_f
-    # Fallback: SL from OHLC adverse move (or broker floor if quieter).
+    # Fallback (non-LIVE invent only): full OHLC width — never loss-cooled.
     raw_sl = float(ohlc_sl) if ohlc_sl is not None and ohlc_sl > 0 else floor
-    stop_d = max(floor, raw_sl) * t
+    stop_d = max(floor, raw_sl)
     # TP from OHLC κ, limited by what this window actually reaches.
     raw_tp = float(ohlc_kappa) * stop_d
     if ohlc_tp is not None and ohlc_tp > 0:
-        profit_d = min(raw_tp, float(ohlc_tp) * t)
+        profit_d = min(raw_tp, float(ohlc_tp))
     else:
         profit_d = raw_tp
     profit_d = max(floor, profit_d)
@@ -1552,7 +1547,7 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
         'ohlc_kappa': float(ohlc_kappa),
         'ohlc_sl': float(raw_sl),
         'ohlc_tp': float(ohlc_tp) if ohlc_tp is not None else None,
-        'tighten': float(t),
+        'tighten': 1.0,
         'source': 'ohlc_zone',
         'ready': bool(z.get('ready')),
         'lookback': z.get('lookback'),

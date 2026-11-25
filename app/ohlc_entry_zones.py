@@ -9,7 +9,10 @@
     optional pin/structure when confirm is opted in.
   • Invalidated zones (close through) are never selected (V3 Z03)
 
-Also: break trigger (structure/range break + M1 tape) on live mid when aligned.
+Also: break trigger (structure/range break + M1 tape) on **completed** close.
+
+Entry decisions use completed candle OHLC layout (structure). Ask/bid are
+fill prices only — they do not invent a zone/break trigger without candle proof.
 
 Gate knobs learn from closed broker £ via ``observe_close``.
 Never invent mid ± κ.
@@ -37,6 +40,9 @@ DEFAULTS = {
     'mtf_opposite_conf': 0.75,
     'zone_wide_conf': 0.50,
     'shift_block_conf': 0.60,
+    # 0 = OPEN only on completed M1 proof (close/wick vs structure). No mid-bar
+    # ask/bid chase through a level before the candle closes.
+    'break_live_mid': 0,
     # Rails.
     'band_span_frac_min': 0.08,
     'band_span_frac_max': 0.22,
@@ -102,7 +108,7 @@ def load_params(store=None) -> dict:
     if isinstance(bag, dict):
         for k in out:
             if bag.get(k) is not None:
-                if k == 'tape_need' or k == 'enabled':
+                if k in ('tape_need', 'enabled', 'break_live_mid'):
                     out[k] = int(bag[k])
                 else:
                     out[k] = float(bag[k])
@@ -113,6 +119,7 @@ def load_params(store=None) -> dict:
         out[k] = _clip(k, out[k])
     out['tape_need'] = int(round(_clip('tape_need', out['tape_need'])))
     out['enabled'] = int(out.get('enabled') or 0)
+    out['break_live_mid'] = 1 if int(out.get('break_live_mid') or 0) else 0
     if migrated:
         try:
             save_params(store, out)
@@ -999,9 +1006,8 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
             return out
         out['reason']='break_needs_m1_or_mtf'
         return out
-    # Range break: prefer completed close past the swing. When MTF is aligned
-    # and M1 tape already agrees, allow live mid through the level mid-minute
-    # so the signal is not one closed bar late (extension_chase still blocks tip).
+        # Range break: completed close past the level (structure). Live mid chase
+    # only when ``break_live_mid=1`` (default off — ask/bid must not invent entry).
     if isinstance(zones,dict) and isinstance(mtf,dict) and mtf.get('ready'):
         hi=_finite(zones.get('range_hi'))
         lo=_finite(zones.get('range_lo'))
@@ -1012,26 +1018,26 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
             buf=0.01
         aligned=mtf_aligned or (mode=='SHIFT' and conf>=break_conf)
         proof=tape_ok or conf>=break_conf
-        live_early=bool(aligned and tape_ok and conf>=break_conf)
-        if (action=='BUY' and aligned and hi is not None and p is not None
-                and p>=(hi-buf) and proof):
+        live_early=bool(
+            int(cfg.get('break_live_mid') or 0)
+            and aligned and tape_ok and conf>=break_conf)
+        if action=='BUY' and aligned and hi is not None and proof:
             close_ok=last_c is not None and last_c>=(hi-buf)
             if close_ok:
                 out['ok']=True
                 out['reason']='ohlc_break_range_high'
                 return out
-            if live_early and p>=hi:
+            if live_early and p is not None and p>=hi:
                 out['ok']=True
                 out['reason']='ohlc_break_range_high_live'
                 return out
-        if (action=='SELL' and aligned and lo is not None and p is not None
-                and p<=(lo+buf) and proof):
+        if action=='SELL' and aligned and lo is not None and proof:
             close_ok=last_c is not None and last_c<=(lo+buf)
             if close_ok:
                 out['ok']=True
                 out['reason']='ohlc_break_range_low'
                 return out
-            if live_early and p<=lo:
+            if live_early and p is not None and p<=lo:
                 out['ok']=True
                 out['reason']='ohlc_break_range_low_live'
                 return out
@@ -1040,10 +1046,11 @@ def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
 
 def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
                       tick=0.01,spread=0.0,mtf=None,store=None,params=None):
-    """Gate LIVE OPEN: zone touch OR structure/range break + MTF ok.
+    """Gate LIVE OPEN from **completed candle structure**, not ask/bid chase.
 
-    BUY uses ask (or mid); SELL uses bid (or mid). Buffer = 1 tick.
-    Learned knobs from ``store`` / ``params`` (band, tape, MTF conf).
+    Structure price = last completed M1 close (and bar high/low for zone touch).
+    Ask/bid are recorded as fill quotes only — they cannot alone unlock OPEN
+    without candle proof against the zone/break level.
     """
     cfg=params if isinstance(params,dict) else load_params(store)
     action=(action or '').upper()
@@ -1051,11 +1058,13 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         'allowed':False,'action':action,'reason':'bad_action',
         'zones':None,'price':None,'zone':None,'source':'ohlc_entry_zones',
         'mtf_ok':None,'trigger':None,'intent':action if action in ('BUY','SELL') else None,
+        'decision_from':'completed_candle',
         'params':{
             'band_span_frac':cfg.get('band_span_frac'),
             'tape_need':cfg.get('tape_need'),
             'break_mtf_conf':cfg.get('break_mtf_conf'),
             'mtf_opposite_conf':cfg.get('mtf_opposite_conf'),
+            'break_live_mid':int(cfg.get('break_live_mid') or 0),
         }}
     if action not in ('BUY','SELL'):
         return meta
@@ -1077,17 +1086,23 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     meta['scenario']=scenario
     zone=zones.get('buy_entry') if action=='BUY' else zones.get('sell_entry')
     meta['zone']=zone
+    # Structure decision price = last completed close (candle layout).
+    decision=_last_completed_close(candles)
+    if decision is None:
+        decision=_finite(mid)
+    # Fill quote (execution only) — never the sole OPEN proof.
     if action=='BUY':
-        price=_finite(ask)
-        if price is None:
-            price=_finite(mid)
+        fill=_finite(ask)
+        if fill is None:
+            fill=_finite(mid)
     else:
-        price=_finite(bid)
-        if price is None:
-            price=_finite(mid)
-    meta['price']=price
-    if price is None:
-        meta['reason']='wait_entry_zone (no_price)'
+        fill=_finite(bid)
+        if fill is None:
+            fill=_finite(mid)
+    meta['price']=decision
+    meta['fill_quote']=fill
+    if decision is None:
+        meta['reason']='wait_entry_zone (no_completed_candle)'
         return meta
 
     def _stamp_breakout(sc, reason_s):
@@ -1103,10 +1118,9 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
             sc_for['entry_hint']='BUY' if action=='BUY' else 'SELL'
         return sc_for
 
-    # --- Trigger A0: compression / flag box break (playbook continuation) ---
-    # Runs even when Demand/Supply is not stamped yet — the flag IS scenario.range.
+    # --- Trigger A0: compression / flag box break (completed close vs box) ---
     cb=compression_break_allows(
-        action,price=price,scenario=scenario,candles=candles,tick=tick,
+        action,price=decision,scenario=scenario,candles=candles,tick=tick,
         params=cfg)
     meta['compression_break']=cb
     if cb.get('ok'):
@@ -1126,14 +1140,12 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
         return meta
 
-    # --- Trigger A: break (structure) — scenario may veto blind range break ---
+    # --- Trigger A: break (structure) on completed close ---
     br=break_trigger_allows(
-        action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles,
+        action,price=decision,zones=zones,mtf=mtf,tick=tick,candles=candles,
         params=cfg)
     meta['break']=br
     if br.get('ok'):
-        # MTF/structure break already confirmed → treat as BREAKOUT tag so
-        # RANGE "prefer retest" does not veto a real BOS.
         sc_for_break=dict(scenario or {})
         mtf_br=None
         if isinstance(mtf,dict):
@@ -1148,11 +1160,10 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
             meta['trigger']='break'
             meta['reason']=br.get('reason') or 'ohlc_break_trigger'
             return meta
-        # Fall through to zone/retest wait instead of chasing.
         meta['break_blocked_by_scenario']=sc_ok.get('reason')
     # Guide: never open zone-path in the middle of a range / compression box.
     mid_block,mid_reason=ohlc_scenarios.mid_range_blocked(
-        action,scenario,price,tick=tick)
+        action,scenario,decision,tick=tick)
     if mid_block:
         meta['reason']=mid_reason or 'wait_mid_range'
         return meta
@@ -1163,34 +1174,34 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         buf=max(float(tick or 0.01),0.)
     except (TypeError,ValueError):
         buf=0.01
-    # Strong OHLC/MTF agreement → slightly wider touch so mid-tape "cross" into
-    # the band still fires instead of waiting another closed M1.
     try:
         conf=float((mtf or {}).get('confidence') or 0) if isinstance(mtf,dict) else 0.
     except (TypeError,ValueError):
         conf=0.
     pref=str((mtf or {}).get('preferred') or '').upper() if isinstance(mtf,dict) else ''
     wide_conf=float(cfg.get('zone_wide_conf') or 0.50)
-    # Mild widen — cross into the band still fires without waiting another M1.
     if pref==action and conf>=wide_conf:
         buf=max(buf,float(tick or 0.01)*1.5)
         meta['wide_ohlc_touch']=True
-    # Also treat a just-crossed bar that still tags the box as a touch.
-    crossed=False
-    if candles:
-        last=candles[-1] if isinstance(candles[-1],dict) else None
-        if last and _candle_interacted_zone(last,zone,buffer=buf):
-            crossed=True
-            meta['zone_cross_bar']=True
-    # --- Trigger B: touch/cross Demand/Supply (confirm optional) ---
-    if not (price_in_zone(zone,price,buffer=buf) or crossed):
+    # Candle proof: last completed bar must tag the box (wick or close).
+    last=candles[-1] if candles and isinstance(candles[-1],dict) else None
+    bar_touch=bool(last and _candle_interacted_zone(last,zone,buffer=buf))
+    close_in=price_in_zone(zone,decision,buffer=buf)
+    meta['zone_cross_bar']=bar_touch
+    meta['zone_close_in']=close_in
+    # --- Trigger B: Demand/Supply from candle layout (not ask/bid alone) ---
+    if not (bar_touch or close_in):
         lo=_finite(zone['lo']);hi=_finite(zone['hi'])
-        if action=='BUY' and price>hi:
-            meta['reason']=f'wait_buy_entry_zone (price {price:.5g} > zona {hi:.5g})'
-        elif action=='SELL' and price<lo:
-            meta['reason']=f'wait_sell_entry_zone (price {price:.5g} < zona {lo:.5g})'
+        if action=='BUY' and decision>hi:
+            meta['reason']=(
+                f'wait_buy_entry_zone (candle {decision:.5g} > zona {hi:.5g})')
+        elif action=='SELL' and decision<lo:
+            meta['reason']=(
+                f'wait_sell_entry_zone (candle {decision:.5g} < zona {lo:.5g})')
         else:
-            meta['reason']=f'wait_entry_zone (price {price:.5g} outside [{lo:.5g},{hi:.5g}])'
+            meta['reason']=(
+                f'wait_entry_zone (candle {decision:.5g} outside '
+                f'[{lo:.5g},{hi:.5g}])')
         return meta
     confirm=zone_confirm_allows(
         action,candles=candles,zone=zone,tick=tick,store=store)

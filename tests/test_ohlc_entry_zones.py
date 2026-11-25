@@ -28,29 +28,39 @@ def test_compute_entry_zones_builds_supply_from_base_impulse():
 
 
 def test_entry_allows_open_waits_until_confirm_in_demand_zone():
-    """Confirm OFF: far → wait; inside Demand → allow without pin/structure."""
+    """Confirm OFF: candle outside → wait; completed bar in Demand → allow."""
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     assert buy
     far = float(buy['hi']) + 5.0
+    rows_far = list(rows)
+    rows_far[-1] = {
+        **rows_far[-1], 'open': far, 'high': far + 0.2, 'low': far - 0.2,
+        'close': far, 'mid': far,
+    }
     gate = oez.entry_allows_open(
-        'BUY', candles=rows, mid=far, ask=far, bid=far - 0.1,
+        'BUY', candles=rows_far, mid=far, ask=far, bid=far - 0.1,
         tick=0.1, spread=0.2)
     assert gate['allowed'] is False
     assert 'wait' in (gate['reason'] or '')
 
-    # Inside band, confirm skipped → allow.
+    # Last completed candle closes inside Demand — structure proof.
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
+    rows_in = list(rows)
+    rows_in[-1] = {
+        **rows_in[-1], 'open': inside - 0.05, 'high': inside + 0.1,
+        'low': inside - 0.15, 'close': inside, 'mid': inside,
+    }
     gate_touch = oez.entry_allows_open(
-        'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
+        'BUY', candles=rows_in, mid=inside, ask=inside, bid=inside - 0.1,
         tick=0.1, spread=0.2)
     assert gate_touch['allowed'] is True
     assert gate_touch.get('trigger') == 'zone'
     assert (gate_touch.get('confirm') or {}).get('reason') == 'confirm_skipped'
 
     conf = oez.zone_confirm_allows(
-        'BUY', candles=rows, zone=buy, tick=0.1, require_confirm=True)
+        'BUY', candles=rows_in, zone=buy, tick=0.1, require_confirm=True)
     assert conf['ok'] is False
     assert 'confirm' in (conf.get('reason') or '')
 
@@ -118,13 +128,23 @@ def test_entry_allows_open_sell_zone_with_confirm():
     sell = z['sell_entry']
     assert sell
     below = float(sell['lo']) - 4.0
+    rows_below = list(rows)
+    rows_below[-1] = {
+        **rows_below[-1], 'open': below + 0.2, 'high': below + 0.3,
+        'low': below - 0.1, 'close': below, 'mid': below,
+    }
     gate = oez.entry_allows_open(
-        'SELL', candles=rows, mid=below, ask=below + 0.1, bid=below,
+        'SELL', candles=rows_below, mid=below, ask=below + 0.1, bid=below,
         tick=0.1, spread=0.2)
     assert gate['allowed'] is False
     inside = (float(sell['lo']) + float(sell['hi'])) / 2
+    rows_in = list(rows)
+    rows_in[-1] = {
+        **rows_in[-1], 'open': inside + 0.05, 'high': inside + 0.15,
+        'low': inside - 0.1, 'close': inside, 'mid': inside,
+    }
     gate2 = oez.entry_allows_open(
-        'SELL', candles=rows, mid=inside, ask=inside + 0.1, bid=inside,
+        'SELL', candles=rows_in, mid=inside, ask=inside + 0.1, bid=inside,
         tick=0.1, spread=0.2)
     assert gate2['allowed'] is True
     assert gate2.get('trigger') == 'zone'
@@ -328,8 +348,8 @@ def test_break_fires_on_one_green_m1_not_two():
     assert br['reason'] == 'ohlc_break_structure'
 
 
-def test_range_break_live_mid_when_mtf_aligned():
-    """Live mid through range_hi fires early — do not wait for completed close."""
+def test_range_break_live_mid_default_off_opt_in():
+    """Default: no live mid chase. Opt-in break_live_mid=1 restores early fire."""
     from datetime import timedelta
     t0 = datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
     rows = []
@@ -341,12 +361,9 @@ def test_range_break_live_mid_when_mtf_aligned():
             'open': o, 'high': c + 0.1, 'low': o - 0.1, 'close': c,
         })
         px = c
-    # Last completed close still inside range; live mid already clears hi.
     range_hi = 2005.0
     range_lo = 1998.0
-    # Keep last close below hi.
     rows[-1] = dict(rows[-1], open=2003.5, high=2004.2, low=2003.0, close=2004.0)
-    # One green tape bar for early proof.
     rows.append({
         'at': (t0 + timedelta(minutes=30)).isoformat(),
         'open': 2003.8, 'high': 2004.5, 'low': 2003.6, 'close': 2004.2,
@@ -359,19 +376,13 @@ def test_range_break_live_mid_when_mtf_aligned():
         'ready': True, 'enabled': True, 'mode': 'BUY', 'preferred': 'BUY',
         'confidence': 0.62, 'structure_break': None, 'move_ok': True,
     }
-    # Close still below hi → old path would wait; live mid clears → early.
     live = range_hi + 0.3
     br = oez.break_trigger_allows(
         'BUY', price=live, zones=zones, mtf=mtf, tick=0.1, candles=rows)
-    assert br['ok'] is True
-    assert br['reason'] == 'ohlc_break_range_high_live'
+    assert br['ok'] is False
 
-    # Without tape + strong conf, live mid alone must not chase.
-    weak = dict(mtf, confidence=0.2)
-    red = list(rows[:-1]) + [{
-        'at': (t0 + timedelta(minutes=30)).isoformat(),
-        'open': 2004.5, 'high': 2004.6, 'low': 2003.0, 'close': 2003.2,
-    }]
-    br_no = oez.break_trigger_allows(
-        'BUY', price=live, zones=zones, mtf=weak, tick=0.1, candles=red)
-    assert br_no['ok'] is False
+    br_opt = oez.break_trigger_allows(
+        'BUY', price=live, zones=zones, mtf=mtf, tick=0.1, candles=rows,
+        params={**oez.load_params(None), 'break_live_mid': 1})
+    assert br_opt['ok'] is True
+    assert br_opt['reason'] == 'ohlc_break_range_high_live'

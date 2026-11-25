@@ -356,7 +356,9 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
             'min_margin': need,
         }
     # SL/TP width is an OHLC decision (zone κ / range / max_tp) — not learned
-    # multipliers. Aggression may only *tighten* after losses (≤1).
+    # multipliers and not loss-cooled shrink. Aggression may raise the edge
+    # HOLD floor above; it must NOT pull swing/zone SL toward entry (that
+    # recreated 2-minute hairline scratches after soft-cap was banned).
     del learned  # width ignores raise/cut mults; keep arg for call-site compat
     kappa = _finite(zone.get('kappa')) or 1.0
     if kappa <= 0:
@@ -364,10 +366,9 @@ def compose_open(*, action, scores, evaluation, zone, learned, cycle_state,
     ohlc_sl = _finite(zone.get('range_distance'))
     tp = tp_hint
     base = float(base_hint)
-    tighten = min(1.0, float(aggression))
-    # Weak edge → slightly tighter fraction of the *same* OHLC plan.
-    edge_scale = _clip(0.85 + max(0.0, margin) * 2.0, 0.85, 1.0)
-    tighten = min(tighten, float(edge_scale))
+    # Report aggression for UI/learn; never scale structural distances.
+    edge_scale = 1.0
+    tighten = 1.0
     if base > 0 and tp is not None and tp > 0:
         room = float(tp) / base
         if kappa > room:

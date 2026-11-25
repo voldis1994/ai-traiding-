@@ -3238,8 +3238,8 @@ class SingleTradeEngine:
         m1 = tf.get('m1') if isinstance(tf.get('m1'), dict) else {}
         m5 = tf.get('m5') if isinstance(tf.get('m5'), dict) else {}
         atr = _num(m1.get('atr14'))
-        if atr is None:
-            atr = _num(mtf.get('stop_hint_atr14'))
+        # Never fall back to M5 stop_hint_atr14 for LIVE SL floor — that reinvented
+        # wrong-TF width. Missing M1 ATR → None → broker min + buffer only.
         kama = _num(m1.get('kama'))
         if kama is None:
             kama = _num(m5.get('kama'))

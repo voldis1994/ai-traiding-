@@ -2863,6 +2863,14 @@ class SingleTradeEngine:
                 return dict(result,action='HOLD',
                             reason=reentry.get('reason') or 'reentry_confirm_hold',
                             proposal=result.get('proposal') or result['action'])
+            # Guide 1+2 checklist: London→NY session window (playbook_session_filter).
+            from . import playbook_entry as _pb_entry
+            session_gate=_pb_entry.session_allows_open(store=self.store)
+            result=dict(result,playbook_session=session_gate)
+            if not session_gate.get('allowed',True):
+                return dict(result,action='HOLD',
+                            reason=session_gate.get('reason') or 'wait_session_london_ny',
+                            proposal=result.get('proposal') or result['action'])
             # OHLC entry zone first — playbook break/flag may override impulse
             # regime veto (dump bar is often the continuation the zone just saw).
             zone_gate=self._ohlc_entry_zone_gate(
@@ -2879,7 +2887,8 @@ class SingleTradeEngine:
             # Replaces eternal M1 colour-confirm HOLD as the candle-quality veto.
             from . import ohlc_regime_gate
             candles_rg=self._decision_candles()
-            atr_rg=_num((mtf_analysis or {}).get('stop_hint_atr14'))
+            atr_m1,_kama_rg=self._bracket_m1_hints(mtf_analysis or {})
+            atr_rg=atr_m1  # M1 only — never M5 stop_hint for impulse/chop scale
             struct_rg=((edge_advice or {}).get('structure')
                        or ctx.get('structure'))
             regime_gate=ohlc_regime_gate.evaluate(
@@ -6185,6 +6194,14 @@ class SingleTradeEngine:
             # Completed M1 only — forming QUOTE minute must not move zona/SL/TP.
             candles=self._decision_candles(self.mandate['epic'])
             mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
+            from . import playbook_entry as _pb_entry
+            session_sub=_pb_entry.session_allows_open(store=self.store)
+            if not session_sub.get('allowed',True):
+                self.last_entry_reason=session_sub.get('reason') or 'wait_session_london_ny'
+                self.store.event('entry','OPEN skipped — playbook session window',{
+                    'reason':self.last_entry_reason,'action':action,
+                    'hour':session_sub.get('hour')})
+                return
             # Defense in depth: OHLC+MTF zona *and* shared fleet side (same as eval).
             zone_gate=self._ohlc_entry_zone_gate(action,mtf_live)
             if not zone_gate.get('allowed'):
@@ -6198,7 +6215,7 @@ class SingleTradeEngine:
                     'source':zone_gate.get('source')})
                 return
             from . import ohlc_regime_gate
-            atr_sub=_num((mtf_live or {}).get('stop_hint_atr14'))
+            atr_sub,_kama_sub=self._bracket_m1_hints(mtf_live or {})
             regime_sub=ohlc_regime_gate.evaluate(
                 candles=candles,mid=mid,spread=spread,atr=atr_sub,
                 structure=(self.market_context or {}).get('structure'),
@@ -6220,13 +6237,7 @@ class SingleTradeEngine:
             buffer=max(2*float(tick),2*float(spread))
             base_sl=max(float(minimum)+buffer,float(rng or 0))
             learned=bracket_learn.load_multipliers(self.store)
-            # Break trigger is earlier/more aggressive — keep SL tighter than pullback.
-            if zone_gate.get('trigger')=='break':
-                try:
-                    learned=dict(learned or {})
-                    learned['sl_scale']=min(float(learned.get('sl_scale') or 1.0),0.85)
-                except (TypeError,ValueError):
-                    pass
+            # Structural SL/TP only — do not shrink break opens via learned sl_scale.
             cycle_state=unified_cycle.load_state(self.store)
             scores=(self.last_signal or {}).get('scores')
             evaluation={'action':action,'score_edge':(

@@ -24,8 +24,8 @@ STRUCTURE_VS_MEDIAN_CAP=2.0
 # Live Gold/indices bug: SL glued to ~0.5×M1 ATR dies on 1–2m noise while the
 # structural move still runs. Floor stops to a full ATR of the same TF as swings.
 ATR_STOP_FLOOR_FRAC=1.0
-# Default min reward:risk when Store has no bracket_min_rr yet.
-DEFAULT_MIN_RR=1.0
+# Default min reward:risk when Store has no bracket_min_rr yet (guide ≥1.5).
+DEFAULT_MIN_RR=1.5
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
 MIN_BATCH_SAMPLES=6
 # Exit reasons the adaptation layer understands.
@@ -1217,13 +1217,11 @@ def decide_brackets_from_ohlc(zone, *, tick, spread=0., min_distance=0.,
                               zones=None, trigger=None) -> dict:
     """System decides SL/TP from this OHLC window — not multipliers, not hard fantasy.
 
-    Preference order:
-      1. Swing High/Low anchors when ``entry``+``action``+``candles`` are given
-         (real chart levels — not entry ± median bar span). With ``entry_zone``,
-         SL is forced behind the Demand/Supply box when pivots alone cannot.
-      2. Else regime brackets (scenario + opposite zone) when playbook context
-         is provided.
+    Preference order (guides 1+3):
+      1. Swing High/Low + zone-behind (guide 1: SL behind Demand/Supply).
+      2. Regime brackets per named scenario (guide 3: TREND/RANGE/BREAKOUT/…).
       3. Else zone geometry: SL = adverse range, TP = κ×SL capped by ``max_tp``.
+    Never soft-cap structural SL to hit R:R; seed min_rr is 1.5.
 
     When live OPEN provides entry/action/candles, ``require_swing`` defaults True:
     if swing+regime cannot place levels, return ``ready=False`` instead of

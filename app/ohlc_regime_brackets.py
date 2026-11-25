@@ -43,12 +43,25 @@ def _buf(tick=0.01, spread=0., atr=None):
 
 
 def _floor(min_distance, buffer=None, atr_v=None, atr_frac=None):
-    """Capital min stop/profit distance only. Buffer sits on the candle edge;
-    ATR never belongs here."""
+    """Broker min, optionally widened to ATR noise so OHLC edges are extended
+    behind structure — never used alone as entry±ATR invent."""
     try:
-        return max(float(min_distance or 0), 0.)
+        floor = max(float(min_distance or 0), 0.)
     except (TypeError, ValueError):
-        return 0.
+        floor = 0.
+    atr = None
+    try:
+        atr = float(atr_v) if atr_v is not None else None
+    except (TypeError, ValueError):
+        atr = None
+    if atr is not None and atr > 0:
+        try:
+            from .bracket_learn import ATR_STOP_FLOOR_FRAC
+            frac = float(atr_frac) if atr_frac is not None else float(ATR_STOP_FLOOR_FRAC)
+        except Exception:
+            frac = float(atr_frac) if atr_frac is not None else 1.0
+        floor = max(floor, frac * atr)
+    return floor
 
 
 def _min_rr(store=None):

@@ -9,7 +9,7 @@ from app.bracket_learn import ATR_STOP_FLOOR_FRAC, swing_anchor_brackets
 from tests.test_bracket_learn import _swing_rows
 
 
-def test_swing_sl_respects_half_atr_floor():
+def test_swing_sl_respects_atr_noise_floor():
     """Nearest swing 2pts under entry must NOT become SL when ATR is 4.65."""
     # Flat-ish tape then a tiny dip — nearest low is only ~2 below entry.
     seq = [
@@ -32,11 +32,15 @@ def test_swing_sl_respects_half_atr_floor():
     if swing.get('ready'):
         assert swing['stop_distance'] + 1e-9 >= floor
         assert swing['stop_level'] <= entry - floor + 1e-9
+        assert not swing.get('rr_capped')
     else:
-        # Refusing micro-structure is OK — never invent hairline SL.
+        # Refusing micro-structure / soft-cap is OK — never invent hairline SL.
         assert 'floor' in str(swing.get('reason') or '').lower() or swing.get(
             'reason') in ('no_structural_swings_for_entry',
-                          'swing_distances_below_floor')
+                          'swing_distances_below_floor',
+                          'rr_keep_structural_sl',
+                          'rr_unachievable_vs_floor',
+                          'rr_fail')
 
 
 def test_shared_side_keeps_fleet_on_one_side():

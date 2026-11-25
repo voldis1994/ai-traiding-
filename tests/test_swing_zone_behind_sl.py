@@ -86,7 +86,7 @@ def test_zone_behind_survives_wide_atr_floor():
         candles=rows, entry=entry, action='BUY', tick=0.1, spread=0.2,
         min_distance=1.0, atr=atr, entry_zone=buy)
     assert swing.get('ready') is True, swing
-    assert float(swing['stop_distance']) + 1e-9 >= 0.5 * atr
+    assert float(swing['stop_distance']) + 1e-9 >= 1.0 * atr
     assert float(swing['profit_distance']) + 1e-9 >= float(swing['stop_distance'])
     decided = bracket_learn.decide_brackets_from_ohlc(
         z, tick=0.1, spread=0.2, min_distance=1.0, entry=entry, action='BUY',

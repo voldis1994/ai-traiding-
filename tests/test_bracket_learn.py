@@ -421,10 +421,10 @@ def test_post_bos_reentry_keeps_swing_not_ohlc_zone():
     assert swing['stop_level'] < entry < swing['profit_level']
     base = str(swing.get('reason') or '').split('+')[0]
     assert base in ('swing_levels', 'swing_measured_move', 'swing_levels_closer_sl')
-    if swing.get('rr_capped'):
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
-    else:
-        assert abs(swing['stop_distance'] - swing['profit_distance']) > 0.3
+    # Soft-cap must never invent mid-structure SL; honest RR may sit below min_rr.
+    assert not swing.get('rr_capped')
+    assert 'rr_cap_sl' not in str(swing.get('reason') or '')
+    assert float(swing['stop_distance']) + 1e-9 >= 2.0  # ≥ ATR floor
 
     decided = decide_brackets_from_ohlc(
         zone, tick=0.01, spread=0.05, min_distance=0.2,
@@ -464,8 +464,8 @@ def test_apply_min_rr_refuses_when_floor_blocks_cap():
     assert out['reason'] == 'rr_unachievable_vs_floor'
 
 
-def test_swing_anchor_prefers_rr_extend_or_cap_not_zone_invent():
-    """Wide 1m swing vs tight TP: extend TP / soft-cap SL — never median invent."""
+def test_swing_anchor_prefers_rr_extend_or_refuse_not_soft_cap():
+    """Wide 1m swing vs tight TP: extend TP or refuse — never soft-cap SL."""
     from app.bracket_learn import swing_anchor_brackets
     # Deep swing low far under entry; nearest high only a few pts above.
     seq = [
@@ -483,9 +483,16 @@ def test_swing_anchor_prefers_rr_extend_or_cap_not_zone_invent():
         candles=rows, entry=entry, action='BUY', tick=0.01, spread=0.05,
         min_distance=0.2, atr=2.0, zone=zone)
     if swing.get('ready'):
-        assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
         assert float(swing['stop_level']) < entry
         assert swing['source'] == 'swing_anchor'
+        assert not swing.get('rr_capped')
+        assert 'rr_cap_sl' not in str(swing.get('reason') or '')
+        # Honest RR may sit below min_rr when structural SL is kept.
+        if swing.get('rr_structural_kept'):
+            assert 'rr_keep_structural' in str(swing.get('reason') or '')
+            assert float(swing['stop_distance']) >= 2.0
+        else:
+            assert swing['rr'] + 1e-9 >= float(swing.get('min_rr') or 1.0)
     else:
         assert swing.get('reason') in (
             'rr_keep_structural_sl', 'rr_unachievable_vs_floor',

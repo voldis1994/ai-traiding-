@@ -21,8 +21,9 @@ MULT_SL_MIN,MULT_SL_MAX=1.0,2.5
 # Peak-to-trough structure may inform SL, but never dominate after a win streak
 # blew the lookback window (live: 3 wins → fantasy SL/TP from full swing).
 STRUCTURE_VS_MEDIAN_CAP=2.0
-# Live Gold bug: SL 2pts while ATR≈4.65 — floor stop to a real volatility width.
-ATR_STOP_FLOOR_FRAC=0.50
+# Live Gold/indices bug: SL glued to ~0.5×M1 ATR dies on 1–2m noise while the
+# structural move still runs. Floor stops to a full ATR of the same TF as swings.
+ATR_STOP_FLOOR_FRAC=1.0
 # Default min reward:risk when Store has no bracket_min_rr yet.
 DEFAULT_MIN_RR=1.0
 # Seed aliases (tests / no-store callers); Store overrides via _schedule().
@@ -933,8 +934,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
     if atr_v is not None and atr_v > 0:
         buffer = max(buffer, 0.15 * atr_v)
         out['atr_used'] = float(atr_v)
-    # Minimum protective distance: broker min + buffer, OR half ATR —
-    # never place a hairline SL that ATR noise will stop out immediately.
+    # Minimum protective distance: broker min + buffer, OR 1×ATR —
+    # never place a hairline SL that M1 noise stops out in 1–2 minutes.
     floor = mn + buffer if (mn + buffer) > 0 else tick_f
     if atr_v is not None and atr_v > 0:
         atr_floor = float(ATR_STOP_FLOOR_FRAC) * float(atr_v)
@@ -968,14 +969,13 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
     def _zone_behind_with_opp_tp():
         """SL behind Demand/Supply + TP from opposite OHLC swing.
 
-        When ATR/broker floor is wider than the nearest opposite pivot (common
-        on GOLD M1 zone-touch), keep the structural TP anchor and bump it out
-        to clear the floor — refuse only when no opposite structure exists.
+        When ATR/broker floor is wider than the zone box (hairline Demand on
+        US100 M1), extend *further* behind the zone extreme to clear the noise
+        floor — still protective invalidation, never soft-cap toward entry.
         """
         if action == 'BUY' and ez_sl is not None:
             stop_level = float(ez_sl) - buffer
-            # Meet ATR/broker floor by extending *further* behind the zone —
-            # still OHLC invalidation, never invent entry±ATR without zone.
+            # Meet ATR/broker floor by extending further behind the zone.
             if entry_f - stop_level + 1e-12 < floor:
                 stop_level = entry_f - floor
             if stop_level >= entry_f:
@@ -1104,6 +1104,8 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                 picked['reason'] = (picked.get('reason') or 'swing_levels') + '+kama'
 
     # Demand/Supply base: SL behind the zone box (OHLC ± buffer, then ATR floor).
+    # Only adopt zone SL when it is at least as protective as the swing stop —
+    # never pull a wider structural swing in toward a hairline box / floor glue.
     out['zone_sl'] = str(picked.get('reason') or '').startswith('zone_behind')
     if action == 'BUY' and ez_sl is not None:
         zone_stop = float(ez_sl) - buffer
@@ -1134,8 +1136,9 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     stop_level=stop_level, profit_level=profit_level,
                     kama_stop=out.get('kama_stop'), zone_sl=out.get('zone_sl'))
 
-    # Prefer extending TP to the next real 1m swing before soft-capping SL off
-    # the OHLC invalidation (soft-cap invents entry±distance mid-structure).
+    # Prefer extending TP to the next real 1m swing. Never soft-cap SL toward
+    # entry — that invents mid-structure stops (US100: ~10pt SL → £0.7 scratch
+    # then a 30m run). V5 / zone-behind: keep OHLC invalidation or refuse.
     min_rr_need = _min_rr(store)
     rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
     if rr_now + 1e-12 < min_rr_need:
@@ -1162,24 +1165,23 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
         floor=floor, store=store)
-    # Zone-behind / structural SL: never soft-cap off the 1m OHLC box.
-    if rr.get('capped') and out.get('zone_sl'):
-        return dict(out, ready=False, reason='rr_keep_structural_sl',
-                    stop_distance=float(stop_d), profit_distance=float(profit_d),
-                    stop_level=float(stop_level), profit_level=float(profit_level),
-                    min_rr=rr.get('min_rr'), rr=rr.get('rr'),
-                    kama_stop=out.get('kama_stop'), zone_sl=True)
-    if not rr.get('ok'):
+    reason = picked.get('reason') or 'swing_levels'
+    # V5 / US100: never soft-cap structural SL toward entry (that invented
+    # ~10pt mid-structure stops). Prefer the TP extend above; if RR still
+    # short, keep OHLC invalidation and report honest RR — do not shrink SL.
+    if rr.get('capped'):
+        reason = str(reason) + '+rr_keep_structural'
+        # stop_d / profit_d / levels stay on structure (ignore capped levels).
+    elif not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
                     stop_distance=float(stop_d), profit_distance=float(profit_d),
                     stop_level=float(stop_level), profit_level=float(profit_level),
-                    min_rr=rr.get('min_rr'), rr=rr.get('rr'),
+                    min_rr=rr.get('min_rr'), rr=(
+                        float(profit_d / stop_d) if stop_d > 1e-12 else None),
                     kama_stop=out.get('kama_stop'), zone_sl=out.get('zone_sl'))
-    stop_d = float(rr['stop_distance']); profit_d = float(rr['profit_distance'])
-    stop_level = float(rr['stop_level']); profit_level = float(rr['profit_level'])
-    reason = picked.get('reason') or 'swing_levels'
-    if rr.get('capped'):
-        reason = str(reason) + '+rr_cap_sl'
+    else:
+        stop_d = float(rr['stop_distance']); profit_d = float(rr['profit_distance'])
+        stop_level = float(rr['stop_level']); profit_level = float(rr['profit_level'])
 
     return {
         'ready': True,
@@ -1194,7 +1196,9 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
         'kappa': float(profit_d / stop_d) if stop_d > 1e-12 else DEFAULT_KAPPA,
         'min_rr': float(rr.get('min_rr') or DEFAULT_MIN_RR),
         'rr': float(profit_d / stop_d) if stop_d > 1e-12 else None,
-        'rr_capped': bool(rr.get('capped')),
+        # Soft-cap is never applied on swing path — flag stays False.
+        'rr_capped': False,
+        'rr_structural_kept': bool(rr.get('capped')),
         'bos_event': bos.get('event'),
         'bos_bias': bos.get('bias'),
         'buffer': float(buffer),

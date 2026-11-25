@@ -64,7 +64,7 @@ def record_close(store, *, deal_id, epic=None, direction=None, pnl=None,
     # 3) Risk geometry vs ATR.
     sl_atr = (stop_d / atr_v) if (stop_d is not None and atr_v and atr_v > 0) else None
     tp_atr = (profit_d / atr_v) if (profit_d is not None and atr_v and atr_v > 0) else None
-    hairline_sl = bool(sl_atr is not None and sl_atr < 0.45)
+    hairline_sl = bool(sl_atr is not None and sl_atr < 0.90)
 
     # 4) False-signal flags.
     scratch = bool(pnl_v is not None and abs(pnl_v) <= float(scratch_band or 0.05))
@@ -140,7 +140,7 @@ def snapshot(store, *, n=40) -> dict:
     if rate >= 0.4:
         tips.append('Daudz false-signal (scratch / quick loss / side conflict) — pārbaudi zonu + shared side.')
     if hair_n and hair_n / len(recent) >= 0.2:
-        tips.append('Hairline SL pret ATR — SL jābūt ≥0.5×ATR.')
+        tips.append('Hairline SL pret ATR — SL jābūt ≥1×ATR (struktūra, ne soft-cap).')
     if conflict_n:
         tips.append(f'{conflict_n}× side conflict uz to pašu tirgu — flotē jābūt vienai pusei.')
     if slips and (sum(slips) / len(slips)) >= 1.0:

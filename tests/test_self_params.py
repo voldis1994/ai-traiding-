@@ -9,7 +9,7 @@ from app.self_params import (DEFAULTS, STORE_KEY, PENDING_KEY, load, save, get,
                              evolve_from_feedback, maybe_commit_long_horizon,
                              snapshot, IMMUTABLE_NOTE, quantize_learn_lr,
                              LEARN_LR_STEP, LEARN_LR_SOFT_MAX,
-                             migrate_soft_ceilings)
+                             migrate_soft_ceilings, migrate_zone_confirm_off)
 from app.feature_discovery import FeatureDiscovery
 from app.feature_validation import validate_feature
 
@@ -231,3 +231,25 @@ def test_validation_uses_store_horizon_not_module_constant():
                                 spreads=None,store=store)
         assert result['approved'] is False
         assert 'spread' in result['reason']
+
+
+def test_migrate_zone_confirm_off_clears_persisted_308_default():
+    """#309 seed=0 must not leave live Stores stuck on confirm=1 from #308."""
+    assert DEFAULTS['playbook_require_zone_confirm'] == 0
+    assert DEFAULTS['playbook_zone_confirm_and'] == 0
+    with tempfile.TemporaryDirectory() as d:
+        store=Store(Path(d)/'db.sqlite3')
+        save(store,{**DEFAULTS,'playbook_require_zone_confirm':1,
+                    'playbook_zone_confirm_and':1},reason='sim #308 persist')
+        assert get(store,'playbook_require_zone_confirm') == 1
+        migrated=migrate_zone_confirm_off(store)
+        assert migrated is not None
+        assert get(store,'playbook_require_zone_confirm') == 0
+        assert get(store,'playbook_zone_confirm_and') == 0
+        assert store.get('migrated_zone_confirm_off_v309') is True
+        assert migrate_zone_confirm_off(store) is None  # one-shot
+        # Operator can turn confirm back on after migrate.
+        save(store,{**load(store),'playbook_require_zone_confirm':1},
+             reason='operator opt-in')
+        assert get(store,'playbook_require_zone_confirm') == 1
+        assert migrate_zone_confirm_off(store) is None

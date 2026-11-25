@@ -139,10 +139,15 @@ def _pick_tp_ladder(action, entry, *, candidates, risk, min_rr, floor):
     TP2 = farther structural target that clears min_rr when possible.
     If only one real level exists → TP1 == TP2.
     If none → None (caller may refuse ready).
+
+    When ATR/broker floor is wider than the nearest opposite structure
+    (zone-touch on noisy GOLD M1), keep the structural anchor and bump TP
+    out to clear the floor — same pattern as swing zone-behind.
     """
+    # Accept any level past entry first; floor bump happens after pick.
     real = []
     for c in candidates or []:
-        lv = _level_ok(action, entry, c, floor=floor)
+        lv = _level_ok(action, entry, c, floor=0.0)
         if lv is not None:
             real.append(lv)
     if action == 'BUY':
@@ -168,6 +173,17 @@ def _pick_tp_ladder(action, entry, *, candidates, risk, min_rr, floor):
         structural_rr = True
     if action == 'SELL' and tp2 - 1e-12 <= need:
         structural_rr = True
+    try:
+        floor_f = max(float(floor or 0), 0.0)
+    except (TypeError, ValueError):
+        floor_f = 0.0
+    if floor_f > 0:
+        if action == 'BUY':
+            tp1 = max(float(tp1), float(entry) + floor_f)
+            tp2 = max(float(tp2), float(entry) + floor_f, float(tp1))
+        else:
+            tp1 = min(float(tp1), float(entry) - floor_f)
+            tp2 = min(float(tp2), float(entry) - floor_f, float(tp1))
     return float(tp1), float(tp2), structural_rr
 
 
@@ -438,13 +454,22 @@ def regime_brackets(*, candles, entry, action, scenario=None, zones=None,
         if stop is None:
             return dict(out, reason='no_structural_sl', regime=name)
 
-    # OHLC stop as-is. Broker min only skips levels Capital cannot accept —
-    # never invent entry±ATR, never drop a real candle level for ATR noise.
+    # OHLC stop as-is. When the zone/edge SL sits inside the ATR/broker floor,
+    # extend *further* behind the box (same as swing zone-behind) — still
+    # protective invalidation, never invent a mid-zone hairline stop.
     if action == 'BUY':
         stop_d = entry_f - float(stop)
+        if floor > 0 and stop_d + 1e-12 < floor:
+            stop = entry_f - floor
+            stop_d = floor
+            zone_sl = True
     else:
         stop_d = float(stop) - entry_f
-    if floor > 0 and stop_d + 1e-12 < floor:
+        if floor > 0 and stop_d + 1e-12 < floor:
+            stop = entry_f + floor
+            stop_d = floor
+            zone_sl = True
+    if stop_d <= 0:
         return dict(out, reason='regime_sl_below_broker_min',
                     stop_distance=float(stop_d), stop_level=float(stop),
                     regime=name)

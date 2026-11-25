@@ -71,3 +71,26 @@ def test_propose_for_open_derives_entry_zone_for_swing():
         assert bp.get('bracket_source') in ('swing_anchor', 'regime_brackets')
         assert float(bp['stop_level']) < entry
         assert float(bp['profit_level']) > entry
+
+
+def test_zone_behind_survives_wide_atr_floor():
+    """Zone-touch OPEN must not die on require_swing when ATR floor > opposite pivot."""
+    rows, mid = demand_zone_path(confirm=False)
+    zones = oez.compute_entry_zones(rows, mid=mid, tick=0.1, spread=0.2)
+    buy = zones['buy_entry']
+    entry = (float(buy['lo']) + float(buy['hi'])) / 2
+    sc = osc.classify(rows, mid=entry, zones=zones, tick=0.1)
+    z = bracket_learn.zone_at_open(rows, multi_tf=True)
+    atr = 15.0
+    swing = bracket_learn.swing_anchor_brackets(
+        candles=rows, entry=entry, action='BUY', tick=0.1, spread=0.2,
+        min_distance=1.0, atr=atr, entry_zone=buy)
+    assert swing.get('ready') is True, swing
+    assert float(swing['stop_distance']) + 1e-9 >= 0.5 * atr
+    assert float(swing['profit_distance']) + 1e-9 >= float(swing['stop_distance'])
+    decided = bracket_learn.decide_brackets_from_ohlc(
+        z, tick=0.1, spread=0.2, min_distance=1.0, entry=entry, action='BUY',
+        candles=rows, atr=atr, require_swing=True, entry_zone=buy,
+        scenario=sc, zones=zones, trigger='zone')
+    assert decided.get('ready') is True, decided
+    assert decided.get('source') in ('swing_anchor', 'regime_brackets')

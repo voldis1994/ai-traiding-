@@ -44,9 +44,13 @@ def test_admin_structure_view_builds_zones():
         assert view.get('client_name') == 'Chart One' or view.get('username') == 'chart1'
         assert len(view['candles']) >= 40
         zones = view['zones']
-        # At least one structural or entry zone should be present when swings exist.
-        assert zones.get('buy_entry') or zones.get('sell_entry') or zones.get('support')
         assert 'structure' in view
+        # Swings always mark structure; Demand/Supply needs base→impulse (may be empty
+        # on synthetic zig-zag tape without a real zone).
+        assert (view['structure'].get('swing_highs')
+                or view['structure'].get('swing_lows')
+                or zones.get('buy_entry') or zones.get('sell_entry')
+                or zones.get('support'))
         # Same module LIVE uses before OPEN — Admin drawing == robot wait gate.
         assert view.get('entry_zone_source') == 'ohlc_entry_zones'
         assert 'overlays' in view

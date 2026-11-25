@@ -3226,6 +3226,25 @@ class SingleTradeEngine:
             return []
         return [e for e in peers if e is not None and e is not self]
 
+    def _bracket_m1_hints(self, mtf=None):
+        """ATR/KAMA for LIVE SL/TP — prefer M1 (same TF as OHLC swings).
+
+        ``stop_hint_atr14`` is M5 protective width and must NOT floor swing SL
+        (that reinvented entry±0.5×ATR_M5 instead of 1m High/Low). Matches Admin
+        structure-view which already prefers ``tf.m1.atr14``.
+        """
+        mtf = mtf if isinstance(mtf, dict) else {}
+        tf = mtf.get('tf') if isinstance(mtf.get('tf'), dict) else {}
+        m1 = tf.get('m1') if isinstance(tf.get('m1'), dict) else {}
+        m5 = tf.get('m5') if isinstance(tf.get('m5'), dict) else {}
+        atr = _num(m1.get('atr14'))
+        if atr is None:
+            atr = _num(mtf.get('stop_hint_atr14'))
+        kama = _num(m1.get('kama'))
+        if kama is None:
+            kama = _num(m5.get('kama'))
+        return atr, kama
+
     def _mtf_momentum_analysis(self):
         """M1→M60 Momentum+Structure+ADX+ATR stack — soft evidence + SHIFT mode.
 
@@ -4734,10 +4753,7 @@ class SingleTradeEngine:
             (cycle_state or {}).get('aggression') or 1.0)))
         entry=float(mid)
         mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
-        kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
-        if kama_hint is None:
-            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+        atr_hint,kama_hint=self._bracket_m1_hints(mtf_live)
         decided=bracket_learn.decide_brackets_from_ohlc(
             zone,tick=tick,spread=spread,min_distance=min_d,tighten=tighten,
             entry=entry,action=proposal,candles=candles,atr=atr_hint,
@@ -5863,13 +5879,14 @@ class SingleTradeEngine:
         level=float(_broker_price_level(p.get('level'),p.get('level')) or mid)
         direction=p.get('direction')
         mtf_live=self._mtf_momentum_analysis() if hasattr(self,'_mtf_momentum_analysis') else {}
-        atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
-        kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
-        if kama_hint is None:
-            kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
+        atr_hint,kama_hint=self._bracket_m1_hints(mtf_live)
+        # M1-only zone medians for bracket geometry (not M5/H1 soft caps).
+        zone_m1=bracket_learn.zone_at_open(candles,multi_tf=False)
         bp=bracket_learn.propose_for_open(
-            self.store,ohlc_kappa=zone.get('kappa'),
-            base_sl=base_sl,max_tp=zone.get('max_tp'),
+            self.store,ohlc_kappa=zone_m1.get('kappa') or zone.get('kappa'),
+            base_sl=max(float(min_dist)+buffer,
+                        float(zone_m1.get('range_distance') or rng or 0)),
+            max_tp=zone_m1.get('max_tp') or zone.get('max_tp'),
             candles=candles,tick=tick,spread=spread,
             min_distance=min_dist,entry=level,action=direction,
             atr=atr_hint,kama=kama_hint,require_swing=True)
@@ -6212,15 +6229,10 @@ class SingleTradeEngine:
                     'reason':self.last_entry_reason,'decision':pkg.get('decision'),
                     'aggression':pkg.get('aggression'),'min_margin':pkg.get('min_margin')})
                 return
-            atr_hint=_num((mtf_live or {}).get('stop_hint_atr14'))
-            kama_hint=None
-            try:
-                kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m5',{}).get('kama'))
-                if kama_hint is None:
-                    kama_hint=_num(((mtf_live or {}).get('tf') or {}).get('m1',{}).get('kama'))
-            except (TypeError,AttributeError):
-                kama_hint=None
+            atr_hint,kama_hint=self._bracket_m1_hints(mtf_live)
             # Regime SL/TP owns break/zone geometry — no invented break tighten.
+            # Bracket zone = M1 OHLC only so swing soft-caps stay on 1m tape.
+            zone_m1=bracket_learn.zone_at_open(candles,multi_tf=False)
             entry_zone=zone_gate.get('zone') if isinstance(zone_gate,dict) else None
             scenario=(zone_gate.get('scenario')
                       if isinstance(zone_gate,dict) else None)
@@ -6229,7 +6241,7 @@ class SingleTradeEngine:
             trigger_name=(zone_gate.get('trigger')
                           if isinstance(zone_gate,dict) else None)
             decided=bracket_learn.decide_brackets_from_ohlc(
-                zone,tick=tick,spread=spread,min_distance=minimum,
+                zone_m1,tick=tick,spread=spread,min_distance=minimum,
                 tighten=float(pkg.get('tighten') or 1.0),
                 entry=entry,action=action,candles=candles,atr=atr_hint,
                 kama=kama_hint,require_swing=True,store=self.store,

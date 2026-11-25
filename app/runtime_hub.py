@@ -900,16 +900,15 @@ class RuntimeHub:
                 pass
         atr_hint=None
         kama_hint=None
-        # Bracket geometry uses M1 ATR (same as entry zones) — M5 stop_hint
-        # was only for protective width labels and inflated hairline SL floors.
+        # Bracket geometry uses M1 ATR/KAMA — same TF as OHLC swings / LIVE OPEN.
         if isinstance(mtf,dict) and mtf.get('ready'):
             tf=mtf.get('tf') or {}
             atr_hint=_finite_num((tf.get('m1') or {}).get('atr14'))
             if atr_hint is None:
                 atr_hint=_finite_num(mtf.get('stop_hint_atr14'))
-            kama_hint=(tf.get('m5') or {}).get('kama')
+            kama_hint=(tf.get('m1') or {}).get('kama')
             if kama_hint is None:
-                kama_hint=(tf.get('m1') or {}).get('kama')
+                kama_hint=(tf.get('m5') or {}).get('kama')
         if atr_hint is None and isinstance(overlays,dict):
             atr_hint=_finite_num(overlays.get('atr14')) or _finite_num(
                 overlays.get('stop_hint_atr14'))
@@ -918,7 +917,7 @@ class RuntimeHub:
         if kama_hint is None and isinstance(overlays,dict):
             kama_hint=overlays.get('kama_level')
         swing_brackets=None
-        # Preview SL/TP at side price (ask/bid) — same as LIVE OPEN entry.
+        # Preview SL/TP at side price (ask/bid) — same decide path as LIVE OPEN.
         entry_px=mid
         if preferred=='BUY' and mid is not None:
             entry_px=mid+(spread/2.0 if spread else 0)
@@ -926,12 +925,36 @@ class RuntimeHub:
             entry_px=mid-(spread/2.0 if spread else 0)
         if entry_px is not None and preferred in ('BUY','SELL') and (candles_full or candles):
             try:
-                zone=bracket_learn.zone_at_open(
-                    candles_full or candles,multi_tf=True)
-                swing_brackets=bracket_learn.swing_anchor_brackets(
-                    candles=candles_full or candles,entry=entry_px,action=preferred,
-                    tick=tick,spread=spread,min_distance=0.,zone=zone,
-                    atr=atr_hint,kama=kama_hint,store=store)
+                rows=candles_full or candles
+                zone=bracket_learn.zone_at_open(rows,multi_tf=False)
+                entry_zone=None
+                zones_card=ez if isinstance(ez,dict) else None
+                if preferred=='BUY' and isinstance(zones_card,dict):
+                    entry_zone=zones_card.get('buy_entry')
+                elif preferred=='SELL' and isinstance(zones_card,dict):
+                    entry_zone=zones_card.get('sell_entry')
+                sc=None
+                try:
+                    from . import ohlc_scenarios as _osc
+                    if zones_card is not None:
+                        sc=_osc.classify(
+                            rows,mid=entry_px,zones=zones_card,tick=tick)
+                except Exception:
+                    sc=None
+                decided=bracket_learn.decide_brackets_from_ohlc(
+                    zone,tick=tick,spread=spread,min_distance=0.,
+                    entry=entry_px,action=preferred,candles=rows,
+                    atr=atr_hint,kama=kama_hint,require_swing=True,store=store,
+                    entry_zone=entry_zone,scenario=sc,zones=zones_card,
+                    trigger='zone' if entry_zone else None)
+                if decided.get('ready'):
+                    swing_brackets=dict(decided,source=decided.get('source') or 'swing_anchor')
+                else:
+                    swing_brackets=bracket_learn.swing_anchor_brackets(
+                        candles=rows,entry=entry_px,action=preferred,
+                        tick=tick,spread=spread,min_distance=0.,zone=zone,
+                        atr=atr_hint,kama=kama_hint,store=store,
+                        entry_zone=entry_zone)
             except Exception as exc:
                 swing_brackets={'ready':False,'reason':type(exc).__name__}
         open_levels=[]

@@ -1134,11 +1134,41 @@ def swing_anchor_brackets(*, candles, entry, action, tick=0.01, spread=0.,
                     stop_level=stop_level, profit_level=profit_level,
                     kama_stop=out.get('kama_stop'), zone_sl=out.get('zone_sl'))
 
-    # Combine swing SL with min RR — never keep 21pt SL vs 3pt TP.
+    # Prefer extending TP to the next real 1m swing before soft-capping SL off
+    # the OHLC invalidation (soft-cap invents entry±distance mid-structure).
+    min_rr_need = _min_rr(store)
+    rr_now = (profit_d / stop_d) if stop_d > 1e-12 else 0.0
+    if rr_now + 1e-12 < min_rr_need:
+        need_tp = max(floor, float(stop_d) * float(min_rr_need))
+        if action == 'BUY':
+            farther = [s for s in highs
+                       if float(s['price']) >= entry_f + need_tp - 1e-12]
+            if farther:
+                nxt = min(farther, key=lambda s: float(s['price']))
+                profit_level = float(nxt['price'])
+                profit_d = profit_level - entry_f
+                picked['swing_hi'] = profit_level
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+rr_extend_tp'
+        else:
+            farther = [s for s in lows
+                       if float(s['price']) <= entry_f - need_tp + 1e-12]
+            if farther:
+                nxt = max(farther, key=lambda s: float(s['price']))
+                profit_level = float(nxt['price'])
+                profit_d = entry_f - profit_level
+                picked['swing_lo'] = profit_level
+                picked['reason'] = (picked.get('reason') or 'swing_levels') + '+rr_extend_tp'
     rr = apply_min_rr(
         action=action, entry=entry_f, stop_level=stop_level,
         profit_level=profit_level, stop_d=stop_d, profit_d=profit_d,
         floor=floor, store=store)
+    # Zone-behind / structural SL: never soft-cap off the 1m OHLC box.
+    if rr.get('capped') and out.get('zone_sl'):
+        return dict(out, ready=False, reason='rr_keep_structural_sl',
+                    stop_distance=float(stop_d), profit_distance=float(profit_d),
+                    stop_level=float(stop_level), profit_level=float(profit_level),
+                    min_rr=rr.get('min_rr'), rr=rr.get('rr'),
+                    kama_stop=out.get('kama_stop'), zone_sl=True)
     if not rr.get('ok'):
         return dict(out, ready=False, reason=rr.get('reason') or 'rr_fail',
                     stop_distance=float(stop_d), profit_distance=float(profit_d),

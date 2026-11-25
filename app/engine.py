@@ -2930,19 +2930,27 @@ class SingleTradeEngine:
         return ohlc_entry_zones.drop_forming_minute(raw)
 
     def _entry_wait_reason_retryable(self,reason):
-        """True when HOLD was only waiting for zone / soft MTF — retry mid-bar.
+        """True when HOLD may clear on a new quote without a new M1 close.
 
-        ``no_trade_*`` OHLC regime vetoes are NOT retryable mid-bar (need new
-        completed candles). Old m1_confirm eternal waits are gone.
+        Zone / break / mid-range / candle-confirm waits need a **new completed
+        candle** — ask/bid ticks must not invent structure entry mid-bar.
+        ``no_trade_*`` regime vetoes also wait for new completed candles.
         """
         r=str(reason or '').lower()
         if r.startswith('no_trade_'):
             return False
+        # Structure entry is candle-decided — do not mid-bar retry these.
+        candle_waits=(
+            'wait_entry_zone','wait_buy_entry_zone','wait_sell_entry_zone',
+            'wait_mid_range','wait_zone_confirm','wait_scenario',
+            'hold_scenario','wait_range_edge','compression_wait',
+            'wait_compression','no_completed_candle','candle ')
+        if any(n in r for n in candle_waits):
+            return False
         needles=(
-            'wait_','reentry','need_new','raw_disagrees','mtf_conflict',
-            'mtf_hold','entry_zone','ohlc_entry','gaida trigger','intent',
-            'chase_extension','same_range','hold_scenario','scenario_conflict',
-            'zone_confirm','confirm')
+            'reentry','need_new','raw_disagrees','mtf_conflict',
+            'mtf_hold','gaida trigger','intent',
+            'chase_extension','same_range','scenario_conflict')
         return any(n in r for n in needles)
 
     def _apply_stream_quote(self):
@@ -3142,7 +3150,7 @@ class SingleTradeEngine:
             await self.submit(action,broker_market)
 
     def _ohlc_entry_zone_gate(self,action,mtf_analysis=None):
-        """HOLD until ask/bid sits in OHLC entry zona and MTF stack agrees."""
+        """HOLD until completed-candle structure allows OPEN; ask/bid = fill only."""
         candles=self._decision_candles()
         market=self.market or {}
         mtf=mtf_analysis

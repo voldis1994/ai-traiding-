@@ -71,12 +71,17 @@ def test_zone_confirm_off_by_default():
 
 
 def test_zone_touch_allows_open_without_pin():
-    """With confirm off, price inside Demand is enough for zone trigger."""
+    """With confirm off, completed candle inside Demand is enough for zone trigger."""
     from tests.ohlc_zone_path import demand_zone_path
     rows, _ = demand_zone_path(confirm=False)
     z = oez.compute_entry_zones(rows, tick=0.1, spread=0.2)
     buy = z['buy_entry']
     inside = (float(buy['lo']) + float(buy['hi'])) / 2
+    rows = list(rows)
+    rows[-1] = {
+        **rows[-1], 'open': inside - 0.05, 'high': inside + 0.1,
+        'low': inside - 0.15, 'close': inside, 'mid': inside,
+    }
     gate = oez.entry_allows_open(
         'BUY', candles=rows, mid=inside, ask=inside, bid=inside - 0.1,
         tick=0.1, spread=0.2)

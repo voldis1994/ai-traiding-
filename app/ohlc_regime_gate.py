@@ -215,3 +215,23 @@ def evaluate(*, candles, mid=None, spread=None, atr=None, structure=None,
                         flags=meta['flags'])
 
     return meta
+
+
+def playbook_overrides_regime(regime: dict | None, zone_gate: dict | None) -> bool:
+    """True when playbook break may OPEN despite impulse/chop candle veto.
+
+    Oversized dump bar is often the flag→impulse the playbook just confirmed.
+    Blocking that bar with ``no_trade_impulse`` made LIVE blind to the circled
+    consolidation breaks. Soft chop during the break bar is the same class.
+    """
+    rg = regime if isinstance(regime, dict) else {}
+    zg = zone_gate if isinstance(zone_gate, dict) else {}
+    if rg.get('allowed', True):
+        return True
+    if not zg.get('allowed'):
+        return False
+    trigger = str(zg.get('trigger') or '').lower()
+    if trigger not in ('break', 'compression_break'):
+        return False
+    reason = str(rg.get('reason') or '')
+    return reason in ('no_trade_impulse', 'no_trade_chop')

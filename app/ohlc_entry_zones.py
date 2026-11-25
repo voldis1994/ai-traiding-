@@ -887,6 +887,70 @@ def _last_completed_close(candles):
     return _finite(rows[-1].get('close'))
 
 
+def compression_break_allows(action,*,price,scenario,candles=None,tick=0.01,
+                             params=None):
+    """Flag / COMPRESSION box break — continuation without pivot BOS wait.
+
+    The playbook draws the tight base (circled consolidation); OPEN on the
+    first M1 that breaks the box with tape, not after a late pivot stamp.
+    """
+    cfg=params if isinstance(params,dict) else DEFAULTS
+    tape_need=max(1,int(cfg.get('tape_need') or 1))
+    action=(action or '').upper()
+    out={'ok':False,'reason':'no_compression_break','trigger':'compression_break',
+         'tape_streak':0,'tape_need':tape_need}
+    if action not in ('BUY','SELL') or not isinstance(scenario,dict):
+        return out
+    box=scenario.get('range') if isinstance(scenario.get('range'),dict) else {}
+    lo=_finite(box.get('lo'));hi=_finite(box.get('hi'));p=_finite(price)
+    if lo is None or hi is None or p is None or not (hi>lo):
+        out['reason']='no_compression_box'
+        return out
+    tags=list(scenario.get('scenarios') or [])
+    name=str(scenario.get('scenario') or '').upper()
+    is_comp=bool(scenario.get('compression')) or name=='COMPRESSION' or (
+        'COMPRESSION' in tags)
+    if not is_comp:
+        # Tight RANGE flag: span ≤ 1.5×ATR of the box.
+        if name!='RANGE' and 'RANGE' not in tags:
+            out['reason']='not_compression_or_flag'
+            return out
+        atr=_finite(box.get('atr'));span=hi-lo
+        if atr is None or atr<=0 or span>1.5*atr:
+            out['reason']='range_not_tight_flag'
+            return out
+    tape_ok,tape_streak=m1_tape_agrees(action,candles,need=tape_need)
+    out['tape_streak']=tape_streak
+    if not tape_ok:
+        out['reason']='compression_break_needs_tape'
+        return out
+    try:
+        buf=max(float(tick or 0.01),0.)
+    except (TypeError,ValueError):
+        buf=0.01
+    last_c=_last_completed_close(candles)
+    if action=='SELL' and p<=(lo+buf):
+        if last_c is not None and last_c<=(lo+buf):
+            out['ok']=True
+            out['reason']='ohlc_break_compression_low'
+            return out
+        if p<=lo:
+            out['ok']=True
+            out['reason']='ohlc_break_compression_low_live'
+            return out
+    if action=='BUY' and p>=(hi-buf):
+        if last_c is not None and last_c>=(hi-buf):
+            out['ok']=True
+            out['reason']='ohlc_break_compression_high'
+            return out
+        if p>=hi:
+            out['ok']=True
+            out['reason']='ohlc_break_compression_high_live'
+            return out
+    out['reason']='wait_compression_break'
+    return out
+
+
 def break_trigger_allows(action,*,price,zones,mtf=None,tick=0.01,candles=None,
                          params=None):
     """True when structure/range break aligns with neural side AND M1 tape.
@@ -1011,9 +1075,6 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     scenario=ohlc_scenarios.classify(
         candles,mid=mid,zones=zones,tick=tick,store=store)
     meta['scenario']=scenario
-    if not zones.get('ok'):
-        meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
-        return meta
     zone=zones.get('buy_entry') if action=='BUY' else zones.get('sell_entry')
     meta['zone']=zone
     if action=='BUY':
@@ -1028,6 +1089,43 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
     if price is None:
         meta['reason']='wait_entry_zone (no_price)'
         return meta
+
+    def _stamp_breakout(sc, reason_s):
+        sc_for=dict(sc or {})
+        tags=list(sc_for.get('scenarios') or [])
+        tag=('BREAKOUT_UP' if action=='BUY' else 'BREAKOUT_DOWN')
+        if tag not in tags:
+            tags.append(tag)
+        sc_for['scenarios']=tags
+        if str(sc_for.get('scenario') or '') in (
+                'RANGE','COMPRESSION','UNKNOWN',''):
+            sc_for['scenario']=tag
+            sc_for['entry_hint']='BUY' if action=='BUY' else 'SELL'
+        return sc_for
+
+    # --- Trigger A0: compression / flag box break (playbook continuation) ---
+    # Runs even when Demand/Supply is not stamped yet — the flag IS scenario.range.
+    cb=compression_break_allows(
+        action,price=price,scenario=scenario,candles=candles,tick=tick,
+        params=cfg)
+    meta['compression_break']=cb
+    if cb.get('ok'):
+        sc_for_cb=_stamp_breakout(scenario,cb.get('reason'))
+        sc_ok=ohlc_scenarios.scenario_allows_trigger(
+            action,sc_for_cb,'break',store=store)
+        meta['scenario_gate']=sc_ok
+        if sc_ok.get('ok'):
+            meta['allowed']=True
+            meta['trigger']='break'
+            meta['reason']=cb.get('reason') or 'ohlc_break_compression'
+            meta['scenario']=sc_for_cb
+            return meta
+        meta['break_blocked_by_scenario']=sc_ok.get('reason')
+
+    if not zones.get('ok'):
+        meta['reason']=f"wait_entry_zone ({zones.get('reason') or 'unready'})"
+        return meta
+
     # --- Trigger A: break (structure) — scenario may veto blind range break ---
     br=break_trigger_allows(
         action,price=price,zones=zones,mtf=mtf,tick=tick,candles=candles,
@@ -1041,14 +1139,7 @@ def entry_allows_open(action,*,candles,mid=None,ask=None,bid=None,
         if isinstance(mtf,dict):
             mtf_br=mtf.get('structure_break')
         if mtf_br in ('UP','DOWN') or str(br.get('reason') or '').startswith('ohlc_break'):
-            tags=list(sc_for_break.get('scenarios') or [])
-            tag=('BREAKOUT_UP' if action=='BUY' else 'BREAKOUT_DOWN')
-            if tag not in tags:
-                tags.append(tag)
-            sc_for_break['scenarios']=tags
-            if str(sc_for_break.get('scenario') or '') in ('RANGE','COMPRESSION','UNKNOWN'):
-                sc_for_break['scenario']=tag
-                sc_for_break['entry_hint']='BUY' if action=='BUY' else 'SELL'
+            sc_for_break=_stamp_breakout(sc_for_break,br.get('reason'))
         sc_ok=ohlc_scenarios.scenario_allows_trigger(
             action,sc_for_break,'break',store=store)
         meta['scenario_gate']=sc_ok

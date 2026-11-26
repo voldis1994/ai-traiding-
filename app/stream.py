@@ -1,4 +1,4 @@
-"""Capital.com WebSocket quotes, authenticated with in-memory session tokens.
+"""Broker WebSocket quotes (Capital.com streaming URL when available).
 REST /markets remains the fallback and source of current dealing rules.
 """
 import asyncio
@@ -17,8 +17,13 @@ class CapitalQuoteStream:
             if not engine.broker or not engine.mandate:
                 self.connected=False;await asyncio.sleep(3);continue
             epic=engine.mandate['epic'];broker=engine.broker
+            stream_url=getattr(broker,'streaming_url',None) or None
+            if not stream_url:
+                # IG / custom hosts — REST market poll in the engine is enough.
+                self.connected=False;self.last_error='no_streaming_url'
+                await asyncio.sleep(30);continue
             try:
-                async with websockets.connect(URL,open_timeout=12,ping_interval=120,ping_timeout=20,max_size=2**20) as socket:
+                async with websockets.connect(stream_url,open_timeout=12,ping_interval=120,ping_timeout=20,max_size=2**20) as socket:
                     self.connected=True;self.subscription=epic;self.last_error=None
                     credentials={'cst':broker.cst,'securityToken':broker.security}
                     await socket.send(json.dumps({'destination':'marketData.subscribe','correlationId':'1',

@@ -180,6 +180,7 @@ class BrokerAttach(BaseModel):
     api_key:str=Field(min_length=1,max_length=256)
     identifier:str=Field(min_length=1,max_length=256)
     password:str=Field(min_length=1,max_length=256)
+    base_url:str=Field(default='',max_length=512)
 
 class LanguageBody(BaseModel):
     language:str=Field(min_length=2,max_length=8)
@@ -487,9 +488,11 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
     # One LIVE session: validate, save, then hand the same connection to the robot
     # (a second login often fails with HTTPStatusError / session conflict).
     api_key=data.api_key.strip(); identifier=data.identifier.strip(); password=data.password.strip()
+    base_url=(data.base_url or '').strip()
     stage='session'
     try:
-        candidate=create_broker(data.broker_type,api_key,identifier,password,live=True)
+        candidate=create_broker(data.broker_type,api_key,identifier,password,live=True,
+                                base_url=base_url or None)
     except ValueError as exc:
         raise HTTPException(400,str(exc)) from None
     try:
@@ -501,7 +504,7 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
         raise _capital_connect_error(stage,exc) from None
     try:
         account=platform.attach_broker(client_id,data.broker_type,data.display_name,
-                                       api_key,identifier,password)
+                                       api_key,identifier,password,base_url=base_url or None)
     except ValueError as exc:
         await candidate.close()
         raise HTTPException(409,str(exc)) from None

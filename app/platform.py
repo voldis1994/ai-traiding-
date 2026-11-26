@@ -54,6 +54,7 @@ class PlatformStore:
             api_key_enc TEXT NOT NULL,
             identifier_enc TEXT NOT NULL,
             password_enc TEXT NOT NULL,
+            endpoint_enc TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             created TEXT NOT NULL,
             UNIQUE(client_id)
@@ -66,6 +67,9 @@ class PlatformStore:
             expires TEXT
         );
         ''')
+        cols={r[1] for r in self.db.execute('PRAGMA table_info(broker_accounts)')}
+        if 'endpoint_enc' not in cols:
+            self.db.execute('ALTER TABLE broker_accounts ADD COLUMN endpoint_enc TEXT')
         self.db.commit()
 
     # --- admin bootstrap ---
@@ -210,35 +214,39 @@ class PlatformStore:
 
     # --- broker accounts ---
     def attach_broker(self,client_id: int,broker_type: str,display_name: str,
-                      api_key: str,identifier: str,password: str) -> dict:
+                      api_key: str,identifier: str,password: str,
+                      base_url: str|None=None) -> dict:
         client=self.get_client(client_id)
         if not client:raise ValueError('Client not found')
         broker_type=(broker_type or 'capital_com').strip().lower()
         display_name=(display_name or f"{client['display_name']} · {broker_type}").strip()
-        # Capital.com allows one LIVE session per API key — sharing kills the other robot.
+        endpoint=(base_url or '').strip() or None
+        # One LIVE session per API key — sharing kills the other robot.
         dupes=self.find_clients_with_api_key(broker_type,api_key,exclude_client_id=client_id)
         if dupes:
             other=dupes[0]
             raise ValueError(
                 f"API atslēga jau pievienota klientam '{other['username']}' "
-                f"(id={other['client_id']}). Katram klientam vajag savu Capital.com API key.")
+                f"(id={other['client_id']}). Katram klientam vajag savu API key.")
+        endpoint_enc=self.box.encrypt(endpoint) if endpoint else None
         payload=(
             self.box.encrypt(api_key),
             self.box.encrypt(identifier),
             self.box.encrypt(password),
+            endpoint_enc,
         )
         existing=self.db.execute('SELECT id FROM broker_accounts WHERE client_id=?',
                                  (client_id,)).fetchone()
         if existing:
             self.db.execute(
                 'UPDATE broker_accounts SET broker_type=?,display_name=?,api_key_enc=?,'
-                'identifier_enc=?,password_enc=?,active=1 WHERE client_id=?',
+                'identifier_enc=?,password_enc=?,endpoint_enc=?,active=1 WHERE client_id=?',
                 (broker_type,display_name,*payload,client_id))
             account_id=existing['id']
         else:
             cur=self.db.execute(
                 'INSERT INTO broker_accounts(client_id,broker_type,display_name,api_key_enc,'
-                'identifier_enc,password_enc,created) VALUES(?,?,?,?,?,?,?)',
+                'identifier_enc,password_enc,endpoint_enc,created) VALUES(?,?,?,?,?,?,?,?)',
                 (client_id,broker_type,display_name,*payload,_now()))
             account_id=cur.lastrowid
         self.db.commit()
@@ -247,7 +255,7 @@ class PlatformStore:
     def get_broker_account(self,account_id: int) -> Optional[dict]:
         row=self.db.execute(
             'SELECT id,client_id,broker_type,display_name,api_key_enc,identifier_enc,'
-            'password_enc,active,created FROM broker_accounts WHERE id=?',
+            'password_enc,endpoint_enc,active,created FROM broker_accounts WHERE id=?',
             (account_id,)).fetchone()
         if not row:return None
         data=dict(row);data['active']=bool(data['active'])
@@ -256,17 +264,23 @@ class PlatformStore:
     def get_broker_for_client(self,client_id: int) -> Optional[dict]:
         row=self.db.execute(
             'SELECT id,client_id,broker_type,display_name,api_key_enc,identifier_enc,'
-            'password_enc,active,created FROM broker_accounts WHERE client_id=?',
+            'password_enc,endpoint_enc,active,created FROM broker_accounts WHERE client_id=?',
             (client_id,)).fetchone()
         if not row:return None
         data=dict(row);data['active']=bool(data['active'])
         return data
 
     def broker_credentials(self,account: dict) -> dict[str,str]:
+        endpoint=''
+        enc=account.get('endpoint_enc')
+        if enc:
+            try:endpoint=self.box.decrypt(enc) or ''
+            except Exception:endpoint=''
         return {
             'api_key':self.box.decrypt(account['api_key_enc']),
             'identifier':self.box.decrypt(account['identifier_enc']),
             'password':self.box.decrypt(account['password_enc']),
+            'base_url':endpoint,
             'broker_type':account['broker_type'],
             'display_name':account['display_name'],
         }
@@ -274,7 +288,8 @@ class PlatformStore:
     def list_active_broker_accounts(self) -> list[dict]:
         rows=self.db.execute(
             'SELECT b.id,b.client_id,b.broker_type,b.display_name,b.api_key_enc,'
-            'b.identifier_enc,b.password_enc,b.active,b.created,c.username,c.active AS client_active '
+            'b.identifier_enc,b.password_enc,b.endpoint_enc,b.active,b.created,'
+            'c.username,c.active AS client_active '
             'FROM broker_accounts b JOIN clients c ON c.id=b.client_id '
             'WHERE b.active=1 AND c.active=1').fetchall()
         return [dict(r)|{'active':True,'client_active':bool(r['client_active'])} for r in rows]

@@ -365,94 +365,186 @@ class OandaBroker:
                 return dict(conf)
         return {'dealStatus': 'UNKNOWN', 'dealReference': ref}
 
-    def _tx_window_params(self, *, last_period=600, from_time=None, to_time=None):
-        params = {}
-        ft = capital_api_time(from_time)
-        tt = capital_api_time(to_time)
-        if ft:
-            params['from'] = ft + 'Z'
-        if tt:
-            params['to'] = tt + 'Z'
-        if not ft and last_period is not None:
-            start = datetime.now(timezone.utc) - timedelta(seconds=int(last_period))
-            params['from'] = start.replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
-        return params
+    async def _recent_transactions(self, *, lookback: int = 500) -> list[dict]:
+        """Fetch concrete OANDA transaction objects (not page-index links).
 
-    def _map_transaction(self, tx: dict) -> dict:
+        ``GET /v3/accounts/{id}/transactions`` only returns page URLs. Closed-trade
+        cash P&L lives on ORDER_FILL rows from ``idrange`` / ``sinceid``.
+        """
+        lookback = max(20, min(int(lookback), 1000))
+        last_id = None
+        if self._last_tx_id is not None:
+            try:
+                last_id = int(self._last_tx_id)
+            except (TypeError, ValueError):
+                last_id = None
+        if last_id is None:
+            summary = await self._request(
+                'GET', f'/v3/accounts/{self.account_id}/summary')
+            self._last_tx_id = summary.get('lastTransactionID')
+            account = summary.get('account') or {}
+            self._currency = account.get('currency') or self._currency
+            try:
+                last_id = int(self._last_tx_id or 0)
+            except (TypeError, ValueError):
+                last_id = 0
+        if last_id <= 0:
+            return []
+        from_id = max(1, last_id - lookback + 1)
+        data = await self._request(
+            'GET', f'/v3/accounts/{self.account_id}/transactions/idrange',
+            params={'from': str(from_id), 'to': str(last_id)})
+        rows = data.get('transactions') or []
+        # Refresh cursor if the response carries a newer tip.
+        tip = data.get('lastTransactionID')
+        if tip is not None:
+            self._last_tx_id = tip
+        return [tx for tx in rows if isinstance(tx, dict)]
+
+    def _map_fill_rows(self, tx: dict) -> list[dict]:
+        """One Capital-shaped cash row per closed/reduced trade (realizedPL).
+
+        Fill-level ``pl`` is the sum; per-trade ``realizedPL`` is what the engine
+        must bind to ``dealId`` (= OANDA trade id).
+        """
+        tx_id = str(tx.get('id') or '')
+        instrument = tx.get('instrument')
+        stamp = tx.get('time')
+        rows = []
+        closed = tx.get('tradesClosed') or []
+        if isinstance(closed, dict):
+            closed = [closed]
+        for item in closed:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get('tradeID') or item.get('id') or '')
+            if not tid:
+                continue
+            pl = _num(item.get('realizedPL'))
+            if pl is None:
+                pl = _num(tx.get('pl'))
+            rows.append({
+                'transactionId': tx_id,
+                'dealId': tid,
+                'reference': tid,
+                'dealReference': tx_id,
+                'date': stamp,
+                'profitAndLoss': pl,
+                'profit': pl,
+                'pnl': pl,
+                'currency': self._currency,
+                'type': tx.get('type'),
+                'instrumentName': instrument,
+                'epic': instrument,
+                'note': tid,
+            })
+        reduced = tx.get('tradeReduced')
+        if isinstance(reduced, dict):
+            tid = str(reduced.get('tradeID') or reduced.get('id') or '')
+            if tid:
+                pl = _num(reduced.get('realizedPL'))
+                if pl is None:
+                    pl = _num(tx.get('pl'))
+                rows.append({
+                    'transactionId': tx_id,
+                    'dealId': tid,
+                    'reference': tid,
+                    'dealReference': tx_id,
+                    'date': stamp,
+                    'profitAndLoss': pl,
+                    'profit': pl,
+                    'pnl': pl,
+                    'currency': self._currency,
+                    'type': tx.get('type'),
+                    'instrumentName': instrument,
+                    'epic': instrument,
+                    'note': tid,
+                })
+        if rows:
+            return rows
+        # Non-close fill / unknown shape — keep fill-level pl only when present.
         pl = _num(tx.get('pl'))
         if pl is None:
-            pl = _num(tx.get('realizedPL'))
-        trade_ids = []
-        for key in ('tradesClosed', 'tradeReduced', 'tradeOpened'):
-            block = tx.get(key)
-            if isinstance(block, list):
-                for item in block:
-                    tid = item.get('tradeID') or item.get('id')
-                    if tid:
-                        trade_ids.append(str(tid))
-            elif isinstance(block, dict):
-                tid = block.get('tradeID') or block.get('id')
-                if tid:
-                    trade_ids.append(str(tid))
-        deal = trade_ids[0] if trade_ids else str(tx.get('id') or '')
-        return {
-            'transactionId': str(tx.get('id') or ''),
-            'dealId': deal,
-            'reference': deal,
-            'date': tx.get('time'),
+            return []
+        opened = tx.get('tradeOpened') or {}
+        tid = str(opened.get('tradeID') or tx_id)
+        return [{
+            'transactionId': tx_id,
+            'dealId': tid,
+            'reference': tid,
+            'dealReference': tx_id,
+            'date': stamp,
             'profitAndLoss': pl,
             'profit': pl,
             'pnl': pl,
             'currency': self._currency,
             'type': tx.get('type'),
-            'note': ','.join(trade_ids),
-        }
+            'instrumentName': instrument,
+            'epic': instrument,
+            'note': tid,
+        }]
 
     async def transactions(self, *, last_period=600, from_time=None, to_time=None,
                            tx_type='TRADE'):
-        params = self._tx_window_params(
-            last_period=last_period, from_time=from_time, to_time=to_time)
-        data = await self._request(
-            'GET', f'/v3/accounts/{self.account_id}/transactions', params=params)
+        # Time filters are honored approximately: pull a wide id window. OANDA
+        # cash evidence is keyed by monotonic transaction ids, not Capital's
+        # lastPeriod clock.
+        seconds = int(last_period) if last_period is not None else 86400
+        if from_time and not last_period:
+            seconds = 86400
+        # ~1 tx/sec upper bound is generous; clamp for API limits.
+        lookback = max(50, min(1000, max(seconds // 2, 200)))
+        raw = await self._recent_transactions(lookback=lookback)
+        ft = capital_api_time(from_time)
+        tt = capital_api_time(to_time)
         rows = []
-        for tx in data.get('transactions') or []:
+        for tx in raw:
             t = str(tx.get('type') or '')
+            has_close = bool(tx.get('tradesClosed') or tx.get('tradeReduced'))
             if tx_type == 'TRADE' and t not in (
                     'ORDER_FILL', 'TRADE_CLOSE', 'STOP_LOSS_ORDER_FILL',
                     'TAKE_PROFIT_ORDER_FILL', 'MARKET_ORDER_TRADE_CLOSE',
                     'GUARANTEED_STOP_LOSS_ORDER_FILL'):
-                # Still keep fills that carry realized PL / closed trades.
-                if not (tx.get('tradesClosed') or tx.get('pl') not in (None, '0', 0, '0.0')):
+                if not has_close:
                     continue
-            rows.append(self._map_transaction(tx))
+            if not has_close and _num(tx.get('pl')) is None:
+                continue
+            stamp = str(tx.get('time') or '')
+            if ft and stamp and stamp[:19] < ft:
+                continue
+            if tt and stamp and stamp[:19] > tt:
+                continue
+            rows.extend(self._map_fill_rows(tx))
         return {'transactions': rows}
 
     async def activity(self, *, last_period=600, from_time=None, to_time=None,
                        detailed=True, deal_id=None):
-        """Synthesize Capital-style activity rows from OANDA transactions."""
+        """Synthesize Capital-style activity rows from OANDA ORDER_FILL cash."""
         payload = await self.transactions(
             last_period=last_period, from_time=from_time, to_time=to_time)
         activities = []
+        want = str(deal_id) if deal_id is not None else None
         for tx in payload.get('transactions') or []:
-            if deal_id and str(deal_id) not in (
-                    str(tx.get('dealId') or ''), str(tx.get('reference') or ''),
-                    str(tx.get('note') or '')):
-                if str(deal_id) not in str(tx.get('note') or ''):
-                    continue
+            tid = str(tx.get('dealId') or '')
+            if want and want not in (tid, str(tx.get('reference') or ''),
+                                    str(tx.get('note') or '')):
+                continue
             activities.append({
-                'dealId': tx.get('dealId'),
+                'dealId': tid,
                 'date': tx.get('date'),
                 'status': 'ACCEPTED',
                 'type': tx.get('type'),
                 'details': {
-                    'dealId': tx.get('dealId'),
+                    'dealId': tid,
                     'profit': tx.get('profit'),
                     'profitAndLoss': tx.get('profitAndLoss'),
                     'currency': tx.get('currency'),
+                    'instrumentName': tx.get('instrumentName'),
                 },
                 'currency': tx.get('currency'),
                 'profit': tx.get('profit'),
                 'profitAndLoss': tx.get('profitAndLoss'),
+                'instrumentName': tx.get('instrumentName'),
             })
         return {'activities': activities}
 
@@ -536,12 +628,26 @@ class OandaBroker:
             'PUT', f'/v3/accounts/{self.account_id}/trades/{tid}/close', json={})
         fill = reply.get('orderFillTransaction') or reply.get('tradeCloseTransaction') or {}
         ref = str(fill.get('id') or f'close-{tid}')
+        # Prefer per-trade realizedPL for this dealId over fill-level sum.
+        profit = _num(fill.get('pl'))
+        for item in (fill.get('tradesClosed') or []):
+            if str(item.get('tradeID') or '') == tid:
+                per = _num(item.get('realizedPL'))
+                if per is not None:
+                    profit = per
+                break
+        reduced = fill.get('tradeReduced') or {}
+        if str(reduced.get('tradeID') or '') == tid:
+            per = _num(reduced.get('realizedPL'))
+            if per is not None:
+                profit = per
         self._confirms[ref] = {
             'dealStatus': 'ACCEPTED',
             'dealId': tid,
             'dealReference': ref,
             'level': _num(fill.get('price')),
-            'profit': _num(fill.get('pl')),
+            'profit': profit,
+            'pnl_currency': self._currency,
         }
         return {'dealReference': ref}
 

@@ -68,6 +68,124 @@ def test_positions_and_accounts_mapping():
     async_run(scenario())
 
 
+def test_closed_trade_realized_pl_from_order_fill():
+    """SL/TP close must expose broker cash keyed by OANDA trade id (= dealId)."""
+    def handle(request):
+        path = request.url.path
+        if path.endswith('/summary'):
+            return httpx.Response(200, json={
+                'account': {
+                    'id': ACCOUNT, 'currency': 'USD', 'balance': '5000',
+                    'NAV': '5000', 'marginAvailable': '4000',
+                },
+                'lastTransactionID': '120',
+            })
+        if path.endswith('/transactions/idrange'):
+            return httpx.Response(200, json={
+                'lastTransactionID': '120',
+                'transactions': [{
+                    'id': '118', 'type': 'ORDER_FILL', 'time': '2026-11-28T12:00:00.000000000Z',
+                    'instrument': 'XAU_USD', 'pl': '-3.40', 'accountID': ACCOUNT,
+                    'tradesClosed': [
+                        {'tradeID': '77', 'units': '-1', 'realizedPL': '-3.40'},
+                    ],
+                }, {
+                    'id': '119', 'type': 'ORDER_FILL', 'time': '2026-11-28T12:01:00.000000000Z',
+                    'instrument': 'XAU_USD', 'pl': '1.10', 'accountID': ACCOUNT,
+                    'tradesClosed': [
+                        {'tradeID': '88', 'units': '2', 'realizedPL': '1.10'},
+                    ],
+                }],
+            })
+        return httpx.Response(404)
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle),
+                                   base_url='https://broker.invalid')
+        broker = OandaBroker('tok', ACCOUNT, '', client=client)
+        await broker.connect()
+        acts = await broker.activity(deal_id='77', last_period=3600)
+        assert len(acts['activities']) == 1
+        assert acts['activities'][0]['dealId'] == '77'
+        assert acts['activities'][0]['profit'] == pytest.approx(-3.40)
+        assert acts['activities'][0]['currency'] == 'USD'
+        txs = await broker.transactions(last_period=3600)
+        by_deal = {t['dealId']: t for t in txs['transactions']}
+        assert by_deal['88']['pnl'] == pytest.approx(1.10)
+        await broker.close()
+
+    async_run(scenario())
+
+
+def test_engine_resolves_oanda_broker_cash_pnl():
+    """End-to-end: vanish → activity realizedPL → pnl_source=broker."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from app.autonomy import AutoEvolution
+    from app.engine import SingleTradeEngine
+    from tests.test_learning_integrity import new_brain
+
+    class OandaHistoryBroker:
+        def __init__(self):
+            self.open = []
+            self._currency = 'USD'
+        async def positions(self):
+            return list(self.open)
+        async def accounts(self):
+            return {'accounts': [{'preferred': True, 'currency': 'USD', 'accountId': '1',
+                                  'balance': {'balance': 1000}}]}
+        async def activity(self, *, last_period=600, from_time=None, to_time=None,
+                           detailed=True, deal_id=None):
+            rows = [{
+                'dealId': '77',
+                'details': {'profit': -3.40, 'currency': 'USD'},
+                'profit': -3.40,
+                'currency': 'USD',
+            }]
+            if deal_id:
+                rows = [r for r in rows if str(r['dealId']) == str(deal_id)]
+            return {'activities': rows}
+        async def transactions(self, *, last_period=600, from_time=None, to_time=None,
+                               tx_type='TRADE'):
+            return {'transactions': [{
+                'dealId': '77', 'reference': '77', 'pnl': -3.40, 'currency': 'USD',
+            }]}
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as d:
+            store, brain = new_brain(d)
+            brain.tick(100, .05, .01, 'XAU_USD')
+            e = SingleTradeEngine(store, brain)
+            e.policy = AutoEvolution(store, Path(d) / 'policy.py')
+            broker = OandaHistoryBroker()
+            broker.open = [{'position': {
+                'dealId': '77', 'size': '1', 'direction': 'SELL',
+                'level': 2651, 'upl': -0.5, 'currency': 'USD',
+            }, 'market': {'epic': 'XAU_USD'}}]
+            e.attach(broker)
+            e.account = {'accounts': [{'preferred': True, 'currency': 'USD', 'accountId': '1'}]}
+            await e.sync()
+            e.market = {'epic': 'XAU_USD', 'mid': 2650.2, 'tick': .1, 'spread': .3}
+            store.set('entry_brain:77', {
+                'epic': 'XAU_USD', 'direction': 'SELL', 'entry': 2651,
+                'tick_size': .1,
+                'transition': brain._json_transition(brain.core.last_transition),
+            })
+            store.upsert_trade({
+                'dealId': '77', 'epic': 'XAU_USD', 'size': '1',
+                'direction': 'SELL', 'level': 2651,
+            })
+            broker.open = []
+            await e.sync()
+            row = store.trades(1)[0]
+            assert row['pnl'] == pytest.approx(-3.40)
+            assert row['pnl_source'] == 'broker'
+            assert row['pnl_currency'] == 'USD'
+
+    asyncio.run(scenario())
+
+
 def test_candles_mapped_to_capital_price_rows():
     def handle(request):
         if '/candles' in request.url.path:

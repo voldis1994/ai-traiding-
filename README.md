@@ -17,7 +17,7 @@ Tur ir:
 - kas ir LIVE lēmums vs kas ir tikai shadow
 
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
-Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
+OANDA brokeris: [`OANDA_LV.md`](OANDA_LV.md)
 
 ## Portāli (stabilie ceļi)
 

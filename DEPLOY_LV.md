@@ -62,7 +62,7 @@ Aiz reverse proxy (Caddy/Nginx) ar HTTPS. Ieslēdz `NTA_SECURE_COOKIES=1`.
 
 1. Atver `/admin` → ielogojies  
 2. Izveido klientu (login + parole)  
-3. Pieslēdz Capital.com API  
+3. Pieslēdz OANDA (API token + Account ID)  
 4. Nosūti klientam tikai: **`NTA_PUBLIC_URL/app`** + login + parole  
 
 Lokāli Windows joprojām: `run_windows.bat` → `http://127.0.0.1:8765`

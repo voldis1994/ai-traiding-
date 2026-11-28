@@ -266,8 +266,12 @@ def test_auth_required_and_frontend_assets_exist():
     from app.main import app
     with TestClient(app) as c:
         assert c.get('/').status_code==200
-        assert c.get('/static/ui.js').status_code==200
-        assert c.get('/static/style.css').status_code==200
+        assert c.get('/portal').status_code==200
+        assert c.get('/admin').status_code==200
+        assert c.get('/app').status_code==200
+        assert c.get('/static/portal.css').status_code==200
+        assert c.get('/admin/static/admin.js').status_code==200
+        assert c.get('/app/static/app.js').status_code==200
         assert c.get('/api/status').status_code==401
         assert c.post('/api/pause').status_code==401
 

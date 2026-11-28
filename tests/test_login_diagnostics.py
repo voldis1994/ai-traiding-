@@ -59,6 +59,7 @@ def test_login_route_reports_exact_broker_stage(monkeypatch):
             return []
         async def close(self):pass
 
+    monkeypatch.setattr(main,'OandaBroker',FailingBroker)
     monkeypatch.setattr(main,'CapitalBroker',FailingBroker)
     with TestClient(main.app) as client:
         for stage, expected_code, phrase in [('session',401,'autentifikāciju'),
@@ -66,9 +67,9 @@ def test_login_route_reports_exact_broker_stage(monkeypatch):
                                               ('positions',503,'pozīciju nolasīšana')]:
             FailingBroker.stage=stage
             reply=client.post('/api/connect',json={
-                'api_key':'SECRET_API_KEY','identifier':'SENSITIVE_EMAIL',
-                'password':'SECRET_PASSWORD'})
+                'api_key':'SECRET_API_KEY','identifier':'101-001-9999999-001',
+                'password':''})
             assert reply.status_code==expected_code
             assert phrase in reply.json()['detail']
             assert 'SECRET_' not in reply.text
-            assert 'SENSITIVE_EMAIL' not in reply.text
+            assert '101-001-9999999-001' not in reply.text

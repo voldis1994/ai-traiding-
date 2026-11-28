@@ -207,9 +207,9 @@ def test_runtime_hub_exposes_separated_metrics():
 
 
 def test_ui_copy_no_longer_claims_zone_shift_entry_bans():
-    ui = Path('app/web/ui.js').read_text(encoding='utf8')
-    assert 'not mid-chop, not against 15m/60m, not SHIFT' not in ui
-    assert 'zone/SHIFT are evidence only' in ui or 'not bans' in ui
-    assert 'diagnostic' in ui.lower()
-    assert 'not profit probability' in ui.lower()
-    assert 'trade win rate' in ui.lower() or 'Closed-trade win rate' in ui
+    # Legacy Capital console ui.js removed — keep guard on live admin/client copy.
+    admin = Path('app/web/admin/admin.js').read_text(encoding='utf8')
+    client = Path('app/web/client/app.js').read_text(encoding='utf8')
+    blob = (admin + '\n' + client).lower()
+    assert 'not mid-chop, not against 15m/60m, not SHIFT' not in admin
+    assert 'capital.com' not in blob

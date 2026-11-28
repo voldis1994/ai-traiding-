@@ -1,135 +1,697 @@
-"""Capital.com LIVE REST broker adapter, modelled on https://open-api.capital.com/.
-Never automatically retry non-idempotent requests. Credentials stay in RAM.
+"""OANDA v20 LIVE REST broker adapter.
+
+Presents the same async surface the engine historically used with Capital.com
+(positions/accounts/market/prices/open/close/update/confirm/transactions),
+while talking only to OANDA fxTrade / fxPractice. Never automatically retry
+non-idempotent writes. Credentials stay in RAM.
 """
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timezone
+import hashlib
+import re
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from urllib.parse import quote
 import httpx
 
-LIVE='https://api-capital.backend-capital.com'
-DEMO='https://demo-api-capital.backend-capital.com'
+LIVE_REST = 'https://api-fxtrade.oanda.com'
+LIVE_STREAM = 'https://stream-fxtrade.oanda.com'
+DEMO_REST = 'https://api-fxpractice.oanda.com'
+DEMO_STREAM = 'https://stream-fxpractice.oanda.com'
 
 
 def capital_api_time(value):
-    """Format timestamps for Capital history/prices ``from``/``to``.
+    """Format timestamps for broker history ``from``/``to`` (UTC, no micros).
 
-    Docs: ``YYYY-MM-DDTHH:MM:SS`` (no ``Z`` / offset suffix). Passing
-    ``...Z`` or ``...+00:00`` can make history requests fail or return empty.
+    Kept under the historical name so engine lookback helpers stay stable.
+    OANDA accepts RFC3339; bare ``YYYY-MM-DDTHH:MM:SS`` is also fine.
     """
     if value is None:
         return None
-    if isinstance(value,datetime):
-        dt=value
+    if isinstance(value, datetime):
+        dt = value
     else:
-        s=str(value).strip().replace(' ','T')
+        s = str(value).strip().replace(' ', 'T')
         if not s:
             return None
         try:
-            dt=datetime.fromisoformat(s.replace('Z','+00:00'))
+            dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
         except ValueError:
-            # Already bare Capital form, or unparseable — strip suffix heuristically.
             if s.endswith('Z'):
                 return s[:-1]
             if s.endswith('+00:00'):
                 return s[:-6]
             return s
     if dt.tzinfo is None:
-        dt=dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=timezone.utc)
     else:
-        dt=dt.astimezone(timezone.utc)
+        dt = dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%S')
 
 
-class CapitalBroker:
-    def __init__(self, api_key, identifier, password, live=True, client=None):
-        self.api_key=api_key;self.identifier=identifier;self.password=password
-        self.base=LIVE if live else DEMO
-        self.client=client or httpx.AsyncClient(base_url=self.base, timeout=15.0, follow_redirects=False)
-        self.cst=None;self.security=None
-        self._relogin=asyncio.Lock()
+broker_api_time = capital_api_time
 
-    async def connect(self):
-        # Non-encrypted password is sent over HTTPS per broker session API.
-        response=await self.client.post('/api/v1/session',headers={'X-CAP-API-KEY':self.api_key},
-            json={'identifier':self.identifier,'password':self.password,'encryptedPassword':False})
-        response.raise_for_status()
-        self.cst=response.headers.get('CST');self.security=response.headers.get('X-SECURITY-TOKEN')
-        if not self.cst or not self.security:raise RuntimeError('Broker session tokens missing')
-        return response.json()
+
+def instrument_name(s: str) -> str:
+    name = str(s or '').strip().upper().replace('/', '_').replace('-', '_')
+    if not re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', name):
+        # Allow legacy Capital-style epics through unchanged for search/adopt.
+        if re.fullmatch(r'[A-Z0-9._]+', name) and name:
+            return name
+        raise ValueError('Invalid OANDA instrument')
+    return name
+
+
+def _num(value):
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_price(value, precision: int) -> str:
+    q = Decimal('1').scaleb(-int(precision))
+    return format(Decimal(str(value)).quantize(q), 'f')
+
+
+class OandaBroker:
+    """Async OANDA v20 client shaped like the former CapitalBroker surface."""
+
+    def __init__(self, api_key, identifier, password='', live=True, client=None):
+        # api_key = Bearer token; identifier = account id; password unused.
+        self.api_key = (api_key or '').strip()
+        self.identifier = (identifier or '').strip()
+        self.password = password or ''
+        self.live = bool(live)
+        self.base = LIVE_REST if self.live else DEMO_REST
+        self.stream_base = LIVE_STREAM if self.live else DEMO_STREAM
+        self.account_id = self.identifier
+        self.client = client or httpx.AsyncClient(
+            base_url=self.base, timeout=15.0, follow_redirects=False)
+        self.cst = None  # unused (Capital session leftover for stream checks)
+        self.security = None
+        self._confirms: dict[str, dict] = {}
+        self._currency = None
+        self._instrument_cache: dict[str, dict] = {}
+        self._last_tx_id = None
+        if not self.api_key or not re.fullmatch(r'[0-9]+(?:-[0-9]+)+', self.account_id):
+            raise ValueError('OANDA requires API token and account id (e.g. 101-001-…)')
 
     def headers(self):
-        if not self.cst or not self.security:raise RuntimeError('Not authenticated')
-        return {'CST':self.cst,'X-SECURITY-TOKEN':self.security,'X-CAP-API-KEY':self.api_key}
+        return {
+            'Authorization': 'Bearer ' + self.api_key,
+            'Accept-Datetime-Format': 'RFC3339',
+            'Content-Type': 'application/json',
+        }
 
-    async def _request(self,method,path,*,params=None,json=None):
-        response=await self.client.request(method,path,headers=self.headers(),params=params,json=json)
-        # Relogin only for reads. Retrying an order on network error is not safe.
-        if response.status_code==401 and method=='GET':
-            async with self._relogin:
-                await self.connect()
-            response=await self.client.request(method,path,headers=self.headers(),params=params,json=json)
+    async def connect(self):
+        """Validate token + account (no session cookie — Bearer auth)."""
+        data = await self._request('GET', f'/v3/accounts/{self.account_id}/summary')
+        account = data.get('account') or {}
+        if str(account.get('id') or '') != self.account_id:
+            raise RuntimeError('OANDA account identity mismatch')
+        self._currency = account.get('currency')
+        self._last_tx_id = data.get('lastTransactionID')
+        # Populate Capital-era token slots so stream readiness checks pass.
+        self.cst = 'oanda'
+        self.security = self.api_key[:12] if self.api_key else 'oanda'
+        return data
+
+    async def _request(self, method, path, *, params=None, json=None):
+        response = await self.client.request(
+            method, path, headers=self.headers(), params=params, json=json)
+        # Relogin-equivalent only for reads (token is static; refresh summary).
+        if response.status_code == 401 and method == 'GET':
+            response = await self.client.request(
+                method, path, headers=self.headers(), params=params, json=json)
+        if 300 <= response.status_code < 400:
+            raise RuntimeError('Unexpected OANDA redirect')
         response.raise_for_status()
+        if not response.content:
+            return {}
         return response.json()
 
-    async def positions(self):return (await self._request('GET','/api/v1/positions')).get('positions',[])
-    async def accounts(self):return await self._request('GET','/api/v1/accounts')
-    async def ping(self):return await self._request('GET','/api/v1/ping')
-    async def market(self,epic):return await self._request('GET','/api/v1/markets/'+quote(epic,safe=''))
-    async def search_markets(self,search_term):
-        return await self._request('GET','/api/v1/markets',params={'searchTerm':search_term})
-    async def prices(self,epic,resolution='MINUTE',maximum=80,from_time=None,to_time=None):
-        """Historical OHLC. ``max`` ≤ 1000. Optional ``from``/``to`` page older bars."""
-        params={'resolution':resolution,'max':int(maximum)}
-        ft=capital_api_time(from_time);tt=capital_api_time(to_time)
-        if ft:params['from']=ft
-        if tt:params['to']=tt
-        return await self._request('GET','/api/v1/prices/'+quote(epic,safe=''),params=params)
-    async def confirm(self,deal_reference):
-        return await self._request('GET','/api/v1/confirms/'+quote(deal_reference,safe=''))
-    async def transactions(self,*,last_period=600,from_time=None,to_time=None,tx_type='TRADE'):
-        """Account cash movements. Default last 10 minutes — includes closed-trade P&L."""
-        params={}
-        ft=capital_api_time(from_time);tt=capital_api_time(to_time)
-        if ft:params['from']=ft
-        if tt:params['to']=tt
-        if last_period is not None and not ft:params['lastPeriod']=int(last_period)
-        if tx_type:params['type']=tx_type
-        return await self._request('GET','/api/v1/history/transactions',params=params or None)
-    async def activity(self,*,last_period=600,from_time=None,to_time=None,detailed=True,
-                       deal_id=None):
-        """Deal activity (SL/TP/USER closes) — often carries dealId + profit details."""
-        params={'detailed':'true' if detailed else 'false'}
-        ft=capital_api_time(from_time);tt=capital_api_time(to_time)
-        if ft:params['from']=ft
-        if tt:params['to']=tt
-        if last_period is not None and not ft:params['lastPeriod']=int(last_period)
-        if deal_id:params['dealId']=str(deal_id)
-        return await self._request('GET','/api/v1/history/activity',params=params)
-    async def open_position(self,epic,direction,size,stop_distance=None,profit_distance=None,limit_distance=None):
-        if direction not in ('BUY','SELL') or Decimal(str(size))<=0:raise ValueError('Invalid trade')
-        payload={'epic':epic,'direction':direction,'size':float(size),'guaranteedStop':False}
-        if stop_distance is not None:payload['stopDistance']=float(stop_distance)
-        distance=profit_distance if profit_distance is not None else limit_distance
-        if distance is not None:payload['profitDistance']=float(distance)
-        return await self._request('POST','/api/v1/positions',json=payload)
-    async def close_position(self,deal_id):
-        return await self._request('DELETE','/api/v1/positions/'+quote(str(deal_id),safe=''))
-    async def update_position(self,deal_id,stop_level=None,profit_level=None,limit_level=None):
-        payload={}
-        # Capital rejects stopLevel/profitLevel that are not on the price grid
-        # (e.g. 4006.075). Pass through floats already snapped by protection_ai.
-        if stop_level is not None:payload['stopLevel']=float(stop_level)
-        if profit_level is not None or limit_level is not None:
-            payload['profitLevel']=float(profit_level if profit_level is not None else limit_level)
-        if not payload:raise ValueError('No changes supplied')
-        return await self._request('PUT','/api/v1/positions/'+quote(str(deal_id),safe=''),json=payload)
-    async def close(self, *, end_session: bool=True):
-        # Free Capital.com session slot so a second connect (or another client) is not blocked.
-        if end_session and self.cst and self.security:
+    async def ping(self):
+        return await self._request('GET', f'/v3/accounts/{self.account_id}/summary')
+
+    async def accounts(self):
+        data = await self._request('GET', f'/v3/accounts/{self.account_id}/summary')
+        account = data.get('account') or {}
+        self._currency = account.get('currency') or self._currency
+        self._last_tx_id = data.get('lastTransactionID') or self._last_tx_id
+        balance = _num(account.get('balance'))
+        nav = _num(account.get('NAV'))
+        available = _num(account.get('marginAvailable'))
+        return {
+            'accounts': [{
+                'preferred': True,
+                'accountId': str(account.get('id') or self.account_id),
+                'accountName': account.get('alias') or self.account_id,
+                'currency': account.get('currency'),
+                'balance': {
+                    'balance': balance,
+                    'available': available,
+                    'equity': nav if nav is not None else balance,
+                    'profitLoss': _num(account.get('pl')),
+                },
+            }],
+            'currentAccountId': str(account.get('id') or self.account_id),
+        }
+
+    def _map_trade(self, trade: dict) -> dict:
+        units = _num(trade.get('currentUnits')) or 0.0
+        direction = 'BUY' if units > 0 else 'SELL'
+        size = abs(units)
+        stop = None
+        profit = None
+        sl = trade.get('stopLossOrder') or {}
+        tp = trade.get('takeProfitOrder') or {}
+        if isinstance(sl, dict):
+            stop = _num(sl.get('price'))
+        if isinstance(tp, dict):
+            profit = _num(tp.get('price'))
+        instrument = trade.get('instrument')
+        return {
+            'position': {
+                'dealId': str(trade.get('id')),
+                'size': size,
+                'direction': direction,
+                'level': _num(trade.get('price')),
+                'stopLevel': stop,
+                'profitLevel': profit if profit is not None else 0,
+                'upl': _num(trade.get('unrealizedPL')),
+                'currency': self._currency,
+                'contractSize': 1,
+            },
+            'market': {
+                'epic': instrument,
+                'instrumentName': instrument,
+                'symbol': instrument,
+            },
+        }
+
+    async def positions(self):
+        data = await self._request('GET', f'/v3/accounts/{self.account_id}/openTrades')
+        trades = data.get('trades') or []
+        return [self._map_trade(t) for t in trades if isinstance(t, dict)]
+
+    async def _instrument(self, epic: str) -> dict:
+        name = instrument_name(epic)
+        if name in self._instrument_cache:
+            return self._instrument_cache[name]
+        data = await self._request(
+            'GET', f'/v3/accounts/{self.account_id}/instruments',
+            params={'instruments': name})
+        rows = data.get('instruments') or []
+        if len(rows) != 1:
+            raise RuntimeError(f'Instrument unavailable: {name}')
+        self._instrument_cache[name] = rows[0]
+        return rows[0]
+
+    async def market(self, epic):
+        name = instrument_name(epic)
+        info = await self._instrument(name)
+        pricing = await self._request(
+            'GET', f'/v3/accounts/{self.account_id}/pricing',
+            params={'instruments': name})
+        prices = pricing.get('prices') or []
+        row = prices[0] if prices else {}
+        bids = row.get('bids') or []
+        asks = row.get('asks') or []
+        bid = _num(bids[0]['price']) if bids else None
+        ask = _num(asks[0]['price']) if asks else None
+        tradeable = row.get('tradeable') is not False and (
+            row.get('status') in (None, 'tradeable'))
+        precision = int(info.get('displayPrecision') or 5)
+        pip_location = int(info.get('pipLocation') or -4)
+        one_pip = 10 ** pip_location
+        min_stop = _num((info.get('minimumTrailingStopDistance')
+                         or info.get('minimumStopDistance') or {}).get('distance'))
+        if min_stop is None:
+            min_stop = one_pip
+        return {
+            'instrument': {
+                'epic': name,
+                'name': info.get('displayName') or name,
+                'type': info.get('type'),
+                'currency': (info.get('marginRate') and self._currency) or self._currency,
+                'onePipMeans': one_pip,
+                'valueOfOnePip': one_pip,
+            },
+            'snapshot': {
+                'bid': bid,
+                'offer': ask,
+                'marketStatus': 'TRADEABLE' if tradeable else 'CLOSED',
+                'decimalPlacesFactor': precision,
+                'updateTime': row.get('time'),
+            },
+            'dealingRules': {
+                'minStopOrProfitDistance': {
+                    'unit': 'POINTS',
+                    'value': str(min_stop),
+                },
+            },
+        }
+
+    async def search_markets(self, search_term):
+        term = str(search_term or '').strip()
+        data = await self._request('GET', f'/v3/accounts/{self.account_id}/instruments')
+        needle = re.sub(r'[^A-Z0-9]', '', term.upper())
+        markets = []
+        for item in data.get('instruments') or []:
+            name = item.get('name') or ''
+            display = item.get('displayName') or ''
+            blob = re.sub(r'[^A-Z0-9]', '', (name + display).upper())
+            if not needle or needle in blob or needle in re.sub(r'[^A-Z0-9]', '', name.upper()):
+                markets.append({
+                    'epic': name,
+                    'instrumentName': display or name,
+                    'name': display or name,
+                    'symbol': name,
+                })
+        return {'markets': markets}
+
+    def _candle_to_capital(self, candle: dict) -> dict | None:
+        if not candle.get('complete'):
+            return None
+        bid = candle.get('bid') or {}
+        ask = candle.get('ask') or {}
+        mid = candle.get('mid') or {}
+
+        def side(bucket, key):
+            if bucket.get(key) is not None:
+                return _num(bucket.get(key))
+            return _num(mid.get(key))
+
+        def pair(key):
+            b = side(bid, key)
+            a = side(ask, key)
+            if b is None and a is None:
+                m = _num(mid.get(key))
+                return {'bid': m, 'ask': m} if m is not None else {}
+            if b is None:
+                b = a
+            if a is None:
+                a = b
+            return {'bid': b, 'ask': a}
+
+        return {
+            'snapshotTimeUTC': candle.get('time'),
+            'snapshotTime': candle.get('time'),
+            'openPrice': pair('o'),
+            'highPrice': pair('h'),
+            'lowPrice': pair('l'),
+            'closePrice': pair('c'),
+        }
+
+    async def prices(self, epic, resolution='MINUTE', maximum=80,
+                     from_time=None, to_time=None):
+        name = instrument_name(epic)
+        gran = {
+            'MINUTE': 'M1', 'MINUTE_5': 'M5', 'MINUTE_15': 'M15',
+            'MINUTE_30': 'M30', 'HOUR': 'H1', 'HOUR_4': 'H4', 'DAY': 'D',
+        }.get(str(resolution).upper(), 'M1')
+        count = max(1, min(int(maximum), 5000))
+        params = {'price': 'MBA', 'granularity': gran, 'count': count}
+        # OANDA from/to are RFC3339; prefer them when a window is requested.
+        ft = capital_api_time(from_time)
+        tt = capital_api_time(to_time)
+        if ft:
+            params['from'] = ft + 'Z'
+            params.pop('count', None)
+        if tt:
+            params['to'] = tt + 'Z'
+            params.pop('count', None)
+        data = await self._request('GET', f'/v3/instruments/{quote(name, safe="")}/candles',
+                                   params=params)
+        rows = []
+        for c in data.get('candles') or []:
+            mapped = self._candle_to_capital(c)
+            if mapped:
+                rows.append(mapped)
+        return {'prices': rows}
+
+    async def confirm(self, deal_reference):
+        ref = str(deal_reference or '')
+        cached = self._confirms.get(ref)
+        if cached:
+            return dict(cached)
+        # Fall back: scan recent transactions for clientExtensions / order id.
+        try:
+            data = await self._request(
+                'GET', f'/v3/accounts/{self.account_id}/transactions',
+                params={'count': 50})
+        except Exception:
+            return {'dealStatus': 'UNKNOWN', 'dealReference': ref}
+        for tx in reversed(data.get('transactions') or []):
+            cid = ((tx.get('clientExtensions') or {}).get('id')
+                   or (tx.get('tradeOpened') or {}).get('tradeID')
+                   or str(tx.get('id') or ''))
+            if ref in (cid, str(tx.get('id') or ''),
+                       str((tx.get('orderFillTransaction') or {}).get('id') or '')):
+                trade = (tx.get('tradeOpened') or {})
+                deal = str(trade.get('tradeID') or tx.get('id') or '')
+                conf = {
+                    'dealStatus': 'ACCEPTED',
+                    'dealId': deal,
+                    'dealReference': ref,
+                    'level': _num(tx.get('price')),
+                    'profit': _num(tx.get('pl')),
+                }
+                self._confirms[ref] = conf
+                return dict(conf)
+        return {'dealStatus': 'UNKNOWN', 'dealReference': ref}
+
+    async def _recent_transactions(self, *, lookback: int = 500) -> list[dict]:
+        """Fetch concrete OANDA transaction objects (not page-index links).
+
+        ``GET /v3/accounts/{id}/transactions`` only returns page URLs. Closed-trade
+        cash P&L lives on ORDER_FILL rows from ``idrange`` / ``sinceid``.
+        """
+        lookback = max(20, min(int(lookback), 1000))
+        last_id = None
+        if self._last_tx_id is not None:
             try:
-                await self.client.delete('/api/v1/session',headers=self.headers())
-            except Exception:
-                pass
-        self.cst=None;self.security=None
+                last_id = int(self._last_tx_id)
+            except (TypeError, ValueError):
+                last_id = None
+        if last_id is None:
+            summary = await self._request(
+                'GET', f'/v3/accounts/{self.account_id}/summary')
+            self._last_tx_id = summary.get('lastTransactionID')
+            account = summary.get('account') or {}
+            self._currency = account.get('currency') or self._currency
+            try:
+                last_id = int(self._last_tx_id or 0)
+            except (TypeError, ValueError):
+                last_id = 0
+        if last_id <= 0:
+            return []
+        from_id = max(1, last_id - lookback + 1)
+        data = await self._request(
+            'GET', f'/v3/accounts/{self.account_id}/transactions/idrange',
+            params={'from': str(from_id), 'to': str(last_id)})
+        rows = data.get('transactions') or []
+        # Refresh cursor if the response carries a newer tip.
+        tip = data.get('lastTransactionID')
+        if tip is not None:
+            self._last_tx_id = tip
+        return [tx for tx in rows if isinstance(tx, dict)]
+
+    def _map_fill_rows(self, tx: dict) -> list[dict]:
+        """One Capital-shaped cash row per closed/reduced trade (realizedPL).
+
+        Fill-level ``pl`` is the sum; per-trade ``realizedPL`` is what the engine
+        must bind to ``dealId`` (= OANDA trade id).
+        """
+        tx_id = str(tx.get('id') or '')
+        instrument = tx.get('instrument')
+        stamp = tx.get('time')
+        rows = []
+        closed = tx.get('tradesClosed') or []
+        if isinstance(closed, dict):
+            closed = [closed]
+        for item in closed:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get('tradeID') or item.get('id') or '')
+            if not tid:
+                continue
+            pl = _num(item.get('realizedPL'))
+            if pl is None:
+                pl = _num(tx.get('pl'))
+            rows.append({
+                'transactionId': tx_id,
+                'dealId': tid,
+                'reference': tid,
+                'dealReference': tx_id,
+                'date': stamp,
+                'profitAndLoss': pl,
+                'profit': pl,
+                'pnl': pl,
+                'currency': self._currency,
+                'type': tx.get('type'),
+                'instrumentName': instrument,
+                'epic': instrument,
+                'note': tid,
+            })
+        reduced = tx.get('tradeReduced')
+        if isinstance(reduced, dict):
+            tid = str(reduced.get('tradeID') or reduced.get('id') or '')
+            if tid:
+                pl = _num(reduced.get('realizedPL'))
+                if pl is None:
+                    pl = _num(tx.get('pl'))
+                rows.append({
+                    'transactionId': tx_id,
+                    'dealId': tid,
+                    'reference': tid,
+                    'dealReference': tx_id,
+                    'date': stamp,
+                    'profitAndLoss': pl,
+                    'profit': pl,
+                    'pnl': pl,
+                    'currency': self._currency,
+                    'type': tx.get('type'),
+                    'instrumentName': instrument,
+                    'epic': instrument,
+                    'note': tid,
+                })
+        if rows:
+            return rows
+        # Non-close fill / unknown shape — keep fill-level pl only when present.
+        pl = _num(tx.get('pl'))
+        if pl is None:
+            return []
+        opened = tx.get('tradeOpened') or {}
+        tid = str(opened.get('tradeID') or tx_id)
+        return [{
+            'transactionId': tx_id,
+            'dealId': tid,
+            'reference': tid,
+            'dealReference': tx_id,
+            'date': stamp,
+            'profitAndLoss': pl,
+            'profit': pl,
+            'pnl': pl,
+            'currency': self._currency,
+            'type': tx.get('type'),
+            'instrumentName': instrument,
+            'epic': instrument,
+            'note': tid,
+        }]
+
+    async def transactions(self, *, last_period=600, from_time=None, to_time=None,
+                           tx_type='TRADE'):
+        # Time filters are honored approximately: pull a wide id window. OANDA
+        # cash evidence is keyed by monotonic transaction ids, not Capital's
+        # lastPeriod clock.
+        seconds = int(last_period) if last_period is not None else 86400
+        if from_time and not last_period:
+            seconds = 86400
+        # ~1 tx/sec upper bound is generous; clamp for API limits.
+        lookback = max(50, min(1000, max(seconds // 2, 200)))
+        raw = await self._recent_transactions(lookback=lookback)
+        ft = capital_api_time(from_time)
+        tt = capital_api_time(to_time)
+        rows = []
+        for tx in raw:
+            t = str(tx.get('type') or '')
+            has_close = bool(tx.get('tradesClosed') or tx.get('tradeReduced'))
+            if tx_type == 'TRADE' and t not in (
+                    'ORDER_FILL', 'TRADE_CLOSE', 'STOP_LOSS_ORDER_FILL',
+                    'TAKE_PROFIT_ORDER_FILL', 'MARKET_ORDER_TRADE_CLOSE',
+                    'GUARANTEED_STOP_LOSS_ORDER_FILL'):
+                if not has_close:
+                    continue
+            if not has_close and _num(tx.get('pl')) is None:
+                continue
+            stamp = str(tx.get('time') or '')
+            if ft and stamp and stamp[:19] < ft:
+                continue
+            if tt and stamp and stamp[:19] > tt:
+                continue
+            rows.extend(self._map_fill_rows(tx))
+        return {'transactions': rows}
+
+    async def activity(self, *, last_period=600, from_time=None, to_time=None,
+                       detailed=True, deal_id=None):
+        """Synthesize Capital-style activity rows from OANDA ORDER_FILL cash."""
+        payload = await self.transactions(
+            last_period=last_period, from_time=from_time, to_time=to_time)
+        activities = []
+        want = str(deal_id) if deal_id is not None else None
+        for tx in payload.get('transactions') or []:
+            tid = str(tx.get('dealId') or '')
+            if want and want not in (tid, str(tx.get('reference') or ''),
+                                    str(tx.get('note') or '')):
+                continue
+            activities.append({
+                'dealId': tid,
+                'date': tx.get('date'),
+                'status': 'ACCEPTED',
+                'type': tx.get('type'),
+                'details': {
+                    'dealId': tid,
+                    'profit': tx.get('profit'),
+                    'profitAndLoss': tx.get('profitAndLoss'),
+                    'currency': tx.get('currency'),
+                    'instrumentName': tx.get('instrumentName'),
+                },
+                'currency': tx.get('currency'),
+                'profit': tx.get('profit'),
+                'profitAndLoss': tx.get('profitAndLoss'),
+                'instrumentName': tx.get('instrumentName'),
+            })
+        return {'activities': activities}
+
+    async def open_position(self, epic, direction, size,
+                            stop_distance=None, profit_distance=None,
+                            limit_distance=None):
+        if direction not in ('BUY', 'SELL') or Decimal(str(size)) <= 0:
+            raise ValueError('Invalid trade')
+        name = instrument_name(epic)
+        info = await self._instrument(name)
+        precision = int(info.get('displayPrecision') or 5)
+        unit_precision = int(info.get('tradeUnitsPrecision') or 0)
+        units_abs = Decimal(str(size)).quantize(Decimal('1').scaleb(-unit_precision))
+        if units_abs <= 0:
+            raise ValueError('Unit precision mismatch')
+        units = units_abs if direction == 'BUY' else -units_abs
+        market = await self.market(name)
+        snap = market.get('snapshot') or {}
+        bid = _num(snap.get('bid'))
+        ask = _num(snap.get('offer'))
+        if bid is None or ask is None:
+            raise RuntimeError('No OANDA quote for entry')
+        entry = ask if direction == 'BUY' else bid
+        order = {
+            'type': 'MARKET',
+            'instrument': name,
+            'units': format(units, 'f'),
+            'timeInForce': 'FOK',
+            'positionFill': 'DEFAULT',
+        }
+        profit_d = profit_distance if profit_distance is not None else limit_distance
+        if stop_distance is not None:
+            sl = entry - float(stop_distance) if direction == 'BUY' else entry + float(stop_distance)
+            order['stopLossOnFill'] = {
+                'price': _fmt_price(sl, precision),
+                'timeInForce': 'GTC',
+            }
+        if profit_d is not None:
+            tp = entry + float(profit_d) if direction == 'BUY' else entry - float(profit_d)
+            order['takeProfitOnFill'] = {
+                'price': _fmt_price(tp, precision),
+                'timeInForce': 'GTC',
+            }
+        cid = 'nta-' + hashlib.sha256(
+            f'{self.account_id}|{name}|{units}|{entry}'.encode()).hexdigest()[:40]
+        order['clientExtensions'] = {'id': cid}
+        order['tradeClientExtensions'] = {'id': cid}
+        reply = await self._request(
+            'POST', f'/v3/accounts/{self.account_id}/orders', json={'order': order})
+        fill = reply.get('orderFillTransaction') or {}
+        cancel = reply.get('orderCancelTransaction')
+        if cancel and not fill:
+            ref = str(cancel.get('id') or cid)
+            self._confirms[ref] = {
+                'dealStatus': 'REJECTED',
+                'dealReference': ref,
+                'reason': cancel.get('reason') or 'cancelled',
+            }
+            return {'dealReference': ref}
+        if not fill:
+            raise RuntimeError('Unconfirmed OANDA order fill')
+        trade = fill.get('tradeOpened') or {}
+        deal_id = str(trade.get('tradeID') or '')
+        ref = str(fill.get('id') or cid)
+        conf = {
+            'dealStatus': 'ACCEPTED',
+            'dealId': deal_id,
+            'dealReference': ref,
+            'level': _num(fill.get('price')),
+            'profit': _num(fill.get('pl')),
+        }
+        self._confirms[ref] = conf
+        self._confirms[cid] = conf
+        return {'dealReference': ref}
+
+    async def close_position(self, deal_id):
+        tid = str(deal_id)
+        if not re.fullmatch(r'[0-9]+', tid):
+            raise ValueError('Invalid trade ID')
+        reply = await self._request(
+            'PUT', f'/v3/accounts/{self.account_id}/trades/{tid}/close', json={})
+        fill = reply.get('orderFillTransaction') or reply.get('tradeCloseTransaction') or {}
+        ref = str(fill.get('id') or f'close-{tid}')
+        # Prefer per-trade realizedPL for this dealId over fill-level sum.
+        profit = _num(fill.get('pl'))
+        for item in (fill.get('tradesClosed') or []):
+            if str(item.get('tradeID') or '') == tid:
+                per = _num(item.get('realizedPL'))
+                if per is not None:
+                    profit = per
+                break
+        reduced = fill.get('tradeReduced') or {}
+        if str(reduced.get('tradeID') or '') == tid:
+            per = _num(reduced.get('realizedPL'))
+            if per is not None:
+                profit = per
+        self._confirms[ref] = {
+            'dealStatus': 'ACCEPTED',
+            'dealId': tid,
+            'dealReference': ref,
+            'level': _num(fill.get('price')),
+            'profit': profit,
+            'pnl_currency': self._currency,
+        }
+        return {'dealReference': ref}
+
+    async def update_position(self, deal_id, stop_level=None, profit_level=None,
+                              limit_level=None):
+        tid = str(deal_id)
+        if not re.fullmatch(r'[0-9]+', tid):
+            raise ValueError('Invalid trade ID')
+        trade = (await self._request(
+            'GET', f'/v3/accounts/{self.account_id}/trades/{tid}')).get('trade') or {}
+        info = await self._instrument(trade.get('instrument') or 'XAU_USD')
+        precision = int(info.get('displayPrecision') or 5)
+        payload = {}
+        if stop_level is not None:
+            payload['stopLoss'] = {
+                'timeInForce': 'GTC',
+                'price': _fmt_price(stop_level, precision),
+            }
+        level = profit_level if profit_level is not None else limit_level
+        if level is not None and float(level) != 0:
+            payload['takeProfit'] = {
+                'timeInForce': 'GTC',
+                'price': _fmt_price(level, precision),
+            }
+        if not payload:
+            raise ValueError('No changes supplied')
+        reply = await self._request(
+            'PUT', f'/v3/accounts/{self.account_id}/trades/{tid}/orders',
+            json=payload)
+        ref = str((reply.get('stopLossOrderTransaction')
+                   or reply.get('takeProfitOrderTransaction')
+                   or {}).get('id') or f'protect-{tid}')
+        self._confirms[ref] = {
+            'dealStatus': 'ACCEPTED',
+            'dealId': tid,
+            'dealReference': ref,
+        }
+        return {'dealReference': ref}
+
+    async def close(self, *, end_session: bool = True):
+        self.cst = None
+        self.security = None
         await self.client.aclose()
+
+
+# Back-compat alias so older imports/monkeypatches keep resolving during migration.
+CapitalBroker = OandaBroker

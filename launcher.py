@@ -96,12 +96,10 @@ def self_test():
     from app.main import app
     from app.core import NeuralCore
     static = Path(__file__).resolve().parent / 'app' / 'web'
-    assert (static / 'index.html').is_file(), f'Missing bundled UI: {static}'
-    assert (static / 'style.css').is_file()
-    assert (static / 'ui.js').is_file()
+    assert (static / 'portal.html').is_file(), f'Missing portal UI: {static}'
     assert (static / 'admin' / 'index.html').is_file()
     assert (static / 'client' / 'index.html').is_file()
-    assert (static / 'portal.html').is_file()
+    assert (static / 'portal.css').is_file()
     assert app.title == 'Neural Trading AI'
     result = NeuralCore(n=8).step([0.0, 1.0, 0.0])
     assert abs(sum(result['scores'].values()) - 1) < 1e-8

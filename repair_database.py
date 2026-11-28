@@ -147,7 +147,7 @@ def run(argv=None):
         return 5
     print('\nAll six tables were read and copied successfully.')
     print('Original SQLite files are retained in:', folder)
-    print('IMPORTANT: Confirm open positions and SL/TP directly at Capital.com before reconnecting LIVE.')
+    print('IMPORTANT: Confirm open positions and SL/TP directly at OANDA before reconnecting LIVE.')
     if input('Type APPLY to replace the original database with this verified copy: ').strip() != 'APPLY':
         print('Not applied. Verified candidate:', recovered_copy)
         return 0

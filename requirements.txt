@@ -9,3 +9,4 @@ websockets>=12,<17
 cryptography>=42,<47
 pytest>=8,<10
 torch>=2.3,<3
+requests>=2.31,<3

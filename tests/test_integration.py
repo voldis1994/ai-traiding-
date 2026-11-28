@@ -12,7 +12,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 from app.core import NeuralCore
 from app.math_rules import stop_take,position_size,pnl
-from app.broker import CapitalBroker
+from app.broker import OandaBroker, CapitalBroker
 from app.engine import Store,AdaptiveBrain,SingleTradeEngine
 from app.autonomy import AutoEvolution
 from tests.market_helpers import install_synthetic_context
@@ -111,29 +111,52 @@ def test_policy_generates_new_python_and_rejects_arbitrary_import():
 
 def test_broker_http_payload_and_session_headers():
     calls=[]
+    account='101-001-1234567-001'
     def handle(request):
         calls.append((request.method,request.url.path,request.content))
-        if request.url.path=='/api/v1/session':
-            return httpx.Response(200,json={'clientId':'abc'},headers={'CST':'abc','X-SECURITY-TOKEN':'def'})
-        if request.url.path.endswith('/positions') and request.method=='GET':return httpx.Response(200,json={'positions':[]})
-        if request.url.path=='/api/v1/positions' and request.method=='POST':
-            assert request.headers['CST']=='abc'
-            payload=json.loads(request.content)
-            assert payload['profitDistance']==.4 and payload['stopDistance']==.2
-            assert payload['size']==.2 and 'limitDistance' not in payload
-            return httpx.Response(200,json={'dealReference':'ref-1'})
-        if request.url.path.endswith('/positions/deal'):return httpx.Response(200,json={'dealReference':'close-ref'})
-        if request.url.path.endswith('/confirms/ref-1'):return httpx.Response(200,json={'dealStatus':'ACCEPTED'})
-        return httpx.Response(200,json={'accounts':[]})
+        path=request.url.path
+        auth=request.headers.get('Authorization','')
+        assert auth.startswith('Bearer ')
+        if path.endswith(f'/accounts/{account}/summary'):
+            return httpx.Response(200,json={
+                'account':{'id':account,'currency':'USD','balance':'1000','NAV':'1000',
+                           'marginAvailable':'900'},
+                'lastTransactionID':'1'})
+        if path.endswith('/openTrades'):
+            return httpx.Response(200,json={'trades':[]})
+        if path.endswith('/instruments') and 'instruments=' in str(request.url):
+            return httpx.Response(200,json={'instruments':[{
+                'name':'XAU_USD','displayName':'Gold','displayPrecision':3,
+                'tradeUnitsPrecision':1,'pipLocation':-1,
+                'minimumTradeSize':'0.1','maximumOrderUnits':'100'}]})
+        if path.endswith('/pricing'):
+            return httpx.Response(200,json={'prices':[{
+                'instrument':'XAU_USD','tradeable':True,'status':'tradeable',
+                'bids':[{'price':'2000.0','liquidity':100}],
+                'asks':[{'price':'2000.5','liquidity':100}]}]})
+        if path.endswith('/orders') and request.method=='POST':
+            payload=json.loads(request.content)['order']
+            assert payload['type']=='MARKET'
+            assert payload['instrument']=='XAU_USD'
+            assert payload['units']=='0.2'
+            assert 'stopLossOnFill' in payload and 'takeProfitOnFill' in payload
+            return httpx.Response(200,json={
+                'orderFillTransaction':{
+                    'id':'55','accountID':account,'instrument':'XAU_USD',
+                    'units':'0.2','price':'2000.5',
+                    'tradeOpened':{'tradeID':'99','units':'0.2'}}})
+        return httpx.Response(404,json={'error':'unhandled'})
     async def scenario():
         client=httpx.AsyncClient(transport=httpx.MockTransport(handle),base_url='https://broker.invalid')
-        broker=CapitalBroker('secret','user','pass',client=client)
+        broker=OandaBroker('secret-token',account,'',client=client)
         await broker.connect();await broker.positions()
-        result=await broker.open_position('EPIC','BUY',Decimal('.2'),Decimal('.2'),Decimal('.4'))
-        assert result['dealReference']=='ref-1'
+        result=await broker.open_position('XAU_USD','BUY',Decimal('.2'),Decimal('.2'),Decimal('.4'))
+        assert result['dealReference']
+        conf=await broker.confirm(result['dealReference'])
+        assert conf['dealStatus']=='ACCEPTED' and conf['dealId']=='99'
         await broker.close()
     async_run(scenario())
-    assert any(m=='POST' and path=='/api/v1/positions' for m,path,_ in calls)
+    assert any(m=='POST' and path.endswith('/orders') for m,path,_ in calls)
 
 
 class BrokerSimulation:
@@ -243,8 +266,12 @@ def test_auth_required_and_frontend_assets_exist():
     from app.main import app
     with TestClient(app) as c:
         assert c.get('/').status_code==200
-        assert c.get('/static/ui.js').status_code==200
-        assert c.get('/static/style.css').status_code==200
+        assert c.get('/portal').status_code==200
+        assert c.get('/admin').status_code==200
+        assert c.get('/app').status_code==200
+        assert c.get('/static/portal.css').status_code==200
+        assert c.get('/admin/static/admin.js').status_code==200
+        assert c.get('/app/static/app.js').status_code==200
         assert c.get('/api/status').status_code==401
         assert c.post('/api/pause').status_code==401
 
@@ -287,9 +314,11 @@ def test_live_login_cookie_and_automatic_mobile_adoption_without_extra_toggle(mo
         def __init__(self,*args,**kwargs):super().__init__();self.open=[]
         async def connect(self):return {'authenticated':True}
         async def close(self):pass
+    monkeypatch.setattr(main,'OandaBroker',LoginBroker)
     monkeypatch.setattr(main,'CapitalBroker',LoginBroker)
     with TestClient(main.app) as client:
-        response=client.post('/api/connect',json={'api_key':'fake','identifier':'fake','password':'fake'})
+        response=client.post('/api/connect',json={
+            'api_key':'fake-token','identifier':'101-001-1234567-001','password':''})
         assert response.status_code==200
         assert response.json()['automatic'] is True
         assert 'httponly' in response.headers.get('set-cookie','').lower()
@@ -365,37 +394,64 @@ def test_broker_confirmed_exit_level_drives_delayed_trade_feedback(monkeypatch):
 
 def test_position_update_uses_documented_profit_level_and_preserves_existing_stop():
     requests=[]
+    account='101-001-1234567-001'
     def handler(req):
-        if req.url.path=='/api/v1/session':
-            return httpx.Response(200,json={},headers={'CST':'c','X-SECURITY-TOKEN':'s'})
-        if req.method=='PUT' and req.url.path=='/api/v1/positions/gold-deal':
+        path=req.url.path
+        if path.endswith(f'/accounts/{account}/summary'):
+            return httpx.Response(200,json={
+                'account':{'id':account,'currency':'USD','balance':'1000','NAV':'1000',
+                           'marginAvailable':'900'},'lastTransactionID':'1'})
+        if path.endswith('/trades/12345') and req.method=='GET':
+            return httpx.Response(200,json={'trade':{
+                'id':'12345','instrument':'XAU_USD','currentUnits':'-1','price':'2000'}})
+        if path.endswith('/instruments'):
+            return httpx.Response(200,json={'instruments':[{
+                'name':'XAU_USD','displayPrecision':2,'tradeUnitsPrecision':0,'pipLocation':-1}]})
+        if req.method=='PUT' and path.endswith('/trades/12345/orders'):
             payload=json.loads(req.content)
             requests.append(payload)
             if 'limitLevel' in payload:return httpx.Response(400,json={'errorCode':'invalid.field'})
-            return httpx.Response(200,json={'dealReference':'update-ref'})
+            return httpx.Response(200,json={'takeProfitOrderTransaction':{'id':'update-ref'}})
         return httpx.Response(404)
     async def scenario():
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='https://broker.invalid')
-        broker=CapitalBroker('api','id','password',client=client)
+        broker=OandaBroker('token',account,'',client=client)
         await broker.connect()
-        result=await broker.update_position('gold-deal',profit_level=4171.11)
+        result=await broker.update_position('12345',profit_level=4171.11)
         assert result['dealReference']=='update-ref'
         await broker.close()
     async_run(scenario())
-    assert requests==[{'profitLevel':4171.11}]
+    assert requests and 'takeProfit' in requests[0]
+    assert requests[0]['takeProfit']['price']=='4171.11'
 
 
 def test_position_update_both_levels_correct_keys():
     received=[]
+    account='101-001-1234567-001'
     def handler(req):
-        if req.url.path=='/api/v1/session':return httpx.Response(200,json={},headers={'CST':'c','X-SECURITY-TOKEN':'s'})
-        received.append(json.loads(req.content))
-        return httpx.Response(200,json={'dealReference':'ref'})
+        path=req.url.path
+        if path.endswith(f'/accounts/{account}/summary'):
+            return httpx.Response(200,json={
+                'account':{'id':account,'currency':'USD','balance':'1000','NAV':'1000',
+                           'marginAvailable':'900'},'lastTransactionID':'1'})
+        if path.endswith('/trades/99') and req.method=='GET':
+            return httpx.Response(200,json={'trade':{
+                'id':'99','instrument':'XAU_USD','currentUnits':'1','price':'2000'}})
+        if path.endswith('/instruments'):
+            return httpx.Response(200,json={'instruments':[{
+                'name':'XAU_USD','displayPrecision':2,'tradeUnitsPrecision':0,'pipLocation':-1}]})
+        if req.method=='PUT' and path.endswith('/trades/99/orders'):
+            received.append(json.loads(req.content))
+            return httpx.Response(200,json={'stopLossOrderTransaction':{'id':'ref'}})
+        return httpx.Response(404)
     async def scenario():
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='https://broker.invalid')
-        broker=CapitalBroker('api','id','password',client=client)
+        broker=OandaBroker('token',account,'',client=client)
         await broker.connect()
-        await broker.update_position('deal',stop_level=4177.09,profit_level=4171.11)
+        await broker.update_position('99',stop_level=4177.09,profit_level=4171.11)
         await broker.close()
     async_run(scenario())
-    assert received==[{'stopLevel':4177.09,'profitLevel':4171.11}]
+    assert received==[{
+        'stopLoss':{'timeInForce':'GTC','price':'4177.09'},
+        'takeProfit':{'timeInForce':'GTC','price':'4171.11'},
+    }]

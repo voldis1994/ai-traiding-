@@ -189,8 +189,8 @@ class PlatformStore:
 
     def find_clients_with_api_key(self,broker_type: str,api_key: str,
                                   *,exclude_client_id: int|None=None) -> list[dict]:
-        """Detect Capital API key reuse across clients (one LIVE session per key)."""
-        broker_type=(broker_type or 'capital_com').strip().lower()
+        """Detect broker API token reuse across clients (one LIVE session per key)."""
+        broker_type=(broker_type or 'oanda').strip().lower()
         rows=self.db.execute(
             'SELECT b.id,b.client_id,b.broker_type,b.api_key_enc,c.username,c.display_name '
             'FROM broker_accounts b JOIN clients c ON c.id=b.client_id '
@@ -213,15 +213,15 @@ class PlatformStore:
                       api_key: str,identifier: str,password: str) -> dict:
         client=self.get_client(client_id)
         if not client:raise ValueError('Client not found')
-        broker_type=(broker_type or 'capital_com').strip().lower()
+        broker_type=(broker_type or 'oanda').strip().lower()
         display_name=(display_name or f"{client['display_name']} · {broker_type}").strip()
-        # Capital.com allows one LIVE session per API key — sharing kills the other robot.
+        # One LIVE session / stream per API token — sharing kills the other robot.
         dupes=self.find_clients_with_api_key(broker_type,api_key,exclude_client_id=client_id)
         if dupes:
             other=dupes[0]
             raise ValueError(
-                f"API atslēga jau pievienota klientam '{other['username']}' "
-                f"(id={other['client_id']}). Katram klientam vajag savu Capital.com API key.")
+                f"API token jau pievienots klientam '{other['username']}' "
+                f"(id={other['client_id']}). Katram klientam vajag savu OANDA API token.")
         payload=(
             self.box.encrypt(api_key),
             self.box.encrypt(identifier),

@@ -2,7 +2,7 @@
 
 Moves neural weights, robot SQLite journals and policy files into a timestamped
 backup. Never contacts the broker. Never touches platform.sqlite3 or secret.key
-(admin/client logins and encrypted Capital.com API credentials stay intact).
+(admin/client logins and encrypted broker API credentials stay intact).
 """
 from __future__ import annotations
 
@@ -209,7 +209,7 @@ def fresh_start(data: Path, confirmation: str, *, check_running=True, stamp=None
         f'Moved {len(moved)} file(s) → {backup}\n'
         f'Kept: {", ".join(kept) or "(platform/secret not present yet)"}.\n'
         'Clients do NOT need to re-register. Broker credentials stay encrypted in platform.sqlite3.\n'
-        'Capital.com open positions are NOT changed.\n'
+        'OANDA open positions are NOT changed.\n'
         'Restart the robot / Start clients in Admin. Mandate re-adoption may be required '
         'on the next LIVE session (learning journal was cleared).'
     )
@@ -220,11 +220,11 @@ def main():
     print('NEURAL TRADING AI -- FRESH LEARNING RESET (KEEP CLIENTS)', flush=True)
     print('DATA FOLDER:', data, flush=True)
     print('This moves neural weights, robot.sqlite3 journals and policy files')
-    print('into a timestamped BACKUP. It does NOT contact Capital.com.')
+    print('into a timestamped BACKUP. It does NOT contact OANDA.')
     print('PRESERVED: platform.sqlite3 (admins/clients/broker APIs) + secret.key')
     print('Your broker positions remain OPEN if they are open at the broker.')
     print('\n1. Close ALL robot windows / Stop every client in Admin.')
-    print('2. Verify LIVE positions and stop loss directly in Capital.com.')
+    print('2. Verify LIVE positions and stop loss directly in OANDA.')
     print('3. Type RESET to confirm or press Enter to cancel.\n')
     try:
         confirmation = input('Type RESET: ').strip()

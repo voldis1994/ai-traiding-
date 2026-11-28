@@ -6,7 +6,7 @@ echo   Neural Trading AI - SAFE DATABASE RECOVERY
 
 echo ===================================================
 echo Close the robot and all launcher windows FIRST.
-echo Check any LIVE position and its SL/TP at Capital.com.
+echo Check any LIVE position and its SL/TP at OANDA.
 echo No broker orders are placed by this recovery tool.
 echo.
 if exist ".venv\Scripts\python.exe" (

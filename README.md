@@ -1,6 +1,6 @@
 # Mans pašmācīšanās treidinga robots
 
-**Šis repo ir reāla pašmācīšanās mašīna** — neironu kodols + Capital.com LIVE +
+**Šis repo ir reāla pašmācīšanās mašīna** — neironu kodols + OANDA LIVE +
 automātiska mācīšanās un (shadow) stratēģijas evolūcija.
 
 ## Algoritmi un vienādojumi
@@ -17,7 +17,7 @@ Tur ir:
 - kas ir LIVE lēmums vs kas ir tikai shadow
 
 Matemātiskais PDF: `reference/Parbauditas_Sakartotas_Formulas.pdf`  
-Tehniskā vēsture: `README.PROJECT.md`, `V6_AUTONOMA_AI_LV.txt`
+OANDA brokeris: [`OANDA_LV.md`](OANDA_LV.md)
 
 ## Portāli (stabilie ceļi)
 

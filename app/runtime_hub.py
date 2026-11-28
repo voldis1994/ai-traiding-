@@ -12,7 +12,7 @@ from .brokers import create_broker
 from .core import client_neural_seed
 from .engine import AdaptiveBrain, SingleTradeEngine, Store
 from .platform import PlatformStore
-from .stream import CapitalQuoteStream
+from .stream import OandaQuoteStream, CapitalQuoteStream
 
 log=logging.getLogger('runtime_hub')
 
@@ -74,7 +74,7 @@ class AccountRuntime:
     store: Store
     brain: AdaptiveBrain
     engine: SingleTradeEngine
-    stream: CapitalQuoteStream
+    stream: OandaQuoteStream
     worker_task: Optional[asyncio.Task]=None
     stream_task: Optional[asyncio.Task]=None
     last_error: Optional[str]=None
@@ -803,7 +803,7 @@ class RuntimeHub:
                 'client_name':client_name,'display_name':client_name,'username':username,
                 'epic':None,'epic_source':None,'candles':[],'zones':{},
                 'structure':{},'swing_brackets':None,'open_levels':[],
-                'hint':'Atver manuālu darījumu Capital.com jebkurā tirgū — robots adoptē to epic un OHLC.',
+                'hint':'Atver manuālu darījumu OANDA jebkurā instrumentā — robots adoptē to epic un OHLC.',
             }
         display_n=max(40,min(int(n),180))
         # Fetch enough M1 for MTF (KAMA/ADX/ATR) — same floor LIVE uses.
@@ -1129,7 +1129,7 @@ class RuntimeHub:
             'client_id':cid,
             'previous_epic':out.get('previous_epic'),
             'next_step':out.get('next_step') or (
-                'Aizver veco pozīciju un Capital.com atver pirmo darījumu jaunajā tirgū'),
+                'Aizver veco pozīciju un OANDA atver pirmo darījumu jaunajā tirgū'),
             'note':'Robots nav piesaistīts tikai GOLD — adoptē jebkuru Capital epic; OHLC SL/TP no tā tirgus svecēm.',
         }
 
@@ -1285,7 +1285,7 @@ class RuntimeHub:
         }
 
     async def start_account(self,broker_row: dict, *, connected_broker=None) -> AccountRuntime:
-        """Start robot. Pass connected_broker to avoid a second Capital.com login."""
+        """Start robot. Pass connected_broker to avoid a second OANDA login."""
         client_id=int(broker_row['client_id'])
         async with self._lock:
             existing=self._runtimes.get(client_id)
@@ -1298,7 +1298,7 @@ class RuntimeHub:
             seed=client_neural_seed(client_id)
             brain=AdaptiveBrain(store,data_dir=data_dir,seed=seed)
             engine=SingleTradeEngine(store,brain,policy_path=data_dir/'policy.py')
-            stream=CapitalQuoteStream()
+            stream=OandaQuoteStream()
             engine.quote_stream=stream
             engine.client_id=client_id
             # Same-epic MTF/OHLC peers — market perception shared, brains private.

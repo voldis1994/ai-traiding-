@@ -10,7 +10,7 @@ echo ===============================================================
 echo  NEURAL TRADING AI - FRESH LEARNING (KEEP CLIENTS)
 echo ===============================================================
 echo.
-echo STOP the robot first. Verify live positions and SL/TP at Capital.com.
+echo STOP the robot first. Verify live positions and SL/TP at OANDA.
 echo This utility does NOT close broker orders or contact the broker.
 echo Neural weights / robot.sqlite3 / policy will be MOVED to a backup.
 echo PRESERVED: platform.sqlite3 (clients + broker APIs) and secret.key.

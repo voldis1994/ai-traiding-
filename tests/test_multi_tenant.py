@@ -39,8 +39,8 @@ def test_hub_assigns_per_client_seed(tmp_path):
     hub=RuntimeHub(platform)
     c1=platform.create_client('alice','pass1234','Alice','en')
     c2=platform.create_client('bob','pass1234','Bob','en')
-    a1=platform.attach_broker(c1['id'],'capital_com','A','key-a','id-a','pw-a')
-    a2=platform.attach_broker(c2['id'],'capital_com','B','key-b','id-b','pw-b')
+    a1=platform.attach_broker(c1['id'],'oanda','A','key-a','id-a','pw-a')
+    a2=platform.attach_broker(c2['id'],'oanda','B','key-b','id-b','pw-b')
 
     class LoginBroker(BrokerSimulation):
         def __init__(self,*a,**k):
@@ -79,11 +79,11 @@ def test_duplicate_api_key_rejected(tmp_path):
     store=PlatformStore(tmp_path/'platform.sqlite3',tmp_path/'secret.key')
     a=store.create_client('one','pass1234','One','lv')
     b=store.create_client('two','pass1234','Two','lv')
-    store.attach_broker(a['id'],'capital_com','One LIVE','SAME-KEY','id1','secret')
-    with pytest.raises(ValueError,match='API atslēga'):
-        store.attach_broker(b['id'],'capital_com','Two LIVE','SAME-KEY','id2','secret')
+    store.attach_broker(a['id'],'oanda','One LIVE','SAME-KEY','id1','secret')
+    with pytest.raises(ValueError,match='API token'):
+        store.attach_broker(b['id'],'oanda','Two LIVE','SAME-KEY','id2','secret')
     # Same client may re-attach / update own key
-    store.attach_broker(a['id'],'capital_com','One LIVE','SAME-KEY','id1','secret2')
+    store.attach_broker(a['id'],'oanda','One LIVE','SAME-KEY','id1','secret2')
 
 
 def test_password_hash_roundtrip():
@@ -99,7 +99,7 @@ def test_platform_client_and_encrypted_broker(tmp_path):
     assert store.verify_admin('admin','nope') is None
     client=store.create_client('janis','pass1234','Jānis','lv')
     assert client['username']=='janis'
-    account=store.attach_broker(client['id'],'capital_com','Janis LIVE',
+    account=store.attach_broker(client['id'],'oanda','Janis LIVE',
                                 'key','id','secret')
     creds=store.broker_credentials(account)
     assert creds['api_key']=='key'
@@ -107,17 +107,22 @@ def test_platform_client_and_encrypted_broker(tmp_path):
     assert store.get_broker_for_client(client['id'])['display_name']=='Janis LIVE'
 
 
-def test_broker_registry_capital_and_slot():
+def test_broker_registry_oanda_and_slot():
     ids={b['id'] for b in list_brokers()}
-    assert 'capital_com' in ids
+    assert 'oanda' in ids
     assert 'generic_rest' in ids
-    broker=create_broker('capital_com','a','b','c')
-    assert broker.__class__.__name__=='CapitalBroker'
+    broker=create_broker('oanda','token','101-001-1234567-001','')
+    assert broker.__class__.__name__=='OandaBroker'
     try:
         create_broker('generic_rest','a','b','c')
         assert False, 'slot must raise'
     except ValueError as exc:
         assert 'slot' in str(exc).lower() or 'adapter' in str(exc).lower()
+    try:
+        create_broker('capital_com','a','b','c')
+        assert False, 'capital must raise'
+    except ValueError as exc:
+        assert 'oanda' in str(exc).lower() or 'replaced' in str(exc).lower()
 
 
 def test_admin_and_client_portals(monkeypatch,tmp_path):
@@ -134,9 +139,10 @@ def test_admin_and_client_portals(monkeypatch,tmp_path):
         async def accounts(self):
             return {'accounts':[{'accountId':'1','balance':{'balance':10,'available':10}}]}
 
+    monkeypatch.setattr(main,'OandaBroker',LoginBroker)
     monkeypatch.setattr(main,'CapitalBroker',LoginBroker)
     monkeypatch.setattr(main,'create_broker',lambda *a,**k:LoginBroker())
-    monkeypatch.setattr('app.brokers.CapitalBroker',LoginBroker)
+    monkeypatch.setattr('app.brokers.OandaBroker',LoginBroker)
     monkeypatch.setattr('app.runtime_hub.create_broker',lambda *a,**k:LoginBroker())
 
     with TestClient(main.app) as client:
@@ -164,7 +170,7 @@ def test_admin_and_client_portals(monkeypatch,tmp_path):
         cid=created.json()['client']['id']
 
         attach=client.post(f'/api/admin/clients/{cid}/broker',json={
-            'broker_type':'capital_com','display_name':'Anna Capital',
+            'broker_type':'oanda','display_name':'Anna OANDA',
             'api_key':'k','identifier':'i','password':'p'})
         assert attach.status_code==200, attach.text
 

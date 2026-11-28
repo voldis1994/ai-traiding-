@@ -1,6 +1,6 @@
 # Mans pašmācīšanās treidinga robots
 
-**Šis repo ir reāla pašmācīšanās mašīna** — neironu kodols + Capital.com LIVE +
+**Šis repo ir reāla pašmācīšanās mašīna** — neironu kodols + OANDA LIVE +
 automātiska mācīšanās un (shadow) stratēģijas evolūcija.
 
 ## Algoritmi un vienādojumi

@@ -32,7 +32,7 @@ def _seed_platform(data: Path, *, clients=1):
             (i, f'user{i}', 'hash', f'User {i}', 'lv', 1, 't'))
         conn.execute(
             'INSERT INTO broker_accounts VALUES (?,?,?,?,?,?,?,?)',
-            (i, i, 'capital_com', f'Acc {i}', 'enc_k', 'enc_i', 'enc_p', 1))
+            (i, i, 'oanda', f'Acc {i}', 'enc_k', 'enc_i', 'enc_p', 1))
     conn.commit()
     conn.close()
     (data / 'secret.key').write_bytes(b'x' * 44)

@@ -308,10 +308,10 @@
               <label>Brokeris
                 <select name="broker_type" id="brokerType" required></select>
               </label>
-              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa Capital LIVE"></label>
-              <label>API key<input name="api_key" required maxlength="256" autocomplete="off"></label>
-              <label>Identifier<input name="identifier" required maxlength="256" autocomplete="off"></label>
-              <label>API parole<input name="password" type="password" required maxlength="256" autocomplete="off"></label>
+              <label>Konta nosaukums<input name="display_name" maxlength="120" placeholder="Jāņa OANDA LIVE"></label>
+              <label>OANDA API token<input name="api_key" required maxlength="512" autocomplete="off" placeholder="Bearer token"></label>
+              <label>OANDA Account ID<input name="identifier" required maxlength="256" autocomplete="off" placeholder="101-001-…"></label>
+              <label>Piezīme (nav parole)<input name="password" type="password" maxlength="256" autocomplete="off" placeholder="OANDA neprasa — atstāj tukšu"></label>
               <button class="btn btn-primary" type="submit">
                 <svg class="ico"><use href="#i-play"></use></svg>
                 Saglabāt un palaist
@@ -323,7 +323,7 @@
             <div class="card-head">
               <h2><svg class="ico accent"><use href="#i-sync"></use></svg> Mācīšanās</h2>
             </div>
-            <p class="muted">Izdzēš neironu/treidu/signālu vēsturi. Klienti un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.</p>
+            <p class="muted">Izdzēš neironu/treidu/signālu vēsturi. Klienti un brokera API paliek. OANDA pozīcijas netiek aizvērtas.</p>
             <button type="button" id="resetLearningBtn" class="btn btn-ghost">
               <svg class="ico"><use href="#i-sync"></use></svg>
               Mācīties no jauna (viss)

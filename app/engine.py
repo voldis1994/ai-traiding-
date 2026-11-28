@@ -1347,7 +1347,7 @@ class SingleTradeEngine:
             self.armed=True;self.execution_enabled=True
             self.store.event('control','Market mandate cleared by operator; awaiting new first mobile trade',
                              {'previous_epic':previous,'instrument_bag_parked':bool(previous)})
-            return {'ok':True,'previous_epic':previous,'next_step':'Open first trade manually on Capital.com'}
+            return {'ok':True,'previous_epic':previous,'next_step':'Open first trade manually on OANDA'}
 
     @staticmethod
     def _normalize_direction(value):

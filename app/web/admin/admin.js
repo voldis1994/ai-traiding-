@@ -644,7 +644,7 @@ function renderCard(c){
         ?` [${t.pnl_source}]`:''));
     let right;
     if(showPnl!=null){right=money(showPnl,tCcy);}
-    else if(pending){right='gaida Capital £';}
+    else if(pending){right='gaida OANDA P&L';}
     else{right='—';}
     return `<div><span>${esc(t.direction||'?')} ${esc(t.epic||'')}${esc(src)}</span><span class="${cls}">${esc(right)}</span></div>`;
   }).join('')||'<div><span>Nav slēgtu treidu</span></div>';
@@ -723,7 +723,7 @@ function renderCard(c){
       })()}
       <div><span>Day phase</span><strong>${esc(dayPhase)}</strong></div>
       <div><span>Mandate lot</span><strong>${esc(mandateSize)}</strong></div>
-      <div><span>Tirgus (Capital adopt)</span><strong>${esc(
+      <div><span>Tirgus (OANDA adopt)</span><strong>${esc(
         a.market||(a.mandate&&a.mandate.epic)||'gaida manuālu darījumu')}</strong></div>
       <div><span>Neironi / soļi</span><strong>${esc(e.neurons??'—')} / ${esc(e.steps??0)}</strong></div>
       <div><span>Paaudze</span><strong>${esc(e.learning_generation??e.generation??0)}</strong></div>
@@ -754,7 +754,7 @@ function renderCard(c){
       <button type="button" class="btn tiny btn-ghost" data-act="ohlc" data-id="${c.id}"
         data-ohlc-name="${esc(c.display_name||c.username||('#'+c.id))}"
         title="Atvērt OHLC logu šim klientam">${icon('candles')} OHLC</button>
-      <button type="button" class="btn tiny btn-ghost" data-act="market" data-id="${c.id}" title="Jebkurš Capital tirgus — ne tikai GOLD">${icon('candles')} Mainīt tirgu</button>
+      <button type="button" class="btn tiny btn-ghost" data-act="market" data-id="${c.id}" title="Jebkurš OANDA instruments — ne tikai GOLD">${icon('candles')} Mainīt tirgu</button>
       <button type="button" class="btn tiny btn-ghost" data-act="wipe" data-id="${c.id}">${icon('sync')} Mācīties no jauna</button>
     </div>`;
   el.querySelectorAll('[data-act]').forEach(btn=>{
@@ -767,7 +767,7 @@ function renderCard(c){
         if(btn.dataset.act==='wipe'){
           const ok=confirm(
             `Izdzēst mācīšanās vēsturi klientam #${btn.dataset.id}?\n`+
-            'Klienta login un brokera API paliek. Capital.com pozīcijas netiek aizvērtas.');
+            'Klienta login un brokera API paliek. OANDA pozīcijas netiek aizvērtas.');
           if(!ok)return;
           const typed=prompt('Ieraksti RESET, lai apstiprinātu:');
           if(typed!=='RESET'){alert('Atcelts.');return}
@@ -776,9 +776,9 @@ function renderCard(c){
         }else if(btn.dataset.act==='market'){
           const ok=confirm(
             `Mainīt tirgu klientam #${btn.dataset.id}?\n\n`+
-            '1) Aizver visas Capital pozīcijas šim kontam.\n'+
+            '1) Aizver visas OANDA pozīcijas šim kontam.\n'+
             '2) Apstiprini — robots noņem veco mandate.\n'+
-            '3) Capital.com atver PIRMO darījumu JAUNAJĀ tirgū (US500, EURUSD, OIL… — jebkurš).\n\n'+
+            '3) OANDA atver PIRMO darījumu JAUNAJĀ tirgū (US500, EURUSD, OIL… — jebkurš).\n\n'+
             'Entry / SL / TP tad seko tā tirgus OHLC svecēm. Robots NAV piesaistīts tikai GOLD.');
           if(!ok)return;
           const out=await api(
@@ -1038,7 +1038,7 @@ $('resetLearningBtn').onclick=async()=>{
   const ok=confirm(
     'Izdzēst VISU mācīšanās vēsturi (neironi, treidi, signāli, policy)?\n\n'+
     'Klienti un brokera API paliek — nav jāreģistrē no jauna.\n'+
-    'Capital.com pozīcijas netiek aizvērtas.\n\n'+
+    'OANDA pozīcijas netiek aizvērtas.\n\n'+
     'Visi roboti tiks apturēti. Pēc tam ieteicams restartēt run_windows.bat.');
   if(!ok)return;
   const typed=prompt('Ieraksti RESET (lielajiem burtiem), lai apstiprinātu:');

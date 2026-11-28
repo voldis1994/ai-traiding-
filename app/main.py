@@ -11,9 +11,9 @@ from fastapi import FastAPI,HTTPException,Request,WebSocket,WebSocketDisconnect,
 from fastapi.responses import FileResponse,JSONResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel,Field
-from .broker import CapitalBroker
+from .broker import OandaBroker, CapitalBroker
 from .brokers import create_broker, list_brokers
-from .stream import CapitalQuoteStream
+from .stream import OandaQuoteStream, CapitalQuoteStream
 from .engine import Store,AdaptiveBrain,SingleTradeEngine
 from .storage import DATA
 from .platform import PlatformStore
@@ -27,7 +27,7 @@ ADMIN_COOKIE='nta_admin'
 CLIENT_COOKIE='nta_client'
 worker_task=None
 stream_task=None
-stream=CapitalQuoteStream()
+stream=OandaQuoteStream()
 engine.quote_stream=stream
 
 platform=PlatformStore()
@@ -160,9 +160,9 @@ def require_client(request:Request):
     return client
 
 class Credentials(BaseModel):
-    api_key:str=Field(min_length=1,max_length=256)
-    identifier:str=Field(min_length=1,max_length=256)
-    password:str=Field(min_length=1,max_length=256)
+    api_key:str=Field(min_length=1,max_length=512)  # OANDA API token
+    identifier:str=Field(min_length=1,max_length=256)  # OANDA account id
+    password:str=Field(default='',max_length=256)  # unused for OANDA
 
 class UserPass(BaseModel):
     username:str=Field(min_length=1,max_length=64)
@@ -175,11 +175,11 @@ class ClientCreate(BaseModel):
     language:str=Field(default='lv',max_length=8)
 
 class BrokerAttach(BaseModel):
-    broker_type:str=Field(default='capital_com',max_length=64)
+    broker_type:str=Field(default='oanda',max_length=64)
     display_name:str=Field(default='',max_length=120)
-    api_key:str=Field(min_length=1,max_length=256)
-    identifier:str=Field(min_length=1,max_length=256)
-    password:str=Field(min_length=1,max_length=256)
+    api_key:str=Field(min_length=1,max_length=512)  # OANDA API token
+    identifier:str=Field(min_length=1,max_length=256)  # OANDA account id
+    password:str=Field(default='',max_length=256)  # unused for OANDA (Bearer auth)
 
 class LanguageBody(BaseModel):
     language:str=Field(min_length=2,max_length=8)
@@ -204,7 +204,7 @@ class DayRiskGatesBody(BaseModel):
 
 
 
-def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
+def _broker_connect_error(stage: str, exc: Exception) -> HTTPException:
     """Explain the failed step, without ever exposing credentials, headers or response body."""
     stages={
         'session':'autentifikācija',
@@ -214,26 +214,31 @@ def _capital_connect_error(stage: str, exc: Exception) -> HTTPException:
     }
     label=stages.get(stage,stage)
     status=getattr(getattr(exc, 'response', None), 'status_code', None)
-    logging.warning('Capital.com connect failed: stage=%s exception=%s http=%s',
+    logging.warning('OANDA connect failed: stage=%s exception=%s http=%s',
                     stage, type(exc).__name__, status if status is not None else '-')
+    if isinstance(exc, ValueError):
+        return HTTPException(400, str(exc))
     if status is not None:
         if status==429:
-            return HTTPException(429, f'Capital.com pieprasījumu limits (HTTP 429; {label}). Uzgaidi 1 min un mēģini vēlāk.')
+            return HTTPException(429, f'OANDA pieprasījumu limits (HTTP 429; {label}). Uzgaidi 1 min un mēģini vēlāk.')
         if stage in ('session','robot_start') and status in (401,403):
             return HTTPException(401,
-                f'Capital.com nepieņēma LIVE autentifikāciju (HTTP {status}; {label}). '
-                f'Pārbaudi LIVE (ne DEMO) API key, identifikatoru (epasts) un API paroli. '
-                f'Divi klienti nedrīkst lietot vienu un to pašu API atslēgu vienlaikus.')
+                f'OANDA nepieņēma LIVE autentifikāciju (HTTP {status}; {label}). '
+                f'Pārbaudi LIVE (ne Practice) API token un account id. '
+                f'Divi klienti nedrīkst lietot vienu un to pašu token vienlaikus.')
         if status in (401,403):
-            return HTTPException(502, f'Capital.com sesija izveidota, bet {label} noraidīta (HTTP {status}).')
+            return HTTPException(502, f'OANDA savienojums izveidots, bet {label} noraidīta (HTTP {status}).')
         if status>=500:
-            return HTTPException(503, f'Capital.com servisa kļūda (HTTP {status}; {label}). Mēģini vēlāk.')
-        return HTTPException(502, f'Capital.com {label} neizdevās (HTTP {status}).')
+            return HTTPException(503, f'OANDA servisa kļūda (HTTP {status}; {label}). Mēģini vēlāk.')
+        return HTTPException(502, f'OANDA {label} neizdevās (HTTP {status}).')
     if isinstance(exc, httpx.TimeoutException):
-        return HTTPException(503, f'Capital.com neatbildēja laikus ({label}).')
+        return HTTPException(503, f'OANDA neatbildēja laikus ({label}).')
     if isinstance(exc, httpx.RequestError):
-        return HTTPException(503, f'Neizdevās sasniegt Capital.com ({label}).')
-    return HTTPException(502, f'Capital.com {label} neizdevās ({type(exc).__name__}).')
+        return HTTPException(503, f'Neizdevās sasniegt OANDA ({label}).')
+    return HTTPException(502, f'OANDA {label} neizdevās ({type(exc).__name__}).')
+
+# Back-compat alias for older tests/monkeypatches.
+_capital_connect_error = _broker_connect_error
 
 def _set_session_cookie(response:JSONResponse,name:str,value:str):
     response.set_cookie(name,value,httponly=True,samesite='strict',
@@ -268,20 +273,23 @@ async def client_page():return FileResponse(WEB/'client'/'index.html')
 @app.get('/app/')
 async def client_page_slash():return RedirectResponse('/app')
 
-# ---------- legacy operator Capital.com console ----------
+# ---------- legacy operator OANDA console ----------
 @app.post('/api/connect')
 async def connect(data:Credentials):
     global stream_task
-    # Legacy console must not steal a hub client's Capital LIVE session.
-    dupes=platform.find_clients_with_api_key('capital_com',data.api_key.strip())
+    # Legacy console must not steal a hub client's OANDA LIVE session.
+    dupes=platform.find_clients_with_api_key('oanda',data.api_key.strip())
     if dupes:
         other=dupes[0]
         raise HTTPException(409,
-            f"API atslēga jau pievienota klientam '{other['username']}' "
+            f"API token jau pievienots klientam '{other['username']}' "
             f"(id={other['client_id']}). Legacy /api/connect bloķēts.")
     if engine.broker:
         await engine.broker.close();engine.broker=None
-    candidate=CapitalBroker(data.api_key,data.identifier,data.password,live=True)
+    try:
+        candidate=OandaBroker(data.api_key,data.identifier,data.password,live=True)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc)) from None
     stage='session'
     try:
         await candidate.connect()
@@ -290,7 +298,7 @@ async def connect(data:Credentials):
         stage='positions'
         await candidate.positions()
     except Exception as exc:
-        error=_capital_connect_error(stage, exc)
+        error=_broker_connect_error(stage, exc)
         await candidate.close()
         raise error from None
     engine.attach(candidate);engine.account=initial_accounts
@@ -303,7 +311,7 @@ async def connect(data:Credentials):
     # Lazy-start legacy quote stream only when this console path is used.
     if stream_task is None or stream_task.done():
         stream_task=asyncio.create_task(stream.run(engine))
-    store.event('auth','Capital.com LIVE authenticated; automatic cycle initialized',
+    store.event('auth','OANDA LIVE authenticated; automatic cycle initialized',
                 {'data_dir':str(DATA),'sqlite':str(store.path),
                  'mandate_requires_new_manual_trade':engine.mandate is None})
     response=JSONResponse({'ok':True,'live':True,'automatic':True,
@@ -362,7 +370,7 @@ async def prepare_new_market(_:bool=Depends(require_auth)):
     try:return await engine.prepare_new_instrument()
     except ValueError as exc:raise HTTPException(409,str(exc)) from None
     except RuntimeError as exc:raise HTTPException(409,str(exc)) from None
-    except Exception as exc:raise HTTPException(502,'Capital.com position verification failed') from exc
+    except Exception as exc:raise HTTPException(502,'OANDA position verification failed') from exc
 
 @app.post('/api/emergency')
 async def emergency(_:bool=Depends(require_auth)):
@@ -498,7 +506,7 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
         stage='positions';await candidate.positions()
     except Exception as exc:
         await candidate.close()
-        raise _capital_connect_error(stage,exc) from None
+        raise _broker_connect_error(stage,exc) from None
     try:
         account=platform.attach_broker(client_id,data.broker_type,data.display_name,
                                        api_key,identifier,password)
@@ -510,7 +518,7 @@ async def admin_attach_broker(client_id:int,data:BrokerAttach,_:dict=Depends(req
     except Exception as exc:
         try:await candidate.close()
         except Exception:pass
-        raise _capital_connect_error('robot_start',exc) from None
+        raise _broker_connect_error('robot_start',exc) from None
     return {'ok':True,'broker':{'id':account['id'],'broker_type':account['broker_type'],
                                 'display_name':account['display_name']},
             'client':platform.get_client(client_id)}
@@ -520,7 +528,7 @@ async def admin_start_client(client_id:int,_:dict=Depends(require_admin)):
     try:
         rt=await hub.ensure_client_running(client_id)
     except Exception as exc:
-        raise _capital_connect_error('robot_start',exc) from None
+        raise _broker_connect_error('robot_start',exc) from None
     if not rt:raise HTTPException(409,'Klientam nav pieslēgta brokera konta')
     return {'ok':True,'view':rt.client_view()}
 
@@ -610,7 +618,7 @@ async def admin_reset_learning(data:LearningResetBody,_:dict=Depends(require_adm
     """Wipe neural/trade/policy history; keep platform clients + broker credentials.
 
     Stops the affected robot runtime(s) first so SQLite/brain files can be moved.
-    Capital.com positions are never touched. Type confirmation exactly: RESET.
+    OANDA positions are never touched. Type confirmation exactly: RESET.
     """
     global store,brain,engine
     import reset_learning

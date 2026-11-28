@@ -11,13 +11,14 @@ from .instrument_profile import instrument_profile
 from .market_context import candle_time
 
 REFERENCE_TERMS = {
-    'FOREX': ('US Dollar Index','US 500','Gold','Brent Crude'),
-    'METALS': ('Silver','US Dollar Index','US 500','Brent Crude'),
-    'COMMODITIES': ('Brent Crude','US Dollar Index','US 500','Gold'),
-    'INDICES': ('US 500','US Dollar Index','Gold','Bitcoin'),
-    'CRYPTO': ('Bitcoin','Ethereum','US 500','US Dollar Index'),
-    'EQUITIES': ('US 500','US Dollar Index','Gold','Bitcoin'),
-    'OTHER': ('US 500','US Dollar Index','Gold','Bitcoin'),
+    # OANDA instrument names first; legacy human labels kept as fallback.
+    'FOREX': ('XAU_USD','SPX500_USD','BCO_USD','USD_JPY','US Dollar Index','US 500','Gold','Brent Crude'),
+    'METALS': ('XAG_USD','USD_JPY','SPX500_USD','BCO_USD','Silver','US Dollar Index','US 500','Brent Crude'),
+    'COMMODITIES': ('BCO_USD','USD_JPY','SPX500_USD','XAU_USD','Brent Crude','US Dollar Index','US 500','Gold'),
+    'INDICES': ('SPX500_USD','USD_JPY','XAU_USD','BTC_USD','US 500','US Dollar Index','Gold','Bitcoin'),
+    'CRYPTO': ('BTC_USD','ETH_USD','SPX500_USD','USD_JPY','Bitcoin','Ethereum','US 500','US Dollar Index'),
+    'EQUITIES': ('SPX500_USD','USD_JPY','XAU_USD','BTC_USD','US 500','US Dollar Index','Gold','Bitcoin'),
+    'OTHER': ('SPX500_USD','USD_JPY','XAU_USD','BTC_USD','US 500','US Dollar Index','Gold','Bitcoin'),
 }
 
 
@@ -145,7 +146,7 @@ class IntermarketMonitor:
             observations.append({**p,**reading})
         ready=[p for p in observations if p.get('ready')]
         if not ready:
-            self.state={'status':'UNAVAILABLE','entry_allowed':False,'reason':'No fresh aligned Capital.com peer history; wait for data','peers':observations,'profile':profile,
+            self.state={'status':'UNAVAILABLE','entry_allowed':False,'reason':'No fresh aligned OANDA peer history; wait for data','peers':observations,'profile':profile,
                         'bar_time':latest.isoformat() if latest else None}
         else:
             self.state={'status':'READY','entry_allowed':True,'reason':'Broker reference prices aligned; cross-market veto enabled',

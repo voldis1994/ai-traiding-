@@ -12,7 +12,7 @@ from .brokers import create_broker
 from .core import client_neural_seed
 from .engine import AdaptiveBrain, SingleTradeEngine, Store
 from .platform import PlatformStore
-from .stream import CapitalQuoteStream
+from .stream import OandaQuoteStream, CapitalQuoteStream
 
 log=logging.getLogger('runtime_hub')
 
@@ -74,7 +74,7 @@ class AccountRuntime:
     store: Store
     brain: AdaptiveBrain
     engine: SingleTradeEngine
-    stream: CapitalQuoteStream
+    stream: OandaQuoteStream
     worker_task: Optional[asyncio.Task]=None
     stream_task: Optional[asyncio.Task]=None
     last_error: Optional[str]=None
@@ -1298,7 +1298,7 @@ class RuntimeHub:
             seed=client_neural_seed(client_id)
             brain=AdaptiveBrain(store,data_dir=data_dir,seed=seed)
             engine=SingleTradeEngine(store,brain,policy_path=data_dir/'policy.py')
-            stream=CapitalQuoteStream()
+            stream=OandaQuoteStream()
             engine.quote_stream=stream
             engine.client_id=client_id
             # Same-epic MTF/OHLC peers — market perception shared, brains private.

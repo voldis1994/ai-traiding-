@@ -22,7 +22,7 @@ F_t = F_{\text{learn}} \circ F_{\text{broker}} \circ F_{\text{order}} \circ F_{\
 | \(F_{\text{neuron}}\) | `NeuralCore.step` | stāvoklis → Softmax scores |
 | \(F_{\text{decision}}\) | `evaluate_neural_entry` | argmax → BUY/SELL/HOLD |
 | \(F_{\text{order}}\) | `submit` + journal | SL/TP, 1 pozīcija |
-| \(F_{\text{broker}}\) | `CapitalBroker` | LIVE izpilde / confirm |
+| \(F_{\text{broker}}\) | `OandaBroker` | LIVE izpilde / confirm |
 | \(F_{\text{learn}}\) | `NeuralCore.learn` | kļūda → svaru update |
 
 **LIVE lēmums:** tikai neironu argmax (v6).  
@@ -198,14 +198,14 @@ Kodā: `math_rules.stop_take`, `engine.protect_position`.
 
 - Softmax % ≠ “varbūtība nopelnīt”
 - Background 1-bar virziens ir **papildu** signāls; **galvenā** mācība pēc treida ir P&L regret/reinforce
-- Backtest / offline testi ≠ Capital.com LIVE pierādījums
+- Backtest / offline testi ≠ OANDA LIVE pierādījums
 - Pašmācīšanās nozīmē **pielāgošanos**, ne automātisku peļņu
 
 ---
 
 ## 9. Kā palaist mašīnu
 
-Windows: `run_windows.bat` → `http://127.0.0.1:8765` → Capital.com API →
+Windows: `run_windows.bat` → `http://127.0.0.1:8765` → OANDA API →
 manuāla 1. pozīcija → aizver → AI mācās un lemj uz nākamajām M1 svecēm.
 
 Testi: `python -m pytest -q` (137).

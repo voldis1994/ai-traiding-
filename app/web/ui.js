@@ -1,5 +1,5 @@
 /* Offline-capable browser control center. All data originates from local FastAPI,
-   which in turn uses the authenticated Capital.com connection. */
+   which in turn uses the authenticated OANDA connection. */
 'use strict';
 const $ = id => document.getElementById(id);
 const escapeHtml = input => String(input ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -18,7 +18,7 @@ function setHtml(id,value){const el=$(id);if(el)el.innerHTML=value}
 function displayDashboard(){ $('login').classList.add('hidden');$('dashboard').classList.remove('hidden'); }
 function displayLogin(){ $('dashboard').classList.add('hidden');$('login').classList.remove('hidden');if(liveSocket)liveSocket.close();clearInterval(refreshTimer); }
 $('loginForm').addEventListener('submit',async event=>{
-  event.preventDefault();const btn=$('loginButton');btn.disabled=true;setText('loginError','Connecting to Capital.com LIVE...');
+  event.preventDefault();const btn=$('loginButton');btn.disabled=true;setText('loginError','Connecting to OANDA LIVE...');
   const data=Object.fromEntries(new FormData(event.target).entries());
   try{await api('/api/connect','POST',data);event.target.reset();displayDashboard();await updateStatus();startStream();}
   catch(e){setText('loginError',e.message)}finally{btn.disabled=false}
@@ -37,7 +37,7 @@ async function control(path,message,confirmAction=false){if(confirmAction&&!conf
 $('pause').onclick=()=>control('/api/pause','');
 $('resume').onclick=()=>control('/api/resume','');
 $('newMarket').onclick=async()=>{
- if(!confirm('Switch instrument? You must first close every open broker position. The next FIRST trade must be opened manually in Capital.com. Training history is preserved.'))return;
+ if(!confirm('Switch instrument? You must first close every open broker position. The next FIRST trade must be opened manually in OANDA. Training history is preserved.'))return;
  try{await api('/api/prepare-new-market','POST',{});await updateStatus();alert('Ready. Open the first trade manually in your newly selected market.');}
  catch(e){alert('Market switch denied: '+e.message)}
 };
@@ -52,7 +52,7 @@ function drawCandles(canvasId,candles){
   const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
   ctx.strokeStyle='#233257';ctx.lineWidth=1;for(let k=0;k<=5;k++){let y=18+(h-45)*k/5;ctx.beginPath();ctx.moveTo(14,y);ctx.lineTo(w-72,y);ctx.stroke()}
   const clean=(candles||[]).filter(c=>['open','high','low','close'].every(k=>Number.isFinite(Number(c[k])))).slice(-80);
-  if(!clean.length){ctx.fillStyle='#8495bb';ctx.font='14px Segoe UI';ctx.textAlign='center';ctx.fillText('Awaiting real Capital.com candle data',w/2,h/2);return}
+  if(!clean.length){ctx.fillStyle='#8495bb';ctx.font='14px Segoe UI';ctx.textAlign='center';ctx.fillText('Awaiting real OANDA candle data',w/2,h/2);return}
   let low=Math.min(...clean.map(c=>Number(c.low))),high=Math.max(...clean.map(c=>Number(c.high)));const pad=(high-low||Math.abs(high)*.001||.01)*.18;low-=pad;high+=pad;
   const y=p=>20+(high-p)/(high-low)*(h-54);const chartW=w-92;const spacing=chartW/clean.length;
   clean.forEach((c,i)=>{let x=15+(i+.5)*spacing;const rising=+c.close>=+c.open;ctx.strokeStyle=rising?'#28dbb1':'#fe6294';ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.moveTo(x,y(+c.high));ctx.lineTo(x,y(+c.low));ctx.stroke();let y1=y(+c.open),y2=y(+c.close);ctx.fillRect(x-Math.max(1,spacing*.34),Math.min(y1,y2),Math.max(2,spacing*.68),Math.max(1,Math.abs(y1-y2))) });
@@ -68,7 +68,7 @@ function render(data){
   // Model score is uncalibrated — never shown as profit probability (audit #24).
   setText('confidence',signal.confidence!=null?(signal.confidence*100).toFixed(1)+'%':'—');
   setText('signalBrief',signal.action?signal.action+' · uncalibrated model score (not profit odds)':'Waiting for prices');
-  setText('connection',state.error?'◌ MARKET CONNECTION ISSUE':'● CAPITAL.COM CONNECTED');
+  setText('connection',state.error?'◌ MARKET CONNECTION ISSUE':'● OANDA CONNECTED');
   setText('accountId',state.account?.accountId||'—');setText('execute',state.execution_enabled?'AUTOMATIC LIVE':'PAUSED');setText('robotState',state.armed?'RUNNING':'PAUSED');setText('ticks',state.tick_count);
   setText('epic',mandate?.epic||(position?'ADOPTING OPEN POSITION…':'WAITING FOR MOBILE TRADE'));
   setText('size',mandate?'ADOPTED SIZE: '+mandate.size:(position?'Broker position seen — waiting for epic/size adoption':'Instrument and lot size will be adopted automatically'));
@@ -99,14 +99,14 @@ function render(data){
   setHtml('events',entries(data.events,10));setHtml('recentTrades',entries((data.events||[]).filter(e=>e.kind==='trade'||e.kind==='order'),7));
   setHtml('tradeDetails',table([['Deal ID','dealId'],['Epic','epic'],['Direction','direction'],['Size','size'],['Stop','stopLevel'],['Profit','profitLevel'],['Unrealized P&L','upl']],state.positions||[]));
   setHtml('pendingDetails',state.unresolved_orders?.length?table([['ID','id'],['Kind','kind'],['Status','status'],['Reference','reference'],['Time','time']],state.unresolved_orders):'<div class="muted">No unresolved broker operations.</div>');
-  setHtml('neuralDetails',`<div class="metric-grid"><div class="metric"><span>ACTIVE NEURONS</span><strong>${neural.neurons??0}</strong></div><div class="metric"><span>TRAINING STEPS</span><strong>${neural.steps??0}</strong></div><div class="metric"><span>RECONSTRUCTION ERROR EMA</span><strong>${small(neural.smoothed_error)}</strong></div><div class="metric"><span>GRADIENT NORM</span><strong>${small(neural.gradient_norm)}</strong></div><div class="metric"><span>NEURAL INPUTS</span><strong>${neural.input_dimension??'—'}</strong></div><div class="metric"><span>EXTERNAL NEURAL LEARNING</span><strong>${neural.external_features_learned?(neural.external_feed_ready?'READY':'WAITING DATA'):'NOT YET INITIALIZED'}</strong></div></div><div class="muted">${neural.external_features_learned?'Neural fusion enabled. '+String(neural.external_trained_labels??0)+' delayed external-feature supervised updates.':'Waiting for aligned Capital.com reference markets AND verified news; legacy OHLC model still runs.'}</div>`);
+  setHtml('neuralDetails',`<div class="metric-grid"><div class="metric"><span>ACTIVE NEURONS</span><strong>${neural.neurons??0}</strong></div><div class="metric"><span>TRAINING STEPS</span><strong>${neural.steps??0}</strong></div><div class="metric"><span>RECONSTRUCTION ERROR EMA</span><strong>${small(neural.smoothed_error)}</strong></div><div class="metric"><span>GRADIENT NORM</span><strong>${small(neural.gradient_norm)}</strong></div><div class="metric"><span>NEURAL INPUTS</span><strong>${neural.input_dimension??'—'}</strong></div><div class="metric"><span>EXTERNAL NEURAL LEARNING</span><strong>${neural.external_features_learned?(neural.external_feed_ready?'READY':'WAITING DATA'):'NOT YET INITIALIZED'}</strong></div></div><div class="muted">${neural.external_features_learned?'Neural fusion enabled. '+String(neural.external_trained_labels??0)+' delayed external-feature supervised updates.':'Waiting for aligned OANDA reference markets AND verified news; legacy OHLC model still runs.'}</div>`);
   setHtml('evoDetails',`<div class="kv"><span>Learning generation (Paaudze)</span><b>${state.learning_generation||state.code_generation||0}</b></div><div class="kv"><span>Policy file generation (shadow research)</span><b>${state.policy_generation||data.code?.generation||0}</b></div><div class="kv"><span>Shadow-evolved code variant (not LIVE gate)</span><b>${escapeHtml(data.code?.strategy||'—')}</b></div><div class="kv"><span>Evolution attempts</span><b>${data.code?.attempts??0}</b></div><div class="kv"><span>Next evaluation</span><b>${Math.ceil(Math.max(20,state.labeled_samples+1)/20)*20} labeled samples</b></div><div class="kv"><span>Last evolution result</span><b>${escapeHtml(data.code?.last_reason||'—')}</b></div><div class="kv"><span>SHA-256</span><b>${escapeHtml(data.code?.sha256?.slice(0,24)||'—')}…</b></div>`);
   setText('codeSource',data.code?.source||'—');setHtml('codeEvents',entries((data.events||[]).filter(e=>e.kind==='code'),40));
   setHtml('signalHistory',table([['Time','time'],['Epic','epic'],['Action','action'],['Price','price'],['Step','model_step'],['Next-label','label']],data.signals||[]));
   setHtml('fullTrades',table([['Deal','deal_id'],['Epic','epic'],['Side','direction'],['Size','size'],['Entry','entry'],['Exit','exit'],
     ['P&L',row=>row.pnl==null||row.pnl===''?'—':Number(row.pnl).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:4})],
     ['Opened','opened'],['Closed','closed']],data.trades||[]));
-  setHtml('fullEvents',entries(data.events,80));setText('footerState',state.error?state.error:'CAPITAL.COM LIVE · NEURAL ENGINE');
+  setHtml('fullEvents',entries(data.events,80));setText('footerState',state.error?state.error:'OANDA LIVE · NEURAL ENGINE');
   if(visible==='dashboard')drawCandles('candleChart',data.candles);
   if(visible==='analysis'){renderIntelligence(data);drawCandles('analysisChart',data.candles);drawSignalMarkers(data.candles,data.signals||[])}
 }
